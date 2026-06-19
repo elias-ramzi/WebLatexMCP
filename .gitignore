@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+# Local secrets / config — never commit
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
