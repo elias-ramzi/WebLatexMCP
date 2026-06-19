@@ -6,6 +6,11 @@ import { createContext } from './context.js';
 import { createServer } from './server.js';
 
 async function main(): Promise<void> {
+  // Fail fast instead of hanging on an interactive credential prompt when no token or
+  // credential helper is available. Child git processes inherit these.
+  process.env.GIT_TERMINAL_PROMPT ??= '0';
+  process.env.GCM_INTERACTIVE ??= 'never';
+
   const config = loadConfig();
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);

@@ -51,8 +51,9 @@ token**. For GitHub, create a PAT under **Settings → Developer settings → Pe
 
 ### Tokens — resolved per host
 
-Tokens are used as the HTTPS password. The server picks one **by remote host**, then falls back to a
-generic env var, then the macOS Keychain (service `latex-git-mcp`, account = host):
+Tokens are used as the HTTPS password. For a project the server tries, in order: a per-project
+`tokenEnv`, the host's token env (below), the generic `GIT_MCP_TOKEN`, the **GitHub CLI**
+(`gh auth token`), then the macOS Keychain (service `latex-git-mcp`, account = host):
 
 | host               | token env            | default username |
 | ------------------ | -------------------- | ---------------- |
@@ -63,6 +64,13 @@ generic env var, then the macOS Keychain (service `latex-git-mcp`, account = hos
 
 A project can override with its own `tokenEnv` (names an env var holding the token) and/or `username`.
 So Overleaf and GitHub projects coexist with different credentials.
+
+**Using the GitHub CLI:** if [`gh`](https://cli.github.com) is installed and authenticated
+(`gh auth login`), you can leave `GITHUB_TOKEN` unset — the server runs `gh auth token` to obtain a
+token (injected in-memory, never persisted). It also works if you've run `gh auth setup-git` (gh becomes
+git's credential helper). Git operations run with `GIT_TERMINAL_PROMPT=0`, so a missing or expired
+credential fails fast instead of hanging. Note: for **Claude Desktop**, `gh` must be on the server
+process's `PATH` (the GUI launcher may not provide your shell `PATH` — set it in the `env` block if so).
 
 ### Token security
 

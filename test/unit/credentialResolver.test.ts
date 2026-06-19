@@ -1,9 +1,27 @@
 import { describe, it, expect } from 'vitest';
 import { CredentialResolver, authenticateUrl } from '../../src/services/auth.js';
+import type { ExecResult } from '../../src/lib/exec.js';
+
+/** Fake exec that returns a gh token for `gh auth token`, and "no entry" for anything else. */
+function ghExec(token: string): (cmd: string, args: string[]) => Promise<ExecResult> {
+  return async (cmd, args) => {
+    if (cmd === 'gh' && args[0] === 'auth' && args[1] === 'token') {
+      return { code: 0, stdout: `${token}\n`, stderr: '', timedOut: false };
+    }
+    return { code: 1, stdout: '', stderr: 'not found', timedOut: false };
+  };
+}
+
+const failExec = async (): Promise<ExecResult> => ({
+  code: 1,
+  stdout: '',
+  stderr: 'not found',
+  timedOut: false,
+});
 
 describe('CredentialResolver', () => {
   it('resolves a GitHub remote to GITHUB_TOKEN with the x-access-token username', async () => {
-    const r = new CredentialResolver({ GITHUB_TOKEN: 'ghtok' });
+    const r = new CredentialResolver({ GITHUB_TOKEN: 'ghtok' }, failExec);
     expect(await r.resolve({ gitUrl: 'https://github.com/me/repo.git' })).toEqual({
       username: 'x-access-token',
       token: 'ghtok',
@@ -11,7 +29,7 @@ describe('CredentialResolver', () => {
   });
 
   it('resolves an Overleaf remote to OVERLEAF_GIT_TOKEN with the git username', async () => {
-    const r = new CredentialResolver({ OVERLEAF_GIT_TOKEN: 'ovtok' });
+    const r = new CredentialResolver({ OVERLEAF_GIT_TOKEN: 'ovtok' }, failExec);
     expect(await r.resolve({ gitUrl: 'https://git.overleaf.com/abc' })).toEqual({
       username: 'git',
       token: 'ovtok',
@@ -19,7 +37,7 @@ describe('CredentialResolver', () => {
   });
 
   it('lets a project override the token env and username', async () => {
-    const r = new CredentialResolver({ MY_TOKEN: 'mine', GITHUB_TOKEN: 'gh' });
+    const r = new CredentialResolver({ MY_TOKEN: 'mine', GITHUB_TOKEN: 'gh' }, failExec);
     expect(
       await r.resolve({
         gitUrl: 'https://github.com/me/repo',
@@ -30,7 +48,7 @@ describe('CredentialResolver', () => {
   });
 
   it('falls back to the generic GIT_MCP_TOKEN for unknown hosts', async () => {
-    const r = new CredentialResolver({ GIT_MCP_TOKEN: 'gen' });
+    const r = new CredentialResolver({ GIT_MCP_TOKEN: 'gen' }, failExec);
     expect(await r.resolve({ gitUrl: 'https://git.example.com/x/y' })).toEqual({
       username: 'git',
       token: 'gen',
@@ -38,13 +56,35 @@ describe('CredentialResolver', () => {
   });
 
   it('returns no token for an unauthenticated (file://) remote', async () => {
-    const r = new CredentialResolver({});
+    const r = new CredentialResolver({}, failExec);
     expect(await r.resolve({ gitUrl: 'file:///tmp/x' })).toEqual({ username: 'git' });
   });
 
-  it('allSecrets enumerates every configured host token for redaction', async () => {
-    const r = new CredentialResolver({ GITHUB_TOKEN: 'gh', OVERLEAF_GIT_TOKEN: 'ov' });
+  it('uses `gh auth token` when no env token is configured', async () => {
+    const r = new CredentialResolver({}, ghExec('gh-cli-token'));
+    expect(await r.resolve({ gitUrl: 'https://github.com/me/repo' })).toEqual({
+      username: 'x-access-token',
+      token: 'gh-cli-token',
+    });
+  });
+
+  it('prefers an env token over the gh CLI', async () => {
+    const r = new CredentialResolver({ GITHUB_TOKEN: 'env-tok' }, ghExec('gh-cli-token'));
+    expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBe('env-tok');
+  });
+
+  it('yields no token when neither env nor gh provides one', async () => {
+    const r = new CredentialResolver({}, failExec);
+    expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBeUndefined();
+  });
+
+  it('allSecrets enumerates configured host tokens and resolved gh tokens', async () => {
+    const r = new CredentialResolver({ GITHUB_TOKEN: 'gh', OVERLEAF_GIT_TOKEN: 'ov' }, ghExec('x'));
     expect(r.allSecrets().sort()).toEqual(['gh', 'ov']);
+    // A token resolved via gh is also scrubbed once seen.
+    const r2 = new CredentialResolver({}, ghExec('gh-cli-token'));
+    await r2.resolve({ gitUrl: 'https://github.com/me/repo' });
+    expect(r2.allSecrets()).toContain('gh-cli-token');
   });
 });
 

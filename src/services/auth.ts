@@ -87,7 +87,11 @@ export class CredentialResolver {
   /** Tokens actually resolved, retained so redaction can scrub them from any output. */
   private readonly seenTokens = new Set<string>();
 
-  constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
+  constructor(
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    /** Injectable for tests; defaults to spawning real subprocesses. */
+    private readonly exec: typeof execCapture = execCapture,
+  ) {}
 
   async resolve(project: CredentialProject): Promise<AuthConfig> {
     const host = hostOf(project.gitUrl);
@@ -114,6 +118,7 @@ export class CredentialResolver {
     host: string | undefined,
     defaults: HostDefaults | undefined,
   ): Promise<string | undefined> {
+    // 1. Env vars: per-project override, then host default, then generic.
     const envNames: string[] = [];
     if (project.tokenEnv) envNames.push(project.tokenEnv);
     if (defaults) envNames.push(defaults.tokenEnv);
@@ -123,18 +128,42 @@ export class CredentialResolver {
       if (value) return value;
     }
 
-    if (process.platform === 'darwin' && host) {
-      try {
-        const res = await execCapture(
-          'security',
-          ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', host, '-w'],
-          { timeoutMs: 5000 },
-        );
-        const token = res.stdout.trim();
-        if (res.code === 0 && token) return token;
-      } catch {
-        // security unavailable or no entry — fall through.
-      }
+    if (!host) return undefined;
+
+    // 2. GitHub CLI — works for github.com and any GitHub host gh is authenticated to.
+    const ghToken = await this.tokenFromGh(host);
+    if (ghToken) return ghToken;
+
+    // 3. macOS Keychain (account = host).
+    if (process.platform === 'darwin') {
+      const kcToken = await this.tokenFromKeychain(host);
+      if (kcToken) return kcToken;
+    }
+    return undefined;
+  }
+
+  private async tokenFromGh(host: string): Promise<string | undefined> {
+    try {
+      const res = await this.exec('gh', ['auth', 'token', '--hostname', host], { timeoutMs: 5000 });
+      const token = res.stdout.trim();
+      if (res.code === 0 && token) return token;
+    } catch {
+      // gh not installed — skip.
+    }
+    return undefined;
+  }
+
+  private async tokenFromKeychain(host: string): Promise<string | undefined> {
+    try {
+      const res = await this.exec(
+        'security',
+        ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', host, '-w'],
+        { timeoutMs: 5000 },
+      );
+      const token = res.stdout.trim();
+      if (res.code === 0 && token) return token;
+    } catch {
+      // security unavailable or no entry — skip.
     }
     return undefined;
   }

@@ -55,9 +55,12 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
-  → macOS Keychain). Tools resolve it (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into
-  `GitService.clone/syncPull/push` per call — `GitService` holds no credential. It's injected in-memory and
-  `clone` resets origin to the tokenless URL; never write credentials into `.git/config`.
+  → `gh auth token` → macOS Keychain). Its subprocess runner is injectable for tests. Tools resolve it
+  (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into `GitService.clone/syncPull/push` per
+  call — `GitService` holds no credential. It's injected in-memory and `clone` resets origin to the
+  tokenless URL; never write credentials into `.git/config`. `index.ts` sets `GIT_TERMINAL_PROMPT=0` so
+  git fails fast rather than prompting; with no resolved token, git also falls through to its own
+  credential helpers (e.g. `gh auth setup-git`).
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
