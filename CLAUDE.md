@@ -27,6 +27,23 @@ npx vitest run -t "refuses to push when behind"     # a single test by name
 
 The full local gate before considering work done: `typecheck` + `lint` + `format:check` + `test`.
 
+## Git workflow
+
+**Before committing, always sync with the remote `main` and resolve any merge conflicts first** — so you
+never clobber upstream work and conflicts surface early, not at push time:
+
+```bash
+git fetch origin
+git rebase origin/main        # or: git merge origin/main
+# resolve any conflicts, then re-run the full gate
+```
+
+- The default branch is `main`. Only commit once the working tree is in sync with `origin/main` and all
+  conflicts are resolved.
+- After resolving conflicts, **re-run the gate** (`typecheck` + `lint` + `format:check` + `test`) before
+  committing.
+- Commit and push only when the user asks.
+
 ## Architecture
 
 **Thin tool layer over a testable service core.** Tools do only schema validation + response
