@@ -22,7 +22,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:smoke": "vitest run test/smoke"
+    "test:smoke": "vitest run test/smoke",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",

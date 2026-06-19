@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run build
+      # Unit + integration tests. No TeX is installed here, so the TeX-gated smoke
+      # compile auto-skips. Integration tests use a local bare repo — no secrets needed.
+      - run: npm test
+
+  tex-smoke:
+    name: LaTeX compile smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Minimal TeX Live (scheme-basic) + latexmk, cached across runs to stay fast.
+      - name: Set up TeX Live
+        uses: teatimeguest/setup-texlive-action@v3
+        with:
+          packages: |
+            scheme-basic
+            latexmk
+      - run: npm ci
+      - run: npm run test:smoke

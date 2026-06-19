@@ -1,0 +1,72 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+An MCP server (stdio transport) that lets an MCP client read, edit, compile, and commit LaTeX
+in an Overleaf project via its Git remote. It manages local clones of one or more projects,
+compiles locally with `latexmk`, and pushes changes back. See [README.md](README.md) for user-facing
+setup (env vars, Claude Desktop/Code registration, the full tool list).
+
+## Commands
+
+```bash
+npm run build        # tsc -p tsconfig.build.json -> dist/ (build excludes tests)
+npm run dev          # run from source via tsx (src/index.ts)
+npm run typecheck    # tsc --noEmit (covers src AND test)
+npm run lint         # eslint
+npm run format       # prettier --write   (format:check for CI verification)
+npm test             # vitest run: unit + integration (TeX-gated smokes auto-skip)
+npm run test:smoke   # only test/smoke/** (real latexmk compile; needs TeX installed)
+
+npx vitest run test/unit/logParser.test.ts          # a single file
+npx vitest run -t "refuses to push when behind"     # a single test by name
+```
+
+The full local gate before considering work done: `typecheck` + `lint` + `format:check` + `test`.
+
+## Architecture
+
+**Thin tool layer over a testable service core.** Tools do only schema validation + response
+formatting; all logic lives in services so it is unit-testable without a live MCP client.
+
+- `src/index.ts` — stdio bootstrap. Resolves auth (async, may hit the Keychain) then builds the context.
+- `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
+- `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`)
+  passed to every tool handler.
+- `src/tools/*` — one file per tool: a zod `inputSchema`/`outputSchema` + a handler that calls services.
+- `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex, dynamic
+  registration), `GitService` (simple-git wrapper), `FileService` (sandboxed fs), `LatexmkCompiler`
+  (implements the `LatexCompiler` interface), `logParser`, `auth`.
+
+Project state: clones live under a workspace root (`OVERLEAF_MCP_WORKSPACE`), one dir per project id.
+Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime registration.
+
+## Conventions that aren't obvious
+
+- **stdout is the JSON-RPC channel.** Never `console.log` from server code — log to **stderr** only.
+- **Tool return shape.** `CallToolResult` has an index signature that named types/consts don't satisfy,
+  so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
+  Use `errorResult(err, ctx.git.secrets())` (from `src/lib/errors.ts`) in every handler's catch so messages
+  are token-scrubbed.
+- **Mutating tools** (write/edit/delete/commit/push/discard/clone) must run inside
+  `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+- **Git auth is never persisted.** The token is injected in-memory per network call (`GitService.withAuth`
+  / `clone` resets origin to the tokenless URL). Don't write credentials into `.git/config`.
+- **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
+  refuses when behind. Keep this guarantee.
+- **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
+- **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
+
+## Testing strategy
+
+- **Unit** tests mock nothing external — they use temp dirs and feed canned data (e.g. `logParser`
+  against real LaTeX log snippets).
+- **Integration** (`test/integration/`) runs real git against a **local bare repo** created by
+  `helpers/bareRepo.ts` (a `file://` stand-in for the Overleaf remote) — **no network, no secrets**.
+  Branch is `master` to match Overleaf.
+- **The compile boundary is the `LatexCompiler` interface** so nothing needs TeX except the smokes.
+  `test/smoke/**` is gated on `latexmk` being installed (`describe.skipIf(!available)`), so it skips
+  locally/in the fast CI job and runs in the dedicated `tex-smoke` CI job.
+- Fixtures: `test/fixtures/sample-latex/` (a minimal project + `main-broken.tex` for error parsing).

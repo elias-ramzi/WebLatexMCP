@@ -1,0 +1,42 @@
+import { describe, it, expect } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { loadConfig } from '../../src/config.js';
+
+describe('loadConfig', () => {
+  it('uses the default workspace root when unset', () => {
+    const cfg = loadConfig({});
+    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.overleaf-mcp', 'projects'));
+    expect(cfg.projects).toEqual([]);
+    expect(cfg.defaultProject).toBeUndefined();
+  });
+
+  it('expands a leading ~ in the workspace root', () => {
+    const cfg = loadConfig({ OVERLEAF_MCP_WORKSPACE: '~/tex-projects' });
+    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));
+  });
+
+  it('parses the projects registry and default project', () => {
+    const cfg = loadConfig({
+      OVERLEAF_MCP_PROJECTS: JSON.stringify({
+        thesis: { gitUrl: 'https://git.overleaf.com/abc', rootFile: 'main.tex' },
+      }),
+      OVERLEAF_MCP_DEFAULT_PROJECT: 'thesis',
+    });
+    expect(cfg.projects).toHaveLength(1);
+    expect(cfg.projects[0]).toMatchObject({
+      id: 'thesis',
+      gitUrl: 'https://git.overleaf.com/abc',
+      rootFile: 'main.tex',
+    });
+    expect(cfg.defaultProject).toBe('thesis');
+  });
+
+  it('throws on invalid projects JSON', () => {
+    expect(() => loadConfig({ OVERLEAF_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
+  });
+
+  it('throws when the default project is not in the registry', () => {
+    expect(() => loadConfig({ OVERLEAF_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
+  });
+});
