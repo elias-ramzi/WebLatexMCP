@@ -1,11 +1,36 @@
+<div align="center">
+
+<img src="assets/overleaf-mcp-stacked-ink.svg" alt="latex-git-mcp" width="220" />
+
 # latex-git-mcp
+
+**Read, edit, compile, and commit LaTeX in any git-hosted project — straight from Claude.**
+
+[![CI](https://github.com/elias-ramzi/overleaf_mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/overleaf_mcp/actions/workflows/ci.yml)
+&nbsp;
+![Node ≥ 20](https://img.shields.io/badge/node-%E2%89%A5%2020-3C873A?logo=node.js&logoColor=white)
+&nbsp;
+![Platforms](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-444)
+&nbsp;
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+
+</div>
+
+---
 
 An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a git-hosted project —
 **Overleaf**, **GitHub**, or any git remote. It keeps a local clone, runs LaTeX compilation locally
 (TeX Live + `latexmk`) so you see errors and PDFs without round-tripping, and sends changes back via an
-explicit, reviewable commit → push to the repo's default branch.
+explicit, reviewable commit → push to the repo's default branch. Works with both **Claude Desktop** and
+**Claude Code** over stdio, on **macOS, Linux, and Windows**.
 
-Works with both **Claude Desktop** and **Claude Code** over stdio, on **macOS, Linux, and Windows**.
+## Highlights
+
+- 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
+- ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
+- 🧪 **Local compiles** — `latexmk` runs on your machine and returns structured errors/warnings + the PDF.
+- 🔍 **Reviewable pushes** — `commit` and `push` are separate steps; nothing leaves your machine implicitly.
+- 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 
 ## Requirements
 
@@ -191,7 +216,7 @@ npm run test:smoke    # full compile/loop smoke (needs latexmk; auto-skips other
 ```
 
 CI (GitHub Actions) runs lint + typecheck + build + tests on **ubuntu, windows, and macos**, plus a
-separate Linux job that installs a minimal TeX Live (`scheme-basic` + `latexmk`) for the compile smoke.
+separate Linux job that installs a minimal TeX Live + `latexmk` (via `apt`) for the compile smoke.
 Integration tests use a local bare repo as an Overleaf/GitHub stand-in, so **no secrets are ever needed**.
 
 ## License
