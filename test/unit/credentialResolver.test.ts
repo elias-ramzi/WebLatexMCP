@@ -19,6 +19,21 @@ const failExec = async (): Promise<ExecResult> => ({
   timedOut: false,
 });
 
+/** Fake exec: gh fails, but `git credential fill` returns a token. */
+function gitCredentialExec(token: string): (cmd: string, args: string[]) => Promise<ExecResult> {
+  return async (cmd, args) => {
+    if (cmd === 'git' && args[0] === 'credential' && args[1] === 'fill') {
+      return {
+        code: 0,
+        stdout: `protocol=https\nhost=github.com\nusername=x-access-token\npassword=${token}\n`,
+        stderr: '',
+        timedOut: false,
+      };
+    }
+    return { code: 1, stdout: '', stderr: 'no', timedOut: false };
+  };
+}
+
 describe('CredentialResolver', () => {
   it('resolves a GitHub remote to GITHUB_TOKEN with the x-access-token username', async () => {
     const r = new CredentialResolver({ GITHUB_TOKEN: 'ghtok' }, failExec);
@@ -73,7 +88,22 @@ describe('CredentialResolver', () => {
     expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBe('env-tok');
   });
 
-  it('yields no token when neither env nor gh provides one', async () => {
+  it('falls back to the git credential helper when env and gh have nothing', async () => {
+    const r = new CredentialResolver({}, gitCredentialExec('cred-token'));
+    expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBe('cred-token');
+  });
+
+  it('prefers gh over the git credential helper', async () => {
+    const bothExec = async (cmd: string): Promise<ExecResult> => {
+      if (cmd === 'gh') return { code: 0, stdout: 'gh-token\n', stderr: '', timedOut: false };
+      if (cmd === 'git') return { code: 0, stdout: 'password=cred\n', stderr: '', timedOut: false };
+      return { code: 1, stdout: '', stderr: '', timedOut: false };
+    };
+    const r = new CredentialResolver({}, bothExec);
+    expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBe('gh-token');
+  });
+
+  it('yields no token when env, gh, and git credential all have nothing', async () => {
     const r = new CredentialResolver({}, failExec);
     expect((await r.resolve({ gitUrl: 'https://github.com/me/repo' })).token).toBeUndefined();
   });

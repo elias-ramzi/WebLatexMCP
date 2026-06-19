@@ -117,7 +117,8 @@ export class GitService {
   async clone(gitUrl: string, targetDir: string, auth: AuthConfig, branch?: string): Promise<void> {
     await mkdir(path.dirname(targetDir), { recursive: true });
     const authUrl = authenticateUrl(gitUrl, auth);
-    const options = branch ? ['-b', branch] : [];
+    // Keep repo line endings (LF) so edit_file's exact match is deterministic on Windows.
+    const options = ['-c', 'core.autocrlf=false', ...(branch ? ['-b', branch] : [])];
     await simpleGit().clone(authUrl, targetDir, options);
     await simpleGit(targetDir).remote(['set-url', 'origin', gitUrl]);
   }

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { readdir, readFile, writeFile, mkdir, stat, rm } from 'node:fs/promises';
-import { resolveInside } from '../lib/paths.js';
+import { resolveInside, toPosix } from '../lib/paths.js';
 
 export type FileFilter = 'tex' | 'bib' | 'assets' | 'all';
 export type FileType = 'tex' | 'bib' | 'asset' | 'other';
@@ -91,7 +91,7 @@ export class FileService {
     const entries = await Promise.all(
       collected.map(async (rel) => {
         const info = await stat(path.join(projectDir, rel));
-        return { path: rel, type: classify(rel), sizeBytes: info.size };
+        return { path: toPosix(rel), type: classify(rel), sizeBytes: info.size };
       }),
     );
     return entries

@@ -21,9 +21,6 @@ export interface CredentialProject {
   tokenEnv?: string;
 }
 
-/** macOS Keychain service name; accounts are keyed by host. */
-const KEYCHAIN_SERVICE = 'latex-git-mcp';
-
 /** Generic token env, used when no host-specific or per-project token is configured. */
 const GENERIC_TOKEN_ENV = 'GIT_MCP_TOKEN';
 
@@ -134,11 +131,10 @@ export class CredentialResolver {
     const ghToken = await this.tokenFromGh(host);
     if (ghToken) return ghToken;
 
-    // 3. macOS Keychain (account = host).
-    if (process.platform === 'darwin') {
-      const kcToken = await this.tokenFromKeychain(host);
-      if (kcToken) return kcToken;
-    }
+    // 3. The user's git credential helper (cross-platform: osxkeychain / libsecret / manager).
+    const credToken = await this.tokenFromGitCredential(host);
+    if (credToken) return credToken;
+
     return undefined;
   }
 
@@ -153,17 +149,19 @@ export class CredentialResolver {
     return undefined;
   }
 
-  private async tokenFromKeychain(host: string): Promise<string | undefined> {
+  private async tokenFromGitCredential(host: string): Promise<string | undefined> {
     try {
-      const res = await this.exec(
-        'security',
-        ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', host, '-w'],
-        { timeoutMs: 5000 },
-      );
-      const token = res.stdout.trim();
-      if (res.code === 0 && token) return token;
+      const res = await this.exec('git', ['credential', 'fill'], {
+        input: `protocol=https\nhost=${host}\n\n`,
+        // Never prompt — just query configured helpers.
+        env: { ...this.env, GIT_TERMINAL_PROMPT: '0' },
+        timeoutMs: 5000,
+      });
+      if (res.code !== 0) return undefined;
+      const token = /^password=(.*)$/m.exec(res.stdout)?.[1]?.trim();
+      return token || undefined;
     } catch {
-      // security unavailable or no entry — skip.
+      // git unavailable — skip.
     }
     return undefined;
   }

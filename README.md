@@ -5,17 +5,19 @@ An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a gi
 (TeX Live + `latexmk`) so you see errors and PDFs without round-tripping, and sends changes back via an
 explicit, reviewable commit → push to the repo's default branch.
 
-Works with both **Claude Desktop** and **Claude Code** over stdio.
+Works with both **Claude Desktop** and **Claude Code** over stdio, on **macOS, Linux, and Windows**.
 
 ## Requirements
 
-- **Node.js ≥ 20** and **git**
+- **Node.js ≥ 20** and **git** on your `PATH`.
 - A git remote you can authenticate to over HTTPS with a token:
   - **Overleaf** (Premium): a Git authentication token, or
   - **GitHub**: a Personal Access Token (PAT) with repo access, or any other host.
-- For local compilation: **TeX Live** with **`latexmk`** on your `PATH`
-  (e.g. `brew install --cask mactex` or `sudo tlmgr install latexmk` on BasicTeX).
-  Editing and git operations work without TeX; only the `compile` tool needs it.
+- For local compilation: **TeX Live / MiKTeX** with **`latexmk`** on your `PATH`. Editing and git
+  operations work without TeX; only the `compile` tool needs it.
+  - **macOS**: `brew install --cask mactex` (or BasicTeX + `sudo tlmgr install latexmk`)
+  - **Linux**: `sudo apt install texlive texlive-latex-extra latexmk` (or the `dnf` equivalent)
+  - **Windows**: install [MiKTeX](https://miktex.org) or TeX Live and ensure `latexmk` is on `PATH`
 
 ## Install
 
@@ -53,7 +55,7 @@ token**. For GitHub, create a PAT under **Settings → Developer settings → Pe
 
 Tokens are used as the HTTPS password. For a project the server tries, in order: a per-project
 `tokenEnv`, the host's token env (below), the generic `GIT_MCP_TOKEN`, the **GitHub CLI**
-(`gh auth token`), then the macOS Keychain (service `latex-git-mcp`, account = host):
+(`gh auth token`), then your **git credential helper** (`git credential fill` — works on every OS):
 
 | host               | token env            | default username |
 | ------------------ | -------------------- | ---------------- |
@@ -65,27 +67,24 @@ Tokens are used as the HTTPS password. For a project the server tries, in order:
 A project can override with its own `tokenEnv` (names an env var holding the token) and/or `username`.
 So Overleaf and GitHub projects coexist with different credentials.
 
-**Using the GitHub CLI:** if [`gh`](https://cli.github.com) is installed and authenticated
-(`gh auth login`), you can leave `GITHUB_TOKEN` unset — the server runs `gh auth token` to obtain a
-token (injected in-memory, never persisted). It also works if you've run `gh auth setup-git` (gh becomes
-git's credential helper). Git operations run with `GIT_TERMINAL_PROMPT=0`, so a missing or expired
-credential fails fast instead of hanging. Note: for **Claude Desktop**, `gh` must be on the server
-process's `PATH` (the GUI launcher may not provide your shell `PATH` — set it in the `env` block if so).
+**No token in the config?** The server uses, if available:
 
-### Token security
+- **The GitHub CLI** — `gh auth login` (any OS); leave `GITHUB_TOKEN` unset and the server runs
+  `gh auth token`. `gh auth setup-git` also works (gh becomes git's credential helper).
+- **Your OS git credential helper**, queried via `git credential fill`: **osxkeychain** (macOS),
+  **libsecret**/cache (Linux, e.g. `sudo apt install libsecret-1-0 libsecret-tools` +
+  `git config --global credential.helper libsecret`), **Git Credential Manager** (Windows, bundled with
+  Git for Windows). Populate it once with `gh auth setup-git`, your normal `git push`, or
+  `printf 'protocol=https\nhost=github.com\nusername=x\npassword=<TOKEN>\n\n' | git credential approve`.
 
-- Tokens are injected into git operations **in memory only**. After cloning, the stored remote is reset
-  to a **tokenless** URL — no credential lands in `.git/config`.
-- Tokens are scrubbed from error messages and tool output (every known host token, not just the one used).
-- **macOS Keychain** (so Claude Desktop, which can't expand `${VARS}`, avoids an inline token):
-
-  ```bash
-  security add-generic-password -s latex-git-mcp -a github.com -w   # prompts for the token
-  ```
+Tokens are injected into git operations **in memory only** — after cloning, the remote is reset to a
+**tokenless** URL, so nothing lands in `.git/config`. Every known host token is scrubbed from error
+messages and tool output. Git runs with `GIT_TERMINAL_PROMPT=0`, so a missing/expired credential fails
+fast instead of hanging.
 
 ## Registering the server
 
-### Claude Code
+### Claude Code (macOS / Linux / Windows)
 
 ```bash
 claude mcp add latex-git --scope user -- node /absolute/path/to/overleaf_mcp/dist/index.js
@@ -102,7 +101,6 @@ without secrets):
       "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "OVERLEAF_GIT_TOKEN": "${OVERLEAF_GIT_TOKEN}",
         "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "GIT_MCP_DEFAULT_PROJECT": "paper",
       },
@@ -111,33 +109,44 @@ without secrets):
 }
 ```
 
-Inspect with `/mcp`.
+Inspect with `/mcp`. On **Windows**, this works in PowerShell, cmd, and WSL; under WSL use Linux-style
+paths.
 
-### Claude Desktop
+### Claude Desktop (macOS / Windows)
 
-Edit `claude_desktop_config.json` (macOS:
-`~/Library/Application Support/Claude/claude_desktop_config.json`) and **restart the app**. Desktop does
-**not** expand env vars, so either inline tokens or use the Keychain:
+Edit `claude_desktop_config.json` and **restart the app**:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+(Claude Desktop has no Linux build — use Claude Code there.) Desktop does **not** expand env vars, so
+inline non-secret config and rely on `gh` / your git credential helper for the token. **Use
+forward-slash paths even on Windows** to avoid JSON backslash escaping:
 
 ```jsonc
 {
   "mcpServers": {
     "latex-git": {
       "command": "node",
-      "args": ["/absolute/path/to/overleaf_mcp/dist/index.js"],
+      "args": ["C:/Users/you/overleaf_mcp/dist/index.js"],
       "env": {
         "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "GIT_MCP_DEFAULT_PROJECT": "paper",
-        /* tokens omitted -> read from the macOS Keychain (account = host) */
       },
     },
   },
 }
 ```
 
+**PATH note:** the server is a subprocess, so `node`, `git`, `gh`, and `latexmk` must be on _its_ `PATH`.
+Claude Code inherits your shell `PATH`. **macOS** Claude Desktop is launched by the GUI with a minimal
+`PATH` — use absolute paths or add a `"PATH"` entry to the `env` block. **Windows** Claude Desktop
+usually inherits the user `PATH`.
+
 ## Tools
 
-All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`).
+All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`). File paths are always
+POSIX (`/`-separated), on every OS.
 
 | Tool            | Description                                                                                                                |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -159,8 +168,14 @@ All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`).
 
 `commit` and `push` are separate, and nothing pushes automatically. Review with `status` / `diff`,
 `commit` locally, then `push` with `confirm: true`. `push` targets the repo's default branch and refuses
-if the local clone is behind or diverged — run `project_sync` first. (Feature-branch and Pull-Request
-workflows are intentionally out of scope.)
+if the local clone is behind or diverged — run `project_sync` first.
+
+### Cross-platform notes
+
+- File paths in tool output are POSIX (`/`), regardless of OS.
+- Clones force `core.autocrlf=false`, so files keep their repo (LF) line endings and `edit_file`'s exact
+  match is deterministic on Windows.
+- Secrets come from env vars, the GitHub CLI, or your git credential helper — no OS-specific config.
 
 ## Development
 
@@ -172,9 +187,9 @@ npm test              # vitest: unit + integration (bare-repo stand-in, no secre
 npm run test:smoke    # full compile/loop smoke (needs latexmk; auto-skips otherwise)
 ```
 
-CI (GitHub Actions) runs lint + typecheck + build + tests on every push/PR, with a separate job that
-installs a minimal TeX Live (`scheme-basic` + `latexmk`) for the compile smoke. Integration tests use a
-local bare repo as an Overleaf/GitHub stand-in, so **no secrets are ever needed** for the standard run.
+CI (GitHub Actions) runs lint + typecheck + build + tests on **ubuntu, windows, and macos**, plus a
+separate Linux job that installs a minimal TeX Live (`scheme-basic` + `latexmk`) for the compile smoke.
+Integration tests use a local bare repo as an Overleaf/GitHub stand-in, so **no secrets are ever needed**.
 
 ## License
 

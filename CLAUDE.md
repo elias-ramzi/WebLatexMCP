@@ -55,7 +55,7 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
-  → `gh auth token` → macOS Keychain). Its subprocess runner is injectable for tests. Tools resolve it
+  → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it
   (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into `GitService.clone/syncPull/push` per
   call — `GitService` holds no credential. It's injected in-memory and `clone` resets origin to the
   tokenless URL; never write credentials into `.git/config`. `index.ts` sets `GIT_TERMINAL_PROMPT=0` so
@@ -65,6 +65,11 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
   refuses when behind. Keep this guarantee.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
 - **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
+- **Cross-platform (macOS/Linux/Windows).** Tool output paths are POSIX via `toPosix` (`src/lib/paths.ts`);
+  clones force `core.autocrlf=false`. `execCapture` supports `input` (stdin) / `env` and sets
+  `windowsHide`. The bare-repo test helper builds its `file://` URL with `pathToFileURL` (string-concatenated
+  `file://C:\…` is invalid on Windows). CI runs the gate on ubuntu + windows + macos; keep new code and
+  tests separator-agnostic.
 
 ## Testing strategy
 

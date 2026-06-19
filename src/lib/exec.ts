@@ -7,18 +7,27 @@ export interface ExecResult {
   timedOut: boolean;
 }
 
+export interface ExecOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** Environment for the child process. Defaults to the parent's environment. */
+  env?: NodeJS.ProcessEnv;
+  /** Written to the child's stdin, which is then closed (e.g. for `git credential fill`). */
+  input?: string;
+}
+
 /**
  * Spawn a command and capture its output. Rejects only when the binary cannot be
  * spawned (e.g. not found); a non-zero exit code resolves normally so callers can
- * inspect `code`. Kills the process on timeout.
+ * inspect `code`. Kills the process on timeout. `windowsHide` avoids console flashes.
  */
 export function execCapture(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; timeoutMs?: number } = {},
+  opts: ExecOptions = {},
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd });
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, windowsHide: true });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -43,5 +52,12 @@ export function execCapture(
       if (timer) clearTimeout(timer);
       resolve({ code, stdout, stderr, timedOut });
     });
+
+    if (opts.input !== undefined) {
+      // Swallow EPIPE if the child never reads (e.g. failed to spawn).
+      child.stdin.on('error', () => {});
+      child.stdin.write(opts.input);
+      child.stdin.end();
+    }
   });
 }

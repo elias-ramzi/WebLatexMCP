@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
-import { resolveInside } from '../../src/lib/paths.js';
+import { resolveInside, toPosix } from '../../src/lib/paths.js';
 
 describe('resolveInside', () => {
   const root = '/tmp/project';
@@ -20,5 +20,15 @@ describe('resolveInside', () => {
 
   it('rejects absolute paths', () => {
     expect(() => resolveInside(root, '/etc/passwd')).toThrow(/absolute/);
+  });
+});
+
+describe('toPosix', () => {
+  it('converts native separators to forward slashes', () => {
+    expect(toPosix(['chapters', 'intro.tex'].join(path.sep))).toBe('chapters/intro.tex');
+  });
+
+  it('leaves already-POSIX paths unchanged', () => {
+    expect(toPosix('a/b/c.tex')).toBe('a/b/c.tex');
   });
 });

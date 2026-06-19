@@ -6,21 +6,30 @@ on:
 
 jobs:
   quality:
-    name: Lint, typecheck, test
-    runs-on: ubuntu-latest
+    name: Lint, typecheck, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      # Deterministic line endings + a git identity for the integration tests' repos.
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
       - run: npm ci
       - run: npm run lint
       - run: npm run format:check
       - run: npm run typecheck
       - run: npm run build
-      # Unit + integration tests. No TeX is installed here, so the TeX-gated smoke
-      # compile auto-skips. Integration tests use a local bare repo — no secrets needed.
+      # Unit + integration tests use a local bare repo — no TeX, no secrets.
       - run: npm test
 
   tex-smoke:

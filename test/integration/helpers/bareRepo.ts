@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 
@@ -33,6 +34,7 @@ export async function createFakeRemote(
   await seed.raw(['init', '-b', branch]);
   await seed.addConfig('user.email', 'seed@example.com');
   await seed.addConfig('user.name', 'Seed');
+  await seed.addConfig('core.autocrlf', 'false');
   await writeFiles(seedDir, files);
   await seed.add('.');
   await seed.commit('initial commit');
@@ -40,7 +42,7 @@ export async function createFakeRemote(
   await seed.push('origin', branch);
 
   return {
-    url: `file://${bareDir}`,
+    url: pathToFileURL(bareDir).href,
     bareDir,
     branch,
     cleanup: () => rm(tmp, { recursive: true, force: true }),
@@ -59,6 +61,7 @@ export async function pushCommit(
     await git.clone(remote.url, tmp);
     await git.addConfig('user.email', 'other@example.com');
     await git.addConfig('user.name', 'Other');
+    await git.addConfig('core.autocrlf', 'false');
     await writeFiles(tmp, files);
     await git.add('.');
     await git.commit(message);

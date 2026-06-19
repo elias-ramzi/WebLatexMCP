@@ -1,5 +1,10 @@
 import path from 'node:path';
 
+/** Convert a native path to POSIX (`/`) separators, so tool output is identical on Windows. */
+export function toPosix(p: string): string {
+  return p.split(path.sep).join('/');
+}
+
 /**
  * Resolve a user-supplied relative path against a project root, rejecting anything
  * that escapes the root (`..`, absolute paths, symlink-style traversal in the string).
