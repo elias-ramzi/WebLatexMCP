@@ -41,12 +41,16 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Minimal TeX Live (scheme-basic) + latexmk, cached across runs to stay fast.
+      # Minimal TeX Live + latexmk via apt (the sample is a bare `article` with a manual
+      # thebibliography, so no bibtex/biber is needed). Installed directly rather than via
+      # a third-party action so the job doesn't depend on the repo's Actions allow-list.
       - name: Set up TeX Live
-        uses: teatimeguest/setup-texlive-action@v3
-        with:
-          packages: |
-            scheme-basic
-            latexmk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            latexmk \
+            texlive-latex-base \
+            texlive-latex-recommended \
+            texlive-fonts-recommended
       - run: npm ci
       - run: npm run test:smoke

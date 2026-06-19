@@ -4,6 +4,11 @@ import { pathToFileURL } from 'node:url';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 
+// Windows keeps transient locks on freshly-used .git files (the OS/AV releases them a
+// beat later), so a plain recursive rm can throw EBUSY/ENOTEMPTY. Retry to ride it out.
+const rmDir = (dir: string): Promise<void> =>
+  rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+
 export interface FakeRemote {
   /** file:// URL pointing at the bare repo — a stand-in for an Overleaf/GitHub remote. */
   url: string;
@@ -45,7 +50,7 @@ export async function createFakeRemote(
     url: pathToFileURL(bareDir).href,
     bareDir,
     branch,
-    cleanup: () => rm(tmp, { recursive: true, force: true }),
+    cleanup: () => rmDir(tmp),
   };
 }
 
@@ -67,7 +72,7 @@ export async function pushCommit(
     await git.commit(message);
     await git.push('origin', remote.branch);
   } finally {
-    await rm(tmp, { recursive: true, force: true });
+    await rmDir(tmp);
   }
 }
 
