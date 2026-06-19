@@ -6,7 +6,9 @@ describe('resolveInside', () => {
   const root = '/tmp/project';
 
   it('resolves a normal relative path inside the root', () => {
-    expect(resolveInside(root, 'chapters/intro.tex')).toBe(path.join(root, 'chapters/intro.tex'));
+    expect(resolveInside(root, 'chapters/intro.tex')).toBe(
+      path.resolve(root, 'chapters/intro.tex'),
+    );
   });
 
   it('allows the root itself', () => {
