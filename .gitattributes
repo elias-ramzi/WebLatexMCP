@@ -1,0 +1,3 @@
+# Normalize line endings: store text as LF in the repo and check out as LF on every OS
+# (including Windows), so Prettier and edit_file stay deterministic cross-platform.
+* text=auto eol=lf
