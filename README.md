@@ -84,6 +84,9 @@ fast instead of hanging.
 
 ## Registering the server
 
+**Prefer a step-by-step guide?** See [`docs/install/`](docs/install/) —
+[macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
+
 ### Claude Code (macOS / Linux / Windows)
 
 ```bash
