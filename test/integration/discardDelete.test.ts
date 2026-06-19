@@ -27,9 +27,9 @@ describe('discard + delete against a bare-repo stand-in', () => {
       defaultProject: 'demo',
     };
     const pm = new ProjectManager(config);
-    const git = new GitService({ username: 'git' });
+    const git = new GitService();
     const dir = pm.projectPath('demo');
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
     return { remote, git, files: new FileService(), dir };
   }
 

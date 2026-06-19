@@ -6,37 +6,44 @@ import { loadConfig } from '../../src/config.js';
 describe('loadConfig', () => {
   it('uses the default workspace root when unset', () => {
     const cfg = loadConfig({});
-    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.overleaf-mcp', 'projects'));
+    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.latex-git-mcp', 'projects'));
     expect(cfg.projects).toEqual([]);
     expect(cfg.defaultProject).toBeUndefined();
   });
 
   it('expands a leading ~ in the workspace root', () => {
-    const cfg = loadConfig({ OVERLEAF_MCP_WORKSPACE: '~/tex-projects' });
+    const cfg = loadConfig({ GIT_MCP_WORKSPACE: '~/tex-projects' });
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));
   });
 
   it('parses the projects registry and default project', () => {
     const cfg = loadConfig({
-      OVERLEAF_MCP_PROJECTS: JSON.stringify({
+      GIT_MCP_PROJECTS: JSON.stringify({
         thesis: { gitUrl: 'https://git.overleaf.com/abc', rootFile: 'main.tex' },
+        paper: { gitUrl: 'https://github.com/me/paper', branch: 'main', tokenEnv: 'GITHUB_TOKEN' },
       }),
-      OVERLEAF_MCP_DEFAULT_PROJECT: 'thesis',
+      GIT_MCP_DEFAULT_PROJECT: 'thesis',
     });
-    expect(cfg.projects).toHaveLength(1);
+    expect(cfg.projects).toHaveLength(2);
     expect(cfg.projects[0]).toMatchObject({
       id: 'thesis',
       gitUrl: 'https://git.overleaf.com/abc',
       rootFile: 'main.tex',
     });
+    expect(cfg.projects[1]).toMatchObject({
+      id: 'paper',
+      gitUrl: 'https://github.com/me/paper',
+      branch: 'main',
+      tokenEnv: 'GITHUB_TOKEN',
+    });
     expect(cfg.defaultProject).toBe('thesis');
   });
 
   it('throws on invalid projects JSON', () => {
-    expect(() => loadConfig({ OVERLEAF_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
+    expect(() => loadConfig({ GIT_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
   });
 
   it('throws when the default project is not in the registry', () => {
-    expect(() => loadConfig({ OVERLEAF_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
+    expect(() => loadConfig({ GIT_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
   });
 });

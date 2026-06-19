@@ -44,7 +44,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           structuredContent: { ...status },
         };
       } catch (err) {
-        return errorResult(err, ctx.git.secrets());
+        return errorResult(err, ctx.credentials.allSecrets());
       }
     },
   );

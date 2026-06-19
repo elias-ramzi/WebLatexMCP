@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 An MCP server (stdio transport) that lets an MCP client read, edit, compile, and commit LaTeX
-in an Overleaf project via its Git remote. It manages local clones of one or more projects,
-compiles locally with `latexmk`, and pushes changes back. See [README.md](README.md) for user-facing
-setup (env vars, Claude Desktop/Code registration, the full tool list).
+in a git-hosted project (Overleaf, GitHub, or any git remote). It manages local clones of one or more
+projects, compiles locally with `latexmk`, and pushes changes back to the default branch. See
+[README.md](README.md) for user-facing setup (env vars, Claude Desktop/Code registration, the full tool
+list).
 
 ## Commands
 
@@ -48,12 +49,15 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
 - **stdout is the JSON-RPC channel.** Never `console.log` from server code — log to **stderr** only.
 - **Tool return shape.** `CallToolResult` has an index signature that named types/consts don't satisfy,
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
-  Use `errorResult(err, ctx.git.secrets())` (from `src/lib/errors.ts`) in every handler's catch so messages
-  are token-scrubbed.
+  Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
+  so messages are token-scrubbed across every configured host.
 - **Mutating tools** (write/edit/delete/commit/push/discard/clone) must run inside
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
-- **Git auth is never persisted.** The token is injected in-memory per network call (`GitService.withAuth`
-  / `clone` resets origin to the tokenless URL). Don't write credentials into `.git/config`.
+- **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
+  project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
+  → macOS Keychain). Tools resolve it (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into
+  `GitService.clone/syncPull/push` per call — `GitService` holds no credential. It's injected in-memory and
+  `clone` resets origin to the tokenless URL; never write credentials into `.git/config`.
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).

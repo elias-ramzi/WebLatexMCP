@@ -50,20 +50,21 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
         const cfg = ctx.projectManager.getProjectConfig(project);
         const dir = ctx.projectManager.projectPath(cfg.id);
         const cloned = await ctx.projectManager.hasClone(cfg.id);
+        const auth = await ctx.credentials.resolve(cfg);
 
         let result: SyncResult;
         if (!cloned) {
           if (mode === 'pull') {
             throw new Error(`Project "${cfg.id}" is not cloned yet; use mode "clone" or "auto".`);
           }
-          await ctx.git.clone(cfg.gitUrl, dir);
+          await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
           const ab = await ctx.git.aheadBehind(dir);
           result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
         } else {
           if (mode === 'clone') {
             throw new Error(`Project "${cfg.id}" is already cloned; use mode "pull" or "auto".`);
           }
-          result = await ctx.git.syncPull(cfg.gitUrl, dir);
+          result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
         }
 
         const payload = { project: cfg.id, path: dir, ...result };
@@ -79,7 +80,7 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           structuredContent: { ...payload },
         };
       } catch (err) {
-        return errorResult(err, ctx.git.secrets());
+        return errorResult(err, ctx.credentials.allSecrets());
       }
     },
   );

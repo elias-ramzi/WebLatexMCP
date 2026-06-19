@@ -44,7 +44,7 @@ export function registerListFiles(server: McpServer, ctx: AppContext): void {
           structuredContent: { files },
         };
       } catch (err) {
-        return errorResult(err, ctx.git.secrets());
+        return errorResult(err, ctx.credentials.allSecrets());
       }
     },
   );

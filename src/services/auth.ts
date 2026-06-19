@@ -1,10 +1,8 @@
 import { execCapture } from '../lib/exec.js';
 
-/** Git authentication configuration for the Overleaf remote. */
+/** Resolved git auth for one project: a username + optional token (HTTPS password). */
 export interface AuthConfig {
-  /** The git token used as the HTTPS password. Undefined for unauthenticated (e.g. file://) remotes. */
   token?: string;
-  /** HTTPS username. Overleaf accepts any value with token-as-password; defaults to "git". */
   username: string;
 }
 
@@ -14,49 +12,46 @@ export interface CommitIdentity {
   email: string;
 }
 
-/** macOS Keychain service name under which the git token may be stored. */
-const KEYCHAIN_SERVICE = 'overleaf-mcp';
+/** The fields of a project that affect credential resolution. */
+export interface CredentialProject {
+  gitUrl: string;
+  /** Override the HTTPS username for this project. */
+  username?: string;
+  /** Name of the env var holding this project's token (overrides host defaults). */
+  tokenEnv?: string;
+}
 
-export function loadUsername(env: NodeJS.ProcessEnv = process.env): string {
-  return env.OVERLEAF_GIT_USERNAME?.trim() || 'git';
+/** macOS Keychain service name; accounts are keyed by host. */
+const KEYCHAIN_SERVICE = 'latex-git-mcp';
+
+/** Generic token env, used when no host-specific or per-project token is configured. */
+const GENERIC_TOKEN_ENV = 'GIT_MCP_TOKEN';
+
+interface HostDefaults {
+  tokenEnv: string;
+  username: string;
+}
+
+/** Per-host conventions for the token env var and HTTPS username. Overridable per project. */
+const HOST_DEFAULTS: Record<string, HostDefaults> = {
+  'github.com': { tokenEnv: 'GITHUB_TOKEN', username: 'x-access-token' },
+  'gitlab.com': { tokenEnv: 'GITLAB_TOKEN', username: 'oauth2' },
+  'git.overleaf.com': { tokenEnv: 'OVERLEAF_GIT_TOKEN', username: 'git' },
+};
+
+function hostOf(gitUrl: string): string | undefined {
+  try {
+    return new URL(gitUrl).hostname;
+  } catch {
+    return undefined;
+  }
 }
 
 export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdentity {
   return {
-    name: env.OVERLEAF_GIT_AUTHOR_NAME?.trim() || 'Overleaf MCP',
-    email: env.OVERLEAF_GIT_AUTHOR_EMAIL?.trim() || 'overleaf-mcp@localhost',
+    name: env.GIT_MCP_AUTHOR_NAME?.trim() || 'LaTeX Git MCP',
+    email: env.GIT_MCP_AUTHOR_EMAIL?.trim() || 'latex-git-mcp@localhost',
   };
-}
-
-/**
- * Resolve the git token: prefer the environment variable, then fall back to the macOS
- * Keychain (so Claude Desktop, which cannot expand env vars in its config, can still
- * avoid an inline plaintext token). Never throws — returns undefined when unavailable.
- */
-export async function resolveToken(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<string | undefined> {
-  const fromEnv = env.OVERLEAF_GIT_TOKEN?.trim();
-  if (fromEnv) return fromEnv;
-
-  if (process.platform === 'darwin') {
-    try {
-      const res = await execCapture(
-        'security',
-        ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
-        { timeoutMs: 5000 },
-      );
-      const token = res.stdout.trim();
-      if (res.code === 0 && token) return token;
-    } catch {
-      // security not available or no entry — fall through.
-    }
-  }
-  return undefined;
-}
-
-export async function loadAuth(env: NodeJS.ProcessEnv = process.env): Promise<AuthConfig> {
-  return { token: await resolveToken(env), username: loadUsername(env) };
 }
 
 /**
@@ -80,4 +75,67 @@ export function authenticateUrl(gitUrl: string, auth: AuthConfig): string {
 /** The list of secret strings to scrub from any output, for this auth config. */
 export function redactionSecrets(auth: AuthConfig): string[] {
   return auth.token ? [auth.token] : [];
+}
+
+/**
+ * Resolves git credentials per project: token from a per-project env override, then the
+ * host-default env, then a generic env, then the macOS Keychain (keyed by host); username
+ * from a per-project override or the host default. Tokens are never thrown on — missing
+ * credentials yield `{ token: undefined }` (fine for public/file:// remotes).
+ */
+export class CredentialResolver {
+  /** Tokens actually resolved, retained so redaction can scrub them from any output. */
+  private readonly seenTokens = new Set<string>();
+
+  constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
+
+  async resolve(project: CredentialProject): Promise<AuthConfig> {
+    const host = hostOf(project.gitUrl);
+    const defaults = host ? HOST_DEFAULTS[host] : undefined;
+    const username = project.username?.trim() || defaults?.username || 'git';
+    const token = await this.resolveToken(project, host, defaults);
+    if (token) this.seenTokens.add(token);
+    return { username, token };
+  }
+
+  /** Every token that could appear in output, so error/redaction covers all providers. */
+  allSecrets(): string[] {
+    const secrets = new Set<string>(this.seenTokens);
+    const envNames = [GENERIC_TOKEN_ENV, ...Object.values(HOST_DEFAULTS).map((d) => d.tokenEnv)];
+    for (const name of envNames) {
+      const value = this.env[name]?.trim();
+      if (value) secrets.add(value);
+    }
+    return [...secrets];
+  }
+
+  private async resolveToken(
+    project: CredentialProject,
+    host: string | undefined,
+    defaults: HostDefaults | undefined,
+  ): Promise<string | undefined> {
+    const envNames: string[] = [];
+    if (project.tokenEnv) envNames.push(project.tokenEnv);
+    if (defaults) envNames.push(defaults.tokenEnv);
+    envNames.push(GENERIC_TOKEN_ENV);
+    for (const name of envNames) {
+      const value = this.env[name]?.trim();
+      if (value) return value;
+    }
+
+    if (process.platform === 'darwin' && host) {
+      try {
+        const res = await execCapture(
+          'security',
+          ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', host, '-w'],
+          { timeoutMs: 5000 },
+        );
+        const token = res.stdout.trim();
+        if (res.code === 0 && token) return token;
+      } catch {
+        // security unavailable or no entry — fall through.
+      }
+    }
+    return undefined;
+  }
 }

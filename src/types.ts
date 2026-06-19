@@ -1,11 +1,17 @@
-/** A single Overleaf project the server knows how to clone and operate on. */
+/** A single git project (Overleaf, GitHub, or any host) the server can operate on. */
 export interface ProjectConfig {
   /** Friendly id used in tool calls and as the clone directory name. */
   id: string;
-  /** Overleaf git remote URL, e.g. https://git.overleaf.com/<projectId>. Stored tokenless. */
+  /** Git remote URL (e.g. https://git.overleaf.com/<id> or https://github.com/<owner>/<repo>). Stored tokenless. */
   gitUrl: string;
   /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
   rootFile?: string;
+  /** Optional branch to clone/track. Defaults to the remote's default branch. */
+  branch?: string;
+  /** Optional HTTPS username override (otherwise a per-host default is used). */
+  username?: string;
+  /** Optional name of the env var holding this project's token (overrides host defaults). */
+  tokenEnv?: string;
 }
 
 /** Clone status for a configured project. */

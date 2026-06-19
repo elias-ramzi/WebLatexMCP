@@ -44,12 +44,12 @@ describe.skipIf(!available)('full loop: clone -> edit -> compile -> commit -> pu
       defaultProject: 'demo',
     };
     const pm = new ProjectManager(config);
-    const git = new GitService({ username: 'git' });
+    const git = new GitService();
     const files = new FileService();
     const dir = pm.projectPath('demo');
 
     // clone
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
 
     // edit
     await files.applyEdits(dir, 'main.tex', [
@@ -63,7 +63,7 @@ describe.skipIf(!available)('full loop: clone -> edit -> compile -> commit -> pu
 
     // commit + push
     await git.commit(dir, { message: 'edit and compile' });
-    const pushed = await git.push(dir, remote.url);
+    const pushed = await git.push(dir, remote.url, { username: 'git' });
     expect(pushed.pushed).toBe(true);
 
     // verify the edit reached the remote

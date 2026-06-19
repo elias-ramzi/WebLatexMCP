@@ -8,6 +8,9 @@ const projectsSchema = z.record(
   z.object({
     gitUrl: z.string().min(1),
     rootFile: z.string().min(1).optional(),
+    branch: z.string().min(1).optional(),
+    username: z.string().min(1).optional(),
+    tokenEnv: z.string().min(1).optional(),
   }),
 );
 
@@ -24,13 +27,13 @@ function parseProjects(raw: string | undefined): ProjectConfig[] {
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`OVERLEAF_MCP_PROJECTS is not valid JSON: ${(err as Error).message}`, {
+    throw new Error(`GIT_MCP_PROJECTS is not valid JSON: ${(err as Error).message}`, {
       cause: err,
     });
   }
   const result = projectsSchema.safeParse(parsed);
   if (!result.success) {
-    throw new Error(`OVERLEAF_MCP_PROJECTS is invalid: ${result.error.message}`);
+    throw new Error(`GIT_MCP_PROJECTS is invalid: ${result.error.message}`);
   }
   return Object.entries(result.data).map(([id, cfg]) => ({ id, ...cfg }));
 }
@@ -40,17 +43,17 @@ function parseProjects(raw: string | undefined): ProjectConfig[] {
  * (other than reading `env`), so it can be unit-tested with a synthetic environment.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const workspaceRaw = env.OVERLEAF_MCP_WORKSPACE?.trim();
+  const workspaceRaw = env.GIT_MCP_WORKSPACE?.trim();
   const workspaceRoot = workspaceRaw
     ? path.resolve(expandHome(workspaceRaw))
-    : path.join(os.homedir(), '.overleaf-mcp', 'projects');
+    : path.join(os.homedir(), '.latex-git-mcp', 'projects');
 
-  const projects = parseProjects(env.OVERLEAF_MCP_PROJECTS);
-  const defaultProject = env.OVERLEAF_MCP_DEFAULT_PROJECT?.trim() || undefined;
+  const projects = parseProjects(env.GIT_MCP_PROJECTS);
+  const defaultProject = env.GIT_MCP_DEFAULT_PROJECT?.trim() || undefined;
 
   if (defaultProject && !projects.some((p) => p.id === defaultProject)) {
     throw new Error(
-      `OVERLEAF_MCP_DEFAULT_PROJECT "${defaultProject}" is not present in OVERLEAF_MCP_PROJECTS.`,
+      `GIT_MCP_DEFAULT_PROJECT "${defaultProject}" is not present in GIT_MCP_PROJECTS.`,
     );
   }
 

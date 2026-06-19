@@ -32,7 +32,7 @@ describe('read-only git flow against a bare-repo stand-in', () => {
       defaultProject: 'demo',
     };
     const pm = new ProjectManager(config);
-    const git = new GitService({ username: 'git' }); // no token for file://
+    const git = new GitService(); // identity-only; auth is passed per call
     return { remote, pm, git, files: new FileService(), dir: pm.projectPath('demo') };
   }
 
@@ -42,7 +42,7 @@ describe('read-only git flow against a bare-repo stand-in', () => {
       'refs.bib': '@book{x, title={T}}\n',
     });
 
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
     expect(await pm.hasClone('demo')).toBe(true);
 
     // Token must never be persisted into .git/config.
@@ -63,11 +63,11 @@ describe('read-only git flow against a bare-repo stand-in', () => {
 
   it('fast-forwards on pull and surfaces divergence without merging', async () => {
     const { remote, git, dir } = await setup();
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
 
     // Remote-only change -> clean fast-forward.
     await pushCommit(remote, { 'extra.tex': 'x\n' }, 'remote change');
-    const pulled = await git.syncPull(remote.url, dir);
+    const pulled = await git.syncPull(remote.url, dir, { username: 'git' });
     expect(pulled.action).toBe('pulled');
     expect(pulled.behind).toBe(0);
     expect(await readFile(path.join(dir, 'extra.tex'), 'utf8')).toBe('x\n');
@@ -81,7 +81,7 @@ describe('read-only git flow against a bare-repo stand-in', () => {
     await local.commit('local change');
     await pushCommit(remote, { 'remote2.tex': 'y\n' }, 'remote change 2');
 
-    const diverged = await git.syncPull(remote.url, dir);
+    const diverged = await git.syncPull(remote.url, dir, { username: 'git' });
     expect(diverged.action).toBe('diverged');
     expect(diverged.diverged).toBe(true);
     expect(diverged.ahead).toBeGreaterThan(0);
@@ -94,7 +94,7 @@ describe('read-only git flow against a bare-repo stand-in', () => {
 
   it('reports diff after an uncommitted edit', async () => {
     const { remote, git, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
     await writeFile(path.join(dir, 'main.tex'), 'one\ntwo\nthree\n');
 
     const diff = await git.diff(dir, {});

@@ -33,8 +33,12 @@ export class ProjectManager {
   }
 
   /** Register (or update) a project at runtime. */
-  registerProject(id: string, gitUrl: string, rootFile?: string): ProjectConfig {
-    const cfg: ProjectConfig = { id, gitUrl, rootFile };
+  registerProject(
+    id: string,
+    gitUrl: string,
+    opts: Pick<ProjectConfig, 'rootFile' | 'branch' | 'username' | 'tokenEnv'> = {},
+  ): ProjectConfig {
+    const cfg: ProjectConfig = { id, gitUrl, ...opts };
     this.projects.set(id, cfg);
     return cfg;
   }

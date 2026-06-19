@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { simpleGit, type SimpleGit } from 'simple-git';
-import { authenticateUrl, redactionSecrets, type AuthConfig, type CommitIdentity } from './auth.js';
+import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'Overleaf MCP', email: 'overleaf-mcp@localhost' };
 
@@ -40,15 +40,7 @@ export interface DiffResult {
  * in-memory per network call and never persisted to .git/config.
  */
 export class GitService {
-  constructor(
-    private readonly auth: AuthConfig,
-    private readonly identity: CommitIdentity = DEFAULT_IDENTITY,
-  ) {}
-
-  /** Secrets to scrub from tool output/errors. */
-  secrets(): string[] {
-    return redactionSecrets(this.auth);
-  }
+  constructor(private readonly identity: CommitIdentity = DEFAULT_IDENTITY) {}
 
   /** Stage and commit locally. Does not push. */
   async commit(
@@ -98,9 +90,10 @@ export class GitService {
   async push(
     dir: string,
     gitUrl: string,
+    auth: AuthConfig,
   ): Promise<{ pushed: boolean; remote: string; summary: string }> {
     const git = simpleGit(dir);
-    await this.withAuth(git, gitUrl, () => git.fetch(['origin']));
+    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
     const ab = await this.aheadBehindOf(git);
     if (ab.behind > 0) {
       throw new Error(
@@ -112,7 +105,7 @@ export class GitService {
     if (ab.ahead === 0) {
       return { pushed: false, remote: gitUrl, summary: 'Nothing to push; already up to date.' };
     }
-    await this.withAuth(git, gitUrl, () => git.push(['origin', ab.branch]));
+    await this.withAuth(git, gitUrl, auth, () => git.push(['origin', ab.branch]));
     return {
       pushed: true,
       remote: gitUrl,
@@ -121,17 +114,18 @@ export class GitService {
   }
 
   /** Clone a project, then reset origin to the tokenless URL so no credential is persisted. */
-  async clone(gitUrl: string, targetDir: string): Promise<void> {
+  async clone(gitUrl: string, targetDir: string, auth: AuthConfig, branch?: string): Promise<void> {
     await mkdir(path.dirname(targetDir), { recursive: true });
-    const authUrl = authenticateUrl(gitUrl, this.auth);
-    await simpleGit().clone(authUrl, targetDir);
+    const authUrl = authenticateUrl(gitUrl, auth);
+    const options = branch ? ['-b', branch] : [];
+    await simpleGit().clone(authUrl, targetDir, options);
     await simpleGit(targetDir).remote(['set-url', 'origin', gitUrl]);
   }
 
   /** Fetch and fast-forward (ff-only). Surfaces divergence instead of merging. */
-  async syncPull(gitUrl: string, dir: string): Promise<SyncResult> {
+  async syncPull(gitUrl: string, dir: string, auth: AuthConfig): Promise<SyncResult> {
     const git = simpleGit(dir);
-    await this.withAuth(git, gitUrl, () => git.fetch(['origin']));
+    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
     const ab = await this.aheadBehindOf(git);
     if (ab.behind === 0) {
       return { action: 'up-to-date', ahead: ab.ahead, behind: 0, diverged: false };
@@ -220,9 +214,10 @@ export class GitService {
   private async withAuth(
     git: SimpleGit,
     gitUrl: string,
+    auth: AuthConfig,
     fn: () => Promise<unknown>,
   ): Promise<void> {
-    const authUrl = authenticateUrl(gitUrl, this.auth);
+    const authUrl = authenticateUrl(gitUrl, auth);
     if (authUrl === gitUrl) {
       await fn();
       return;

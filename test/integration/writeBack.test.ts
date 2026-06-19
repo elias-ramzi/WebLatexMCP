@@ -31,9 +31,9 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
       defaultProject: 'demo',
     };
     const pm = new ProjectManager(config);
-    const git = new GitService({ username: 'git' });
+    const git = new GitService();
     const dir = pm.projectPath('demo');
-    await git.clone(remote.url, dir);
+    await git.clone(remote.url, dir, { username: 'git' });
     return { remote, git, files: new FileService(), dir };
   }
 
@@ -45,7 +45,7 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     expect(committed.committed).toBe(true);
     expect(committed.filesChanged).toBe(1);
 
-    const pushed = await git.push(dir, remote.url);
+    const pushed = await git.push(dir, remote.url, { username: 'git' });
     expect(pushed.pushed).toBe(true);
     expect(pushed.summary).toMatch(/Pushed 1 commit/);
 
@@ -70,6 +70,6 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     // Remote advances independently.
     await pushCommit(remote, { 'remote.tex': 'remote\n' }, 'remote change');
 
-    await expect(git.push(dir, remote.url)).rejects.toThrow(/behind remote/);
+    await expect(git.push(dir, remote.url, { username: 'git' })).rejects.toThrow(/behind remote/);
   });
 });

@@ -1,10 +1,10 @@
 {
-  "name": "overleaf-mcp",
+  "name": "latex-git-mcp",
   "version": "0.1.0",
-  "description": "MCP server to read, edit, compile, and commit LaTeX files in an Overleaf project via its Git remote.",
+  "description": "MCP server to read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote).",
   "type": "module",
   "bin": {
-    "overleaf-mcp": "dist/index.js"
+    "latex-git-mcp": "dist/index.js"
   },
   "files": [
     "dist"
@@ -28,6 +28,8 @@
   "keywords": [
     "mcp",
     "overleaf",
+    "github",
+    "git",
     "latex",
     "model-context-protocol"
   ],

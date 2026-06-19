@@ -32,16 +32,17 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
       try {
         const cfg = ctx.projectManager.getProjectConfig(project);
         const { id, dir } = await ctx.projectManager.requireClonedDir(cfg.id);
+        const auth = await ctx.credentials.resolve(cfg);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const res = await ctx.git.push(dir, cfg.gitUrl);
-          const safeRemote = redact(res.remote, ctx.git.secrets());
+          const res = await ctx.git.push(dir, cfg.gitUrl, auth);
+          const safeRemote = redact(res.remote, ctx.credentials.allSecrets());
           return {
             content: [{ type: 'text', text: res.summary }],
             structuredContent: { ...res, remote: safeRemote },
           };
         });
       } catch (err) {
-        return errorResult(err, ctx.git.secrets());
+        return errorResult(err, ctx.credentials.allSecrets());
       }
     },
   );

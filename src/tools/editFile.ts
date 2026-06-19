@@ -55,7 +55,7 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           };
         });
       } catch (err) {
-        return errorResult(err, ctx.git.secrets());
+        return errorResult(err, ctx.credentials.allSecrets());
       }
     },
   );
