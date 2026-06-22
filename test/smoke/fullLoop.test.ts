@@ -63,7 +63,8 @@ describe.skipIf(!available)('full loop: clone -> edit -> compile -> commit -> pu
 
     // commit + push
     await git.commit(dir, { message: 'edit and compile' });
-    const pushed = await git.push(dir, remote.url, { username: 'git' });
+    const pushed = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(pushed.status).toBe('pushed');
     expect(pushed.pushed).toBe(true);
 
     // verify the edit reached the remote

@@ -14,18 +14,23 @@ import { registerPush } from './tools/push.js';
 import { registerDeleteFile } from './tools/deleteFile.js';
 import { registerDiscard } from './tools/discard.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
+import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { buildInstructions } from './lib/writingGuide.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
  *
- * When a `writingGuide` is provided it reaches the client two ways: as the MCP
- * `instructions` hint (advertised at initialization, so clients add it to the
- * model's context automatically) and as a fetchable resource (for on-demand
- * re-reading and clients that ignore `instructions`).
+ * Each provided guide (`writingGuide`, `concurrencyGuide`) reaches the client two
+ * ways: folded into the MCP `instructions` hint (advertised at initialization, so
+ * clients add it to the model's context automatically) and as a fetchable resource
+ * (for on-demand re-reading and clients that ignore `instructions`).
  */
-export function createServer(ctx: AppContext, writingGuide?: string): McpServer {
-  const instructions = buildInstructions(writingGuide);
+export function createServer(
+  ctx: AppContext,
+  writingGuide?: string,
+  concurrencyGuide?: string,
+): McpServer {
+  const instructions = buildInstructions(writingGuide, concurrencyGuide);
   const server = new McpServer(
     {
       name: 'overleaf-mcp',
@@ -49,6 +54,7 @@ export function createServer(ctx: AppContext, writingGuide?: string): McpServer 
   registerDiscard(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
+  if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
 
   return server;
 }

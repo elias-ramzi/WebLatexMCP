@@ -31,15 +31,29 @@ export async function loadWritingGuide(
 }
 
 /**
- * Wrap the guide in a short framing sentence so the client knows what it is and
- * when to apply it. Returns `undefined` when there is no guide, so the server
- * advertises no instructions in that case.
+ * Wrap each available guide in a short framing sentence so the client knows what it
+ * is and when to apply it, then join them into one `instructions` string. Returns
+ * `undefined` when no guide is present, so the server advertises no instructions in
+ * that case.
  */
-export function buildInstructions(guide: string | undefined): string | undefined {
-  if (!guide) return undefined;
-  return (
-    'When reading, writing, editing, or reviewing LaTeX (.tex) files through this ' +
-    "server, follow the project's LaTeX writing guide below.\n\n" +
-    guide
-  );
+export function buildInstructions(
+  writingGuide?: string,
+  concurrencyGuide?: string,
+): string | undefined {
+  const sections: string[] = [];
+  if (writingGuide) {
+    sections.push(
+      'When reading, writing, editing, or reviewing LaTeX (.tex) files through this ' +
+        "server, follow the project's LaTeX writing guide below.\n\n" +
+        writingGuide,
+    );
+  }
+  if (concurrencyGuide) {
+    sections.push(
+      'When committing or pushing changes through this server, follow the concurrency ' +
+        'and safe-push rules below.\n\n' +
+        concurrencyGuide,
+    );
+  }
+  return sections.length > 0 ? sections.join('\n\n---\n\n') : undefined;
 }

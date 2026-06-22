@@ -50,4 +50,17 @@ describe('buildInstructions', () => {
   it('returns undefined when there is no guide', () => {
     expect(buildInstructions(undefined)).toBeUndefined();
   });
+
+  it('combines the writing and concurrency guides when both are present', () => {
+    const out = buildInstructions('WRITING_BODY', 'CONCURRENCY_BODY');
+    expect(out).toContain('WRITING_BODY');
+    expect(out).toContain('CONCURRENCY_BODY');
+    expect(out).toContain('committing or pushing changes');
+  });
+
+  it('frames the concurrency guide alone when only it is present', () => {
+    const out = buildInstructions(undefined, 'CONCURRENCY_BODY');
+    expect(out).toContain('CONCURRENCY_BODY');
+    expect(out).not.toContain('LaTeX (.tex) files through this server');
+  });
 });

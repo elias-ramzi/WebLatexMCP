@@ -57,13 +57,14 @@ This produces `dist/index.js`, the stdio entry point.
 
 Configured entirely through environment variables (set them in your MCP client's `env` block).
 
-| Variable                                       | Required | Description                                                                                                             |
-| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                        |
-| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.latex-git-mcp/projects`.                                           |
-| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                       |
-| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `LaTeX Git MCP <latex-git-mcp@localhost>`.                                           |
-| `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`docs/writing-guide.md`](docs/writing-guide.md). |
+| Variable                                       | Required | Description                                                                                                                   |
+| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                              |
+| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.latex-git-mcp/projects`.                                                 |
+| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                             |
+| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `LaTeX Git MCP <latex-git-mcp@localhost>`.                                                 |
+| `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`docs/writing-guide.md`](docs/writing-guide.md).       |
+| `GIT_MCP_CONCURRENCY_GUIDE`                    | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md). |
 
 `GIT_MCP_PROJECTS` example — one Overleaf project and one GitHub repo:
 
@@ -177,21 +178,21 @@ usually inherits the user `PATH`.
 All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`). File paths are always
 POSIX (`/`-separated), on every OS.
 
-| Tool            | Description                                                                                                                |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `list_projects` | List configured projects and their clone status.                                                                           |
-| `project_sync`  | Clone if missing, else fast-forward pull. Surfaces divergence instead of merging. Pass `gitUrl` to register a new project. |
-| `list_files`    | List files, filter `tex` / `bib` / `assets` / `all`.                                                                       |
-| `read_file`     | Read a text file (optional line range). Binaries return a path, not bytes.                                                 |
-| `write_file`    | Create or overwrite a file.                                                                                                |
-| `edit_file`     | Surgical string-replacement edits (unique match unless `replaceAll`; atomic).                                              |
-| `delete_file`   | Delete a file from the project.                                                                                            |
-| `compile`       | Compile locally with latexmk; returns success, PDF path, structured errors/warnings + raw log tail.                        |
-| `status`        | Branch, ahead/behind, staged/unstaged/untracked.                                                                           |
-| `diff`          | Unified diff + per-file line counts.                                                                                       |
-| `discard`       | Discard uncommitted changes (requires `confirm: true`).                                                                    |
-| `commit`        | Stage and commit locally. Does **not** push.                                                                               |
-| `push`          | Push committed changes to the default branch (requires `confirm: true`; refuses if behind).                                |
+| Tool            | Description                                                                                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects` | List configured projects and their clone status.                                                                                                               |
+| `project_sync`  | Clone if missing, else fast-forward pull. Surfaces divergence instead of merging. Pass `gitUrl` to register a new project.                                     |
+| `list_files`    | List files, filter `tex` / `bib` / `assets` / `all`.                                                                                                           |
+| `read_file`     | Read a text file (optional line range). Binaries return a path, not bytes.                                                                                     |
+| `write_file`    | Create or overwrite a file.                                                                                                                                    |
+| `edit_file`     | Surgical string-replacement edits (unique match unless `replaceAll`; atomic).                                                                                  |
+| `delete_file`   | Delete a file from the project.                                                                                                                                |
+| `compile`       | Compile locally with latexmk; returns success, PDF path, structured errors/warnings + raw log tail.                                                            |
+| `status`        | Branch, ahead/behind, staged/unstaged/untracked.                                                                                                               |
+| `diff`          | Unified diff + per-file line counts.                                                                                                                           |
+| `discard`       | Discard uncommitted changes (requires `confirm: true`).                                                                                                        |
+| `commit`        | Stage and commit locally. Does **not** push.                                                                                                                   |
+| `push`          | Safe push: pull-rebase onto the latest remote, then push (never force). Surfaces conflicts for a human; `mode: "branch"` for review. Requires `confirm: true`. |
 
 ### Writing guide in context
 
@@ -204,11 +205,22 @@ and English-usage conventions. Point `GIT_MCP_WRITING_GUIDE` at your own file to
 to a non-existent path to ship no guide (the server logs to stderr and starts normally either way; with
 no guide, neither the instructions nor the resource is advertised).
 
-### Reviewable, never-surprising pushes
+### Concurrency guide in context
+
+The same way, the server surfaces a concurrency / safe-push guide as both the `instructions` hint and a
+fetchable **resource** at `guide://latex/concurrency`. The bundled [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md)
+explains how this server pushes without clobbering edits made elsewhere (people editing in the Overleaf
+web editor, or other agents). Override it with `GIT_MCP_CONCURRENCY_GUIDE`.
+
+### Reviewable, safe pushes
 
 `commit` and `push` are separate, and nothing pushes automatically. Review with `status` / `diff`,
-`commit` locally, then `push` with `confirm: true`. `push` targets the repo's default branch and refuses
-if the local clone is behind or diverged — run `project_sync` first.
+`commit` locally, then `push` with `confirm: true`. Because people may also be editing in the Overleaf
+web editor, `push` is **safe by default**: it `pull --rebase`s onto the latest remote (immediately before
+pushing) and **never force-pushes**. A rebase conflict means the agent and a human touched the same lines —
+`push` aborts the rebase and returns `status: "conflict"` with both versions, for a human to resolve; it
+never auto-merges. For larger edits, `mode: "branch"` commits to a local review branch and returns its
+diff, landing it only on `approve: true`. See [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md) for the full model.
 
 ### Cross-platform notes
 
