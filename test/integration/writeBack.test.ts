@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
-import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
+import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
@@ -45,7 +45,8 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     expect(committed.committed).toBe(true);
     expect(committed.filesChanged).toBe(1);
 
-    const pushed = await git.push(dir, remote.url, { username: 'git' });
+    const pushed = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(pushed.status).toBe('pushed');
     expect(pushed.pushed).toBe(true);
     expect(pushed.summary).toMatch(/Pushed 1 commit/);
 
@@ -61,15 +62,5 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     await expect(git.commit(dir, { message: 'noop' })).rejects.toThrow(/Nothing to commit/);
   });
 
-  it('refuses to push when the local clone is behind the remote', async () => {
-    const { remote, git, files, dir } = await setup({ 'main.tex': 'x\n' });
-
-    await files.write(dir, { path: 'local.tex', content: 'local\n' });
-    await git.commit(dir, { message: 'local change' });
-
-    // Remote advances independently.
-    await pushCommit(remote, { 'remote.tex': 'remote\n' }, 'remote change');
-
-    await expect(git.push(dir, remote.url, { username: 'git' })).rejects.toThrow(/behind remote/);
-  });
+  // Concurrent-edit handling (non-overlapping merge, overlapping conflict) lives in safePush.test.ts.
 });

@@ -38,7 +38,8 @@ describe('GitHub-style main-branch full loop against a bare-repo stand-in', () =
 
     await files.applyEdits(dir, 'main.tex', [{ oldString: 'world', newString: 'WORLD' }]);
     await git.commit(dir, { message: 'edit on main' });
-    const pushed = await git.push(dir, remote.url, { username: 'git' });
+    const pushed = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(pushed.status).toBe('pushed');
     expect(pushed.pushed).toBe(true);
 
     const verify = await mkdtemp(path.join(os.tmpdir(), 'ovl-gh-verify-'));
