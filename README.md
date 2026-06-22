@@ -57,12 +57,13 @@ This produces `dist/index.js`, the stdio entry point.
 
 Configured entirely through environment variables (set them in your MCP client's `env` block).
 
-| Variable                                       | Required | Description                                                                      |
-| ---------------------------------------------- | -------- | -------------------------------------------------------------------------------- |
-| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`. |
-| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.latex-git-mcp/projects`.    |
-| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                |
-| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `LaTeX Git MCP <latex-git-mcp@localhost>`.    |
+| Variable                                       | Required | Description                                                                                                             |
+| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                        |
+| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.latex-git-mcp/projects`.                                           |
+| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                       |
+| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `LaTeX Git MCP <latex-git-mcp@localhost>`.                                           |
+| `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`docs/writing-guide.md`](docs/writing-guide.md). |
 
 `GIT_MCP_PROJECTS` example — one Overleaf project and one GitHub repo:
 
@@ -191,6 +192,17 @@ POSIX (`/`-separated), on every OS.
 | `discard`       | Discard uncommitted changes (requires `confirm: true`).                                                                    |
 | `commit`        | Stage and commit locally. Does **not** push.                                                                               |
 | `push`          | Push committed changes to the default branch (requires `confirm: true`; refuses if behind).                                |
+
+### Writing guide in context
+
+At startup the server reads a LaTeX writing guide and surfaces it to the client two ways: as the MCP
+`instructions` hint (so a client like Claude keeps it in context for the whole session — no need to ask
+it to read the file) and as a fetchable **resource** at `guide://latex/writing-guide` (so you can
+re-open it on demand and clients that ignore `instructions` can still reach it). The bundled
+[`docs/writing-guide.md`](docs/writing-guide.md) covers tense, style, figures, equations, bibliography,
+and English-usage conventions. Point `GIT_MCP_WRITING_GUIDE` at your own file to override it, or set it
+to a non-existent path to ship no guide (the server logs to stderr and starts normally either way; with
+no guide, neither the instructions nor the resource is advertised).
 
 ### Reviewable, never-surprising pushes
 

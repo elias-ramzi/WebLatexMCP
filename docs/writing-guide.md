@@ -1,0 +1,121 @@
+# Writing Academic Articles in LaTeX
+
+A style and conventions guide for drafting research papers in this repository.
+These are the rules Claude should follow when writing or editing `.tex` files
+through the Overleaf MCP server, and that human contributors should follow too.
+
+---
+
+## Tense
+
+Use the present tense throughout the paper.
+
+## Writing style
+
+The reading must flow. If the reader has to stop and re-read a sentence, it is
+not clear enough — prefer the simpler phrasing.
+
+Avoid overusing "we" and "our". These words are impactful when reserved for key
+contributions ("our contributions are...") and diluting when applied to
+everything ("our parameters are..." → "the parameters are..."). Reserve the
+first person for what is genuinely yours; let the rest of the paper speak
+plainly.
+
+## Sections
+
+Introduce each section with a short header sentence that signposts its
+subsections. For example:
+
+> In \autoref{sec:exp:details}, we present the experimental details, and compare
+> against state-of-the-art models in \autoref{sec:exp:sota}.
+
+## Figures and tables
+
+- Every figure and table is referred to in the text. An unreferenced float is a
+  red flag.
+- Position figures and tables next to where they are discussed.
+- Prefer the **top** of the page for placement (`[t]`), occasionally the bottom;
+  avoid floats drifting far from their discussion.
+- Captions start with a short title in **bold**, then the explanation.
+- Use descriptive labels: `\label{tab:sota_results}`, `\label{fig:overview}`.
+- The caption test: a reader who only reads the title and then looks at the
+  figures, tables, and their captions should still understand them. Write
+  captions to pass this test.
+- For table design, follow the conventions in Markus Püschel's guide:
+  <https://people.inf.ethz.ch/markusp/teaching/guides/guide-tables.pdf>
+  (in short: `booktabs` rules, no vertical lines, aligned numbers).
+
+## Equations
+
+- Introduce every notation you use.
+- Drop any notation you introduce but never use.
+- Equations are part of the sentence: punctuate them. End with a period if the
+  sentence ends there, a comma if it continues.
+- Textual subscripts and superscripts use `\text` or `\textit`, otherwise the
+  letters are typeset as a product and become hard to read. Write
+  `L_\textit{image}`, not `L_{image}`.
+
+```latex
+The image loss is defined as
+\begin{equation}
+  L_\textit{image} = \frac{1}{n} \sum_i \| x_i - \hat{x}_i \|_2^2,
+\end{equation}
+where $\hat{x}_i$ is the reconstruction.
+```
+
+## Bibliography
+
+- **Claude must never add a new citation.** Do not invent references, fabricate
+  BibTeX entries, or insert `\cite` commands pointing to works the author has not
+  already provided. If a passage seems to need a citation, flag it for the author
+  to add rather than supplying one — a hallucinated reference is worse than a
+  missing one. Only cite keys that already exist in the `.bib` file.
+- Harmonize the reference style consistently across the whole file:
+  - Strip noise: conference location and date, editors, URL/DOI, volume number,
+    page ranges, etc.
+  - Use venue acronyms instead of full names (optional, but be consistent — all
+    or none).
+- BibTeX key format: `firstauthorYEARpaperacronym`, e.g. `chambon2024pointbev`.
+  If the paper has no acronym, use the first word of the title.
+
+## English usage
+
+- "i.e.," and "e.g.," — dot, dot, comma. Not italicized.
+- "ground truth" as a noun (no hyphen); "ground-truth" as an adjective, as in
+  "the ground-truth annotation".
+- Hyphens and dashes:
+  - **Hyphen** (`-`): compound words ("well-known"), prefixes ("re-evaluate"),
+    word breaks.
+  - **En dash** (`--`): ranges ("2010--2015") and connections
+    ("Paris--London flight").
+  - **Em dash** (`---`): parenthetical punctuation — like this — in place of
+    parentheses or commas for emphasis. Use sparingly: it has become a tell of
+    LLM-generated text, so do not overuse it.
+
+## LaTeX commands
+
+- Use `\autoref{}` for cross-references, not `\ref{}` or `\cref{}`.
+- For quotation marks, the opening quote uses backticks: `` `single' `` and
+  ` ``double'' `.
+
+---
+
+## Working with Claude through the MCP server
+
+This repository lets Claude read, edit, compile, and commit `.tex` files
+directly. To get clean, reviewable results:
+
+- Write **one sentence per line** in the source. LaTeX flows them into normal
+  paragraphs, but it keeps `git diff`s small and lets Claude edit surgically
+  instead of rewriting whole blocks.
+- Ask for **targeted changes** ("tighten the second paragraph of the intro",
+  "fix the punctuation on the loss equations") rather than "rewrite this
+  section" — the diffs stay reviewable.
+- Have Claude **compile after editing** and report errors; LaTeX failures are
+  usually localized and the log points to the offending line.
+- **Review the diff before pushing.** Treat edits like a collaborator's pull
+  request: read `git diff`, then commit and push deliberately.
+
+---
+
+_Contributions to this guide are welcome. Keep examples minimal and compilable._

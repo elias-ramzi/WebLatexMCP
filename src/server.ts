@@ -13,13 +13,26 @@ import { registerCommit } from './tools/commit.js';
 import { registerPush } from './tools/push.js';
 import { registerDeleteFile } from './tools/deleteFile.js';
 import { registerDiscard } from './tools/discard.js';
+import { registerWritingGuide } from './resources/writingGuide.js';
+import { buildInstructions } from './lib/writingGuide.js';
 
-/** Create the MCP server and register all tools against the given context. */
-export function createServer(ctx: AppContext): McpServer {
-  const server = new McpServer({
-    name: 'overleaf-mcp',
-    version: '0.1.0',
-  });
+/**
+ * Create the MCP server and register all tools against the given context.
+ *
+ * When a `writingGuide` is provided it reaches the client two ways: as the MCP
+ * `instructions` hint (advertised at initialization, so clients add it to the
+ * model's context automatically) and as a fetchable resource (for on-demand
+ * re-reading and clients that ignore `instructions`).
+ */
+export function createServer(ctx: AppContext, writingGuide?: string): McpServer {
+  const instructions = buildInstructions(writingGuide);
+  const server = new McpServer(
+    {
+      name: 'overleaf-mcp',
+      version: '0.1.0',
+    },
+    instructions ? { instructions } : undefined,
+  );
 
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);
@@ -34,6 +47,8 @@ export function createServer(ctx: AppContext): McpServer {
   registerCommit(server, ctx);
   registerPush(server, ctx);
   registerDiscard(server, ctx);
+
+  if (writingGuide) registerWritingGuide(server, writingGuide);
 
   return server;
 }

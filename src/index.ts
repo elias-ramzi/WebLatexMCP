@@ -4,6 +4,7 @@ import { loadConfig } from './config.js';
 import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createContext } from './context.js';
 import { createServer } from './server.js';
+import { loadWritingGuide } from './lib/writingGuide.js';
 
 async function main(): Promise<void> {
   // Fail fast instead of hanging on an interactive credential prompt when no token or
@@ -15,12 +16,15 @@ async function main(): Promise<void> {
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);
   const ctx = createContext(config, credentials, identity);
-  const server = createServer(ctx);
+  const writingGuide = await loadWritingGuide(process.env);
+  const server = createServer(ctx, writingGuide);
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[latex-git-mcp] server ready on stdio');
+  console.error(
+    `[latex-git-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}`,
+  );
 }
 
 main().catch((err: unknown) => {
