@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/LaTeX-MCP-lockup.svg" alt="latex-git-mcp" width="220" />
+<img src="assets/LaTeX-MCP-lockup.svg" alt="latex-git-mcp" width="480" />
 
 # latex-git-mcp
 
