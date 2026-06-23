@@ -6,6 +6,7 @@ coverage/
 # Local secrets / config — never commit
 .env
 .env.local
+.mcp.json
 
 # Editor / OS
 .DS_Store
