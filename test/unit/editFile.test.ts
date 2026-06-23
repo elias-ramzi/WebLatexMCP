@@ -81,4 +81,9 @@ describe('FileService write + edit', () => {
       files.applyEdits(dir, '../x', [{ oldString: 'a', newString: 'b' }]),
     ).rejects.toThrow(/escapes/);
   });
+
+  it('readText returns content, and empty string for a missing file', async () => {
+    expect(await files.readText(dir, 'main.tex')).toBe('alpha\nbeta\nalpha\n');
+    expect(await files.readText(dir, 'does-not-exist.bib')).toBe('');
+  });
 });

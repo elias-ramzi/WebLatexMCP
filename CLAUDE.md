@@ -51,12 +51,13 @@ formatting; all logic lives in services so it is unit-testable without a live MC
 
 - `src/index.ts` — stdio bootstrap. Resolves auth (async, may hit the Keychain) then builds the context.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
-- `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`)
-  passed to every tool handler.
+- `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
+  `dblp`) passed to every tool handler.
 - `src/tools/*` — one file per tool: a zod `inputSchema`/`outputSchema` + a handler that calls services.
 - `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex, dynamic
   registration), `GitService` (simple-git wrapper), `FileService` (sandboxed fs), `LatexmkCompiler`
-  (implements the `LatexCompiler` interface), `logParser`, `auth`.
+  (implements the `LatexCompiler` interface), `DblpService` (DBLP search + canonical BibTeX fetch, with
+  an injectable `fetch` for tests), `logParser`, `auth`.
 
 Project state: clones live under a workspace root (`OVERLEAF_MCP_WORKSPACE`), one dir per project id.
 Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime registration.
@@ -68,8 +69,13 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
   so messages are token-scrubbed across every configured host.
-- **Mutating tools** (write/edit/delete/commit/push/discard/clone) must run inside
+- **Mutating tools** (write/edit/delete/commit/push/discard/clone/add_citation) must run inside
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+- **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
+  (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
+  is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
+  model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
+  not blocked.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it

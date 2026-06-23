@@ -2,10 +2,18 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 
 const inputSchema = {
   project: z.string().optional(),
   path: z.string().describe('Path relative to the project root.'),
+  confirmBibEdit: z
+    .boolean()
+    .optional()
+    .describe(
+      'Required to edit a .bib file directly. Add references via add_citation instead; ' +
+        'only set this after the user approves a manual bibliography change.',
+    ),
   edits: z
     .array(
       z.object({
@@ -38,8 +46,11 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath, edits }) => {
+    async ({ project, path: relPath, edits, confirmBibEdit }) => {
       try {
+        if (isBibFile(relPath) && !confirmBibEdit) {
+          throw new Error(bibEditBlockedMessage(relPath));
+        }
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.applyEdits(dir, relPath, edits);

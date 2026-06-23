@@ -65,11 +65,16 @@ where $\hat{x}_i$ is the reconstruction.
 
 ## Bibliography
 
-- **Claude must never add a new citation.** Do not invent references, fabricate
-  BibTeX entries, or insert `\cite` commands pointing to works the author has not
-  already provided. If a passage seems to need a citation, flag it for the author
-  to add rather than supplying one — a hallucinated reference is worse than a
-  missing one. Only cite keys that already exist in the `.bib` file.
+- **Never hand-write or invent references.** Do not fabricate BibTeX entries or
+  `\cite` keys for works you cannot verify. The only sanctioned way to add a
+  reference is the `add_citation` tool, which fetches the BibTeX from DBLP
+  server-side — use it when the author asks for a citation. If a passage seems to
+  need a citation and you cannot find the work on DBLP, flag it for the author
+  rather than guessing — a hallucinated reference is worse than a missing one.
+- **`.bib` files are protected.** Direct `write_file` / `edit_file` /
+  `delete_file` on a `.bib` file is refused; add references through
+  `add_citation`. Any other change to a `.bib` (removing or fixing an entry)
+  needs the author's explicit approval and the `confirmBibEdit: true` flag.
 - Harmonize the reference style consistently across the whole file:
   - Strip noise: conference location and date, editors, URL/DOI, volume number,
     page ranges, etc.

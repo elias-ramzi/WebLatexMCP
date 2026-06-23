@@ -130,6 +130,17 @@ export class FileService {
     return { path: opts.path, content, totalLines, truncated: start > 1 || end < totalLines };
   }
 
+  /** Read a file's full text, returning '' when it does not exist (used for appends). */
+  async readText(projectDir: string, relPath: string): Promise<string> {
+    const abs = resolveInside(projectDir, relPath);
+    try {
+      return await readFile(abs, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      throw err;
+    }
+  }
+
   /** Create or overwrite a file. */
   async write(
     projectDir: string,

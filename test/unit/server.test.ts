@@ -69,3 +69,14 @@ describe('createServer writing guide', () => {
     await client.close();
   });
 });
+
+describe('createServer tool registration', () => {
+  it('registers the citation tools', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name);
+    expect(names).toContain('search_references');
+    expect(names).toContain('add_citation');
+    await client.close();
+  });
+});

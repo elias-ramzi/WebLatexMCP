@@ -3,6 +3,7 @@ import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
 import { LatexmkCompiler } from './services/compiler.js';
 import { CredentialResolver } from './services/auth.js';
+import { DblpService } from './services/dblp.js';
 import type { LatexCompiler } from './services/compiler.js';
 import type { CommitIdentity } from './services/auth.js';
 import type { ServerConfig } from './types.js';
@@ -15,6 +16,7 @@ export interface AppContext {
   files: FileService;
   compiler: LatexCompiler;
   credentials: CredentialResolver;
+  dblp: DblpService;
 }
 
 export function createContext(
@@ -29,5 +31,6 @@ export function createContext(
     files: new FileService(),
     compiler: new LatexmkCompiler(),
     credentials,
+    dblp: new DblpService(),
   };
 }

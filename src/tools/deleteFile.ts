@@ -2,10 +2,15 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 
 const inputSchema = {
   project: z.string().optional(),
   path: z.string().describe('Path relative to the project root.'),
+  confirmBibEdit: z
+    .boolean()
+    .optional()
+    .describe('Required to delete a .bib file. Only set this after the user approves it.'),
 };
 
 const outputSchema = {
@@ -22,8 +27,11 @@ export function registerDeleteFile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath }) => {
+    async ({ project, path: relPath, confirmBibEdit }) => {
       try {
+        if (isBibFile(relPath) && !confirmBibEdit) {
+          throw new Error(bibEditBlockedMessage(relPath));
+        }
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.delete(dir, relPath);
