@@ -31,6 +31,7 @@ explicit, reviewable commit → push to the repo's default branch. Works with bo
 - 🧪 **Local compiles** — `latexmk` runs on your machine and returns structured errors/warnings + the PDF.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate steps; nothing leaves your machine implicitly.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 🧹 **One-command cleanup** — a bundled Claude Code skill splits a project into per-section `\input`s and reflows prose to one sentence per line.
 
 ## Install
 
@@ -141,6 +142,16 @@ pushing) and **never force-pushes**. A rebase conflict means the agent and a hum
 `push` aborts the rebase and returns `status: "conflict"` with both versions, for a human to resolve; it
 never auto-merges. For larger edits, `mode: "branch"` commits to a local review branch and returns its
 diff, landing it only on `approve: true`. See [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md) for the full model.
+
+### Bundled skill — reformat an existing project
+
+For **Claude Code**, the repo ships a [`format-latex-project`](.claude/skills/format-latex-project/SKILL.md)
+skill that cleans up an existing project in two cosmetic-only passes: it splits the monolithic main file
+into per-section `\input{sections/…}` files, and rewrites body paragraphs to **one sentence per line** (the
+convention from [`docs/writing-guide.md`](docs/writing-guide.md), which keeps diffs small and edits
+surgical). It compiles before and after as a guardrail — the PDF must be unchanged — and stops at the diff
+so you review before any `commit`/`push`. Ask Claude to "format my Overleaf project" or invoke
+`/format-latex-project`. The skill loads automatically when Claude Code is launched from this repo.
 
 ### Cross-platform notes
 
