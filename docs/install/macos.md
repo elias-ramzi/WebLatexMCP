@@ -60,6 +60,30 @@ claude mcp add latex-git --scope user \
 
 (Drop the `GITHUB_TOKEN` line if you use `gh` or the Keychain from step 3.) Check it with `/mcp`.
 
+**Scope it to this repo instead.** `--scope user` registers the server for every Claude Code session.
+To keep it active **only when you work inside the `overleaf_mcp` repo**, drop a project-scoped
+`.mcp.json` in the repo root instead — Claude Code loads it only when launched from that directory:
+
+```jsonc
+// overleaf_mcp/.mcp.json
+{
+  "mcpServers": {
+    "latex-git": {
+      "command": "node",
+      "args": ["./dist/index.js"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+        "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
+        "GIT_MCP_DEFAULT_PROJECT": "paper",
+      },
+    },
+  },
+}
+```
+
+`${VAR}` expansion keeps the token in your environment. The repo's `.gitignore` already excludes a local
+`.mcp.json`, so your config never gets committed.
+
 ## 4b. Claude Desktop
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **restart Claude Desktop**:

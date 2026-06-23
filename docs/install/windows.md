@@ -54,14 +54,16 @@ The server resolves a token per host in this order: per-project `tokenEnv` → h
 ## 4a. Claude Code
 
 Works in PowerShell, cmd, and WSL. Because shell quoting of JSON is fiddly on Windows, the easiest path is
-a project-scoped `.mcp.json` (in your working folder):
+a project-scoped `.mcp.json`. Put it in the **`overleaf_mcp` repo root** so the server is active **only
+when you work inside this repo** — Claude Code loads `.mcp.json` only when launched from that directory:
 
 ```jsonc
+// overleaf_mcp/.mcp.json
 {
   "mcpServers": {
     "latex-git": {
       "command": "node",
-      "args": ["C:/Users/you/overleaf_mcp/dist/index.js"],
+      "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
         "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
@@ -72,7 +74,9 @@ a project-scoped `.mcp.json` (in your working folder):
 }
 ```
 
-`${VAR}` expansion is supported in Claude Code, so the token stays in your environment. Or use the CLI:
+`${VAR}` expansion is supported in Claude Code, so the token stays in your environment. The repo's
+`.gitignore` already excludes a local `.mcp.json`, so your config never gets committed. Or, to register
+the server **globally** (active in every session, not just inside this repo), use the CLI:
 
 ```powershell
 claude mcp add latex-git --scope user `
