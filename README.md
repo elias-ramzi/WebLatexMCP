@@ -32,6 +32,7 @@ explicit, reviewable commit → push to the repo's default branch. Works with bo
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate steps; nothing leaves your machine implicitly.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧹 **One-command cleanup** — a bundled Claude Code skill splits a project into per-section `\input`s and reflows prose to one sentence per line.
+- ✅ **Citation audits** — a bundled skill checks every `.bib` entry (title, authors, venue, year) against DBLP and flags anything off; read-only, never edits your bibliography without permission.
 
 ## Install
 
@@ -170,6 +171,20 @@ convention from [`docs/writing-guide.md`](docs/writing-guide.md), which keeps di
 surgical). It compiles before and after as a guardrail — the PDF must be unchanged — and stops at the diff
 so you review before any `commit`/`push`. Ask Claude to "format my Overleaf project" or invoke
 `/format-latex-project`. The skill loads automatically when Claude Code is launched from this repo.
+
+### Bundled skill — verify citations against DBLP
+
+A second [`verify-citations`](.claude/skills/verify-citations/SKILL.md) skill **audits the references
+already in your `.bib`** against [DBLP](https://dblp.org). For each entry it compares the **title**,
+**authors**, **venue** (reconciling abbreviations like CVPR / NeurIPS / ICLR with their full names), and
+**publication year** to the canonical DBLP record via `search_references`. Confident matches are tallied
+silently; anything doubtful — a wrong year, a misspelled or missing author, a preprint cited where a
+published version exists, or an entry DBLP can't find — is brought back to **you** with the bib entry
+shown beside the DBLP record, so you decide what to do. It is **read-only by default and never edits a
+`.bib` without your explicit say-so** (consistent with the [`.bib` protection](#citations-via-dblp)
+above); optionally, on entries you confirm, it adds a `% verified-by-claude` comment (ignored by BibTeX,
+so the PDF is unchanged) that later runs skip. Ask Claude to "check my citations" or invoke
+`/verify-citations`.
 
 ### Cross-platform notes
 
