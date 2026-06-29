@@ -33,6 +33,7 @@ explicit, reviewable commit → push to the repo's default branch. Works with bo
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧹 **One-command cleanup** — a bundled Claude Code skill splits a project into per-section `\input`s and reflows prose to one sentence per line.
 - ✅ **Citation audits** — a bundled skill checks every `.bib` entry (title, authors, venue, year) against DBLP and flags anything off; read-only, never edits your bibliography without permission.
+- 📚 **Bibliography housekeeping** — another skill deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy (url/doi/pages) — propagating key renames into your `\cite`s, with compile as the guardrail.
 
 ## Install
 
@@ -185,6 +186,20 @@ shown beside the DBLP record, so you decide what to do. It is **read-only by def
 above); optionally, on entries you confirm, it adds a `% verified-by-claude` comment (ignored by BibTeX,
 so the PDF is unchanged) that later runs skip. Ask Claude to "check my citations" or invoke
 `/verify-citations`.
+
+### Bundled skill — normalize the bibliography
+
+A third [`format-bibliography`](.claude/skills/format-bibliography/SKILL.md) skill brings a `.bib` into a
+single house style: it **deduplicates** entries (e.g. an arXiv preprint and its published version),
+**renames cite keys** to a consistent `firstauthorYEARtag` scheme (`chambon2024pointbev`), **harmonizes
+venue names** (pick short `CVPR` _or_ long "Computer Vision and Pattern Recognition", not a mix), and
+applies **one field policy** — strip or systematically add `url` / `doi` / `pages` (added values are
+pulled from DBLP, not invented). Unlike `verify-citations`, this one **edits** the `.bib`, so it is
+permission-gated: it agrees a policy with you, previews the changes, and writes only on your go-ahead.
+Renaming a cite key would break every `\cite{…}`, so the skill **propagates renames into the `.tex` in the
+same pass** and uses **compile (no `Citation … undefined` warnings) as its guardrail**. Reformatted
+entries get a `% formatted-by-claude` marker so a later run skips them. Ask Claude to "tidy up my
+bibliography" or invoke `/format-bibliography`.
 
 ### Cross-platform notes
 
