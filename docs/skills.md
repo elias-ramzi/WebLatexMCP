@@ -4,11 +4,12 @@ For **Claude Code**, the repo bundles task-specific skills that drive the [tools
 automatically when Claude Code is launched from this repo; each stops at the diff, so nothing is committed
 or pushed unless you ask.
 
-| Skill                                                                     | What it does                                                                                                                                                                                                   | Mutates              | Invoke                  |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----------------------- |
-| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                 | `.tex`               | `/format-latex-project` |
-| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, and optionally marks confirmed entries. **Read-only** unless you approve a change.                          | none (opt-in `.bib`) | `/verify-citations`     |
-| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail. | `.bib` + `.tex`      | `/format-bibliography`  |
+| Skill                                                                     | What it does                                                                                                                                                                                                                  | Mutates              | Invoke                  |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----------------------- |
+| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                | `.tex`               | `/format-latex-project` |
+| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, and optionally marks confirmed entries. **Read-only** unless you approve a change.                                         | none (opt-in `.bib`) | `/verify-citations`     |
+| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                | `.bib` + `.tex`      | `/format-bibliography`  |
+| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed. | local note only      | `/summarize-paper`      |
 
 ## `format-latex-project` — reformat an existing project
 
@@ -42,3 +43,18 @@ writes only on your go-ahead. Renaming a cite key would break every `\cite{…}`
 renames into the `.tex` in the same pass** and uses **compile (no `Citation … undefined` warnings) as its
 guardrail**. Reformatted entries get a `% formatted-by-claude` marker so a later run skips them. Ask Claude
 to "tidy up my bibliography".
+
+## `summarize-paper` — local cheat-sheet for future sessions
+
+Writes a compact markdown summary of the paper — a one-paragraph thesis, the contributions, a **section
+map and file map** (which `\label`/section lives in which `.tex`), key terms, results, and open threads —
+so a new session can get oriented in seconds instead of re-reading every source file. On later runs it
+**updates** the note in place, preserving any notes you added by hand and refreshing what changed. It reads
+the paper through the MCP tools but writes only the one local note (never the `.tex` or `.bib`).
+
+The note (`paper-summary.local.md` by default) lives at the root of the project clone but is **kept out of
+git via the clone's `.git/info/exclude`** — so it is never staged by `commit` (which uses `git add -A`),
+never shows up in `status`/`diff`, never pushed to Overleaf/GitHub, and survives `discard`. Using the
+local exclude rather than a committed `.gitignore` keeps it purely local — no change is ever destined for
+the remote. Ask Claude to "summarize the paper" or "update the paper summary"; read the note first at the
+start of a session to save the re-reading cost.

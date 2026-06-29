@@ -77,6 +77,7 @@ diff, so nothing is committed or pushed unless you ask:
 - **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
 - **`/verify-citations`** — audit every `.bib` entry against DBLP and flag discrepancies (read-only).
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
+- **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 
 See the [skills guide](docs/skills.md) for details.
 
