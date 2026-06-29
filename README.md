@@ -89,6 +89,11 @@ See the [skills guide](docs/skills.md) for details.
 - [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
 - [Development](docs/development.md) — build, test, and CI.
 
+## Contributing
+
+This repo **accepts pull requests** — bug reports, feature ideas, docs fixes, and code changes are all
+welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up, run the local gate, and open a PR.
+
 ## License
 
 MIT
