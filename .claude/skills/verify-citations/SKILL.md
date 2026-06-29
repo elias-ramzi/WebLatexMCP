@@ -43,27 +43,48 @@ Run in order. Stop and report if a step fails.
 
 1. **Pick the project.** If the user didn't name one, `list_projects` and ask which.
 2. **Sync.** `project_sync` the project so you check the current bibliography, not a stale clone.
-3. **Collect the entries.** `list_files` with `filter: "bib"`; `read_file` each `.bib`. Parse out every
+3. **Ask the scope: whole `.bib`, or only what the draft cites?** Before doing any DBLP work, ask the
+   user whether to verify **every entry in the `.bib`** or **only the entries actually cited in the
+   draft**. Default to recommending **only-cited** — a `.bib` often carries far more entries than the
+   paper uses, and each extra entry is another (rate-limited) DBLP call. If they pick only-cited, gather
+   the cite keys from the `.tex` files (see _Scoping to cited entries_) and verify just those.
+4. **Collect the entries.** `list_files` with `filter: "bib"`; `read_file` each `.bib`. Parse out every
    entry — its cite key, `title`, `author`, `year`, and venue (`booktitle` for proceedings, `journal`
-   for articles, else `series`/`publisher`/`howpublished`). **Skip** any entry already carrying a
-   `% verified-by-claude:` comment (see below) unless the user asks to re-check everything.
-4. **Match each entry against DBLP — one paper at a time, sequentially.** For each entry, call
+   for articles, else `series`/`publisher`/`howpublished`). Keep only the entries in the chosen scope
+   (step 3). **Skip** any entry already carrying a `% verified-by-claude:` comment (see below) unless the
+   user asks to re-check everything.
+5. **Match each entry against DBLP — one paper at a time, sequentially.** For each entry, call
    `search_references` with a query built from the distinctive title words plus the first author's surname
    (e.g. `deep residual learning he`). Keep `maxResults` small (5–8). Classify the result (see
    _Classifying a match_), then move to the next entry. **Do not fan out parallel DBLP calls** (see
    _Pace DBLP requests_ — it rate-limits hard). Process the whole bibliography one entry at a time.
-5. **Triage, don't interrogate.** Entries that match confidently need no questions — just count them.
+6. **Triage, don't interrogate.** Entries that match confidently need no questions — just count them.
    Only entries with a discrepancy or no match get escalated to the user.
-6. **Resolve the doubtful ones with the user.** Go through the flagged entries (one at a time, or a few
+7. **Resolve the doubtful ones with the user.** Go through the flagged entries (one at a time, or a few
    at a time if there are many), showing the `.bib` fields beside the DBLP record and naming the exact
    discrepancy. Let the user decide. **Never resolve a doubt by guessing.**
-7. **Report.** A short summary: how many verified cleanly, how many need attention (with the specifics),
-   how many weren't found on DBLP.
-8. **(Optional, opt-in) Annotate.** If — and only if — the user wants it, add a `% verified-by-claude`
+8. **Report.** A short summary: how many verified cleanly, how many need attention (with the specifics),
+   how many weren't found on DBLP. If you scoped to cited entries, say how many `.bib` entries you skipped.
+9. **(Optional, opt-in) Annotate.** If — and only if — the user wants it, add a `% verified-by-claude`
    comment to each confirmed entry (see _Annotating verified entries_). This is the one and only `.bib`
    write the skill makes on its own initiative, and only after an explicit yes.
 
 Do all reads/edits within the one project so the per-project mutex serializes them.
+
+## Scoping to cited entries
+
+When the user chooses **only-cited** (step 3), verify just the entries the draft actually references:
+
+- `list_files` with `filter: "tex"` and `read_file` the `.tex` sources, then collect every cite key from
+  the citation commands. Cover the common variants — `\cite`, `\citep`, `\citet`, `\citeauthor`,
+  `\citeyear`, `\autocite`, `\parencite`, `\textcite`, `\footcite`, `\Cite…`, etc. — and remember a single
+  command can list several comma-separated keys: `\citep{a,b,c}`. Optional arguments are not keys:
+  in `\citep[see][p.~3]{key}`, only `key` counts.
+- Take the **union** across all `.tex` files, then verify only the `.bib` entries whose cite key is in
+  that set. A key cited in the text but **missing from the `.bib`** is its own kind of problem — list those
+  separately for the user (it's an undefined-citation / compile warning), don't silently drop them.
+- Entries present in the `.bib` but never cited are simply out of scope here; mention the count so the user
+  knows they were skipped, not verified.
 
 ## Pace DBLP requests
 
