@@ -10,14 +10,16 @@ Audit the references already in a project's `.bib` file(s) against the **DBLP** 
 fields against the canonical DBLP record:
 
 1. **Title** of the paper.
-2. **Authors**.
+2. **Authors** — the **complete** author list. A citation must name **every** author; a bib entry that
+   truncates with `and others` (which biblatex/BibTeX renders as "et al.") is a defect to flag, even when
+   the names it does list are correct.
 3. **Venue** — conference or journal. Bibliographies and DBLP both abbreviate heavily (CVPR, NeurIPS,
    ICLR…), so normalize before comparing.
 4. **Publication year**.
 
-The point is to catch wrong years, misspelled or missing authors, a preprint cited where a published
-version exists, a mangled title, or an entry that isn't on DBLP at all — and to let the **user** decide
-what to do about each one. You verify; you do not silently fix.
+The point is to catch wrong years, misspelled or missing authors, a truncated author list (`and others`),
+a preprint cited where a published version exists, a mangled title, or an entry that isn't on DBLP at all —
+and to let the **user** decide what to do about each one. You verify; you do not silently fix.
 
 ## The one rule that overrides everything
 
@@ -65,15 +67,20 @@ Do all reads/edits within the one project so the per-project mutex serializes th
 
 Normalize before comparing — bibliographies are full of LaTeX. Strip `{}` capitalization braces,
 `\&`→`&`, accent commands (`\'e`→`e`), and `$…$`; lowercase; collapse whitespace. For authors, compare
-on **surnames** (bib uses `Last, First` or `First Last`, `and`-separated; DBLP returns `First Last`).
+on **surnames** (bib uses `Last, First` or `First Last`, `and`-separated; DBLP returns `First Last`), and
+check the **count** too — the bib must list every author DBLP does, in the same order.
 
-- **Confident match** — the top DBLP hit's title matches, the first author's surname matches, the year
-  is identical, and the venue is consistent after abbreviation normalization. No need to bother the user;
-  mark it verified.
+A bib `author` field ending in `and others` (or containing a literal `et al.`) is **always a defect**,
+independent of the name comparison: it means the citation will print an abbreviated author list. Treat it
+as a **doubt** and tell the user the full list from DBLP so they can complete the entry.
+
+- **Confident match** — the top DBLP hit's title matches, **every** author matches (same surnames, same
+  count, no `and others` truncation), the year is identical, and the venue is consistent after
+  abbreviation normalization. No need to bother the user; mark it verified.
 - **Doubt** — title matches but something disagrees: a different year (even ±1), a misspelled/missing/extra
-  author, a venue that doesn't reconcile, **or** the bib cites an arXiv/preprint while DBLP has a
-  published version (or vice-versa), **or** several DBLP records are equally plausible. Escalate to the
-  user.
+  author, a **truncated author list** (`and others` / `et al.` in the bib while DBLP lists more names), a
+  venue that doesn't reconcile, **or** the bib cites an arXiv/preprint while DBLP has a published version
+  (or vice-versa), **or** several DBLP records are equally plausible. Escalate to the user.
 - **Not found** — no DBLP hit has a matching title. Escalate, but note that some legitimate references
   (books, tech reports, standards, very new or niche work) simply aren't indexed by DBLP — "not found"
   means "DBLP can't confirm it", not "it's wrong".
@@ -106,7 +113,8 @@ Make the discrepancy obvious. For each, show:
 - the **bib entry** as it stands: cite key, title, authors, venue, year;
 - the **DBLP candidate(s)**: title, authors, venue, year, and the DBLP key — or "no DBLP match found";
 - a one-line statement of **what differs** (e.g. "bib says 2019, DBLP says 2020"; "bib cites the arXiv
-  preprint; DBLP has the CVPR 2021 version"; "author _J. Smith_ not on the DBLP record").
+  preprint; DBLP has the CVPR 2021 version"; "author _J. Smith_ not on the DBLP record"; "bib truncates
+  the authors with `and others` — DBLP lists all 7, paste them in").
 
 Offer concrete choices, e.g. _Accept as-is (mark verified)_ · _Leave unverified / flag it_ · _Update the
 entry from DBLP (I'll need your go-ahead to edit the .bib)_. Only act on what the user picks. If they ask
