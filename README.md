@@ -19,56 +19,28 @@
 ---
 
 An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a git-hosted project —
-**Overleaf**, **GitHub**, or any git remote. It keeps a local clone, runs LaTeX compilation locally
-(TeX Live + `latexmk`) so you see errors and PDFs without round-tripping, and sends changes back via an
-explicit, reviewable commit → push to the repo's default branch. Works with both **Claude Desktop** and
-**Claude Code** over stdio, on **macOS, Linux, and Windows**.
+**Overleaf**, **GitHub**, or any git remote. It keeps a local clone, compiles locally (TeX Live +
+`latexmk`) so you see errors and PDFs without round-tripping, and sends changes back through an explicit
+commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
+**macOS, Linux, and Windows**.
 
 ## Highlights
 
 - 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
 - ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
 - 🧪 **Local compiles** — `latexmk` runs on your machine and returns structured errors/warnings + the PDF.
-- 🔍 **Reviewable pushes** — `commit` and `push` are separate steps; nothing leaves your machine implicitly.
+- 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
-- 🧩 **Bundled Claude Code skills** — one-command project cleanup, DBLP citation audits, and bibliography normalization. See [Skills](#skills).
+- 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
-## Install
-
-**Step-by-step guides per OS:** [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) ·
-[Windows](docs/install/windows.md) (see [`docs/install/`](docs/install/)). They cover prerequisites
-(Node ≥ 20, git, optional `gh` + TeX Live/MiKTeX for `compile`), authentication, and registering the
-server with Claude Code and Claude Desktop.
-
-The short version — build, then register:
+## Quick start
 
 ```bash
 npm install && npm run build      # emits dist/index.js (the stdio entry point)
 claude mcp add latex-git --scope user -- node /absolute/path/to/overleaf_mcp/dist/index.js
 ```
 
-Editing and git operations work without TeX; only the `compile` tool needs `latexmk` on your `PATH`.
-
-> **Tip:** `--scope user` makes the server active in every Claude Code session. To keep it active **only
-> when you work inside this repo**, skip the CLI and drop a project-scoped `.mcp.json` in the
-> `overleaf_mcp` repo root instead — Claude Code loads it only when launched from that directory (it's
-> already gitignored, so your config never gets committed). See the [install guides](docs/install/).
-
-## Configuration
-
-Configured entirely through environment variables (set them in your MCP client's `env` block — see the
-[install guides](docs/install/) for full `.mcp.json` / `claude_desktop_config.json` examples).
-
-| Variable                                       | Required | Description                                                                                                                   |
-| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                              |
-| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.latex-git-mcp/projects`.                                                 |
-| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                             |
-| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `LaTeX Git MCP <latex-git-mcp@localhost>`.                                                 |
-| `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`docs/writing-guide.md`](docs/writing-guide.md).       |
-| `GIT_MCP_CONCURRENCY_GUIDE`                    | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md). |
-
-`GIT_MCP_PROJECTS` example — one Overleaf project and one GitHub repo:
+Then point the server at your projects with one environment variable:
 
 ```json
 {
@@ -77,155 +49,45 @@ Configured entirely through environment variables (set them in your MCP client's
 }
 ```
 
-(Find an Overleaf git URL under **Menu → Git** and a token under **Account Settings → Git authentication
-token**. For GitHub, create a PAT under **Settings → Developer settings → Personal access tokens**.)
+Set that JSON as `GIT_MCP_PROJECTS` in your MCP client's `env` block. Editing and git operations work
+without TeX; only `compile` needs `latexmk` on your `PATH`.
 
-### Tokens — resolved per host
+**Per-OS setup guides** (prerequisites, authentication, registering with Claude Code & Desktop):
+[macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
-Tokens are used as the HTTPS password. For a project the server tries, in order: a per-project
-`tokenEnv`, the host's token env (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `OVERLEAF_GIT_TOKEN`, …), the generic
-`GIT_MCP_TOKEN`, the **GitHub CLI** (`gh auth token`), then your **git credential helper**
-(`git credential fill` — works on every OS). A project can override with its own `tokenEnv` and/or
-`username`, so Overleaf and GitHub projects coexist with different credentials. The
-[install guides](docs/install/) walk through each auth method per OS.
+## What you can do
 
-Tokens are injected into git operations **in memory only** — after cloning, the remote is reset to a
-**tokenless** URL, so nothing lands in `.git/config`. Every known host token is scrubbed from error
-messages and tool output. Git runs with `GIT_TERMINAL_PROMPT=0`, so a missing/expired credential fails
-fast instead of hanging.
+Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
-## Tools
+- **Sync & browse** — clone/pull a project, list and read files.
+- **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
+- **Compile** — run `latexmk` locally and get back structured errors, warnings, and the PDF path.
+- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
+  from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
+- **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
+  come back to you).
 
-All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`). File paths are always
-POSIX (`/`-separated), on every OS.
+See the [full tool reference](docs/tools.md).
 
-| Tool                | Description                                                                                                                                                    |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_projects`     | List configured projects and their clone status.                                                                                                               |
-| `project_sync`      | Clone if missing, else fast-forward pull. Surfaces divergence instead of merging. Pass `gitUrl` to register a new project.                                     |
-| `list_files`        | List files, filter `tex` / `bib` / `assets` / `all`.                                                                                                           |
-| `read_file`         | Read a text file (optional line range). Binaries return a path, not bytes.                                                                                     |
-| `write_file`        | Create or overwrite a file. A `.bib` target needs `confirmBibEdit: true` (see [Citations](#citations-via-dblp)).                                               |
-| `edit_file`         | Surgical string-replacement edits (unique match unless `replaceAll`; atomic). A `.bib` target needs `confirmBibEdit: true`.                                    |
-| `delete_file`       | Delete a file from the project. A `.bib` target needs `confirmBibEdit: true`.                                                                                  |
-| `search_references` | Search DBLP for publications; returns candidates and their DBLP keys. Read-only.                                                                               |
-| `add_citation`      | Fetch a reference from DBLP by key and append it to a `.bib` file. The only sanctioned way to add a citation.                                                  |
-| `compile`           | Compile locally with latexmk; returns success, PDF path, structured errors/warnings + raw log tail.                                                            |
-| `status`            | Branch, ahead/behind, staged/unstaged/untracked.                                                                                                               |
-| `diff`              | Unified diff + per-file line counts.                                                                                                                           |
-| `discard`           | Discard uncommitted changes (requires `confirm: true`).                                                                                                        |
-| `commit`            | Stage and commit locally. Does **not** push.                                                                                                                   |
-| `push`              | Safe push: pull-rebase onto the latest remote, then push (never force). Surfaces conflicts for a human; `mode: "branch"` for review. Requires `confirm: true`. |
+## Skills (Claude Code)
 
-### Citations via DBLP
+Launched from this repo, Claude Code loads task-specific skills that drive the tools — each stops at the
+diff, so nothing is committed or pushed unless you ask:
 
-References are added through a verified path, never hand-written. `.bib` files are **protected**:
-`write_file`, `edit_file`, and `delete_file` refuse a `.bib` target unless you pass `confirmBibEdit: true`
-— a guard so an agent can't quietly rewrite the bibliography. The tool tells the agent to ask you first;
-set the flag only after you approve a manual change (removing or fixing an entry).
+- **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
+- **`/verify-citations`** — audit every `.bib` entry against DBLP and flag discrepancies (read-only).
+- **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 
-To add a reference, use the two-step DBLP flow:
+See the [skills guide](docs/skills.md) for details.
 
-1. `search_references` queries the [DBLP search API](https://dblp.org/faq/How+to+use+the+dblp+search+API.html)
-   and returns candidates, each with a DBLP record `key`.
-2. `add_citation` takes that key, **re-fetches the canonical BibTeX from DBLP server-side**, and appends it
-   to the project's `.bib` (deduplicated by cite key — re-adding is a no-op). Because the entry text comes
-   from DBLP and not the model, citations are verifiable rather than invented. With one `.bib` in the
-   project it's chosen automatically; otherwise pass `bibFile`.
+## Documentation
 
-### Writing guide in context
-
-At startup the server reads a LaTeX writing guide and surfaces it to the client two ways: as the MCP
-`instructions` hint (so a client like Claude keeps it in context for the whole session — no need to ask
-it to read the file) and as a fetchable **resource** at `guide://latex/writing-guide` (so you can
-re-open it on demand and clients that ignore `instructions` can still reach it). The bundled
-[`docs/writing-guide.md`](docs/writing-guide.md) covers tense, style, figures, equations, bibliography,
-and English-usage conventions. Point `GIT_MCP_WRITING_GUIDE` at your own file to override it, or set it
-to a non-existent path to ship no guide (the server logs to stderr and starts normally either way; with
-no guide, neither the instructions nor the resource is advertised).
-
-### Concurrency guide in context
-
-The same way, the server surfaces a concurrency / safe-push guide as both the `instructions` hint and a
-fetchable **resource** at `guide://latex/concurrency`. The bundled [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md)
-explains how this server pushes without clobbering edits made elsewhere (people editing in the Overleaf
-web editor, or other agents). Override it with `GIT_MCP_CONCURRENCY_GUIDE`.
-
-### Reviewable, safe pushes
-
-`commit` and `push` are separate, and nothing pushes automatically. Review with `status` / `diff`,
-`commit` locally, then `push` with `confirm: true`. Because people may also be editing in the Overleaf
-web editor, `push` is **safe by default**: it `pull --rebase`s onto the latest remote (immediately before
-pushing) and **never force-pushes**. A rebase conflict means the agent and a human touched the same lines —
-`push` aborts the rebase and returns `status: "conflict"` with both versions, for a human to resolve; it
-never auto-merges. For larger edits, `mode: "branch"` commits to a local review branch and returns its
-diff, landing it only on `approve: true`. See [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md) for the full model.
-
-### Cross-platform notes
-
-- File paths in tool output are POSIX (`/`), regardless of OS.
-- Clones force `core.autocrlf=false`, so files keep their repo (LF) line endings and `edit_file`'s exact
-  match is deterministic on Windows.
-- Secrets come from env vars, the GitHub CLI, or your git credential helper — no OS-specific config.
-
-## Skills
-
-For **Claude Code**, the repo bundles task-specific skills that drive the tools above. They load
-automatically when Claude Code is launched from this repo; each stops at the diff, so nothing is committed
-or pushed unless you ask.
-
-| Skill                                                                  | What it does                                                                                                                                                                                                   | Mutates              | Invoke                  |
-| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----------------------- |
-| [`format-latex-project`](.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                 | `.tex`               | `/format-latex-project` |
-| [`verify-citations`](.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, and optionally marks confirmed entries. **Read-only** unless you approve a change.                          | none (opt-in `.bib`) | `/verify-citations`     |
-| [`format-bibliography`](.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail. | `.bib` + `.tex`      | `/format-bibliography`  |
-
-### `format-latex-project` — reformat an existing project
-
-Cleans up an existing project in two cosmetic-only passes: it splits the monolithic main file into
-per-section `\input{sections/…}` files, and rewrites body paragraphs to **one sentence per line** (the
-convention from [`docs/writing-guide.md`](docs/writing-guide.md), which keeps diffs small and edits
-surgical). It compiles before and after as a guardrail — the PDF must be unchanged — and stops at the diff
-so you review before any `commit`/`push`. Ask Claude to "format my Overleaf project".
-
-### `verify-citations` — audit citations against DBLP
-
-**Audits the references already in your `.bib`** against [DBLP](https://dblp.org). For each entry it
-compares the **title**, **authors**, **venue** (reconciling abbreviations like CVPR / NeurIPS / ICLR with
-their full names), and **publication year** to the canonical DBLP record via `search_references`. Confident
-matches are tallied silently; anything doubtful — a wrong year, a misspelled or missing author, a preprint
-cited where a published version exists, or an entry DBLP can't find — is brought back to **you** with the
-bib entry shown beside the DBLP record, so you decide what to do. It is **read-only by default and never
-edits a `.bib` without your explicit say-so** (consistent with the [`.bib` protection](#citations-via-dblp)
-above); optionally, on entries you confirm, it adds a `% verified-by-claude` comment (ignored by BibTeX, so
-the PDF is unchanged) that later runs skip. Ask Claude to "check my citations".
-
-### `format-bibliography` — normalize the bibliography
-
-Brings a `.bib` into a single house style: it **deduplicates** entries (e.g. an arXiv preprint and its
-published version), **renames cite keys** to a consistent `firstauthorYEARtag` scheme
-(`chambon2024pointbev`), **harmonizes venue names** (pick short `CVPR` _or_ long "Computer Vision and
-Pattern Recognition", not a mix), and applies **one field policy** — strip or systematically add `url` /
-`doi` / `pages` (added values are pulled from DBLP, not invented). Unlike `verify-citations`, this one
-**edits** the `.bib`, so it is permission-gated: it agrees a policy with you, previews the changes, and
-writes only on your go-ahead. Renaming a cite key would break every `\cite{…}`, so the skill **propagates
-renames into the `.tex` in the same pass** and uses **compile (no `Citation … undefined` warnings) as its
-guardrail**. Reformatted entries get a `% formatted-by-claude` marker so a later run skips them. Ask Claude
-to "tidy up my bibliography".
-
-## Development
-
-```bash
-npm run typecheck     # tsc --noEmit
-npm run lint          # eslint
-npm run format        # prettier --write
-npm test              # vitest: unit + integration (bare-repo stand-in, no secrets)
-npm run test:smoke    # full compile/loop smoke (needs latexmk; auto-skips otherwise)
-```
-
-CI (GitHub Actions) runs lint + typecheck + build + tests on **ubuntu, windows, and macos**, plus a
-separate Linux job that installs a minimal TeX Live + `latexmk` (via `apt`) for the compile smoke.
-Integration tests use a local bare repo as an Overleaf/GitHub stand-in, so **no secrets are ever needed**.
+- [Configuration](docs/configuration.md) — environment variables, per-host token resolution, in-context guides, cross-platform notes.
+- [Tools](docs/tools.md) — full tool reference, the DBLP citation flow, and how safe pushes work.
+- [Skills](docs/skills.md) — what each bundled Claude Code skill does.
+- [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere.
+- [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
+- [Development](docs/development.md) — build, test, and CI.
 
 ## License
 
