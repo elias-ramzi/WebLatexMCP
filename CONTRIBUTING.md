@@ -10,8 +10,7 @@ npm install
 npm run build        # emits dist/index.js
 ```
 
-See [docs/development.md](docs/development.md) for the build, test, and CI details, and
-[CLAUDE.md](CLAUDE.md) for the architecture overview and repository conventions.
+See [CLAUDE.md](CLAUDE.md) for the architecture overview and repository conventions.
 
 ## Submitting a pull request
 
@@ -27,10 +26,24 @@ See [docs/development.md](docs/development.md) for the build, test, and CI detai
    ```
 
 4. **Add or update tests** for behavior changes. Tests run against a local bare repo, so no secrets or
-   network are needed (see [docs/development.md](docs/development.md)).
+   network are needed.
 5. **Update the docs** when you change configuration, tools, or behavior.
 6. **Open the PR** against `main` with a clear description of what changed and why. CI runs the gate on
    ubuntu, windows, and macos; please make sure it's green.
+
+## Tests and CI
+
+```bash
+npm run typecheck     # tsc --noEmit
+npm run lint          # eslint
+npm run format        # prettier --write
+npm test              # vitest: unit + integration (bare-repo stand-in, no secrets)
+npm run test:smoke    # full compile/loop smoke (needs latexmk; auto-skips otherwise)
+```
+
+CI (GitHub Actions) runs lint + typecheck + build + tests on **ubuntu, windows, and macos**, plus a
+separate Linux job that installs a minimal TeX Live + `latexmk` (via `apt`) for the compile smoke.
+Integration tests use a local bare repo as an Overleaf/GitHub stand-in, so **no secrets are ever needed**.
 
 ## Reporting bugs
 

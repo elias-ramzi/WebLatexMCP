@@ -87,7 +87,7 @@ See the [skills guide](docs/skills.md) for details.
 - [Skills](docs/skills.md) — what each bundled Claude Code skill does.
 - [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere.
 - [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
-- [Development](docs/development.md) — build, test, and CI.
+- [Contributing](CONTRIBUTING.md) — how to build, test, and open a pull request.
 
 ## Contributing
 
