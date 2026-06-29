@@ -47,9 +47,11 @@ Run in order. Stop and report if a step fails.
    entry — its cite key, `title`, `author`, `year`, and venue (`booktitle` for proceedings, `journal`
    for articles, else `series`/`publisher`/`howpublished`). **Skip** any entry already carrying a
    `% verified-by-claude:` comment (see below) unless the user asks to re-check everything.
-4. **Match each entry against DBLP.** For each, call `search_references` with a query built from the
-   distinctive title words plus the first author's surname (e.g. `deep residual learning he`). Keep
-   `maxResults` small (5–8). Classify the result (see _Classifying a match_).
+4. **Match each entry against DBLP — one paper at a time, sequentially.** For each entry, call
+   `search_references` with a query built from the distinctive title words plus the first author's surname
+   (e.g. `deep residual learning he`). Keep `maxResults` small (5–8). Classify the result (see
+   _Classifying a match_), then move to the next entry. **Do not fan out parallel DBLP calls** (see
+   _Pace DBLP requests_ — it rate-limits hard). Process the whole bibliography one entry at a time.
 5. **Triage, don't interrogate.** Entries that match confidently need no questions — just count them.
    Only entries with a discrepancy or no match get escalated to the user.
 6. **Resolve the doubtful ones with the user.** Go through the flagged entries (one at a time, or a few
@@ -62,6 +64,22 @@ Run in order. Stop and report if a step fails.
    write the skill makes on its own initiative, and only after an explicit yes.
 
 Do all reads/edits within the one project so the per-project mutex serializes them.
+
+## Pace DBLP requests
+
+DBLP is a free public API and **rate-limits aggressively**. Firing many `search_references` calls at once
+(or in big parallel batches) gets you `429 Too Many Requests` and timeouts, which is slower overall than
+going steadily — you end up waiting out cooldowns. Lessons from real runs:
+
+- **Go strictly sequential: one `search_references` per entry, awaited before the next.** Paper-by-paper
+  is _more_ efficient here than asking for a batch all at once, because it never trips the limiter.
+- **Don't burst.** Never issue DBLP queries in parallel, and don't pre-fetch the whole bibliography up
+  front.
+- **On a `429` or a timeout, back off briefly and retry** — a few seconds, doubling if it repeats
+  (e.g. 5s → 10s → 20s). That's enough; **don't sit on multi-minute fixed timers** between every call —
+  that's overcorrecting and makes a long bibliography crawl.
+- For a large `.bib`, tell the user this part is paced and roughly how long it'll take, so a steady run
+  doesn't look stuck.
 
 ## Classifying a match
 
