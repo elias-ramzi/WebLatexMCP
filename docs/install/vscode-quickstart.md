@@ -32,7 +32,7 @@ Open **either** folder in VS Code and start a Claude Code chat there:
 
 ## Step 2 · Ask Claude to set up the server
 
-> 🧑 **You**
+> 👽 **You**
 >
 > Set up the LaTeX Overleaf MCP server for me. I cloned it at `../overleaf_mcp`.
 
@@ -52,7 +52,7 @@ That's the whole install. Reload VS Code when Claude asks, and the tools light u
 In Overleaf: **Account Settings → Git Integration → Authentication tokens** → create a token
 and copy it.
 
-> 🧑 **You**
+> 👽 **You**
 >
 > Here's my Overleaf git token: `olp_xxxxxxxxxxxxxxxx`. How do I wire it in?
 
@@ -77,7 +77,7 @@ https://git.overleaf.com/0123456789abcdef0123456789
 
 ## Step 5 · Add the project, with a name you pick
 
-> 🧑 **You**
+> 👽 **You**
 >
 > Add this Overleaf project as **`thesis`**: `https://git.overleaf.com/0123456789abcdef0123456789`
 
@@ -95,7 +95,7 @@ in chat.
 
 Now just talk to your paper:
 
-> 🧑 **You**
+> 👽 **You**
 >
 > In **thesis**, read the intro, tighten the last paragraph, compile, and show me the diff.
 

@@ -43,7 +43,7 @@ git clone https://github.com/elias-ramzi/overleaf_mcp.git
 
 Then let Claude walk you through the rest:
 
-> 🧑 **You**
+> 👽 **You**
 >
 > Claude, can you walk me through how to install this MCP server?
 
