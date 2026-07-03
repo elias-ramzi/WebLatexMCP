@@ -35,29 +35,35 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 
 ## Quick start
 
-> ⚡ **Using the Claude Code extension in VS Code?** The fastest path is to just **chat your way
-> through setup** — clone the repo, then let Claude build, register, and add your Overleaf project
-> for you. Follow the **[super fast start](docs/install/vscode-quickstart.md)**.
+The easiest way in: **clone this repo, open it in Claude, and just ask.**
 
 ```bash
-npm install && npm run build      # emits dist/index.js (the stdio entry point)
-claude mcp add latex-git --scope user -- node /absolute/path/to/overleaf_mcp/dist/index.js
+git clone https://github.com/elias-ramzi/overleaf_mcp.git
 ```
 
-Then point the server at your projects with one environment variable:
+Then let Claude walk you through the rest:
 
-```json
-{
-  "thesis": { "gitUrl": "https://git.overleaf.com/0123456789abcdef", "rootFile": "main.tex" },
-  "paper": { "gitUrl": "https://github.com/me/paper", "branch": "main" }
-}
-```
+> 🧑 **You**
+>
+> Claude, can you walk me through how to install this MCP server?
 
-Set that JSON as `GIT_MCP_PROJECTS` in your MCP client's `env` block. Editing and git operations work
-without TeX; only `compile` needs `latexmk` on your `PATH`.
+> ✦ **Claude**
+>
+> Absolutely — I'll install dependencies, build the server, register it with Claude, and help you
+> add your first Overleaf project. Let's go step by step.
 
-**Setup guides:** [super fast start (VS Code)](docs/install/vscode-quickstart.md) · or per-OS
-(prerequisites, authentication, registering with Claude Code & Desktop):
+Claude drives the whole setup from the chat. Editing and git operations work without TeX; only
+`compile` needs `latexmk` on your `PATH`.
+
+### ⚡ Super fast start in VS Code — recommended
+
+The **[step-by-step VS Code guide](docs/install/vscode-quickstart.md)** is the most tested and by far
+the most efficient path. Best of all, run it **from your paper's own repo** — that way Claude sees
+your code _and_ writes the paper right alongside it.
+
+### Detailed setup, all platforms
+
+Prerequisites, authentication, and registering with both Claude Code & Claude Desktop:
 [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
 ## What you can do
