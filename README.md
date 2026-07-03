@@ -35,6 +35,10 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 
 ## Quick start
 
+> ⚡ **Using the Claude Code extension in VS Code?** The fastest path is to just **chat your way
+> through setup** — clone the repo, then let Claude build, register, and add your Overleaf project
+> for you. Follow the **[super fast start](docs/install/vscode-quickstart.md)**.
+
 ```bash
 npm install && npm run build      # emits dist/index.js (the stdio entry point)
 claude mcp add latex-git --scope user -- node /absolute/path/to/overleaf_mcp/dist/index.js
@@ -52,7 +56,8 @@ Then point the server at your projects with one environment variable:
 Set that JSON as `GIT_MCP_PROJECTS` in your MCP client's `env` block. Editing and git operations work
 without TeX; only `compile` needs `latexmk` on your `PATH`.
 
-**Per-OS setup guides** (prerequisites, authentication, registering with Claude Code & Desktop):
+**Setup guides:** [super fast start (VS Code)](docs/install/vscode-quickstart.md) · or per-OS
+(prerequisites, authentication, registering with Claude Code & Desktop):
 [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
 ## What you can do
