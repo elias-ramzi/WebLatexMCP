@@ -35,7 +35,7 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 
 ## Quick start
 
-The easiest way in: **clone this repo, open it in Claude, and just ask.**
+The easiest way in: **clone this repo, point Claude Code at the folder, and just ask.**
 
 ```bash
 git clone https://github.com/elias-ramzi/overleaf_mcp.git
@@ -59,7 +59,7 @@ Claude drives the whole setup from the chat. Editing and git operations work wit
 
 The **[step-by-step VS Code guide](docs/install/vscode-quickstart.md)** is the most tested and by far
 the most efficient path. Best of all, run it **from your paper's own repo** — that way Claude sees
-your code _and_ writes the paper right alongside it.
+your code *and* writes the paper right alongside it.
 
 ### Detailed setup, all platforms
 
