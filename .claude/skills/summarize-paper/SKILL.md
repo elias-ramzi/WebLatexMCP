@@ -34,7 +34,10 @@ Run in order. Stop and report if a step fails.
 
 1. **Pick the project.** `list_projects`; if the user didn't name one, ask which. Note the project's clone
    **`path`** from the result — you need the absolute path for the exclude step — and that it's `cloned`.
-2. **Sync.** `project_sync` so you summarize the current source.
+2. **Fetch the latest version first.** Always run `project_sync` **before** reading anything, so the
+   summary reflects the current remote source and not a stale local clone. Do this even if you just synced
+   in this session — the paper may have moved on Overleaf/GitHub since. If the sync reports divergence or
+   fails, stop and report it rather than summarizing an out-of-date clone.
 3. **Make the note git-excluded _before_ writing it.** Append the filename to the clone's
    `.git/info/exclude` if it isn't already there, so the file can never be accidentally staged. Using the
    clone `path` from step 1:
