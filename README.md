@@ -59,7 +59,7 @@ Claude drives the whole setup from the chat. Editing and git operations work wit
 
 The **[step-by-step VS Code guide](docs/install/vscode-quickstart.md)** is the most tested and by far
 the most efficient path. Best of all, run it **from your paper's own repo** — that way Claude sees
-your code *and* writes the paper right alongside it.
+your code _and_ writes the paper right alongside it.
 
 ### Detailed setup, all platforms
 

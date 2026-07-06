@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "MCP server to read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote).",
   "type": "module",
+  "author": "Elias Ramzi",
+  "homepage": "https://github.com/elias-ramzi/overleaf_mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elias-ramzi/overleaf_mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/elias-ramzi/overleaf_mcp/issues"
+  },
   "bin": {
     "latex-git-mcp": "dist/index.js"
   },

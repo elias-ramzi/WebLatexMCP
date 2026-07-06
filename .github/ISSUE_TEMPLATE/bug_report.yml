@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a problem with latex-git-mcp
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the details below.
+
+        ⚠️ **Never paste tokens or private project URLs.** Output is redacted by the server,
+        but double-check any logs before sharing them.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what actually happened?
+      placeholder: |
+        Steps to reproduce:
+        1. ...
+        2. ...
+
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Token-free error output from the server (stderr) or the client, if any.
+      render: shell
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: 'macOS 14 / Ubuntu 24.04 / Windows 11'
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: Output of `node --version`.
+      placeholder: 'v22.x.x'
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: latex-git-mcp version / commit
+      placeholder: '0.1.0 or a commit SHA'
+  - type: dropdown
+    id: remote
+    attributes:
+      label: Git remote
+      description: Which host is the affected project on?
+      options:
+        - Overleaf
+        - GitHub
+        - GitLab
+        - Other git remote
+        - Not applicable
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I searched existing issues and this has not been reported.
+          required: true
+        - label: My logs/output contain no tokens or private URLs.
+          required: true

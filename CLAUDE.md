@@ -59,7 +59,7 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   (implements the `LatexCompiler` interface), `DblpService` (DBLP search + canonical BibTeX fetch, with
   an injectable `fetch` for tests), `logParser`, `auth`.
 
-Project state: clones live under a workspace root (`OVERLEAF_MCP_WORKSPACE`), one dir per project id.
+Project state: clones live under a workspace root (`GIT_MCP_WORKSPACE`), one dir per project id.
 Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime registration.
 
 ## Conventions that aren't obvious
