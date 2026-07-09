@@ -1,7 +1,7 @@
 import { ProjectManager } from './services/projectManager.js';
 import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
-import { LatexmkCompiler } from './services/compiler.js';
+import { createCompiler } from './services/compiler.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
 import type { LatexCompiler } from './services/compiler.js';
@@ -29,7 +29,7 @@ export function createContext(
     projectManager: new ProjectManager(config),
     git: new GitService(identity),
     files: new FileService(),
-    compiler: new LatexmkCompiler(),
+    compiler: createCompiler(config.compiler ?? 'latexmk'),
     credentials,
     dblp: new DblpService(),
   };

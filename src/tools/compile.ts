@@ -38,8 +38,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
     {
       title: 'Compile the project locally',
       description:
-        'Compile the project with latexmk locally and return success, the PDF path, and ' +
-        'structured errors/warnings plus a raw log tail. Does not touch the Overleaf remote.',
+        'Compile the project locally (latexmk by default, or tectonic) and return success, ' +
+        'the PDF path, and structured errors/warnings plus a raw log tail. Does not touch the ' +
+        'Overleaf remote.',
       inputSchema,
       outputSchema,
     },

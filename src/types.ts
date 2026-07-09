@@ -34,6 +34,9 @@ export interface StructuredError {
   rule?: string;
 }
 
+/** Local compile backend. */
+export type CompilerKind = 'latexmk' | 'tectonic';
+
 /** Resolved server configuration, derived from the environment. */
 export interface ServerConfig {
   /** Directory that holds one clone per project. */
@@ -42,4 +45,6 @@ export interface ServerConfig {
   projects: ProjectConfig[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
+  /** Local compile backend. `loadConfig` always resolves this; omit to default to `latexmk`. */
+  compiler?: CompilerKind;
 }

@@ -20,7 +20,7 @@
 
 An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a git-hosted project —
 **Overleaf**, **GitHub**, or any git remote. It keeps a local clone, compiles locally (TeX Live +
-`latexmk`) so you see errors and PDFs without round-tripping, and sends changes back through an explicit
+`latexmk`, or `tectonic`) so you see errors and PDFs without round-tripping, and sends changes back through an explicit
 commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
 **macOS, Linux, and Windows**.
 
@@ -28,7 +28,7 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 
 - 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
 - ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
-- 🧪 **Local compiles** — `latexmk` runs on your machine and returns structured errors/warnings + the PDF.
+- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
@@ -53,7 +53,8 @@ Then let Claude walk you through the rest:
 > add your first Overleaf project. Let's go step by step.
 
 Claude drives the whole setup from the chat. Editing and git operations work without TeX; only
-`compile` needs `latexmk` on your `PATH`.
+`compile` needs a backend on your `PATH` — `latexmk` by default, or `tectonic` (set `GIT_MCP_COMPILER`;
+see [Configuration](docs/configuration.md#compile-backend)).
 
 ### ⚡ Super fast start in VS Code — recommended
 
@@ -72,7 +73,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 
 - **Sync & browse** — clone/pull a project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
-- **Compile** — run `latexmk` locally and get back structured errors, warnings, and the PDF path.
+- **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and the PDF path.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts

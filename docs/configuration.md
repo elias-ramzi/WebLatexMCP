@@ -10,6 +10,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                    |
 | `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.web-latex-mcp/projects`.                                       |
 | `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                   |
+| `GIT_MCP_COMPILER`                             | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                  |
 | `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                         |
 | `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).       |
 | `GIT_MCP_CONCURRENCY_GUIDE`                    | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md). |
@@ -27,6 +28,23 @@ One Overleaf project and one GitHub repo:
 
 Find an Overleaf git URL under **Menu → Git** and a token under **Account Settings → Git authentication
 token**. For GitHub, create a PAT under **Settings → Developer settings → Personal access tokens**.
+
+## Compile backend
+
+The `compile` tool runs locally so you see errors and PDFs without round-tripping through Overleaf.
+Two backends are supported; select with `GIT_MCP_COMPILER`.
+
+- **`latexmk`** (default) — drives your system TeX install (TeX Live / MacTeX / MiKTeX). This is what
+  Overleaf itself runs, so it gives the closest "compiles here == compiles on Overleaf" guarantee and the
+  broadest package/engine compatibility. Requires `latexmk` (and a TeX distribution) on your `PATH`.
+- **`tectonic`** — a self-contained engine that bundles its own TeX and fetches packages on demand into a
+  local cache. No multi-gigabyte TeX install needed, and builds are reproducible. Trade-offs: the first
+  compile of a project needs network access to populate the cache, and tectonic is **XeTeX-only** — the
+  `engine` argument (`pdflatex`/`xelatex`/`lualatex`) is ignored and the `clean` argument is a no-op.
+  Documents that rely on pdfLaTeX-specific behavior may render differently. Requires `tectonic` on your
+  `PATH` (`brew install tectonic`, `cargo install tectonic`, or see <https://tectonic-typesetting.github.io>).
+
+Both return the same structured errors/warnings and PDF path, so switching backends changes nothing else.
 
 ## Tokens — resolved per host
 

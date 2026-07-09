@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { ProjectConfig, ServerConfig } from './types.js';
+import type { CompilerKind, ProjectConfig, ServerConfig } from './types.js';
 
 const projectsSchema = z.record(
   z.string(),
@@ -38,6 +38,20 @@ function parseProjects(raw: string | undefined): ProjectConfig[] {
   return Object.entries(result.data).map(([id, cfg]) => ({ id, ...cfg }));
 }
 
+const COMPILERS: readonly CompilerKind[] = ['latexmk', 'tectonic'];
+
+/** Select the compile backend from env, defaulting to latexmk. */
+function parseCompiler(raw: string | undefined): CompilerKind {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return 'latexmk';
+  if (!(COMPILERS as readonly string[]).includes(value)) {
+    throw new Error(
+      `GIT_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILERS.join(', ')}.`,
+    );
+  }
+  return value as CompilerKind;
+}
+
 /**
  * Build the server configuration from environment variables. Pure and side-effect free
  * (other than reading `env`), so it can be unit-tested with a synthetic environment.
@@ -57,5 +71,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     );
   }
 
-  return { workspaceRoot, projects, defaultProject };
+  const compiler = parseCompiler(env.GIT_MCP_COMPILER);
+
+  return { workspaceRoot, projects, defaultProject, compiler };
 }

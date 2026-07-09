@@ -46,4 +46,17 @@ describe('loadConfig', () => {
   it('throws when the default project is not in the registry', () => {
     expect(() => loadConfig({ GIT_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
   });
+
+  it('defaults the compiler to latexmk', () => {
+    expect(loadConfig({}).compiler).toBe('latexmk');
+  });
+
+  it('selects the tectonic compiler (case-insensitively)', () => {
+    expect(loadConfig({ GIT_MCP_COMPILER: 'tectonic' }).compiler).toBe('tectonic');
+    expect(loadConfig({ GIT_MCP_COMPILER: '  TECTONIC ' }).compiler).toBe('tectonic');
+  });
+
+  it('throws on an unknown compiler', () => {
+    expect(() => loadConfig({ GIT_MCP_COMPILER: 'pdflatex' })).toThrow(/GIT_MCP_COMPILER/);
+  });
 });
