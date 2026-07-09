@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 150" width="560" height="150" font-family="&#39;Space Grotesk&#39;, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 150" width="600" height="150" font-family="&#39;Space Grotesk&#39;, sans-serif">
   
 
-  <rect width="560" height="150" rx="4" fill="#1A1A2E"></rect>
+  <rect width="600" height="150" rx="4" fill="#1A1A2E"></rect>
 
   
   <g transform="translate(-52,-52)">
@@ -18,7 +18,7 @@
 
   
   <text class="wm" x="232" y="70" font-size="40" font-weight="700" letter-spacing="-0.5" fill="#ffffff">
-    <tspan>L</tspan><tspan dx="-5" dy="-13" font-size="29">A</tspan><tspan dx="-3" dy="13" font-size="40">T</tspan><tspan dy="7">E</tspan><tspan dy="-7">X</tspan><tspan dx="1" fill="#7C5CFF">\</tspan><tspan>MCP</tspan>
+    <tspan>Web</tspan><tspan dx="2">L</tspan><tspan dx="-5" dy="-13" font-size="29">A</tspan><tspan dx="-3" dy="13" font-size="40">T</tspan><tspan dy="7">E</tspan><tspan dy="-7">X</tspan><tspan dx="1" fill="#7C5CFF">\</tspan><tspan>MCP</tspan>
   </text>
 
   

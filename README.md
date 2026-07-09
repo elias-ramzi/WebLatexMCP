@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/LaTeX-MCP-lockup.svg" alt="WebLatexMCP" width="100%" />
+<img src="assets/weblatexmcp-lockup.svg" alt="WebLatexMCP" width="100%" />
 
 # WebLatexMCP
 
