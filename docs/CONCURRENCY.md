@@ -2,7 +2,7 @@
 
 How this server pushes changes without clobbering edits made elsewhere in the
 document. These are the rules Claude follows when committing and pushing through
-the Overleaf MCP server, and that human contributors should understand too.
+the WebLatexMCP server, and that human contributors should understand too.
 
 ---
 

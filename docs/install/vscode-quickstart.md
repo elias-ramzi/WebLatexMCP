@@ -20,12 +20,12 @@ Claude Code CLI). For the manual, per-OS reference, see
 ## Step 1 · Clone this repository
 
 ```bash
-git clone https://github.com/elias-ramzi/overleaf_mcp.git
+git clone https://github.com/elias-ramzi/WebLatexMCP.git
 ```
 
 Open **either** folder in VS Code and start a Claude Code chat there:
 
-- the **`overleaf_mcp`** repo you just cloned, or
+- the **`WebLatexMCP`** repo you just cloned, or
 - **your paper's own repo** — so Claude can see your code _and_ write the paper alongside it.
 
 ---
@@ -34,14 +34,14 @@ Open **either** folder in VS Code and start a Claude Code chat there:
 
 > 👽 **You**
 >
-> Set up the LaTeX Overleaf MCP server for me. I cloned it at `../overleaf_mcp`.
+> Set up the WebLatexMCP server for me. I cloned it at `../WebLatexMCP`.
 
 > ✦ **Claude**
 >
 > On it — I'll install dependencies, build the server, and register it with Claude Code.
-> _(runs `npm install && npm run build`, then `claude mcp add latex-git …`)_
+> _(runs `npm install && npm run build`, then `claude mcp add web-latex-mcp …`)_
 >
-> Done ✅ The `latex-git` server is registered. Reload the window and you'll see its tools.
+> Done ✅ The `web-latex-mcp` server is registered. Reload the window and you'll see its tools.
 
 That's the whole install. Reload VS Code when Claude asks, and the tools light up.
 

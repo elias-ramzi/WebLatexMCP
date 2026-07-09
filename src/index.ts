@@ -25,12 +25,12 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `[latex-git-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}` +
+    `[web-latex-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}` +
       `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}`,
   );
 }
 
 main().catch((err: unknown) => {
-  console.error('[latex-git-mcp] fatal:', err instanceof Error ? err.message : err);
+  console.error('[web-latex-mcp] fatal:', err instanceof Error ? err.message : err);
   process.exit(1);
 });

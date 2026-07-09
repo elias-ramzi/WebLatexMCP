@@ -24,7 +24,7 @@ export async function loadWritingGuide(
     return text.length > 0 ? text : undefined;
   } catch (err) {
     console.error(
-      `[latex-git-mcp] writing guide not loaded from ${path}: ${err instanceof Error ? err.message : String(err)}`,
+      `[web-latex-mcp] writing guide not loaded from ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return undefined;
   }

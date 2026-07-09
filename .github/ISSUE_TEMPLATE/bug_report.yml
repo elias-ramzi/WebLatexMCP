@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a problem with latex-git-mcp
+description: Report a problem with WebLatexMCP
 labels: ['bug']
 body:
   - type: markdown
@@ -47,7 +47,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: latex-git-mcp version / commit
+      label: WebLatexMCP version / commit
       placeholder: '0.1.0 or a commit SHA'
   - type: dropdown
     id: remote

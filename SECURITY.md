@@ -1,6 +1,6 @@
 # Security Policy
 
-`latex-git-mcp` runs locally over stdio and handles git credentials for the remotes you
+`WebLatexMCP` runs locally over stdio and handles git credentials for the remotes you
 configure (Overleaf, GitHub, GitLab, or any git host). This document explains how it treats
 secrets and how to report a vulnerability.
 
@@ -9,7 +9,7 @@ secrets and how to report a vulnerability.
 Please **do not** open a public issue for security problems.
 
 Instead, use GitHub's private reporting: go to the repository's
-[**Security → Report a vulnerability**](https://github.com/elias-ramzi/overleaf_mcp/security/advisories/new)
+[**Security → Report a vulnerability**](https://github.com/elias-ramzi/WebLatexMCP/security/advisories/new)
 page, which opens a private advisory visible only to the maintainers.
 
 Include, where possible:

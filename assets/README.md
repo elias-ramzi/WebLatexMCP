@@ -6,7 +6,7 @@ Reference it from the root `README.md` with a relative path:
 
 ```markdown
 <p align="center">
-  <img src="assets/logo.png" alt="latex-git-mcp" width="200" />
+  <img src="assets/logo.png" alt="WebLatexMCP" width="200" />
 </p>
 ```
 

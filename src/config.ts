@@ -46,7 +46,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const workspaceRaw = env.GIT_MCP_WORKSPACE?.trim();
   const workspaceRoot = workspaceRaw
     ? path.resolve(expandHome(workspaceRaw))
-    : path.join(os.homedir(), '.latex-git-mcp', 'projects');
+    : path.join(os.homedir(), '.web-latex-mcp', 'projects');
 
   const projects = parseProjects(env.GIT_MCP_PROJECTS);
   const defaultProject = env.GIT_MCP_DEFAULT_PROJECT?.trim() || undefined;

@@ -35,7 +35,7 @@ export function createServer(
   const instructions = buildInstructions(writingGuide, concurrencyGuide);
   const server = new McpServer(
     {
-      name: 'overleaf-mcp',
+      name: 'web-latex-mcp',
       version: '0.1.0',
     },
     instructions ? { instructions } : undefined,

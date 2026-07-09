@@ -6,7 +6,7 @@ import { loadConfig } from '../../src/config.js';
 describe('loadConfig', () => {
   it('uses the default workspace root when unset', () => {
     const cfg = loadConfig({});
-    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.latex-git-mcp', 'projects'));
+    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
     expect(cfg.projects).toEqual([]);
     expect(cfg.defaultProject).toBeUndefined();
   });

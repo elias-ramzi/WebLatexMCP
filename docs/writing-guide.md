@@ -2,7 +2,7 @@
 
 A style and conventions guide for drafting research papers in this repository.
 These are the rules Claude should follow when writing or editing `.tex` files
-through the Overleaf MCP server, and that human contributors should follow too.
+through the WebLatexMCP server, and that human contributors should follow too.
 
 ---
 

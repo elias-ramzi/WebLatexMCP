@@ -1,12 +1,12 @@
 ---
 name: verify-citations
-description: Verify the citations already in a project's .bib bibliography against DBLP — check each entry's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, and optionally annotate the entries you confirmed. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a LaTeX/Overleaf project. Read-only by default; never changes a .bib without explicit permission. Operates on projects served by the latex-git MCP server.
+description: Verify the citations already in a project's .bib bibliography against DBLP — check each entry's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, and optionally annotate the entries you confirmed. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a LaTeX/Overleaf project. Read-only by default; never changes a .bib without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
 # Verify a project's citations against DBLP
 
 Audit the references already in a project's `.bib` file(s) against the **DBLP** database (via the
-`latex-git` MCP tools) and surface anything that doesn't line up. For each entry you compare four
+`web-latex-mcp` MCP tools) and surface anything that doesn't line up. For each entry you compare four
 fields against the canonical DBLP record:
 
 1. **Title** of the paper.

@@ -1,6 +1,6 @@
-# latex-git-mcp on macOS
+# WebLatexMCP on macOS
 
-Setup for both **Claude Code** and **Claude Desktop**. Replace `/path/to/overleaf_mcp` with the real
+Setup for both **Claude Code** and **Claude Desktop**. Replace `/path/to/WebLatexMCP` with the real
 absolute path wherever it appears.
 
 ## 1. Prerequisites
@@ -28,8 +28,8 @@ node --version && git --version && latexmk -v
 ## 2. Build the server
 
 ```bash
-git clone https://github.com/elias-ramzi/overleaf_mcp.git
-cd overleaf_mcp
+git clone https://github.com/elias-ramzi/WebLatexMCP.git
+cd WebLatexMCP
 npm install
 npm run build
 pwd            # note this absolute path; dist/index.js lives under it
@@ -51,24 +51,24 @@ The server resolves a token per host in this order: per-project `tokenEnv` → h
 ## 4a. Claude Code
 
 ```bash
-claude mcp add latex-git --scope user \
+claude mcp add web-latex-mcp --scope user \
   -e GIT_MCP_PROJECTS='{"paper":{"gitUrl":"https://github.com/me/paper","branch":"main"}}' \
   -e GIT_MCP_DEFAULT_PROJECT=paper \
   -e GITHUB_TOKEN=ghp_xxx \
-  -- node /path/to/overleaf_mcp/dist/index.js
+  -- node /path/to/WebLatexMCP/dist/index.js
 ```
 
 (Drop the `GITHUB_TOKEN` line if you use `gh` or the Keychain from step 3.) Check it with `/mcp`.
 
 **Scope it to this repo instead.** `--scope user` registers the server for every Claude Code session.
-To keep it active **only when you work inside the `overleaf_mcp` repo**, drop a project-scoped
+To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a project-scoped
 `.mcp.json` in the repo root instead — Claude Code loads it only when launched from that directory:
 
 ```jsonc
-// overleaf_mcp/.mcp.json
+// WebLatexMCP/.mcp.json
 {
   "mcpServers": {
-    "latex-git": {
+    "web-latex-mcp": {
       "command": "node",
       "args": ["./dist/index.js"],
       "env": {
@@ -91,9 +91,9 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **r
 ```jsonc
 {
   "mcpServers": {
-    "latex-git": {
+    "web-latex-mcp": {
       "command": "node",
-      "args": ["/path/to/overleaf_mcp/dist/index.js"],
+      "args": ["/path/to/WebLatexMCP/dist/index.js"],
       "env": {
         "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "GIT_MCP_DEFAULT_PROJECT": "paper",
@@ -125,7 +125,7 @@ Claude Code inherits your shell `PATH`, so this isn't needed there.
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```bash
-GIT_MCP_PROJECTS='{}' node /path/to/overleaf_mcp/dist/index.js
+GIT_MCP_PROJECTS='{}' node /path/to/WebLatexMCP/dist/index.js
 ```
 
 It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).

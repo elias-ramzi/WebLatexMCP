@@ -1,7 +1,7 @@
-# latex-git-mcp on Windows
+# WebLatexMCP on Windows
 
 Setup for both **Claude Code** and **Claude Desktop**. Commands are for **PowerShell**. Replace
-`C:/Users/you/overleaf_mcp` with the real path wherever it appears, and **use forward slashes in JSON**
+`C:/Users/you/WebLatexMCP` with the real path wherever it appears, and **use forward slashes in JSON**
 to avoid backslash escaping.
 
 > Using **WSL**? Treat it as Linux — follow [linux.md](linux.md) inside the WSL shell.
@@ -29,13 +29,13 @@ node --version; git --version; latexmk -v
 ## 2. Build the server
 
 ```powershell
-git clone https://github.com/elias-ramzi/overleaf_mcp.git
-cd overleaf_mcp
+git clone https://github.com/elias-ramzi/WebLatexMCP.git
+cd WebLatexMCP
 npm install
 npm run build
 ```
 
-`dist/index.js` is now under the repo folder; note its full path (e.g. `C:/Users/you/overleaf_mcp`).
+`dist/index.js` is now under the repo folder; note its full path (e.g. `C:/Users/you/WebLatexMCP`).
 
 ## 3. Authentication
 
@@ -54,14 +54,14 @@ The server resolves a token per host in this order: per-project `tokenEnv` → h
 ## 4a. Claude Code
 
 Works in PowerShell, cmd, and WSL. Because shell quoting of JSON is fiddly on Windows, the easiest path is
-a project-scoped `.mcp.json`. Put it in the **`overleaf_mcp` repo root** so the server is active **only
+a project-scoped `.mcp.json`. Put it in the **`WebLatexMCP` repo root** so the server is active **only
 when you work inside this repo** — Claude Code loads `.mcp.json` only when launched from that directory:
 
 ```jsonc
-// overleaf_mcp/.mcp.json
+// WebLatexMCP/.mcp.json
 {
   "mcpServers": {
-    "latex-git": {
+    "web-latex-mcp": {
       "command": "node",
       "args": ["./dist/index.js"],
       "env": {
@@ -79,9 +79,9 @@ when you work inside this repo** — Claude Code loads `.mcp.json` only when lau
 the server **globally** (active in every session, not just inside this repo), use the CLI:
 
 ```powershell
-claude mcp add latex-git --scope user `
+claude mcp add web-latex-mcp --scope user `
   -e GIT_MCP_DEFAULT_PROJECT=paper `
-  -- node C:/Users/you/overleaf_mcp/dist/index.js
+  -- node C:/Users/you/WebLatexMCP/dist/index.js
 ```
 
 Check it with `/mcp`.
@@ -94,9 +94,9 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`
 ```jsonc
 {
   "mcpServers": {
-    "latex-git": {
+    "web-latex-mcp": {
       "command": "node",
-      "args": ["C:/Users/you/overleaf_mcp/dist/index.js"],
+      "args": ["C:/Users/you/WebLatexMCP/dist/index.js"],
       "env": {
         "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "GIT_MCP_DEFAULT_PROJECT": "paper",
@@ -120,7 +120,7 @@ found by Claude Desktop. If `node` isn't found, point `command` at the full path
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```powershell
-$env:GIT_MCP_PROJECTS='{}'; node C:/Users/you/overleaf_mcp/dist/index.js
+$env:GIT_MCP_PROJECTS='{}'; node C:/Users/you/WebLatexMCP/dist/index.js
 ```
 
 It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).

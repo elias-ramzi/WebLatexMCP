@@ -5,7 +5,7 @@ import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js
 import { parseConflictHunks, type ConflictFile } from '../lib/conflictParser.js';
 import { toPosix } from '../lib/paths.js';
 
-const DEFAULT_IDENTITY: CommitIdentity = { name: 'Overleaf MCP', email: 'overleaf-mcp@localhost' };
+const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
 export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged';
 

@@ -46,8 +46,8 @@ function hostOf(gitUrl: string): string | undefined {
 
 export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdentity {
   return {
-    name: env.GIT_MCP_AUTHOR_NAME?.trim() || 'LaTeX Git MCP',
-    email: env.GIT_MCP_AUTHOR_EMAIL?.trim() || 'latex-git-mcp@localhost',
+    name: env.GIT_MCP_AUTHOR_NAME?.trim() || 'WebLatexMCP',
+    email: env.GIT_MCP_AUTHOR_EMAIL?.trim() || 'web-latex-mcp@localhost',
   };
 }
 

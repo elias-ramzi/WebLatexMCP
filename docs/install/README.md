@@ -5,7 +5,7 @@ In a hurry and using the VS Code extension? Start here:
 - ⚡ [**Super fast start (VS Code)**](vscode-quickstart.md) — chat your way through setup; Claude
   builds, registers, and adds your Overleaf project for you.
 
-Per-OS setup for **latex-git-mcp**, each covering both **Claude Code** and **Claude Desktop**:
+Per-OS setup for **WebLatexMCP**, each covering both **Claude Code** and **Claude Desktop**:
 
 - [macOS](macos.md)
 - [Linux](linux.md) (Claude Desktop has no Linux build — use Claude Code)

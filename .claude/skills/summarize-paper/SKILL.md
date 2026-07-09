@@ -1,13 +1,13 @@
 ---
 name: summarize-paper
-description: Write (or update) a small local markdown summary of the paper so future Claude sessions can pick it up fast without re-reading every .tex. The summary lives in the project clone but is kept out of git (local-only, never pushed) via the clone's .git/info/exclude. Use when the user asks to "summarize the paper", "make/update a paper summary", "write local notes about the project", or "create a cheat-sheet for future sessions". Reads the paper through the latex-git MCP server; writes only a local, git-excluded note (never the .tex or .bib).
+description: Write (or update) a small local markdown summary of the paper so future Claude sessions can pick it up fast without re-reading every .tex. The summary lives in the project clone but is kept out of git (local-only, never pushed) via the clone's .git/info/exclude. Use when the user asks to "summarize the paper", "make/update a paper summary", "write local notes about the project", or "create a cheat-sheet for future sessions". Reads the paper through the web-latex-mcp MCP server; writes only a local, git-excluded note (never the .tex or .bib).
 ---
 
 # Summarize a paper into a local, git-excluded note
 
 Build a compact, high-signal summary of the project's paper and keep it in a **local markdown file** so a
 future session can get oriented in seconds instead of re-reading the whole source. The skill **creates**
-the note the first time and **updates** it on later runs. It reads the paper through the `latex-git` MCP
+the note the first time and **updates** it on later runs. It reads the paper through the `web-latex-mcp` MCP
 tools but only ever writes the one local note — never the `.tex`, never the `.bib`.
 
 The summary is for **Claude's** benefit across sessions: a navigation index and a cheat-sheet, not a

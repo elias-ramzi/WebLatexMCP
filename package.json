@@ -1,19 +1,19 @@
 {
-  "name": "latex-git-mcp",
+  "name": "web-latex-mcp",
   "version": "0.1.0",
   "description": "MCP server to read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote).",
   "type": "module",
   "author": "Elias Ramzi",
-  "homepage": "https://github.com/elias-ramzi/overleaf_mcp#readme",
+  "homepage": "https://github.com/elias-ramzi/WebLatexMCP#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/elias-ramzi/overleaf_mcp.git"
+    "url": "git+https://github.com/elias-ramzi/WebLatexMCP.git"
   },
   "bugs": {
-    "url": "https://github.com/elias-ramzi/overleaf_mcp/issues"
+    "url": "https://github.com/elias-ramzi/WebLatexMCP/issues"
   },
   "bin": {
-    "latex-git-mcp": "dist/index.js"
+    "web-latex-mcp": "dist/index.js"
   },
   "files": [
     "dist",

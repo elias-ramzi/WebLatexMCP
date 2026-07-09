@@ -24,7 +24,7 @@ export async function loadConcurrencyGuide(
     return text.length > 0 ? text : undefined;
   } catch (err) {
     console.error(
-      `[latex-git-mcp] concurrency guide not loaded from ${path}: ${err instanceof Error ? err.message : String(err)}`,
+      `[web-latex-mcp] concurrency guide not loaded from ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return undefined;
   }

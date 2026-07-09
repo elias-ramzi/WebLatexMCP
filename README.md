@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="assets/LaTeX-MCP-lockup.svg" alt="latex-git-mcp" width="100%" />
+<img src="assets/LaTeX-MCP-lockup.svg" alt="WebLatexMCP" width="100%" />
 
-# latex-git-mcp
+# WebLatexMCP
 
 **Read, edit, compile, and commit LaTeX in any git-hosted project — straight from Claude.**
 
-[![CI](https://github.com/elias-ramzi/overleaf_mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/overleaf_mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
 ![Node ≥ 20](https://img.shields.io/badge/node-%E2%89%A5%2020-3C873A?logo=node.js&logoColor=white)
 &nbsp;
@@ -38,7 +38,7 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 The easiest way in: **clone this repo, point Claude Code at the folder, and just ask.**
 
 ```bash
-git clone https://github.com/elias-ramzi/overleaf_mcp.git
+git clone https://github.com/elias-ramzi/WebLatexMCP.git
 ```
 
 Then let Claude walk you through the rest:

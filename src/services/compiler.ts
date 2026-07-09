@@ -60,7 +60,7 @@ export class LatexmkCompiler implements LatexCompiler {
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
     const engine = req.engine ?? 'pdflatex';
-    const buildDir = path.join(os.tmpdir(), 'overleaf-mcp-build', path.basename(req.projectDir));
+    const buildDir = path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(req.projectDir));
     await mkdir(buildDir, { recursive: true });
 
     const args = [

@@ -1,12 +1,12 @@
 ---
 name: format-latex-project
-description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, or to apply the one-sentence-per-line convention. Operates on projects served by the latex-git MCP server.
+description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, or to apply the one-sentence-per-line convention. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
 # Format a LaTeX project
 
 Two cosmetic-only transformations on a git-hosted LaTeX project, applied through the
-`latex-git` MCP tools. **Neither may change the compiled PDF.** The compile step is the
+`web-latex-mcp` MCP tools. **Neither may change the compiled PDF.** The compile step is the
 guardrail — if the project compiled before and not after, you broke it.
 
 1. **Modularize** — move each section out of the main file into its own file under
