@@ -49,3 +49,11 @@ Integration tests use a local bare repo as an Overleaf/GitHub stand-in, so **no 
 
 Open an issue with steps to reproduce, what you expected, and what happened. Include your OS, Node
 version, and any relevant (token-free) error output.
+
+## A note on maturity
+
+This project is largely vibe-coded, so treat it as best-effort rather than battle-tested:
+
+- Robustness isn't guaranteed — expect rough edges, and please report them.
+- It has been mostly tested on these setups: VS Code + Claude Code extension, the Claude Code CLI, and
+  Claude Desktop for macOS.
