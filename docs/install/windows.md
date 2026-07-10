@@ -57,8 +57,7 @@ Works in PowerShell, cmd, and WSL. Because shell quoting of JSON is fiddly on Wi
 a project-scoped `.mcp.json`. Put it in the **`WebLatexMCP` repo root** so the server is active **only
 when you work inside this repo** — Claude Code loads `.mcp.json` only when launched from that directory:
 
-```jsonc
-// WebLatexMCP/.mcp.json
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -67,10 +66,10 @@ when you work inside this repo** — Claude Code loads `.mcp.json` only when lau
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 
@@ -91,7 +90,7 @@ Check it with `/mcp`.
 Edit `%APPDATA%\Claude\claude_desktop_config.json`
 (i.e. `C:\Users\you\AppData\Roaming\Claude\claude_desktop_config.json`), then **restart Claude Desktop**:
 
-```jsonc
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -99,10 +98,10 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`
       "args": ["C:/Users/you/WebLatexMCP/dist/index.js"],
       "env": {
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 

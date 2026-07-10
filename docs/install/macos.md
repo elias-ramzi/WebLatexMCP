@@ -64,8 +64,7 @@ claude mcp add web-latex-mcp --scope user \
 To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a project-scoped
 `.mcp.json` in the repo root instead — Claude Code loads it only when launched from that directory:
 
-```jsonc
-// WebLatexMCP/.mcp.json
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -74,10 +73,10 @@ To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a p
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 
@@ -88,7 +87,7 @@ To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a p
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **restart Claude Desktop**:
 
-```jsonc
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -96,10 +95,10 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **r
       "args": ["/path/to/WebLatexMCP/dist/index.js"],
       "env": {
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 

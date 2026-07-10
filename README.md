@@ -70,20 +70,20 @@ Prerequisites, authentication, and registering with both Claude Code & Claude De
 ### Or install from npm — no clone, no build
 
 Prefer not to clone the repo? Register the published package with `npx`. Editing and git work without
-TeX; only `compile` needs `latexmk` or `tectonic` on your `PATH`.
+TeX; only `compile` needs `latexmk` or `tectonic` on your `PATH`. Add this to your Claude Code or Claude
+Desktop MCP config:
 
-```jsonc
-// Claude Code / Claude Desktop MCP config
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
       "command": "npx",
       "args": ["-y", "web-latex-mcp"],
       "env": {
-        "WEB_LATEX_MCP_PROJECTS": "{\"thesis\":{\"gitUrl\":\"https://git.overleaf.com/…\"}}",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_PROJECTS": "{\"thesis\":{\"gitUrl\":\"https://git.overleaf.com/…\"}}"
+      }
+    }
+  }
 }
 ```
 

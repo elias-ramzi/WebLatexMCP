@@ -76,8 +76,7 @@ Claude Code inherits your shell `PATH`, so `node`/`git`/`gh`/`latexmk` are found
 To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a project-scoped
 `.mcp.json` in the repo root instead — Claude Code loads it only when launched from that directory:
 
-```jsonc
-// WebLatexMCP/.mcp.json
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -86,10 +85,10 @@ To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a p
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 
@@ -102,7 +101,7 @@ There is **no official Claude Desktop build for Linux** — use **Claude Code** 
 an unofficial/community Electron build, its config typically lives at
 `~/.config/Claude/claude_desktop_config.json` and uses the same shape:
 
-```jsonc
+```json
 {
   "mcpServers": {
     "web-latex-mcp": {
@@ -110,10 +109,10 @@ an unofficial/community Electron build, its config typically lives at
       "args": ["/path/to/WebLatexMCP/dist/index.js"],
       "env": {
         "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
-      },
-    },
-  },
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
+      }
+    }
+  }
 }
 ```
 
