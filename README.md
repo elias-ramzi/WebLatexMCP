@@ -67,6 +67,32 @@ your code _and_ writes the paper right alongside it.
 Prerequisites, authentication, and registering with both Claude Code & Claude Desktop:
 [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
+### Or install from npm — no clone, no build
+
+Prefer not to clone the repo? Register the published package with `npx`. Editing and git work without
+TeX; only `compile` needs `latexmk` or `tectonic` on your `PATH`.
+
+```jsonc
+// Claude Code / Claude Desktop MCP config
+{
+  "mcpServers": {
+    "web-latex-mcp": {
+      "command": "npx",
+      "args": ["-y", "web-latex-mcp"],
+      "env": {
+        "WEB_LATEX_MCP_PROJECTS": "{\"thesis\":{\"gitUrl\":\"https://git.overleaf.com/…\"}}",
+      },
+    },
+  },
+}
+```
+
+Or add it in one line with Claude Code:
+
+```bash
+claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
+```
+
 ## What you can do
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
