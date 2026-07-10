@@ -67,8 +67,9 @@ your code _and_ writes the paper right alongside it.
 Prerequisites, authentication, and registering with both Claude Code & Claude Desktop:
 [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
-Using **Gemini** instead? See the [Gemini guide](docs/install/gemini.md) — Gemini CLI and Gemini Code
-Assist (IDE agent mode) register the same server over stdio.
+Using **Gemini** or **GitHub Copilot** instead? See the [Gemini guide](docs/install/gemini.md) (Gemini
+CLI and Gemini Code Assist) or the [Copilot guide](docs/install/copilot.md) (Copilot agent mode in VS
+Code / Visual Studio) — both register the same server over stdio.
 
 ### Or install from npm — no clone, no build
 

@@ -20,3 +20,4 @@ full configuration reference and tool list.
 The server speaks standard MCP over stdio, so it works with any MCP-capable client:
 
 - [**Gemini**](gemini.md) — Gemini CLI and Gemini Code Assist (IDE agent mode).
+- [**GitHub Copilot**](copilot.md) — Copilot agent mode in VS Code (and Visual Studio 2022).
