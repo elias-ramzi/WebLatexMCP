@@ -14,6 +14,14 @@
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
+**Works with**
+&nbsp;
+[![Claude](https://img.shields.io/badge/Claude-D97757?logo=anthropic&logoColor=white)](docs/install/README.md)
+&nbsp;
+[![Gemini](https://img.shields.io/badge/Gemini-1C69FF?logo=googlegemini&logoColor=white)](docs/install/gemini.md)
+&nbsp;
+[![GitHub Copilot](https://img.shields.io/badge/Copilot-24292F?logo=githubcopilot&logoColor=white)](docs/install/copilot.md)
+
 </div>
 
 ---
