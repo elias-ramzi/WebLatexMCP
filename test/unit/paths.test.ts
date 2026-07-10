@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
-import { resolveInside, toPosix } from '../../src/lib/paths.js';
+import { pathToFileURL } from 'node:url';
+import { resolveInside, toFileUrl, toPosix } from '../../src/lib/paths.js';
 
 describe('resolveInside', () => {
   const root = '/tmp/project';
@@ -32,5 +33,18 @@ describe('toPosix', () => {
 
   it('leaves already-POSIX paths unchanged', () => {
     expect(toPosix('a/b/c.tex')).toBe('a/b/c.tex');
+  });
+});
+
+describe('toFileUrl', () => {
+  it('produces a clickable file:// URL for an absolute path', () => {
+    const abs = path.resolve('/tmp/web-latex-mcp-build/proj/main.pdf');
+    expect(toFileUrl(abs)).toBe(pathToFileURL(abs).href);
+    expect(toFileUrl(abs).startsWith('file://')).toBe(true);
+  });
+
+  it('percent-encodes spaces so the URL stays valid', () => {
+    const abs = path.resolve('/tmp/my project/main.pdf');
+    expect(toFileUrl(abs)).toContain('my%20project');
   });
 });

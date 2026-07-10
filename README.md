@@ -111,7 +111,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 
 - **Sync & browse** — clone/pull a project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
-- **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and the PDF path.
+- **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts

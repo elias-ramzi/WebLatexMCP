@@ -17,6 +17,7 @@ const outputSchema = {
   committed: z.boolean(),
   sha: z.string(),
   filesChanged: z.number(),
+  files: z.array(z.object({ path: z.string(), added: z.number(), removed: z.number() })),
 };
 
 export function registerCommit(server: McpServer, ctx: AppContext): void {
@@ -35,13 +36,12 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.git.commit(dir, { message, paths, allowEmpty });
+          const added = res.files.reduce((sum, f) => sum + f.added, 0);
+          const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
+          const headline = `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, not yet pushed`;
+          const stat = res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`).join('\n');
           return {
-            content: [
-              {
-                type: 'text',
-                text: `committed ${res.sha.slice(0, 8)} (${res.filesChanged} file(s)) — not yet pushed`,
-              },
-            ],
+            content: [{ type: 'text', text: stat ? `${headline}\n${stat}` : headline }],
             structuredContent: { ...res },
           };
         });

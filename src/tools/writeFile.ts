@@ -45,13 +45,9 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.write(dir, { path: relPath, content, createDirs });
           const { diff } = await ctx.git.diff(dir, { path: relPath });
+          const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           return {
-            content: [
-              {
-                type: 'text',
-                text: `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`,
-              },
-            ],
+            content: [{ type: 'text', text: diff ? `${headline}\n\n${diff}` : headline }],
             structuredContent: { ...res, diff },
           };
         });

@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
+import { toFileUrl } from '../lib/paths.js';
 import { parseLog, logTail } from '../services/logParser.js';
 
 const inputSchema = {
@@ -25,6 +26,10 @@ const outputSchema = {
   success: z.boolean(),
   rootFile: z.string(),
   pdfPath: z.string().optional(),
+  pdfUrl: z
+    .string()
+    .optional()
+    .describe('Clickable file:// URL of the compiled PDF, when produced.'),
   durationSec: z.number(),
   errors: z.array(errorShape),
   warnings: z.array(errorShape),
@@ -57,10 +62,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             timeoutSec,
           });
           const { errors, warnings } = parseLog(outcome.log);
+          const pdfUrl = outcome.pdfPath ? toFileUrl(outcome.pdfPath) : undefined;
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
             pdfPath: outcome.pdfPath,
+            pdfUrl,
             durationSec: outcome.durationSec,
             errors,
             warnings,
@@ -74,7 +81,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             .slice(0, 10)
             .map((e) => `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`)
             .join('\n');
-          const text = [headline, outcome.pdfPath ? `PDF: ${outcome.pdfPath}` : '', errorLines]
+          const text = [headline, pdfUrl ? `PDF: ${pdfUrl}` : '', errorLines]
             .filter(Boolean)
             .join('\n');
           return {

@@ -84,7 +84,7 @@ export class GitService {
   async commit(
     dir: string,
     opts: { message: string; paths?: string[]; allowEmpty?: boolean },
-  ): Promise<{ committed: boolean; sha: string; filesChanged: number }> {
+  ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
     const git = simpleGit(dir);
     if (opts.paths && opts.paths.length > 0) {
       await git.add(opts.paths);
@@ -95,6 +95,9 @@ export class GitService {
     if (staged.length === 0 && !opts.allowEmpty) {
       throw new Error('Nothing to commit (no staged changes).');
     }
+    // Capture the staged per-file line counts before committing — once committed, the
+    // `--cached` diff is empty. Drives the diffstat surfaced by the commit tool.
+    const files = parseNumstat(await git.diff(['--cached', '--numstat']));
     // Identity is supplied per-invocation with -c, so we never mutate the repo config.
     const args = [
       '-c',
@@ -108,7 +111,7 @@ export class GitService {
     if (opts.allowEmpty) args.push('--allow-empty');
     await git.raw(args);
     const sha = (await git.revparse(['HEAD'])).trim();
-    return { committed: true, sha, filesChanged: staged.length };
+    return { committed: true, sha, filesChanged: staged.length, files };
   }
 
   /** Discard uncommitted changes (working tree + untracked), optionally limited to paths. */

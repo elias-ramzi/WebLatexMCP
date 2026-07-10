@@ -44,6 +44,7 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     const committed = await git.commit(dir, { message: 'edit two' });
     expect(committed.committed).toBe(true);
     expect(committed.filesChanged).toBe(1);
+    expect(committed.files).toEqual([{ path: 'main.tex', added: 1, removed: 1 }]);
 
     const pushed = await git.safePush(dir, remote.url, { username: 'git' });
     expect(pushed.status).toBe('pushed');
