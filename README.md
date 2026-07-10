@@ -67,6 +67,9 @@ your code _and_ writes the paper right alongside it.
 Prerequisites, authentication, and registering with both Claude Code & Claude Desktop:
 [macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
 
+Using **Gemini** instead? See the [Gemini guide](docs/install/gemini.md) — Gemini CLI and Gemini Code
+Assist (IDE agent mode) register the same server over stdio.
+
 ### Or install from npm — no clone, no build
 
 Prefer not to clone the repo? Register the published package with `npx`. Editing and git work without

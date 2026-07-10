@@ -14,3 +14,9 @@ Per-OS setup for **WebLatexMCP**, each covering both **Claude Code** and **Claud
 All three end at the same place: the server registered over stdio, with a token resolved from an env
 var, the GitHub CLI, or your OS git credential helper. See the main [README](../../README.md) for the
 full configuration reference and tool list.
+
+## Other MCP clients
+
+The server speaks standard MCP over stdio, so it works with any MCP-capable client:
+
+- [**Gemini**](gemini.md) — Gemini CLI and Gemini Code Assist (IDE agent mode).
