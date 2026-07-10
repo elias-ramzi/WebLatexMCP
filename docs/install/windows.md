@@ -40,7 +40,7 @@ npm run build
 ## 3. Authentication
 
 The server resolves a token per host in this order: per-project `tokenEnv` → host env (`GITHUB_TOKEN`,
-`OVERLEAF_GIT_TOKEN`, …) → `GIT_MCP_TOKEN` → `gh auth token` → `git credential fill`. Pick one:
+`OVERLEAF_GIT_TOKEN`, …) → `WEB_LATEX_MCP_TOKEN` → `gh auth token` → `git credential fill`. Pick one:
 
 - **Env var** (simplest): set `GITHUB_TOKEN` / `OVERLEAF_GIT_TOKEN` in the client `env` block (below).
 - **GitHub CLI**: `gh auth login`, then leave `GITHUB_TOKEN` unset.
@@ -66,8 +66,8 @@ when you work inside this repo** — Claude Code loads `.mcp.json` only when lau
       "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "GIT_MCP_DEFAULT_PROJECT": "paper",
+        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
       },
     },
   },
@@ -80,7 +80,7 @@ the server **globally** (active in every session, not just inside this repo), us
 
 ```powershell
 claude mcp add web-latex-mcp --scope user `
-  -e GIT_MCP_DEFAULT_PROJECT=paper `
+  -e WEB_LATEX_MCP_DEFAULT_PROJECT=paper `
   -- node C:/Users/you/WebLatexMCP/dist/index.js
 ```
 
@@ -98,8 +98,8 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`
       "command": "node",
       "args": ["C:/Users/you/WebLatexMCP/dist/index.js"],
       "env": {
-        "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "GIT_MCP_DEFAULT_PROJECT": "paper",
+        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
       },
     },
   },
@@ -120,7 +120,7 @@ found by Claude Desktop. If `node` isn't found, point `command` at the full path
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```powershell
-$env:GIT_MCP_PROJECTS='{}'; node C:/Users/you/WebLatexMCP/dist/index.js
+$env:WEB_LATEX_MCP_PROJECTS='{}'; node C:/Users/you/WebLatexMCP/dist/index.js
 ```
 
 It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).

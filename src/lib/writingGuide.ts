@@ -10,14 +10,14 @@ function bundledGuidePath(): string {
 /**
  * Read the LaTeX writing guide that is surfaced to MCP clients as the server's
  * `instructions` hint. Defaults to the bundled `docs/writing-guide.md`; override
- * with `GIT_MCP_WRITING_GUIDE` to point at a project-specific guide. Returns
+ * with `WEB_LATEX_MCP_WRITING_GUIDE` to point at a project-specific guide. Returns
  * `undefined` (and logs to stderr) when the file is absent or empty, so a missing
  * guide never prevents the server from starting.
  */
 export async function loadWritingGuide(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string | undefined> {
-  const override = env.GIT_MCP_WRITING_GUIDE?.trim();
+  const override = env.WEB_LATEX_MCP_WRITING_GUIDE?.trim();
   const path = override ? resolve(override) : bundledGuidePath();
   try {
     const text = (await readFile(path, 'utf8')).trim();

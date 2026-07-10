@@ -1,6 +1,6 @@
 # Tools
 
-All tools take an optional `project` id (defaults to `GIT_MCP_DEFAULT_PROJECT`). File paths are always
+All tools take an optional `project` id (defaults to `WEB_LATEX_MCP_DEFAULT_PROJECT`). File paths are always
 POSIX (`/`-separated), on every OS.
 
 | Tool                | Description                                                                                                                                                    |

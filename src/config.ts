@@ -27,13 +27,13 @@ function parseProjects(raw: string | undefined): ProjectConfig[] {
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`GIT_MCP_PROJECTS is not valid JSON: ${(err as Error).message}`, {
+    throw new Error(`WEB_LATEX_MCP_PROJECTS is not valid JSON: ${(err as Error).message}`, {
       cause: err,
     });
   }
   const result = projectsSchema.safeParse(parsed);
   if (!result.success) {
-    throw new Error(`GIT_MCP_PROJECTS is invalid: ${result.error.message}`);
+    throw new Error(`WEB_LATEX_MCP_PROJECTS is invalid: ${result.error.message}`);
   }
   return Object.entries(result.data).map(([id, cfg]) => ({ id, ...cfg }));
 }
@@ -46,7 +46,7 @@ function parseCompiler(raw: string | undefined): CompilerKind {
   if (!value) return 'latexmk';
   if (!(COMPILERS as readonly string[]).includes(value)) {
     throw new Error(
-      `GIT_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILERS.join(', ')}.`,
+      `WEB_LATEX_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILERS.join(', ')}.`,
     );
   }
   return value as CompilerKind;
@@ -57,21 +57,21 @@ function parseCompiler(raw: string | undefined): CompilerKind {
  * (other than reading `env`), so it can be unit-tested with a synthetic environment.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const workspaceRaw = env.GIT_MCP_WORKSPACE?.trim();
+  const workspaceRaw = env.WEB_LATEX_MCP_WORKSPACE?.trim();
   const workspaceRoot = workspaceRaw
     ? path.resolve(expandHome(workspaceRaw))
     : path.join(os.homedir(), '.web-latex-mcp', 'projects');
 
-  const projects = parseProjects(env.GIT_MCP_PROJECTS);
-  const defaultProject = env.GIT_MCP_DEFAULT_PROJECT?.trim() || undefined;
+  const projects = parseProjects(env.WEB_LATEX_MCP_PROJECTS);
+  const defaultProject = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
 
   if (defaultProject && !projects.some((p) => p.id === defaultProject)) {
     throw new Error(
-      `GIT_MCP_DEFAULT_PROJECT "${defaultProject}" is not present in GIT_MCP_PROJECTS.`,
+      `WEB_LATEX_MCP_DEFAULT_PROJECT "${defaultProject}" is not present in WEB_LATEX_MCP_PROJECTS.`,
     );
   }
 
-  const compiler = parseCompiler(env.GIT_MCP_COMPILER);
+  const compiler = parseCompiler(env.WEB_LATEX_MCP_COMPILER);
 
   return { workspaceRoot, projects, defaultProject, compiler };
 }

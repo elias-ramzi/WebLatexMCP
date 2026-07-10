@@ -22,7 +22,7 @@ export interface CredentialProject {
 }
 
 /** Generic token env, used when no host-specific or per-project token is configured. */
-const GENERIC_TOKEN_ENV = 'GIT_MCP_TOKEN';
+const GENERIC_TOKEN_ENV = 'WEB_LATEX_MCP_TOKEN';
 
 interface HostDefaults {
   tokenEnv: string;
@@ -46,8 +46,8 @@ function hostOf(gitUrl: string): string | undefined {
 
 export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdentity {
   return {
-    name: env.GIT_MCP_AUTHOR_NAME?.trim() || 'WebLatexMCP',
-    email: env.GIT_MCP_AUTHOR_EMAIL?.trim() || 'web-latex-mcp@localhost',
+    name: env.WEB_LATEX_MCP_AUTHOR_NAME?.trim() || 'WebLatexMCP',
+    email: env.WEB_LATEX_MCP_AUTHOR_EMAIL?.trim() || 'web-latex-mcp@localhost',
   };
 }
 

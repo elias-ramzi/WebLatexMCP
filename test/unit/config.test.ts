@@ -12,17 +12,17 @@ describe('loadConfig', () => {
   });
 
   it('expands a leading ~ in the workspace root', () => {
-    const cfg = loadConfig({ GIT_MCP_WORKSPACE: '~/tex-projects' });
+    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/tex-projects' });
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));
   });
 
   it('parses the projects registry and default project', () => {
     const cfg = loadConfig({
-      GIT_MCP_PROJECTS: JSON.stringify({
+      WEB_LATEX_MCP_PROJECTS: JSON.stringify({
         thesis: { gitUrl: 'https://git.overleaf.com/abc', rootFile: 'main.tex' },
         paper: { gitUrl: 'https://github.com/me/paper', branch: 'main', tokenEnv: 'GITHUB_TOKEN' },
       }),
-      GIT_MCP_DEFAULT_PROJECT: 'thesis',
+      WEB_LATEX_MCP_DEFAULT_PROJECT: 'thesis',
     });
     expect(cfg.projects).toHaveLength(2);
     expect(cfg.projects[0]).toMatchObject({
@@ -40,11 +40,11 @@ describe('loadConfig', () => {
   });
 
   it('throws on invalid projects JSON', () => {
-    expect(() => loadConfig({ GIT_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
+    expect(() => loadConfig({ WEB_LATEX_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
   });
 
   it('throws when the default project is not in the registry', () => {
-    expect(() => loadConfig({ GIT_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
+    expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
   });
 
   it('defaults the compiler to latexmk', () => {
@@ -52,11 +52,13 @@ describe('loadConfig', () => {
   });
 
   it('selects the tectonic compiler (case-insensitively)', () => {
-    expect(loadConfig({ GIT_MCP_COMPILER: 'tectonic' }).compiler).toBe('tectonic');
-    expect(loadConfig({ GIT_MCP_COMPILER: '  TECTONIC ' }).compiler).toBe('tectonic');
+    expect(loadConfig({ WEB_LATEX_MCP_COMPILER: 'tectonic' }).compiler).toBe('tectonic');
+    expect(loadConfig({ WEB_LATEX_MCP_COMPILER: '  TECTONIC ' }).compiler).toBe('tectonic');
   });
 
   it('throws on an unknown compiler', () => {
-    expect(() => loadConfig({ GIT_MCP_COMPILER: 'pdflatex' })).toThrow(/GIT_MCP_COMPILER/);
+    expect(() => loadConfig({ WEB_LATEX_MCP_COMPILER: 'pdflatex' })).toThrow(
+      /WEB_LATEX_MCP_COMPILER/,
+    );
   });
 });

@@ -38,7 +38,7 @@ pwd            # note this absolute path; dist/index.js lives under it
 ## 3. Authentication
 
 The server resolves a token per host in this order: per-project `tokenEnv` → host env (`GITHUB_TOKEN`,
-`OVERLEAF_GIT_TOKEN`, …) → `GIT_MCP_TOKEN` → `gh auth token` → `git credential fill`. Pick one:
+`OVERLEAF_GIT_TOKEN`, …) → `WEB_LATEX_MCP_TOKEN` → `gh auth token` → `git credential fill`. Pick one:
 
 - **Env var** (simplest): set `GITHUB_TOKEN` / `OVERLEAF_GIT_TOKEN` in the client `env` block (below).
 - **GitHub CLI**: `gh auth login`, then leave `GITHUB_TOKEN` unset.
@@ -52,8 +52,8 @@ The server resolves a token per host in this order: per-project `tokenEnv` → h
 
 ```bash
 claude mcp add web-latex-mcp --scope user \
-  -e GIT_MCP_PROJECTS='{"paper":{"gitUrl":"https://github.com/me/paper","branch":"main"}}' \
-  -e GIT_MCP_DEFAULT_PROJECT=paper \
+  -e WEB_LATEX_MCP_PROJECTS='{"paper":{"gitUrl":"https://github.com/me/paper","branch":"main"}}' \
+  -e WEB_LATEX_MCP_DEFAULT_PROJECT=paper \
   -e GITHUB_TOKEN=ghp_xxx \
   -- node /path/to/WebLatexMCP/dist/index.js
 ```
@@ -73,8 +73,8 @@ To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a p
       "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "GIT_MCP_DEFAULT_PROJECT": "paper",
+        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
       },
     },
   },
@@ -95,8 +95,8 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **r
       "command": "node",
       "args": ["/path/to/WebLatexMCP/dist/index.js"],
       "env": {
-        "GIT_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
-        "GIT_MCP_DEFAULT_PROJECT": "paper",
+        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
+        "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper",
       },
     },
   },
@@ -125,7 +125,7 @@ Claude Code inherits your shell `PATH`, so this isn't needed there.
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```bash
-GIT_MCP_PROJECTS='{}' node /path/to/WebLatexMCP/dist/index.js
+WEB_LATEX_MCP_PROJECTS='{}' node /path/to/WebLatexMCP/dist/index.js
 ```
 
 It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).

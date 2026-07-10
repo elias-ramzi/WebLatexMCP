@@ -53,7 +53,7 @@ Then let Claude walk you through the rest:
 > add your first Overleaf project. Let's go step by step.
 
 Claude drives the whole setup from the chat. Editing and git operations work without TeX; only
-`compile` needs a backend on your `PATH` — `latexmk` by default, or `tectonic` (set `GIT_MCP_COMPILER`;
+`compile` needs a backend on your `PATH` — `latexmk` by default, or `tectonic` (set `WEB_LATEX_MCP_COMPILER`;
 see [Configuration](docs/configuration.md#compile-backend)).
 
 ### ⚡ Super fast start in VS Code — recommended

@@ -20,22 +20,24 @@ describe('loadWritingGuide', () => {
     expect(guide).toContain('Writing Academic Articles in LaTeX');
   });
 
-  it('reads an override path from GIT_MCP_WRITING_GUIDE', async () => {
+  it('reads an override path from WEB_LATEX_MCP_WRITING_GUIDE', async () => {
     const custom = path.join(tmp, 'guide.md');
     await writeFile(custom, '# Custom guide\n\nUse the past tense.\n');
-    const guide = await loadWritingGuide({ GIT_MCP_WRITING_GUIDE: custom });
+    const guide = await loadWritingGuide({ WEB_LATEX_MCP_WRITING_GUIDE: custom });
     expect(guide).toBe('# Custom guide\n\nUse the past tense.');
   });
 
   it('returns undefined when the file is missing', async () => {
-    const guide = await loadWritingGuide({ GIT_MCP_WRITING_GUIDE: path.join(tmp, 'nope.md') });
+    const guide = await loadWritingGuide({
+      WEB_LATEX_MCP_WRITING_GUIDE: path.join(tmp, 'nope.md'),
+    });
     expect(guide).toBeUndefined();
   });
 
   it('returns undefined for an empty file', async () => {
     const empty = path.join(tmp, 'empty.md');
     await writeFile(empty, '   \n');
-    const guide = await loadWritingGuide({ GIT_MCP_WRITING_GUIDE: empty });
+    const guide = await loadWritingGuide({ WEB_LATEX_MCP_WRITING_GUIDE: empty });
     expect(guide).toBeUndefined();
   });
 });

@@ -5,17 +5,17 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 
 ## Environment variables
 
-| Variable                                       | Required | Description                                                                                                         |
-| ---------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `GIT_MCP_PROJECTS`                             | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                    |
-| `GIT_MCP_WORKSPACE`                            | no       | Directory holding one clone per project. Default `~/.web-latex-mcp/projects`.                                       |
-| `GIT_MCP_DEFAULT_PROJECT`                      | no       | Project id used when a tool call omits `project`.                                                                   |
-| `GIT_MCP_COMPILER`                             | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                  |
-| `GIT_MCP_AUTHOR_NAME` / `GIT_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                         |
-| `GIT_MCP_WRITING_GUIDE`                        | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).       |
-| `GIT_MCP_CONCURRENCY_GUIDE`                    | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md). |
+| Variable                                                   | Required | Description                                                                                                         |
+| ---------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
+| `WEB_LATEX_MCP_PROJECTS`                                   | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                    |
+| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Default `~/.web-latex-mcp/projects`.                                       |
+| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                   |
+| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                  |
+| `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                         |
+| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).       |
+| `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md). |
 
-### `GIT_MCP_PROJECTS` example
+### `WEB_LATEX_MCP_PROJECTS` example
 
 One Overleaf project and one GitHub repo:
 
@@ -32,7 +32,7 @@ token**. For GitHub, create a PAT under **Settings → Developer settings → Pe
 ## Compile backend
 
 The `compile` tool runs locally so you see errors and PDFs without round-tripping through Overleaf.
-Two backends are supported; select with `GIT_MCP_COMPILER`.
+Two backends are supported; select with `WEB_LATEX_MCP_COMPILER`.
 
 - **`latexmk`** (default) — drives your system TeX install (TeX Live / MacTeX / MiKTeX). This is what
   Overleaf itself runs, so it gives the closest "compiles here == compiles on Overleaf" guarantee and the
@@ -50,7 +50,7 @@ Both return the same structured errors/warnings and PDF path, so switching backe
 
 Tokens are used as the HTTPS password. For a project the server tries, in order: a per-project
 `tokenEnv`, the host's token env (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `OVERLEAF_GIT_TOKEN`, …), the generic
-`GIT_MCP_TOKEN`, the **GitHub CLI** (`gh auth token`), then your **git credential helper**
+`WEB_LATEX_MCP_TOKEN`, the **GitHub CLI** (`gh auth token`), then your **git credential helper**
 (`git credential fill` — works on every OS). A project can override with its own `tokenEnv` and/or
 `username`, so Overleaf and GitHub projects coexist with different credentials. The
 [install guides](install/) walk through each auth method per OS.
@@ -69,10 +69,10 @@ reach it).
 
 - **Writing guide** — resource `guide://latex/writing-guide`. The bundled
   [`writing-guide.md`](writing-guide.md) covers tense, style, figures, equations, bibliography, and
-  English-usage conventions. Override with `GIT_MCP_WRITING_GUIDE`.
+  English-usage conventions. Override with `WEB_LATEX_MCP_WRITING_GUIDE`.
 - **Concurrency guide** — resource `guide://latex/concurrency`. The bundled [`CONCURRENCY.md`](CONCURRENCY.md)
   explains how the server pushes without clobbering edits made elsewhere (the Overleaf web editor, or
-  other agents). Override with `GIT_MCP_CONCURRENCY_GUIDE`.
+  other agents). Override with `WEB_LATEX_MCP_CONCURRENCY_GUIDE`.
 
 Point a guide variable at your own file to override it, or at a non-existent path to ship no guide (the
 server starts normally either way; with no guide, neither the instructions nor the resource is

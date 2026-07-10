@@ -62,8 +62,8 @@ describe('CredentialResolver', () => {
     ).toEqual({ username: 'me', token: 'mine' });
   });
 
-  it('falls back to the generic GIT_MCP_TOKEN for unknown hosts', async () => {
-    const r = new CredentialResolver({ GIT_MCP_TOKEN: 'gen' }, failExec);
+  it('falls back to the generic WEB_LATEX_MCP_TOKEN for unknown hosts', async () => {
+    const r = new CredentialResolver({ WEB_LATEX_MCP_TOKEN: 'gen' }, failExec);
     expect(await r.resolve({ gitUrl: 'https://git.example.com/x/y' })).toEqual({
       username: 'git',
       token: 'gen',
