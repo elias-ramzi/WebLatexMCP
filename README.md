@@ -145,6 +145,11 @@ See the [skills guide](docs/skills.md) for details.
 This repo **accepts pull requests** — bug reports, feature ideas, docs fixes, and code changes are all
 welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up, run the local gate, and open a PR.
 
+A note on maturity: this project is largely vibe-coded, so treat it as best-effort rather than
+battle-tested. Robustness isn't guaranteed — expect rough edges, and please report them. It has been
+mostly tested on these setups: VS Code + Claude Code extension, the Claude Code CLI, and Claude Desktop
+for macOS.
+
 ## License
 
 MIT
