@@ -53,7 +53,7 @@ Then let Claude walk you through the rest:
 
 > 👽 **You**
 >
-> Claude, can you walk me through how to install this MCP server?
+> Claude, can you walk me through how to install the WebLatexMCP server?
 
 > ✦ **Claude**
 >
