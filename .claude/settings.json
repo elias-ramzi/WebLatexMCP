@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(arxiv_latex_cleaner:*)",
+      "Bash(pipx install arxiv-latex-cleaner:*)",
+      "Bash(pip install arxiv-latex-cleaner:*)",
+      "Bash(pip install --user arxiv-latex-cleaner:*)",
+      "Bash(zip:*)"
+    ]
+  }
+}

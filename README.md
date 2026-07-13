@@ -125,6 +125,7 @@ Launched from this repo, Claude Code loads task-specific skills that drive the t
 diff, so nothing is committed or pushed unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
+- **`/arxiv-clean-project`** — strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
 - **`/verify-citations`** — audit every `.bib` entry against DBLP and flag discrepancies (read-only).
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.

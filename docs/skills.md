@@ -4,12 +4,13 @@ For **Claude Code**, the repo bundles task-specific skills that drive the [tools
 automatically when Claude Code is launched from this repo; each stops at the diff, so nothing is committed
 or pushed unless you ask.
 
-| Skill                                                                     | What it does                                                                                                                                                                                                                  | Mutates              | Invoke                  |
-| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----------------------- |
-| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                | `.tex`               | `/format-latex-project` |
-| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, and optionally marks confirmed entries. **Read-only** unless you approve a change.                                         | none (opt-in `.bib`) | `/verify-citations`     |
-| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                | `.bib` + `.tex`      | `/format-bibliography`  |
-| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed. | local note only      | `/summarize-paper`      |
+| Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                            | Mutates                | Invoke                  |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------- |
+| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                          | `.tex`                 | `/format-latex-project` |
+| [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`. | `.tex` (in-place mode) | `/arxiv-clean-project`  |
+| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, and optionally marks confirmed entries. **Read-only** unless you approve a change.                                                                                                                                                                                   | none (opt-in `.bib`)   | `/verify-citations`     |
+| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                          | `.bib` + `.tex`        | `/format-bibliography`  |
+| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                           | local note only        | `/summarize-paper`      |
 
 ## `format-latex-project` — reformat an existing project
 
@@ -18,6 +19,24 @@ per-section `\input{sections/…}` files, and rewrites body paragraphs to **one 
 convention from [`writing-guide.md`](writing-guide.md), which keeps diffs small and edits surgical). It
 compiles before and after as a guardrail — the PDF must be unchanged — and stops at the diff so you review
 before any `commit`/`push`. Ask Claude to "format my Overleaf project".
+
+## `arxiv-clean-project` — prepare a project for arXiv
+
+Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) over the project to
+produce submission-ready LaTeX: it **strips every `%` comment** and **deletes draft macros and
+environments** you name (`\todo{…}`, `\note{…}`, review commands, `comment`-style blocks), and can
+optionally **shrink oversized figures** (resize images, PNG→JPG, compress PDFs) to fit arXiv's 50MB limit.
+Unlike `format-latex-project`, this one **intentionally changes the compiled PDF** — removing todos and
+notes removes content — so compile is only a "still builds cleanly" guardrail, not a "PDF unchanged" one.
+Before deleting, it detects which draft macros the project actually uses and **confirms the list with you**.
+`.bib` files are preserved via `--keep_bib`.
+
+It asks each run which of two modes you want: a **separate `…_arXiv` copy** (plus an optional `.zip`),
+leaving the live project untouched — the tool's native, non-destructive behavior — or **applied in place**,
+reconciling the cleaned files back through the MCP tools, compiling, and stopping at the diff so you review
+before any `commit`/`push`. In-place mode is destructive (it strips your live project's comments), so the
+skill flags that first. The cleaner is a Python CLI installed on demand (`pipx`/`pip`). Ask Claude to
+"clean my project for arXiv".
 
 ## `verify-citations` — audit citations against DBLP
 
