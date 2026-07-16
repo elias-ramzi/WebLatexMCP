@@ -50,7 +50,7 @@ git rebase origin/main        # or: git merge origin/main
 formatting; all logic lives in services so it is unit-testable without a live MCP client.
 
 - `src/index.ts` — stdio bootstrap. Resolves auth (async, may hit the Keychain), builds the context, and
-  (when `WEB_LATEX_MCP_WORKSPACE=cwd`) excludes the workspace-local clone dir from the host repo's git.
+  (when the workspace is local) excludes the workspace-local clone dir from the host repo's git.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
   `dblp`) passed to every tool handler.
@@ -61,9 +61,13 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   an injectable `fetch` for tests), `logParser`, `auth`.
 
 Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per project id.
-Set `WEB_LATEX_MCP_WORKSPACE=cwd` to clone into `<launch-dir>/.web_latex_mcp` (beside the agent's code;
-git-excluded via the host repo's `.git/info/exclude` — `src/lib/workspaceExclude.ts`). Config comes from
-env (`src/config.ts`); `ProjectManager` also supports runtime registration.
+When unset, the default is workspace-local — `<launch-dir>/.web_latex_mcp` (beside the agent's code;
+git-excluded via the host repo's `.git/info/exclude` — `src/lib/workspaceExclude.ts`) — whenever the
+launch dir is a git repo and not the home dir; otherwise it falls back to `~/.web-latex-mcp/projects`.
+`WEB_LATEX_MCP_WORKSPACE=cwd` forces workspace-local; any other value is a path. The git-repo detection
+(`resolveWorkspace` in `src/config.ts`) is injectable so tests stay hermetic. In workspace-local mode
+`compile` also surfaces the PDF at `<workspace>/<id>.pdf` beside the clone (`src/lib/pdfSurface.ts`) —
+build artifacts otherwise live in a temp dir. `ProjectManager` also supports runtime registration.
 
 ## Conventions that aren't obvious
 

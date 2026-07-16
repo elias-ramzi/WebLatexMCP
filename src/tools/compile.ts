@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
+import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { parseLog, logTail } from '../services/logParser.js';
 
 const inputSchema = {
@@ -25,7 +26,13 @@ const errorShape = z.object({
 const outputSchema = {
   success: z.boolean(),
   rootFile: z.string(),
-  pdfPath: z.string().optional(),
+  pdfPath: z
+    .string()
+    .optional()
+    .describe(
+      'Path to the compiled PDF. For workspace-local clones this is <workspace>/.web_latex_mcp/' +
+        '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path.',
+    ),
   pdfUrl: z
     .string()
     .optional()
@@ -62,11 +69,17 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             timeoutSec,
           });
           const { errors, warnings } = parseLog(outcome.log);
-          const pdfUrl = outcome.pdfPath ? toFileUrl(outcome.pdfPath) : undefined;
+          // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
+          // the user can open the latest build from their editor instead of hunting the temp dir.
+          let pdfPath = outcome.pdfPath;
+          if (pdfPath && ctx.config.workspaceIsLocal) {
+            pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
+          }
+          const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
-            pdfPath: outcome.pdfPath,
+            pdfPath,
             pdfUrl,
             durationSec: outcome.durationSec,
             errors,
