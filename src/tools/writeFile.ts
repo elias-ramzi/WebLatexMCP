@@ -9,6 +9,14 @@ const inputSchema = {
   path: z.string().describe('Path relative to the project root.'),
   content: z.string().describe('Full file content to write.'),
   createDirs: z.boolean().optional().describe('Create missing parent directories (default false).'),
+  overrideExternalChanges: z
+    .boolean()
+    .optional()
+    .describe(
+      'Overwrite even if the file changed on disk since it was last read through this server ' +
+        '(e.g. edited directly by the user). Prefer re-reading first; only set this to ' +
+        'deliberately discard those on-disk changes.',
+    ),
   confirmBibEdit: z
     .boolean()
     .optional()
@@ -36,14 +44,26 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath, content, createDirs, confirmBibEdit }) => {
+    async ({
+      project,
+      path: relPath,
+      content,
+      createDirs,
+      overrideExternalChanges,
+      confirmBibEdit,
+    }) => {
       try {
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const res = await ctx.files.write(dir, { path: relPath, content, createDirs });
+          const res = await ctx.files.write(dir, {
+            path: relPath,
+            content,
+            createDirs,
+            overrideExternalChanges,
+          });
           const { diff } = await ctx.git.diff(dir, { path: relPath });
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           return {

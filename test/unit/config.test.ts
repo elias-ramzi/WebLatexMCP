@@ -7,6 +7,7 @@ describe('loadConfig', () => {
   it('uses the default workspace root when unset', () => {
     const cfg = loadConfig({});
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
+    expect(cfg.workspaceIsLocal).toBe(false);
     expect(cfg.projects).toEqual([]);
     expect(cfg.defaultProject).toBeUndefined();
   });
@@ -14,6 +15,19 @@ describe('loadConfig', () => {
   it('expands a leading ~ in the workspace root', () => {
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/tex-projects' });
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));
+    expect(cfg.workspaceIsLocal).toBe(false);
+  });
+
+  it('clones into the launch dir on the "cwd" sentinel', () => {
+    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '  CWD ' }, '/work/paper');
+    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', '.web_latex_mcp'));
+    expect(cfg.workspaceIsLocal).toBe(true);
+  });
+
+  it('resolves a relative workspace against the launch dir', () => {
+    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: 'clones' }, '/work/paper');
+    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', 'clones'));
+    expect(cfg.workspaceIsLocal).toBe(false);
   });
 
   it('parses the projects registry and default project', () => {

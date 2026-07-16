@@ -34,6 +34,9 @@ export function registerDiscard(server: McpServer, ctx: AppContext): void {
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.git.discard(dir, paths);
+          // The working tree was rewritten to HEAD; drop baselines so the reverted content
+          // isn't later mistaken for an out-of-band user edit.
+          ctx.files.resetBaselines(dir);
           return {
             content: [{ type: 'text', text: 'discarded uncommitted changes' }],
             structuredContent: { ...res },

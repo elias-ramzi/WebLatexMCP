@@ -7,6 +7,13 @@ import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 const inputSchema = {
   project: z.string().optional(),
   path: z.string().describe('Path relative to the project root.'),
+  overrideExternalChanges: z
+    .boolean()
+    .optional()
+    .describe(
+      'Apply even if the file changed on disk since it was last read through this server ' +
+        '(e.g. edited directly by the user). Prefer re-reading first to see those changes.',
+    ),
   confirmBibEdit: z
     .boolean()
     .optional()
@@ -46,14 +53,14 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath, edits, confirmBibEdit }) => {
+    async ({ project, path: relPath, edits, overrideExternalChanges, confirmBibEdit }) => {
       try {
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const res = await ctx.files.applyEdits(dir, relPath, edits);
+          const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
           const { diff } = await ctx.git.diff(dir, { path: relPath });
           return {
             content: [

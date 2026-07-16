@@ -21,6 +21,39 @@ function expandHome(p: string): string {
   return p;
 }
 
+/**
+ * Sentinel value for `WEB_LATEX_MCP_WORKSPACE` that clones into the coding agent's own
+ * workspace — under `<launch-dir>/.web_latex_mcp` — so the `.tex`/PDF files sit right beside
+ * the code the agent is working on. The launch dir is the server's cwd, which for a stdio
+ * server spawned by Claude Code (or another agent) is the workspace root.
+ */
+const WORKSPACE_CWD_SENTINEL = 'cwd';
+
+/** Name of the workspace-local clone directory used by the `cwd` sentinel. */
+export const LOCAL_WORKSPACE_DIRNAME = '.web_latex_mcp';
+
+interface ResolvedWorkspace {
+  workspaceRoot: string;
+  /** True when clones live inside the agent's workspace (the `cwd` sentinel). */
+  workspaceIsLocal: boolean;
+}
+
+/** Resolve `WEB_LATEX_MCP_WORKSPACE` (raw env value) to an absolute clone root. */
+function resolveWorkspace(raw: string | undefined, cwd: string): ResolvedWorkspace {
+  const value = raw?.trim();
+  if (!value) {
+    return {
+      workspaceRoot: path.join(os.homedir(), '.web-latex-mcp', 'projects'),
+      workspaceIsLocal: false,
+    };
+  }
+  if (value.toLowerCase() === WORKSPACE_CWD_SENTINEL) {
+    return { workspaceRoot: path.join(cwd, LOCAL_WORKSPACE_DIRNAME), workspaceIsLocal: true };
+  }
+  // Relative paths resolve against the launch dir; absolute (and ~-expanded) paths pass through.
+  return { workspaceRoot: path.resolve(cwd, expandHome(value)), workspaceIsLocal: false };
+}
+
 function parseProjects(raw: string | undefined): ProjectConfig[] {
   if (!raw || !raw.trim()) return [];
   let parsed: unknown;
@@ -56,11 +89,11 @@ function parseCompiler(raw: string | undefined): CompilerKind {
  * Build the server configuration from environment variables. Pure and side-effect free
  * (other than reading `env`), so it can be unit-tested with a synthetic environment.
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const workspaceRaw = env.WEB_LATEX_MCP_WORKSPACE?.trim();
-  const workspaceRoot = workspaceRaw
-    ? path.resolve(expandHome(workspaceRaw))
-    : path.join(os.homedir(), '.web-latex-mcp', 'projects');
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+): ServerConfig {
+  const { workspaceRoot, workspaceIsLocal } = resolveWorkspace(env.WEB_LATEX_MCP_WORKSPACE, cwd);
 
   const projects = parseProjects(env.WEB_LATEX_MCP_PROJECTS);
   const defaultProject = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
@@ -73,5 +106,5 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 
   const compiler = parseCompiler(env.WEB_LATEX_MCP_COMPILER);
 
-  return { workspaceRoot, projects, defaultProject, compiler };
+  return { workspaceRoot, workspaceIsLocal, projects, defaultProject, compiler };
 }

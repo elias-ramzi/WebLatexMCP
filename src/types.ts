@@ -41,6 +41,11 @@ export type CompilerKind = 'latexmk' | 'tectonic';
 export interface ServerConfig {
   /** Directory that holds one clone per project. */
   workspaceRoot: string;
+  /**
+   * True when `workspaceRoot` lives inside the agent's own workspace (the `cwd` sentinel),
+   * so the server excludes it from the host repo's git on startup.
+   */
+  workspaceIsLocal?: boolean;
   /** Registered projects. */
   projects: ProjectConfig[];
   /** Project id used when a tool call omits `project`. */

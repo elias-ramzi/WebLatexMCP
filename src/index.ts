@@ -6,6 +6,7 @@ import { createContext } from './context.js';
 import { createServer } from './server.js';
 import { loadWritingGuide } from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
+import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
 
 async function main(): Promise<void> {
   // Fail fast instead of hanging on an interactive credential prompt when no token or
@@ -14,6 +15,12 @@ async function main(): Promise<void> {
   process.env.GCM_INTERACTIVE ??= 'never';
 
   const config = loadConfig();
+  if (config.workspaceIsLocal) {
+    const pattern = await excludeWorkspaceFromHostGit(config.workspaceRoot);
+    if (pattern) {
+      console.error(`[web-latex-mcp] excluded ${pattern} from the host repo's git`);
+    }
+  }
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);
   const ctx = createContext(config, credentials, identity);

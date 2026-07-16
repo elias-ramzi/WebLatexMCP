@@ -1,6 +1,19 @@
 import path from 'node:path';
 import { readdir, readFile, writeFile, mkdir, stat, rm } from 'node:fs/promises';
 import { resolveInside, toPosix } from '../lib/paths.js';
+import { FileRevisionTracker } from './fileRevisions.js';
+
+/** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
+export class ExternalChangeError extends Error {
+  constructor(relPath: string) {
+    super(
+      `"${relPath}" changed on disk since it was last read through this server — it was likely ` +
+        `edited directly. Re-read it to see the current content before writing, or pass ` +
+        `overrideExternalChanges: true to overwrite those changes.`,
+    );
+    this.name = 'ExternalChangeError';
+  }
+}
 
 export type FileFilter = 'tex' | 'bib' | 'assets' | 'all';
 export type FileType = 'tex' | 'bib' | 'asset' | 'other';
@@ -80,6 +93,9 @@ function countOccurrences(haystack: string, needle: string): number {
 
 /** Sandboxed file access within a project's clone directory. */
 export class FileService {
+  /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
+  private readonly revisions = new FileRevisionTracker();
+
   async list(
     projectDir: string,
     opts: { filter?: FileFilter; subdir?: string } = {},
@@ -119,6 +135,9 @@ export class FileService {
       };
     }
     const raw = await readFile(abs, 'utf8');
+    // The whole file is read into memory even for a range request, so this is the content the
+    // server now knows to be on disk — record it as the baseline for out-of-band-edit detection.
+    this.revisions.record(abs, raw);
     const lines = raw.split('\n');
     const totalLines = lines.length;
     if (opts.startLine === undefined && opts.endLine === undefined) {
@@ -134,7 +153,9 @@ export class FileService {
   async readText(projectDir: string, relPath: string): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
     try {
-      return await readFile(abs, 'utf8');
+      const raw = await readFile(abs, 'utf8');
+      this.revisions.record(abs, raw);
+      return raw;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
       throw err;
@@ -144,20 +165,37 @@ export class FileService {
   /** Create or overwrite a file. */
   async write(
     projectDir: string,
-    opts: { path: string; content: string; createDirs?: boolean },
+    opts: {
+      path: string;
+      content: string;
+      createDirs?: boolean;
+      overrideExternalChanges?: boolean;
+    },
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
-    let created = false;
+    let current: string | undefined;
     try {
-      await stat(abs);
+      current = await readFile(abs, 'utf8');
     } catch {
-      created = true;
+      current = undefined; // file does not exist yet
+    }
+    if (
+      !opts.overrideExternalChanges &&
+      current !== undefined &&
+      this.revisions.isStale(abs, current)
+    ) {
+      throw new ExternalChangeError(opts.path);
     }
     if (opts.createDirs) {
       await mkdir(path.dirname(abs), { recursive: true });
     }
     await writeFile(abs, opts.content, 'utf8');
-    return { path: opts.path, bytesWritten: Buffer.byteLength(opts.content, 'utf8'), created };
+    this.revisions.record(abs, opts.content);
+    return {
+      path: opts.path,
+      bytesWritten: Buffer.byteLength(opts.content, 'utf8'),
+      created: current === undefined,
+    };
   }
 
   /**
@@ -169,12 +207,16 @@ export class FileService {
     projectDir: string,
     relPath: string,
     edits: EditOp[],
+    opts: { overrideExternalChanges?: boolean } = {},
   ): Promise<{ path: string; appliedEdits: number }> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
     }
     const abs = resolveInside(projectDir, relPath);
     const original = await readFile(abs, 'utf8');
+    if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
+      throw new ExternalChangeError(relPath);
+    }
     let content = original;
     edits.forEach((edit, i) => {
       if (edit.oldString === edit.newString) {
@@ -194,18 +236,58 @@ export class FileService {
         : content.replace(edit.oldString, edit.newString);
     });
     await writeFile(abs, content, 'utf8');
+    this.revisions.record(abs, content);
     return { path: relPath, appliedEdits: edits.length };
   }
 
   /** Delete a file (not a directory) from the project. */
-  async delete(projectDir: string, relPath: string): Promise<{ path: string }> {
+  async delete(
+    projectDir: string,
+    relPath: string,
+    opts: { overrideExternalChanges?: boolean } = {},
+  ): Promise<{ path: string }> {
     const abs = resolveInside(projectDir, relPath);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
     }
+    if (!opts.overrideExternalChanges && this.revisions.hasBaseline(abs)) {
+      const current = await readFile(abs, 'utf8');
+      if (this.revisions.isStale(abs, current)) {
+        throw new ExternalChangeError(relPath);
+      }
+    }
     await rm(abs);
+    this.revisions.forget(abs);
     return { path: relPath };
+  }
+
+  /**
+   * Forget all recorded baselines under a project dir. Call after git rewrites the working tree
+   * (pull, discard) so files that changed on disk aren't mistaken for out-of-band user edits.
+   */
+  resetBaselines(projectDir: string): void {
+    this.revisions.reset(path.resolve(projectDir));
+  }
+
+  /**
+   * Of the given repo-relative paths, return those whose on-disk content differs from what the
+   * tools last read/wrote this session — i.e. files a human changed directly. Paths that no
+   * longer exist or can't be read as text are skipped.
+   */
+  async externalModifications(projectDir: string, relPaths: string[]): Promise<string[]> {
+    const out: string[] = [];
+    for (const rel of relPaths) {
+      const abs = resolveInside(projectDir, rel);
+      let content: string;
+      try {
+        content = await readFile(abs, 'utf8');
+      } catch {
+        continue;
+      }
+      if (this.revisions.isExternal(abs, content)) out.push(rel);
+    }
+    return out;
   }
 
   private async walk(root: string, dir: string, out: string[]): Promise<void> {

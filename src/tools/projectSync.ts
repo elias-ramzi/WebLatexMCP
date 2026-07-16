@@ -67,6 +67,12 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
         }
 
+        // A clone or ff-pull rewrites files on disk; drop stale baselines so post-sync content
+        // isn't misread as an out-of-band user edit.
+        if (result.action === 'cloned' || result.action === 'pulled') {
+          ctx.files.resetBaselines(dir);
+        }
+
         const payload = { project: cfg.id, path: dir, ...result };
         return {
           content: [

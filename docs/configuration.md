@@ -5,15 +5,15 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 
 ## Environment variables
 
-| Variable                                                   | Required | Description                                                                                                         |
-| ---------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `WEB_LATEX_MCP_PROJECTS`                                   | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                    |
-| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Default `~/.web-latex-mcp/projects`.                                       |
-| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                   |
-| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                  |
-| `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                         |
-| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).       |
-| `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md). |
+| Variable                                                   | Required | Description                                                                                                                                                                                 |
+| ---------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WEB_LATEX_MCP_PROJECTS`                                   | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                                                                                            |
+| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Default `~/.web-latex-mcp/projects`. Set to `cwd` to clone into the agent's own workspace — see [Workspace-local clones](#workspace-local-clones). |
+| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                           |
+| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                                                                                          |
+| `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                 |
+| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                               |
+| `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                         |
 
 ### `WEB_LATEX_MCP_PROJECTS` example
 
@@ -28,6 +28,29 @@ One Overleaf project and one GitHub repo:
 
 Find an Overleaf git URL under **Menu → Git** and a token under **Account Settings → Git authentication
 token**. For GitHub, create a PAT under **Settings → Developer settings → Personal access tokens**.
+
+## Workspace-local clones
+
+By default clones live under `~/.web-latex-mcp/projects`, out of the way. When you drive the server
+from a coding agent (Claude Code, and other agents that spawn it over stdio from your project
+directory), it's often handier to have the LaTeX sitting **right beside the code** — so the agent can
+open the `.tex` and the compiled PDF as ordinary workspace files, not only through MCP tools.
+
+Set `WEB_LATEX_MCP_WORKSPACE` to the sentinel `cwd` for that:
+
+```json
+{ "env": { "WEB_LATEX_MCP_WORKSPACE": "cwd" } }
+```
+
+Clones then land under `<workspace>/.web_latex_mcp/<project-id>/`, where `<workspace>` is the
+directory the server was launched from (the agent's workspace root). On startup the server adds
+`.web_latex_mcp/` to the host repo's **`.git/info/exclude`** (never the tracked `.gitignore`), so the
+LaTeX clones don't show up as untracked files in your own repo. This is best-effort: if the workspace
+isn't inside a git repo, nothing is written.
+
+> Prefer this only with agents that launch the server from your project directory. Clients whose
+> launch directory is unpredictable (e.g. Claude Desktop, which may start at `/`) should point
+> `WEB_LATEX_MCP_WORKSPACE` at an explicit path instead.
 
 ## Compile backend
 

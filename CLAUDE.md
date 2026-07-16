@@ -60,7 +60,9 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   an injectable `fetch` for tests), `logParser`, `auth`.
 
 Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per project id.
-Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime registration.
+Set `WEB_LATEX_MCP_WORKSPACE=cwd` to clone into `<launch-dir>/.web_latex_mcp` (beside the agent's code;
+git-excluded via the host repo's `.git/info/exclude` — `src/lib/workspaceExclude.ts`). Config comes from
+env (`src/config.ts`); `ProjectManager` also supports runtime registration.
 
 ## Conventions that aren't obvious
 
@@ -76,6 +78,12 @@ Config comes from env (`src/config.ts`); `ProjectManager` also supports runtime 
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
+- **Out-of-band edits are guarded.** `FileService` holds a `FileRevisionTracker`
+  (`src/services/fileRevisions.ts`) that hashes each file it reads/writes. `write_file`/`edit_file`/
+  `delete_file` refuse (throw `ExternalChangeError`) when the on-disk bytes changed since the server last
+  saw them — the user editing the clone directly — unless `overrideExternalChanges: true`. `status`
+  surfaces `externalChanges`. Baselines reset after `project_sync`/`discard` (`ctx.files.resetBaselines`),
+  since those rewrite the tree. Keep this so a hand-edited clone isn't silently clobbered.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it
