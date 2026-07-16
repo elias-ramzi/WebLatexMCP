@@ -49,7 +49,8 @@ git rebase origin/main        # or: git merge origin/main
 **Thin tool layer over a testable service core.** Tools do only schema validation + response
 formatting; all logic lives in services so it is unit-testable without a live MCP client.
 
-- `src/index.ts` — stdio bootstrap. Resolves auth (async, may hit the Keychain) then builds the context.
+- `src/index.ts` — stdio bootstrap. Resolves auth (async, may hit the Keychain), builds the context, and
+  (when `WEB_LATEX_MCP_WORKSPACE=cwd`) excludes the workspace-local clone dir from the host repo's git.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
   `dblp`) passed to every tool handler.
