@@ -1,6 +1,6 @@
 ---
 name: format-bibliography
-description: Normalize and reformat a project's .bib bibliography — find and merge duplicate entries, rename cite keys to a consistent firstauthorYEARtag scheme (e.g. chambon2024pointbev), harmonize venue names (CVPR ↔ "Computer Vision and Pattern Recognition"), and apply one consistent field policy (strip or add url/doi/pages, etc.). Use when the user asks to "format", "reformat", "normalize", "tidy", "clean up", "harmonize", or "deduplicate" the bibliography / .bib / bibtex / citation keys. This skill EDITS the .bib (and the \cite keys in the .tex): it is permission-gated and uses compile as a guardrail. Operates on projects served by the web-latex-mcp MCP server.
+description: Normalize and reformat a project's .bib bibliography — find and merge duplicate entries, rename cite keys to a consistent firstauthorYEARtag scheme (e.g. smith2024fastnet), harmonize venue names (CVPR ↔ "Computer Vision and Pattern Recognition"), and apply one consistent field policy (strip or add url/doi/pages, etc.). Use when the user asks to "format", "reformat", "normalize", "tidy", "clean up", "harmonize", or "deduplicate" the bibliography / .bib / bibtex / citation keys. This skill EDITS the .bib (and the \cite keys in the .tex): it is permission-gated and uses compile as a guardrail. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
 # Normalize and reformat a project's `.bib` bibliography
@@ -10,7 +10,7 @@ each one the collaborator asked for:
 
 1. **Deduplicate** — find entries that are the same paper (often an arXiv preprint and its published
    version) and merge them down to one.
-2. **Consistent cite keys** — rename to `firstauthorYEARtag` (e.g. `chambon2024pointbev`), and **update
+2. **Consistent cite keys** — rename to `firstauthorYEARtag` (e.g. `smith2024fastnet`), and **update
    every `\cite{…}` in the draft to match**.
 3. **Harmonize venues** — make every proceedings/journal name use one style: short (`CVPR`) _or_ long
    (`Computer Vision and Pattern Recognition`), the user's choice — not a mix.
@@ -79,12 +79,12 @@ Lowercase ASCII, letters and digits only. Three parts, concatenated with no sepa
 - **YEAR** — the 4-digit publication `year`.
 - **tag** — the paper's **acronym / method name** if it has one, else the **first meaningful word of the
   title**:
-  - Many titles are `Acronym: full title` — take the part **before the colon** (`PointBeV: …` → `pointbev`).
+  - Many titles are `Acronym: full title` — take the part **before the colon** (`FastNet: …` → `fastnet`).
   - Otherwise look for a distinctive mixed-case or all-caps token in the title (`ResNet`, `BERT`).
   - No acronym → the **first word of the title**, skipping a leading article (`A`/`An`/`The`). Lowercase,
     letters/digits only.
 
-Example: _Chambon et al., 2024, "PointBeV: A Sparse Approach…"_ → `chambon2024pointbev`.
+Example: _Smith et al., 2024, "FastNet: A Fast Approach…"_ → `smith2024fastnet`.
 
 **Collisions:** if two distinct papers reduce to the same key, append `a`, `b`, `c`, … to disambiguate
 (`smith2020deep`, `smith2020deepb`). Two entries that collide **and are the same paper** are duplicates —
@@ -156,8 +156,8 @@ This is the dangerous part: a renamed key that isn't updated everywhere becomes 
 After reformatting an entry, add one comment line **immediately above** it so a later run skips it:
 
 ```bibtex
-% formatted-by-claude: key chambon2024pointbev on 2026-06-29
-@inproceedings{chambon2024pointbev,
+% formatted-by-claude: key smith2024fastnet on 2026-06-29
+@inproceedings{smith2024fastnet,
   ...
 }
 ```
