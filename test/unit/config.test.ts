@@ -4,12 +4,27 @@ import path from 'node:path';
 import { loadConfig } from '../../src/config.js';
 
 describe('loadConfig', () => {
-  it('uses the default workspace root when unset', () => {
-    const cfg = loadConfig({});
+  const notInRepo = () => false;
+  const inRepo = () => true;
+
+  it('falls back to the home cache when unset and not in a git repo', () => {
+    const cfg = loadConfig({}, '/some/dir', notInRepo);
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
     expect(cfg.workspaceIsLocal).toBe(false);
     expect(cfg.projects).toEqual([]);
     expect(cfg.defaultProject).toBeUndefined();
+  });
+
+  it('defaults to workspace-local when unset and inside a git repo', () => {
+    const cfg = loadConfig({}, '/work/paper', inRepo);
+    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', '.web_latex_mcp'));
+    expect(cfg.workspaceIsLocal).toBe(true);
+  });
+
+  it('does not default to workspace-local in the home dir even inside a repo', () => {
+    const cfg = loadConfig({}, os.homedir(), inRepo);
+    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
+    expect(cfg.workspaceIsLocal).toBe(false);
   });
 
   it('expands a leading ~ in the workspace root', () => {
