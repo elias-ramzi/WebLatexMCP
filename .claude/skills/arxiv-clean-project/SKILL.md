@@ -16,9 +16,9 @@ _"identical output"_.
 
 Two output modes; **ask the user which they want each run** (after the baseline compile):
 
-- **Separate copy** — produce a cleaned `..._arXiv` folder (and, if asked, a `.zip`) and leave the live
-  project untouched. This is the tool's native behavior and the safe default: the working project keeps
-  its comments and todos for ongoing collaboration.
+- **Separate copy** — produce a cleaned `<id>_arXiv/` folder **and always a `<id>_arXiv.zip`** beside the
+  clone (exact location in step 8), leaving the live project untouched. This is the tool's native behavior
+  and the safe default: the working project keeps its comments and todos for ongoing collaboration.
 - **In place** — apply the cleaning back into the project through the MCP write/edit/delete tools, guard
   with `compile`, show the `diff`, and `commit`/`push` only if asked. **Destructive**: it strips the
   comments and draft macros out of the live Overleaf project.
@@ -30,11 +30,18 @@ Run in order. Stop and report if any step fails.
 1. **Pick the project.** If the user didn't name one, call `list_projects` and ask which.
 2. **Sync & baseline.** `project_sync` the project, then `compile`. Record success + page count. **If it
    does not compile cleanly to begin with, stop** and tell the user — do not clean a broken project.
-3. **Locate the clone on disk.** The cleaner needs a real folder. The MCP server clones each project to
-   `{WEB_LATEX_MCP_WORKSPACE}/{id}` (default `~/.web-latex-mcp/projects/{id}` when the env var is unset).
-   Resolve that path, confirm it is a git repo whose contents match `list_files`. If you can't find it,
-   ask the user for the clone path (or, for text-only cleaning, mirror the `.tex` files into the
-   scratchpad via `list_files` + `read_file` — see note below).
+3. **Get the clone path from the server — don't guess it.** The cleaner needs a real folder, and
+   `list_projects` returns the authoritative one: each project's `path` is its on-disk clone directory
+   (`<workspaceRoot>/<id>`), with a `cloned` flag. Call `list_projects`, take the `path` for your project
+   as `<clone>`, and confirm `cloned` is true (if not, `project_sync` first). This is drift-proof — the
+   server computes `path` the same way it decides where clones live, so it stays correct no matter how
+   `WEB_LATEX_MCP_WORKSPACE` is set (home default, the `cwd` workspace-local dir, or an explicit path).
+   Set `<workspaceRoot>` to the parent of `<clone>` — **step 8 writes the cleaned copy + zip there**, beside
+   the clone. Because server and agent share a filesystem (stdio), the clone — figures and all — is already
+   on disk; there is nothing to "pull". If `list_projects` shows the project but `path` is not reachable
+   from your shell, the server is not co-located; stop and tell the user rather than producing a partial
+   archive.
+
 4. **Ensure the tool is installed.** `arxiv_latex_cleaner --help`. If missing, install it (needs Python
    ≥3.9): prefer `pipx install arxiv-latex-cleaner`, else `pip install --user arxiv-latex-cleaner`.
 5. **Detect draft macros to delete.** `grep` the `.tex` for `\usepackage{todonotes}` and common draft
@@ -48,29 +55,57 @@ Run in order. Stop and report if any step fails.
 7. **Run the cleaner** on a scratchpad _copy_ of the clone (never point it at the live clone's `.git`):
 
    ```bash
-   cp -r "<clone>" "<scratch>/proj" && rm -rf "<scratch>/proj/.git"
-   arxiv_latex_cleaner "<scratch>/proj" --keep_bib \
+   cp -r "<clone>" "<scratch>/<id>" && rm -rf "<scratch>/<id>/.git"
+   arxiv_latex_cleaner "<scratch>/<id>" --keep_bib \
      --commands_to_delete todo note fixme \
      --environments_to_delete note comment
-   # -> writes cleaned tree to <scratch>/proj_arXiv/
+   # -> writes the cleaned tree to <scratch>/<id>_arXiv/  (basename tracks the input dir)
    ```
 
    Always pass `--keep_bib` (default operation; keeps this repo's `.bib`-guarding intent). Add image
    flags only if the user opted in (see below).
 
 8. **Deliver by mode:**
-   - **Separate copy:** report the `..._arXiv` path. If the user wants a submission archive, zip it
-     (`cd <scratch> && zip -r proj_arXiv.zip proj_arXiv`) and give them the path. **No MCP mutation.**
+   - **Separate copy (always zip):** place the cleaned tree **and a zip** beside the clone, in
+     `<workspaceRoot>` — clearing any stale prior run first. The zip holds the cleaned files at its root
+     (arXiv-ready — no wrapping folder). **No MCP mutation.**
+
+     ```bash
+     rm -rf "<workspaceRoot>/<id>_arXiv" "<workspaceRoot>/<id>_arXiv.zip"
+     cp -r "<scratch>/<id>_arXiv" "<workspaceRoot>/<id>_arXiv"
+     ( cd "<workspaceRoot>/<id>_arXiv" && zip -r "../<id>_arXiv.zip" . )
+     ```
+
+     Keep **both** the folder and the zip, then **surface the zip** (see "Surfacing the zip" below) and
+     stop — the live project is never touched.
+
    - **In place:** reconcile the cleaned tree back into the project **through MCP tools** — for each
      changed `.tex`, `write_file` the cleaned content; `delete_file` anything the cleaner dropped. This
      keeps the per-project mutex and guards in play (`.bib` is untouched thanks to `--keep_bib`). Then
      go to step 9.
+
 9. **Recompile (in-place only).** `compile` again — it must still succeed. Fewer pages / removed content
    is expected; broken build is not. If it breaks, fix it, or `discard` and report.
 10. **Review (in-place only).** Show the `diff`. Do **not** `commit`/`push` unless the user asks — per
     CLAUDE.md, mutating the remote happens only on explicit request.
 
 Do all MCP edits inside the one project so the per-project mutex serializes them.
+
+## Surfacing the zip (separate-copy mode)
+
+Give the user a usable pointer to `<workspaceRoot>/<id>_arXiv.zip`:
+
+- When `<workspaceRoot>` is **inside the Bash working directory** — the `cwd` sentinel, the common case
+  here, where the zip lands under the git-excluded `.web_latex_mcp/` — present a **clickable
+  workspace-relative link**, e.g. `[.web_latex_mcp/<id>_arXiv.zip](.web_latex_mcp/<id>_arXiv.zip)`. It is
+  durable across sessions and already untracked, so it never shows in this repo's `git status`.
+- Otherwise (home-dir default, or an explicit path outside the workspace) give the **absolute path** and
+  note it lives outside the IDE workspace, so it can't be a clickable relative link.
+- If `<workspaceRoot>` happens to sit inside some _other_ git repo that does not already exclude it, add
+  `<id>_arXiv/` and `<id>_arXiv.zip` to that repo's `.git/info/exclude` so the export is never
+  accidentally tracked (the same local-exclude trick `summarize-paper` uses).
+
+Report the zip's size and the page count before/after alongside the link.
 
 ## Default operations
 
@@ -80,8 +115,8 @@ in-place mode is destructive — call that out to the user before applying it in
 
 ## Image compression (opt-in)
 
-Only when the user asks (e.g. "shrink it to fit arXiv's 50MB limit"). These need the real clone with its
-binary assets, so they only work on the on-disk clone, not an MCP text mirror:
+Only when the user asks (e.g. "shrink it to fit arXiv's 50MB limit"). These act on the clone's binary
+assets, which are already on disk (step 3):
 
 - `--resize_images --im_size 1000` — cap the longest side at N px.
 - `--convert_png_to_jpg --png_quality 80` — re-encode large PNGs as JPG.
@@ -90,14 +125,9 @@ binary assets, so they only work on the on-disk clone, not an MCP text mirror:
 Recompile and eyeball figure quality in the PDF before recommending a commit — over-aggressive resizing
 degrades figures.
 
-## Note: MCP text mirror fallback
-
-If the on-disk clone is unreachable but the user still wants comment/todo cleaning (no image ops), mirror
-the project's `.tex` into the scratchpad with `list_files` + `read_file`, run the cleaner there, and
-(in-place mode) `write_file` the results back. Image flags are unavailable on this path.
-
 ## After you finish
 
-Report concisely: which draft macros/environments were removed, whether comments were stripped, that it
-still compiles (in-place) or where the `..._arXiv` copy/zip lives (separate), and the page count
-before/after. For in-place, point the user at the `diff` and ask whether to commit and push.
+Report concisely: which draft macros/environments were removed, whether comments were stripped, and the
+page count before/after. For **separate-copy**, surface the `<id>_arXiv.zip` per "Surfacing the zip"
+(clickable relative link when the workspace is local) and confirm the live project was left untouched. For
+**in-place**, confirm it still compiles, point the user at the `diff`, and ask whether to commit and push.
