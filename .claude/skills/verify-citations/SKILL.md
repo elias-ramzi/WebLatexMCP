@@ -1,6 +1,6 @@
 ---
 name: verify-citations
-description: Verify the citations already in a project's .bib bibliography against DBLP — check each entry's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, and optionally annotate the entries you confirmed. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a LaTeX/Overleaf project. Read-only by default; never changes a .bib without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
+description: Verify the citations already in a project's .bib bibliography against DBLP — check each entry's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write a local git-excluded audit report you can open, and optionally annotate the entries you confirmed. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a LaTeX/Overleaf project. Read-only for the .bib by default (the report is a separate local file, never pushed); never changes a .bib without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
 # Verify a project's citations against DBLP
@@ -33,6 +33,10 @@ Both require `confirmBibEdit: true` on the `edit_file`/`write_file` call **and**
 user first. When in doubt, do not write. A missed annotation is harmless; an unrequested edit to someone's
 bibliography is not.
 
+Writing the **local audit report** (see _The audit report_) is **not** a `.bib` write and is exempt from
+this rule: it's a single git-excluded markdown file at the clone root that never touches the `.tex`/`.bib`
+and is never pushed — so, like `summarize-paper`'s note, it needs no permission and is produced every run.
+
 **Verification comes from DBLP, not from your own memory.** Do not "confirm" a citation from what you
 think you know about the paper — only an actual DBLP match counts. If DBLP can't confirm it, it's
 unverified, and you say so.
@@ -41,7 +45,8 @@ unverified, and you say so.
 
 Run in order. Stop and report if a step fails.
 
-1. **Pick the project.** If the user didn't name one, `list_projects` and ask which.
+1. **Pick the project.** `list_projects`; if the user didn't name one, ask which. Note the project's clone
+   **`path`** from the result — you need it for the report's git-exclude step — and that it's `cloned`.
 2. **Sync.** `project_sync` the project so you check the current bibliography, not a stale clone.
 3. **Ask the scope: whole `.bib`, or only what the draft cites?** Before doing any DBLP work, ask the
    user whether to verify **every entry in the `.bib`** or **only the entries actually cited in the
@@ -63,8 +68,11 @@ Run in order. Stop and report if a step fails.
 7. **Resolve the doubtful ones with the user.** Go through the flagged entries (one at a time, or a few
    at a time if there are many), showing the `.bib` fields beside the DBLP record and naming the exact
    discrepancy. Let the user decide. **Never resolve a doubt by guessing.**
-8. **Report.** A short summary: how many verified cleanly, how many need attention (with the specifics),
-   how many weren't found on DBLP. If you scoped to cited entries, say how many `.bib` entries you skipped.
+8. **Report — inline and to a file.** Give the short inline summary (how many verified cleanly, how many
+   need attention with the specifics, how many weren't found on DBLP; if you scoped to cited entries, how
+   many `.bib` entries you skipped). **Then write the persistent report** per _The audit report_ below and
+   surface its link. Capture each flagged entry's **final** status — including how the user resolved it in
+   step 7 (accepted as-is, left unverified, or fixed).
 9. **(Optional, opt-in) Annotate.** If — and only if — the user wants it, add a `% verified-by-claude`
    comment to each confirmed entry (see _Annotating verified entries_). This is the one and only `.bib`
    write the skill makes on its own initiative, and only after an explicit yes.
@@ -184,9 +192,73 @@ explicit yes, add a single comment line **immediately above** each confirmed ent
 - Only annotate **confident matches** (or entries the user explicitly accepted). Never annotate something
   still in doubt.
 
+## The audit report
+
+Every run writes a persistent, local report and surfaces it — so the findings outlive the chat and the
+user can open the full table instead of scrolling back.
+
+- **Path:** `citation-report.local.md` at the **root of the project clone** (the `path` from step 1). When
+  clones are workspace-local this lands under `.web_latex_mcp/<id>/`, inside the IDE workspace; when the
+  clone lives elsewhere (e.g. the home-dir default) it's written at that clone root all the same.
+- **Local-only, never pushed.** It is **not** a `.bib` change: a single markdown file kept out of git via
+  the clone's `.git/info/exclude`, exactly like `summarize-paper`'s note. So `commit` (which stages
+  `git add -A`) can't pick it up, it stays out of `status`/`diff`, and it survives `discard`.
+
+**Make it git-excluded _before_ writing it**, so it can never be staged, then write it with `write_file`:
+
+```bash
+DIR="<clone path from list_projects>"
+NOTE="citation-report.local.md"
+mkdir -p "$DIR/.git/info"
+grep -qxF "$NOTE" "$DIR/.git/info/exclude" 2>/dev/null || printf '%s\n' "$NOTE" >> "$DIR/.git/info/exclude"
+git -C "$DIR" check-ignore "$NOTE"   # must echo the filename → confirms it's ignored
+```
+
+Then `write_file` the report (path `citation-report.local.md`). Because it's git-excluded, `write_file`'s
+returned `diff` is empty — expected, not an error. Confirm via `status` that it stays out of the untracked
+list. On a re-run, overwrite it with the current findings, preserving any notes the user added by hand.
+
+**Surface it.** Give the user a pointer to `<clone>/citation-report.local.md`:
+
+- When the clone is **inside the IDE/Bash working directory** (the `.web_latex_mcp` case), present a
+  **clickable workspace-relative link**, e.g. `[.web_latex_mcp/<id>/citation-report.local.md](.web_latex_mcp/<id>/citation-report.local.md)`.
+- Otherwise give the **absolute path** and note it lives outside the workspace, so it can't be a clickable
+  relative link.
+
+**Contents** — a git-excluded header marker, then the totals and the per-entry findings (derive every row
+from the DBLP comparisons — the same evidence you showed inline):
+
+```markdown
+<!--
+Local citation-audit report by Claude (the `verify-citations` skill).
+Git-excluded — local only, never pushed. Safe to edit or delete.
+Generated: 2026-07-16 · Scope: only-cited | whole .bib
+-->
+
+# Citation audit — <paper title or project id>
+
+**Totals:** N checked · N verified · N need attention · N not found on DBLP · N skipped (uncited)
+
+## Needs attention
+
+| cite key   | field   | in .bib                | on DBLP          | resolution      |
+| ---------- | ------- | ---------------------- | ---------------- | --------------- |
+| he2016deep | year    | 2015                   | 2016             | user fixed      |
+| vaswani17  | authors | truncated `and others` | 8 authors listed | left unverified |
+
+## Not found on DBLP
+
+- `key` — title — (books, tech reports, standards, or very new work may simply be unindexed)
+
+## Verified
+
+- `key` — matched DBLP `conf/cvpr/HeZRS16` (list them, or just the count — the user's preference)
+```
+
 ## After you finish
 
 Report concisely: total entries checked, how many verified against DBLP, the specific entries that need
-the user's attention and why, and any that weren't on DBLP. If you annotated, say which file(s) you
-touched and remind the user that — per CLAUDE.md — `commit`/`push` happen only when they ask, so nothing
-has left their machine. Point them at the `diff`.
+the user's attention and why, and any that weren't on DBLP. **Surface the `citation-report.local.md` link**
+(clickable when the clone is workspace-local) and note it's local-only — never pushed. If you annotated,
+say which file(s) you touched and remind the user that — per CLAUDE.md — `commit`/`push` happen only when
+they ask, so nothing has left their machine. Point them at the `diff`.
