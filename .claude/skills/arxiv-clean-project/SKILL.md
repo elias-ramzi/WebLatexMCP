@@ -1,6 +1,12 @@
 ---
 name: arxiv-clean-project
 description: Prepare a LaTeX/Overleaf project for arXiv submission with google-research/arxiv-latex-cleaner — strip source comments, delete draft macros (\todo, \note, review environments), and optionally shrink oversized figures to fit arXiv's 50MB limit. Produces either a separate submission-ready copy (the tool's native mode) or applies the cleaning back into the project in place. Use when the user asks to "clean", "arxiv-clean", "prepare for arXiv/submission", "strip comments/todos", or "make a submission copy" of an Overleaf/LaTeX project. Operates on projects served by the web-latex-mcp MCP server. NOT for cosmetic reformatting (that is format-latex-project).
+allowed-tools:
+  - Bash(arxiv_latex_cleaner:*)
+  - Bash(pipx install arxiv-latex-cleaner:*)
+  - Bash(pip install arxiv-latex-cleaner:*)
+  - Bash(pip install --user arxiv-latex-cleaner:*)
+  - Bash(zip:*)
 ---
 
 # Clean a LaTeX project for arXiv

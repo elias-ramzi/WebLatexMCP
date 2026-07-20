@@ -105,6 +105,21 @@ Or add it in one line with Claude Code:
 claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
 ```
 
+### Or install the Claude Code plugin — server **and** skills together
+
+The `claude mcp add` / raw-config routes register the server but **not** the [skills](#skills-claude-code) —
+those only load when Claude Code is launched from a clone of this repo. Installing the **plugin** instead
+gives you the MCP server _and_ all the skills in every session, from any directory:
+
+```bash
+# In Claude Code:
+/plugin marketplace add elias-ramzi/WebLatexMCP
+/plugin install web-latex-mcp@web-latex-tools
+```
+
+The plugin pins no workspace, so clones still land beside your paper (the workspace-local default). Set
+`WEB_LATEX_MCP_PROJECTS` in your own MCP config, or register projects at runtime, as usual.
+
 ## What you can do
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
@@ -121,8 +136,9 @@ See the [full tool reference](docs/tools.md).
 
 ## Skills (Claude Code)
 
-Launched from this repo, Claude Code loads task-specific skills that drive the tools — each stops at the
-diff, so nothing is committed or pushed unless you ask:
+Claude Code loads task-specific skills that drive the tools — each stops at the diff, so nothing is
+committed or pushed unless you ask. You get them by [installing the plugin](#or-install-the-claude-code-plugin--server-and-skills-together)
+(available everywhere) or by launching Claude Code from a clone of this repo:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.

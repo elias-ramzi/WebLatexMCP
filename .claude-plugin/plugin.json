@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "web-latex-mcp",
+  "displayName": "WebLatexMCP",
+  "version": "0.1.0",
+  "description": "Read, edit, compile, and commit LaTeX in any git-hosted project (Overleaf, GitHub, or any git remote) — the MCP server plus its LaTeX skills (project cleanup, DBLP citation audits, bibliography normalization) in one install.",
+  "author": {
+    "name": "Elias Ramzi",
+    "email": "elias.ramzi@gmail.com"
+  },
+  "homepage": "https://github.com/elias-ramzi/WebLatexMCP",
+  "repository": "https://github.com/elias-ramzi/WebLatexMCP",
+  "license": "MIT",
+  "keywords": ["latex", "overleaf", "mcp", "bibliography", "dblp", "arxiv"],
+  "skills": "./.claude/skills",
+  "mcpServers": {
+    "web-latex-mcp": {
+      "command": "npx",
+      "args": ["-y", "web-latex-mcp"]
+    }
+  }
+}

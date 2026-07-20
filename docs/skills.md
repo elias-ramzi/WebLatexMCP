@@ -1,8 +1,9 @@
 # Skills (Claude Code)
 
 For **Claude Code**, the repo bundles task-specific skills that drive the [tools](tools.md). They load
-automatically when Claude Code is launched from this repo; each stops at the diff, so nothing is committed
-or pushed unless you ask.
+automatically when you install the [plugin](../README.md#or-install-the-claude-code-plugin--server-and-skills-together)
+(server + skills, available in every session) or when Claude Code is launched from a clone of this repo;
+each stops at the diff, so nothing is committed or pushed unless you ask.
 
 | Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                            | Mutates                     | Invoke                  |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ----------------------- |
