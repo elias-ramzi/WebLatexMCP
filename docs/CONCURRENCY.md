@@ -86,10 +86,13 @@ returns the **full content of all three sides**:
   a substitute for the full sides).
 
 Plus, at the top level: `conflictPaths` (the scope up front), `remoteHead` (the commit
-we conflicted against), and `remoteCommits` (the hashes/messages that landed upstream).
-`theirs` is otherwise invisible — a `read_file` only sees the working tree — so it is
-included in full. (You can also fetch any committed version directly with
-`read_file(path, ref)`, e.g. `ref: "origin/master"`.)
+we conflicted against), `mergeBase` (the common-ancestor commit sha), and `remoteCommits`
+(the hashes/messages that landed upstream). Any side too large to inline is elided with an
+exact `read_file(path, ref)` pointer — `theirs` at `remoteHead`/`origin/<branch>`, `base`
+at `mergeBase` — so all three full sides are always reconstructable from refs in the
+payload, with no shell. (`read_file`'s `ref` takes any commit sha, `origin/<branch>`, or
+`HEAD~1`.) This matters most for a **multi-hunk** conflict, where `base` is what
+distinguishes "they changed this line, we didn't" from "we both changed it".
 
 ### Resolving a conflict through the tool
 
@@ -183,7 +186,7 @@ The `push` tool returns a structured result with a `status` field:
 **Reading a `conflict` result.** The rebase was already aborted — your clone is
 back to its pre-push state, nothing is half-merged. `conflictFiles` gives each
 conflicting file's full `base`/`ours`/`theirs` plus a marker `hunks` view, and the
-top level carries `conflictPaths`, `remoteHead`, and `remoteCommits`. Reconcile the
+top level carries `conflictPaths`, `remoteHead`, `mergeBase`, and `remoteCommits`. Reconcile the
 three sides, then retry `push` with a **`resolutions`** array carrying each
 conflicted file's full merged content (see [Resolving a conflict through the
 tool](#resolving-a-conflict-through-the-tool)). Don't just edit and push again —

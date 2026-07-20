@@ -3,6 +3,7 @@ import { renderConflictText, renderRebasedOver } from '../../src/lib/conflictTex
 import type { ConflictReport } from '../../src/services/gitService.js';
 
 const REMOTE_HEAD = 'e782dae2c0ffee1234567890abcdef0011223344';
+const MERGE_BASE = 'ba5eba5e1122334455667788990011223344aabb';
 
 function report(overrides: Partial<ConflictReport> = {}): ConflictReport {
   return {
@@ -18,6 +19,7 @@ function report(overrides: Partial<ConflictReport> = {}): ConflictReport {
     conflictPaths: ['sections/04.tex'],
     rebasedOnto: 'origin/master',
     remoteHead: REMOTE_HEAD,
+    mergeBase: MERGE_BASE,
     remoteCommits: [{ hash: 'abc1234def', message: 'reword scaling section' }],
     guidance: 'resolve the overlap',
     ...overrides,
@@ -33,6 +35,7 @@ describe('renderConflictText', () => {
     expect(text).toContain('sections/04.tex');
     expect(text).toContain(REMOTE_HEAD); // full sha
     expect(text).toContain('e782dae2'); // abbreviated
+    expect(text).toContain(MERGE_BASE); // merge-base sha, so base is fetchable by ref
     expect(text).toContain('expectedRemoteHead');
     expect(text).toContain('reword scaling section');
     // All three full sides.
@@ -48,11 +51,13 @@ describe('renderConflictText', () => {
     const base = report();
     const text = renderConflictText('conflict', {
       ...base,
-      files: [{ ...base.files[0]!, theirs: huge }],
+      files: [{ ...base.files[0]!, theirs: huge, base: huge }],
     });
 
     expect(text).not.toContain(huge);
+    // theirs points at the remote ref; base points at the merge-base sha — both shell-free.
     expect(text).toContain('read_file("sections/04.tex", ref="origin/master")');
+    expect(text).toContain(`read_file("sections/04.tex", ref="${MERGE_BASE}")`);
   });
 
   it('marks an absent side (added/deleted) rather than showing null', () => {

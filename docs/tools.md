@@ -63,7 +63,8 @@ web editor, `push` is **safe by default**: it `pull --rebase`s onto the latest r
 pushing) and **never force-pushes**. A rebase conflict means the agent and a human touched the same lines —
 `push` aborts the rebase and returns `status: "conflict"` — a full 3-way payload: each conflicted file's
 `base`/`ours`/`theirs` (full contents) plus a marker `hunks` view, and top-level `conflictPaths`,
-`remoteHead`, and `remoteCommits`. (You can also read any side directly with `read_file(path, ref)`.) It
+`remoteHead`, `mergeBase`, and `remoteCommits`. (You can read any side directly with `read_file(path, ref)`
+— `ref` takes `remoteHead`/`mergeBase` or any commit sha.) It
 never auto-merges. To resolve, retry `push` with a `resolutions` array — the full merged content for each
 conflicted file (`.bib` files need `confirmBibEdit: true`); the set is validated (missing/extra files are
 named), an optional `expectedRemoteHead` refuses the push if the remote moved again (abbreviated SHAs are

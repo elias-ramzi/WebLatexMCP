@@ -347,6 +347,133 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       const remoteHeadSha = (await simpleGit(dir).revparse(['origin/master'])).trim();
       expect(report.remoteHead).toBe(remoteHeadSha);
       expect(report.remoteCommits.map((c) => c.message)).toContain('remote edits line 2');
+
+      // mergeBase is the common ancestor sha, and `base` is fetchable at that ref.
+      const mergeBaseSha = (
+        await simpleGit(dir).raw(['merge-base', 'master', 'origin/master'])
+      ).trim();
+      expect(report.mergeBase).toBe(mergeBaseSha);
+      expect(await git.showAtRef(dir, report.mergeBase!, 'main.tex')).toBe('alpha\nbeta\ngamma\n');
+    });
+  });
+
+  describe('multi-file / multi-hunk conflict (MCP-only acceptance)', () => {
+    // a.tex has two far-apart overlapping regions (→ two hunks); b.tex has one. Both conflict.
+    const aBase = 'a1\na2\na3\na4\na5\na6\na7\na8\na9\n';
+    const bBase = 'b1\nb2\nb3\n';
+
+    async function setUpConflict(
+      git: GitService,
+      files: FileService,
+      dir: string,
+      remote: FakeRemote,
+    ) {
+      await files.applyEdits(dir, 'a.tex', [
+        { oldString: 'a2', newString: 'a2-local' },
+        { oldString: 'a8', newString: 'a8-local' },
+      ]);
+      await files.applyEdits(dir, 'b.tex', [{ oldString: 'b2', newString: 'b2-local' }]);
+      await git.commit(dir, { message: 'local edits' });
+      await pushCommit(
+        remote,
+        {
+          'a.tex': 'a1\na2-remote\na3\na4\na5\na6\na7\na8-remote\na9\n',
+          'b.tex': 'b1\nb2-remote\nb3\n',
+        },
+        'remote edits',
+      );
+    }
+
+    it('resolves end-to-end using only payload refs + resolutions + expectedRemoteHead', async () => {
+      const { remote, git, files, dir } = await setup({ 'a.tex': aBase, 'b.tex': bBase });
+      await setUpConflict(git, files, dir, remote);
+
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      const report = conflict.conflict!;
+
+      // Scope + multi-hunk.
+      expect(report.conflictPaths.sort()).toEqual(['a.tex', 'b.tex']);
+      const a = report.files.find((f) => f.path === 'a.tex')!;
+      expect(a.hunks.length).toBe(2);
+
+      // All three full sides reconstructable from payload refs alone (no shell).
+      expect(await git.showAtRef(dir, report.mergeBase!, 'a.tex')).toBe(aBase);
+      expect(await git.showAtRef(dir, 'HEAD', 'a.tex')).toBe(
+        'a1\na2-local\na3\na4\na5\na6\na7\na8-local\na9\n',
+      );
+      expect(await git.showAtRef(dir, report.rebasedOnto, 'a.tex')).toBe(
+        'a1\na2-remote\na3\na4\na5\na6\na7\na8-remote\na9\n',
+      );
+
+      // Resolve both files, guarding with the reported head, and push.
+      const aMerged = 'a1\na2-both\na3\na4\na5\na6\na7\na8-both\na9\n';
+      const bMerged = 'b1\nb2-both\nb3\n';
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [
+            { path: 'a.tex', content: aMerged },
+            { path: 'b.tex', content: bMerged },
+          ],
+          expectedRemoteHead: report.remoteHead,
+        },
+      );
+
+      expect(res.status).toBe('pushed');
+      expect(await readFromRemote(remote, 'a.tex')).toBe(aMerged);
+      expect(await readFromRemote(remote, 'b.tex')).toBe(bMerged);
+    });
+
+    it('omitting a conflicted file re-surfaces the report naming it, pushes nothing', async () => {
+      const { remote, git, files, dir } = await setup({ 'a.tex': aBase, 'b.tex': bBase });
+      await setUpConflict(git, files, dir, remote);
+      const before = await headSha(dir);
+
+      // Provide a.tex but omit b.tex (also conflicted).
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        { resolutions: [{ path: 'a.tex', content: aBase }] },
+      );
+
+      expect(res.status).toBe('conflict');
+      expect(res.conflict?.guidance).toContain('b.tex');
+      expect(res.conflict?.conflictPaths.sort()).toEqual(['a.tex', 'b.tex']);
+      // Nothing pushed; clone restored.
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect(await readFromRemote(remote, 'b.tex')).toBe('b1\nb2-remote\nb3\n');
+    });
+
+    it('a non-conflicted resolution path is rejected by name, pushes nothing', async () => {
+      const { remote, git, files, dir } = await setup({ 'a.tex': aBase, 'b.tex': bBase });
+      await setUpConflict(git, files, dir, remote);
+      const before = await headSha(dir);
+
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          {
+            resolutions: [
+              { path: 'a.tex', content: 'a1\na2-both\na3\na4\na5\na6\na7\na8-both\na9\n' },
+              { path: 'b.tex', content: 'b1\nb2-both\nb3\n' },
+              { path: 'c.tex', content: 'not in conflict\n' },
+            ],
+          },
+        ),
+      ).rejects.toThrow(/c\.tex/);
+
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect(await readFromRemote(remote, 'a.tex')).toBe(
+        'a1\na2-remote\na3\na4\na5\na6\na7\na8-remote\na9\n',
+      );
     });
   });
 

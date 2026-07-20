@@ -96,6 +96,7 @@ const outputSchema = {
   conflictPaths: z.array(z.string()).optional(),
   rebasedOnto: z.string().optional(),
   remoteHead: z.string().optional(),
+  mergeBase: z.string().nullable().optional(),
   remoteCommits: z.array(remoteCommitSchema).optional(),
   // status === 'awaiting-approval'
   base: z.string().optional(),
@@ -124,6 +125,7 @@ function safePushToolResult(
     structured.conflictPaths = res.conflict.conflictPaths;
     structured.rebasedOnto = res.conflict.rebasedOnto;
     structured.remoteHead = res.conflict.remoteHead;
+    structured.mergeBase = res.conflict.mergeBase;
     structured.remoteCommits = res.conflict.remoteCommits;
   }
   // Put the full resolution payload in the model-visible text, not only structuredContent (which a
@@ -141,11 +143,18 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
       title: 'Push to Overleaf',
       description:
         'Safely push committed changes to the Overleaf remote. Default (direct) mode pull-rebases ' +
-        'onto the latest remote before pushing and never force-pushes; a conflict means a human ' +
-        'touched the same lines, so it aborts the rebase and returns status "conflict" with both ' +
-        'sides — it never auto-resolves. To resolve, retry with `resolutions` (the merged full-file ' +
-        'content for each conflicted file). Branch mode commits to a local review branch and lands ' +
-        'it only on approve=true. Requires confirm=true. See docs/CONCURRENCY.md.',
+        'onto the latest remote before pushing and never force-pushes; on success it reports the ' +
+        'new tip (pushedSha) and the remote commits it rebased over (rebasedOver). A conflict means ' +
+        'someone touched the same lines: it aborts the rebase (clone back to pre-push state, nothing ' +
+        'half-merged) and returns status "conflict" with a full 3-way payload — per file base/ours/' +
+        'theirs plus a marker `hunks` view, and top-level conflictPaths, remoteHead, mergeBase, and ' +
+        'remoteCommits (all in the result text, not just structuredContent). It never auto-resolves. ' +
+        'To resolve, retry with `resolutions` (the full merged content per conflicted file; the set ' +
+        'is validated and missing/extra files are named), optionally passing expectedRemoteHead ' +
+        '(the reported remoteHead) so the push is refused if the remote moved again. `.bib` files ' +
+        'need confirmBibEdit. Read any side directly with read_file(path, ref) using remoteHead/' +
+        'mergeBase. Branch mode commits to a local review branch and lands it only on approve=true. ' +
+        'Requires confirm=true. See docs/CONCURRENCY.md.',
       inputSchema,
       outputSchema,
     },

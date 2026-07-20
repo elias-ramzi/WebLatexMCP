@@ -77,6 +77,12 @@ export interface ConflictReport {
   rebasedOnto: string;
   /** Commit id of the remote head we conflicted against (`origin/<branch>`). */
   remoteHead: string;
+  /**
+   * Merge-base commit sha (common ancestor of `ours` and `theirs`), or `null` if unrelated. Read
+   * any file's `base` side with `read_file(path, ref=<mergeBase>)` — essential for a multi-hunk
+   * 3-way merge, where the base is what distinguishes "they changed it" from "we both changed it".
+   */
+  mergeBase: string | null;
   /** The remote commits we did not have — what landed upstream — newest first. */
   remoteCommits: RemoteCommit[];
   guidance: string;
@@ -685,6 +691,7 @@ export class GitService {
       conflictPaths: files.map((f) => f.path),
       rebasedOnto: remoteRef,
       remoteHead: (await this.revParseOrNull(git, remoteRef)) ?? remoteRef,
+      mergeBase,
       remoteCommits: await this.logCommits(git, `${oursRef}..${remoteRef}`),
       guidance:
         'We and someone on the remote touched the same lines. The clone is back to its pre-push ' +

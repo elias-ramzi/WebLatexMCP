@@ -32,6 +32,9 @@ export function renderConflictText(summary: string, report: ConflictReport): str
   const out: string[] = [summary, '', report.guidance, ''];
   out.push(`remoteHead: ${report.remoteHead} (${report.remoteHead.slice(0, 8)})`);
   out.push('Pass remoteHead back as `expectedRemoteHead` when you resolve.');
+  if (report.mergeBase) {
+    out.push(`mergeBase: ${report.mergeBase} (${report.mergeBase.slice(0, 8)})`);
+  }
   if (report.remoteCommits.length) {
     out.push('', `Landed upstream (${report.remoteCommits.length} commit(s)):`);
     for (const c of report.remoteCommits) out.push(`  ${c.hash.slice(0, 8)} ${c.message}`);
@@ -40,10 +43,15 @@ export function renderConflictText(summary: string, report: ConflictReport): str
     '',
     `Conflicted file(s) (${report.conflictPaths.length}): ${report.conflictPaths.join(', ')}`,
   );
+  // Fetch pointer for a side that's too large to inline — an exact ref, no shell needed.
+  const baseHint = (p: string): string =>
+    report.mergeBase
+      ? `read_file("${p}", ref="${report.mergeBase}")`
+      : 'see the overlap markers above';
   for (const f of report.files) {
     out.push('', `━━━━━ ${f.path} ━━━━━`);
     if (f.hunks.length) out.push('overlap:', renderHunks(f.hunks));
-    out.push(renderSide('base (common ancestor)', f.base, 'see the overlap markers above'));
+    out.push(renderSide('base (common ancestor)', f.base, baseHint(f.path)));
     out.push(renderSide('ours (local)', f.ours, `read_file("${f.path}", ref="HEAD")`));
     out.push(
       renderSide(
