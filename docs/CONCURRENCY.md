@@ -71,6 +71,54 @@ So we do **not** auto-resolve. On any conflict the tool:
 Failing safe and asking a human beats merging wrong. A conflict is information, not
 an error to be papered over.
 
+### The conflict result carries everything needed to resolve
+
+Aborting is the _default_, not a dead end. The `status: "conflict"` result is a full
+3-way merge payload, so an MCP-only client (e.g. Claude Desktop) has the same material
+a shell-capable agent (Claude Code) would get from raw `git`. Per conflicted file it
+returns the **full content of all three sides**:
+
+- `base` — the merge-base (common ancestor), so you can tell "they changed this line,
+  we didn't" from "we both changed it";
+- `ours` — our (local) full version;
+- `theirs` — the full remote version that landed;
+- `hunks` — a compact `<<<<<<<`-style marker view of just the overlap (an addition, not
+  a substitute for the full sides).
+
+Plus, at the top level: `conflictPaths` (the scope up front), `remoteHead` (the commit
+we conflicted against), and `remoteCommits` (the hashes/messages that landed upstream).
+`theirs` is otherwise invisible — a `read_file` only sees the working tree — so it is
+included in full. (You can also fetch any committed version directly with
+`read_file(path, ref)`, e.g. `ref: "origin/master"`.)
+
+### Resolving a conflict through the tool
+
+Once you've reconciled the sides, apply the merge back through the same `push` tool —
+no shell required:
+
+- Retry `push` with a **`resolutions`** array — for each conflicted file, the full
+  merged file content. The submitted `content` is used **verbatim** as the resolved
+  blob, so you are responsible for folding in the remote's non-conflicting edits too
+  (which is exactly why you were handed `theirs` in full). The tool re-runs the rebase,
+  writes your content, `git add`s it, `git rebase --continue`s, and pushes.
+- The set is **validated**: omit a conflicted file and the tool re-surfaces the full
+  report naming what's missing; include a file that wasn't in conflict and it's
+  rejected by name (nothing is pushed). A wrong `resolutions` tells you exactly what's
+  wrong instead of silently re-aborting.
+- Pass **`expectedRemoteHead`** (the `remoteHead` from the conflict you merged against).
+  If the remote advanced again since you computed the merge, the push is refused rather
+  than applying your merge over a stale `theirs`.
+- The merged text always originates from the caller — nothing is auto-merged. `.bib`
+  files may only be included when **`confirmBibEdit: true`**, mirroring the
+  write/edit/delete guard.
+- On success the result includes **`pushedSha`**, the new tip now on the remote.
+
+Why this is needed at all: a rebase replays our local _commit_ onto the moved remote,
+so the same overlapping line conflicts on _every_ retry regardless of what the
+working tree looks like — editing the file and pushing again just re-conflicts. The
+merged content has to be applied _inside_ the rebase (add + `--continue`), which is
+exactly what `resolutions` does.
+
 ## The sync-lag caveat
 
 Overleaf's Git bridge does **not** instantly reflect in-flight web edits. Someone
@@ -125,17 +173,21 @@ document.
 
 The `push` tool returns a structured result with a `status` field:
 
-| Mode                    | What happens                                                                                                              | Result `status`                           |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `direct` (default)      | Commit pending work → fetch → `pull --rebase` → fetch → `pull --rebase` (right before pushing) → `push`. Never `--force`. | `pushed` / `nothing-to-push` / `conflict` |
-| `branch` (no `approve`) | Commit work to a local-only feature branch; return its diff vs `master`.                                                  | `awaiting-approval`                       |
-| `branch` + `approve`    | Rebase the reviewed branch onto fresh `master`, fast-forward, push.                                                       | `pushed` / `conflict`                     |
+| Mode                     | What happens                                                                                                              | Result `status`                           |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `direct` (default)       | Commit pending work → fetch → `pull --rebase` → fetch → `pull --rebase` (right before pushing) → `push`. Never `--force`. | `pushed` / `nothing-to-push` / `conflict` |
+| `branch` (no `approve`)  | Commit work to a local-only feature branch; return its diff vs `master`.                                                  | `awaiting-approval`                       |
+| `branch` + `approve`     | Rebase the reviewed branch onto fresh `master`, fast-forward, push.                                                       | `pushed` / `conflict`                     |
+| `direct` + `resolutions` | Re-run the rebase, apply the merged content for each conflicted file, `--continue`, push. `.bib` needs `confirmBibEdit`.  | `pushed` / `conflict` / `nothing-to-push` |
 
 **Reading a `conflict` result.** The rebase was already aborted — your clone is
-back to its pre-push state, nothing is half-merged. `conflictFiles` lists each
-conflicting file with its hunks; each hunk gives the line range and both the
-`local` (our) and `remote` (upstream) text. Show both sides to the author, let
-them decide the merged text, then edit, commit, and push again.
+back to its pre-push state, nothing is half-merged. `conflictFiles` gives each
+conflicting file's full `base`/`ours`/`theirs` plus a marker `hunks` view, and the
+top level carries `conflictPaths`, `remoteHead`, and `remoteCommits`. Reconcile the
+three sides, then retry `push` with a **`resolutions`** array carrying each
+conflicted file's full merged content (see [Resolving a conflict through the
+tool](#resolving-a-conflict-through-the-tool)). Don't just edit and push again —
+the same commit replays and re-conflicts.
 
 > Note: this server is branch-agnostic (it rebases onto whatever the clone's
 > default branch is), but for Overleaf that branch is `master`, so this document

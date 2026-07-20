@@ -92,6 +92,8 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     expect(res.status).toBe('pushed');
     // Both edits survive — line-granularity merge.
     expect(await readFromRemote(remote, 'main.tex')).toBe('ALPHA\nbeta\nGAMMA\n');
+    // The clean push reports the remote commit it rebased over.
+    expect(res.rebasedOver?.map((c) => c.message)).toContain('remote edits line 3');
   });
 
   it('aborts the rebase and surfaces both sides when edits overlap', async () => {
@@ -148,6 +150,243 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     await expect(git.safePush(dir, remote.url, { username: 'git' })).rejects.toThrow(
       /uncommitted changes/,
     );
+  });
+
+  describe('conflict resolution (resolvePush)', () => {
+    it('applies merged content, continues the rebase, and pushes', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      // Confirm it conflicts first (nothing pushed, tree clean).
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+
+      // Resolve with a hand-merged line and push.
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'main.tex', content: 'alpha\nbeta-local-and-remote\ngamma\n' }],
+        },
+      );
+
+      expect(res.status).toBe('pushed');
+      expect(res.pushedCommits).toBe(1);
+      expect(await readFromRemote(remote, 'main.tex')).toBe(
+        'alpha\nbeta-local-and-remote\ngamma\n',
+      );
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+    });
+
+    it('surfaces the still-unresolved files when a resolution is missing (and aborts)', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const before = await headSha(dir);
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'other.tex', content: 'noop\n' }],
+        },
+      );
+
+      expect(res.status).toBe('conflict');
+      // The report names the missing conflicted file and lists the real conflict scope.
+      expect(res.conflict?.conflictPaths).toEqual(['main.tex']);
+      expect(res.conflict?.guidance).toContain('main.tex');
+      // Fail safe: rebase aborted, nothing pushed, clone back to its pre-resolve state.
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
+    });
+
+    it('refuses a .bib resolution without confirmBibEdit', async () => {
+      const { remote, git, dir } = await setup({ 'refs.bib': '@article{a,\n title={x}\n}\n' });
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          {
+            resolutions: [{ path: 'refs.bib', content: '@article{a,\n title={merged}\n}\n' }],
+          },
+        ),
+      ).rejects.toThrow(/\.bib/);
+    });
+
+    it('rejects an extra (non-conflicted) resolution by name and pushes nothing', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const before = await headSha(dir);
+      // main.tex is the real conflict; also (wrongly) include a bogus path.
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          {
+            resolutions: [
+              { path: 'main.tex', content: 'alpha\nMERGED\ngamma\n' },
+              { path: 'nope.tex', content: 'x\n' },
+            ],
+          },
+        ),
+      ).rejects.toThrow(/nope\.tex/);
+
+      // Fully undone: HEAD restored, nothing pushed.
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
+    });
+
+    it('accepts an abbreviated expectedRemoteHead that matches the current remote', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      const head = conflict.conflict!.remoteHead;
+
+      // Pass back only the 8-char prefix of the reported head — it must not read as "moved to self".
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'main.tex', content: 'alpha\nMERGED\ngamma\n' }],
+          expectedRemoteHead: head.slice(0, 8),
+        },
+      );
+
+      expect(res.status).toBe('pushed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nMERGED\ngamma\n');
+    });
+
+    it('refuses to apply when the remote advanced past expectedRemoteHead', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      // Resolve against a stale head id — the remote has since moved past it.
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          {
+            resolutions: [{ path: 'main.tex', content: 'alpha\nMERGED\ngamma\n' }],
+            expectedRemoteHead: '0000000000000000000000000000000000000000',
+          },
+        ),
+      ).rejects.toThrow(/Remote moved/);
+
+      expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
+    });
+  });
+
+  describe('conflict report payload', () => {
+    it('returns full base/ours/theirs plus remote head and landed commits', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(res.status).toBe('conflict');
+      const report = res.conflict!;
+
+      expect(report.conflictPaths).toEqual(['main.tex']);
+      const file = report.files.find((f) => f.path === 'main.tex')!;
+      // Full three sides — base is the common ancestor, ours/theirs the two full versions.
+      expect(file.base).toBe('alpha\nbeta\ngamma\n');
+      expect(file.ours).toBe('alpha\nbeta-local\ngamma\n');
+      expect(file.theirs).toBe('alpha\nbeta-remote\ngamma\n');
+      // Marker view still present as an addition.
+      expect(file.hunks.length).toBeGreaterThan(0);
+
+      // Remote head + the commit that landed.
+      const remoteHeadSha = (await simpleGit(dir).revparse(['origin/master'])).trim();
+      expect(report.remoteHead).toBe(remoteHeadSha);
+      expect(report.remoteCommits.map((c) => c.message)).toContain('remote edits line 2');
+    });
+  });
+
+  describe('read-at-ref (showAtRef)', () => {
+    it('reads a committed version at a ref without touching the working tree', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+      await simpleGit(dir).fetch(['origin']);
+
+      // Working tree still has our version; the ref read reaches the remote side.
+      expect(await git.showAtRef(dir, 'origin/master', 'main.tex')).toBe(
+        'alpha\nbeta-remote\ngamma\n',
+      );
+      expect(await git.showAtRef(dir, 'HEAD', 'main.tex')).toBe('alpha\nbeta-local\ngamma\n');
+      await expect(git.showAtRef(dir, 'origin/master', 'missing.tex')).rejects.toThrow(
+        /does not exist/,
+      );
+    });
+  });
+
+  describe('status divergence', () => {
+    it('lists ahead and behind commits', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'alpha', newString: 'ALPHA' }]);
+      await git.commit(dir, { message: 'my local commit' });
+      await pushCommit(remote, { 'main.tex': 'alpha\nbeta\nGAMMA\n' }, 'their remote commit');
+      await simpleGit(dir).fetch(['origin']);
+
+      const status = await git.status(dir);
+      expect(status.ahead).toBe(1);
+      expect(status.behind).toBe(1);
+      expect(status.aheadCommits.map((c) => c.message)).toContain('my local commit');
+      expect(status.behindCommits.map((c) => c.message)).toContain('their remote commit');
+    });
   });
 
   describe('branch-review mode', () => {

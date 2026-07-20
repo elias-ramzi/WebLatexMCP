@@ -130,7 +130,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
-  come back to you).
+  come back to you with both sides, and you resolve them by pushing the merged content back).
 
 See the [full tool reference](docs/tools.md).
 

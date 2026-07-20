@@ -99,6 +99,16 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   credential helpers (e.g. `gh auth setup-git`).
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
+- **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict `push`
+  aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way payload per
+  file (`base`/`ours`/`theirs` + marker `hunks`) plus `conflictPaths`/`remoteHead`/`remoteCommits`. This
+  payload is rendered into the result **text** (`src/lib/conflictText.ts`), not only `structuredContent`,
+  so an MCP-only client can resolve without a shell. The caller resolves by retrying `push` with
+  `resolutions` (full merged content per file — used verbatim, applied _inside_ the rebase via add +
+  `rebase --continue`); the set is validated (missing/extra files named), `expectedRemoteHead` guards
+  against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
+  gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
+  directly. Keep the merged text originating from the caller.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
 - **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
 - **Cross-platform (macOS/Linux/Windows).** Tool output paths are POSIX via `toPosix` (`src/lib/paths.ts`);

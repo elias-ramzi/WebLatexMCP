@@ -3,23 +3,23 @@
 All tools take an optional `project` id (defaults to `WEB_LATEX_MCP_DEFAULT_PROJECT`). File paths are always
 POSIX (`/`-separated), on every OS.
 
-| Tool                | Description                                                                                                                                                                                                         |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_projects`     | List configured projects and their clone status.                                                                                                                                                                    |
-| `project_sync`      | Clone if missing, else fast-forward pull. Surfaces divergence instead of merging. Pass `gitUrl` to register a new project.                                                                                          |
-| `list_files`        | List files, filter `tex` / `bib` / `assets` / `all`.                                                                                                                                                                |
-| `read_file`         | Read a text file (optional line range). Binaries return a path, not bytes.                                                                                                                                          |
-| `write_file`        | Create or overwrite a file. Refuses if the file changed on disk since last read (see [Out-of-band edits](#out-of-band-edits)). A `.bib` target needs `confirmBibEdit: true` (see [Citations](#citations-via-dblp)). |
-| `edit_file`         | Surgical string-replacement edits (unique match unless `replaceAll`; atomic). Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                            |
-| `delete_file`       | Delete a file from the project. Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                                                                          |
-| `search_references` | Search DBLP for publications; returns candidates and their DBLP keys. Read-only.                                                                                                                                    |
-| `add_citation`      | Fetch a reference from DBLP by key and append it to a `.bib` file. The only sanctioned way to add a citation.                                                                                                       |
-| `compile`           | Compile locally with latexmk; returns success, PDF path, structured errors/warnings + raw log tail. For workspace-local clones the PDF is surfaced at `.web_latex_mcp/<project>.pdf`.                               |
-| `status`            | Branch, ahead/behind, staged/unstaged/untracked, plus `externalChanges` (files edited directly, not via tools).                                                                                                     |
-| `diff`              | Unified diff + per-file line counts.                                                                                                                                                                                |
-| `discard`           | Discard uncommitted changes (requires `confirm: true`).                                                                                                                                                             |
-| `commit`            | Stage and commit locally. Does **not** push.                                                                                                                                                                        |
-| `push`              | Safe push: pull-rebase onto the latest remote, then push (never force). Surfaces conflicts for a human; `mode: "branch"` for review. Requires `confirm: true`.                                                      |
+| Tool                | Description                                                                                                                                                                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`     | List configured projects and their clone status.                                                                                                                                                                                         |
+| `project_sync`      | Clone if missing, else fast-forward pull. Surfaces divergence instead of merging. Pass `gitUrl` to register a new project.                                                                                                               |
+| `list_files`        | List files, filter `tex` / `bib` / `assets` / `all`.                                                                                                                                                                                     |
+| `read_file`         | Read a text file (optional line range). Pass `ref` (e.g. `origin/main`) to read a committed version — the remote side of a conflict — instead of the working tree. Binaries return a path, not bytes.                                    |
+| `write_file`        | Create or overwrite a file. Refuses if the file changed on disk since last read (see [Out-of-band edits](#out-of-band-edits)). A `.bib` target needs `confirmBibEdit: true` (see [Citations](#citations-via-dblp)).                      |
+| `edit_file`         | Surgical string-replacement edits (unique match unless `replaceAll`; atomic). Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                                                 |
+| `delete_file`       | Delete a file from the project. Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                                                                                               |
+| `search_references` | Search DBLP for publications; returns candidates and their DBLP keys. Read-only.                                                                                                                                                         |
+| `add_citation`      | Fetch a reference from DBLP by key and append it to a `.bib` file. The only sanctioned way to add a citation.                                                                                                                            |
+| `compile`           | Compile locally with latexmk; returns success, PDF path, structured errors/warnings + raw log tail. For workspace-local clones the PDF is surfaced at `.web_latex_mcp/<project>.pdf`.                                                    |
+| `status`            | Branch, ahead/behind (with `aheadCommits`/`behindCommits` — the actual commits either side), staged/unstaged/untracked, plus `externalChanges` (files edited directly, not via tools).                                                   |
+| `diff`              | Unified diff + per-file line counts.                                                                                                                                                                                                     |
+| `discard`           | Discard uncommitted changes (requires `confirm: true`).                                                                                                                                                                                  |
+| `commit`            | Stage and commit locally. Does **not** push.                                                                                                                                                                                             |
+| `push`              | Safe push: pull-rebase onto the latest remote, then push (never force). Surfaces conflicts for a human; retry with `resolutions` (merged content per conflicted file) to resolve. `mode: "branch"` for review. Requires `confirm: true`. |
 
 ## Citations via DBLP
 
@@ -61,6 +61,14 @@ exactly what changed).
 `commit` locally, then `push` with `confirm: true`. Because people may also be editing in the Overleaf
 web editor, `push` is **safe by default**: it `pull --rebase`s onto the latest remote (immediately before
 pushing) and **never force-pushes**. A rebase conflict means the agent and a human touched the same lines —
-`push` aborts the rebase and returns `status: "conflict"` with both versions, for a human to resolve; it
-never auto-merges. For larger edits, `mode: "branch"` commits to a local review branch and returns its
-diff, landing it only on `approve: true`. See [`CONCURRENCY.md`](CONCURRENCY.md) for the full model.
+`push` aborts the rebase and returns `status: "conflict"` — a full 3-way payload: each conflicted file's
+`base`/`ours`/`theirs` (full contents) plus a marker `hunks` view, and top-level `conflictPaths`,
+`remoteHead`, and `remoteCommits`. (You can also read any side directly with `read_file(path, ref)`.) It
+never auto-merges. To resolve, retry `push` with a `resolutions` array — the full merged content for each
+conflicted file (`.bib` files need `confirmBibEdit: true`); the set is validated (missing/extra files are
+named), an optional `expectedRemoteHead` refuses the push if the remote moved again (abbreviated SHAs are
+accepted), and success returns `pushedSha`. The whole conflict payload is delivered in the result **text**
+(not only `structuredContent`), so a client that drops structured fields can still resolve. A successful
+`direct` push also reports `rebasedOver` — the remote commits that landed underneath your change. For
+larger edits, `mode: "branch"` commits to a local review branch and returns its diff, landing it only on
+`approve: true`. See [`CONCURRENCY.md`](CONCURRENCY.md) for the full model.

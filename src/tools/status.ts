@@ -7,6 +7,8 @@ const inputSchema = {
   project: z.string().optional(),
 };
 
+const commitSchema = z.object({ hash: z.string(), message: z.string() });
+
 const outputSchema = {
   branch: z.string(),
   ahead: z.number(),
@@ -15,6 +17,12 @@ const outputSchema = {
   staged: z.array(z.string()),
   unstaged: z.array(z.string()),
   untracked: z.array(z.string()),
+  aheadCommits: z
+    .array(commitSchema)
+    .describe('Local commits not yet on the remote (what a push would send).'),
+  behindCommits: z
+    .array(commitSchema)
+    .describe('Remote commits not yet local (what landed upstream since the last sync).'),
   externalChanges: z
     .array(z.string())
     .describe('Files changed on disk directly (not via this server this session).'),
@@ -39,12 +47,20 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           ...status.unstaged,
           ...status.untracked,
         ]);
+        const commitLine = (c: { hash: string; message: string }): string =>
+          `  ${c.hash.slice(0, 8)} ${c.message}`;
         const text = [
           `branch ${status.branch} (ahead ${status.ahead}, behind ${status.behind})`,
           status.clean ? 'working tree clean' : 'working tree has changes',
           status.staged.length ? `staged: ${status.staged.join(', ')}` : '',
           status.unstaged.length ? `unstaged: ${status.unstaged.join(', ')}` : '',
           status.untracked.length ? `untracked: ${status.untracked.join(', ')}` : '',
+          status.behindCommits.length
+            ? `landed upstream:\n${status.behindCommits.map(commitLine).join('\n')}`
+            : '',
+          status.aheadCommits.length
+            ? `to push:\n${status.aheadCommits.map(commitLine).join('\n')}`
+            : '',
           externalChanges.length
             ? `⚠ changed directly (not via tools): ${externalChanges.join(', ')}`
             : '',
