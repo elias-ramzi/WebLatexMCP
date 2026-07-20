@@ -41,7 +41,7 @@ describe('loadConfig', () => {
 
   it('resolves a relative workspace against the launch dir', () => {
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: 'clones' }, '/work/paper');
-    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', 'clones'));
+    expect(cfg.workspaceRoot).toBe(path.resolve('/work/paper', 'clones'));
     expect(cfg.workspaceIsLocal).toBe(false);
   });
 
