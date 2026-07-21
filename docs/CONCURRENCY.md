@@ -122,6 +122,18 @@ working tree looks like — editing the file and pushing again just re-conflicts
 merged content has to be applied _inside_ the rebase (add + `--continue`), which is
 exactly what `resolutions` does.
 
+### Alternative recovery: rewind and redo
+
+If reconciling the merged content is more trouble than simply redoing your edits, the
+**`reset_to_remote`** tool (`confirm: true`) closes the loop without a shell detour: it
+fetches and hard-resets the clone to the current `origin/<branch>`, leaving a clean working
+tree at exactly what is on the remote — so you can re-apply your edits onto the fresh remote and
+push normally. It is destructive by design: it discards your local commit(s) ahead of the remote
+and any uncommitted changes, and reports exactly what it dropped. It **never merges or pushes** —
+you still decide the content by redoing the edits. Use it when "rewind my local and redo cleanly"
+beats computing a line-by-line merge; use `resolutions` when you want to preserve the existing
+commit and merge the overlap.
+
 ## The sync-lag caveat
 
 Overleaf's Git bridge does **not** instantly reflect in-flight web edits. Someone
@@ -190,7 +202,9 @@ top level carries `conflictPaths`, `remoteHead`, `mergeBase`, and `remoteCommits
 three sides, then retry `push` with a **`resolutions`** array carrying each
 conflicted file's full merged content (see [Resolving a conflict through the
 tool](#resolving-a-conflict-through-the-tool)). Don't just edit and push again —
-the same commit replays and re-conflicts.
+the same commit replays and re-conflicts. If you'd rather rewind and redo than
+merge, `reset_to_remote` (confirm: true) hard-resets the clone to the current
+remote head so you can re-apply your edits cleanly.
 
 > Note: this server is branch-agnostic (it rebases onto whatever the clone's
 > default branch is), but for Overleaf that branch is `master`, so this document

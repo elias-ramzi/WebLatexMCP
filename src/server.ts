@@ -13,6 +13,7 @@ import { registerCommit } from './tools/commit.js';
 import { registerPush } from './tools/push.js';
 import { registerDeleteFile } from './tools/deleteFile.js';
 import { registerDiscard } from './tools/discard.js';
+import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
@@ -54,6 +55,7 @@ export function createServer(
   registerCommit(server, ctx);
   registerPush(server, ctx);
   registerDiscard(server, ctx);
+  registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
 

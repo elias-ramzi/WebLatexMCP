@@ -4,7 +4,7 @@ import path from 'node:path';
 import { mkdtemp, cp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
-import { parseLog } from '../../src/services/logParser.js';
+import { parseLog, filterLog, logTail } from '../../src/services/logParser.js';
 
 // Gate the real compile on latexmk being installed, so this auto-skips in the fast
 // CI job and on dev machines without TeX, but runs in the dedicated tex-smoke job.
@@ -30,6 +30,18 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
     expect(outcome.success).toBe(true);
     expect(outcome.pdfPath).toBeDefined();
     expect(parseLog(outcome.log).errors).toHaveLength(0);
+  }, 60_000);
+
+  it('de-noises a real compile log yet keeps the output summary (rawLog restores the rest)', async () => {
+    const outcome = await compiler.compile({ projectDir: dir, rootFile: 'main.tex' });
+    const filtered = filterLog(outcome.log); // what compile returns by default
+    expect(filtered).not.toMatch(/\.pfb>/);
+    expect(filtered).not.toMatch(/\.enc}/);
+    expect(filtered).not.toMatch(/TeX's memory/);
+    expect(filtered).toMatch(/Output written on /);
+    expect(filtered).toMatch(/\d+ page/);
+    // The raw tail (compile's rawLog: true) still carries the noise the filter dropped.
+    expect(logTail(outcome.log, 400)).toMatch(/TeX's memory/);
   }, 60_000);
 
   it('reports failure and a structured error for a broken file', async () => {

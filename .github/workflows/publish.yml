@@ -1,0 +1,51 @@
+name: Publish
+
+# Publish to npm when a version tag is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+# Requires an `NPM_TOKEN` repository secret (an npm automation/publish token). Publishing itself
+# stays a deliberate, human-initiated act — tagging — rather than firing on every push.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance attestation
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      # Deterministic line endings + a git identity for the integration tests' repos.
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+      - run: npm ci
+      # Never publish a red build: run the same gate CI enforces, plus the build.
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      # Guard against a tag/version mismatch — `v0.1.0` must match package.json's 0.1.0.
+      - name: Verify tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${TAG}) does not match package.json version ${PKG}." >&2
+            exit 1
+          fi
+      # prepublishOnly rebuilds; --access public publishes the scoped-or-unscoped package publicly,
+      # --provenance attaches a signed build-provenance attestation (needs id-token: write above).
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

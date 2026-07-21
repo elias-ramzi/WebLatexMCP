@@ -5,7 +5,10 @@ import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
-import { parseLog, logTail } from '../services/logParser.js';
+import { parseLog, filterLog, logTail } from '../services/logParser.js';
+
+/** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
+const RAW_TAIL_LINES = 400;
 
 const inputSchema = {
   project: z.string().optional(),
@@ -13,6 +16,14 @@ const inputSchema = {
   engine: z.enum(['pdflatex', 'xelatex', 'lualatex']).optional().describe('Default pdflatex.'),
   clean: z.boolean().optional().describe('Force a full rebuild.'),
   timeoutSec: z.number().int().positive().optional().describe('Compile timeout (default 120s).'),
+  rawLog: z
+    .boolean()
+    .optional()
+    .describe(
+      'Return the raw, unfiltered log tail instead of the de-noised default. Default false: ' +
+        'logTail keeps only errors, warnings, and the "Output written on" summary, dropping the ' +
+        'font/memory noise. The full log is always at logPath.',
+    ),
 };
 
 const errorShape = z.object({
@@ -40,7 +51,12 @@ const outputSchema = {
   durationSec: z.number(),
   errors: z.array(errorShape),
   warnings: z.array(errorShape),
-  logTail: z.string(),
+  logTail: z
+    .string()
+    .describe(
+      'De-noised log excerpt: only errors, warnings, and the "Output written on" summary (font ' +
+        'and memory noise stripped). Pass rawLog: true for the unfiltered tail; logPath has the full log.',
+    ),
   logPath: z.string().optional(),
 };
 
@@ -51,12 +67,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       title: 'Compile the project locally',
       description:
         'Compile the project locally (latexmk by default, or tectonic) and return success, ' +
-        'the PDF path, and structured errors/warnings plus a raw log tail. Does not touch the ' +
+        'the PDF path, and structured errors/warnings (each attributed to its source .tex file ' +
+        'when known) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
+        'not the font/memory dump (pass rawLog: true for the unfiltered tail). Does not touch the ' +
         'Overleaf remote.',
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, engine, clean, timeoutSec }) => {
+    async ({ project, rootFile, engine, clean, timeoutSec, rawLog }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
@@ -84,7 +102,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             durationSec: outcome.durationSec,
             errors,
             warnings,
-            logTail: logTail(outcome.log),
+            logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
             logPath: outcome.logPath,
           };
           const headline = outcome.timedOut

@@ -31,6 +31,17 @@ export interface StatusResult {
   behindCommits: RemoteCommit[];
 }
 
+export interface ResetToRemoteResult {
+  branch: string;
+  /** Commit now checked out (the current `origin/<branch>` tip). */
+  remoteHead: string;
+  /** Local commits that were ahead of the remote and are now discarded, newest first. */
+  discardedCommits: RemoteCommit[];
+  /** Whether the working tree had uncommitted changes (now discarded) before the reset. */
+  hadUncommittedChanges: boolean;
+  reset: boolean;
+}
+
 export interface DiffFile {
   path: string;
   added: number;
@@ -181,6 +192,45 @@ export class GitService {
       await git.clean('fd');
     }
     return { discarded: true };
+  }
+
+  /**
+   * Rewind the clone to the current remote head — the safe recovery from a push conflict. Fetches,
+   * then hard-resets to `origin/<branch>` and removes untracked files, so the working tree ends up
+   * clean at exactly what is on the remote, ready for edits to be re-applied. Destructive: it drops
+   * local commits ahead of the remote and any uncommitted changes, so it reports what it discarded
+   * (the ahead commits, and whether the tree was dirty) captured *before* the reset. It never merges
+   * or pushes — the caller redoes and re-pushes their edits. Callers must gate this behind explicit
+   * confirmation and serialize it per project like other mutating operations.
+   */
+  async resetToRemote(dir: string, gitUrl: string, auth: AuthConfig): Promise<ResetToRemoteResult> {
+    const git = simpleGit(dir);
+    const branch = await this.currentBranch(git);
+
+    // Fetch so we land on the *current* remote head, not a stale one — the whole point is to redo
+    // edits against what actually landed upstream.
+    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    const remoteRef = `origin/${branch}`;
+    if ((await this.revParseOrNull(git, remoteRef)) === null) {
+      throw new Error(
+        `No tracking ref ${remoteRef} to reset onto (has the project been pushed/cloned?).`,
+      );
+    }
+
+    // Capture what we're about to throw away, before the reset erases the evidence.
+    const discardedCommits = await this.logCommits(git, `${remoteRef}..${branch}`);
+    const hadUncommittedChanges = !(await git.status()).isClean();
+
+    await git.raw(['reset', '--hard', remoteRef]);
+    await git.clean('fd');
+
+    return {
+      branch,
+      remoteHead: (await git.revparse(['HEAD'])).trim(),
+      discardedCommits,
+      hadUncommittedChanges,
+      reset: true,
+    };
   }
 
   /**
@@ -698,7 +748,9 @@ export class GitService {
         'state (nothing half-merged). For each file, `ours` is our full version, `theirs` is the ' +
         'full version that landed upstream, and `base` is the common ancestor — use all three to ' +
         'compute a merged file that also keeps their non-conflicting edits. Then retry `push` with ' +
-        "a `resolutions` array carrying each conflicted file's full merged content. Never force-push.",
+        "a `resolutions` array carrying each conflicted file's full merged content. Never force-push. " +
+        'Alternatively, `reset_to_remote` (confirm: true) rewinds the clone to the current remote ' +
+        'head so you can re-apply your edits cleanly — it discards the local commit shown above.',
     };
   }
 
