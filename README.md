@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/weblatexmcp-lockup.svg" alt="WebLatexMCP" width="100%" />
+<img src="assets/weblatexmcp-lockup-beta.svg" alt="WebLatexMCP — public beta" width="100%" />
 
 # WebLatexMCP
 
@@ -23,6 +23,13 @@
 [![GitHub Copilot](https://img.shields.io/badge/Copilot-24292F?logo=githubcopilot&logoColor=white)](docs/install/copilot.md)
 
 </div>
+
+> [!WARNING]
+> **Public beta — very early development.** WebLatexMCP is now public, but it's in its early stages and
+> under active development. Expect bugs, rough edges, and incomplete features. Editing and git operations
+> touch real projects, so review diffs before you push. Please
+> [report anything you run into](https://github.com/elias-ramzi/WebLatexMCP/issues) — bug reports and
+> feedback are hugely welcome.
 
 ---
 
