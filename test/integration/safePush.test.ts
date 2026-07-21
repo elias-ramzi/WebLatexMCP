@@ -516,6 +516,63 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     });
   });
 
+  describe('reset to remote (conflict recovery)', () => {
+    it('rewinds to the remote head after a conflict, then re-edit + push lands cleanly', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      // The push conflicts (same line touched on both sides).
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+
+      // Rewind the clone to the current remote head instead of dropping to raw git. The tool resets
+      // FileService baselines after this (the reset rewrote the tree); mirror that here.
+      const reset = await git.resetToRemote(dir, remote.url, { username: 'git' });
+      files.resetBaselines(dir);
+      expect(reset.reset).toBe(true);
+      expect(reset.hadUncommittedChanges).toBe(false);
+      expect(reset.discardedCommits.map((c) => c.message)).toContain('local edits line 2');
+      const remoteSha = (await simpleGit(dir).revparse(['origin/master'])).trim();
+      expect(reset.remoteHead).toBe(remoteSha);
+
+      // Clean working tree at exactly the remote head; the remote's content is what's on disk.
+      expect(await headSha(dir)).toBe(remoteSha);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe(
+        'alpha\nbeta-remote\ngamma\n',
+      );
+
+      // Re-apply the edit onto the fresh remote and push — no conflict this time.
+      await files.applyEdits(dir, 'main.tex', [
+        { oldString: 'beta-remote', newString: 'beta-merged' },
+      ]);
+      await git.commit(dir, { message: 'redo edit onto fresh remote' });
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(res.status).toBe('pushed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-merged\ngamma\n');
+    });
+
+    it('discards uncommitted changes too and reports them', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
+      await pushCommit(remote, { 'main.tex': 'one\nTWO-remote\n' }, 'remote change');
+      // A local edit that was never committed.
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'two-local' }]);
+
+      const reset = await git.resetToRemote(dir, remote.url, { username: 'git' });
+      expect(reset.hadUncommittedChanges).toBe(true);
+      expect(reset.discardedCommits).toHaveLength(0);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('one\nTWO-remote\n');
+    });
+  });
+
   describe('branch-review mode', () => {
     it('prepareBranch commits to a local branch and returns the diff (branch stays local)', async () => {
       const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });

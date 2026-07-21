@@ -79,4 +79,11 @@ describe('createServer tool registration', () => {
     expect(names).toContain('add_citation');
     await client.close();
   });
+
+  it('registers the reset_to_remote recovery tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('reset_to_remote');
+    await client.close();
+  });
 });
