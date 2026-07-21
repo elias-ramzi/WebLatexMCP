@@ -5,10 +5,39 @@ export interface ParsedLog {
   warnings: StructuredError[];
 }
 
-/** Return the last `n` lines of a log, for the raw escape hatch. */
+/** pdfTeX/latexmk hard-wrap column (`max_print_line` default). */
+const WRAP_WIDTH = 79;
+
+/** Return the last `n` lines of a log verbatim, for the raw escape hatch. */
 export function logTail(log: string, n = 60): string {
   const lines = log.split('\n');
   return lines.slice(Math.max(0, lines.length - n)).join('\n');
+}
+
+/**
+ * TeX hard-wraps its log at `max_print_line` columns (79 by default), splitting long file paths and
+ * messages across physical lines with no continuation marker. Rejoin them so a path or message that
+ * spans several physical lines is parsed as one logical line: a physical line of exactly the wrap
+ * width is treated as a wrap and glued to the next. Best-effort — a natural line that happens to be
+ * exactly 79 chars is (rarely) joined too, the accepted cost of every LaTeX-log parser.
+ */
+export function unwrapLines(log: string, width = WRAP_WIDTH): string[] {
+  const physical = log.split('\n');
+  const logical: string[] = [];
+  let buf = '';
+  let wrapped = false;
+  for (const line of physical) {
+    buf += line;
+    if (line.length === width) {
+      wrapped = true;
+      continue;
+    }
+    logical.push(buf);
+    buf = '';
+    wrapped = false;
+  }
+  if (wrapped || buf) logical.push(buf);
+  return logical;
 }
 
 function normalizeFile(file: string): string {
@@ -21,17 +50,65 @@ function deriveRule(message: string): string {
 }
 
 /**
- * Parse a LaTeX/latexmk log into structured errors and warnings. LaTeX logs are messy,
- * so this is best-effort and deliberately conservative; callers should also surface the
- * raw log tail. Works best with `-file-line-error`.
+ * Does a token that followed a `(` look like a filename TeX opened? A real file always prints with a
+ * path separator or a dotted extension (`./main.tex`, `/usr/share/.../pgf.sty`, `main.aux`), whereas
+ * incidental parens in prose/math (`(\end occurred`, `(3.14)`) do not. Requiring a slash or an
+ * alphabetic extension keeps those from corrupting the file stack.
+ */
+function looksLikeFile(token: string): boolean {
+  return token.includes('/') || /\.[A-Za-z]/.test(token);
+}
+
+/** Topmost real (non-`null`) file on the stack — the file currently being read. */
+function currentFile(stack: Array<string | null>): string | undefined {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const f = stack[i];
+    if (f) return f;
+  }
+  return undefined;
+}
+
+/**
+ * Update the balanced-paren file stack for one logical line. TeX brackets every file it reads in
+ * `(path … )`, nesting them, so the top of the stack is the file currently open. A `(` followed by a
+ * filename pushes it; any other `(` pushes a `null` placeholder so its matching `)` pops the
+ * placeholder instead of a real file; a `)` pops. Underflow (unbalanced `)`) is ignored.
+ */
+function scanParens(line: string, stack: Array<string | null>): void {
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '(') {
+      let j = i + 1;
+      while (j < line.length && !'(){}[]<> '.includes(line[j] as string)) j++;
+      const token = line.slice(i + 1, j);
+      stack.push(looksLikeFile(token) ? normalizeFile(token) : null);
+      i = j - 1;
+    } else if (ch === ')') {
+      if (stack.length > 0) stack.pop();
+    }
+  }
+}
+
+/**
+ * Parse a LaTeX/latexmk log into structured errors and warnings. LaTeX logs are messy, so this is
+ * best-effort and deliberately conservative; callers should also surface the filtered log tail.
+ * Works best with `-file-line-error`. Each diagnostic is attributed to the source file open when it
+ * was emitted, tracked via the log's balanced `(path … )` nesting (`file`), so a warning in an
+ * `\input`-ed section maps back to that section rather than the main file. Attribution is omitted
+ * when it cannot be determined.
  */
 export function parseLog(log: string): ParsedLog {
-  const lines = log.split('\n');
+  const lines = unwrapLines(log);
   const errors: StructuredError[] = [];
   const warnings: StructuredError[] = [];
+  const stack: Array<string | null> = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
+    // The file established by prior lines — diagnostics print inside the file already open, before
+    // any `(open` on their own line. Capture it, then fold this line's parens into the stack.
+    const openFile = currentFile(stack);
+    scanParens(line, stack);
 
     // file-line-error format: "./main.tex:12: Undefined control sequence."
     const fle = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/.exec(line);
@@ -57,7 +134,13 @@ export function parseLog(log: string): ParsedLog {
           break;
         }
       }
-      errors.push({ severity: 'error', message, line: lineNo, rule: deriveRule(message) });
+      errors.push({
+        severity: 'error',
+        file: openFile,
+        message,
+        line: lineNo,
+        rule: deriveRule(message),
+      });
       continue;
     }
 
@@ -69,6 +152,7 @@ export function parseLog(log: string): ParsedLog {
         /on input line (\d+)/.exec(message) ?? /on input line (\d+)/.exec(lines[i + 1] ?? '');
       warnings.push({
         severity: 'warning',
+        file: openFile,
         message,
         line: onLine && onLine[1] ? Number(onLine[1]) : undefined,
         rule: warn[1] ?? warn[2] ?? 'LaTeX',
@@ -82,6 +166,7 @@ export function parseLog(log: string): ParsedLog {
       const lm = /at lines? (\d+)/.exec(line);
       warnings.push({
         severity: 'warning',
+        file: openFile,
         message: line.trim(),
         line: lm && lm[1] ? Number(lm[1]) : undefined,
         rule: `${box[1]} \\${box[2]}box`,
@@ -90,6 +175,49 @@ export function parseLog(log: string): ParsedLog {
   }
 
   return { errors: dedupe(errors), warnings: dedupe(warnings) };
+}
+
+/**
+ * Lines worth keeping from a compile log: real errors and their `l.<n>` position context, warnings
+ * (boxes, undefined refs/citations, font substitutions, "rerun" hints), and the final "Output
+ * written on …" summary. Everything else — the memory-usage block, the trailing font `.pfb`/`.enc`
+ * path dump, PDF-object statistics, and the reams of `LaTeX Font Info` chatter — is dropped.
+ */
+const KEEP_PATTERNS: RegExp[] = [
+  /^! /, // TeX error
+  /^l\.\d+/, // error position/context ("l.12 …")
+  /^Runaway /, // runaway-argument error context
+  /^(Emergency stop|Fatal error|No pages of output)/,
+  /Warning:/, // LaTeX / package / class / font warnings, incl. "Label(s) may have changed"
+  /pdfTeX warning/,
+  /Error:/, // LaTeX / package errors printed inline (no leading "! ")
+  /^(Overfull|Underfull) \\[hv]box/,
+  /(may have changed|Rerun to get|Please rerun)/, // cross-reference rerun hints
+  /^Output written on /, // the "(N pages, … bytes)" summary
+];
+
+/**
+ * Distil a raw compile log down to only diagnostically useful lines (see {@link KEEP_PATTERNS}),
+ * scanning the whole log (not just its tail, so an error early in a long log is not lost) after
+ * un-wrapping TeX's 79-column hard-wrapping. Bounds the result to `maxLines` (keeping the most
+ * recent, where a fatal error and the output summary sit) and notes any omission. Falls back to a
+ * short raw tail if nothing matched, so the caller always sees something. The full log stays on disk
+ * at `logPath`; `compile`'s `rawLog: true` returns the unfiltered tail.
+ */
+export function filterLog(log: string, opts: { maxLines?: number } = {}): string {
+  const maxLines = opts.maxLines ?? 80;
+  const kept = unwrapLines(log)
+    .map((l) => l.replace(/\s+$/, ''))
+    .filter((l) => KEEP_PATTERNS.some((re) => re.test(l)));
+  if (kept.length === 0) return logTail(log, 15);
+  if (kept.length > maxLines) {
+    const omitted = kept.length - maxLines;
+    return [
+      `… (${omitted} earlier diagnostic line(s) omitted — see logPath for the full log)`,
+      ...kept.slice(-maxLines),
+    ].join('\n');
+  }
+  return kept.join('\n');
 }
 
 function dedupe(items: StructuredError[]): StructuredError[] {
