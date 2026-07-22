@@ -19,9 +19,11 @@ import { registerDiscard } from './tools/discard.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
+import { registerServerInfo } from './tools/serverInfo.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
 import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { buildInstructions } from './lib/writingGuide.js';
+import { getServerVersion } from './lib/version.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -40,7 +42,7 @@ export function createServer(
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
-      version: '0.1.3',
+      version: getServerVersion(),
     },
     instructions ? { instructions } : undefined,
   );
@@ -64,6 +66,7 @@ export function createServer(
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
+  registerServerInfo(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
