@@ -13,7 +13,13 @@ const inputSchema = {
 
 const commentShape = z.object({
   id: z.string(),
-  number: z.number().describe('Stable 1-based number the user sees in the viewer.'),
+  number: z
+    .number()
+    .describe(
+      'The #N the user sees in the viewer: position among open comments, always 1..N. It is ' +
+        'renumbered whenever comments are resolved or deleted, so always act on `id`, not on a ' +
+        'number remembered from an earlier listing.',
+    ),
   page: z.number(),
   note: z.string(),
   quote: z.string().optional().describe('The PDF text the user selected, if any.'),

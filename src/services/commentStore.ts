@@ -29,7 +29,11 @@ export interface Comment extends NewComment {
   id: string;
   project: string;
   resolved: boolean;
-  /** Stable 1-based number within the project, for the user to reference ("resolve comment 3"). */
+  /**
+   * 1-based position among the project's **open** comments, so the user always sees #1..#N with no
+   * gaps. Recomputed whenever the open set changes (add / resolve / delete / undo), so a number
+   * identifies a comment only as of the latest listing — act on `id`, not on a remembered number.
+   */
   number: number;
   /** Monotonic insertion order, for stable sorting. */
   order: number;
@@ -42,19 +46,33 @@ export class CommentStore {
   private readonly byProject = new Map<string, Comment[]>();
   /** Per-project stack of recently deleted comments, most recent last (for undo). */
   private readonly deleted = new Map<string, Comment[]>();
-  /** Per-project count of comments ever added, so numbers are stable and never reused. */
-  private readonly issued = new Map<string, number>();
   private counter = 0;
 
   add(project: string, input: NewComment): Comment {
     const order = ++this.counter;
-    const number = (this.issued.get(project) ?? 0) + 1;
-    this.issued.set(project, number);
-    const comment: Comment = { ...input, id: `c${order}`, project, resolved: false, number, order };
+    const comment: Comment = {
+      ...input,
+      id: `c${order}`,
+      project,
+      resolved: false,
+      number: 0,
+      order,
+    };
     const list = this.byProject.get(project);
     if (list) list.push(comment);
     else this.byProject.set(project, [comment]);
+    this.renumber(project); // fills in `number` on the comment we just pushed
     return comment;
+  }
+
+  /** Re-assign #1..#N over the project's open comments in insertion order, closing any gaps. */
+  private renumber(project: string): void {
+    const list = this.byProject.get(project);
+    if (!list) return;
+    let n = 0;
+    for (const c of [...list].sort((a, b) => a.order - b.order)) {
+      if (!c.resolved) c.number = ++n;
+    }
   }
 
   list(project: string, opts: { includeResolved?: boolean } = {}): Comment[] {
@@ -82,6 +100,7 @@ export class CommentStore {
     stack.push(removed!);
     if (stack.length > UNDO_LIMIT) stack.shift();
     this.deleted.set(project, stack);
+    this.renumber(project);
     return true;
   }
 
@@ -92,6 +111,7 @@ export class CommentStore {
     const list = this.byProject.get(project);
     if (list) list.push(comment);
     else this.byProject.set(project, [comment]);
+    this.renumber(project);
     return comment; // list() re-sorts by `order`, so it lands back in place
   }
 
@@ -106,6 +126,7 @@ export class CommentStore {
         n++;
       }
     }
+    if (n > 0) this.renumber(project); // remaining open comments close the gaps: #1..#N
     return n;
   }
 

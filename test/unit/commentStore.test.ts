@@ -46,16 +46,35 @@ describe('CommentStore', () => {
     expect(c).toMatchObject({ quote: 'hello', file: 'main.tex', line: 12 });
   });
 
-  it('assigns stable per-project numbers that are never reused', () => {
+  it('numbers open comments #1..#N, renumbering as they resolve/delete/undo', () => {
     const s = new CommentStore();
-    expect(s.add('p', base).number).toBe(1);
-    const b = s.add('p', base);
-    expect(b.number).toBe(2);
-    expect(s.add('q', base).number).toBe(1); // per-project
+    const a = s.add('p', { ...base, note: 'a' });
+    const b = s.add('p', { ...base, note: 'b' });
+    s.add('p', { ...base, note: 'c' });
+    expect(s.list('p').map((x) => [x.note, x.number])).toEqual([
+      ['a', 1],
+      ['b', 2],
+      ['c', 3],
+    ]);
+    expect(s.add('q', base).number).toBe(1); // numbering is per project
+
+    // Resolving the first closes the gap.
+    s.resolve('p', [a.id]);
+    expect(s.list('p').map((x) => [x.note, x.number])).toEqual([
+      ['b', 1],
+      ['c', 2],
+    ]);
+
+    // Deleting also renumbers.
     s.remove('p', b.id);
-    expect(s.add('p', base).number).toBe(3); // not reused after delete
-    // Undo restores the original number.
-    expect(s.undo('p')?.number).toBe(2);
+    expect(s.list('p').map((x) => [x.note, x.number])).toEqual([['c', 1]]);
+
+    // Undo restores it in order and renumbers again.
+    s.undo('p');
+    expect(s.list('p').map((x) => [x.note, x.number])).toEqual([
+      ['b', 1],
+      ['c', 2],
+    ]);
   });
 
   it('updates a note in place', () => {
