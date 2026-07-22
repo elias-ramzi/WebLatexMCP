@@ -22,7 +22,7 @@
 &nbsp;
 [![GitHub Copilot](https://img.shields.io/badge/Copilot-24292F?logo=githubcopilot&logoColor=white)](docs/install/copilot.md)
 &nbsp;
-[![Mistral](https://img.shields.io/badge/Mistral-FA520F?logo=mistralai&logoColor=white)](docs/install/README.md)
+[![Mistral](https://img.shields.io/badge/Mistral-FA520F?logo=mistralai&logoColor=white)](docs/install/mistral.md)
 
 </div>
 

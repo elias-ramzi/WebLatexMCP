@@ -21,3 +21,5 @@ The server speaks standard MCP over stdio, so it works with any MCP-capable clie
 
 - [**Gemini**](gemini.md) — Gemini CLI and Gemini Code Assist (IDE agent mode).
 - [**GitHub Copilot**](copilot.md) — Copilot agent mode in VS Code (and Visual Studio 2022).
+- [**Mistral**](mistral.md) — the Vibe Code CLI (Le Chat connectors are remote-only, so they can't
+  reach a local stdio server).
