@@ -31,10 +31,29 @@ export async function loadWritingGuide(
 }
 
 /**
+ * Always-on guidance so a vague request reliably drives the PDF-comment loop. The user places
+ * comments by selecting text in the local `viewer` and attaching a note; these instructions tell
+ * the client what to do when asked to act on them.
+ */
+const COMMENT_WORKFLOW =
+  'The user can leave review comments on the compiled PDF in this server’s local `viewer` ' +
+  '(they select text and attach a note). When the user asks you to apply, address, resolve, or ' +
+  'act on their PDF comments / feedback / review notes — e.g. “resolve my comments”, ' +
+  '“apply my PDF feedback”, “address the comments” — run this loop for the ' +
+  'relevant project:\n' +
+  '1. Call `list_comments` to get the open comments (each has the note, the selected `quote`, and ' +
+  'the source `file`/`line` with a snippet).\n' +
+  '2. Make the requested change at each comment’s `file`/`line`, using the `quote` to pin the ' +
+  'exact spot when the line is approximate.\n' +
+  '3. `compile` to confirm it still builds (the viewer hot-reloads).\n' +
+  '4. Call `resolve_comments` (all, or the specific `ids` you handled) so the viewer clears them.\n' +
+  'Make all the edits before resolving, and ask rather than guess when a comment is ambiguous.';
+
+/**
  * Wrap each available guide in a short framing sentence so the client knows what it
- * is and when to apply it, then join them into one `instructions` string. Returns
- * `undefined` when no guide is present, so the server advertises no instructions in
- * that case.
+ * is and when to apply it, then join them into one `instructions` string. The PDF-comment
+ * workflow is always included (the comment tools always exist), so instructions are always
+ * present even with no writing/concurrency guide.
  */
 export function buildInstructions(
   writingGuide?: string,
@@ -55,5 +74,6 @@ export function buildInstructions(
         concurrencyGuide,
     );
   }
+  sections.push(COMMENT_WORKFLOW);
   return sections.length > 0 ? sections.join('\n\n---\n\n') : undefined;
 }

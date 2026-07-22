@@ -111,6 +111,9 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
     ENGINE_FLAG[engine],
     '-interaction=nonstopmode',
     '-file-line-error',
+    // Emit a .synctex.gz next to the PDF so a click in the viewer maps back to source file:line
+    // (powers `list_comments`). Cheap and harmless when unused.
+    '-synctex=1',
     `-outdir=${buildDir}`,
   ];
   const shellFlag = shellEscapeFlag(req);

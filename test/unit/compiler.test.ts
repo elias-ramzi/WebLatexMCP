@@ -14,6 +14,7 @@ describe('latexmkArgs (shell escape)', () => {
     expect(args).not.toContain('-shell-escape');
     expect(args).not.toContain('-shell-restricted');
     expect(args).toContain('-file-line-error');
+    expect(args).toContain('-synctex=1');
     expect(args.at(-1)).toBe('main.tex');
   });
 

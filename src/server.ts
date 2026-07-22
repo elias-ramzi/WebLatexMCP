@@ -8,6 +8,8 @@ import { registerWriteFile } from './tools/writeFile.js';
 import { registerEditFile } from './tools/editFile.js';
 import { registerCompile } from './tools/compile.js';
 import { registerViewer } from './tools/viewer.js';
+import { registerListComments } from './tools/listComments.js';
+import { registerResolveComments } from './tools/resolveComments.js';
 import { registerStatus } from './tools/status.js';
 import { registerDiff } from './tools/diff.js';
 import { registerCommit } from './tools/commit.js';
@@ -52,6 +54,8 @@ export function createServer(
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
   registerViewer(server, ctx);
+  registerListComments(server, ctx);
+  registerResolveComments(server, ctx);
   registerStatus(server, ctx);
   registerDiff(server, ctx);
   registerCommit(server, ctx);
