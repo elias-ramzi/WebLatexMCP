@@ -816,7 +816,7 @@ export class GitService {
       summary:
         `Rebase onto ${report.rebasedOnto} conflicts in ${report.files.length} file(s) ` +
         `(${report.conflictPaths.join(', ')}). The rebase was aborted and nothing was pushed — ` +
-        'resolve the overlap and push the merged content back (see docs/CONCURRENCY.md).',
+        'resolve the overlap and push the merged content back (see docs/tools.md).',
       conflict: report,
     };
   }
