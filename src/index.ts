@@ -6,6 +6,7 @@ import { createContext } from './context.js';
 import { createServer } from './server.js';
 import { loadWritingGuide } from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
+import { loadSkills } from './lib/skills.js';
 import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
 import {
   installOutputSchemaCompat,
@@ -31,7 +32,8 @@ async function main(): Promise<void> {
   const ctx = createContext(config, credentials, identity);
   const writingGuide = await loadWritingGuide(process.env);
   const concurrencyGuide = await loadConcurrencyGuide(process.env);
-  const server = createServer(ctx, writingGuide, concurrencyGuide);
+  const skills = await loadSkills(process.env);
+  const server = createServer(ctx, writingGuide, concurrencyGuide, skills);
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
@@ -52,7 +54,8 @@ async function main(): Promise<void> {
   await server.connect(transport);
   console.error(
     `[web-latex-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}` +
-      `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}`,
+      `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}` +
+      `${skills.length > 0 ? ` (${skills.length} skills as prompts)` : ''}`,
   );
 }
 

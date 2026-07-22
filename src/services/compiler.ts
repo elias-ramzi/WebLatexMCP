@@ -1,6 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
-import { mkdir, readFile, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
 import type { CompilerKind } from '../types.js';
@@ -16,6 +16,16 @@ export interface CompileRequest {
   /** Force a full rebuild. */
   clean?: boolean;
   timeoutSec?: number;
+  /**
+   * Pass `-shell-escape`, letting the document run arbitrary shell commands (needed by TikZ
+   * externalization). Off by default; never inferred — the caller must opt in per compile.
+   */
+  shellEscape?: boolean;
+  /**
+   * Pass `-shell-restricted`: only TeX's allow-listed binaries may run. Safer than full
+   * `shellEscape` and sufficient for most externalization setups. Ignored if `shellEscape` is set.
+   */
+  restrictedShellEscape?: boolean;
 }
 
 export interface CompileOutcome {
@@ -51,10 +61,76 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /** Per-project build dir under the OS temp root, keeping the clone clean. */
+export function buildDir(projectDir: string): string {
+  return path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(projectDir));
+}
+
 async function buildDirFor(projectDir: string): Promise<string> {
-  const dir = path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(projectDir));
+  const dir = buildDir(projectDir);
   await mkdir(dir, { recursive: true });
   return dir;
+}
+
+/**
+ * Mirror the project's subdirectory tree (directories only, never files) into the build dir.
+ * The engine compiles into `-output-directory`, but a document's relative write paths resolve
+ * against that dir — most notably TikZ externalization's cache (`imgs/tikzmain-figure0.md5`,
+ * `.dpth`, `.pdf`). Those subdirectories exist in the source but not in the fresh build dir, so
+ * the write fails with "I can't write on file". Recreating every source subdirectory is the
+ * simple, robust fix — no preamble parsing, no special-casing `imgs`. `.git` is skipped.
+ */
+export async function mirrorSubdirs(srcDir: string, buildDir: string): Promise<void> {
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === '.git') continue;
+    const dest = path.join(buildDir, entry.name);
+    await mkdir(dest, { recursive: true });
+    await mirrorSubdirs(path.join(srcDir, entry.name), dest);
+  }
+}
+
+/**
+ * The engine shell-escape flag for a request, or `undefined` for none. Full `-shell-escape`
+ * (arbitrary commands) takes precedence over the safer `-shell-restricted` (allow-list only)
+ * when both are set; neither is ever enabled unless the caller explicitly opted in.
+ */
+function shellEscapeFlag(req: CompileRequest): string | undefined {
+  if (req.shellEscape) return '-shell-escape';
+  if (req.restrictedShellEscape) return '-shell-restricted';
+  return undefined;
+}
+
+/**
+ * The full latexmk argument vector for a request. Pure and exported so the arg construction —
+ * in particular that a shell-escape flag is present only when explicitly requested — is unit
+ * testable without a TeX install.
+ */
+export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
+  const engine = req.engine ?? 'pdflatex';
+  const args = [
+    ENGINE_FLAG[engine],
+    '-interaction=nonstopmode',
+    '-file-line-error',
+    // Emit a .synctex.gz next to the PDF so a click in the viewer maps back to source file:line
+    // (powers `list_comments`). Cheap and harmless when unused.
+    '-synctex=1',
+    `-outdir=${buildDir}`,
+  ];
+  const shellFlag = shellEscapeFlag(req);
+  if (shellFlag) args.push(shellFlag);
+  if (req.clean) args.push('-gg');
+  args.push(req.rootFile);
+  return args;
+}
+
+/**
+ * The path a compile would write its `.pdf` to (the build-dir `<jobname>.pdf`). Lets the read-only
+ * `viewer` tool locate the last build without re-compiling. This is only the temp build
+ * copy; a workspace-local compile also surfaces the same PDF beside the clone (`pdfSurface`).
+ */
+export function buildPdfPath(projectDir: string, rootFile: string): string {
+  const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
+  return path.join(buildDir(projectDir), `${rootBase}.pdf`);
 }
 
 /**
@@ -105,17 +181,9 @@ export class LatexmkCompiler implements LatexCompiler {
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
-    const engine = req.engine ?? 'pdflatex';
     const buildDir = await buildDirFor(req.projectDir);
-
-    const args = [
-      ENGINE_FLAG[engine],
-      '-interaction=nonstopmode',
-      '-file-line-error',
-      `-outdir=${buildDir}`,
-    ];
-    if (req.clean) args.push('-gg');
-    args.push(req.rootFile);
+    await mirrorSubdirs(req.projectDir, buildDir);
+    const args = latexmkArgs(req, buildDir);
 
     const start = Date.now();
     const res = await execCapture('latexmk', args, {
@@ -149,8 +217,12 @@ export class TectonicCompiler implements LatexCompiler {
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
     const buildDir = await buildDirFor(req.projectDir);
+    await mirrorSubdirs(req.projectDir, buildDir);
 
     const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
+    // Tectonic has no restricted mode, so `restrictedShellEscape` alone does not widen to full
+    // shell escape here; only an explicit `shellEscape` enables system calls.
+    if (req.shellEscape) args.push('-Z', 'shell-escape');
 
     const start = Date.now();
     const res = await execCapture('tectonic', args, {

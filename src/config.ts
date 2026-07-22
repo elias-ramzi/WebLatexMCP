@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { z } from 'zod';
-import type { CompilerKind, ProjectConfig, ServerConfig } from './types.js';
+import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 const projectsSchema = z.record(
   z.string(),
@@ -146,6 +146,37 @@ export function loadConfig(
   }
 
   const compiler = parseCompiler(env.WEB_LATEX_MCP_COMPILER);
+  const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
+  const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
 
-  return { workspaceRoot, workspaceIsLocal, projects, defaultProject, compiler };
+  return {
+    workspaceRoot,
+    workspaceIsLocal,
+    projects,
+    defaultProject,
+    compiler,
+    viewerPort,
+    viewerTarget,
+  };
+}
+
+/** Parse the default viewer target from env; undefined (the default) means the OS browser. */
+function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
+  const v = raw?.trim().toLowerCase();
+  if (!v) return undefined;
+  if (v === 'browser' || v === 'vscode') return v;
+  throw new Error(
+    `WEB_LATEX_MCP_VIEWER_TARGET "${raw}" is invalid; expected "browser" or "vscode".`,
+  );
+}
+
+/** Parse an optional fixed viewer port; undefined (the default) means OS-assigned ephemeral. */
+function parseViewerPort(raw: string | undefined): number | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`WEB_LATEX_MCP_VIEWER_PORT "${raw}" is invalid; expected a port 0-65535.`);
+  }
+  return port;
 }

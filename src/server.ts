@@ -7,6 +7,9 @@ import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
 import { registerEditFile } from './tools/editFile.js';
 import { registerCompile } from './tools/compile.js';
+import { registerViewer } from './tools/viewer.js';
+import { registerListComments } from './tools/listComments.js';
+import { registerResolveComments } from './tools/resolveComments.js';
 import { registerStatus } from './tools/status.js';
 import { registerDiff } from './tools/diff.js';
 import { registerCommit } from './tools/commit.js';
@@ -16,9 +19,13 @@ import { registerDiscard } from './tools/discard.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
+import { registerServerInfo } from './tools/serverInfo.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
 import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
+import { registerSkillPrompts } from './prompts/skills.js';
 import { buildInstructions } from './lib/writingGuide.js';
+import { getServerVersion } from './lib/version.js';
+import type { Skill } from './lib/skills.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -27,17 +34,21 @@ import { buildInstructions } from './lib/writingGuide.js';
  * ways: folded into the MCP `instructions` hint (advertised at initialization, so
  * clients add it to the model's context automatically) and as a fetchable resource
  * (for on-demand re-reading and clients that ignore `instructions`).
+ *
+ * `skills` are the bundled `.claude/skills` procedures, registered as MCP prompts so
+ * clients that don't read that directory can still run them (see ./prompts/skills.ts).
  */
 export function createServer(
   ctx: AppContext,
   writingGuide?: string,
   concurrencyGuide?: string,
+  skills: Skill[] = [],
 ): McpServer {
   const instructions = buildInstructions(writingGuide, concurrencyGuide);
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
-      version: '0.1.2',
+      version: getServerVersion(),
     },
     instructions ? { instructions } : undefined,
   );
@@ -50,6 +61,9 @@ export function createServer(
   registerEditFile(server, ctx);
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
+  registerViewer(server, ctx);
+  registerListComments(server, ctx);
+  registerResolveComments(server, ctx);
   registerStatus(server, ctx);
   registerDiff(server, ctx);
   registerCommit(server, ctx);
@@ -58,9 +72,11 @@ export function createServer(
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
+  registerServerInfo(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
+  registerSkillPrompts(server, skills);
 
   return server;
 }
