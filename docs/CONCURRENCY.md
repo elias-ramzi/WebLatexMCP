@@ -11,23 +11,24 @@ client can resolve without a shell).
 ## The setup: two concurrency models
 
 An Overleaf project's Git bridge is an ordinary Git remote — in practice a single
-`master` branch. But the people editing the document are not all using Git:
+default branch (`main`; older projects may still use `master`). But the people
+editing the document are not all using Git:
 
 - **Web-editor users** type in Overleaf's real-time editor. Their keystrokes are
   reconciled by operational transforms (OT) and committed back to the Git history
-  **opaquely** — you see commits appear on `master`, not the individual edits.
+  **opaquely** — you see commits appear on `main`, not the individual edits.
 - **AI agents** (Claude, through this server) clone the repo, edit files, commit,
   and push over Git.
 
 So we are bridging two concurrency models: OT inside Overleaf, Git on our side.
-The web side can advance `master` at any moment, without warning. Every push has
+The web side can advance `main` at any moment, without warning. Every push has
 to assume the remote may have moved since we last looked.
 
 ## The core rule
 
 **Always `pull --rebase` before pushing. Never force-push.**
 
-Rebasing replays our local commits on top of whatever is currently on `master`, so
+Rebasing replays our local commits on top of whatever is currently on `main`, so
 we add our work _after_ everyone else's instead of on top of a stale base. A
 force-push would overwrite commits made on the web side — silently destroying
 other people's work. There is no situation in this workflow where force-pushing is
@@ -110,26 +111,27 @@ We cannot eliminate this, only shrink the window:
 
 - **Keep the push window short.** The tool fetches and `pull --rebase`s
   _immediately_ before the actual `git push`, so the gap between "this is the
-  current `master`" and "pushed" is as small as possible.
+  current `main`" and "pushed" is as small as possible.
 - **For high-stakes pushes, coordinate timing.** Before a large or structural push,
   it is worth asking collaborators to pause web edits for a moment, or pushing when
   the document is quiet.
 
 ## Optional review flow for larger edits
 
-For a big or risky change, you do not have to push straight to `master`. The `push`
+For a big or risky change, you do not have to push straight to `main`. The `push`
 tool's **branch mode** stages the work on a **local** feature branch (never pushed —
-the Overleaf bridge only reliably syncs `master`) and returns its full diff against
-`master` for a human to read. Only on explicit approval does it rebase onto a freshly
-fetched `master`, fast-forward, and push — with the same abort-and-surface behavior
+the Overleaf bridge only reliably syncs the default branch) and returns its full diff
+against `main` for a human to read. Only on explicit approval does it rebase onto a
+freshly fetched `main`, fast-forward, and push — with the same abort-and-surface behavior
 if the rebase conflicts. This is the right mode when you want eyes on the change
 before it reaches the shared document.
 
 ---
 
-> Note: this server is branch-agnostic (it rebases onto whatever the clone's default
-> branch is), but for Overleaf that branch is `master`, so this document says
-> `master` throughout.
+> Note: this server is branch-agnostic — it rebases onto whatever the clone's default
+> branch actually is. This document says `main` throughout because that is Overleaf's
+> current default; older projects may still use `master`, and everything here applies
+> unchanged to either.
 
 _Read alongside the [LaTeX writing guide](writing-guide.md): the editing habits it
 prescribes are what make these merges clean. For the tool-by-tool mechanics, see
