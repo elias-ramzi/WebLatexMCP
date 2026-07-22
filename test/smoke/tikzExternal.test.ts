@@ -5,11 +5,21 @@ import { mkdtemp, cp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
 import { parseLog, needsShellEscape } from '../../src/services/logParser.js';
+import { execCapture } from '../../src/lib/exec.js';
 
-// Gated on latexmk, like the other smokes: skips in the fast CI job and on TeX-less machines,
-// runs in the dedicated tex-smoke job.
+// Gated on latexmk AND pgf/tikz being installed: skips in the fast CI job, on TeX-less machines,
+// and on minimal TeX Live installs without pgf; runs in the dedicated tex-smoke job (which pulls
+// in texlive-pictures). This fixture needs \usepackage{tikz} to load at all.
 const compiler = new LatexmkCompiler();
-const available = await compiler.isAvailable();
+async function tikzAvailable(): Promise<boolean> {
+  try {
+    const res = await execCapture('kpsewhich', ['tikz.sty'], { timeoutMs: 5000 });
+    return res.code === 0 && res.stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+const available = (await compiler.isAvailable()) && (await tikzAvailable());
 
 const FIXTURE = fileURLToPath(new URL('../fixtures/tikz-external', import.meta.url));
 
