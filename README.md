@@ -119,9 +119,10 @@ claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
 
 ### Or install the Claude Code plugin — server **and** skills together
 
-The `claude mcp add` / raw-config routes register the server but **not** the [skills](#skills-claude-code) —
-those only load when Claude Code is launched from a clone of this repo. Installing the **plugin** instead
-gives you the MCP server _and_ all the skills in every session, from any directory:
+The `claude mcp add` / raw-config routes register the server, and with it the skills as [prompts](docs/skills.md#two-ways-a-skill-runs) —
+but not as Claude Code [skills](#skills), which only load when Claude Code is launched from a clone of
+this repo. Installing the **plugin** instead gives you the MCP server _and_ all the skills in every
+session, from any directory:
 
 ```bash
 # In Claude Code:
@@ -147,11 +148,10 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 
 See the [full tool reference](docs/tools.md).
 
-## Skills (Claude Code)
+## Skills
 
-Claude Code loads task-specific skills that drive the tools — each stops at the diff, so nothing is
-committed or pushed unless you ask. You get them by [installing the plugin](#or-install-the-claude-code-plugin--server-and-skills-together)
-(available everywhere) or by launching Claude Code from a clone of this repo:
+Task-specific skills that drive the tools — each stops at the diff, so nothing is committed or pushed
+unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
@@ -159,13 +159,27 @@ committed or pushed unless you ask. You get them by [installing the plugin](#or-
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 
-See the [skills guide](docs/skills.md) for details.
+**How you get them depends on the client:**
+
+- **Claude Code** — [install the plugin](#or-install-the-claude-code-plugin--server-and-skills-together)
+  (or launch Claude Code from a clone of this repo). Claude picks a skill up on its own when your request
+  matches it.
+- **Any MCP client** — nothing to install. Every skill is also registered as an **MCP prompt**, so it
+  ships with the server; pick it from the client's prompt menu (in Claude Desktop, the `+` in the
+  composer) instead of typing `/`.
+- **Claude Desktop / claude.ai**, for the same automatic behavior Claude Code gets — upload the skills to
+  your account: zip each folder under [`.claude/skills/`](.claude/skills/), then upload them under
+  **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an
+  uploaded copy is a snapshot, so re-upload when a skill changes.
+
+See the [skills guide](docs/skills.md) for what each skill does, [step-by-step installation](docs/skills.md#installing),
+and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) — environment variables, per-host token resolution, in-context guides, cross-platform notes.
 - [Tools](docs/tools.md) — full tool reference, the DBLP citation flow, and how safe pushes work.
-- [Skills](docs/skills.md) — what each bundled Claude Code skill does.
+- [Skills](docs/skills.md) — what each bundled skill does, how to install it per client, and the two ways one runs.
 - [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere.
 - [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
 - [Contributing](CONTRIBUTING.md) — how to build, test, and open a pull request.

@@ -55,6 +55,9 @@ formatting; all logic lives in services so it is unit-testable without a live MC
 - `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
   `dblp`) passed to every tool handler.
 - `src/tools/*` — one file per tool: a zod `inputSchema`/`outputSchema` + a handler that calls services.
+- `src/prompts/skills.ts` — registers each bundled skill (`.claude/skills/*/SKILL.md`, loaded by
+  `src/lib/skills.ts`) as an MCP prompt, so clients that don't read `.claude/skills` (Claude Desktop,
+  Cursor) can still run them. Add a skill by adding its directory — no code change.
 - `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex, dynamic
   registration), `GitService` (simple-git wrapper), `FileService` (sandboxed fs), `LatexmkCompiler`
   (implements the `LatexCompiler` interface), `DblpService` (DBLP search + canonical BibTeX fetch, with

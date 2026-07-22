@@ -22,8 +22,10 @@ import { registerAddCitation } from './tools/addCitation.js';
 import { registerServerInfo } from './tools/serverInfo.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
 import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
+import { registerSkillPrompts } from './prompts/skills.js';
 import { buildInstructions } from './lib/writingGuide.js';
 import { getServerVersion } from './lib/version.js';
+import type { Skill } from './lib/skills.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -32,11 +34,15 @@ import { getServerVersion } from './lib/version.js';
  * ways: folded into the MCP `instructions` hint (advertised at initialization, so
  * clients add it to the model's context automatically) and as a fetchable resource
  * (for on-demand re-reading and clients that ignore `instructions`).
+ *
+ * `skills` are the bundled `.claude/skills` procedures, registered as MCP prompts so
+ * clients that don't read that directory can still run them (see ./prompts/skills.ts).
  */
 export function createServer(
   ctx: AppContext,
   writingGuide?: string,
   concurrencyGuide?: string,
+  skills: Skill[] = [],
 ): McpServer {
   const instructions = buildInstructions(writingGuide, concurrencyGuide);
   const server = new McpServer(
@@ -70,6 +76,7 @@ export function createServer(
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
+  registerSkillPrompts(server, skills);
 
   return server;
 }

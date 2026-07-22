@@ -1,9 +1,8 @@
-# Skills (Claude Code)
+# Skills
 
-For **Claude Code**, the repo bundles task-specific skills that drive the [tools](tools.md). They load
-automatically when you install the [plugin](../README.md#or-install-the-claude-code-plugin--server-and-skills-together)
-(server + skills, available in every session) or when Claude Code is launched from a clone of this repo;
-each stops at the diff, so nothing is committed or pushed unless you ask.
+The repo bundles task-specific skills that drive the [tools](tools.md) — each stops at the diff, so
+nothing is committed or pushed unless you ask. How you install them, and how you invoke them, depends on
+the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-a-skill-runs).
 
 | Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                            | Mutates                     | Invoke                  |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ----------------------- |
@@ -12,6 +11,75 @@ each stops at the diff, so nothing is committed or pushed unless you ask.
 | [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local git-excluded audit report, and optionally marks confirmed entries. **Read-only for the `.bib`** unless you approve a change.                                                                                                                          | local report; opt-in `.bib` | `/verify-citations`     |
 | [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                          | `.bib` + `.tex`             | `/format-bibliography`  |
 | [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                           | local note only             | `/summarize-paper`      |
+
+## Two ways a skill runs
+
+The same `SKILL.md` reaches a client through one of two mechanisms, and they differ in **who decides to
+run it** — worth knowing, because it changes how you ask.
+
+**As a skill — model-invoked.** The client reads the skill's `description` and reaches for it on its own
+when your request matches: "check my bibliography" pulls in `verify-citations` without you naming it.
+This is what Claude Code does with `.claude/skills`, and what an uploaded skill does in Claude Desktop
+and claude.ai.
+
+**As an [MCP prompt](https://modelcontextprotocol.io/specification/server/prompts) — user-invoked.** The
+server registers every bundled skill as a prompt under the same name, carrying the same instructions, so
+clients that don't read `.claude/skills` can still run them. You pick it from the client's prompt menu
+(the `+` in Claude Desktop's composer; `/web-latex-mcp:…` in Claude Code) — the model will **not** reach
+for it on its own. Each prompt takes an optional `project` argument, so you can scope the run up front
+instead of being asked. Because prompts are flat text, a skill that grows bundled scripts or reference
+files would only be partially conveyed — the `SKILL.md` body is what ships. All five current skills are
+self-contained, so nothing is lost today.
+
+The two coexist: prompts always work because they travel with the server, and installing the skills
+properly on top adds the model-invoked trigger.
+
+## Installing
+
+### Claude Code — the plugin
+
+Installs the server _and_ the skills, in every session, from any directory:
+
+```bash
+/plugin marketplace add elias-ramzi/WebLatexMCP
+/plugin install web-latex-mcp@web-latex-tools
+```
+
+Launching Claude Code from a clone of this repo works too — `.claude/skills` is picked up from the
+working directory. Either way you get `/verify-citations` and friends, model-invoked.
+
+### Any MCP client — nothing to install
+
+The prompts come with the server. Once `web-latex-mcp` is connected, the five skills appear in the
+client's prompt menu, at the version the server shipped with. Nothing to upload, nothing to keep in sync.
+
+### Claude Desktop and claude.ai — upload the skills
+
+To get the **model-invoked** behavior in Claude Desktop (so "verify my citations" just works), upload the
+skills to your Claude account. They are per-account, and sync to Desktop, claude.ai, and the Cowork tab.
+
+1. Zip each skill folder from a clone of this repo:
+
+   ```bash
+   cd .claude/skills
+   for s in */; do zip -r "${s%/}.zip" "$s"; done
+   ```
+
+2. In Claude, open **Customize → Skills**, then **+ → Create skill**, and upload one `.zip` per skill.
+
+Requires a Pro, Max, Team, or Enterprise plan with **code execution enabled** — skills are gated on it,
+including instruction-only ones like these. On Team and Enterprise you can share an uploaded skill with
+your organization so colleagues don't each upload it.
+
+An uploaded skill is a **snapshot**: editing a `SKILL.md` here (or upgrading the server) does not update
+it, so re-upload after a change. The prompts have no such drift, which is why both routes are worth
+having.
+
+## Serving your own skills
+
+Set `WEB_LATEX_MCP_SKILLS_DIR` to expose a different directory as prompts — one subdirectory per skill,
+each with a `SKILL.md` whose frontmatter carries a `name` and a `description`. The default is the bundled
+`.claude/skills`.
 
 ## `format-latex-project` — reformat an existing project
 
