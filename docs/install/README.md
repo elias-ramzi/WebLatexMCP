@@ -15,9 +15,11 @@ All three end at the same place: the server registered over stdio, with a token 
 var, the GitHub CLI, or your OS git credential helper. See the main [README](../../README.md) for the
 full configuration reference and tool list.
 
-## Other MCP clients
+## Other MCP clients — pending verification
 
-The server speaks standard MCP over stdio, so it works with any MCP-capable client:
+The server speaks standard MCP over stdio, so any MCP-capable client should work. These guides are
+written but **not yet verified end-to-end** — the tested setups are Claude Code and Claude Desktop.
+Reports welcome:
 
 - [**Gemini**](gemini.md) — Gemini CLI and Gemini Code Assist (IDE agent mode).
 - [**GitHub Copilot**](copilot.md) — Copilot agent mode in VS Code (and Visual Studio 2022).

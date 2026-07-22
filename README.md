@@ -17,6 +17,8 @@
 **Works with**
 &nbsp;
 [![Claude](https://img.shields.io/badge/Claude-D97757?logo=anthropic&logoColor=white)](docs/install/README.md)
+
+**Pending**
 &nbsp;
 [![Gemini](https://img.shields.io/badge/Gemini-1C69FF?logo=googlegemini&logoColor=white)](docs/install/gemini.md)
 &nbsp;
