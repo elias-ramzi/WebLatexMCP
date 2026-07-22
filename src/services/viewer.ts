@@ -665,7 +665,12 @@ export class ViewerService {
   async close(): Promise<void> {
     const server = this.server;
     if (server) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      // `close()` only stops new connections and reaps *idle* sockets. A client that stopped
+      // reading mid-response (a closed browser tab part-way through an 800KB pdf.js asset) leaves
+      // an active one, and closing would then hang indefinitely. Drop them all.
+      server.closeAllConnections();
+      await closed;
     }
     this.server = undefined;
     this.baseUrl = undefined;
