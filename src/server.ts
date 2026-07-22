@@ -37,7 +37,7 @@ export function createServer(
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
-      version: '0.1.2',
+      version: '0.1.3',
     },
     instructions ? { instructions } : undefined,
   );

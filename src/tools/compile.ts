@@ -5,7 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
-import { parseLog, filterLog, logTail } from '../services/logParser.js';
+import { parseLog, filterLog, logTail, needsShellEscape } from '../services/logParser.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
@@ -16,6 +16,23 @@ const inputSchema = {
   engine: z.enum(['pdflatex', 'xelatex', 'lualatex']).optional().describe('Default pdflatex.'),
   clean: z.boolean().optional().describe('Force a full rebuild.'),
   timeoutSec: z.number().int().positive().optional().describe('Compile timeout (default 120s).'),
+  restrictedShellEscape: z
+    .boolean()
+    .optional()
+    .describe(
+      "Pass -shell-restricted, allowing only TeX's allow-listed helper binaries to run. This is " +
+        'the safer way to enable TikZ externalization (\\tikzexternalize) and is enough for most ' +
+        'setups. Default false. Prefer this over shellEscape.',
+    ),
+  shellEscape: z
+    .boolean()
+    .optional()
+    .describe(
+      'Pass -shell-escape, letting the .tex run ARBITRARY shell commands during compilation. ' +
+        'Default false. SECURITY: only enable for a project you trust — the document comes from a ' +
+        'shared remote others can write to. Never enabled automatically; try restrictedShellEscape ' +
+        'first, and enable this only when the caller explicitly wants it.',
+    ),
   rawLog: z
     .boolean()
     .optional()
@@ -58,6 +75,13 @@ const outputSchema = {
         'and memory noise stripped). Pass rawLog: true for the unfiltered tail; logPath has the full log.',
     ),
   logPath: z.string().optional(),
+  hint: z
+    .string()
+    .optional()
+    .describe(
+      'An actionable next step surfaced when the failure has a known remedy — e.g. the document ' +
+        'uses TikZ externalization and needs a shell-escape retry. Absent when there is nothing to advise.',
+    ),
 };
 
 export function registerCompile(server: McpServer, ctx: AppContext): void {
@@ -70,11 +94,23 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'the PDF path, and structured errors/warnings (each attributed to its source .tex file ' +
         'when known) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
         'not the font/memory dump (pass rawLog: true for the unfiltered tail). Does not touch the ' +
-        'Overleaf remote.',
+        'Overleaf remote. TikZ externalization (\\tikzexternalize) needs system calls: retry with ' +
+        'restrictedShellEscape: true (preferred) or shellEscape: true — the latter lets the .tex ' +
+        'run ARBITRARY shell commands, so only enable it for a trusted project. Shell escape is ' +
+        'never enabled automatically; when a compile fails for lack of it, the result carries a hint.',
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, engine, clean, timeoutSec, rawLog }) => {
+    async ({
+      project,
+      rootFile,
+      engine,
+      clean,
+      timeoutSec,
+      rawLog,
+      shellEscape,
+      restrictedShellEscape,
+    }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
@@ -85,8 +121,19 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             engine,
             clean,
             timeoutSec,
+            shellEscape,
+            restrictedShellEscape,
           });
           const { errors, warnings } = parseLog(outcome.log);
+          // Never silently retry with shell escape — that would turn a compile into arbitrary code
+          // execution without consent. Surface a hint and let the caller opt in explicitly.
+          const shellEscapeOn = shellEscape || restrictedShellEscape;
+          const hint =
+            !shellEscapeOn && needsShellEscape(outcome.log)
+              ? 'This document uses TikZ externalization, which needs system calls. Retry compile ' +
+                'with restrictedShellEscape: true (preferred) or shellEscape: true. Only enable ' +
+                'this for a project you trust — shell escape lets the .tex run arbitrary commands.'
+              : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.
           let pdfPath = outcome.pdfPath;
@@ -104,6 +151,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             warnings,
             logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
             logPath: outcome.logPath,
+            hint,
           };
           const headline = outcome.timedOut
             ? `compile timed out after ${outcome.durationSec.toFixed(1)}s`
@@ -112,7 +160,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             .slice(0, 10)
             .map((e) => `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`)
             .join('\n');
-          const text = [headline, pdfUrl ? `PDF: ${pdfUrl}` : '', errorLines]
+          const text = [
+            headline,
+            pdfUrl ? `PDF: ${pdfUrl}` : '',
+            errorLines,
+            hint ? `hint: ${hint}` : '',
+          ]
             .filter(Boolean)
             .join('\n');
           return {
