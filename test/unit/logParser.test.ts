@@ -1,5 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import { parseLog, filterLog, logTail, unwrapLines } from '../../src/services/logParser.js';
+import {
+  parseLog,
+  filterLog,
+  logTail,
+  unwrapLines,
+  needsShellEscape,
+} from '../../src/services/logParser.js';
+
+/** One real per-figure TikZ externalization failure, as latexmk prints it (file-line-error). */
+function tikzShellEscapeError(figure: number): string {
+  return (
+    `./main.tex:6: Package tikz Error: Sorry, the system call 'pdflatex -halt-on-error ` +
+    `-interaction=batchmode -jobname "imgs/tikzmain-figure${figure}" "..."' did NOT result in a ` +
+    `usable output file 'imgs/tikzmain-figure${figure}' (expected one of .pdf:.jpg:). Please ` +
+    `verify that you have enabled system calls. For pdflatex, this is 'pdflatex -shell-escape'.`
+  );
+}
 
 /** Re-wrap a logical line at TeX's 79-column width, the way pdfTeX hard-wraps the log. */
 function hardWrap(line: string, width = 79): string {
@@ -55,6 +71,35 @@ describe('parseLog', () => {
     const line = './main.tex:3: Undefined control sequence.';
     const { errors } = parseLog([line, line].join('\n'));
     expect(errors).toHaveLength(1);
+  });
+
+  it('collapses the N per-figure TikZ shell-escape errors into one diagnostic', () => {
+    const log = [
+      '(./main.tex',
+      tikzShellEscapeError(0),
+      tikzShellEscapeError(1),
+      tikzShellEscapeError(2),
+      ')',
+    ].join('\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ severity: 'error', rule: 'shell escape disabled' });
+    expect(errors[0]?.message).toMatch(/3 figures/);
+    expect(errors[0]?.message).toMatch(/restrictedShellEscape: true|shellEscape: true/);
+  });
+
+  it('leaves a single shell-escape error uncollapsed but keeps other errors intact', () => {
+    const log = [
+      '(./main.tex',
+      tikzShellEscapeError(0),
+      '! Undefined control sequence.',
+      'l.9 \\badmacro',
+      ')',
+    ].join('\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(2);
+    expect(errors.some((e) => /did NOT result in a usable output file/.test(e.message))).toBe(true);
+    expect(errors.some((e) => /Undefined control sequence/.test(e.message))).toBe(true);
   });
 
   it('logTail returns the last n lines', () => {
@@ -238,5 +283,24 @@ describe('parseLog file attribution (Task 2)', () => {
 
   it('is robust to unbalanced parens (does not throw)', () => {
     expect(() => parseLog('(./main.tex\nstray ) close and more text\n)')).not.toThrow();
+  });
+});
+
+describe('needsShellEscape', () => {
+  it('detects the blocked-system-call signature', () => {
+    expect(needsShellEscape(tikzShellEscapeError(0))).toBe(true);
+  });
+
+  it('detects it even when TeX wraps the advice across physical lines', () => {
+    // TeX hard-wraps "…that you have enabled system calls" across two physical lines.
+    const wrapped = [
+      "'imgs/tikzmain-figure0'... did NOT result in a usable output file. Please verify that you have ",
+      'enabled system calls. For pdflatex, this is ...',
+    ].join('\n');
+    expect(needsShellEscape(wrapped)).toBe(true);
+  });
+
+  it('is false for an ordinary error with no system-call failure', () => {
+    expect(needsShellEscape('./main.tex:3: Undefined control sequence.')).toBe(false);
   });
 });

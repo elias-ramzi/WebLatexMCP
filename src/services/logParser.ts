@@ -44,6 +44,46 @@ function normalizeFile(file: string): string {
   return file.replace(/^\.\//, '');
 }
 
+/**
+ * pgf/TikZ prints this when a `\write18` system call was blocked because `-shell-escape` was not
+ * enabled. Externalization fires one such error per figure (18 on a figure-heavy paper), all with
+ * the same root cause. The "did NOT result in a usable output file" phrase prints on a single
+ * physical line, so it survives without un-wrapping.
+ */
+const SHELL_ESCAPE_FAILURE = /did NOT result in a usable output file/;
+
+/**
+ * True when the log shows a system call was blocked for lack of `-shell-escape` — the signature of
+ * a TikZ-externalizing document compiled without shell escape. Un-wraps first, since TeX splits the
+ * "…enabled system calls" advice across physical lines.
+ */
+export function needsShellEscape(log: string): boolean {
+  const text = unwrapLines(log).join('\n');
+  return SHELL_ESCAPE_FAILURE.test(text) && /enabled system calls/.test(text);
+}
+
+/**
+ * TikZ externalization emits one identical "system call did NOT result in a usable output file"
+ * error per figure — they share a single cause (shell escape disabled), so collapse them into one
+ * diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.
+ */
+function collapseShellEscapeErrors(errors: StructuredError[]): StructuredError[] {
+  const matched = errors.filter((e) => SHELL_ESCAPE_FAILURE.test(e.message));
+  if (matched.length <= 1) return errors;
+  const first = matched[0] as StructuredError;
+  const collapsed: StructuredError = {
+    severity: 'error',
+    file: first.file,
+    line: first.line,
+    message:
+      `TikZ externalization failed for ${matched.length} figures: the system call did NOT ` +
+      'result in a usable output file because shell escape is disabled. Retry compile with ' +
+      'restrictedShellEscape: true (or shellEscape: true) to enable system calls.',
+    rule: 'shell escape disabled',
+  };
+  return [collapsed, ...errors.filter((e) => !SHELL_ESCAPE_FAILURE.test(e.message))];
+}
+
 function deriveRule(message: string): string {
   // First clause of the message, e.g. "Undefined control sequence." -> "Undefined control sequence".
   return message.split(/[.:]/)[0]?.trim() ?? message;
@@ -174,7 +214,7 @@ export function parseLog(log: string): ParsedLog {
     }
   }
 
-  return { errors: dedupe(errors), warnings: dedupe(warnings) };
+  return { errors: collapseShellEscapeErrors(dedupe(errors)), warnings: dedupe(warnings) };
 }
 
 /**
