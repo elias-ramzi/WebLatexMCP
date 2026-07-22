@@ -105,4 +105,36 @@ describe('createServer tool registration', () => {
     expect(names).toContain('resolve_comments');
     await client.close();
   });
+
+  it('registers the server_info tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('server_info');
+    await client.close();
+  });
+});
+
+describe('server_info', () => {
+  it('advertises the package version and reports runtime config', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: true, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    // The server advertises a real version (read from package.json), not a placeholder.
+    expect(client.getServerVersion()?.version).toMatch(/^\d+\.\d+\.\d+/);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.name).toBe('web-latex-mcp');
+    expect(structured.version).toBe(client.getServerVersion()?.version);
+    expect(structured.workspaceRoot).toBe('/tmp/ws');
+    expect(structured.workspaceLocal).toBe(true);
+    expect(structured.compiler).toBe('latexmk');
+
+    await client.close();
+  });
 });
