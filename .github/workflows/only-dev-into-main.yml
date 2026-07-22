@@ -1,0 +1,22 @@
+# Policy gate: a pull request into `main` may only come from `dev`.
+# GitHub branch protection cannot constrain a PR's head branch, so this required
+# check enforces it. It reads only github.head_ref (no checkout of PR code).
+name: Branch policy
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  only-dev:
+    name: Only dev can merge into main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the PR source branch is dev
+        run: |
+          head='${{ github.head_ref }}'
+          if [ "$head" != "dev" ]; then
+            echo "::error::PRs into 'main' must come from 'dev' (this PR is from '$head')."
+            exit 1
+          fi
+          echo "OK: source branch is 'dev'."
