@@ -18,7 +18,8 @@
   "files": [
     "dist",
     "docs/writing-guide.md",
-    "docs/CONCURRENCY.md"
+    "docs/CONCURRENCY.md",
+    ".claude/skills"
   ],
   "engines": {
     "node": ">=20"

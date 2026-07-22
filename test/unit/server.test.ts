@@ -5,13 +5,18 @@ import { createServer } from '../../src/server.js';
 import { WRITING_GUIDE_URI } from '../../src/resources/writingGuide.js';
 import { CONCURRENCY_GUIDE_URI } from '../../src/resources/concurrencyGuide.js';
 import type { AppContext } from '../../src/context.js';
+import type { Skill } from '../../src/lib/skills.js';
 
 // Tool/resource registration never touches the context (handlers do, lazily), so an
 // empty stand-in is enough to exercise the server's initialization surface.
 const fakeCtx = {} as unknown as AppContext;
 
-async function connect(guide?: string, concurrencyGuide?: string): Promise<Client> {
-  const server = createServer(fakeCtx, guide, concurrencyGuide);
+async function connect(
+  guide?: string,
+  concurrencyGuide?: string,
+  skills?: Skill[],
+): Promise<Client> {
+  const server = createServer(fakeCtx, guide, concurrencyGuide, skills);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test', version: '0.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -110,6 +115,54 @@ describe('createServer tool registration', () => {
     const client = await connect();
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name)).toContain('server_info');
+    await client.close();
+  });
+});
+
+describe('createServer skill prompts', () => {
+  const skills: Skill[] = [
+    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
+    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+  ];
+
+  it('advertises each skill as a prompt carrying its description', async () => {
+    const client = await connect(undefined, undefined, skills);
+    expect(client.getServerCapabilities()?.prompts).toBeDefined();
+
+    const listed = (await client.listPrompts()).prompts;
+    expect(listed.map((p) => p.name)).toEqual(['verify-citations', 'summarize-paper']);
+    expect(listed[0]?.description).toBe('Audit the .bib against DBLP.');
+    expect(listed[0]?.arguments?.map((a) => a.name)).toEqual(['project']);
+    expect(listed[0]?.arguments?.[0]?.required).toBe(false);
+
+    await client.close();
+  });
+
+  it('returns the skill body, scoped to the project argument', async () => {
+    const client = await connect(undefined, undefined, skills);
+
+    const scoped = await client.getPrompt({
+      name: 'verify-citations',
+      arguments: { project: 'pictura' },
+    });
+    const message = scoped.messages[0];
+    expect(message?.role).toBe('user');
+    const text = message && 'text' in message.content ? message.content.text : undefined;
+    expect(text).toContain('STEP ONE');
+    expect(text).toContain('`pictura`');
+
+    const unscoped = await client.getPrompt({ name: 'summarize-paper', arguments: {} });
+    const plain = unscoped.messages[0];
+    const plainText = plain && 'text' in plain.content ? plain.content.text : undefined;
+    expect(plainText).toContain('STEP TWO');
+    expect(plainText).toContain('Ask which project');
+
+    await client.close();
+  });
+
+  it('advertises no prompts when no skills were loaded', async () => {
+    const client = await connect();
+    expect(client.getServerCapabilities()?.prompts).toBeUndefined();
     await client.close();
   });
 });

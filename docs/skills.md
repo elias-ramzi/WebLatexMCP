@@ -3,7 +3,8 @@
 For **Claude Code**, the repo bundles task-specific skills that drive the [tools](tools.md). They load
 automatically when you install the [plugin](../README.md#or-install-the-claude-code-plugin--server-and-skills-together)
 (server + skills, available in every session) or when Claude Code is launched from a clone of this repo;
-each stops at the diff, so nothing is committed or pushed unless you ask.
+each stops at the diff, so nothing is committed or pushed unless you ask. On **other MCP clients** the
+same skills are available as prompts — see [Other clients](#other-clients-skills-as-mcp-prompts).
 
 | Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                            | Mutates                     | Invoke                  |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ----------------------- |
@@ -12,6 +13,25 @@ each stops at the diff, so nothing is committed or pushed unless you ask.
 | [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local git-excluded audit report, and optionally marks confirmed entries. **Read-only for the `.bib`** unless you approve a change.                                                                                                                          | local report; opt-in `.bib` | `/verify-citations`     |
 | [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                          | `.bib` + `.tex`             | `/format-bibliography`  |
 | [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                           | local note only             | `/summarize-paper`      |
+
+## Other clients: skills as MCP prompts
+
+`.claude/skills` is a Claude Code mechanism — Claude Desktop, Cursor and other MCP clients never read it.
+So the server **also registers every skill as an [MCP prompt](https://modelcontextprotocol.io/specification/server/prompts)**,
+under the same name, carrying the same instructions. They travel with the server: install it and the
+skills come along, with no per-user upload and no copy to keep in sync.
+
+Prompts are a _user-invoked_ primitive, which is the one real difference from a skill. The model will not
+reach for `verify-citations` on its own because you said "check my bibliography" — you pick the prompt
+from the client's menu (in Claude Desktop, the `+` in the composer; in Claude Code, `/web-latex-mcp:…`).
+Each takes an optional `project` argument, so you can scope the run up front instead of being asked.
+
+Because prompts are flat text, a skill that grows bundled scripts or reference files would only be
+partially conveyed this way — the `SKILL.md` body is what ships. All five current skills are
+self-contained, so nothing is lost today.
+
+Set `WEB_LATEX_MCP_SKILLS_DIR` to serve your own directory of skills instead (one subdirectory per skill,
+each with a `SKILL.md` whose frontmatter has a `name` and `description`).
 
 ## `format-latex-project` — reformat an existing project
 

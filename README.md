@@ -151,7 +151,9 @@ See the [full tool reference](docs/tools.md).
 
 Claude Code loads task-specific skills that drive the tools — each stops at the diff, so nothing is
 committed or pushed unless you ask. You get them by [installing the plugin](#or-install-the-claude-code-plugin--server-and-skills-together)
-(available everywhere) or by launching Claude Code from a clone of this repo:
+(available everywhere) or by launching Claude Code from a clone of this repo. **On other MCP clients**
+(Claude Desktop, Cursor, …) the same skills ship as [MCP prompts](docs/skills.md#other-clients-skills-as-mcp-prompts) —
+pick one from the client's prompt menu instead of typing `/`:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
