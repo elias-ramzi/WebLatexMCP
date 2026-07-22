@@ -90,4 +90,16 @@ describe('loadConfig', () => {
       /WEB_LATEX_MCP_COMPILER/,
     );
   });
+
+  it('parses the viewer target (default undefined = browser)', () => {
+    expect(loadConfig({}).viewerTarget).toBeUndefined();
+    expect(loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: 'vscode' }).viewerTarget).toBe('vscode');
+    expect(loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: '  Browser ' }).viewerTarget).toBe('browser');
+  });
+
+  it('throws on an invalid viewer target', () => {
+    expect(() => loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: 'terminal' })).toThrow(
+      /WEB_LATEX_MCP_VIEWER_TARGET/,
+    );
+  });
 });

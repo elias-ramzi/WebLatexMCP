@@ -8,6 +8,9 @@ coverage/
 .env.local
 .mcp.json
 
+# Agent worktrees (nested checkouts of this repo); .claude/settings.json + skills stay tracked
+.claude/worktrees/
+
 # Editor / OS
 .DS_Store
 .vscode/

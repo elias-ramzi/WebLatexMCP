@@ -109,6 +109,41 @@ steps, so nothing leaves your machine implicitly.
 
 ---
 
+## See the PDF as a tab in VS Code
+
+The `viewer` tool serves a live PDF viewer on `http://127.0.0.1:<port>` (renders with pdf.js —
+zoom, scroll, search, select-to-comment; hot-reloads on every compile). VS Code can show that URL
+as an **editor tab** via its built-in **Simple Browser**, so you never leave the editor.
+
+**1 · Tell the server you're in VS Code.** In your MCP server config's `env`, set:
+
+```jsonc
+"WEB_LATEX_MCP_VIEWER_TARGET": "vscode",   // return the URL instead of opening your OS browser
+"WEB_LATEX_MCP_VIEWER_PORT": "41725"       // pin a port so the URL is stable across sessions
+```
+
+**2 · Open it.** Ask Claude to `compile`, then “open the viewer”. It returns a `127.0.0.1` URL.
+Open the **Command Palette** (`Cmd/Ctrl+Shift+P`) → **“Simple Browser: Show”** → paste the URL.
+The tab stays live and refreshes on every compile — dock it beside your `.tex`.
+
+**One-key open (optional).** With the port pinned, add a keybinding (`Cmd/Ctrl+Shift+P` →
+“Preferences: Open Keyboard Shortcuts (JSON)”) so a single chord opens the tab:
+
+```jsonc
+{
+  "key": "cmd+alt+p",
+  "command": "simpleBrowser.show",
+  "args": "http://127.0.0.1:41725/p/<your-project-id>",
+}
+```
+
+Comments you add in the viewer flow straight back to Claude: select text → **💬 Comment** → write
+the change, then ask Claude to _“resolve my comments”_ (it reads them via `list_comments`, edits the
+source, recompiles, and marks them done). Simple Browser is a sandboxed webview, so if text
+selection or the clipboard button misbehaves, fall back to your OS browser (`target: "browser"`).
+
+---
+
 ## Where to go next
 
 - **[Configuration](../configuration.md)** — every env var, how tokens resolve per host, project options.

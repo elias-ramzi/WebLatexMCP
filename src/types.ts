@@ -54,4 +54,9 @@ export interface ServerConfig {
   compiler?: CompilerKind;
   /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
   viewerPort?: number;
+  /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
+  viewerTarget?: ViewerTarget;
 }
+
+/** Where the `viewer` tool expects the PDF viewer to be opened. */
+export type ViewerTarget = 'browser' | 'vscode';
