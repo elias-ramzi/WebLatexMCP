@@ -7,6 +7,11 @@ import { createServer } from './server.js';
 import { loadWritingGuide } from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
 import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
+import {
+  installOutputSchemaCompat,
+  isIncompatibleClient,
+  outputSchemaMode,
+} from './lib/outputSchemaCompat.js';
 
 async function main(): Promise<void> {
   // Fail fast instead of hanging on an interactive credential prompt when no token or
@@ -30,6 +35,20 @@ async function main(): Promise<void> {
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
+  // Shape outgoing tool schemas for clients that can't handle `outputSchema` (e.g. Claude Desktop);
+  // see src/lib/outputSchemaCompat.ts. The default `auto` mode only affects known-incompatible clients.
+  const schemaMode = outputSchemaMode();
+  installOutputSchemaCompat(server, transport, schemaMode);
+  const prevOnInitialized = server.server.oninitialized;
+  server.server.oninitialized = () => {
+    prevOnInitialized?.();
+    const client = server.server.getClientVersion();
+    const stripping = schemaMode === 'always' || isIncompatibleClient(client?.name);
+    console.error(
+      `[web-latex-mcp] client ${client?.name ?? 'unknown'} v${client?.version ?? '?'}` +
+        `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
+    );
+  };
   await server.connect(transport);
   console.error(
     `[web-latex-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}` +

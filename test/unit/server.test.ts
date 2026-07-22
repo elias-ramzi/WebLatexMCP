@@ -87,35 +87,3 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 });
-
-describe('createServer no-output-schema flag', () => {
-  const KEY = 'WEB_LATEX_MCP_NO_OUTPUT_SCHEMA';
-
-  it('strips outputSchema from every tool when the flag is set', async () => {
-    const prev = process.env[KEY];
-    process.env[KEY] = '1';
-    try {
-      const client = await connect();
-      const { tools } = await client.listTools();
-      expect(tools.length).toBeGreaterThan(0);
-      expect(tools.every((t) => t.outputSchema === undefined)).toBe(true);
-      await client.close();
-    } finally {
-      if (prev === undefined) delete process.env[KEY];
-      else process.env[KEY] = prev;
-    }
-  });
-
-  it('advertises outputSchema by default', async () => {
-    const prev = process.env[KEY];
-    delete process.env[KEY];
-    try {
-      const client = await connect();
-      const { tools } = await client.listTools();
-      expect(tools.some((t) => t.outputSchema !== undefined)).toBe(true);
-      await client.close();
-    } finally {
-      if (prev !== undefined) process.env[KEY] = prev;
-    }
-  });
-});

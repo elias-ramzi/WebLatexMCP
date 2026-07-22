@@ -14,7 +14,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                      |
 | `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                    |
 | `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                              |
-| `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Set to `1` to omit `outputSchema`/`structuredContent` from tool results — a workaround for Claude Desktop builds that silently drop calls to servers advertising an output schema. See [Claude Desktop compatibility](#claude-desktop-compatibility).                            |
+| `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Output-schema client compatibility. Default **auto-detects Claude Desktop** and omits `outputSchema`/`structuredContent` for it only; `1` forces omit for every client, `0` disables. See [Claude Desktop compatibility](#claude-desktop-compatibility).                         |
 
 ### `WEB_LATEX_MCP_PROJECTS` example
 
@@ -113,16 +113,20 @@ advertised).
 
 Some Claude Desktop builds **silently fail to dispatch tool calls** to an MCP server whose tools
 advertise an `outputSchema` (structured output): the server connects and its tools list fine, but every
-call fails with a generic "Tool execution failed" and never reaches the server. If you hit that — and
-other MCP servers work in the same app — set:
+call fails with a generic "Tool execution failed" and never reaches the server.
+
+**This is handled automatically — no configuration needed.** The server detects Claude Desktop from the
+`clientInfo.name` it sends (`claude-ai`) and omits `outputSchema`/`structuredContent` for that client
+only, leaving structured output fully intact for clients that support it (e.g. Claude Code).
+
+`WEB_LATEX_MCP_NO_OUTPUT_SCHEMA` overrides the auto-detection when you need to:
+
+- **`1`** — always omit `outputSchema` (use if another client hits the same bug).
+- **`0`** / `false` — never omit, even for Claude Desktop (strict spec behavior).
 
 ```json
 { "env": { "WEB_LATEX_MCP_NO_OUTPUT_SCHEMA": "1" } }
 ```
-
-This drops `outputSchema` and the `structuredContent` field from tool results, leaving the
-human-readable text content intact. It is **off by default**, since structured output is valuable for
-clients that support it (e.g. Claude Code); it's a targeted workaround for the affected clients only.
 
 ## Cross-platform notes
 
