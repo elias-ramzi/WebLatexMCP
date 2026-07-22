@@ -62,6 +62,11 @@ export class ProjectManager {
     return path.join(this.workspaceRoot, id);
   }
 
+  /** All known project ids (configured + runtime-registered), for enumeration. */
+  knownIds(): string[] {
+    return [...this.projects.keys()];
+  }
+
   /** Whether a project id has been cloned locally. */
   async hasClone(id: string): Promise<boolean> {
     return this.isCloned(this.projectPath(id));

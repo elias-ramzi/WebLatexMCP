@@ -17,10 +17,14 @@
 **Works with**
 &nbsp;
 [![Claude](https://img.shields.io/badge/Claude-D97757?logo=anthropic&logoColor=white)](docs/install/README.md)
+
+**Pending**
 &nbsp;
 [![Gemini](https://img.shields.io/badge/Gemini-1C69FF?logo=googlegemini&logoColor=white)](docs/install/gemini.md)
 &nbsp;
 [![GitHub Copilot](https://img.shields.io/badge/Copilot-24292F?logo=githubcopilot&logoColor=white)](docs/install/copilot.md)
+&nbsp;
+[![Mistral](https://img.shields.io/badge/Mistral-FA520F?logo=mistralai&logoColor=white)](docs/install/mistral.md)
 
 </div>
 
@@ -44,6 +48,7 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 - 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
 - ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
 - 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF.
+- 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.

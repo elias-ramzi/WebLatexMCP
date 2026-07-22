@@ -39,10 +39,14 @@ describe('createServer writing guide', () => {
     await client.close();
   });
 
-  it('omits instructions and the resource when no guide is present', async () => {
+  it('always advertises the PDF-comment workflow, even with no guide', async () => {
     const client = await connect(undefined);
 
-    expect(client.getInstructions()).toBeUndefined();
+    // Instructions are always present (the comment workflow), but carry no guide text or resource.
+    const instructions = client.getInstructions();
+    expect(instructions).toContain('list_comments');
+    expect(instructions).toContain('resolve_comments');
+    expect(instructions).not.toContain('present tense');
     expect(client.getServerCapabilities()?.resources).toBeUndefined();
 
     await client.close();
@@ -84,6 +88,21 @@ describe('createServer tool registration', () => {
     const client = await connect();
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name)).toContain('reset_to_remote');
+    await client.close();
+  });
+
+  it('registers the viewer tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('viewer');
+    await client.close();
+  });
+
+  it('registers the comment tools', async () => {
+    const client = await connect();
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).toContain('list_comments');
+    expect(names).toContain('resolve_comments');
     await client.close();
   });
 });

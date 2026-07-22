@@ -5,6 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
+import { compileViewerHint } from '../lib/viewerHint.js';
 import { parseLog, filterLog, logTail, needsShellEscape } from '../services/logParser.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -160,11 +161,17 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             .slice(0, 10)
             .map((e) => `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`)
             .join('\n');
+          // Surface the live viewer whenever there's something to look at: its URL if it's already
+          // running (this build just hot-reloaded into it), else a pointer that the tool exists.
+          const viewerLine = pdfPath
+            ? compileViewerHint(ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined)
+            : '';
           const text = [
             headline,
             pdfUrl ? `PDF: ${pdfUrl}` : '',
             errorLines,
             hint ? `hint: ${hint}` : '',
+            viewerLine,
           ]
             .filter(Boolean)
             .join('\n');

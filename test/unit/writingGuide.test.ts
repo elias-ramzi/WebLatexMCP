@@ -49,8 +49,15 @@ describe('buildInstructions', () => {
     expect(out).toContain('GUIDE_BODY');
   });
 
-  it('returns undefined when there is no guide', () => {
-    expect(buildInstructions(undefined)).toBeUndefined();
+  it('always includes the PDF-comment workflow, even with no guide', () => {
+    const out = buildInstructions(undefined);
+    expect(out).toContain('list_comments');
+    expect(out).toContain('resolve_comments');
+    expect(out).not.toContain('LaTeX (.tex) files through this server');
+  });
+
+  it('includes the comment workflow alongside a guide', () => {
+    expect(buildInstructions('GUIDE_BODY')).toContain('list_comments');
   });
 
   it('combines the writing and concurrency guides when both are present', () => {

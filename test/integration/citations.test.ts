@@ -9,6 +9,9 @@ import { createServer } from '../../src/server.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
+import { ViewerService } from '../../src/services/viewer.js';
+import { SyncTexService } from '../../src/services/synctex.js';
+import { CommentStore } from '../../src/services/commentStore.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
@@ -64,6 +67,20 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       git,
       files: new FileService(),
       compiler: new LatexmkCompiler(),
+      viewer: new ViewerService({
+        knownIds: () => [],
+        resolvePdfPath: async () => null,
+        addComment: async () => {
+          throw new Error('not used');
+        },
+        listComments: () => [],
+        updateComment: () => null,
+        deleteComment: () => false,
+        undoDelete: () => null,
+        resolveComments: () => 0,
+      }),
+      synctex: new SyncTexService(),
+      comments: new CommentStore(),
       credentials: new CredentialResolver({}),
       dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
     };

@@ -61,8 +61,12 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /** Per-project build dir under the OS temp root, keeping the clone clean. */
+export function buildDir(projectDir: string): string {
+  return path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(projectDir));
+}
+
 async function buildDirFor(projectDir: string): Promise<string> {
-  const dir = path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(projectDir));
+  const dir = buildDir(projectDir);
   await mkdir(dir, { recursive: true });
   return dir;
 }
@@ -107,6 +111,9 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
     ENGINE_FLAG[engine],
     '-interaction=nonstopmode',
     '-file-line-error',
+    // Emit a .synctex.gz next to the PDF so a click in the viewer maps back to source file:line
+    // (powers `list_comments`). Cheap and harmless when unused.
+    '-synctex=1',
     `-outdir=${buildDir}`,
   ];
   const shellFlag = shellEscapeFlag(req);
@@ -114,6 +121,16 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
   if (req.clean) args.push('-gg');
   args.push(req.rootFile);
   return args;
+}
+
+/**
+ * The path a compile would write its `.pdf` to (the build-dir `<jobname>.pdf`). Lets the read-only
+ * `viewer` tool locate the last build without re-compiling. This is only the temp build
+ * copy; a workspace-local compile also surfaces the same PDF beside the clone (`pdfSurface`).
+ */
+export function buildPdfPath(projectDir: string, rootFile: string): string {
+  const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
+  return path.join(buildDir(projectDir), `${rootBase}.pdf`);
 }
 
 /**

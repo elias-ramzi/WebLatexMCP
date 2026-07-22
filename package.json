@@ -48,6 +48,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "async-mutex": "^0.5.0",
+    "pdfjs-dist": "^6.1.200",
     "simple-git": "^3.36.0",
     "zod": "^4.4.3"
   },
