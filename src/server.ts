@@ -37,10 +37,37 @@ export function createServer(
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
-      version: '0.1.0',
+      version: '0.1.1',
     },
     instructions ? { instructions } : undefined,
   );
+
+  // Experimental workaround: some MCP clients (observed with certain Claude Desktop builds)
+  // silently fail to dispatch tool calls for servers that advertise an `outputSchema`. When
+  // WEB_LATEX_MCP_NO_OUTPUT_SCHEMA is set, strip outputSchema from every tool and drop the
+  // structuredContent from results so only plain-text content is returned.
+  if (process.env.WEB_LATEX_MCP_NO_OUTPUT_SCHEMA) {
+    type RegFn = (
+      name: string,
+      config: Record<string, unknown>,
+      cb: (...args: unknown[]) => unknown,
+    ) => unknown;
+    const orig = (server.registerTool as unknown as RegFn).bind(server);
+    (server as unknown as { registerTool: RegFn }).registerTool = (name, config, cb) => {
+      const rest: Record<string, unknown> = { ...config };
+      delete rest.outputSchema;
+      const wrapped = async (...args: unknown[]) => {
+        const res = (await cb(...args)) as Record<string, unknown> | undefined;
+        if (res && typeof res === 'object' && 'structuredContent' in res) {
+          const clone: Record<string, unknown> = { ...res };
+          delete clone.structuredContent;
+          return clone;
+        }
+        return res;
+      };
+      return orig(name, rest, wrapped);
+    };
+  }
 
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);

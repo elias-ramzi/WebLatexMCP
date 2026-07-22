@@ -14,6 +14,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                      |
 | `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                    |
 | `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                              |
+| `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Set to `1` to omit `outputSchema`/`structuredContent` from tool results — a workaround for Claude Desktop builds that silently drop calls to servers advertising an output schema. See [Claude Desktop compatibility](#claude-desktop-compatibility).                            |
 
 ### `WEB_LATEX_MCP_PROJECTS` example
 
@@ -107,6 +108,21 @@ reach it).
 Point a guide variable at your own file to override it, or at a non-existent path to ship no guide (the
 server starts normally either way; with no guide, neither the instructions nor the resource is
 advertised).
+
+## Claude Desktop compatibility
+
+Some Claude Desktop builds **silently fail to dispatch tool calls** to an MCP server whose tools
+advertise an `outputSchema` (structured output): the server connects and its tools list fine, but every
+call fails with a generic "Tool execution failed" and never reaches the server. If you hit that — and
+other MCP servers work in the same app — set:
+
+```json
+{ "env": { "WEB_LATEX_MCP_NO_OUTPUT_SCHEMA": "1" } }
+```
+
+This drops `outputSchema` and the `structuredContent` field from tool results, leaving the
+human-readable text content intact. It is **off by default**, since structured output is valuable for
+clients that support it (e.g. Claude Code); it's a targeted workaround for the affected clients only.
 
 ## Cross-platform notes
 

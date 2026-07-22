@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "web-latex-mcp",
   "displayName": "WebLatexMCP",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Read, edit, compile, and commit LaTeX in any git-hosted project (Overleaf, GitHub, or any git remote) — the MCP server plus its LaTeX skills (project cleanup, DBLP citation audits, bibliography normalization) in one install.",
   "author": {
     "name": "Elias Ramzi",
