@@ -9,6 +9,7 @@ import { createServer } from '../../src/server.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
+import { ViewerService } from '../../src/services/viewer.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
@@ -64,6 +65,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       git,
       files: new FileService(),
       compiler: new LatexmkCompiler(),
+      viewer: new ViewerService({ knownIds: () => [], resolvePdfPath: async () => null }),
       credentials: new CredentialResolver({}),
       dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
     };

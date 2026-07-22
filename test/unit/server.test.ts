@@ -86,4 +86,11 @@ describe('createServer tool registration', () => {
     expect(tools.map((t) => t.name)).toContain('reset_to_remote');
     await client.close();
   });
+
+  it('registers the viewer tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('viewer');
+    await client.close();
+  });
 });

@@ -52,4 +52,6 @@ export interface ServerConfig {
   defaultProject?: string;
   /** Local compile backend. `loadConfig` always resolves this; omit to default to `latexmk`. */
   compiler?: CompilerKind;
+  /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
+  viewerPort?: number;
 }

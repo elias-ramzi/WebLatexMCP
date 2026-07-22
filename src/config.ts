@@ -146,6 +146,18 @@ export function loadConfig(
   }
 
   const compiler = parseCompiler(env.WEB_LATEX_MCP_COMPILER);
+  const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
 
-  return { workspaceRoot, workspaceIsLocal, projects, defaultProject, compiler };
+  return { workspaceRoot, workspaceIsLocal, projects, defaultProject, compiler, viewerPort };
+}
+
+/** Parse an optional fixed viewer port; undefined (the default) means OS-assigned ephemeral. */
+function parseViewerPort(raw: string | undefined): number | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`WEB_LATEX_MCP_VIEWER_PORT "${raw}" is invalid; expected a port 0-65535.`);
+  }
+  return port;
 }
