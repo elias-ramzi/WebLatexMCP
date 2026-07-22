@@ -263,4 +263,27 @@ describe('ViewerService', () => {
     expect(list.some((c) => c.id === cid)).toBe(true);
     // (The "nothing left to undo → null" path is covered in isolation in commentStore.test.ts.)
   });
+
+  // Regression: a response whose body is never read leaves the socket *active*, and `server.close()`
+  // alone only reaps idle ones — so closing stayed pending until that socket timed out, stalling
+  // shutdown (and this suite's own teardown, which flaked in CI).
+  it('closes promptly with an unread response body still open', async () => {
+    const other = new ViewerService({
+      knownIds: () => ['demo'],
+      resolvePdfPath: async () => pdf,
+      addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
+      listComments: (id) => store.list(id),
+      updateComment: (id, cid, note) => store.update(id, cid, { note }),
+      deleteComment: (id, cid) => store.remove(id, cid),
+      undoDelete: (id) => store.undo(id),
+      resolveComments: (id, ids) => store.resolve(id, ids),
+    });
+    const url = await other.start(0);
+    expect(url).toBeDefined();
+    // Deliberately leave the body unconsumed, as several tests above do.
+    expect((await fetch(`${url!}/pdfjs/build/pdf.mjs`)).status).toBe(200);
+
+    await other.close();
+    expect(other.isRunning()).toBe(false);
+  }, 5_000);
 });
