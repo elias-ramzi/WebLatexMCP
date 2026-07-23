@@ -6,6 +6,37 @@ import type { SafePushResult } from '../services/gitService.js';
 import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
 import { renderConflictText, renderRebasedOver } from '../lib/conflictText.js';
+import { toPosix } from '../lib/paths.js';
+
+/**
+ * Refuse to push while a live sibling session has uncommitted work in the shared clone.
+ *
+ * A push has to rebase, and a rebase needs a clean tree — so pushing here would mean either
+ * sweeping that session's half-finished paragraph into our commit or rewriting the tree
+ * underneath it. Neither is ours to do, so we stop and name who to wait for.
+ *
+ * Changes nobody owns (edited outside this server, or left behind by a session that has since
+ * exited) are not blocked: they are the single-session behaviour this server has always had.
+ */
+async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<void> {
+  const peers = await ctx.sessions.livePeers(id);
+  if (peers.length === 0) return;
+
+  const status = await ctx.git.status(dir);
+  const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
+  if (dirty.length === 0) return;
+
+  const mine = new Set((await ctx.shadows.changes(id)).map((c) => c.path));
+  const theirs = dirty.filter((p) => !mine.has(p));
+  if (theirs.length === 0) return;
+
+  throw new Error(
+    `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}. ` +
+      `Session(s) ${peers.map((p) => `"${p.sessionId}"`).join(', ')} are active — pushing has to ` +
+      'rebase, which would sweep up or overwrite their in-flight work. Wait for them to commit, ' +
+      'or take ownership deliberately with commit scope "all" and push again.',
+  );
+}
 
 const conflictHunkSchema = z.object({
   startLine: z.number(),
@@ -176,6 +207,10 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         const secrets = ctx.credentials.allSecrets();
 
         return await ctx.projectManager.runExclusive(id, async () => {
+          await ctx.sessions.touch(id);
+          await ctx.shadows.refresh(id, dir);
+          await guardPeerWork(ctx, id, dir);
+
           if (resolutions && resolutions.length > 0) {
             if (mode === 'branch') {
               throw new Error('Conflict resolutions are only supported in direct mode.');
@@ -189,6 +224,7 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
             // The resolver rewrote files on disk; drop stale revision baselines so a later edit
             // isn't misread as an out-of-band change.
             ctx.files.resetBaselines(dir);
+            await ctx.shadows.refresh(id, dir);
             return safePushToolResult(res, secrets);
           }
 
@@ -219,6 +255,9 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
           }
 
           const res = await ctx.git.safePush(dir, cfg.gitUrl, auth, { commitMessage: message });
+          // The rebase moved HEAD, so carry this session's remaining shadow onto it — and settle
+          // whatever of it just went out.
+          await ctx.shadows.refresh(id, dir);
           return safePushToolResult(res, secrets);
         });
       } catch (err) {

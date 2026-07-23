@@ -19,6 +19,7 @@ describe('ProjectManager', () => {
   function makeConfig(): ServerConfig {
     return {
       workspaceRoot,
+      sessionId: 'test',
       projects: [
         { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
         { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
@@ -43,7 +44,7 @@ describe('ProjectManager', () => {
   });
 
   it('throws when no id and no default are available', () => {
-    const pm = new ProjectManager({ workspaceRoot, projects: [] });
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] });
     expect(() => pm.getProjectConfig()).toThrow(/No project specified/);
   });
 
@@ -57,7 +58,7 @@ describe('ProjectManager', () => {
   });
 
   it('registers a project dynamically', () => {
-    const pm = new ProjectManager({ workspaceRoot, projects: [] });
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] });
     expect(() => pm.getProjectConfig('new')).toThrow(/Unknown project/);
     pm.registerProject('new', 'https://git.overleaf.com/zzz');
     expect(pm.getProjectConfig('new').gitUrl).toBe('https://git.overleaf.com/zzz');

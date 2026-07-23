@@ -25,6 +25,7 @@ describe('GitHub-style main-branch full loop against a bare-repo stand-in', () =
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
+      sessionId: 'test',
       projects: [{ id: 'gh', gitUrl: remote.url }],
       defaultProject: 'gh',
     };

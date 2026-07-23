@@ -5,6 +5,7 @@ import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
 import { isBibFile } from '../lib/bib.js';
 import { toPosix } from '../lib/paths.js';
+import { execCapture } from '../lib/exec.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
@@ -179,6 +180,83 @@ export class GitService {
     await git.raw(args);
     const sha = (await git.revparse(['HEAD'])).trim();
     return { committed: true, sha, filesChanged: staged.length, files };
+  }
+
+  /**
+   * Commit exact file contents, regardless of what the working tree currently holds.
+   *
+   * This is how one session commits only its own changes while its peers' edits sit uncommitted
+   * in the shared working tree: the index is reset to HEAD, the given contents are written
+   * straight into it as blobs, and the commit is made from the index alone — no `add`, no `-a`,
+   * and not a single byte of the working tree is touched.
+   *
+   * A null `content` stages the file's deletion.
+   */
+  async commitContents(
+    dir: string,
+    opts: {
+      message: string;
+      files: Array<{ path: string; content: string | null }>;
+      allowEmpty?: boolean;
+    },
+  ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
+    const git = simpleGit(dir);
+    // Start from HEAD so nothing another call left staged can leak into this commit. Without
+    // `-u` the working tree is left exactly as it is.
+    await git.raw(['read-tree', '--reset', 'HEAD']);
+
+    for (const file of opts.files) {
+      const rel = toPosix(file.path);
+      if (file.content === null) {
+        await git.raw(['update-index', '--force-remove', '--', rel]);
+        continue;
+      }
+      const mode = (await this.indexMode(git, rel)) ?? '100644';
+      const sha = await this.hashObject(dir, rel, file.content);
+      await git.raw(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`]);
+    }
+
+    const staged = (await git.diff(['--cached', '--name-only'])).split('\n').filter(Boolean);
+    if (staged.length === 0 && !opts.allowEmpty) {
+      throw new Error('Nothing to commit (no staged changes).');
+    }
+    const files = parseNumstat(await git.diff(['--cached', '--numstat']));
+    const args = [
+      '-c',
+      `user.name=${this.identity.name}`,
+      '-c',
+      `user.email=${this.identity.email}`,
+      'commit',
+      '-m',
+      opts.message,
+    ];
+    if (opts.allowEmpty) args.push('--allow-empty');
+    await git.raw(args);
+    const sha = (await git.revparse(['HEAD'])).trim();
+    return { committed: true, sha, filesChanged: staged.length, files };
+  }
+
+  /** Read a path's content at a commit-ish, or null when it does not exist there. */
+  async readAtRef(dir: string, ref: string, relPath: string): Promise<string | null> {
+    return this.showOrNull(simpleGit(dir), ref, toPosix(relPath));
+  }
+
+  /** Write `content` into the object database and return its blob sha. */
+  private async hashObject(dir: string, relPath: string, content: string): Promise<string> {
+    const res = await execCapture('git', ['hash-object', '-w', '--stdin', '--path', relPath], {
+      cwd: dir,
+      input: content,
+    });
+    if (res.code !== 0) {
+      throw new Error(`git hash-object failed for "${relPath}": ${res.stderr.trim()}`);
+    }
+    return res.stdout.trim();
+  }
+
+  /** A tracked path's index mode, so staging preserves it (e.g. an executable). */
+  private async indexMode(git: SimpleGit, relPath: string): Promise<string | null> {
+    const out = await git.raw(['ls-files', '-s', '--', relPath]);
+    return out.trim().split(/\s+/)[0] || null;
   }
 
   /** Discard uncommitted changes (working tree + untracked), optionally limited to paths. */

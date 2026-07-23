@@ -51,6 +51,9 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
           // The reset rewrote the working tree to the remote head; drop stale revision baselines so a
           // later edit isn't misread as an out-of-band change (as project_sync/discard do).
           ctx.files.resetBaselines(dir);
+          // Every session's uncommitted work was thrown away with the tree, so no session's
+          // record of it is meaningful any more.
+          await ctx.shadows.clearAll(id);
 
           const discarded: string[] = [];
           if (res.discardedCommits.length) {

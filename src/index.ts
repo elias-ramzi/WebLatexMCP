@@ -51,9 +51,19 @@ async function main(): Promise<void> {
         `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
     );
   };
+  // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
+  // session that dies without this is detected as gone by pid instead.
+  const release = (): void => {
+    for (const id of ctx.sessions.trackedProjects()) void ctx.sessions.release(id).catch(() => {});
+  };
+  process.once('SIGINT', release);
+  process.once('SIGTERM', release);
+  process.once('beforeExit', release);
+
   await server.connect(transport);
   console.error(
-    `[web-latex-mcp] server ready on stdio${writingGuide ? ' (writing guide loaded)' : ''}` +
+    `[web-latex-mcp] server ready on stdio as session "${config.sessionId}"` +
+      `${writingGuide ? ' (writing guide loaded)' : ''}` +
       `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}` +
       `${skills.length > 0 ? ` (${skills.length} skills as prompts)` : ''}`,
   );

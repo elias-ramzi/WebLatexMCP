@@ -58,10 +58,11 @@ formatting; all logic lives in services so it is unit-testable without a live MC
 - `src/prompts/skills.ts` — registers each bundled skill (`.claude/skills/*/SKILL.md`, loaded by
   `src/lib/skills.ts`) as an MCP prompt, so clients that don't read `.claude/skills` (Claude Desktop,
   Cursor) can still run them. Add a skill by adding its directory — no code change.
-- `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex, dynamic
-  registration), `GitService` (simple-git wrapper), `FileService` (sandboxed fs), `LatexmkCompiler`
-  (implements the `LatexCompiler` interface), `DblpService` (DBLP search + canonical BibTeX fetch, with
-  an injectable `fetch` for tests), `logParser`, `auth`.
+- `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex **+
+  cross-process lock**, dynamic registration), `GitService` (simple-git wrapper), `FileService`
+  (sandboxed fs), `LatexmkCompiler` (implements the `LatexCompiler` interface), `DblpService` (DBLP
+  search + canonical BibTeX fetch, with an injectable `fetch` for tests), `SessionRegistry` +
+  `ShadowStore` (parallel sessions — see below), `logParser`, `auth`.
 
 Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per project id.
 When unset, the default is workspace-local — `<launch-dir>/.web_latex_mcp` (beside the agent's code;
@@ -81,6 +82,21 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   so messages are token-scrubbed across every configured host.
 - **Mutating tools** (write/edit/delete/commit/push/discard/clone/add_citation) must run inside
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+  `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`), because
+  sibling agent sessions are separate server processes over the same clone.
+- **Parallel sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names this process
+  (`config.sessionId`). `ShadowStore` (`src/services/shadowStore.ts`) keeps, per touched file, a shadow
+  holding `HEAD + only this session's edits`; `commit` stages that via `GitService.commitContents`
+  (`read-tree --reset HEAD` + `hash-object` + `update-index`, never `git add`), so a peer's in-flight
+  edits stay uncommitted in the working tree. The shadow is fed by `FileService.setMutationRecorder`
+  (wired in `context.ts`) with the working-tree content **either side** of each write — it folds in the
+  _change_, three-way merged, never the file the model happened to read, or peers' lines would leak in.
+  After HEAD moves, `shadows.refresh(id, dir)` carries shadows forward (lazily, per session); tools that
+  rewrite the whole tree (`discard`, `reset_to_remote`) call `shadows.clearAll(id)` instead. A same-line
+  collision flags the entry `conflicted` and it **stays** flagged — never clear it on a later edit, since
+  its base is stale and committing it would revert what landed. State lives in
+  `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`), outside the clones. Keep this: the
+  guarantee is that a commit contains one session's lines and nobody else's.
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
