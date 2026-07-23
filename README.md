@@ -153,7 +153,7 @@ See the [full tool reference](docs/tools.md).
 Task-specific skills that drive the tools — each stops at the diff, so nothing is committed or pushed
 unless you ask:
 
-- **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
+- **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
 - **`/verify-citations`** — audit every `.bib` entry against DBLP, flag discrepancies, and write a local git-excluded audit report (read-only for the `.bib`).
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
