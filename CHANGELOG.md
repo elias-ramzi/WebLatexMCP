@@ -39,3 +39,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   own `figures/<name>.tex` or `tables/<name>.tex` file, `\input`ed from exactly where the float stood.
   Files are named after the float's label, `\includegraphics` paths are left byte-identical, and new
   floats are authored the same way from the start.
+- `arxiv-clean-project` skill now gates `--use_external_tikz` on detection: it is offered only when the
+  project already externalizes TikZ (`\tikzexternalize` plus one PDF per figure in the prefix folder),
+  since `arxiv_latex_cleaner` only substitutes the PDFs and never generates them. Otherwise the skill
+  explains what setting externalization up would require (a live source edit and arXiv's TeX Live
+  release) and proceeds without the flag.
+- Writing guide clarifies two conventions: figure/table caption explanations are descriptive (axes,
+  conditions, curves — interpretation stays in the body text), and acronyms are defined once at first
+  appearance, only for terms that recur, with the abstract as the standalone exception.
