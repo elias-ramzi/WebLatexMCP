@@ -8,7 +8,7 @@ client can resolve without a shell).
 
 ---
 
-## The setup: two concurrency models
+## The setup: three concurrency models
 
 An Overleaf project's Git bridge is an ordinary Git remote — in practice a single
 default branch (`main`; older projects may still use `master`). But the people
@@ -19,10 +19,17 @@ editing the document are not all using Git:
   **opaquely** — you see commits appear on `main`, not the individual edits.
 - **AI agents** (Claude, through this server) clone the repo, edit files, commit,
   and push over Git.
+- **Several agent sessions at once** — one person running a session per section,
+  say — each a separate server process, all editing the _same_ local clone.
 
-So we are bridging two concurrency models: OT inside Overleaf, Git on our side.
-The web side can advance `main` at any moment, without warning. Every push has
-to assume the remote may have moved since we last looked.
+So we are bridging concurrency models: OT inside Overleaf, Git against the remote,
+and a shared working tree between sibling sessions. The web side can advance `main`
+at any moment, without warning, so every push has to assume the remote may have
+moved since we last looked. And the working tree can change under a session at any
+moment, so no session may assume the files on disk hold only its own work.
+
+The rest of this document covers the remote (agent ↔ web) half. For the local half,
+see [**parallel sessions**](#parallel-sessions-on-one-clone) below.
 
 ## The core rule
 
@@ -115,6 +122,90 @@ We cannot eliminate this, only shrink the window:
 - **For high-stakes pushes, coordinate timing.** Before a large or structural push,
   it is worth asking collaborators to pause web edits for a moment, or pushing when
   the document is quiet.
+
+## Parallel sessions on one clone
+
+Everything above is about the _remote_. This section is about the _local_ clone, when
+one person runs several agent sessions on the same paper — one per section, say — and
+each is a separate server process sharing a single working tree.
+
+Two things break if that is left unmanaged. Git has no tolerance for two processes
+rewriting an index at once, so operations must be serialised across processes, not
+just within one. And `git add` cannot tell whose change is whose, so one session
+committing would sweep up another's half-written paragraph under its own message.
+
+### Naming your sessions
+
+Set `WEB_LATEX_MCP_SESSION` per session to something meaningful — `intro`,
+`experiments` — and it becomes what peers see in `status`. Without it a session still
+works and is still isolated, but it shows up to the others under a generated id.
+
+### Serialising across processes
+
+Every mutating operation takes a lock file beside the clone for the duration, on top
+of the in-process mutex. A session that crashes cannot release its lock, so a lock is
+reclaimed once its owning process is gone, or once it stops being refreshed. Callers
+wait rather than fail; only a genuinely stuck holder produces an error, and it names
+the session holding it.
+
+### Committing only your own work
+
+Each session keeps a **shadow** of every file it has touched, holding `HEAD + only
+this session's edits`, while the working tree holds everyone's. `commit` stages the
+shadow directly rather than running `git add`, so the commit contains that session's
+lines and leaves its peers' edits sitting uncommitted on disk, exactly where they
+were.
+
+The shadow is maintained from the _change_, not the result: when a session writes a
+file, what is folded into its shadow is the difference its own write made, three-way
+merged, never the whole file it happened to read. That is what keeps a peer's lines
+out of it. After HEAD moves — a peer commits, a pull lands, a push rebases — each
+session carries its shadow onto the new HEAD by three-way merge, lazily, on its next
+call. No session has to be running for another to make progress.
+
+Two consequences worth knowing:
+
+- `commit` reports `leftUncommitted` — what is still dirty that it deliberately did
+  not take. A file can appear there even though the commit included part of it; that
+  is the two-sessions-one-file case, working as intended.
+- `commit scope: "all"` is the escape hatch: it commits the whole working tree, other
+  sessions' work included. Use it deliberately, not as a default.
+
+### When two sessions edit the same lines
+
+Same file, different paragraphs, is the case this is built for and it merges silently.
+Same _lines_ is a genuine collision, and it is treated exactly like a rebase conflict:
+surfaced, never guessed at. The file is flagged (`conflictedChanges` in `status`,
+`conflicted` on a commit result) and excluded from commits, and it stays flagged —
+later edits do not quietly clear it, because that session's shadow is anchored to a
+base the file has since moved past, and committing it would revert whatever landed in
+between.
+
+There are two honest ways out, and both are the caller's decision: commit with
+`scope: "all"` to take the working tree as it stands, or discard those files to give
+up that session's version.
+
+### Pushing with peers around
+
+A push has to rebase, and a rebase needs a clean tree. So `push` refuses while a live
+peer session has uncommitted work, naming who to wait for — the alternative would be
+sweeping their in-flight paragraph into the push or rewriting the tree underneath
+them. Changes nobody owns (edited outside the server, or left by a session that has
+since exited) do not block it.
+
+The practical rhythm: sessions commit as they finish a piece, and whoever pushes does
+so when the others are between edits.
+
+### What this does not do
+
+- **It is one machine only.** All of it rests on a shared filesystem. Two people on
+  two laptops see none of it, and coordinate through the remote as they always did.
+- **It attributes, it does not lock.** No session is prevented from editing any file.
+  Splitting the paper into per-section files remains the real defence — it makes
+  collisions rare rather than merely legible.
+- **A session that dies leaves its edits behind.** They stay in the working tree, but
+  the record of whose they were is eventually collected; they then show up as
+  unattributed changes, committable with `scope: "all"`.
 
 ## Optional review flow for larger edits
 

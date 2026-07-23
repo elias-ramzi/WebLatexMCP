@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { syncState, syncSummary } from '../lib/syncState.js';
+import { toPosix } from '../lib/paths.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -37,6 +38,25 @@ const outputSchema = {
   externalChanges: z
     .array(z.string())
     .describe('Files changed on disk directly (not via this server this session).'),
+  session: z.string().describe('Id of this session.'),
+  sessionChanges: z
+    .array(z.string())
+    .describe('Uncommitted files this session edited — what a default commit would send.'),
+  otherChanges: z
+    .array(z.string())
+    .describe(
+      "Uncommitted files this session did not edit — another session's in-flight work, or " +
+        'edits made outside this server. A default commit leaves these alone.',
+    ),
+  activeSessions: z
+    .array(z.object({ session: z.string(), live: z.boolean(), lastSeen: z.string() }))
+    .describe('Other sessions known to be working on this project.'),
+  conflictedChanges: z
+    .array(z.string())
+    .describe(
+      'Files this session edited that a commit has since changed on the same lines. They are ' +
+        'excluded from commits until re-read and re-edited on the current content.',
+    ),
 };
 
 export function registerStatus(server: McpServer, ctx: AppContext): void {
@@ -47,14 +67,27 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
       description:
         'Show branch, sync state (ahead/behind vs the tracked remote — a non-zero "behind" means ' +
         'origin moved since the last sync and a push may conflict), and staged/unstaged/untracked ' +
-        'files. Counts reflect the last fetch; run project_sync to refresh them.',
+        'files. Counts reflect the last fetch; run project_sync to refresh them. Also splits the ' +
+        "uncommitted changes into this session's and other sessions', and lists the other agent " +
+        'sessions currently working on the project.',
       inputSchema,
       outputSchema,
     },
     async ({ project }) => {
       try {
-        const { dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
         const status = await ctx.git.status(dir);
+        await ctx.sessions.touch(id);
+        // Carry this session's shadow onto the current HEAD first, so the split below reflects
+        // what a commit would actually do rather than a stale picture.
+        await ctx.shadows.refresh(id, dir);
+        const changes = await ctx.shadows.changes(id);
+        const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
+        const owned = new Set(changes.map((c) => c.path));
+        const sessionChanges = dirty.filter((p) => owned.has(p)).sort();
+        const otherChanges = dirty.filter((p) => !owned.has(p)).sort();
+        const conflictedChanges = changes.filter((c) => c.conflicted).map((c) => c.path);
+        const peers = (await ctx.sessions.peers(id)).filter((p) => !p.self);
         // Flag files a human edited directly (as opposed to changes the tools made), so the
         // agent acknowledges them before writing over them.
         const externalChanges = await ctx.files.externalModifications(dir, [
@@ -78,6 +111,18 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           externalChanges.length
             ? `⚠ changed directly (not via tools): ${externalChanges.join(', ')}`
             : '',
+          sessionChanges.length
+            ? `this session ("${ctx.shadows.sessionId}") changed: ${sessionChanges.join(', ')}`
+            : '',
+          otherChanges.length ? `changed by others: ${otherChanges.join(', ')}` : '',
+          conflictedChanges.length
+            ? `⚠ conflicted (this session vs a commit): ${conflictedChanges.join(', ')}`
+            : '',
+          peers.length
+            ? `other sessions: ${peers
+                .map((p) => `${p.sessionId}${p.live ? '' : ' (gone)'}`)
+                .join(', ')}`
+            : '',
         ]
           .filter(Boolean)
           .join('\n');
@@ -87,6 +132,15 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
             ...status,
             syncState: syncState(status.ahead, status.behind),
             externalChanges,
+            session: ctx.shadows.sessionId,
+            sessionChanges,
+            otherChanges,
+            conflictedChanges,
+            activeSessions: peers.map((p) => ({
+              session: p.sessionId,
+              live: p.live,
+              lastSeen: p.heartbeatAt,
+            })),
           },
         };
       } catch (err) {

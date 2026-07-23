@@ -1,6 +1,8 @@
 import path from 'node:path';
 import { access } from 'node:fs/promises';
 import { Mutex } from 'async-mutex';
+import { withFileLock } from '../lib/fileLock.js';
+import { projectLockPath } from '../lib/sessionPaths.js';
 import type { ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
 
 /**
@@ -12,6 +14,7 @@ export class ProjectManager {
   private readonly projects: Map<string, ProjectConfig>;
   private readonly workspaceRoot: string;
   private readonly defaultProject?: string;
+  private readonly sessionId: string;
 
   /** One mutex per project, so concurrent mutating tool calls can't interleave. */
   private readonly locks = new Map<string, Mutex>();
@@ -20,16 +23,26 @@ export class ProjectManager {
     this.projects = new Map(config.projects.map((p) => [p.id, p]));
     this.workspaceRoot = config.workspaceRoot;
     this.defaultProject = config.defaultProject;
+    this.sessionId = config.sessionId;
   }
 
-  /** Run `fn` holding the project's lock — serializes writes/commits/pushes per project. */
+  /**
+   * Run `fn` holding the project's lock — serializes writes/commits/pushes per project.
+   *
+   * Two layers, because sibling agent sessions run separate server processes over the same
+   * clone: the mutex serialises this process's own calls, and the lock file serialises us
+   * against every other process. Both are needed — git will happily corrupt an index that two
+   * processes rewrite at once.
+   */
   async runExclusive<T>(id: string, fn: () => Promise<T>): Promise<T> {
     let lock = this.locks.get(id);
     if (!lock) {
       lock = new Mutex();
       this.locks.set(id, lock);
     }
-    return lock.runExclusive(fn);
+    return lock.runExclusive(() =>
+      withFileLock(projectLockPath(this.workspaceRoot, id), fn, { owner: this.sessionId }),
+    );
   }
 
   /** Register (or update) a project at runtime. */
@@ -65,6 +78,16 @@ export class ProjectManager {
   /** All known project ids (configured + runtime-registered), for enumeration. */
   knownIds(): string[] {
     return [...this.projects.keys()];
+  }
+
+  /**
+   * Inverse of `projectPath`: which project a clone directory belongs to, or undefined if it is
+   * not one of ours. Lets services that are handed a directory (FileService) attribute work to a
+   * project without every caller threading the id through.
+   */
+  idForDir(dir: string): string | undefined {
+    const resolved = path.resolve(dir);
+    return this.knownIds().find((id) => path.resolve(this.projectPath(id)) === resolved);
   }
 
   /** Whether a project id has been cloned locally. */

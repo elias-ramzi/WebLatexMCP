@@ -59,6 +59,20 @@ const ASSET_EXT = new Set([
 
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Notified of every mutation this server makes, with the working-tree content either side of it
+ * (null meaning the file was absent). Lets the session's shadow of its own uncommitted work be
+ * kept up to date without FileService knowing anything about sessions or git.
+ */
+export interface MutationRecorder {
+  record(
+    projectDir: string,
+    relPath: string,
+    before: string | null,
+    after: string | null,
+  ): Promise<void>;
+}
+
 function classify(file: string): FileType {
   const ext = path.extname(file).toLowerCase();
   if (ext === '.tex') return 'tex';
@@ -95,6 +109,18 @@ function countOccurrences(haystack: string, needle: string): number {
 export class FileService {
   /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
   private readonly revisions = new FileRevisionTracker();
+
+  /** Optional; when absent, mutations simply aren't attributed to a session. */
+  private recorder?: MutationRecorder;
+
+  /**
+   * Set after construction because the recorder needs services that are built later (it resolves
+   * a clone dir to a project and reads git HEAD). Every mutating method funnels through
+   * `notify`, so this is the single seam where session attribution attaches.
+   */
+  setMutationRecorder(recorder: MutationRecorder): void {
+    this.recorder = recorder;
+  }
 
   async list(
     projectDir: string,
@@ -191,6 +217,7 @@ export class FileService {
     }
     await writeFile(abs, opts.content, 'utf8');
     this.revisions.record(abs, opts.content);
+    await this.notify(projectDir, opts.path, current ?? null, opts.content);
     return {
       path: opts.path,
       bytesWritten: Buffer.byteLength(opts.content, 'utf8'),
@@ -237,6 +264,7 @@ export class FileService {
     });
     await writeFile(abs, content, 'utf8');
     this.revisions.record(abs, content);
+    await this.notify(projectDir, relPath, original, content);
     return { path: relPath, appliedEdits: edits.length };
   }
 
@@ -251,14 +279,15 @@ export class FileService {
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
     }
+    const current = await readFile(abs, 'utf8').catch(() => null);
     if (!opts.overrideExternalChanges && this.revisions.hasBaseline(abs)) {
-      const current = await readFile(abs, 'utf8');
-      if (this.revisions.isStale(abs, current)) {
+      if (current !== null && this.revisions.isStale(abs, current)) {
         throw new ExternalChangeError(relPath);
       }
     }
     await rm(abs);
     this.revisions.forget(abs);
+    await this.notify(projectDir, relPath, current, null);
     return { path: relPath };
   }
 
@@ -288,6 +317,28 @@ export class FileService {
       if (this.revisions.isExternal(abs, content)) out.push(rel);
     }
     return out;
+  }
+
+  /**
+   * Tell the recorder about a completed mutation. Never allowed to fail the write itself — the
+   * file is already on disk, and losing attribution is a far smaller problem than reporting an
+   * error for a change that actually landed.
+   */
+  private async notify(
+    projectDir: string,
+    relPath: string,
+    before: string | null,
+    after: string | null,
+  ): Promise<void> {
+    if (!this.recorder) return;
+    try {
+      await this.recorder.record(projectDir, toPosix(relPath), before, after);
+    } catch (err) {
+      console.error(
+        `[web-latex-mcp] could not attribute the change to "${relPath}" to this session:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   private async walk(root: string, dir: string, out: string[]): Promise<void> {

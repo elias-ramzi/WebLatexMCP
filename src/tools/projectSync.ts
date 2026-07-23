@@ -72,6 +72,12 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
         if (result.action === 'cloned' || result.action === 'pulled') {
           ctx.files.resetBaselines(dir);
         }
+        if (result.action === 'pulled') {
+          // A pull moves HEAD but keeps uncommitted work, so this session's changes are still
+          // real — carry them onto the new HEAD rather than forgetting whose they are. Peers do
+          // the same lazily on their next call.
+          await ctx.shadows.refresh(cfg.id, dir);
+        }
 
         const payload = { project: cfg.id, path: dir, ...result };
         return {

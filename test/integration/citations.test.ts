@@ -15,6 +15,8 @@ import { CommentStore } from '../../src/services/commentStore.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
+import { SessionRegistry } from '../../src/services/sessionRegistry.js';
+import { ShadowStore } from '../../src/services/shadowStore.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -53,6 +55,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
     cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
     const config: ServerConfig = {
       workspaceRoot: workspace,
+      sessionId: 'test',
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',
     };
@@ -83,7 +86,15 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       comments: new CommentStore(),
       credentials: new CredentialResolver({}),
       dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+      sessions: new SessionRegistry(workspace, config.sessionId),
+      shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
+        git.readAtRef(d, 'HEAD', rel),
+      ),
     };
+    ctx.files.setMutationRecorder({
+      record: (projectDir, relPath, before, after) =>
+        ctx.shadows.record('demo', projectDir, relPath, before, after),
+    });
 
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

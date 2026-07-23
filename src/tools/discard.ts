@@ -37,6 +37,9 @@ export function registerDiscard(server: McpServer, ctx: AppContext): void {
           // The working tree was rewritten to HEAD; drop baselines so the reverted content
           // isn't later mistaken for an out-of-band user edit.
           ctx.files.resetBaselines(dir);
+          // Discard is not session-scoped — it throws away every session's uncommitted work, so
+          // every session's record of that work has to go too, or later edits get misattributed.
+          await ctx.shadows.clearAll(id);
           return {
             content: [{ type: 'text', text: 'discarded uncommitted changes' }],
             structuredContent: { ...res },

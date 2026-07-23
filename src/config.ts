@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
@@ -152,12 +153,33 @@ export function loadConfig(
   return {
     workspaceRoot,
     workspaceIsLocal,
+    sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
     defaultProject,
     compiler,
     viewerPort,
     viewerTarget,
   };
+}
+
+/**
+ * Resolve this process's session id. An explicit `WEB_LATEX_MCP_SESSION` is the useful case —
+ * it names the session in `status` and keys its shadow of uncommitted work, so parallel agent
+ * sessions on one project should each set a distinct, meaningful value. Unset, we generate one,
+ * which still isolates this process's changes but reads as anonymous to peers.
+ *
+ * Sanitised to a safe directory name, since it becomes one under the session state dir.
+ */
+function parseSessionId(raw: string | undefined): string {
+  const value = raw?.trim();
+  if (!value) return `session-${randomBytes(4).toString('hex')}`;
+  const safe = value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  if (!safe) {
+    throw new Error(
+      `WEB_LATEX_MCP_SESSION "${raw}" has no usable characters; use letters, digits, ".", "_" or "-".`,
+    );
+  }
+  return safe.slice(0, 64);
 }
 
 /** Parse the default viewer target from env; undefined (the default) means the OS browser. */

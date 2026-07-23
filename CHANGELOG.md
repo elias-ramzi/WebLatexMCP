@@ -9,7 +9,31 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **Parallel sessions on one clone.** Several agent sessions — a session per section, say — can work on
+  the same project at once, each committing only its own edits. Each session keeps a shadow of every
+  file it touched, holding `HEAD` plus only that session's changes, and `commit` stages that content
+  directly instead of running `git add`, so a peer's half-written paragraph in the same file stays
+  uncommitted in the working tree. Name a session with `WEB_LATEX_MCP_SESSION`; state lives in
+  `<workspace>/.sessions/`, outside the clones. Same file, different paragraphs merges silently; the
+  same _lines_ is surfaced and excluded from commits rather than resolved. See
+  [Parallel sessions on one clone](docs/CONCURRENCY.md#parallel-sessions-on-one-clone). Requires one
+  server process per session (Claude Code); Claude Desktop shares a single session across chats.
+- Mutating operations now also take a lock file, so two server processes over the same clone can no
+  longer rewrite its git index at once. Abandoned locks are reclaimed once the owning process is gone.
+- `status` reports `sessionChanges` / `otherChanges` (who owns each uncommitted file), `activeSessions`,
+  and `conflictedChanges`; `commit` reports `scope`, `session`, `leftUncommitted`, and `conflicted`.
+  Rendered into the result text too, so clients without structured output still see them.
+
 ### Changed
+
+- `commit` commits only the current session's edits by default, once that session has changes to track;
+  pass `scope: "all"` for the previous whole-clone behaviour. Sessions that make every edit through the
+  tools — the single-session case — are unaffected.
+- `push` refuses while another live session has uncommitted work, naming who to wait for: a push has to
+  rebase, and a rebase needs a clean tree. Changes nobody owns (edited outside the server, or left by an
+  exited session) do not block it.
 
 - `format-latex-project` gains a third cosmetic pass: every `figure`/`table` environment moves into its
   own `figures/<name>.tex` or `tables/<name>.tex` file, `\input`ed from exactly where the float stood.
