@@ -83,8 +83,9 @@ each with a `SKILL.md` whose frontmatter carries a `name` and a `description`. T
 
 ## `format-latex-project` — reformat an existing project
 
-Cleans up an existing project in two cosmetic-only passes: it splits the monolithic main file into
-per-section `\input{sections/…}` files, and rewrites body paragraphs to **one sentence per line** (the
+Cleans up an existing project in three cosmetic-only passes: it splits the monolithic main file into
+per-section `\input{sections/…}` files, moves every figure and table into its own
+`\input{figures/…}`/`\input{tables/…}` file, and rewrites body paragraphs to **one sentence per line** (the
 convention from [`writing-guide.md`](writing-guide.md), which keeps diffs small and edits surgical). It
 compiles before and after as a guardrail — the PDF must be unchanged — and stops at the diff so you review
 before any `commit`/`push`. Ask Claude to "format my Overleaf project".
