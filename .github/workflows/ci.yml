@@ -49,5 +49,13 @@ jobs:
         with:
           packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended
           version: 1.0
+      # cache-apt-pkgs-action restores the .deb payloads but skips dpkg's post-install, so on a
+      # warm cache TeX Live's filename/font databases are never rebuilt and latexmk fails
+      # intermittently (a cache miss installs cleanly and passes; a hit does not). Rebuild them so
+      # a cache hit matches a fresh install.
+      - name: Refresh TeX Live databases
+        run: |
+          sudo mktexlsr
+          sudo updmap-sys
       - run: npm ci
       - run: npm run test:smoke
