@@ -1,6 +1,6 @@
 {
   "name": "web-latex-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server to read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote).",
   "type": "module",
   "author": "Elias Ramzi",
