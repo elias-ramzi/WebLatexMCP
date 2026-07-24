@@ -27,6 +27,7 @@ describe('write-back flow (commit + push) against a bare-repo stand-in', () => {
     cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
     const config: ServerConfig = {
       workspaceRoot: workspace,
+      sessionId: 'test',
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',
     };

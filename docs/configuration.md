@@ -10,6 +10,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_PROJECTS`                                   | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                                                                                                                                                                                 |
 | `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override. |
 | `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                                                                                                                |
+| `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                |
 | `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                               |
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                      |
 | `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                    |
@@ -60,6 +61,30 @@ To override the default:
 - `cwd` — force workspace-local even when the auto-detection wouldn't (e.g. a non-repo project dir).
 - any **path** (absolute, `~`-relative, or relative to the launch dir) — use that exact directory as
   the shared clone root; nothing is git-excluded.
+
+## Parallel sessions
+
+Several agent sessions can work on one paper at once — one per section, say — each a separate server
+process sharing a single clone. Give each one a name:
+
+```json
+{ "env": { "WEB_LATEX_MCP_SESSION": "experiments" } }
+```
+
+That name is what the other sessions see in `status`, and it is what `commit` scopes to: by default a
+commit contains only the edits **that session** made, leaving its peers' in-flight work uncommitted in
+the working tree. Mutating operations are serialised across processes with a lock file, so two servers
+never rewrite the clone's index at once.
+
+Session state (the lock, and each session's record of its own changes) lives under
+`<workspace>/.sessions/<project-id>/`, beside the clones rather than inside them — nothing there can be
+committed or mistaken for project content. With no `WEB_LATEX_MCP_SESSION` set, a session still works
+and is still isolated, but shows up to its peers under a generated id.
+
+This works between processes on **one machine**; it is not coordination between people on different
+machines, who still meet at the git remote. See [Parallel sessions on one
+clone](CONCURRENCY.md#parallel-sessions-on-one-clone) for the model, the conflict semantics, and the
+limits.
 
 ## Compile backend
 

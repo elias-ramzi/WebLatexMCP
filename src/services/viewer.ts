@@ -230,7 +230,7 @@ function viewerHtml(id: string): string {
 <button class="wlm-fab" id="fab">💬 Comment</button>
 <div class="wlm-pop" id="pop">
   <div class="q" id="popq"></div>
-  <textarea id="popnote" placeholder="Describe the change you want…"></textarea>
+  <textarea id="popnote" placeholder="Describe the change you want… (⇧⏎ to save, Esc to cancel)"></textarea>
   <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
 </div>
 <div class="wlm-panel" id="panel">
@@ -412,6 +412,12 @@ fab.addEventListener('click', () => {
 });
 
 document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
+// Shift+Enter saves without reaching for the mouse; Escape cancels. Plain Enter still adds a
+// newline in the note.
+popnote.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); document.getElementById('popsave').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
+});
 document.getElementById('popsave').onclick = async () => {
   if (!pending) return;
   const note = popnote.value.trim();

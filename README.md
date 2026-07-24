@@ -50,6 +50,8 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 - 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
+- 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
+  nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
@@ -153,7 +155,7 @@ See the [full tool reference](docs/tools.md).
 Task-specific skills that drive the tools — each stops at the diff, so nothing is committed or pushed
 unless you ask:
 
-- **`/format-latex-project`** — split the main file into per-section `\input`s and reflow to one sentence per line.
+- **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
 - **`/verify-citations`** — audit every `.bib` entry against DBLP, flag discrepancies, and write a local git-excluded audit report (read-only for the `.bib`).
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
@@ -180,7 +182,7 @@ and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 - [Configuration](docs/configuration.md) — environment variables, per-host token resolution, in-context guides, cross-platform notes.
 - [Tools](docs/tools.md) — full tool reference, the DBLP citation flow, and how safe pushes work.
 - [Skills](docs/skills.md) — what each bundled skill does, how to install it per client, and the two ways one runs.
-- [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere.
+- [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere, and how parallel sessions share one clone.
 - [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
 - [Contributing](CONTRIBUTING.md) — how to build, test, and open a pull request.
 

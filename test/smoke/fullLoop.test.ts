@@ -40,6 +40,7 @@ describe.skipIf(!available)('full loop: clone -> edit -> compile -> commit -> pu
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
+      sessionId: 'test',
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',
     };

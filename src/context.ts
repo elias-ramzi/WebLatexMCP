@@ -7,6 +7,8 @@ import { SyncTexService } from './services/synctex.js';
 import { CommentStore } from './services/commentStore.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
+import { SessionRegistry } from './services/sessionRegistry.js';
+import { ShadowStore } from './services/shadowStore.js';
 import { detectRootFile } from './lib/rootFile.js';
 import { locateProjectPdf } from './lib/pdfLocate.js';
 import type { LatexCompiler } from './services/compiler.js';
@@ -25,6 +27,10 @@ export interface AppContext {
   comments: CommentStore;
   credentials: CredentialResolver;
   dblp: DblpService;
+  /** Who else is working on a project right now — see `src/services/sessionRegistry.ts`. */
+  sessions: SessionRegistry;
+  /** This session's own uncommitted changes — see `src/services/shadowStore.ts`. */
+  shadows: ShadowStore;
 }
 
 export function createContext(
@@ -36,6 +42,25 @@ export function createContext(
   const files = new FileService();
   const synctex = new SyncTexService();
   const comments = new CommentStore();
+  const git = new GitService(identity);
+
+  const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
+  const shadows = new ShadowStore(config.workspaceRoot, config.sessionId, (dir, rel) =>
+    git.readAtRef(dir, 'HEAD', rel),
+  );
+  // Every mutation this server makes is folded into this session's shadow, so `commit` can later
+  // stage this session's lines alone. FileService is handed the hook rather than the store so it
+  // stays unaware of sessions; the project id comes from the clone directory it was given.
+  files.setMutationRecorder({
+    record: async (projectDir, relPath, before, after) => {
+      const id = projectManager.idForDir(projectDir);
+      if (!id) return; // not one of our clones — nothing to attribute it to
+      // Editing is what makes a session worth knowing about, so this doubles as its heartbeat —
+      // otherwise a session that only writes would stay invisible to its peers until it committed.
+      await sessions.touch(id);
+      await shadows.record(id, projectDir, relPath, before, after);
+    },
+  });
 
   // The viewer resolves a project's current PDF the same way `compile` surfaces it, and (for
   // comments) resolves a clicked PDF point to source via synctex against the build-dir PDF, which
@@ -81,7 +106,7 @@ export function createContext(
   return {
     config,
     projectManager,
-    git: new GitService(identity),
+    git,
     files,
     compiler: createCompiler(config.compiler ?? 'latexmk'),
     viewer,
@@ -89,5 +114,7 @@ export function createContext(
     comments,
     credentials,
     dblp: new DblpService(),
+    sessions,
+    shadows,
   };
 }

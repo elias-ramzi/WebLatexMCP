@@ -46,6 +46,13 @@ export interface ServerConfig {
    * so the server excludes it from the host repo's git on startup.
    */
   workspaceIsLocal?: boolean;
+  /**
+   * Identifies this server process among sibling sessions sharing the same workspace, so each
+   * one's uncommitted work can be tracked and committed separately. From
+   * `WEB_LATEX_MCP_SESSION` when set (give each session a meaningful name — it is what `status`
+   * shows peers as); otherwise generated per process.
+   */
+  sessionId: string;
   /** Registered projects. */
   projects: ProjectConfig[];
   /** Project id used when a tool call omits `project`. */

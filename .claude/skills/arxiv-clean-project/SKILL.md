@@ -68,8 +68,8 @@ Run in order. Stop and report if any step fails.
    # -> writes the cleaned tree to <scratch>/<id>_arXiv/  (basename tracks the input dir)
    ```
 
-   Always pass `--keep_bib` (default operation; keeps this repo's `.bib`-guarding intent). Add image
-   flags only if the user opted in (see below).
+   Always pass `--keep_bib` (default operation; keeps this repo's `.bib`-guarding intent). Add image or
+   TikZ-externalization flags only if the user opted in (see below).
 
 8. **Deliver by mode:**
    - **Separate copy (always zip):** place the cleaned tree **and a zip** beside the clone, in
@@ -130,6 +130,36 @@ assets, which are already on disk (step 3):
 
 Recompile and eyeball figure quality in the PDF before recommending a commit — over-aggressive resizing
 degrades figures.
+
+## TikZ externalization (opt-in — only if the project already externalizes)
+
+`--use_external_tikz <dir>` swaps each `tikzpicture` in the cleaned copy for an `\includegraphics` of the
+already-externalized PDF found in `<dir>` (the folder the TikZ `external` library wrote to, e.g.
+`figures/tikz`). It keeps arXiv from having to compile TikZ at all.
+
+**The flag only substitutes — it never generates.** `arxiv_latex_cleaner` does not run LaTeX, so the
+externalized PDFs must already exist in the clone before you run it.
+
+**First check whether the project already externalizes**: `grep` the `.tex` for
+`\usetikzlibrary{external}` / `\tikzexternalize` (and its
+`\tikzsetexternalprefix` / `\tikzexternalize[prefix=...]` target), then confirm that folder actually holds
+one PDF per `tikzpicture`.
+
+- **Already set up** — offer the flag as an opt-in. Note that the externalized PDFs are only as fresh as
+  the last shell-escape compile (`latexmk -shell-escape`): if the TikZ source changed afterwards, the
+  substituted figures are stale, so have the project recompiled before cleaning.
+- **Not set up (or the folder is missing/empty/stale)** — **do not pass the flag** and do not attempt to
+  add externalization silently. Tell the user first what it would take:
+  - the Overleaf/LaTeX source must be **changed** — load the `external` library, call `\tikzexternalize`
+    with a prefix, and compile with shell-escape enabled — which is an edit to the live project, not
+    something this cleaning step does on its own;
+  - and to trust the resulting PDFs, the **TeX Live release arXiv runs** should be installed locally and
+    used for that compile (arXiv documents the current release at
+    <https://info.arxiv.org/help/faq/texlive.html>) — figures built against a different TeX Live can
+    render differently from what arXiv would produce.
+
+  Then offer to proceed **without** the flag (the normal path — arXiv compiles the TikZ itself), or to
+  stop so the user can set externalization up and re-run this skill.
 
 ## After you finish
 

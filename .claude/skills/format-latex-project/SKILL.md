@@ -1,17 +1,19 @@
 ---
 name: format-latex-project
-description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, or to apply the one-sentence-per-line convention. Operates on projects served by the web-latex-mcp MCP server.
+description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, move every figure and table into its own \input file, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, to extract figures/tables into separate files, or to apply the one-sentence-per-line convention. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
 # Format a LaTeX project
 
-Two cosmetic-only transformations on a git-hosted LaTeX project, applied through the
-`web-latex-mcp` MCP tools. **Neither may change the compiled PDF.** The compile step is the
-guardrail — if the project compiled before and not after, you broke it.
+Three cosmetic-only transformations on a git-hosted LaTeX project, applied through the
+`web-latex-mcp` MCP tools. **None of them may change the compiled PDF.** The compile step is
+the guardrail — if the project compiled before and not after, you broke it.
 
-1. **Modularize** — move each section out of the main file into its own file under
+1. **Modularize sections** — move each section out of the main file into its own file under
    `sections/`, leaving the main file as mostly a list of `\input{...}`.
-2. **One sentence per line** — within body paragraphs, put each sentence on its own
+2. **Modularize floats** — move each `figure`/`table` environment into its own file under
+   `figures/` or `tables/`, leaving a one-line `\input{...}` where the float was.
+3. **One sentence per line** — within body paragraphs, put each sentence on its own
    source line so `git diff`s stay small and edits stay surgical.
 
 ## Workflow
@@ -26,7 +28,9 @@ Run these in order. Stop and report if any step fails.
 3. **Find the main file.** Usually the `.tex` with `\documentclass`. `list_files`, then
    `read_file` it.
 4. **Apply the transformation(s) the user asked for** (see rules below). Default to doing
-   both unless they asked for only one.
+   all three unless they asked for only some. Order them: split sections first, then pull
+   the floats out of those section files, then reflow the remaining prose — each step then
+   works on smaller files and the diffs stay legible.
 5. **Recompile.** `compile` again. It must still succeed. Compare the log to the baseline —
    page count / overfull-box warnings should be essentially unchanged. If compilation
    breaks, fix it; if you can't, `discard` and report.
@@ -50,8 +54,38 @@ Do all edits inside one project so the per-project mutex serializes them; prefer
 - Don't move `\bibliography`, `\maketitle`, `\appendix`, or similar one-line structural
   commands into section files; they stay in main between the `\input`s.
 - Move text verbatim — same characters, same order. The only change is the cut/paste plus
-  the `\input` line. (Reformatting to one-sentence-per-line is the _other_ rule; you may do
-  both, but keep the two intents clear in the diff if the user wants separate commits.)
+  the `\input` line. (Extracting floats and reflowing to one-sentence-per-line are the
+  _other_ rules; you may do all three, but keep the intents clear in the diff if the user
+  wants separate commits.)
+
+## Rule: one file per figure and table
+
+Every float lives in its own `.tex` file and is pulled in with `\input`. A section file
+should read as prose plus one-line `\input`s, never as pages of `tabular` markup.
+
+- Create `figures/<name>.tex` for each `\begin{figure}`/`figure*` block and
+  `tables/<name>.tex` for each `\begin{table}`/`table*` block.
+- **Name the file after the label**, minus the prefix: `\label{fig:overview}` →
+  `figures/overview.tex`; `\label{tab:sota_results}` → `tables/sota-results.tex`
+  (kebab-case, ASCII). If a float has no label, add one following the project's convention
+  (`fig:`/`tab:` + descriptive name) and name the file after it — a float worth extracting
+  is a float worth referencing.
+- The file holds the **whole environment**, from `\begin{figure}` to `\end{figure}`,
+  including its `\caption` and `\label`. Nothing else — no `\section`, no surrounding prose.
+- Replace the block in the section (or main) file with `\input{figures/overview}` (no `.tex`
+  extension), on its own line, **in exactly the same position**. Float placement is
+  positional in LaTeX: moving the `\input` up or down moves the float in the PDF.
+- Move the content verbatim, placement specifier (`[t]`) and all. This rule is a cut/paste;
+  restyling captions or switching to `booktabs` is a separate, non-cosmetic change — do it
+  only if the user asks.
+- Nested floats (a `subfigure` inside a `figure`) stay together in the parent's file: one
+  file per top-level float, not per image.
+- Graphics files themselves (`.pdf`/`.png` under `figures/`) don't move. Keep
+  `\includegraphics` paths **byte-identical** — they resolve from the main file's directory,
+  not from the `\input`ed file's, so a working path stays working.
+- **Authoring new floats follows the same rule.** When this project later gains a figure or
+  table, write it in its own `figures/`/`tables/` file first and `\input` it — never paste a
+  new float body inline into a section file.
 
 ## Rule: one sentence per line
 
@@ -81,5 +115,7 @@ touch.
 
 ## After you finish
 
-Report concisely: which files were created, that it still compiles, and the page count
-before/after. Point the user at the diff and ask whether to commit and push.
+Report concisely: which files were created (sections, figures, tables), that it still
+compiles, and the page count before/after. Flag anything you had to add rather than move —
+notably labels invented for unlabelled floats. Point the user at the diff and ask whether to
+commit and push.

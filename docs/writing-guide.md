@@ -37,6 +37,10 @@ subsections. For example:
 - Prefer the **top** of the page for placement (`[t]`), occasionally the bottom;
   avoid floats drifting far from their discussion.
 - Captions start with a short title in **bold**, then the explanation.
+- The explanation is descriptive: it says what the figure or table shows — the
+  axes, the conditions, what each curve, column, or panel is. Do not comment on
+  the figure in the caption. Interpretation, comparison, and the conclusions
+  drawn from it belong in the body text, not the caption.
 - Use descriptive labels: `\label{tab:sota_results}`, `\label{fig:overview}`.
 - The caption test: a reader who only reads the title and then looks at the
   figures, tables, and their captions should still understand them. Write
@@ -82,6 +86,20 @@ where $\hat{x}_i$ is the reconstruction.
     or none).
 - BibTeX key format: `firstauthorYEARpaperacronym`, e.g. `chambon2024pointbev`.
   If the paper has no acronym, use the first word of the title.
+
+## Acronyms and abbreviations
+
+- Define an acronym at its **first appearance**: full term first, acronym in
+  parentheses, as in "bird's-eye view (BEV)". Every occurrence after that uses
+  the acronym alone.
+- Define it **once**. Re-introducing "bird's-eye view (BEV)" in a later section
+  tells the reader they missed something — check the whole paper for duplicate
+  definitions.
+- The abstract is read on its own: if the acronym appears there, define it in
+  the abstract and again at its first appearance in the body, then never after.
+- Only introduce an acronym worth reusing. A term that appears once or twice
+  stays spelled out — an acronym the reader has to look back for costs more than
+  the words it saves.
 
 ## English usage
 

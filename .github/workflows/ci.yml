@@ -42,15 +42,20 @@ jobs:
           node-version: 22
           cache: npm
       # Minimal TeX Live + latexmk via apt (the sample is a bare `article` with a manual
-      # thebibliography, so no bibtex/biber is needed). Installed directly rather than via
-      # a third-party action so the job doesn't depend on the repo's Actions allow-list.
+      # thebibliography, so no bibtex/biber is needed). Cached with cache-apt-pkgs-action so
+      # warm runs restore the .debs instead of re-downloading; bump `version` to bust the cache.
       - name: Set up TeX Live
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended
+          version: 1.0
+      # cache-apt-pkgs-action restores the .deb payloads but skips dpkg's post-install, so on a
+      # warm cache TeX Live's filename/font databases are never rebuilt and latexmk fails
+      # intermittently (a cache miss installs cleanly and passes; a hit does not). Rebuild them so
+      # a cache hit matches a fresh install.
+      - name: Refresh TeX Live databases
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            latexmk \
-            texlive-latex-base \
-            texlive-latex-recommended \
-            texlive-fonts-recommended
+          sudo mktexlsr
+          sudo updmap-sys
       - run: npm ci
       - run: npm run test:smoke
