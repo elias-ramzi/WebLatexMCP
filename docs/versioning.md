@@ -43,3 +43,22 @@ Releases merge from `dev` into `main` — a required CI gate (`only-dev-into-mai
 5. **After merge, tag `main`** as `vX.Y.Z` to match the existing tags (`v0.1.0` … `v0.2.0`) and push the
    tag. Pushing a `v*` tag triggers `publish.yml`, which runs the gate and publishes to npm; it fails fast
    if the tag does not match `package.json`, which is why step 2 keeps the manifests in lock-step.
+
+## Keeping `dev` a superset of `main` (post-release back-merge)
+
+Merging the release PR adds a merge commit to `main` that `dev` does not have. Because `main` requires
+branches to be up to date before merging, that one commit leaves the _next_ release PR flagged `BEHIND`
+and unmergeable — even though `dev` already contains all of `main`'s content. The remedy is to merge
+`main` back into `dev` after every release (a no-op content-wise — it carries no file changes, only the
+missing ancestry):
+
+```bash
+git checkout dev && git pull
+git merge origin/main        # conflict-free; brings the release merge commit onto dev
+# open a PR for this back-merge into dev (dev is protected), then merge it
+```
+
+This is **automated** by [`back-merge.yml`](../.github/workflows/back-merge.yml): on every push to `main` it
+opens (and auto-merges, once the checks that already ran on `main` are green) a `main → dev` PR, skipping
+when `dev` is already up to date. Keep the manual step above as the fallback if that workflow is disabled
+or a genuine conflict needs a human.

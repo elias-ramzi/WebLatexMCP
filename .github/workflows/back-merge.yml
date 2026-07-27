@@ -1,0 +1,54 @@
+# Keep `dev` a superset of `main`.
+#
+# Merging a release PR adds a merge commit to `main` that `dev` lacks. With "require branches to be
+# up to date" on `main`, that single commit leaves the next `dev -> main` release PR flagged BEHIND
+# and unmergeable, even though `dev` already holds all of `main`'s content. This opens (and
+# auto-merges) a `main -> dev` back-merge PR after every push to `main`, so the gap never accumulates.
+#
+# It relies on `ci.yml` running `on: push`, so the required checks already exist on `main`'s HEAD SHA
+# and the back-merge PR inherits them — no separate CI run needed for auto-merge to proceed.
+name: Back-merge main into dev
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  back-merge:
+    name: Open and auto-merge main -> dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Open (and auto-merge) the back-merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main dev
+
+          if git merge-base --is-ancestor origin/main origin/dev; then
+            echo "dev already contains main — nothing to back-merge."
+            exit 0
+          fi
+
+          number="$(gh pr list --base dev --head main --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            number="$(gh pr create --base dev --head main \
+              --title "Back-merge main into dev" \
+              --body "Automated after a push to \`main\` (typically a release). Merges \`main\` back into \`dev\` so \`dev\` stays a superset and the next \`dev -> main\` release PR is never flagged BEHIND. Content is already on \`dev\`, so this carries no file changes." \
+              | grep -oE '[0-9]+$')"
+            echo "Opened back-merge PR #$number."
+          else
+            echo "Reusing open back-merge PR #$number."
+          fi
+
+          # Best-effort: enable auto-merge so it lands once main's already-run checks are green.
+          # If the repo disallows auto-merge, leave the PR open as a visible reminder.
+          gh pr merge "$number" --merge --auto \
+            || echo "::warning::Could not enable auto-merge on PR #$number; merge it manually."
