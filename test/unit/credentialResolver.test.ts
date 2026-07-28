@@ -118,6 +118,57 @@ describe('CredentialResolver', () => {
   });
 });
 
+describe('CredentialResolver.storeCredential', () => {
+  /** Records `git credential approve` input, and replays it on the next `fill` (a fake keychain). */
+  function keychainExec(): {
+    exec: (cmd: string, args: string[], opts?: { input?: string }) => Promise<ExecResult>;
+    approved: string[];
+  } {
+    let stored: string | undefined;
+    const approved: string[] = [];
+    return {
+      approved,
+      async exec(cmd, args, opts) {
+        if (cmd === 'git' && args[0] === 'credential' && args[1] === 'approve') {
+          approved.push(opts?.input ?? '');
+          stored = /^password=(.*)$/m.exec(opts?.input ?? '')?.[1];
+          return { code: 0, stdout: '', stderr: '', timedOut: false };
+        }
+        if (cmd === 'git' && args[0] === 'credential' && args[1] === 'fill') {
+          if (!stored) return { code: 1, stdout: '', stderr: '', timedOut: false };
+          return { code: 0, stdout: `password=${stored}\n`, stderr: '', timedOut: false };
+        }
+        return { code: 1, stdout: '', stderr: '', timedOut: false };
+      },
+    };
+  }
+
+  it('approves the credential and reports it persisted when it round-trips', async () => {
+    const { exec, approved } = keychainExec();
+    const r = new CredentialResolver({}, exec);
+    const res = await r.storeCredential('git.overleaf.com', 'git', 'olp_secret');
+    expect(res.persisted).toBe(true);
+    expect(approved[0]).toContain('host=git.overleaf.com');
+    expect(approved[0]).toContain('username=git');
+    expect(approved[0]).toContain('password=olp_secret');
+  });
+
+  it('reports not persisted when no helper keeps the credential', async () => {
+    // approve is a no-op, fill finds nothing (a box with no credential helper configured).
+    const r = new CredentialResolver({}, failExec);
+    expect((await r.storeCredential('git.overleaf.com', 'git', 'olp_secret')).persisted).toBe(
+      false,
+    );
+  });
+
+  it('registers the stored token for redaction', async () => {
+    const { exec } = keychainExec();
+    const r = new CredentialResolver({}, exec);
+    await r.storeCredential('git.overleaf.com', 'git', 'olp_secret');
+    expect(r.allSecrets()).toContain('olp_secret');
+  });
+});
+
 describe('authenticateUrl', () => {
   it('injects credentials into a GitHub HTTPS URL', () => {
     expect(

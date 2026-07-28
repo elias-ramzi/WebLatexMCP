@@ -2,6 +2,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from './context.js';
 import { registerListProjects } from './tools/listProjects.js';
 import { registerProjectSync } from './tools/projectSync.js';
+import { registerRegisterProject } from './tools/registerProject.js';
+import { registerSetCredential } from './tools/setCredential.js';
+import { registerCredentialPortal } from './tools/credentialPortal.js';
 import { registerListFiles } from './tools/listFiles.js';
 import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
@@ -55,6 +58,9 @@ export function createServer(
 
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);
+  registerRegisterProject(server, ctx);
+  registerSetCredential(server, ctx);
+  registerCredentialPortal(server, ctx);
   registerListFiles(server, ctx);
   registerReadFile(server, ctx);
   registerWriteFile(server, ctx);

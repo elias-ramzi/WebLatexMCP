@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.3",
+  "name": "web-latex-mcp",
+  "display_name": "WebLatexMCP",
+  "version": "0.4.0",
+  "description": "Read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote) — straight from Claude.",
+  "long_description": "An MCP server that keeps a local clone of your LaTeX project, compiles it locally with latexmk (or tectonic), shows a live PDF viewer with review comments, and sends changes back through a reviewable commit → push. Add projects straight from the chat with register_project (no config editing), and store your git token in the OS keychain via credential_portal or set_credential — the token never touches this config file or the conversation.",
+  "author": {
+    "name": "Elias Ramzi",
+    "url": "https://github.com/elias-ramzi"
+  },
+  "homepage": "https://github.com/elias-ramzi/WebLatexMCP",
+  "documentation": "https://github.com/elias-ramzi/WebLatexMCP/blob/main/docs/configuration.md",
+  "support": "https://github.com/elias-ramzi/WebLatexMCP/issues",
+  "license": "MIT",
+  "keywords": ["latex", "overleaf", "git", "pdf", "compile", "bibtex", "academic"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "WEB_LATEX_MCP_WORKSPACE": "${user_config.workspace}",
+        "OVERLEAF_GIT_TOKEN": "${user_config.overleaf_token}",
+        "GITHUB_TOKEN": "${user_config.github_token}"
+      }
+    }
+  },
+  "user_config": {
+    "overleaf_token": {
+      "type": "string",
+      "title": "Overleaf Git token",
+      "description": "Optional. Your Overleaf 'Git authentication token', created under Account Settings → Git integration: https://www.overleaf.com/user/settings. Leave blank to add it later from the chat with credential_portal (entered on a local page, never in the chat).",
+      "sensitive": true,
+      "required": false
+    },
+    "github_token": {
+      "type": "string",
+      "title": "GitHub token",
+      "description": "Optional. A GitHub Personal Access Token (repo scope) if you work on GitHub-hosted projects. Leave blank to use the GitHub CLI, a credential helper, or credential_portal later.",
+      "sensitive": true,
+      "required": false
+    },
+    "workspace": {
+      "type": "directory",
+      "title": "Clone workspace folder",
+      "description": "Optional. Folder to keep one local clone per project. Leave blank to use the default (~/.web-latex-mcp/projects).",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

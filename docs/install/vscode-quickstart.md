@@ -49,8 +49,8 @@ That's the whole install. Reload VS Code when Claude asks, and the tools light u
 
 ## Step 3 · Grab your Overleaf token
 
-In Overleaf: **Account Settings → Git Integration → Authentication tokens** → create a token
-and copy it.
+In Overleaf, open [**Account Settings**](https://www.overleaf.com/user/settings) → **Git Integration →
+Authentication tokens** → create a token and copy it.
 
 > 👽 **You**
 >

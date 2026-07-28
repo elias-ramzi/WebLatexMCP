@@ -55,76 +55,15 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
-## Quick start
+## Install
 
-The easiest way in: **clone this repo, point Claude Code at the folder, and just ask.**
+Pick your client below. Either way, editing, git, and the PDF viewer work without TeX — only `compile`
+needs `latexmk` (default) or `tectonic` on your `PATH`.
 
-```bash
-git clone https://github.com/elias-ramzi/WebLatexMCP.git
-```
+### Claude Code (CLI or the VS Code extension)
 
-Then let Claude walk you through the rest:
-
-> 👽 **You**
->
-> Claude, can you walk me through how to install the WebLatexMCP server?
-
-> ✦ **Claude**
->
-> Absolutely — I'll install dependencies, build the server, register it with Claude, and help you
-> add your first Overleaf project. Let's go step by step.
-
-Claude drives the whole setup from the chat. Editing and git operations work without TeX; only
-`compile` needs a backend on your `PATH` — `latexmk` by default, or `tectonic` (set `WEB_LATEX_MCP_COMPILER`;
-see [Configuration](docs/configuration.md#compile-backend)).
-
-### ⚡ Super fast start in VS Code — recommended
-
-The **[step-by-step VS Code guide](docs/install/vscode-quickstart.md)** is the most tested and by far
-the most efficient path. Best of all, run it **from your paper's own repo** — that way Claude sees
-your code _and_ writes the paper right alongside it.
-
-### Detailed setup, all platforms
-
-Prerequisites, authentication, and registering with both Claude Code & Claude Desktop:
-[macOS](docs/install/macos.md) · [Linux](docs/install/linux.md) · [Windows](docs/install/windows.md).
-
-Using **Gemini** or **GitHub Copilot** instead? See the [Gemini guide](docs/install/gemini.md) (Gemini
-CLI and Gemini Code Assist) or the [Copilot guide](docs/install/copilot.md) (Copilot agent mode in VS
-Code / Visual Studio) — both register the same server over stdio.
-
-### Or install from npm — no clone, no build
-
-Prefer not to clone the repo? Register the published package with `npx`. Editing and git work without
-TeX; only `compile` needs `latexmk` or `tectonic` on your `PATH`. Add this to your Claude Code or Claude
-Desktop MCP config:
-
-```json
-{
-  "mcpServers": {
-    "web-latex-mcp": {
-      "command": "npx",
-      "args": ["-y", "web-latex-mcp"],
-      "env": {
-        "WEB_LATEX_MCP_PROJECTS": "{\"thesis\":{\"gitUrl\":\"https://git.overleaf.com/…\"}}"
-      }
-    }
-  }
-}
-```
-
-Or add it in one line with Claude Code:
-
-```bash
-claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
-```
-
-### Or install the Claude Code plugin — server **and** skills together
-
-The `claude mcp add` / raw-config routes register the server, and with it the skills as [prompts](docs/skills.md#two-ways-a-skill-runs) —
-but not as Claude Code [skills](#skills), which only load when Claude Code is launched from a clone of
-this repo. Installing the **plugin** instead gives you the MCP server _and_ all the skills in every
-session, from any directory:
+Install the **plugin** — it registers the server **and** the [skills](#skills) in every session, from
+any directory:
 
 ```bash
 # In Claude Code:
@@ -132,13 +71,53 @@ session, from any directory:
 /plugin install web-latex-mcp@web-latex-tools
 ```
 
-The plugin pins no workspace, so clones still land beside your paper (the workspace-local default). Set
-`WEB_LATEX_MCP_PROJECTS` in your own MCP config, or register projects at runtime, as usual.
+Prefer just the server? Register the npm package in one line (skills still come through as
+[prompts](docs/skills.md#two-ways-a-skill-runs)):
+
+```bash
+claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
+```
+
+💡 Launch Claude Code **from your paper's own repo** so the LaTeX clone lands right beside your code. The
+step-by-step [VS Code quickstart](docs/install/vscode-quickstart.md) is the most-tested path.
+
+### Claude Desktop — one-click extension
+
+Download **`web-latex-mcp.mcpb`** from the
+[latest release](https://github.com/elias-ramzi/WebLatexMCP/releases/latest) and drag it onto the Claude
+Desktop window (or **Settings → Extensions → Install Extension**). No cloning, building, or JSON editing —
+Desktop shows a short, all-optional form (tokens, clone folder). See the
+[Desktop Extension guide](docs/install/desktop-extension.md).
+
+### Add your token and your project — from the chat
+
+However you installed, the server needs a token for your git host — for Overleaf, a **Git authentication
+token** from [Account Settings → Git integration](https://www.overleaf.com/user/settings). The private
+way to hand it over, which **never puts the token in the chat**: ask Claude to open the credential portal.
+
+> 👽 Open the credential portal for my Overleaf token.
+
+`credential_portal` opens a local `127.0.0.1` page where you type the token; it goes straight into your
+**OS keychain**, never through the conversation. (Happy to paste it once instead? `set_credential` stores
+it in the keychain in a single step.)
+
+Then add your project by just giving Claude the git URL — it registers it with `register_project`, and it
+persists across restarts and sessions:
+
+> 👽 Add my Overleaf project https://git.overleaf.com/… and call it "thesis".
+
+### Other clients & full configuration
+
+Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler), or using **Gemini** /
+**GitHub Copilot**? It's all in the docs: [Configuration](docs/configuration.md) · per-OS guides for
+[macOS](docs/install/macos.md) / [Linux](docs/install/linux.md) / [Windows](docs/install/windows.md) ·
+[Gemini](docs/install/gemini.md) · [Copilot](docs/install/copilot.md).
 
 ## What you can do
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
+- **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
 - **Sync & browse** — clone/pull a project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
 - **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).
@@ -163,7 +142,7 @@ unless you ask:
 
 **How you get them depends on the client:**
 
-- **Claude Code** — [install the plugin](#or-install-the-claude-code-plugin--server-and-skills-together)
+- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension)
   (or launch Claude Code from a clone of this repo). Claude picks a skill up on its own when your request
   matches it.
 - **Any MCP client** — nothing to install. Every skill is also registered as an **MCP prompt**, so it

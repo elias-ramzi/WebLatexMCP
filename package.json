@@ -1,6 +1,6 @@
 {
   "name": "web-latex-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server to read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote).",
   "type": "module",
   "author": "Elias Ramzi",
@@ -35,6 +35,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:smoke": "vitest run test/smoke",
+    "bundle": "npm run build && npx --yes @anthropic-ai/mcpb@latest pack . web-latex-mcp.mcpb",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

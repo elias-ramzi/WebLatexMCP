@@ -16,3 +16,6 @@ coverage/
 .vscode/
 .idea/
 tmp/
+
+# Packed Desktop Extension bundle (built on demand / in CI, attached to releases)
+*.mcpb

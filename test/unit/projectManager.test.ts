@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { ProjectManager } from '../../src/services/projectManager.js';
-import type { ServerConfig } from '../../src/types.js';
+import type { ProjectConfig, ServerConfig } from '../../src/types.js';
 
 describe('ProjectManager', () => {
   let workspaceRoot: string;
@@ -62,5 +62,38 @@ describe('ProjectManager', () => {
     expect(() => pm.getProjectConfig('new')).toThrow(/Unknown project/);
     pm.registerProject('new', 'https://git.overleaf.com/zzz');
     expect(pm.getProjectConfig('new').gitUrl).toBe('https://git.overleaf.com/zzz');
+  });
+
+  it('persists a registration through the registry store', async () => {
+    const store = {
+      entries: [] as ProjectConfig[],
+      read() {
+        return this.entries;
+      },
+      async upsert(cfg: ProjectConfig) {
+        this.entries = [...this.entries.filter((e) => e.id !== cfg.id), cfg];
+      },
+    };
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+    await pm.registerAndPersist('new', 'https://git.overleaf.com/zzz', { rootFile: 'main.tex' });
+    expect(store.entries).toEqual([
+      { id: 'new', gitUrl: 'https://git.overleaf.com/zzz', rootFile: 'main.tex' },
+    ]);
+  });
+
+  it('picks up a peer registration from the registry on an unknown-id miss', () => {
+    const store = {
+      entries: [] as ProjectConfig[],
+      read() {
+        return this.entries;
+      },
+      async upsert() {},
+    };
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+    expect(() => pm.getProjectConfig('peer')).toThrow(/Unknown project/);
+    // A peer session persists it after startup...
+    store.entries = [{ id: 'peer', gitUrl: 'https://git.overleaf.com/peer' }];
+    // ...and this session resolves it without a restart.
+    expect(pm.getProjectConfig('peer').gitUrl).toBe('https://git.overleaf.com/peer');
   });
 });

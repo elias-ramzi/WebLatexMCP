@@ -18,6 +18,14 @@ describe('latexmkArgs (shell escape)', () => {
     expect(args.at(-1)).toBe('main.tex');
   });
 
+  it('passes -cd so a root file in a subdirectory finds its sibling packages', () => {
+    const args = latexmkArgs({ projectDir: '/p', rootFile: 'paper/main.tex' }, BUILD);
+    expect(args).toContain('-cd');
+    // -outdir stays absolute so build artifacts are unaffected by the chdir.
+    expect(args).toContain(`-outdir=${BUILD}`);
+    expect(args.at(-1)).toBe('paper/main.tex');
+  });
+
   it('passes -shell-escape only when explicitly requested', () => {
     expect(latexmkArgs({ ...base, shellEscape: true }, BUILD)).toContain('-shell-escape');
   });

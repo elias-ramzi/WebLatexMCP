@@ -29,6 +29,9 @@ interface HostDefaults {
   username: string;
 }
 
+/** Where an Overleaf user creates a Git authentication token (Account Settings → Git integration). */
+export const OVERLEAF_TOKEN_URL = 'https://www.overleaf.com/user/settings';
+
 /** Per-host conventions for the token env var and HTTPS username. Overridable per project. */
 const HOST_DEFAULTS: Record<string, HostDefaults> = {
   'github.com': { tokenEnv: 'GITHUB_TOKEN', username: 'x-access-token' },
@@ -42,6 +45,16 @@ function hostOf(gitUrl: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The host component of a git URL, for callers that don't hold a `URL`. */
+export function hostFromGitUrl(gitUrl: string): string | undefined {
+  return hostOf(gitUrl);
+}
+
+/** The conventional HTTPS username for a host (e.g. `git` for Overleaf), falling back to `git`. */
+export function defaultUsernameForHost(host: string | undefined): string {
+  return (host && HOST_DEFAULTS[host]?.username) || 'git';
 }
 
 export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdentity {
@@ -97,6 +110,31 @@ export class CredentialResolver {
     const token = await this.resolveToken(project, host, defaults);
     if (token) this.seenTokens.add(token);
     return { username, token };
+  }
+
+  /**
+   * Store a credential in the user's git credential helper (the OS keychain — osxkeychain /
+   * Windows Credential Manager / libsecret). This is how a token reaches the server *without*
+   * being written into our own config: it lands, encrypted, in the OS store, and later resolves
+   * through `git credential fill` like any other helper-backed credential — never persisted by us.
+   *
+   * `git credential approve` gives no success signal and is a silent no-op when no helper is
+   * configured (common on a bare Linux box), so this reads the credential straight back and reports
+   * whether it actually stuck — letting the caller tell the user to configure a helper otherwise.
+   */
+  async storeCredential(
+    host: string,
+    username: string,
+    token: string,
+  ): Promise<{ persisted: boolean }> {
+    this.seenTokens.add(token); // ensure it's scrubbed from any output, even on error
+    await this.exec('git', ['credential', 'approve'], {
+      input: `protocol=https\nhost=${host}\nusername=${username}\npassword=${token}\n\n`,
+      env: { ...this.env, GIT_TERMINAL_PROMPT: '0' },
+      timeoutMs: 5000,
+    });
+    const readBack = await this.tokenFromGitCredential(host);
+    return { persisted: readBack === token };
   }
 
   /** Every token that could appear in output, so error/redaction covers all providers. */
