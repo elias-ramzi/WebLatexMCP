@@ -3,12 +3,16 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { resolveCredentialTarget } from '../lib/credentialTarget.js';
+import { OVERLEAF_TOKEN_URL } from '../services/auth.js';
 
 const inputSchema = {
   token: z
     .string()
     .min(1)
-    .describe('The token / password to store (e.g. your Overleaf Git authentication token).'),
+    .describe(
+      'The token / password to store (e.g. your Overleaf Git authentication token, created at ' +
+        `${OVERLEAF_TOKEN_URL}).`,
+    ),
   project: z
     .string()
     .optional()

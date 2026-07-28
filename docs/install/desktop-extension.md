@@ -13,11 +13,11 @@ The lowest-friction way onto **Claude Desktop**: a single [MCP Bundle](https://g
    - open **Settings → Extensions → Install Extension** and select it.
 3. Claude Desktop shows a short configuration form — **every field is optional**:
 
-   | Field                      | Maps to                   | Notes                                                                       |
-   | -------------------------- | ------------------------- | --------------------------------------------------------------------------- |
-   | **Overleaf token**         | `OVERLEAF_GIT_TOKEN`      | Masked. Your Overleaf _Git authentication token_. Leave blank to add later. |
-   | **GitHub token**           | `GITHUB_TOKEN`            | Masked. A PAT with `repo` scope, for GitHub-hosted projects.                |
-   | **Clone workspace folder** | `WEB_LATEX_MCP_WORKSPACE` | Where local clones live. Blank → `~/.web-latex-mcp/projects`.               |
+   | Field                      | Maps to                   | Notes                                                                                                               |
+   | -------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+   | **Overleaf token**         | `OVERLEAF_GIT_TOKEN`      | Masked. Your Overleaf [Git authentication token](https://www.overleaf.com/user/settings). Leave blank to add later. |
+   | **GitHub token**           | `GITHUB_TOKEN`            | Masked. A PAT with `repo` scope, for GitHub-hosted projects.                                                        |
+   | **Clone workspace folder** | `WEB_LATEX_MCP_WORKSPACE` | Where local clones live. Blank → `~/.web-latex-mcp/projects`.                                                       |
 
 4. Enable the extension. That's it — the server is registered.
 
@@ -37,7 +37,8 @@ so it's there next time too.
 ## Credentials — three options, none of which put the token in the config file
 
 - **Enter it in the install form** (Overleaf/GitHub token fields). Masked; handed to the server as an env
-  var, not written into a project.
+  var, not written into a project. Overleaf tokens are created under
+  [Account Settings → Git integration](https://www.overleaf.com/user/settings).
 - **`credential_portal`** — ask Claude to open the credential portal; you type the token into a **local
   `127.0.0.1` page**, so it never passes through the chat, and it lands in your OS keychain.
 - **`set_credential`** — paste the token to Claude once and it stores it in the OS keychain.

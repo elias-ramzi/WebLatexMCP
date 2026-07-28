@@ -23,6 +23,8 @@ describe('CredentialPortal', () => {
     const html = await form.text();
     expect(html).toContain('git.overleaf.com');
     expect(html).toContain('never goes through Claude');
+    // Points the user at where an Overleaf token is created, so they don't have to hunt for it.
+    expect(html).toContain('href="https://www.overleaf.com/user/settings"');
 
     // The nonce guards the portal: the root path (and any wrong path) reveals nothing.
     const base = url!.replace(/\/[0-9a-f]{32}$/, '');
