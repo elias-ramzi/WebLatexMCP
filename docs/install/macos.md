@@ -108,9 +108,10 @@ the Keychain helper from step 3.
 **Projects without touching this file.** Editing the Desktop config and restarting each time is
 awkward, so you don't have to list projects here at all — once the server is registered, just paste your
 Overleaf git URL into the chat and ask Claude to add the project. It calls `register_project`, which
-persists it (survives restarts, shared across sessions). For the **token**, paste it to Claude too and
-ask it to store the credential (`set_credential` puts it in your Keychain), or use the `env` block /
-credential helper above — it is never stored with the project. See
+persists it (survives restarts, shared across sessions). For the **token**, ask Claude to open the
+credential portal (`credential_portal`) and type it into a local page so it never touches the chat, or
+paste it to Claude to store with `set_credential` — either lands it in your Keychain — or use the `env`
+block / credential helper above. It is never stored with the project. See
 [Registering a project without env config](../configuration.md#registering-a-project-without-env-config)
 and [Registering credentials in Claude Desktop](../configuration.md#registering-credentials-in-claude-desktop).
 
