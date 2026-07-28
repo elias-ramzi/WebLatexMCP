@@ -1,4 +1,5 @@
 import { ProjectManager } from './services/projectManager.js';
+import type { ProjectRegistryStore } from './services/projectManager.js';
 import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
 import { createCompiler, buildPdfPath } from './services/compiler.js';
@@ -37,8 +38,9 @@ export function createContext(
   config: ServerConfig,
   credentials: CredentialResolver,
   identity: CommitIdentity,
+  registry?: ProjectRegistryStore,
 ): AppContext {
-  const projectManager = new ProjectManager(config);
+  const projectManager = new ProjectManager(config, registry);
   const files = new FileService();
   const synctex = new SyncTexService();
   const comments = new CommentStore();

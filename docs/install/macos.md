@@ -105,6 +105,14 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`, then **r
 Desktop does **not** expand `${VARS}`, so either inline `"GITHUB_TOKEN": "ghp_xxx"` or rely on `gh` /
 the Keychain helper from step 3.
 
+**Projects without touching this file.** Editing the Desktop config and restarting each time is
+awkward, so you don't have to list projects here at all — once the server is registered, just paste your
+Overleaf git URL into the chat and ask Claude to add the project. It calls `register_project`, which
+persists it (survives restarts, shared across sessions). The **token** still comes from the `env` block
+or a credential helper above — it is never stored with the project. See
+[Registering a project without env config](../configuration.md#registering-a-project-without-env-config)
+and [Registering credentials in Claude Desktop](../configuration.md#registering-credentials-in-claude-desktop).
+
 ## 5. PATH note (important for Claude Desktop)
 
 The macOS GUI launches Claude Desktop with a **minimal `PATH`**, so `node`, `git`, `gh`, and `latexmk`

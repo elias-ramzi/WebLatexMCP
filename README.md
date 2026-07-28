@@ -139,6 +139,7 @@ The plugin pins no workspace, so clones still land beside your paper (the worksp
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
+- **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
 - **Sync & browse** — clone/pull a project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
 - **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).

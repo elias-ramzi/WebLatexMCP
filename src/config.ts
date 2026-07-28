@@ -3,6 +3,7 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
+import { readProjectRegistry } from './services/projectRegistry.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 const projectsSchema = z.record(
@@ -130,6 +131,7 @@ export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   insideRepo?: (dir: string) => boolean,
+  readRegistry: (workspaceRoot: string) => ProjectConfig[] = readProjectRegistry,
 ): ServerConfig {
   const { workspaceRoot, workspaceIsLocal } = resolveWorkspace(
     env.WEB_LATEX_MCP_WORKSPACE,
@@ -137,7 +139,14 @@ export function loadConfig(
     insideRepo,
   );
 
-  const projects = parseProjects(env.WEB_LATEX_MCP_PROJECTS);
+  // Env projects are the explicit source of truth and always win; persisted (runtime-registered)
+  // projects fill in the rest, so a git URL added from the chat is still here after a restart.
+  const envProjects = parseProjects(env.WEB_LATEX_MCP_PROJECTS);
+  const byId = new Map<string, ProjectConfig>();
+  for (const p of readRegistry(workspaceRoot)) byId.set(p.id, p);
+  for (const p of envProjects) byId.set(p.id, p);
+  const projects = [...byId.values()];
+
   const defaultProject = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
 
   if (defaultProject && !projects.some((p) => p.id === defaultProject)) {
