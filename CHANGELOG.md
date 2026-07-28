@@ -9,6 +9,25 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
+### Added
+
+- **`set_credential`** — store a git token in the OS keychain straight from chat, so a project can be
+  authenticated without editing environment variables or shell config. The token is written to the
+  platform keychain and never persisted in `.git/config`.
+- **`credential_portal`** — enter a git token via a one-off loopback web page instead of typing it into
+  the chat, so the secret never travels through the conversation transcript.
+- **Persistent project registry.** Projects registered at runtime (via chat) now survive a server
+  restart instead of living only in memory, so a client does not have to re-register them each session.
+- **One-click Claude Desktop Extension.** The server ships as a `.mcpb` bundle for one-click install in
+  Claude Desktop, trimmed from ~50 MB to ~17 MB (6.2 MB packed).
+
+### Changed
+
+- Compilation adopts `latexmk -cd`, running the build from the main file's own directory so projects
+  that rely on relative paths compile correctly.
+
 ## [0.3.0] - 2026-07-24
 
 ### Added
