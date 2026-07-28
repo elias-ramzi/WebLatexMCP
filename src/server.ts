@@ -3,6 +3,7 @@ import type { AppContext } from './context.js';
 import { registerListProjects } from './tools/listProjects.js';
 import { registerProjectSync } from './tools/projectSync.js';
 import { registerRegisterProject } from './tools/registerProject.js';
+import { registerSetCredential } from './tools/setCredential.js';
 import { registerListFiles } from './tools/listFiles.js';
 import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
@@ -57,6 +58,7 @@ export function createServer(
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);
   registerRegisterProject(server, ctx);
+  registerSetCredential(server, ctx);
   registerListFiles(server, ctx);
   registerReadFile(server, ctx);
   registerWriteFile(server, ctx);

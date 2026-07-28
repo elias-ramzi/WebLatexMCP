@@ -124,6 +124,13 @@ describe('createServer tool registration', () => {
     expect(tools.map((t) => t.name)).toContain('register_project');
     await client.close();
   });
+
+  it('registers the set_credential tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('set_credential');
+    await client.close();
+  });
 });
 
 describe('createServer skill prompts', () => {

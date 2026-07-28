@@ -151,20 +151,26 @@ the simplest is to set `OVERLEAF_GIT_TOKEN` in the client `env` block.
 
 ### Registering credentials in Claude Desktop
 
-The token is **not** part of `register_project` or the persisted registry — it is resolved at git time
-from the sources above, so on Desktop you set it up once, out of band:
+The token is **never** part of `register_project` or the persisted registry — it is resolved at git time
+from the sources above. On Desktop, where hand-editing the config is awkward, you have three ways to get
+it in place:
 
-- **Simplest — inline env var.** In `claude_desktop_config.json`, add the host token to the server's
-  `env` block, e.g. `"env": { "OVERLEAF_GIT_TOKEN": "olp_xxx" }` (Desktop does **not** expand
-  `${VARS}`, so paste the literal value), then restart Desktop.
-- **No token in the config — use a credential helper / gh.** Store the credential once in your OS keychain
-  and leave the `env` block token-free:
+- **From the chat — `set_credential` (recommended).** Just paste your Overleaf token to Claude and ask it
+  to store the credential; it calls the `set_credential` tool (with `confirm: true`), which hands the
+  token to your **OS keychain** via `git credential approve` — it lands there encrypted, not in any
+  config file or our registry, and the server picks it up on the next git operation. Give the tool a
+  `host` (e.g. `git.overleaf.com`) or a `project` id to derive it from. It reports whether a credential
+  helper actually kept the token — some bare Linux boxes have none configured, in which case fall back to
+  an env var. This pairs with `register_project`: paste the git URL, then the token — no JSON editing.
+- **Inline env var.** In `claude_desktop_config.json`, add the host token to the server's `env` block,
+  e.g. `"env": { "OVERLEAF_GIT_TOKEN": "olp_xxx" }` (Desktop does **not** expand `${VARS}`, so paste the
+  literal value), then restart Desktop.
+- **Keychain by hand.** The same thing `set_credential` does, from a terminal:
   - macOS: `printf 'protocol=https\nhost=git.overleaf.com\nusername=git\npassword=<TOKEN>\n\n' | git credential approve`
   - GitHub via the CLI: `gh auth login`.
 
-  The server then picks it up through `git credential fill` / `gh auth token`. This keeps the token out of
-  the Desktop config file entirely. See the per-OS [install guides](install/) for the exact keychain
-  commands.
+  The server then picks it up through `git credential fill` / `gh auth token`. See the per-OS
+  [install guides](install/) for the exact keychain commands.
 
 Tokens are injected into git operations **in memory only** — after cloning, the remote is reset to a
 **tokenless** URL, so nothing lands in `.git/config`. Every known host token is scrubbed from error
