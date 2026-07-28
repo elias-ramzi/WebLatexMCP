@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
+import { OVERLEAF_TOKEN_URL } from './auth.js';
 
 /**
  * A one-shot loopback web page for entering a git token **without it passing through the chat**.
@@ -246,6 +247,7 @@ export class CredentialPortal {
     background: #2d4a7a; color: #fff; cursor: pointer; }
   button:hover { background: #345489; }
   .note { color: #888; font-size: .85rem; margin-top: 1.6em; }
+  .note a { color: inherit; }
 </style></head>
 <body>
 <h1>Store your git credential</h1>
@@ -258,8 +260,9 @@ and stored in your OS keychain — it never goes through Claude or the chat.</p>
     placeholder="e.g. your Overleaf Git authentication token">
   <button type="submit">Store in keychain</button>
 </form>
-<p class="note">Overleaf: Account Settings → Git authentication token. GitHub: a Personal Access
-Token with <code>repo</code> scope.</p>
+<p class="note">Overleaf: create one under Account Settings → Git integration →
+<a href="${OVERLEAF_TOKEN_URL}" target="_blank" rel="noopener noreferrer">Git authentication token</a>.
+GitHub: a Personal Access Token with <code>repo</code> scope.</p>
 </body></html>`;
   }
 

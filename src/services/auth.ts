@@ -29,6 +29,9 @@ interface HostDefaults {
   username: string;
 }
 
+/** Where an Overleaf user creates a Git authentication token (Account Settings → Git integration). */
+export const OVERLEAF_TOKEN_URL = 'https://www.overleaf.com/user/settings';
+
 /** Per-host conventions for the token env var and HTTPS username. Overridable per project. */
 const HOST_DEFAULTS: Record<string, HostDefaults> = {
   'github.com': { tokenEnv: 'GITHUB_TOKEN', username: 'x-access-token' },

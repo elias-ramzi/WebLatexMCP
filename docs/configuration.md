@@ -130,10 +130,10 @@ Both return the same structured errors/warnings and PDF path, so switching backe
 
 ## Tokens — resolved per host
 
-Every host uses a token as the **HTTPS password**. For Overleaf, generate one under **Account Settings →
-Git authentication token** (a git access token). For GitHub, create a PAT under **Settings → Developer
-settings → Personal access tokens** with `repo` scope. GitLab and others: a personal/project access
-token.
+Every host uses a token as the **HTTPS password**. For Overleaf, generate one under
+[**Account Settings → Git integration → Git authentication token**](https://www.overleaf.com/user/settings).
+For GitHub, create a PAT under **Settings → Developer settings → Personal access tokens** with `repo`
+scope. GitLab and others: a personal/project access token.
 
 **How the server finds a token.** For each project it tries these sources in order and uses the first
 that yields one:

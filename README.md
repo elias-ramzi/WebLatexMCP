@@ -91,8 +91,9 @@ Desktop shows a short, all-optional form (tokens, clone folder). See the
 
 ### Add your token and your project — from the chat
 
-However you installed, the server needs a token for your git host. The private way, which **never puts
-the token in the chat**: ask Claude to open the credential portal.
+However you installed, the server needs a token for your git host — for Overleaf, a **Git authentication
+token** from [Account Settings → Git integration](https://www.overleaf.com/user/settings). The private
+way to hand it over, which **never puts the token in the chat**: ask Claude to open the credential portal.
 
 > 👽 Open the credential portal for my Overleaf token.
 

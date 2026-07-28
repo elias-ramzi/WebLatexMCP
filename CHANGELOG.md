@@ -27,6 +27,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 - Compilation adopts `latexmk -cd`, running the build from the main file's own directory so projects
   that rely on relative paths compile correctly.
+- The credential portal page, the `credential_portal` result, the Desktop install form, and the docs now
+  link to <https://www.overleaf.com/user/settings>, where an Overleaf Git authentication token is
+  created — no hunting through Overleaf's settings to find it.
 
 ## [0.3.0] - 2026-07-24
 

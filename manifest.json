@@ -31,7 +31,7 @@
     "overleaf_token": {
       "type": "string",
       "title": "Overleaf Git token",
-      "description": "Optional. Your Overleaf 'Git authentication token' (Account Settings → Git authentication token). Leave blank to add it later from the chat with credential_portal (entered on a local page, never in the chat).",
+      "description": "Optional. Your Overleaf 'Git authentication token', created under Account Settings → Git integration: https://www.overleaf.com/user/settings. Leave blank to add it later from the chat with credential_portal (entered on a local page, never in the chat).",
       "sensitive": true,
       "required": false
     },

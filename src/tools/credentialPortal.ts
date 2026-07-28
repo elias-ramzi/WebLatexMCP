@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { openBrowser } from '../lib/openBrowser.js';
 import { resolveCredentialTarget } from '../lib/credentialTarget.js';
+import { OVERLEAF_TOKEN_URL } from '../services/auth.js';
 
 const inputSchema = {
   project: z
@@ -81,7 +82,10 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
           `Opened a local credential page for ${target.username}@${target.host}: ${url}\n` +
           (opened ? 'It should have opened in your browser. ' : 'Open it in your browser. ') +
           'Enter your token there — it goes straight to this machine’s keychain and never through the chat. ' +
-          'Once you’ve submitted it, ask me to check and I’ll confirm it landed.';
+          'Once you’ve submitted it, ask me to check and I’ll confirm it landed.' +
+          (target.host.includes('overleaf.com')
+            ? `\nDon’t have a token yet? Create one under Account Settings → Git integration: ${OVERLEAF_TOKEN_URL}`
+            : '');
         return {
           content: [{ type: 'text', text }],
           structuredContent: {
