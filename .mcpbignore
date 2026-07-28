@@ -25,3 +25,23 @@ eslint.config.*
 
 # Local, machine-specific MCP config (also git-ignored)
 .mcp.json
+
+# --- Trim runtime-unused weight from bundled dependencies ---
+# Source maps and TypeScript declarations are dev-only; nothing loads them at runtime.
+*.map
+*.d.ts
+*.d.mts
+*.d.cts
+
+# pdf.js (the live PDF viewer) ships a full second "legacy" build plus type defs and an
+# image-decoder entry the viewer never loads — it only serves build/, web/, cmaps/, wasm/,
+# and standard_fonts/. Dropping these cuts the bundle by ~26 MB with no functional change.
+node_modules/pdfjs-dist/legacy/
+node_modules/pdfjs-dist/types/
+node_modules/pdfjs-dist/image_decoders/
+
+# pdf.js's OPTIONAL Node-side canvas renderer (@napi-rs/canvas) — a ~32 MB per-platform native
+# binary. We render in the browser and never import pdf.js in Node (the viewer only serves its
+# files), so it is never loaded; a per-platform binary in a cross-platform bundle would be useless
+# anyway. Dropping it saves ~33 MB.
+node_modules/@napi-rs/
