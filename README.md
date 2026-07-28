@@ -93,6 +93,21 @@ Using **Gemini** or **GitHub Copilot** instead? See the [Gemini guide](docs/inst
 CLI and Gemini Code Assist) or the [Copilot guide](docs/install/copilot.md) (Copilot agent mode in VS
 Code / Visual Studio) — both register the same server over stdio.
 
+### Or install as a one-click Claude Desktop Extension — no clone, no JSON
+
+The lowest-friction path for **Claude Desktop**: a single bundle file, no config editing. Download
+**`web-latex-mcp.mcpb`** from the [latest release](https://github.com/elias-ramzi/WebLatexMCP/releases/latest)
+and either drag it onto the Claude Desktop window or open **Settings → Extensions → Install Extension**
+and pick it. Desktop shows a short form (all optional):
+
+- **Overleaf token / GitHub token** — masked fields; leave blank and add a token later from the chat
+  with `credential_portal` (you type it on a local page, so it never goes through the conversation).
+- **Clone workspace folder** — where local clones live (defaults to `~/.web-latex-mcp/projects`).
+
+Then just tell Claude your project's git URL — it registers it with `register_project` (persisted, no
+config editing). `compile` still needs `latexmk` or `tectonic` on your `PATH`. See the
+[Desktop Extension guide](docs/install/desktop-extension.md).
+
 ### Or install from npm — no clone, no build
 
 Prefer not to clone the repo? Register the published package with `npx`. Editing and git work without

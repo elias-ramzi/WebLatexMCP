@@ -1,0 +1,27 @@
+# Files excluded from the packed .mcpb bundle. The bundle ships the built server (dist/),
+# production node_modules, the skills, and the two runtime guides — not the sources or dev tooling.
+.git/
+.github/
+src/
+test/
+coverage/
+.vscode/
+.web_latex_mcp/
+.sessions/
+
+# Dev config / build inputs (the built output in dist/ is what runs)
+tsconfig*.json
+vitest.config.ts
+eslint.config.*
+.prettier*
+.editorconfig
+.gitignore
+.npmrc
+*.tsbuildinfo
+
+# Never nest a previous bundle inside a new one
+*.mcpb
+.mcpbignore
+
+# Local, machine-specific MCP config (also git-ignored)
+.mcp.json

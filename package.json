@@ -35,6 +35,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:smoke": "vitest run test/smoke",
+    "bundle": "npm run build && npx --yes @anthropic-ai/mcpb@latest pack . web-latex-mcp.mcpb",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

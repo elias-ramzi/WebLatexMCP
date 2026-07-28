@@ -1,7 +1,9 @@
 # Installation guides
 
-In a hurry and using the VS Code extension? Start here:
+In a hurry? Start here:
 
+- 🧩 [**One-click Claude Desktop Extension**](desktop-extension.md) — download `web-latex-mcp.mcpb`,
+  drag it into Claude Desktop, fill an optional form. No cloning, building, or JSON editing.
 - ⚡ [**Super fast start (VS Code)**](vscode-quickstart.md) — chat your way through setup; Claude
   builds, registers, and adds your Overleaf project for you.
 
