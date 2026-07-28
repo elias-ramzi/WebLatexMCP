@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "web-latex-mcp",
   "display_name": "WebLatexMCP",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Read, edit, compile, and commit LaTeX in a git-hosted project (Overleaf, GitHub, any git remote) — straight from Claude.",
   "long_description": "An MCP server that keeps a local clone of your LaTeX project, compiles it locally with latexmk (or tectonic), shows a live PDF viewer with review comments, and sends changes back through a reviewable commit → push. Add projects straight from the chat with register_project (no config editing), and store your git token in the OS keychain via credential_portal or set_credential — the token never touches this config file or the conversation.",
   "author": {
