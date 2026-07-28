@@ -10,6 +10,7 @@ import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
+import { CredentialPortal } from './services/credentialPortal.js';
 import { detectRootFile } from './lib/rootFile.js';
 import { locateProjectPdf } from './lib/pdfLocate.js';
 import type { LatexCompiler } from './services/compiler.js';
@@ -32,6 +33,8 @@ export interface AppContext {
   sessions: SessionRegistry;
   /** This session's own uncommitted changes — see `src/services/shadowStore.ts`. */
   shadows: ShadowStore;
+  /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
+  credentialPortal: CredentialPortal;
 }
 
 export function createContext(
@@ -118,5 +121,8 @@ export function createContext(
     dblp: new DblpService(),
     sessions,
     shadows,
+    credentialPortal: new CredentialPortal((host, username, token) =>
+      credentials.storeCredential(host, username, token),
+    ),
   };
 }

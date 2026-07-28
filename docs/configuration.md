@@ -155,13 +155,18 @@ The token is **never** part of `register_project` or the persisted registry — 
 from the sources above. On Desktop, where hand-editing the config is awkward, you have three ways to get
 it in place:
 
-- **From the chat — `set_credential` (recommended).** Just paste your Overleaf token to Claude and ask it
-  to store the credential; it calls the `set_credential` tool (with `confirm: true`), which hands the
-  token to your **OS keychain** via `git credential approve` — it lands there encrypted, not in any
-  config file or our registry, and the server picks it up on the next git operation. Give the tool a
-  `host` (e.g. `git.overleaf.com`) or a `project` id to derive it from. It reports whether a credential
+- **Local portal — `credential_portal` (most private).** For when you'd rather the token never appear in
+  the chat at all (e.g. a cloud-synced transcript): ask Claude to open the credential portal. It calls
+  `credential_portal`, which starts a tiny page on `127.0.0.1`, opens your browser, and lets you type the
+  token into a **local form**. The token is POSTed straight to the server on your machine and stored in
+  the OS keychain — it never reaches Claude, the tool result, or the conversation. After you submit, ask
+  Claude to check and it reports whether it landed. Give a `host` or a `project` to target.
+- **From the chat — `set_credential`.** If you're fine pasting the token to Claude once, this is the
+  one-step path: it hands the token to your **OS keychain** via `git credential approve` (with
+  `confirm: true`) — it lands there encrypted, not in any config file or our registry, and the server
+  picks it up on the next git operation. Give a `host` or a `project`. It reports whether a credential
   helper actually kept the token — some bare Linux boxes have none configured, in which case fall back to
-  an env var. This pairs with `register_project`: paste the git URL, then the token — no JSON editing.
+  an env var. Pairs with `register_project`: paste the git URL, then the token — no JSON editing.
 - **Inline env var.** In `claude_desktop_config.json`, add the host token to the server's `env` block,
   e.g. `"env": { "OVERLEAF_GIT_TOKEN": "olp_xxx" }` (Desktop does **not** expand `${VARS}`, so paste the
   literal value), then restart Desktop.

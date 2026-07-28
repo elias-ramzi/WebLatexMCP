@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { defaultUsernameForHost, hostFromGitUrl } from '../services/auth.js';
+import { resolveCredentialTarget } from '../lib/credentialTarget.js';
 
 const inputSchema = {
   token: z
@@ -59,20 +59,10 @@ export function registerSetCredential(server: McpServer, ctx: AppContext): void 
           );
         }
 
-        let resolvedHost = host?.trim();
-        let resolvedUsername = username?.trim();
-        if (!resolvedHost) {
-          if (!project) {
-            throw new Error('Provide a `host` (e.g. git.overleaf.com) or a `project` id.');
-          }
-          const cfg = ctx.projectManager.getProjectConfig(project);
-          resolvedHost = hostFromGitUrl(cfg.gitUrl);
-          if (!resolvedHost) {
-            throw new Error(`Could not determine a host from project "${cfg.id}" (${cfg.gitUrl}).`);
-          }
-          resolvedUsername = resolvedUsername || cfg.username;
-        }
-        resolvedUsername = resolvedUsername || defaultUsernameForHost(resolvedHost);
+        const { host: resolvedHost, username: resolvedUsername } = resolveCredentialTarget(
+          ctx.projectManager,
+          { project, host, username },
+        );
 
         const { persisted } = await ctx.credentials.storeCredential(
           resolvedHost,

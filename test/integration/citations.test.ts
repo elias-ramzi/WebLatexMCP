@@ -17,6 +17,7 @@ import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
+import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -90,6 +91,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
         git.readAtRef(d, 'HEAD', rel),
       ),
+      credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
     };
     ctx.files.setMutationRecorder({
       record: (projectDir, relPath, before, after) =>
