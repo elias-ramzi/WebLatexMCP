@@ -76,6 +76,39 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
   });
 
+  it('merges persisted projects, with env projects winning on a shared id', () => {
+    const persisted = () => [
+      { id: 'thesis', gitUrl: 'https://git.overleaf.com/persisted' },
+      { id: 'notes', gitUrl: 'https://git.overleaf.com/notes' },
+    ];
+    const cfg = loadConfig(
+      {
+        WEB_LATEX_MCP_PROJECTS: JSON.stringify({
+          thesis: { gitUrl: 'https://git.overleaf.com/env' },
+        }),
+      },
+      '/some/dir',
+      () => false,
+      persisted,
+    );
+    const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p.gitUrl]));
+    expect(byId).toEqual({
+      thesis: 'https://git.overleaf.com/env', // env wins
+      notes: 'https://git.overleaf.com/notes', // persisted-only survives
+    });
+  });
+
+  it('accepts a default project that only exists in the persisted registry', () => {
+    const persisted = () => [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/persisted' }];
+    const cfg = loadConfig(
+      { WEB_LATEX_MCP_DEFAULT_PROJECT: 'thesis' },
+      '/some/dir',
+      () => false,
+      persisted,
+    );
+    expect(cfg.defaultProject).toBe('thesis');
+  });
+
   it('defaults the compiler to latexmk', () => {
     expect(loadConfig({}).compiler).toBe('latexmk');
   });

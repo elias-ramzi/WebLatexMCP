@@ -5,18 +5,18 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 
 ## Environment variables
 
-| Variable                                                   | Required | Description                                                                                                                                                                                                                                                                      |
-| ---------------------------------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `WEB_LATEX_MCP_PROJECTS`                                   | yes      | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`.                                                                                                                                                                                                 |
-| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override. |
-| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                                                                                                                |
-| `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                |
-| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                               |
-| `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                      |
-| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                    |
-| `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                              |
-| `WEB_LATEX_MCP_SKILLS_DIR`                                 | no       | Directory of skills exposed as MCP prompts (one subdirectory per skill, each with a `SKILL.md`). Default bundled [`.claude/skills`](skills.md).                                                                                                                                  |
-| `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Output-schema client compatibility. Default **auto-detects Claude Desktop** and omits `outputSchema`/`structuredContent` for it only; `1` forces omit for every client, `0` disables. See [Claude Desktop compatibility](#claude-desktop-compatibility).                         |
+| Variable                                                   | Required | Description                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WEB_LATEX_MCP_PROJECTS`                                   | no\*     | JSON map of project id → `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }`. \*Not strictly required — you can also register a project at runtime from the chat (`register_project`); set this to have projects present at boot. See [Registering a project without env config](#registering-a-project-without-env-config). |
+| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override.                                                |
+| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                                                                                                                                                               |
+| `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                               |
+| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                              |
+| `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                                                                     |
+| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                                                                   |
+| `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                                                                             |
+| `WEB_LATEX_MCP_SKILLS_DIR`                                 | no       | Directory of skills exposed as MCP prompts (one subdirectory per skill, each with a `SKILL.md`). Default bundled [`.claude/skills`](skills.md).                                                                                                                                                                                 |
+| `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Output-schema client compatibility. Default **auto-detects Claude Desktop** and omits `outputSchema`/`structuredContent` for it only; `1` forces omit for every client, `0` disables. See [Claude Desktop compatibility](#claude-desktop-compatibility).                                                                        |
 
 ### `WEB_LATEX_MCP_PROJECTS` example
 
@@ -29,8 +29,33 @@ One Overleaf project and one GitHub repo:
 }
 ```
 
-Find an Overleaf git URL under **Menu → Git** and a token under **Account Settings → Git authentication
-token**. For GitHub, create a PAT under **Settings → Developer settings → Personal access tokens**.
+**Where to find the git URL:** in Overleaf, open the project and go to **Menu → Git** — it shows a URL of
+the form `https://git.overleaf.com/<project-id>`. For GitHub (or any git host), use the normal HTTPS
+clone URL, e.g. `https://github.com/me/paper`.
+
+> [!TIP]
+> You don't have to set this variable at all. You can hand Claude the git URL **straight from the chat**
+> and it will register the project for you — see [Registering a project without env
+> config](#registering-a-project-without-env-config). Setting `WEB_LATEX_MCP_PROJECTS` is just the way to
+> have projects present the moment the server boots.
+
+## Registering a project without env config
+
+Editing a client's `env` block is fiddly — especially in **Claude Desktop**, which needs a JSON edit and
+a restart. So the server also lets you register a project **at runtime, from the chat**: give Claude the
+project id and its git URL and it calls the `register_project` tool, which:
+
+- **persists** the project to a `registry.json` under the [workspace root](#workspace-local-clones), so
+  it survives a restart and is picked up by every other session on the same machine — no env var needed;
+- clones it immediately (pass `clone: false` to defer);
+- stores only the id, git URL, and options (`rootFile` / `branch` / `username` / `tokenEnv`) — **never a
+  token**. Credentials are resolved per host at git time exactly as for env-configured projects (see
+  [Tokens](#tokens--resolved-per-host)).
+
+A project configured through `WEB_LATEX_MCP_PROJECTS` always wins over a persisted one with the same id,
+so the env stays the source of truth when you use it. (`project_sync` with a `gitUrl` also registers a
+project, but only for the current process — use `register_project` to keep it across sessions.) See the
+[tool reference](tools.md#registering-a-project-from-the-chat) for the full flow.
 
 ## Workspace-local clones
 
@@ -105,12 +130,52 @@ Both return the same structured errors/warnings and PDF path, so switching backe
 
 ## Tokens — resolved per host
 
-Tokens are used as the HTTPS password. For a project the server tries, in order: a per-project
-`tokenEnv`, the host's token env (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `OVERLEAF_GIT_TOKEN`, …), the generic
-`WEB_LATEX_MCP_TOKEN`, the **GitHub CLI** (`gh auth token`), then your **git credential helper**
-(`git credential fill` — works on every OS). A project can override with its own `tokenEnv` and/or
-`username`, so Overleaf and GitHub projects coexist with different credentials. The
-[install guides](install/) walk through each auth method per OS.
+Every host uses a token as the **HTTPS password**. For Overleaf, generate one under **Account Settings →
+Git authentication token** (a git access token). For GitHub, create a PAT under **Settings → Developer
+settings → Personal access tokens** with `repo` scope. GitLab and others: a personal/project access
+token.
+
+**How the server finds a token.** For each project it tries these sources in order and uses the first
+that yields one:
+
+1. the project's **`tokenEnv`** env var, if set (per-project override);
+2. the **host's token env** — `GITHUB_TOKEN`, `GITLAB_TOKEN`, `OVERLEAF_GIT_TOKEN`, … ;
+3. the generic **`WEB_LATEX_MCP_TOKEN`**;
+4. the **GitHub CLI** — `gh auth token` (GitHub only);
+5. your **git credential helper** — `git credential fill` (macOS Keychain, Windows Credential Manager,
+   libsecret, …; works on every OS).
+
+A project can set its own `tokenEnv` and/or `username`, so an Overleaf project and a GitHub repo coexist
+with different credentials. Pick **one** method — you don't need all five. For a single Overleaf project
+the simplest is to set `OVERLEAF_GIT_TOKEN` in the client `env` block.
+
+### Registering credentials in Claude Desktop
+
+The token is **never** part of `register_project` or the persisted registry — it is resolved at git time
+from the sources above. On Desktop, where hand-editing the config is awkward, you have three ways to get
+it in place:
+
+- **Local portal — `credential_portal` (most private).** For when you'd rather the token never appear in
+  the chat at all (e.g. a cloud-synced transcript): ask Claude to open the credential portal. It calls
+  `credential_portal`, which starts a tiny page on `127.0.0.1`, opens your browser, and lets you type the
+  token into a **local form**. The token is POSTed straight to the server on your machine and stored in
+  the OS keychain — it never reaches Claude, the tool result, or the conversation. After you submit, ask
+  Claude to check and it reports whether it landed. Give a `host` or a `project` to target.
+- **From the chat — `set_credential`.** If you're fine pasting the token to Claude once, this is the
+  one-step path: it hands the token to your **OS keychain** via `git credential approve` (with
+  `confirm: true`) — it lands there encrypted, not in any config file or our registry, and the server
+  picks it up on the next git operation. Give a `host` or a `project`. It reports whether a credential
+  helper actually kept the token — some bare Linux boxes have none configured, in which case fall back to
+  an env var. Pairs with `register_project`: paste the git URL, then the token — no JSON editing.
+- **Inline env var.** In `claude_desktop_config.json`, add the host token to the server's `env` block,
+  e.g. `"env": { "OVERLEAF_GIT_TOKEN": "olp_xxx" }` (Desktop does **not** expand `${VARS}`, so paste the
+  literal value), then restart Desktop.
+- **Keychain by hand.** The same thing `set_credential` does, from a terminal:
+  - macOS: `printf 'protocol=https\nhost=git.overleaf.com\nusername=git\npassword=<TOKEN>\n\n' | git credential approve`
+  - GitHub via the CLI: `gh auth login`.
+
+  The server then picks it up through `git credential fill` / `gh auth token`. See the per-OS
+  [install guides](install/) for the exact keychain commands.
 
 Tokens are injected into git operations **in memory only** — after cloning, the remote is reset to a
 **tokenless** URL, so nothing lands in `.git/config`. Every known host token is scrubbed from error

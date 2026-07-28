@@ -108,6 +108,15 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`
 Desktop does **not** expand `${VARS}`, so either inline `"GITHUB_TOKEN": "ghp_xxx"` or rely on `gh` /
 Git Credential Manager from step 3.
 
+**Projects without touching this file.** You don't have to list projects here — once the server is
+registered, paste your Overleaf git URL into the chat and ask Claude to add the project. It calls
+`register_project`, which persists it (survives restarts, shared across sessions). For the **token**,
+ask Claude to open the credential portal (`credential_portal`) and type it into a local page so it never
+touches the chat, or paste it to Claude to store with `set_credential` — either lands it in Git
+Credential Manager — or use the `env` block above. It is never stored with the project. See
+[Registering a project without env config](../configuration.md#registering-a-project-without-env-config)
+and [Registering credentials in Claude Desktop](../configuration.md#registering-credentials-in-claude-desktop).
+
 ## 5. PATH note
 
 Windows GUI apps generally inherit the user `PATH`, so `node`, `git`, `gh`, and `latexmk` are usually

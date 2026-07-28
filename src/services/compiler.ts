@@ -111,6 +111,11 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
     ENGINE_FLAG[engine],
     '-interaction=nonstopmode',
     '-file-line-error',
+    // chdir into the root file's directory before compiling, so a document that lives in a
+    // subdirectory of the clone still finds its sibling .sty/.bst/.cls with a bare
+    // `\usepackage{local}`. A no-op when the root file is at the clone root. `-outdir` stays
+    // absolute (below), so the build artifacts land in the temp build dir regardless.
+    '-cd',
     // Emit a .synctex.gz next to the PDF so a click in the viewer maps back to source file:line
     // (powers `list_comments`). Cheap and harmless when unused.
     '-synctex=1',

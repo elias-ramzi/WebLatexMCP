@@ -1,0 +1,41 @@
+name: Bundle
+
+# Build the one-click Claude Desktop Extension (.mcpb) and attach it to the GitHub Release when a
+# version tag is pushed (e.g. `git tag v0.4.0 && git push --tags`) — the same trigger as npm publish.
+# Users then download `web-latex-mcp.mcpb` from Releases and drag it into Claude Desktop.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  bundle:
+    name: Build and attach .mcpb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/attach the release asset
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: git config --global core.autocrlf false
+      - run: npm ci
+      # Build with dev deps present, then drop them so only runtime deps ship in the bundle.
+      - run: npm run build
+      - run: npm prune --omit=dev
+      # Keep the bundle's version in step with the release tag so the two never drift.
+      - name: Sync manifest version to the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          node -e "const fs=require('fs');const m=require('./manifest.json');m.version=process.argv[1];fs.writeFileSync('manifest.json',JSON.stringify(m,null,2)+'\n')" "$TAG"
+      - name: Validate the manifest
+        run: npx --yes @anthropic-ai/mcpb@latest validate manifest.json
+      - name: Pack the extension
+        run: npx --yes @anthropic-ai/mcpb@latest pack . web-latex-mcp.mcpb
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: web-latex-mcp.mcpb
+          fail_on_unmatched_files: true

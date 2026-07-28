@@ -4,6 +4,7 @@ import { loadConfig } from './config.js';
 import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createContext } from './context.js';
 import { createServer } from './server.js';
+import { ProjectRegistry } from './services/projectRegistry.js';
 import { loadWritingGuide } from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
 import { loadSkills } from './lib/skills.js';
@@ -29,7 +30,8 @@ async function main(): Promise<void> {
   }
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);
-  const ctx = createContext(config, credentials, identity);
+  const registry = new ProjectRegistry(config.workspaceRoot);
+  const ctx = createContext(config, credentials, identity, registry);
   const writingGuide = await loadWritingGuide(process.env);
   const concurrencyGuide = await loadConcurrencyGuide(process.env);
   const skills = await loadSkills(process.env);
