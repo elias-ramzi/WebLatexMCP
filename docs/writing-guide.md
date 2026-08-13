@@ -100,10 +100,11 @@ where $\hat{x}_i$ is the reconstruction.
 
   ```latex
   % Method section
-  Our architecture utilizes a standard ResNet-50 \cite{he2016resnet} backbone...
+  The architecture uses a standard ResNet-50 \cite{he2016resnet} backbone.
 
   % Experiments section
-  We optimize with AdamW \cite{loshchilov2017decoupled} at a learning rate of...
+  The model is optimized with AdamW \cite{loshchilov2017adamw} at a learning rate
+  of $10^{-4}$.
   ```
 
 - **Do not re-cite within the same section.** Once a method is established, use its
