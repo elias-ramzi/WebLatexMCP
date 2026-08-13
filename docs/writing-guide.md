@@ -87,6 +87,40 @@ where $\hat{x}_i$ is the reconstruction.
 - BibTeX key format: `firstauthorYEARpaperacronym`, e.g. `chambon2024pointbev`.
   If the paper has no acronym, use the first word of the title.
 
+## Citations
+
+- **Never cite in the abstract.** Indexing engines strip bibliographies; bracketed
+  references become bare numbers with no meaning. As a rare exception, if a work is
+  central to the abstract's argument, use plain text only: "(Dosovitskiy et al., 2020)".
+- **Cite on first mention in the main text.** The first time a method, baseline, or
+  architecture is named, add `\cite{}`.
+- **Re-anchor at major section boundaries.** Papers are not read linearly — readers
+  jump straight to the Method or Experiments. Re-cite a method at its first appearance
+  in each new major section: Related Work, Method, and Experiments/Implementation Details.
+
+  ```latex
+  % Method section
+  The architecture uses a standard ResNet-50 \cite{he2016resnet} backbone.
+
+  % Experiments section
+  The model is optimized with AdamW \cite{loshchilov2017adamw} at a learning rate
+  of $10^{-4}$.
+  ```
+
+- **Do not re-cite within the same section.** Once a method is established, use its
+  name alone for the rest of the section. Never bracket the same method twice in the
+  same paragraph:
+
+  ```latex
+  % ✗
+  Unlike NeRF \cite{mildenhall2020nerf}, our method is faster.
+  Furthermore, NeRF \cite{mildenhall2020nerf} requires static scenes.
+
+  % ✓
+  Unlike NeRF \cite{mildenhall2020nerf}, our method is faster.
+  Furthermore, NeRF requires static scenes.
+  ```
+
 ## Acronyms and abbreviations
 
 - Define an acronym at its **first appearance**: full term first, acronym in
