@@ -9,6 +9,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- Writing guide gains a **Citations** section on where `\cite{}` goes in the prose: never in the
+  abstract, on first mention in the main text, re-anchored at each major section boundary (readers jump
+  straight to the Method or Experiments), and never twice for the same work within a section.
+
 ## [0.4.0] - 2026-07-28
 
 ### Added
