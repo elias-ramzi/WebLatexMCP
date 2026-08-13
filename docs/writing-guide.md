@@ -87,7 +87,7 @@ where $\hat{x}_i$ is the reconstruction.
 - BibTeX key format: `firstauthorYEARpaperacronym`, e.g. `chambon2024pointbev`.
   If the paper has no acronym, use the first word of the title.
 
-### Citations
+## Citations
 
 - **Never cite in the abstract.** Indexing engines strip bibliographies; bracketed
   references become bare numbers with no meaning. As a rare exception, if a work is
