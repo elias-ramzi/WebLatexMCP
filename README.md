@@ -57,6 +57,7 @@ compiles the real files **in place** — no remote, no clone, no second copy of 
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 📚 **References in any format** — read them structured out of a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft, and cross-check what the document cites against what it defines.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
 ## Install
@@ -135,6 +136,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 - **Diagnose the toolchain** — `doctor` reports what the machine actually has (engines, TeX distribution and its age, the package manager and the repository it would install from, writable install paths), so a missing package or an end-of-life TeX Live is a one-call answer instead of a chain of failed compiles ([details](docs/tools.md#missing-packages)).
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
+- **Read the references you already have** — `list_references` returns them structured (key, title, authors, year, venue, DOI/arXiv, file and line) from a `.bib`, a LaTeX `thebibliography`, **or a reference list written as prose in a markdown document** — and `check_citations` diffs what the draft cites against what the bibliography defines ([details](docs/tools.md#references-in-any-format)).
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
   come back to you with both sides, and you resolve them by pushing the merged content back — or rewind
   the clone to the current remote with `reset_to_remote` and redo your edits cleanly).
@@ -148,7 +150,7 @@ unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
-- **`/verify-citations`** — audit every `.bib` entry against DBLP, flag discrepancies, and write a local git-excluded audit report (read-only for the `.bib`).
+- **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 - **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, ready to paste into an issue ([contributing](CONTRIBUTING.md#feedback-from-a-session)).

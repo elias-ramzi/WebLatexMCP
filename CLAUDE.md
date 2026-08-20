@@ -114,6 +114,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   its base is stale and committing it would revert what landed. State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`), outside the clones. Keep this: the
   guarantee is that a commit contains one session's lines and nobody else's.
+- **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
+  shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
+  reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
+  `format` and its verbatim `raw`, because only `bibtex` fields are exact; the prose extractor
+  deliberately under-claims (a `title` only when the text delimits it, authors only before a
+  parenthesized year) so a wrong guess never sends a DBLP lookup after the wrong paper. `list_references`
+  and `check_citations` are the tools over it, and `src/lib/referenceSources.ts` decides which files to
+  scan. Neither touches git — the case they exist for is a draft with no remote and no `.bib`.
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the

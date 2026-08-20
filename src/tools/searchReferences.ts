@@ -47,9 +47,14 @@ export function registerSearchReferences(server: McpServer, ctx: AppContext): vo
     {
       title: 'Search DBLP for references',
       description:
-        'Search the DBLP database for publications. Read-only: it does NOT change the project. ' +
-        'Each result includes a DBLP `key`; to add one to the bibliography, call add_citation ' +
-        'with that key. Use this whenever the user asks to add or look up a citation.',
+        'Look a publication UP on DBLP — the external computer-science bibliography at ' +
+        'dblp.org, over the network. It does NOT search the project: it never reads the ' +
+        'project’s .bib and never changes anything. To search the references the project ' +
+        'already has, use list_references instead. Reach for this to find a paper’s canonical ' +
+        'metadata — to check an entry the project cites, or to add one it does not. Each ' +
+        'result carries a DBLP `key`; pass that key to add_citation to append the entry, ' +
+        'fetched from DBLP rather than written by hand. DBLP rate-limits: call it one paper at ' +
+        'a time, never in parallel bursts.',
       inputSchema,
       outputSchema,
     },

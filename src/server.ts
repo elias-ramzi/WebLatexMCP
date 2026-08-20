@@ -22,6 +22,8 @@ import { registerDiscard } from './tools/discard.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
+import { registerListReferences } from './tools/listReferences.js';
+import { registerCheckCitations } from './tools/checkCitations.js';
 import { registerServerInfo } from './tools/serverInfo.js';
 import { registerListSkills } from './tools/listSkills.js';
 import { registerDoctor } from './tools/doctor.js';
@@ -81,6 +83,8 @@ export function createServer(
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
+  registerListReferences(server, ctx);
+  registerCheckCitations(server, ctx);
   registerServerInfo(server, ctx);
   registerListSkills(server, skills);
   registerDoctor(server, ctx);

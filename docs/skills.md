@@ -4,14 +4,14 @@ The repo bundles task-specific skills that drive the [tools](tools.md) — each 
 nothing is committed or pushed unless you ask. How you install them, and how you invoke them, depends on
 the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-a-skill-runs).
 
-| Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                         | Mutates                     | Invoke                  |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- | ----------------------- |
-| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                                       | `.tex`                      | `/format-latex-project` |
-| [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`.              | `.tex` (in-place mode)      | `/arxiv-clean-project`  |
-| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits every `.bib` entry (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local git-excluded audit report, and optionally marks confirmed entries. **Read-only for the `.bib`** unless you approve a change.                                                                                                                                       | local report; opt-in `.bib` | `/verify-citations`     |
-| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                       | `.bib` + `.tex`             | `/format-bibliography`  |
-| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                        | local note only             | `/summarize-paper`      |
-| [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and writing a feedback report on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong — classified, ranked by impact, stamped with `server_info`/`doctor`, and scrubbed of tokens and manuscript content. Optionally filed as a GitHub issue, never without asking. | nothing                     | `/session-feedback`     |
+| Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                         | Mutates                  | Invoke                  |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ | ----------------------- |
+| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                                       | `.tex`                   | `/format-latex-project` |
+| [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`.              | `.tex` (in-place mode)   | `/arxiv-clean-project`  |
+| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                            | local report; opt-in bib | `/verify-citations`     |
+| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                       | `.bib` + `.tex`          | `/format-bibliography`  |
+| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                        | local note only          | `/summarize-paper`      |
+| [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and writing a feedback report on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong — classified, ranked by impact, stamped with `server_info`/`doctor`, and scrubbed of tokens and manuscript content. Optionally filed as a GitHub issue, never without asking. | nothing                  | `/session-feedback`     |
 
 ## Two ways a skill runs
 
@@ -120,18 +120,29 @@ skill flags that first. The cleaner is a Python CLI installed on demand (`pipx`/
 
 ## `verify-citations` — audit citations against DBLP
 
-**Audits the references already in your `.bib`** against [DBLP](https://dblp.org). For each entry it
+**Audits the references a document actually carries** against [DBLP](https://dblp.org). For each entry it
 compares the **title**, **authors**, **venue** (reconciling abbreviations like CVPR / NeurIPS / ICLR with
 their full names), and **publication year** to the canonical DBLP record via `search_references`. Confident
-matches are tallied silently; anything doubtful — a wrong year, a misspelled or missing author, a preprint
-cited where a published version exists, or an entry DBLP can't find — is brought back to **you** with the
-bib entry shown beside the DBLP record, so you decide what to do. It is **read-only by default and never
-edits a `.bib` without your explicit say-so** (consistent with the [`.bib` protection](tools.md#citations-via-dblp));
-optionally, on entries you confirm, it adds a `% verified-by-claude` comment (ignored by BibTeX, so the PDF
-is unchanged) that later runs skip. Every run also writes a **local, git-excluded audit report**
-(`citation-report.local.md` at the clone root — the same local-only mechanism as
-[`summarize-paper`](#summarize-paper--local-cheat-sheet-for-future-sessions), never pushed) and surfaces a
-link to it, so the findings outlive the chat. Ask Claude to "check my citations".
+matches are tallied silently; anything doubtful — a wrong year, a misspelled or missing author, an author
+list truncated with `and others`, a preprint cited where a published version exists, or an entry DBLP can't
+find — is brought back to **you** with the reference shown beside the DBLP record, so you decide what to do.
+
+**It does not need a `.bib`, and it does not need a remote.** Via
+[`list_references`](tools.md#references-in-any-format) it reads a BibTeX `.bib`, a LaTeX
+`thebibliography`, or a reference list written as prose in a markdown or plain-text draft — and it runs
+the same way on a [local project](tools.md#local-in-place-projects) that is just a folder on your machine,
+skipping the git steps rather than failing on them. If your document isn't registered yet, it registers the
+folder in place. When the bibliography has cite keys it also runs
+[`check_citations`](tools.md#references-in-any-format), so keys you cite with no entry come back as their
+own finding rather than as "unverified".
+
+It is **read-only by default and never edits the bibliography without your explicit say-so** (for a `.bib`,
+also behind the [`.bib` protection](tools.md#citations-via-dblp)); optionally, on entries you confirm, it
+adds a `% verified-by-claude` comment (ignored by BibTeX, so the PDF is unchanged) that later runs skip —
+never in a markdown draft, where no comment stays invisible. Every run also writes a **local audit report**
+(`citation-report.local.md` — git-excluded at the clone root for a git project, and for a local project
+only after asking you, since that folder is yours) and surfaces a link to it, so the findings outlive the
+chat. Ask Claude to "check my citations".
 
 ## `format-bibliography` — normalize the bibliography
 
