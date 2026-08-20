@@ -156,6 +156,13 @@ describe('parseProseReferences', () => {
     expect(entries[0]!.authors).toEqual(['He, K.', 'Zhang, X.', 'Sun, J.']);
   });
 
+  it('keeps compound initials with their surname, so the author count stays right', () => {
+    // "A.-Q." is Anh-Quan, one author — splitting it off would report three authors for two, and
+    // the count is what gets compared against the DBLP record.
+    const list = '# References\n\n1. Cao, A.-Q., & de Charette, R. (2022). "MonoScene." CVPR.';
+    expect(parseProseReferences(list)[0]!.authors).toEqual(['Cao, A.-Q.', 'de Charette, R.']);
+  });
+
   it('recognizes an arXiv id, and leaves the title alone when nothing delimits it', () => {
     expect(entries[1]!.arxivId).toBe('2001.10773');
     expect(entries[1]!.title).toBeUndefined();

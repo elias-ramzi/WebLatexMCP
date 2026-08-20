@@ -68,23 +68,36 @@ const outputSchema = {
 
 type Located = ReferenceEntry & { path: string };
 
-/** Read and parse each named source, keeping only the ones that actually carry entries. */
+/**
+ * Read and parse each named source, keeping the entries that carry a cite key.
+ *
+ * `keyless` counts the ones dropped for having none — a prose reference list is numbered, not keyed.
+ * Those are real references, so "none found" would be a lie; the caller uses the count to say what
+ * actually happened instead.
+ */
 async function collectEntries(
   ctx: AppContext,
   dir: string,
   paths: string[],
-): Promise<{ entries: Located[]; sources: string[] }> {
+): Promise<{ entries: Located[]; sources: string[]; keyless: number; keylessIn: string[] }> {
   const entries: Located[] = [];
   const sources: string[] = [];
+  const keylessIn: string[] = [];
+  let keyless = 0;
   for (const rel of paths) {
     const text = await ctx.files.readText(dir, rel);
     if (!text) continue;
-    const parsed = parseReferences(text, rel).filter((e) => e.key);
-    if (parsed.length === 0) continue;
+    const parsed = parseReferences(text, rel);
+    const keyed = parsed.filter((e) => e.key);
+    if (parsed.length > keyed.length) {
+      keyless += parsed.length - keyed.length;
+      keylessIn.push(rel);
+    }
+    if (keyed.length === 0) continue;
     sources.push(rel);
-    entries.push(...parsed.map((e) => ({ ...e, path: rel })));
+    entries.push(...keyed.map((e) => ({ ...e, path: rel })));
   }
-  return { entries, sources };
+  return { entries, sources, keyless, keylessIn };
 }
 
 export function registerCheckCitations(server: McpServer, ctx: AppContext): void {
@@ -109,8 +122,18 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         const { dir } = await ctx.projectManager.requireProjectDir(project);
 
         const bibPaths = bibliography ?? (await referenceSourceCandidates(ctx, dir));
-        const { entries, sources } = await collectEntries(ctx, dir, bibPaths);
+        const { entries, sources, keyless, keylessIn } = await collectEntries(ctx, dir, bibPaths);
         if (entries.length === 0) {
+          // Found references, but they are numbered rather than keyed — a prose reference list.
+          // There is nothing to cross-reference *by*, so say that rather than "none found".
+          if (keyless > 0) {
+            throw new Error(
+              `Found ${keyless} reference(s) in ${keylessIn.join(', ')}, but none carry a cite ` +
+                'key — they are a numbered/prose reference list. check_citations matches cite keys, ' +
+                'so there is nothing here to cross-reference. Use list_references to read the list, ' +
+                'and verify each entry against DBLP with search_references.',
+            );
+          }
           throw new Error(
             'No reference entries found. Pass `bibliography` with the file that holds them ' +
               '(a .bib, or the .tex carrying the thebibliography environment).',

@@ -213,13 +213,30 @@ describe('references in a local, non-.bib document', () => {
   });
 
   it('says what to do when there is no bibliography to check against', async () => {
-    const { client } = await setup();
+    const { client, userDir } = await setup();
+    await rm(path.join(userDir, 'proposal.md'));
+    await writeFile(path.join(userDir, 'notes.md'), '# Notes\n\nNothing to cite here.\n');
     const res = await client.callTool({
       name: 'check_citations',
       arguments: { project: 'proposal' },
     });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/No reference entries found/);
+  });
+
+  it('does not claim "none found" when the references are a keyless prose list', async () => {
+    // The draft has real references — they are just numbered, not keyed. Reporting that as "no
+    // reference entries found" sends the caller looking for a file that is already right there.
+    const { client } = await setup();
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal' },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(
+      /Found 2 reference\(s\) in proposal\.md, but none carry a cite key/,
+    );
+    expect(textOf(res)).toMatch(/list_references/);
   });
 
   it('reads a thebibliography out of a .tex, keys and all', async () => {

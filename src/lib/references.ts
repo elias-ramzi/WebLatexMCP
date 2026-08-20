@@ -420,6 +420,13 @@ function describeFreeText(text: string): Omit<ReferenceEntry, 'format' | 'line' 
   };
 }
 
+/**
+ * A piece that is initials rather than a name. Compound initials count — "A.-Q." (Anh-Quan) and
+ * "T.-H." (Tuan-Hung) are one author's initials, not two authors. Reading them as two inflates the
+ * author count, and the count is exactly what gets compared against the DBLP record.
+ */
+const INITIALS_RE = /^(?:[A-Z]\.?(?:-[A-Z]\.?)?\s*){1,3}$/;
+
 /** "Smith, J., Doe, A., & Roe, B." → the names, in the order written. */
 function splitProseAuthors(chunk: string): string[] {
   return (
@@ -431,8 +438,7 @@ function splitProseAuthors(chunk: string): string[] {
       // "Smith" and "J." arrive as separate pieces because the comma between them is also the
       // separator between authors; fold an initials-only piece back onto the name before it.
       .reduce<string[]>((acc, piece) => {
-        if (/^(?:[A-Z]\.?\s*){1,3}$/.test(piece) && acc.length)
-          acc[acc.length - 1] += `, ${piece}.`;
+        if (INITIALS_RE.test(piece) && acc.length) acc[acc.length - 1] += `, ${piece}.`;
         else acc.push(piece);
         return acc;
       }, [])
