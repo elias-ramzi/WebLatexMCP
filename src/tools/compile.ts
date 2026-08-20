@@ -6,6 +6,7 @@ import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
+import { attachErrorSnippets, formatSnippet } from '../lib/errorSnippets.js';
 import {
   parseLog,
   filterLog,
@@ -16,6 +17,9 @@ import {
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
+
+/** How many errors the result text lists before pointing at structuredContent and the log. */
+const MAX_TEXT_ERRORS = 10;
 
 const inputSchema = {
   project: z.string().optional(),
@@ -56,6 +60,18 @@ const errorShape = z.object({
   line: z.number().optional(),
   message: z.string(),
   rule: z.string().optional(),
+  snippet: z
+    .string()
+    .optional()
+    .describe(
+      'The 5 source lines around `line` (2 either side, clamped at the file bounds) — a LaTeX ' +
+        'message is often uninterpretable without them. Errors only: warnings never carry one, and ' +
+        'neither does a diagnostic the log parser could not attribute to a file and line.',
+    ),
+  snippetStartLine: z
+    .number()
+    .optional()
+    .describe("1-based source line of `snippet`'s first line, so the caller can number it."),
 });
 
 const outputSchema = {
@@ -126,7 +142,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       description:
         'Compile the project locally (latexmk by default, or tectonic) and return success, ' +
         'the PDF path, and structured errors/warnings (each attributed to its source .tex file ' +
-        'when known) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
+        'when known — an error also carries the 5 source lines around it, so you rarely need a ' +
+        'read_file to interpret it) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
         'not the font/memory dump (pass rawLog: true for the unfiltered tail). Does not touch the ' +
         'Overleaf remote. TikZ externalization (\\tikzexternalize) needs system calls: retry with ' +
         'restrictedShellEscape: true (preferred) or shellEscape: true — the latter lets the .tex ' +
@@ -160,7 +177,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             shellEscape,
             restrictedShellEscape,
           });
-          const { errors, warnings } = parseLog(outcome.log);
+          const { errors: parsedErrors, warnings } = parseLog(outcome.log);
+          // Errors carry their source context; warnings do not — a normal build has hundreds of
+          // them and attaching a snippet to each would bloat every successful compile's result.
+          const { errors, omittedLocations } = await attachErrorSnippets(
+            ctx.files,
+            dir,
+            parsedErrors,
+          );
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
@@ -198,9 +222,29 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           const headline = outcome.timedOut
             ? `compile timed out after ${outcome.durationSec.toFixed(1)}s`
             : `${outcome.success ? 'compiled' : 'FAILED'} ${root} in ${outcome.durationSec.toFixed(1)}s — ${errors.length} error(s), ${warnings.length} warning(s)`;
+          // Render the source context into the text too, not only structuredContent: a client that
+          // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
+          // Errors sharing a location print the snippet once.
+          const shownSnippets = new Set<string>();
           const errorLines = errors
-            .slice(0, 10)
-            .map((e) => `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`)
+            .slice(0, MAX_TEXT_ERRORS)
+            .map((e) => {
+              const head = `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`;
+              const key = `${e.file} ${e.line}`;
+              if (!e.snippet || shownSnippets.has(key)) return head;
+              shownSnippets.add(key);
+              return `${head}\n${formatSnippet(e)}`;
+            })
+            .join('\n');
+          const dropped = [
+            errors.length > MAX_TEXT_ERRORS
+              ? `  … ${errors.length - MAX_TEXT_ERRORS} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
+              : '',
+            omittedLocations > 0
+              ? `  … source context omitted for ${omittedLocations} further error location(s)`
+              : '',
+          ]
+            .filter(Boolean)
             .join('\n');
           // Surface the live viewer whenever there's something to look at: its URL if it's already
           // running (this build just hot-reloaded into it), else a pointer that the tool exists.
@@ -211,6 +255,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             headline,
             pdfUrl ? `PDF: ${pdfUrl}` : '',
             errorLines,
+            dropped,
             hint ? `hint: ${hint}` : '',
             viewerLine,
           ]

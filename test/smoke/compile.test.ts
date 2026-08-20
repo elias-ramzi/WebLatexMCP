@@ -5,6 +5,8 @@ import { mkdtemp, cp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
 import { parseLog, filterLog, logTail, findMissingPackages } from '../../src/services/logParser.js';
+import { attachErrorSnippets, formatSnippet } from '../../src/lib/errorSnippets.js';
+import { FileService } from '../../src/services/fileService.js';
 
 // Gate the real compile on latexmk being installed, so this auto-skips in the fast
 // CI job and on dev machines without TeX, but runs in the dedicated tex-smoke job.
@@ -50,6 +52,23 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
     const { errors } = parseLog(outcome.log);
     expect(errors.length).toBeGreaterThan(0);
     expect(errors.some((e) => /undefined control sequence/i.test(e.message))).toBe(true);
+  }, 60_000);
+
+  it('attaches the source around a real error, lined up with the reported line', async () => {
+    const outcome = await compiler.compile({ projectDir: dir, rootFile: 'main-broken.tex' });
+    const { errors } = await attachErrorSnippets(
+      new FileService(),
+      dir,
+      parseLog(outcome.log).errors,
+    );
+    const undefinedMacro = errors.find((e) => /undefined control sequence/i.test(e.message));
+    expect(undefinedMacro?.file).toBe('main-broken.tex');
+    expect(undefinedMacro?.snippet).toBeDefined();
+    // The line TeX reported is the line the snippet shows at that offset — the whole guarantee.
+    const lines = undefinedMacro!.snippet!.split('\n');
+    const offset = undefinedMacro!.line! - undefinedMacro!.snippetStartLine!;
+    expect(lines[offset]).toContain('\\thismacrodoesnotexist');
+    expect(formatSnippet(undefinedMacro!)).toContain(`> ${undefinedMacro!.line} |`);
   }, 60_000);
 
   it('names the package a real TeX installation is missing', async () => {

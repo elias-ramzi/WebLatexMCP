@@ -185,6 +185,29 @@ export class FileService {
     return { path: opts.path, content, totalLines, truncated: start > 1 || end < totalLines };
   }
 
+  /**
+   * Read a line range **without** recording a revision baseline, for context the server shows on
+   * its own initiative (the source around a compile error) rather than on the caller's request.
+   * Recording here would be wrong: it would tell the out-of-band-edit guard that the server has
+   * seen the current bytes of a file the user is hand-editing, so the next write would clobber
+   * those edits silently. Returns '' when there is nothing to show (binary, oversized, or a range
+   * past the end of the file).
+   */
+  async readExcerpt(
+    projectDir: string,
+    opts: { path: string; startLine: number; endLine: number },
+  ): Promise<{ content: string }> {
+    const abs = resolveInside(projectDir, opts.path);
+    const info = await stat(abs);
+    if (!info.isFile()) throw new Error(`Not a file: "${opts.path}"`);
+    const ext = path.extname(opts.path).toLowerCase();
+    if (ASSET_EXT.has(ext) || info.size > MAX_READ_BYTES) return { content: '' };
+    const lines = (await readFile(abs, 'utf8')).split('\n');
+    const start = Math.max(1, opts.startLine);
+    const end = Math.min(lines.length, opts.endLine);
+    return { content: lines.slice(start - 1, end).join('\n') };
+  }
+
   /** Read a file's full text, returning '' when it does not exist (used for appends). */
   async readText(projectDir: string, relPath: string): Promise<string> {
     const abs = resolveInside(projectDir, relPath);

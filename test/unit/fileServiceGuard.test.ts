@@ -48,6 +48,19 @@ describe('FileService out-of-band edit guard', () => {
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('agent version\n');
   });
 
+  it('readExcerpt does not refresh the baseline, so the guard still fires', async () => {
+    await files.read(dir, { path: 'main.tex' });
+    await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+    // compile showing the source around an error is the server's own initiative, not the caller
+    // acknowledging the change — it must not count as "the server has seen these bytes".
+    const excerpt = await files.readExcerpt(dir, { path: 'main.tex', startLine: 1, endLine: 5 });
+    expect(excerpt.content).toContain('edited by the user');
+
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+  });
+
   it('allows writing a file it never read (no baseline)', async () => {
     // No prior read of new.tex — a deliberate create, not a stale overwrite.
     const res = await files.write(dir, { path: 'new.tex', content: 'fresh\n' });
