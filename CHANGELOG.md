@@ -48,6 +48,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   read the project's `.bib`, and points at `list_references` for searching the references already there.
   It was not clear which side of the boundary the tool sat on.
 
+### Known limits
+
+- **`check_citations` works within one project.** Its paths stay sandboxed inside a single project, so a
+  draft that cites a `.bib` belonging to _another_ registered project (a shared group bibliography) is
+  cross-checked with two `list_references` calls and a comparison, not one call — the `verify-citations`
+  skill spells out how.
+
 ## [0.5.0] - 2026-08-20
 
 ### Added

@@ -165,6 +165,33 @@ pandoc's `[@key]` / `@key` in markdown, against every `.bib` and `\bibitem` list
 Verify only the entries whose key appears in the citations. This tool is a **structural** check: it
 says nothing about whether a reference is factually right. That is what the DBLP pass is for.
 
+## When the bibliography lives in a different project
+
+A draft often cites a `.bib` that belongs somewhere else — a proposal in one folder, the group's
+shared bibliography in an Overleaf project. **`check_citations` cannot span two projects**: its paths
+stay sandboxed inside one project, which is a property worth keeping, not a bug to work around by
+reaching outside it.
+
+Do it in two calls and compare yourself:
+
+```
+list_references { project: "proposal" }    // the draft's own reference list, or its cite keys
+list_references { project: "shared-bib", filter: "<surname or title words>" }
+```
+
+Then, per reference in the draft, look for it in the other project's entries — match on cite key when
+the draft cites keys, otherwise on title plus first-author surname plus year. Report the three
+outcomes separately, because they need different fixes:
+
+- **present in both** — verify it against DBLP as usual;
+- **in the draft, absent from the shared `.bib`** — the entry has to be added there (`add_citation`
+  from the DBLP key is the sanctioned path, and it needs that project's permission, not this one's);
+- **fields disagree between the two** — say which project you are quoting for each field. Do not
+  assume the `.bib` is right; it is a _candidate_, and DBLP is the arbiter.
+
+`filter` is what keeps this cheap: query the shared bibliography once per reference rather than
+reading a 300-entry `.bib` into context.
+
 ## Pace DBLP requests
 
 DBLP is a free public API and **rate-limits aggressively**. Firing many `search_references` calls at
