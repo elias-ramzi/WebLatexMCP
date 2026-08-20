@@ -60,7 +60,8 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, message, paths, scope, allowEmpty }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        ctx.projectManager.requireGitProject(project, 'commit to');
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           await ctx.sessions.touch(id);
           // HEAD may have moved since this session last wrote (a peer committed, or a pull

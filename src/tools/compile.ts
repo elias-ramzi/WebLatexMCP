@@ -6,7 +6,13 @@ import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
-import { parseLog, filterLog, logTail, needsShellEscape } from '../services/logParser.js';
+import {
+  parseLog,
+  filterLog,
+  logTail,
+  needsShellEscape,
+  findMissingPackages,
+} from '../services/logParser.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
@@ -69,6 +75,14 @@ const outputSchema = {
   durationSec: z.number(),
   errors: z.array(errorShape),
   warnings: z.array(errorShape),
+  missingPackages: z
+    .array(z.string())
+    .describe(
+      'LaTeX packages/classes the compile could not find, e.g. ["fontawesome"] — pulled out of the ' +
+        'log\'s "File `x.sty\' not found" errors so you do not have to parse them yourself. Only ' +
+        '.sty/.cls names appear here: a missing image or .bbl is a problem with the document, not a ' +
+        'missing package. Empty when nothing is missing.',
+    ),
   logTail: z
     .string()
     .describe(
@@ -81,9 +95,28 @@ const outputSchema = {
     .optional()
     .describe(
       'An actionable next step surfaced when the failure has a known remedy — e.g. the document ' +
-        'uses TikZ externalization and needs a shell-escape retry. Absent when there is nothing to advise.',
+        'uses TikZ externalization and needs a shell-escape retry, or a package is missing from the ' +
+        'local TeX installation. Absent when there is nothing to advise.',
     ),
 };
+
+/**
+ * What to do about packages the local TeX installation does not have. The server never installs
+ * anything itself, so this is advice, not an action: it names the distribution's own installer and
+ * the no-root variant, since a missing package on a shared machine is usually a permissions problem
+ * rather than a missing mirror.
+ */
+function missingPackageHint(names: string[]): string {
+  const args = names.join(' ');
+  return (
+    `Missing from your local TeX installation: ${names.join(', ')}. Install with your TeX ` +
+    `distribution and compile again — TeX Live: \`tlmgr install ${args}\` (or ` +
+    `\`tlmgr --usermode install ${args}\` when you have no root); MiKTeX: ` +
+    `\`mpm --install=${names[0] ?? ''}\`. If that install itself fails, run doctor — it reports ` +
+    'whether this machine can reach a package repository at all. If the document does not ' +
+    'actually need it, drop the \\usepackage line instead.'
+  );
+}
 
 export function registerCompile(server: McpServer, ctx: AppContext): void {
   server.registerTool(
@@ -98,7 +131,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'Overleaf remote. TikZ externalization (\\tikzexternalize) needs system calls: retry with ' +
         'restrictedShellEscape: true (preferred) or shellEscape: true — the latter lets the .tex ' +
         'run ARBITRARY shell commands, so only enable it for a trusted project. Shell escape is ' +
-        'never enabled automatically; when a compile fails for lack of it, the result carries a hint.',
+        'never enabled automatically; when a compile fails for lack of it, the result carries a hint. ' +
+        'A failure caused by a package the local TeX installation does not have names it in ' +
+        'missingPackages, so you can act on it without parsing the log.',
       inputSchema,
       outputSchema,
     },
@@ -113,7 +148,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       restrictedShellEscape,
     }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
           const outcome = await ctx.compiler.compile({
@@ -126,15 +161,20 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             restrictedShellEscape,
           });
           const { errors, warnings } = parseLog(outcome.log);
+          const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
           const shellEscapeOn = shellEscape || restrictedShellEscape;
-          const hint =
-            !shellEscapeOn && needsShellEscape(outcome.log)
-              ? 'This document uses TikZ externalization, which needs system calls. Retry compile ' +
+          const hints: string[] = [];
+          if (!shellEscapeOn && needsShellEscape(outcome.log)) {
+            hints.push(
+              'This document uses TikZ externalization, which needs system calls. Retry compile ' +
                 'with restrictedShellEscape: true (preferred) or shellEscape: true. Only enable ' +
-                'this for a project you trust — shell escape lets the .tex run arbitrary commands.'
-              : undefined;
+                'this for a project you trust — shell escape lets the .tex run arbitrary commands.',
+            );
+          }
+          if (missingPackages.length > 0) hints.push(missingPackageHint(missingPackages));
+          const hint = hints.length > 0 ? hints.join('\n') : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.
           let pdfPath = outcome.pdfPath;
@@ -150,6 +190,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             durationSec: outcome.durationSec,
             errors,
             warnings,
+            missingPackages,
             logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
             logPath: outcome.logPath,
             hint,

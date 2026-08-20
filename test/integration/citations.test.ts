@@ -14,6 +14,7 @@ import { SyncTexService } from '../../src/services/synctex.js';
 import { CommentStore } from '../../src/services/commentStore.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
+import { DoctorService } from '../../src/services/doctor.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
@@ -87,6 +88,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       comments: new CommentStore(),
       credentials: new CredentialResolver({}),
       dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+      doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
         git.readAtRef(d, 'HEAD', rel),

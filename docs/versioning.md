@@ -30,13 +30,18 @@ Releases merge from `dev` into `main` — a required CI gate (`only-dev-into-mai
 1. **Finish the changelog.** Move everything under `## [Unreleased]` in [CHANGELOG.md](../CHANGELOG.md)
    into a new `## [X.Y.Z] - YYYY-MM-DD` heading, leave an empty `## [Unreleased]` on top, and confirm every
    commit on `dev` since the last release is represented.
-2. **Bump the version in all three manifests, in lock-step** — they must never drift:
+2. **Bump the version in all four manifests, in lock-step** — they must never drift:
    - [`package.json`](../package.json) (what the handshake and `server_info` report)
    - [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json)
    - [`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json)
+   - [`manifest.json`](../manifest.json) (the Desktop Extension). `bundle.yml` overwrites this from the
+     tag when it builds the released `.mcpb`, but `npm run bundle` does not — so a stale value here ships
+     in every locally built extension.
 
    Bumping `package.json` also updates `package-lock.json` — run `npm install --package-lock-only` (or let
    `npm version` do it) so the lockfile matches.
+
+   A unit test asserts all of these agree, so the gate fails rather than a release going out mislabelled.
 
 3. **Run the full gate** — `npm run typecheck && npm run lint && npm run format:check && npm test`.
 4. **Open a PR from `dev` into `main`** titled `Release X.Y.Z`.

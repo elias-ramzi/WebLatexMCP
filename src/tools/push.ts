@@ -201,8 +201,8 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
       expectedRemoteHead,
     }) => {
       try {
-        const cfg = ctx.projectManager.getProjectConfig(project);
-        const { id, dir } = await ctx.projectManager.requireClonedDir(cfg.id);
+        const cfg = ctx.projectManager.requireGitProject(project, 'push to');
+        const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         const secrets = ctx.credentials.allSecrets();
 

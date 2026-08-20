@@ -33,7 +33,7 @@ export function registerListFiles(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, filter = 'all', subdir }) => {
       try {
-        const { dir } = await ctx.projectManager.requireClonedDir(project);
+        const { dir } = await ctx.projectManager.requireProjectDir(project);
         const files = await ctx.files.list(dir, { filter, subdir });
         const text =
           files.length === 0

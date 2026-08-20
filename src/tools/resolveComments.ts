@@ -29,7 +29,7 @@ export function registerResolveComments(server: McpServer, ctx: AppContext): voi
     },
     async ({ project, ids }) => {
       try {
-        const { id } = await ctx.projectManager.requireClonedDir(project);
+        const { id } = await ctx.projectManager.requireProjectDir(project);
         const resolved = ctx.comments.resolve(id, ids);
         return {
           content: [{ type: 'text', text: `Resolved ${resolved} comment(s).` }],

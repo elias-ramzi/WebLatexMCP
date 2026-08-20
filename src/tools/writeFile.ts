@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
+import { changeDiff } from '../lib/changeDiff.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -56,7 +57,7 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.write(dir, {
             path: relPath,
@@ -64,7 +65,7 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
             createDirs,
             overrideExternalChanges,
           });
-          const { diff } = await ctx.git.diff(dir, { path: relPath });
+          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           return {
             content: [{ type: 'text', text: diff ? `${headline}\n\n${diff}` : headline }],

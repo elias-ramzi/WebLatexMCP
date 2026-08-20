@@ -4,7 +4,7 @@ import path from 'node:path';
 import { mkdtemp, cp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { LatexmkCompiler } from '../../src/services/compiler.js';
-import { parseLog, filterLog, logTail } from '../../src/services/logParser.js';
+import { parseLog, filterLog, logTail, findMissingPackages } from '../../src/services/logParser.js';
 
 // Gate the real compile on latexmk being installed, so this auto-skips in the fast
 // CI job and on dev machines without TeX, but runs in the dedicated tex-smoke job.
@@ -50,5 +50,15 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
     const { errors } = parseLog(outcome.log);
     expect(errors.length).toBeGreaterThan(0);
     expect(errors.some((e) => /undefined control sequence/i.test(e.message))).toBe(true);
+  }, 60_000);
+
+  it('names the package a real TeX installation is missing', async () => {
+    const outcome = await compiler.compile({
+      projectDir: dir,
+      rootFile: 'main-missing-package.tex',
+    });
+    expect(outcome.success).toBe(false);
+    // The whole point: the caller gets the name without regexing the log itself.
+    expect(findMissingPackages(outcome.log)).toEqual(['weblatexmcpnosuchpkg']);
   }, 60_000);
 });

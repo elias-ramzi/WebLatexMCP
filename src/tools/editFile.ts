@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
+import { changeDiff } from '../lib/changeDiff.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -58,15 +59,16 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
-          const { diff } = await ctx.git.diff(dir, { path: relPath });
+          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
+          const headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
           return {
             content: [
               {
                 type: 'text',
-                text: `applied ${res.appliedEdits} edit(s) to ${res.path}\n\n${diff}`,
+                text: diff ? `${headline}\n\n${diff}` : headline,
               },
             ],
             structuredContent: { ...res, diff },

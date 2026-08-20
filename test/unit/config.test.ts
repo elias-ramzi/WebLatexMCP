@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
+import { gitUrlOf } from '../../src/lib/projectMode.js';
 import { loadConfig } from '../../src/config.js';
 
 describe('loadConfig', () => {
@@ -91,7 +92,7 @@ describe('loadConfig', () => {
       () => false,
       persisted,
     );
-    const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p.gitUrl]));
+    const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, gitUrlOf(p)]));
     expect(byId).toEqual({
       thesis: 'https://git.overleaf.com/env', // env wins
       notes: 'https://git.overleaf.com/notes', // persisted-only survives
@@ -134,5 +135,35 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: 'terminal' })).toThrow(
       /WEB_LATEX_MCP_VIEWER_TARGET/,
     );
+  });
+
+  it('accepts a local project from the environment, resolving ~ and relative paths', () => {
+    const cfg = loadConfig(
+      {
+        WEB_LATEX_MCP_PROJECTS: JSON.stringify({
+          cv: { mode: 'local', path: '~/docs/cv' },
+          notes: { mode: 'local', path: 'papers/notes' },
+          thesis: { gitUrl: 'https://git.overleaf.com/abc' },
+        }),
+      },
+      '/work',
+      notInRepo,
+    );
+
+    const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p]));
+    expect(byId.cv).toEqual({
+      id: 'cv',
+      mode: 'local',
+      path: path.join(os.homedir(), 'docs', 'cv'),
+    });
+    // Relative paths resolve against the launch dir, like WEB_LATEX_MCP_WORKSPACE does.
+    expect(byId.notes).toMatchObject({ path: path.resolve('/work', 'papers/notes') });
+    expect(gitUrlOf(byId.thesis!)).toBe('https://git.overleaf.com/abc');
+  });
+
+  it('rejects a project entry that is neither a remote nor a path', () => {
+    expect(() =>
+      loadConfig({ WEB_LATEX_MCP_PROJECTS: JSON.stringify({ cv: { rootFile: 'cv.tex' } }) }),
+    ).toThrow(/invalid/);
   });
 });

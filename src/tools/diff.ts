@@ -26,7 +26,8 @@ export function registerDiff(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, path: relPath, staged }) => {
       try {
-        const { dir } = await ctx.projectManager.requireClonedDir(project);
+        ctx.projectManager.requireGitProject(project, 'diff against');
+        const { dir } = await ctx.projectManager.requireProjectDir(project);
         const result = await ctx.git.diff(dir, { path: relPath, staged });
         const summary = result.files.length
           ? result.files.map((f) => `${f.path} +${f.added} -${f.removed}`).join('\n')

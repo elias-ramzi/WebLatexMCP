@@ -31,7 +31,8 @@ export function registerDiscard(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, paths }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        ctx.projectManager.requireGitProject(project, 'discard changes in');
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.git.discard(dir, paths);
           // The working tree was rewritten to HEAD; drop baselines so the reverted content

@@ -63,6 +63,40 @@ export function needsShellEscape(log: string): boolean {
 }
 
 /**
+ * TeX's "the file I was told to read does not exist" signatures, in the `-file-line-error` form
+ * (`./main.tex:3: LaTeX Error: File \`fontawesome.sty' not found.`), the bare form
+ * (`! LaTeX Error: File \`IEEEtran.cls' not found.`) and TeX's own lower-level phrasing
+ * (`! I can't find file \`foo.sty'.`). The name is always quoted backtick-apostrophe.
+ */
+const MISSING_FILE = /(?:File\s+`([^'\n]+)'\s+not found|can't find file\s+`([^'\n]+)')/g;
+
+/**
+ * Only these are a *package* the user can install: a missing `.png` or `.bbl` is a problem with the
+ * document (or with an earlier build step), and telling the caller to install a package for it
+ * would send them down the wrong path entirely.
+ */
+const INSTALLABLE_EXTENSION = /\.(sty|cls)$/i;
+
+/**
+ * Package/class names a compile could not find, e.g. `["fontawesome"]` — extracted so the caller
+ * gets a machine-actionable fact instead of having to regex the log itself. Un-wraps first, since a
+ * long path in the message is hard-wrapped like any other line. Names are de-duplicated (TeX
+ * reports the same missing file once per pass) and returned in the order they first appear.
+ */
+export function findMissingPackages(log: string): string[] {
+  const text = unwrapLines(log).join('\n');
+  const names = new Set<string>();
+  for (const match of text.matchAll(MISSING_FILE)) {
+    const file = match[1] ?? match[2];
+    if (!file || !INSTALLABLE_EXTENSION.test(file)) continue;
+    // `\usepackage{sub/foo}` reports `sub/foo.sty`; the installable unit is the base name.
+    const base = file.slice(file.lastIndexOf('/') + 1);
+    names.add(base.replace(INSTALLABLE_EXTENSION, ''));
+  }
+  return [...names];
+}
+
+/**
  * TikZ externalization emits one identical "system call did NOT result in a usable output file"
  * error per figure — they share a single cause (shell escape disabled), so collapse them into one
  * diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.

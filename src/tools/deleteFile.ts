@@ -39,7 +39,7 @@ export function registerDeleteFile(server: McpServer, ctx: AppContext): void {
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.delete(dir, relPath, { overrideExternalChanges });
           return {
