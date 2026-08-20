@@ -9,6 +9,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-20
+
 ### Added
 
 - **Local (in-place) projects.** `register_project` accepts a `path` instead of a `gitUrl` and uses that

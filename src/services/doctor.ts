@@ -69,17 +69,21 @@ export class DoctorService {
   private readonly run: Runner;
   private readonly fetchImpl: FetchLike;
   private readonly now: () => Date;
+  private readonly canWrite: (target: string) => Promise<boolean>;
 
   constructor(
     deps: {
       run?: Runner;
       fetch?: FetchLike;
       now?: () => Date;
+      /** Injectable so tests decide what is writable — the real answer varies by OS and machine. */
+      canWrite?: (target: string) => Promise<boolean>;
     } = {},
   ) {
     this.run = deps.run ?? execCapture;
     this.fetchImpl = deps.fetch ?? ((url, init) => fetch(url, init));
     this.now = deps.now ?? (() => new Date());
+    this.canWrite = deps.canWrite ?? isWritablePath;
   }
 
   async diagnose(opts: DoctorOptions): Promise<Diagnosis> {
@@ -175,7 +179,7 @@ export class DoctorService {
 
     // 5/6. Where a missing package could actually be installed. System texmf normally needs root,
     // which is why the no-root answer (TEXMFHOME, or tlmgr --usermode) is worth stating up front.
-    const homeWritable = texmfHome ? await writable(texmfHome) : false;
+    const homeWritable = texmfHome ? await this.canWrite(texmfHome) : false;
     if (texmfHome) {
       checks.push({
         name: 'texmf-home',
@@ -184,7 +188,7 @@ export class DoctorService {
       });
     }
     if (texmfLocal) {
-      const localWritable = await writable(texmfLocal);
+      const localWritable = await this.canWrite(texmfLocal);
       checks.push({
         name: 'system-texmf',
         status: 'ok', // not writable is the normal, safe state — never a problem in itself
@@ -208,7 +212,7 @@ export class DoctorService {
 
     // 8. The workspace itself: clones and build artifacts have to land somewhere.
     if (opts.workspaceRoot) {
-      const ok = await writable(opts.workspaceRoot);
+      const ok = await this.canWrite(opts.workspaceRoot);
       checks.push({
         name: 'workspace',
         status: ok ? 'ok' : 'fail',
@@ -307,7 +311,7 @@ function distributionYear(banner: string): number | undefined {
  * has to be a writable *directory*. Requiring a directory matters — `/dev/null` is world-writable,
  * so a path underneath it would otherwise look creatable when nothing can ever live there.
  */
-async function writable(target: string): Promise<boolean> {
+export async function isWritablePath(target: string): Promise<boolean> {
   let dir = path.resolve(target);
   for (;;) {
     let info: Stats;
