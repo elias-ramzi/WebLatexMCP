@@ -34,6 +34,17 @@ jobs:
         run: npx --yes @anthropic-ai/mcpb@latest validate manifest.json
       - name: Pack the extension
         run: npx --yes @anthropic-ai/mcpb@latest pack . web-latex-mcp.mcpb
+      # Packing is the one step that can silently drop a runtime dependency: it applies
+      # .mcpbignore to everything, node_modules included, and an unanchored pattern there once
+      # stripped `debug/src` — the entry point of a transitive dependency — shipping a bundle that
+      # could not start. Nothing else in CI exercises the packed artifact, so start it here, before
+      # it is attached to a release.
+      - name: Smoke-test the packed bundle
+        run: |
+          unzip -q web-latex-mcp.mcpb -d /tmp/mcpb-smoke
+          timeout 60 node /tmp/mcpb-smoke/dist/index.js < /dev/null > /tmp/mcpb-smoke.log 2>&1 || true
+          cat /tmp/mcpb-smoke.log
+          grep -q 'server ready on stdio' /tmp/mcpb-smoke.log
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
