@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { loadSkills, parseSkill } from '../../src/lib/skills.js';
@@ -58,7 +58,20 @@ describe('loadSkills', () => {
   it('loads the bundled .claude/skills by default', async () => {
     const skills = await loadSkills({});
     expect(skills.map((s) => s.name)).toContain('verify-citations');
+    expect(skills.map((s) => s.name)).toContain('session-feedback');
     expect(skills.every((s) => s.description.length > 0 && s.body.length > 0)).toBe(true);
+  });
+
+  it('parses every bundled skill — a malformed SKILL.md is dropped silently otherwise', async () => {
+    const dir = path.resolve(import.meta.dirname, '../../.claude/skills');
+    const dirs = (await readdir(dir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+    const skills = await loadSkills({});
+    // Each directory must yield a skill, and its slug must match the directory name — the plugin
+    // and the prompt list both address a skill by that name.
+    expect(skills.map((s) => s.name)).toEqual(dirs);
   });
 
   it('reads an override dir, sorted by name', async () => {

@@ -9,6 +9,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **`session-feedback` skill** — a bundled skill to run at the _end_ of a session, which reviews the tool
+  calls that actually ran and writes a feedback report on the **server itself**: what broke, what cost
+  too many calls, what capability was missing, what the docs got wrong. Findings are classified
+  (`bug`/`friction`/`gap`/`docs`/`skill`), rated blocked/slowed/cosmetic, stamped with `server_info` and
+  `doctor` so they are reproducible, and checked against existing issues (best-effort, via `gh`) so a
+  known problem is marked rather than re-filed. It mutates nothing, scrubs credentials and manuscript
+  content before printing, and files a GitHub issue only when explicitly asked. Documented in
+  [CONTRIBUTING.md](CONTRIBUTING.md#feedback-from-a-session) as the fastest way to contribute.
+
 ## [0.5.0] - 2026-08-20
 
 ### Added
