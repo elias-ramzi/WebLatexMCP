@@ -15,8 +15,8 @@ export class ExternalChangeError extends Error {
   }
 }
 
-export type FileFilter = 'tex' | 'bib' | 'assets' | 'all';
-export type FileType = 'tex' | 'bib' | 'asset' | 'other';
+export type FileFilter = 'tex' | 'bib' | 'docs' | 'assets' | 'all';
+export type FileType = 'tex' | 'bib' | 'doc' | 'asset' | 'other';
 
 export interface FileEntry {
   path: string;
@@ -57,6 +57,13 @@ const ASSET_EXT = new Set([
   '.webp',
 ]);
 
+/**
+ * Prose formats. Their own type because a document is not always LaTeX: a proposal drafted in
+ * markdown still has a reference list to verify and citations to cross-check, and it has to be
+ * findable to be worked on.
+ */
+const DOC_EXT = new Set(['.md', '.markdown', '.txt', '.rst', '.org']);
+
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 /**
@@ -77,6 +84,7 @@ function classify(file: string): FileType {
   const ext = path.extname(file).toLowerCase();
   if (ext === '.tex') return 'tex';
   if (ext === '.bib') return 'bib';
+  if (DOC_EXT.has(ext)) return 'doc';
   if (ASSET_EXT.has(ext)) return 'asset';
   return 'other';
 }
@@ -89,6 +97,8 @@ function matchesFilter(type: FileType, filter: FileFilter): boolean {
       return type === 'tex';
     case 'bib':
       return type === 'bib';
+    case 'docs':
+      return type === 'doc';
     case 'assets':
       return type === 'asset';
   }

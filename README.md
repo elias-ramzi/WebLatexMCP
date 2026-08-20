@@ -43,8 +43,9 @@ An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a gi
 commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
 **macOS, Linux, and Windows**.
 
-Already have the `.tex` on your machine? Point it at that folder instead and it reads, edits and
-compiles the real files **in place** — no remote, no clone, no second copy of the document.
+Already have the `.tex` on your machine? Point it at that folder — or straight at the file — and it
+reads, edits and compiles the real files **in place** — no remote, no clone, no second copy of the
+document.
 
 ## Highlights
 
@@ -57,6 +58,7 @@ compiles the real files **in place** — no remote, no clone, no second copy of 
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 📚 **References in any format** — read them structured out of a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft, and cross-check what the document cites against what it defines.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
 ## Install
@@ -128,13 +130,19 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
 - **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
-- **Compile what you already have** — register a directory by `path` instead of a git URL and the server reads, edits and compiles it **in place**: no clone, no second copy of the document to drift apart ([details](docs/tools.md#local-in-place-projects)).
+- **Compile what you already have** — register by `path` instead of a git URL — a directory, or just the document itself (`~/proposals/eurohpc.md`), and the folder holding it is used — and the server reads, edits and compiles it **in place**: no clone, no second copy of the document to drift apart ([details](docs/tools.md#local-in-place-projects)).
 - **Sync & browse** — clone/pull a git project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
 - **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).
 - **Diagnose the toolchain** — `doctor` reports what the machine actually has (engines, TeX distribution and its age, the package manager and the repository it would install from, writable install paths), so a missing package or an end-of-life TeX Live is a one-call answer instead of a chain of failed compiles ([details](docs/tools.md#missing-packages)).
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
+- **Read the references you already have** — `list_references` returns them structured (key, title, authors, year, venue, DOI/arXiv, file and line) from a `.bib`, a LaTeX `thebibliography`, **or a reference list written as prose in a markdown document** — and `check_citations` diffs what the draft cites against what the bibliography defines ([details](docs/tools.md#references-in-any-format)).
+  _Nice to have, not there yet:_ `check_citations` works within **one** project, since its paths stay
+  sandboxed there. A draft that cites a `.bib` belonging to another registered project — a shared group
+  bibliography — is cross-checked today with two `list_references` calls and a comparison (the
+  [`/verify-citations` skill](docs/skills.md#verify-citations--audit-citations-against-dblp) spells out
+  how); a single cross-project tool would be nicer. [Ideas and PRs welcome.](CONTRIBUTING.md)
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
   come back to you with both sides, and you resolve them by pushing the merged content back — or rewind
   the clone to the current remote with `reset_to_remote` and redo your edits cleanly).
@@ -148,7 +156,7 @@ unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
-- **`/verify-citations`** — audit every `.bib` entry against DBLP, flag discrepancies, and write a local git-excluded audit report (read-only for the `.bib`).
+- **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 - **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, ready to paste into an issue ([contributing](CONTRIBUTING.md#feedback-from-a-session)).

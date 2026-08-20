@@ -19,6 +19,46 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   known problem is marked rather than re-filed. It mutates nothing, scrubs credentials and manuscript
   content before printing, and files a GitHub issue only when explicitly asked. Documented in
   [CONTRIBUTING.md](CONTRIBUTING.md#feedback-from-a-session) as the fastest way to contribute.
+- **`list_references`** — read a project's own references, structured: cite key, entry type, title,
+  authors (with `truncatedAuthors` for an `and others` / "et al." list), year, venue, DOI/arXiv, the file
+  and line each entry sits on, and its `raw` text. Reads three shapes of bibliography and says which one
+  each entry came from: a BibTeX `.bib` (resolving `@string` venue macros), a LaTeX `thebibliography` of
+  `\bibitem`s, and **a reference list written as prose in a markdown or plain-text document**. `filter`
+  searches across key/title/authors/venue. Read-only and git-free, so it works on a local project.
+- **`check_citations`** — cross-check what a document cites against what its bibliography defines, in one
+  call: `undefinedCitations` (cited with no entry — these render as `[?]`), `uncitedEntries`,
+  `duplicateKeys`, and `incompleteEntries` (missing a field the BibTeX entry type requires). Reads the
+  `\cite` family in `.tex` (multi-key and optional-argument forms, skipping commented-out ones) and
+  pandoc `[@key]` / `@key` in markdown. Structural only; correctness is still the DBLP pass.
+- **`list_files` filter `docs`** — prose documents (`.md`, `.markdown`, `.txt`, `.rst`, `.org`) are now a
+  first-class file `type` (`doc`) rather than `other`, so a markdown draft is findable.
+- **`add_citation` returns `line`** — the file and line the entry landed on, so a caller can confirm the
+  insertion without re-reading the `.bib`.
+- **`register_project` accepts a file, not only a directory.** People point at the document — "verify the
+  citations in `~/proposals/eurohpc.md`" — so naming a file now registers the folder holding it instead of
+  failing. A `.tex` named this way also becomes the LaTeX `rootFile`; a markdown or plain-text document
+  does not, since it is not a LaTeX root. An explicit `rootFile` still wins, and the result says which
+  directory was registered — the project is the whole folder, and every file in it is readable.
+
+### Changed
+
+- **`verify-citations` works on a document that is neither a `.bib` nor on a remote.** The skill now
+  branches on the project's `mode`: it skips `project_sync` and the git-exclude step for a local project
+  instead of failing on them, registers an unregistered folder in place, and drives `list_references` /
+  `check_citations` rather than hand-parsing with regex. It states per format how far the parsed fields
+  can be trusted (`prose` entries are heuristic — query DBLP from `raw`), never annotates a markdown
+  draft (no comment syntax stays invisible there), and asks before writing the audit report into a local
+  project's directory, which belongs to the user.
+- **`search_references` description** — says outright that it queries DBLP over the network and does not
+  read the project's `.bib`, and points at `list_references` for searching the references already there.
+  It was not clear which side of the boundary the tool sat on.
+
+### Known limits
+
+- **`check_citations` works within one project.** Its paths stay sandboxed inside a single project, so a
+  draft that cites a `.bib` belonging to _another_ registered project (a shared group bibliography) is
+  cross-checked with two `list_references` calls and a comparison, not one call — the `verify-citations`
+  skill spells out how.
 
 ## [0.5.0] - 2026-08-20
 
