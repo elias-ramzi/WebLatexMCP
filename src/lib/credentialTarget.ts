@@ -31,7 +31,7 @@ export function resolveCredentialTarget(
     if (!input.project) {
       throw new Error('Provide a `host` (e.g. git.overleaf.com) or a `project` id.');
     }
-    const cfg = pm.getProjectConfig(input.project);
+    const cfg = pm.requireGitProject(input.project, 'store a credential for');
     host = hostFromGitUrl(cfg.gitUrl);
     if (!host) {
       throw new Error(`Could not determine a host from project "${cfg.id}" (${cfg.gitUrl}).`);

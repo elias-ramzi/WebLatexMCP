@@ -45,9 +45,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           if (!project) {
             throw new Error('Registering a project with gitUrl also requires a project id.');
           }
-          ctx.projectManager.registerProject(project, gitUrl);
+          ctx.projectManager.registerProject({ id: project, gitUrl });
         }
-        const cfg = ctx.projectManager.getProjectConfig(project);
+        const cfg = ctx.projectManager.requireGitProject(project, 'sync with');
         const dir = ctx.projectManager.projectPath(cfg.id);
         const cloned = await ctx.projectManager.hasClone(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);

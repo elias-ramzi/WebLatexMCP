@@ -1,0 +1,7 @@
+% Requests a package no TeX installation has, so a real compile produces the
+% "File `x.sty' not found" log signature findMissingPackages is built to read.
+\documentclass{article}
+\usepackage{weblatexmcpnosuchpkg}
+\begin{document}
+Never typeset — LaTeX stops at the missing package above.
+\end{document}

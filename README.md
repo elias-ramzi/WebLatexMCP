@@ -43,11 +43,15 @@ An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a gi
 commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
 **macOS, Linux, and Windows**.
 
+Already have the `.tex` on your machine? Point it at that folder instead and it reads, edits and
+compiles the real files **in place** — no remote, no clone, no second copy of the document.
+
 ## Highlights
 
 - 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
+- 📂 **Or no remote at all** — register a folder you already have and work on it in place, so what Claude compiles is the file your editor has open.
 - ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
-- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF.
+- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
@@ -58,7 +62,8 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 ## Install
 
 Pick your client below. Either way, editing, git, and the PDF viewer work without TeX — only `compile`
-needs `latexmk` (default) or `tectonic` on your `PATH`.
+needs `latexmk` (default) or `tectonic` on your `PATH`. Not sure what you have? Ask Claude to run
+`doctor` and it reports your engines, TeX distribution, and where packages can be installed.
 
 ### Claude Code (CLI or the VS Code extension)
 
@@ -106,6 +111,11 @@ persists across restarts and sessions:
 
 > 👽 Add my Overleaf project https://git.overleaf.com/… and call it "thesis".
 
+Working on a `.tex` that is already on this machine? Give it a folder instead — no token, no remote, and
+nothing is cloned ([details](docs/tools.md#local-in-place-projects)):
+
+> 👽 Add the folder ~/papers/neurips as a local project called "paper".
+
 ### Other clients & full configuration
 
 Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler), or using **Gemini** /
@@ -118,9 +128,11 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
 - **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
-- **Sync & browse** — clone/pull a project, list and read files.
+- **Compile what you already have** — register a directory by `path` instead of a git URL and the server reads, edits and compiles it **in place**: no clone, no second copy of the document to drift apart ([details](docs/tools.md#local-in-place-projects)).
+- **Sync & browse** — clone/pull a git project, list and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
 - **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).
+- **Diagnose the toolchain** — `doctor` reports what the machine actually has (engines, TeX distribution and its age, the package manager and the repository it would install from, writable install paths), so a missing package or an end-of-life TeX Live is a one-call answer instead of a chain of failed compiles ([details](docs/tools.md#missing-packages)).
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
 - **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
@@ -147,7 +159,8 @@ unless you ask:
   matches it.
 - **Any MCP client** — nothing to install. Every skill is also registered as an **MCP prompt**, so it
   ships with the server; pick it from the client's prompt menu (in Claude Desktop, the `+` in the
-  composer) instead of typing `/`.
+  composer) instead of typing `/`. Claude can also find and follow one on its own through the
+  `list_skills` tool, without the skills being installed anywhere.
 - **Claude Desktop / claude.ai**, for the same automatic behavior Claude Code gets — upload the skills to
   your account: zip each folder under [`.claude/skills/`](.claude/skills/), then upload them under
   **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an

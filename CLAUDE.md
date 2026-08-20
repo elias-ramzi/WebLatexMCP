@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 An MCP server (stdio transport) that lets an MCP client read, edit, compile, and commit LaTeX
-in a git-hosted project (Overleaf, GitHub, or any git remote). It manages local clones of one or more
+in a git-hosted project (Overleaf, GitHub, or any git remote) — or compile and edit a plain local
+directory in place. It manages local clones of one or more
 projects, compiles locally with `latexmk`, and pushes changes back to the default branch. See
 [README.md](README.md) for user-facing setup (env vars, Claude Desktop/Code registration, the full tool
 list).
@@ -64,6 +65,15 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   search + canonical BibTeX fetch, with an injectable `fetch` for tests), `SessionRegistry` +
   `ShadowStore` (parallel sessions — see below), `logParser`, `auth`.
 
+**Two kinds of project.** `ProjectConfig` is a union (`src/types.ts`): a **git** project (`gitUrl`,
+cloned under the workspace) or a **local** one (`mode: 'local'`, `path` — a directory the user already
+has, used in place). `mode` is optional on the git variant so every pre-existing env/registry entry
+still parses. `ProjectManager.projectPath` returns the clone dir or the local dir accordingly, and
+`requireProjectDir` (formerly `requireClonedDir`) requires `.git` for git projects and mere existence
+for local ones. Git-backed tools call `ctx.projectManager.requireGitProject(id, action)` **first** and
+refuse a local project — otherwise they would operate on whatever repository happens to contain the
+user's directory. `src/lib/projectMode.ts` holds the narrowing helpers.
+
 Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per project id.
 When unset, the default is workspace-local — `<launch-dir>/.web_latex_mcp` (beside the agent's code;
 git-excluded via the host repo's `.git/info/exclude` — `src/lib/workspaceExclude.ts`) — whenever the
@@ -80,6 +90,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
   so messages are token-scrubbed across every configured host.
+- **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`project_sync`/
+  `reset_to_remote`, and `read_file` with a `ref`, all guard with `requireGitProject`. The confirmation
+  diff in `write_file`/`edit_file`/`add_citation` goes through `changeDiff` (`src/lib/changeDiff.ts`),
+  which returns `''` for a local project rather than diffing the user's own repo. The shadow/session
+  recorder in `context.ts` skips them too (no HEAD of ours to three-way merge against). Compiled PDFs
+  are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
+  read and edit in place, not litter in place.
 - **Mutating tools** (write/edit/delete/commit/push/discard/clone/add_citation) must run inside
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
   `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`), because

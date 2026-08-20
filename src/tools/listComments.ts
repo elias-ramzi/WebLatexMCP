@@ -51,7 +51,7 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, includeResolved }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         const comments = ctx.comments.list(id, { includeResolved });
 
         const enriched = await Promise.all(

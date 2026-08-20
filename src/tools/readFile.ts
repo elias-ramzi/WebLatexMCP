@@ -53,9 +53,10 @@ export function registerReadFile(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, path: relPath, startLine, endLine, ref }) => {
       try {
-        const { dir } = await ctx.projectManager.requireClonedDir(project);
+        const { dir } = await ctx.projectManager.requireProjectDir(project);
 
         if (ref) {
+          ctx.projectManager.requireGitProject(project, 'read a committed revision from');
           // Sandbox the path the same way FileService does, then read the blob at the ref.
           const abs = resolveInside(dir, relPath);
           const rel = toPosix(path.relative(dir, abs));

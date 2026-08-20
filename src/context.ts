@@ -8,6 +8,7 @@ import { SyncTexService } from './services/synctex.js';
 import { CommentStore } from './services/commentStore.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
+import { DoctorService } from './services/doctor.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
@@ -29,6 +30,8 @@ export interface AppContext {
   comments: CommentStore;
   credentials: CredentialResolver;
   dblp: DblpService;
+  /** Local toolchain diagnostics — see `src/services/doctor.ts`. */
+  doctor: DoctorService;
   /** Who else is working on a project right now — see `src/services/sessionRegistry.ts`. */
   sessions: SessionRegistry;
   /** This session's own uncommitted changes — see `src/services/shadowStore.ts`. */
@@ -60,6 +63,10 @@ export function createContext(
     record: async (projectDir, relPath, before, after) => {
       const id = projectManager.idForDir(projectDir);
       if (!id) return; // not one of our clones — nothing to attribute it to
+      // Shadows exist so a commit carries one session's lines and nobody else's. A local project
+      // is never committed by this server, and reading `HEAD` there would mean reading whatever
+      // repository happens to contain the user's directory — so it is left out entirely.
+      if (projectManager.isLocal(id)) return;
       // Editing is what makes a session worth knowing about, so this doubles as its heartbeat —
       // otherwise a session that only writes would stay invisible to its peers until it committed.
       await sessions.touch(id);
@@ -75,7 +82,7 @@ export function createContext(
     knownIds: () => projectManager.knownIds(),
     resolvePdfPath: async (id) => {
       try {
-        const { dir } = await projectManager.requireClonedDir(id);
+        const { dir } = await projectManager.requireProjectDir(id);
         const root = await detectRootFile(files, dir);
         return (await locateProjectPdf(config, id, dir, root)) ?? null;
       } catch {
@@ -86,7 +93,7 @@ export function createContext(
       let file: string | undefined;
       let line: number | undefined;
       try {
-        const { dir } = await projectManager.requireClonedDir(id);
+        const { dir } = await projectManager.requireProjectDir(id);
         const root = await detectRootFile(files, dir);
         const loc = await synctex.resolve(
           buildPdfPath(dir, root),
@@ -119,6 +126,7 @@ export function createContext(
     comments,
     credentials,
     dblp: new DblpService(),
+    doctor: new DoctorService(),
     sessions,
     shadows,
     credentialPortal: new CredentialPortal((host, username, token) =>

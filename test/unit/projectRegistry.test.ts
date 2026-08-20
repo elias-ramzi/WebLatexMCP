@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
   ProjectRegistry,
   readProjectRegistry,
@@ -47,7 +48,7 @@ describe('ProjectRegistry', () => {
     await reg.upsert({ id: 'paper', gitUrl: 'https://github.com/me/paper' });
     await reg.upsert({ id: 'thesis', gitUrl: 'https://git.overleaf.com/NEW' });
 
-    const byId = Object.fromEntries(reg.read().map((p) => [p.id, p.gitUrl]));
+    const byId = Object.fromEntries(reg.read().map((p) => [p.id, gitUrlOf(p)]));
     expect(byId).toEqual({
       thesis: 'https://git.overleaf.com/NEW',
       paper: 'https://github.com/me/paper',
@@ -56,6 +57,41 @@ describe('ProjectRegistry', () => {
 
   it('tolerates an invalid registry file (returns [] rather than throwing)', async () => {
     await writeFile(registryPath(workspaceRoot), '{ not json', 'utf8');
+    expect(readProjectRegistry(workspaceRoot)).toEqual([]);
+  });
+
+  it('round-trips a local project, keeping the path and dropping git-only fields', async () => {
+    const reg = new ProjectRegistry(workspaceRoot);
+    await reg.upsert({ id: 'cv', mode: 'local', path: '/home/me/docs/cv', rootFile: 'cv.tex' });
+
+    expect(reg.read()).toEqual([
+      { id: 'cv', mode: 'local', path: '/home/me/docs/cv', rootFile: 'cv.tex' },
+    ]);
+    const raw = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8'));
+    expect(raw).toEqual({ cv: { mode: 'local', path: '/home/me/docs/cv', rootFile: 'cv.tex' } });
+  });
+
+  it('reads a registry holding both kinds of project', async () => {
+    await writeFile(
+      registryPath(workspaceRoot),
+      JSON.stringify({
+        thesis: { gitUrl: 'https://git.overleaf.com/abc' },
+        cv: { mode: 'local', path: '/home/me/docs/cv' },
+      }),
+    );
+
+    const projects = readProjectRegistry(workspaceRoot);
+    expect(projects).toHaveLength(2);
+    expect(gitUrlOf(projects[0]!)).toBe('https://git.overleaf.com/abc');
+    expect(projects[1]).toEqual({ id: 'cv', mode: 'local', path: '/home/me/docs/cv' });
+  });
+
+  it('ignores a local entry with no path, rather than half-registering it', async () => {
+    await writeFile(
+      registryPath(workspaceRoot),
+      JSON.stringify({ cv: { mode: 'local' }, thesis: { gitUrl: 'https://git.example/x' } }),
+    );
+    // The whole file is rejected as invalid — the same fail-safe as any other malformed registry.
     expect(readProjectRegistry(workspaceRoot)).toEqual([]);
   });
 });

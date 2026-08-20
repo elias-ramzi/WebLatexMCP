@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
@@ -60,9 +61,18 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-/** Per-project build dir under the OS temp root, keeping the clone clean. */
+/**
+ * Per-project build dir under the OS temp root, keeping the project directory clean.
+ *
+ * Keyed by the *full* path, not just its basename: local projects are directories the user chose,
+ * so `~/work/paper` and `~/archive/paper` are entirely different documents that would otherwise
+ * share a build dir and surface each other's PDF. The basename is kept as a prefix so the temp
+ * directory is still recognisable by eye.
+ */
 export function buildDir(projectDir: string): string {
-  return path.join(os.tmpdir(), 'web-latex-mcp-build', path.basename(projectDir));
+  const resolved = path.resolve(projectDir);
+  const key = createHash('sha1').update(resolved).digest('hex').slice(0, 8);
+  return path.join(os.tmpdir(), 'web-latex-mcp-build', `${path.basename(resolved)}-${key}`);
 }
 
 async function buildDirFor(projectDir: string): Promise<string> {

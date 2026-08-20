@@ -191,7 +191,12 @@ describe('createServer skill prompts', () => {
 describe('server_info', () => {
   it('advertises the package version and reports runtime config', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: true, compiler: 'latexmk' },
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: true,
+        workspaceExcludePattern: '/.web_latex_mcp/',
+        compiler: 'latexmk',
+      },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -208,6 +213,127 @@ describe('server_info', () => {
     expect(structured.workspaceRoot).toBe('/tmp/ws');
     expect(structured.workspaceLocal).toBe(true);
     expect(structured.compiler).toBe('latexmk');
+    // The clone dir is already git-excluded; say so, or the caller adds a redundant .gitignore.
+    expect(structured.workspaceExcludePattern).toBe('/.web_latex_mcp/');
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('/.web_latex_mcp/');
+    expect(text).toContain('collaborators will not see it');
+
+    await client.close();
+  });
+
+  it('omits the exclude line when nothing was excluded', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    expect(
+      (res.structuredContent as Record<string, unknown>).workspaceExcludePattern,
+    ).toBeUndefined();
+    expect((res.content as Array<{ text: string }>)[0]?.text).not.toContain('.git/info/exclude');
+
+    await client.close();
+  });
+});
+
+describe('doctor', () => {
+  it('renders the diagnosis, hints included, from an injected toolchain', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', compiler: 'latexmk' },
+      credentials: { allSecrets: () => [] },
+      doctor: {
+        diagnose: () =>
+          Promise.resolve({
+            ok: true,
+            engines: ['pdflatex'],
+            checks: [
+              { name: 'compiler', status: 'ok', detail: 'latexmk: Version 4.67' },
+              { name: 'distribution', status: 'warn', detail: 'TeX Live 2019 — past end of life' },
+            ],
+            hints: ['Upgrade the TeX distribution.'],
+          }),
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    expect((await client.listTools()).tools.map((t) => t.name)).toContain('doctor');
+
+    const res = await client.callTool({ name: 'doctor', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.ok).toBe(true);
+    expect(structured.engines).toEqual(['pdflatex']);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('nothing missing, 1 warning(s)');
+    expect(text).toContain('past end of life');
+    expect(text).toContain('- Upgrade the TeX distribution.');
+
+    await client.close();
+  });
+});
+
+describe('list_skills', () => {
+  const skills: Skill[] = [
+    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
+    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+  ];
+
+  it('lists every bundled skill with its description', async () => {
+    const client = await connect(undefined, undefined, skills);
+
+    const res = await client.callTool({ name: 'list_skills', arguments: {} });
+    const structured = res.structuredContent as { skills: Array<Record<string, string>> };
+    expect(structured.skills.map((s) => s.name)).toEqual(['verify-citations', 'summarize-paper']);
+    expect(structured.skills[0]?.description).toBe('Audit the .bib against DBLP.');
+    // The catalogue alone is useless without the way to fetch one, so the text carries it.
+    expect((res.content as Array<{ text: string }>)[0]?.text).toContain('list_skills');
+    // Listing is not fetching — no procedure comes back until one is asked for.
+    expect((res.structuredContent as Record<string, unknown>).instructions).toBeUndefined();
+
+    await client.close();
+  });
+
+  it('returns one skill in full, scoped to a project', async () => {
+    const client = await connect(undefined, undefined, skills);
+
+    const res = await client.callTool({
+      name: 'list_skills',
+      arguments: { skill: 'verify-citations', project: 'pictura' },
+    });
+    const instructions = (res.structuredContent as Record<string, string>).instructions ?? '';
+    expect(instructions).toContain('STEP ONE');
+    expect(instructions).toContain('`pictura`');
+    expect((res.content as Array<{ text: string }>)[0]?.text).toBe(instructions);
+
+    await client.close();
+  });
+
+  it('names the available skills when asked for one that does not exist', async () => {
+    const client = await connect(undefined, undefined, skills);
+
+    const res = await client.callTool({ name: 'list_skills', arguments: { skill: 'nope' } });
+    expect(res.isError).toBe(true);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('Unknown skill "nope"');
+    expect(text).toContain('verify-citations, summarize-paper');
+
+    await client.close();
+  });
+
+  it('is registered, and reports an empty catalogue, even with no skills bundled', async () => {
+    const client = await connect();
+    expect((await client.listTools()).tools.map((t) => t.name)).toContain('list_skills');
+
+    const res = await client.callTool({ name: 'list_skills', arguments: {} });
+    expect((res.structuredContent as { skills: unknown[] }).skills).toEqual([]);
+    expect((res.content as Array<{ text: string }>)[0]?.text).toContain('No skills are bundled');
 
     await client.close();
   });

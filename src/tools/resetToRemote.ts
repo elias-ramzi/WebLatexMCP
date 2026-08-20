@@ -43,8 +43,8 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
     },
     async ({ project }) => {
       try {
-        const cfg = ctx.projectManager.getProjectConfig(project);
-        const { id, dir } = await ctx.projectManager.requireClonedDir(cfg.id);
+        const cfg = ctx.projectManager.requireGitProject(project, 'reset to');
+        const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.git.resetToRemote(dir, cfg.gitUrl, auth);

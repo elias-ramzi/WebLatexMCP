@@ -31,8 +31,16 @@ instead of being asked. Because prompts are flat text, a skill that grows bundle
 files would only be partially conveyed — the `SKILL.md` body is what ships. All five current skills are
 self-contained, so nothing is lost today.
 
-The two coexist: prompts always work because they travel with the server, and installing the skills
-properly on top adds the model-invoked trigger.
+**As the [`list_skills`](tools.md) tool — model-invoked, no install.** The server also exposes its
+bundled skills as a tool: `list_skills` returns the catalogue (name + description), and
+`list_skills({ skill: "verify-citations", project: "thesis" })` returns that procedure in full, ready to
+follow. This is the gap the other two leave: prompts wait for you to pick one, and the model-invoked
+route above needs the skills installed into the client. With the tool, an agent that connects to this
+server can find the right procedure itself — "check my bibliography" works without the skills being
+installed anywhere.
+
+The three coexist: prompts and `list_skills` always work because they travel with the server, and
+installing the skills properly on top adds the client's own model-invoked trigger.
 
 ## Installing
 
@@ -51,7 +59,8 @@ working directory. Either way you get `/verify-citations` and friends, model-inv
 ### Any MCP client — nothing to install
 
 The prompts come with the server. Once `web-latex-mcp` is connected, the five skills appear in the
-client's prompt menu, at the version the server shipped with. Nothing to upload, nothing to keep in sync.
+client's prompt menu, at the version the server shipped with, and the model can reach the same
+procedures through `list_skills`. Nothing to upload, nothing to keep in sync.
 
 ### Claude Desktop and claude.ai — upload the skills
 
