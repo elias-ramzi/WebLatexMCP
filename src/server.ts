@@ -23,6 +23,8 @@ import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
 import { registerServerInfo } from './tools/serverInfo.js';
+import { registerListSkills } from './tools/listSkills.js';
+import { registerDoctor } from './tools/doctor.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
 import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { registerSkillPrompts } from './prompts/skills.js';
@@ -38,8 +40,9 @@ import type { Skill } from './lib/skills.js';
  * clients add it to the model's context automatically) and as a fetchable resource
  * (for on-demand re-reading and clients that ignore `instructions`).
  *
- * `skills` are the bundled `.claude/skills` procedures, registered as MCP prompts so
- * clients that don't read that directory can still run them (see ./prompts/skills.ts).
+ * `skills` are the bundled `.claude/skills` procedures. They are surfaced twice: as MCP prompts
+ * for the user to invoke (see ./prompts/skills.ts) and through the `list_skills` tool so the model
+ * can discover and follow one on its own.
  */
 export function createServer(
   ctx: AppContext,
@@ -79,6 +82,8 @@ export function createServer(
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
   registerServerInfo(server, ctx);
+  registerListSkills(server, skills);
+  registerDoctor(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);

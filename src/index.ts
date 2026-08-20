@@ -25,6 +25,9 @@ async function main(): Promise<void> {
   if (config.workspaceIsLocal) {
     const pattern = await excludeWorkspaceFromHostGit(config.workspaceRoot);
     if (pattern) {
+      // Remember it so `server_info` and `register_project` can say the clone dir is already
+      // handled — otherwise the calling agent has no way to know and may add a .gitignore entry.
+      config.workspaceExcludePattern = pattern;
       console.error(`[web-latex-mcp] excluded ${pattern} from the host repo's git`);
     }
   }

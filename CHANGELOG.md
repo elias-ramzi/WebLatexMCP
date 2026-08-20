@@ -11,9 +11,39 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Local (in-place) projects.** `register_project` accepts a `path` instead of a `gitUrl` and uses that
+  directory where it lies — no clone, no second copy of the document. Registering the surrounding repo
+  just to reach one `.tex` previously left two copies to drift apart. Git tools (`status`, `diff`,
+  `commit`, `push`, `discard`, `project_sync`, `reset_to_remote`, and `read_file` with a `ref`) refuse a
+  local project with an explanation rather than operating on the user's own repository. Compiled PDFs are
+  surfaced into the workspace, never beside the source. Also configurable via `WEB_LATEX_MCP_PROJECTS`
+  as `{ "mode": "local", "path": … }`.
+- **`doctor`** — report the local toolchain a compile depends on: configured compiler, installed engines,
+  TeX distribution and whether it is past end of life, the package manager and the repository it would
+  install from (flagging a frozen `historic`/`tlnet-final` archive), writable install paths, `git`, and
+  the workspace. Local and read-only; `checkRepository: true` also tests the repository over the network.
+- **`missingPackages` on the compile result** — packages the local TeX installation lacks are named
+  directly (e.g. `["fontawesome"]`) instead of leaving the caller to parse ``File `x.sty' not found``
+  out of the log, with a `hint` carrying the install command. Only `.sty`/`.cls` names are reported: a
+  missing image is a problem with the document, not with the machine.
+- **`list_skills`** — the bundled skills as a tool, so the model can discover and follow one on its own.
+  They were previously reachable only as MCP prompts, which a user has to invoke.
+- `server_info` and `register_project` now report the `.git/info/exclude` pattern the server added for
+  the clone directory, so a caller knows it is already handled and does not add a redundant `.gitignore`
+  entry — and that the exclude is local to that checkout.
 - Writing guide gains a **Citations** section on where `\cite{}` goes in the prose: never in the
   abstract, on first mention in the main text, re-anchored at each major section boundary (readers jump
   straight to the Method or Experiments), and never twice for the same work within a section.
+
+### Fixed
+
+- The per-project build directory is keyed by the project's full path rather than its basename, so two
+  projects whose directories share a name no longer share a build directory (and surface each other's
+  PDF).
+- `list_projects` no longer points at `OVERLEAF_MCP_PROJECTS`, an environment variable that no longer
+  exists; an empty workspace now explains how to register a project.
+- Relative paths in `WEB_LATEX_MCP_PROJECTS` resolve against the server's launch directory rather than
+  the process working directory.
 
 ## [0.4.0] - 2026-07-28
 

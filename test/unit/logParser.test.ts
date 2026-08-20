@@ -5,6 +5,7 @@ import {
   logTail,
   unwrapLines,
   needsShellEscape,
+  findMissingPackages,
 } from '../../src/services/logParser.js';
 
 /** One real per-figure TikZ externalization failure, as latexmk prints it (file-line-error). */
@@ -302,5 +303,63 @@ describe('needsShellEscape', () => {
 
   it('is false for an ordinary error with no system-call failure', () => {
     expect(needsShellEscape('./main.tex:3: Undefined control sequence.')).toBe(false);
+  });
+});
+
+describe('findMissingPackages', () => {
+  it('extracts the package name from a file-line-error miss', () => {
+    const log = [
+      '(./resume.tex',
+      "./resume.tex:8: LaTeX Error: File `fontawesome.sty' not found.",
+      'Type X to quit or <RETURN> to proceed,',
+      'l.8 \\usepackage{fontawesome}',
+    ].join('\n');
+    expect(findMissingPackages(log)).toEqual(['fontawesome']);
+  });
+
+  it('extracts it from the bare "! LaTeX Error" form, and from a missing class', () => {
+    expect(findMissingPackages("! LaTeX Error: File `fontawesome.sty' not found.")).toEqual([
+      'fontawesome',
+    ]);
+    expect(findMissingPackages("! LaTeX Error: File `IEEEtran.cls' not found.")).toEqual([
+      'IEEEtran',
+    ]);
+  });
+
+  it('extracts it from TeX\'s own "can\'t find file" phrasing', () => {
+    expect(findMissingPackages("! I can't find file `mypkg.sty'.")).toEqual(['mypkg']);
+  });
+
+  it('reports each package once, in first-seen order, across latexmk passes', () => {
+    const log = [
+      "./main.tex:3: LaTeX Error: File `fontawesome.sty' not found.",
+      "./main.tex:4: LaTeX Error: File `orcidlink.sty' not found.",
+      "./main.tex:3: LaTeX Error: File `fontawesome.sty' not found.",
+    ].join('\n');
+    expect(findMissingPackages(log)).toEqual(['fontawesome', 'orcidlink']);
+  });
+
+  it('survives TeX hard-wrapping the message at 79 columns', () => {
+    const wrapped = hardWrap(
+      "./sections/very/deeply/nested/introduction.tex:12: LaTeX Error: File `fontawesome.sty' not found.",
+    );
+    expect(findMissingPackages(wrapped)).toEqual(['fontawesome']);
+  });
+
+  it('reduces a subdirectory request to the installable name', () => {
+    expect(findMissingPackages("! LaTeX Error: File `sub/foo.sty' not found.")).toEqual(['foo']);
+  });
+
+  it('ignores missing files that are not packages — an image is a document problem', () => {
+    const log = [
+      "./main.tex:20: LaTeX Error: File `figures/plot.png' not found.",
+      "./main.tex:21: LaTeX Error: File `main.bbl' not found.",
+      "LaTeX Warning: File `refs.bib' not found.",
+    ].join('\n');
+    expect(findMissingPackages(log)).toEqual([]);
+  });
+
+  it('is empty for a clean log', () => {
+    expect(findMissingPackages('Output written on main.pdf (3 pages, 12345 bytes).')).toEqual([]);
   });
 });

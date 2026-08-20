@@ -2,6 +2,7 @@ import path from 'node:path';
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { z } from 'zod';
 import { withFileLock } from '../lib/fileLock.js';
+import { isLocalProject } from '../lib/projectMode.js';
 import type { ProjectConfig } from '../types.js';
 
 /**
@@ -22,16 +23,28 @@ export function registryPath(workspaceRoot: string): string {
   return path.join(workspaceRoot, REGISTRY_FILENAME);
 }
 
-/** The persisted shape: the same map as `WEB_LATEX_MCP_PROJECTS`. */
+/**
+ * The persisted shape: the same map as `WEB_LATEX_MCP_PROJECTS`. Either a git remote or a local
+ * directory; an entry without `mode` is a git project, which is what every entry written before
+ * local mode existed looks like.
+ */
 const registrySchema = z.record(
   z.string(),
-  z.object({
-    gitUrl: z.string().min(1),
-    rootFile: z.string().min(1).optional(),
-    branch: z.string().min(1).optional(),
-    username: z.string().min(1).optional(),
-    tokenEnv: z.string().min(1).optional(),
-  }),
+  z.union([
+    z.object({
+      mode: z.literal('git').optional(),
+      gitUrl: z.string().min(1),
+      rootFile: z.string().min(1).optional(),
+      branch: z.string().min(1).optional(),
+      username: z.string().min(1).optional(),
+      tokenEnv: z.string().min(1).optional(),
+    }),
+    z.object({
+      mode: z.literal('local'),
+      path: z.string().min(1),
+      rootFile: z.string().min(1).optional(),
+    }),
+  ]),
 );
 
 type RegistryFile = z.infer<typeof registrySchema>;
@@ -112,6 +125,10 @@ export class ProjectRegistry {
 
 /** Drop the synthetic `id` field — the file keys projects by id. */
 function toEntry(cfg: ProjectConfig): RegistryFile[string] {
+  if (isLocalProject(cfg)) {
+    const { mode, path: dir, rootFile } = cfg;
+    return { mode, path: dir, rootFile };
+  }
   const { gitUrl, rootFile, branch, username, tokenEnv } = cfg;
   return { gitUrl, rootFile, branch, username, tokenEnv };
 }

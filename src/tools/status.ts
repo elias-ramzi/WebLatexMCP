@@ -75,7 +75,8 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
     },
     async ({ project }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        ctx.projectManager.requireGitProject(project, 'report status against');
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         const status = await ctx.git.status(dir);
         await ctx.sessions.touch(id);
         // Carry this session's shadow onto the current HEAD first, so the split below reflects

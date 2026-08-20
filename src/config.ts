@@ -6,15 +6,27 @@ import { z } from 'zod';
 import { readProjectRegistry } from './services/projectRegistry.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
+/**
+ * `WEB_LATEX_MCP_PROJECTS` entries: a git remote to clone, or a directory to use in place. An entry
+ * without `mode` is a git project — which is every entry written before local mode existed.
+ */
 const projectsSchema = z.record(
   z.string(),
-  z.object({
-    gitUrl: z.string().min(1),
-    rootFile: z.string().min(1).optional(),
-    branch: z.string().min(1).optional(),
-    username: z.string().min(1).optional(),
-    tokenEnv: z.string().min(1).optional(),
-  }),
+  z.union([
+    z.object({
+      mode: z.literal('git').optional(),
+      gitUrl: z.string().min(1),
+      rootFile: z.string().min(1).optional(),
+      branch: z.string().min(1).optional(),
+      username: z.string().min(1).optional(),
+      tokenEnv: z.string().min(1).optional(),
+    }),
+    z.object({
+      mode: z.literal('local'),
+      path: z.string().min(1),
+      rootFile: z.string().min(1).optional(),
+    }),
+  ]),
 );
 
 /** Expand a leading `~` to the user's home directory. */
@@ -91,7 +103,7 @@ function resolveWorkspace(
   return { workspaceRoot: path.resolve(cwd, expandHome(value)), workspaceIsLocal: false };
 }
 
-function parseProjects(raw: string | undefined): ProjectConfig[] {
+function parseProjects(raw: string | undefined, cwd: string): ProjectConfig[] {
   if (!raw || !raw.trim()) return [];
   let parsed: unknown;
   try {
@@ -105,7 +117,13 @@ function parseProjects(raw: string | undefined): ProjectConfig[] {
   if (!result.success) {
     throw new Error(`WEB_LATEX_MCP_PROJECTS is invalid: ${result.error.message}`);
   }
-  return Object.entries(result.data).map(([id, cfg]) => ({ id, ...cfg }));
+  return Object.entries(result.data).map(([id, cfg]) =>
+    cfg.mode === 'local'
+      ? // A path from the environment may be `~`-prefixed or relative to the launch dir, the same
+        // as WEB_LATEX_MCP_WORKSPACE. Resolve it once here so everything downstream sees absolute.
+        { id, ...cfg, path: path.resolve(cwd, expandHome(cfg.path)) }
+      : { id, ...cfg },
+  );
 }
 
 const COMPILERS: readonly CompilerKind[] = ['latexmk', 'tectonic'];
@@ -141,7 +159,7 @@ export function loadConfig(
 
   // Env projects are the explicit source of truth and always win; persisted (runtime-registered)
   // projects fill in the rest, so a git URL added from the chat is still here after a restart.
-  const envProjects = parseProjects(env.WEB_LATEX_MCP_PROJECTS);
+  const envProjects = parseProjects(env.WEB_LATEX_MCP_PROJECTS, cwd);
   const byId = new Map<string, ProjectConfig>();
   for (const p of readRegistry(workspaceRoot)) byId.set(p.id, p);
   for (const p of envProjects) byId.set(p.id, p);

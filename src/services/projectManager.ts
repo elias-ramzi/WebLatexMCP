@@ -3,7 +3,8 @@ import { access } from 'node:fs/promises';
 import { Mutex } from 'async-mutex';
 import { withFileLock } from '../lib/fileLock.js';
 import { projectLockPath } from '../lib/sessionPaths.js';
-import type { ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
+import { gitUrlOf, isLocalProject, requireGitProject } from '../lib/projectMode.js';
+import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
 
 /**
  * The persisted registry ProjectManager reads to pick up runtime registrations and writes to make
@@ -59,13 +60,8 @@ export class ProjectManager {
   }
 
   /** Register (or update) a project at runtime, in memory only. */
-  registerProject(
-    id: string,
-    gitUrl: string,
-    opts: Pick<ProjectConfig, 'rootFile' | 'branch' | 'username' | 'tokenEnv'> = {},
-  ): ProjectConfig {
-    const cfg: ProjectConfig = { id, gitUrl, ...opts };
-    this.projects.set(id, cfg);
+  registerProject(cfg: ProjectConfig): ProjectConfig {
+    this.projects.set(cfg.id, cfg);
     return cfg;
   }
 
@@ -73,12 +69,8 @@ export class ProjectManager {
    * Register a project and persist it to the workspace registry, so it survives a restart and is
    * seen by other sessions. Falls back to an in-memory registration when no registry is wired.
    */
-  async registerAndPersist(
-    id: string,
-    gitUrl: string,
-    opts: Pick<ProjectConfig, 'rootFile' | 'branch' | 'username' | 'tokenEnv'> = {},
-  ): Promise<ProjectConfig> {
-    const cfg = this.registerProject(id, gitUrl, opts);
+  async registerAndPersist(cfg: ProjectConfig): Promise<ProjectConfig> {
+    this.registerProject(cfg);
     await this.registry?.upsert(cfg);
     return cfg;
   }
@@ -114,9 +106,31 @@ export class ProjectManager {
     return project;
   }
 
-  /** Local clone directory for a project id. */
+  /**
+   * Working directory for a project id: the clone under the workspace for a git project, and the
+   * directory itself for a local one — which is the whole point of local mode, since a copy is
+   * exactly what it avoids. An unknown id resolves to where its clone *would* go.
+   */
   projectPath(id: string): string {
+    const cfg = this.projects.get(id);
+    if (cfg && isLocalProject(cfg)) return path.resolve(cfg.path);
     return path.join(this.workspaceRoot, id);
+  }
+
+  /** Whether a project is edited in place (no remote, no clone). */
+  isLocal(id: string): boolean {
+    const cfg = this.projects.get(id);
+    return cfg !== undefined && isLocalProject(cfg);
+  }
+
+  /**
+   * Resolve a project that must have a git remote, or throw naming `action`. Every tool that
+   * clones, syncs, commits, pushes or resets calls this instead of `getProjectConfig`, so a local
+   * project is refused with an explanation rather than quietly operating on whatever repository
+   * happens to contain the user's directory.
+   */
+  requireGitProject(id: string | undefined, action: string): GitProjectConfig {
+    return requireGitProject(this.getProjectConfig(id), action);
   }
 
   /** All known project ids (configured + runtime-registered), for enumeration. */
@@ -134,42 +148,49 @@ export class ProjectManager {
     return this.knownIds().find((id) => path.resolve(this.projectPath(id)) === resolved);
   }
 
-  /** Whether a project id has been cloned locally. */
+  /** Whether a project's working directory is there: cloned (git) or simply present (local). */
   async hasClone(id: string): Promise<boolean> {
-    return this.isCloned(this.projectPath(id));
+    return this.isReady(this.getProjectConfig(id));
   }
 
   /**
-   * Resolve a project (or default) to its id + clone dir, requiring it to be cloned.
-   * Used by every read/write tool so they fail with a clear, actionable message.
+   * Resolve a project (or default) to its id + working directory, requiring that directory to
+   * exist. Used by every read/write tool so they fail with a clear, actionable message.
    */
-  async requireClonedDir(id?: string): Promise<{ id: string; dir: string }> {
+  async requireProjectDir(id?: string): Promise<{ id: string; dir: string }> {
     const cfg = this.getProjectConfig(id);
     const dir = this.projectPath(cfg.id);
-    if (!(await this.isCloned(dir))) {
-      throw new Error(`Project "${cfg.id}" is not cloned yet. Run project_sync first.`);
+    if (!(await this.isReady(cfg))) {
+      throw new Error(
+        isLocalProject(cfg)
+          ? `Project "${cfg.id}" is local, but its directory does not exist: ${dir}.`
+          : `Project "${cfg.id}" is not cloned yet. Run project_sync first.`,
+      );
     }
     return { id: cfg.id, dir };
   }
 
-  /** All known projects with their current clone status. */
+  /** All known projects with their current status. */
   async listProjects(): Promise<ProjectStatus[]> {
     return Promise.all(
-      [...this.projects.values()].map(async (p) => {
-        const projectPath = this.projectPath(p.id);
-        return {
-          project: p.id,
-          path: projectPath,
-          gitUrl: p.gitUrl,
-          cloned: await this.isCloned(projectPath),
-        };
-      }),
+      [...this.projects.values()].map(async (p) => ({
+        project: p.id,
+        path: this.projectPath(p.id),
+        mode: isLocalProject(p) ? ('local' as const) : ('git' as const),
+        gitUrl: gitUrlOf(p),
+        cloned: await this.isReady(p),
+      })),
     );
   }
 
-  private async isCloned(projectPath: string): Promise<boolean> {
+  /**
+   * Is the project usable right now? A git project needs a `.git` (an empty dir is a failed
+   * clone); a local one only needs to exist, since the server never created it in the first place.
+   */
+  private async isReady(cfg: ProjectConfig): Promise<boolean> {
+    const dir = this.projectPath(cfg.id);
     try {
-      await access(path.join(projectPath, '.git'));
+      await access(isLocalProject(cfg) ? dir : path.join(dir, '.git'));
       return true;
     } catch {
       return false;

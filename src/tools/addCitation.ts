@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { changeDiff } from '../lib/changeDiff.js';
 import { isBibFile, mergeBibEntry } from '../lib/bib.js';
 
 const inputSchema = {
@@ -66,7 +67,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
     },
     async ({ project, key, bibFile }) => {
       try {
-        const { id, dir } = await ctx.projectManager.requireClonedDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const target = await resolveBibFile(ctx, dir, bibFile);
           // Re-fetch from DBLP so the appended text always originates from the API.
@@ -91,11 +92,10 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           }
 
           await ctx.files.write(dir, { path: target, content: merged.content, createDirs: true });
-          const { diff } = await ctx.git.diff(dir, { path: target });
+          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, target);
+          const summary = `added ${merged.key} to ${target}\n\n${bibtex}`;
           return {
-            content: [
-              { type: 'text', text: `added ${merged.key} to ${target}\n\n${bibtex}\n\n${diff}` },
-            ],
+            content: [{ type: 'text', text: diff ? `${summary}\n\n${diff}` : summary }],
             structuredContent: {
               path: target,
               key: merged.key,
