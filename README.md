@@ -43,11 +43,15 @@ An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a gi
 commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
 **macOS, Linux, and Windows**.
 
+Already have the `.tex` on your machine? Point it at that folder instead and it reads, edits and
+compiles the real files **in place** — no remote, no clone, no second copy of the document.
+
 ## Highlights
 
 - 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
+- 📂 **Or no remote at all** — register a folder you already have and work on it in place, so what Claude compiles is the file your editor has open.
 - ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
-- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF.
+- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
 - 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
@@ -58,7 +62,8 @@ commit → push you review first. Works with **Claude Desktop** and **Claude Cod
 ## Install
 
 Pick your client below. Either way, editing, git, and the PDF viewer work without TeX — only `compile`
-needs `latexmk` (default) or `tectonic` on your `PATH`.
+needs `latexmk` (default) or `tectonic` on your `PATH`. Not sure what you have? Ask Claude to run
+`doctor` and it reports your engines, TeX distribution, and where packages can be installed.
 
 ### Claude Code (CLI or the VS Code extension)
 
@@ -106,6 +111,11 @@ persists across restarts and sessions:
 
 > 👽 Add my Overleaf project https://git.overleaf.com/… and call it "thesis".
 
+Working on a `.tex` that is already on this machine? Give it a folder instead — no token, no remote, and
+nothing is cloned ([details](docs/tools.md#local-in-place-projects)):
+
+> 👽 Add the folder ~/papers/neurips as a local project called "paper".
+
 ### Other clients & full configuration
 
 Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler), or using **Gemini** /
@@ -149,7 +159,8 @@ unless you ask:
   matches it.
 - **Any MCP client** — nothing to install. Every skill is also registered as an **MCP prompt**, so it
   ships with the server; pick it from the client's prompt menu (in Claude Desktop, the `+` in the
-  composer) instead of typing `/`.
+  composer) instead of typing `/`. Claude can also find and follow one on its own through the
+  `list_skills` tool, without the skills being installed anywhere.
 - **Claude Desktop / claude.ai**, for the same automatic behavior Claude Code gets — upload the skills to
   your account: zip each folder under [`.claude/skills/`](.claude/skills/), then upload them under
   **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an
