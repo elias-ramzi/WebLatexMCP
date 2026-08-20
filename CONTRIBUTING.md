@@ -63,7 +63,45 @@ matches `package.json`'s version, and runs `npm publish --provenance --access pu
 first publish lands, the `npx -y web-latex-mcp` install path (README's npm section and the Claude Code
 plugin) will not resolve — publishing is what makes them work.
 
+## Feedback from a session
+
+The most useful bug reports come from the sessions themselves — the call that failed, the detour that
+should not have been needed, the capability that was not there. That evidence is sitting in the
+transcript, and it evaporates when the session closes.
+
+The [`session-feedback`](.claude/skills/session-feedback/SKILL.md) skill is how you keep it. Run it at
+the **end** of a session spent working through the server:
+
+```
+/session-feedback
+```
+
+It walks back over the session's tool calls, keeps only what actually happened, and writes a short
+report: each finding classified (`bug`, `friction`, `gap`, `docs`, `skill`), rated for impact
+(**blocked** / **slowed** / **cosmetic**), stamped with `server_info` + `doctor` output so it is
+reproducible, and checked against the existing issues so it does not re-file a known one. The findings
+are ranked, the weakest are cut, and what got cut is stated.
+
+Three properties make it safe to run and worth reading:
+
+- **It changes nothing.** No `write_file` into a project, no `compile`, no `commit`, no `push`. It looks
+  at the server and its skills, never at your paper.
+- **It scrubs.** Tokens, credential-bearing remotes, private repo URLs, usernames in absolute paths, and
+  the manuscript's own content (title, abstract, results, co-authors) are stripped or generalized before
+  anything is printed — a finding that cannot be described without them is dropped, and the drop is
+  reported. The report is written to be handed to someone who was not there.
+- **It never files anything on its own.** You get the report in the chat; saving it to a file and
+  opening a GitHub issue each need an explicit yes. With `gh` installed it will run
+  `gh issue create --repo elias-ramzi/WebLatexMCP` for you, splitting unrelated findings so each issue
+  is one thing that can be closed; otherwise you get a title and a body to paste.
+
+An empty report is a normal outcome — a clean session should produce two lines saying so, not a page of
+invented nits. If the skill is not installed in your client, it ships with the server anyway: pick
+`session-feedback` from the prompt menu, or ask Claude to fetch it with `list_skills`
+(see [docs/skills.md](docs/skills.md#two-ways-a-skill-runs)).
+
 ## Reporting bugs
 
 Open an issue with steps to reproduce, what you expected, and what happened. Include your OS, Node
-version, and any relevant (token-free) error output.
+version, and any relevant (token-free) error output. A `/session-feedback` report already contains all
+of that — pasting one is a complete bug report.
