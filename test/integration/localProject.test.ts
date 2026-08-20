@@ -120,6 +120,52 @@ describe('local (in-place) projects', () => {
     expect(onDisk).toContain('Elias Ramzi');
   });
 
+  it('accepts a .tex file, registering its folder and taking it as the LaTeX root', async () => {
+    const { client, workspace, userDir } = await setup();
+    const dir = path.join(userDir, '.context');
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: path.join(dir, 'resume.tex') },
+    });
+    // The project is the folder, not the file — that is the sandbox and the compile unit.
+    expect((res.structuredContent as Record<string, unknown>).path).toBe(
+      dir.split(path.sep).join('/'),
+    );
+    expect(textOf(res)).toContain('resume.tex');
+    expect(readProjectRegistry(workspace)).toEqual([
+      { id: 'cv', mode: 'local', path: dir, rootFile: 'resume.tex' },
+    ]);
+  });
+
+  it('registers a markdown file’s folder without making it a LaTeX root', async () => {
+    const { client, workspace, userDir } = await setup();
+    await writeFile(path.join(userDir, 'proposal.md'), '# Draft\n');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'p', path: path.join(userDir, 'proposal.md') },
+    });
+    // rootFile stays undefined: naming a .md as the LaTeX root would break compilation.
+    expect(readProjectRegistry(workspace)).toEqual([
+      { id: 'p', mode: 'local', path: userDir, rootFile: undefined },
+    ]);
+  });
+
+  it('lets an explicit rootFile win over the file pointed at', async () => {
+    const { client, workspace, userDir } = await setup();
+    const dir = path.join(userDir, '.context');
+    await writeFile(path.join(dir, 'main.tex'), '\\documentclass{article}\n');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: path.join(dir, 'resume.tex'), rootFile: 'main.tex' },
+    });
+    expect(readProjectRegistry(workspace)).toEqual([
+      { id: 'cv', mode: 'local', path: dir, rootFile: 'main.tex' },
+    ]);
+  });
+
   it('refuses to write outside the registered directory', async () => {
     const { client, userDir } = await setup();
     await client.callTool({
@@ -207,13 +253,6 @@ describe('local (in-place) projects', () => {
       arguments: { project: 'x', path: path.join(userDir, 'does-not-exist') },
     });
     expect(missing.isError).toBe(true);
-    expect(textOf(missing)).toMatch(/No such directory/);
-
-    const notADir = await client.callTool({
-      name: 'register_project',
-      arguments: { project: 'x', path: path.join(userDir, '.context', 'resume.tex') },
-    });
-    expect(notADir.isError).toBe(true);
-    expect(textOf(notADir)).toMatch(/is a file, not a directory/);
+    expect(textOf(missing)).toMatch(/No such file or directory/);
   });
 });

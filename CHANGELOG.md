@@ -34,6 +34,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   first-class file `type` (`doc`) rather than `other`, so a markdown draft is findable.
 - **`add_citation` returns `line`** — the file and line the entry landed on, so a caller can confirm the
   insertion without re-reading the `.bib`.
+- **`register_project` accepts a file, not only a directory.** People point at the document — "verify the
+  citations in `~/proposals/eurohpc.md`" — so naming a file now registers the folder holding it instead of
+  failing. A `.tex` named this way also becomes the LaTeX `rootFile`; a markdown or plain-text document
+  does not, since it is not a LaTeX root. An explicit `rootFile` still wins, and the result says which
+  directory was registered — the project is the whole folder, and every file in it is readable.
 
 ### Changed
 

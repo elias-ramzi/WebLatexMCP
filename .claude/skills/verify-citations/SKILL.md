@@ -74,11 +74,13 @@ Run in order. Stop and report if a step fails.
    — register it in place, no clone and no remote required:
 
    ```
-   register_project { project: "proposal", path: "/abs/path/to/the/directory" }
+   register_project { project: "proposal", path: "/abs/path/to/the/document.md" }
    ```
 
-   That is also the answer when the user's document is a markdown file: register the **directory** that
-   holds it.
+   `path` takes the document itself or the folder around it — naming a file registers the folder
+   holding it, and the result says which. A project is always a **directory**, so check that the
+   folder is the document's own: pointing at a file loose in the user's home directory would make
+   the whole of it readable. If it is, register the narrower directory instead.
 
 2. **Sync — git projects only.** `project_sync` so you check the current bibliography, not a stale
    clone. **Skip this entirely for a local project** (there is nothing to sync, and the tool will
