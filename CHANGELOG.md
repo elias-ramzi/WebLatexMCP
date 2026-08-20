@@ -39,6 +39,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **The `.mcpb` Desktop Extension could not start.** `.mcpbignore` excluded `src/` unanchored, which
+  matches a directory of that name at any depth — including `node_modules/debug/src/`, where that
+  package's `main` points. The packed bundle was therefore missing the entry point of a transitive
+  runtime dependency (via `simple-git`) and died on startup with
+  `Cannot find package …/debug/src/index.js`. This affected the published 0.4.0 bundle. Our own
+  directories are now anchored (`/src/`, `/test/`, …), and the bundle workflow starts the packed
+  server before attaching it to a release, so a bundle that cannot boot never ships again.
+- `manifest.json` had fallen a release behind the other version manifests, so a locally built
+  Desktop Extension (`npm run bundle`, which does not sync it the way the release workflow does) was
+  labelled with the previous version. A unit test now asserts `package.json`, `plugin.json`,
+  `marketplace.json`, `manifest.json` and the lockfile all agree, so the gate fails instead.
 - The per-project build directory is keyed by the project's full path rather than its basename, so two
   projects whose directories share a name no longer share a build directory (and surface each other's
   PDF).
