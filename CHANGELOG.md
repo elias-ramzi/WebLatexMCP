@@ -39,6 +39,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   failing. A `.tex` named this way also becomes the LaTeX `rootFile`; a markdown or plain-text document
   does not, since it is not a LaTeX root. An explicit `rootFile` still wins, and the result says which
   directory was registered — the project is the whole folder, and every file in it is readable.
+- **`diff` accepts a `ref`** — so a session that already committed a few times is still reviewable as a
+  whole, without dropping to a shell. Takes a commit-ish (`"HEAD~3"`, a sha, `"origin/master"` for what
+  the branch has that the remote does not) or a two-dot range (`"a..b"`); `path` still narrows it to one
+  file. Every endpoint is resolved before it reaches git, so an unknown ref is reported by name rather
+  than surfacing a raw git error, and `ref` alongside `staged` is rejected instead of one silently
+  winning. Note it is **not** session-scoped: `commit` takes only your own edits but history is shared,
+  so on a clone with several sessions a ref diff spans everyone's commits — it answers "what changed",
+  not "what did I change" ([tools.md](docs/tools.md#reviewing-a-whole-session)).
 
 ### Changed
 
