@@ -689,18 +689,58 @@ export class GitService {
     }
   }
 
-  async diff(dir: string, opts: { path?: string; staged?: boolean }): Promise<DiffResult> {
+  /**
+   * Diff the working tree, optionally against a ref rather than the index. `ref` takes a single
+   * commit-ish (`HEAD~3`, `origin/master`, a sha) or a two-dot range (`a..b`), and is resolved
+   * before it reaches git so an unknown ref fails with a readable message instead of a raw git
+   * error. `staged` is meaningless alongside it, so the pair is rejected rather than silently
+   * preferring one.
+   */
+  async diff(
+    dir: string,
+    opts: { path?: string; staged?: boolean; ref?: string },
+  ): Promise<DiffResult> {
     const git = simpleGit(dir);
     const base: string[] = [];
-    if (opts.staged) base.push('--cached');
-    const patchArgs = [...base];
-    const numstatArgs = [...base, '--numstat'];
-    if (opts.path) {
-      patchArgs.push('--', opts.path);
-      numstatArgs.push('--', opts.path);
+    if (opts.ref !== undefined) {
+      if (opts.staged) {
+        throw new Error(
+          '`ref` and `staged` cannot be combined: `staged` diffs the index against HEAD, while ' +
+            '`ref` diffs the working tree against another commit. Pass one or the other.',
+        );
+      }
+      base.push(await this.resolveDiffRef(git, opts.ref));
+    } else if (opts.staged) {
+      base.push('--cached');
     }
+    // Always terminate the revision list when a ref is in play, so a ref that also names a file
+    // ("main.tex" as a branch) is not an ambiguous argument.
+    const tail = opts.path ? ['--', opts.path] : opts.ref !== undefined ? ['--'] : [];
+    const patchArgs = [...base, ...tail];
+    const numstatArgs = [...base, '--numstat', ...tail];
     const [diff, numstat] = await Promise.all([git.diff(patchArgs), git.diff(numstatArgs)]);
     return { diff, files: parseNumstat(numstat) };
+  }
+
+  /**
+   * Validate a diff ref before handing it to git: each endpoint of a range (and a bare ref) must
+   * resolve to a commit in this clone. Returns the caller's spelling — resolving to a sha would
+   * only make the error messages harder to recognise.
+   */
+  private async resolveDiffRef(git: SimpleGit, ref: string): Promise<string> {
+    const range = /^(.+?)\.{2,3}(.+)$/.exec(ref);
+    const endpoints = range ? [range[1] ?? '', range[2] ?? ''] : [ref];
+    for (const endpoint of endpoints) {
+      if (endpoint.startsWith('-')) throw new Error(`Invalid ref "${endpoint}".`);
+      if ((await this.revParseOrNull(git, `${endpoint}^{commit}`)) === null) {
+        throw new Error(
+          `Unknown git ref "${endpoint}" — it does not resolve to a commit in this clone. ` +
+            'Use a commit sha, "HEAD~N", or a remote-tracking branch such as "origin/master" ' +
+            '(run project_sync first if the remote moved).',
+        );
+      }
+    }
+    return ref;
   }
 
   private async currentBranch(git: SimpleGit): Promise<string> {

@@ -153,6 +153,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
   gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
   directly. Keep the merged text originating from the caller.
+- **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
+  range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
+  rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,
+  not silently resolved. History is shared across sessions even though `commit` isn't, so a ref diff
+  spans peers' commits — it answers "what changed", never "what did I change". Say so wherever it is
+  documented.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
 - **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
 - **Cross-platform (macOS/Linux/Windows).** Tool output paths are POSIX via `toPosix` (`src/lib/paths.ts`);
