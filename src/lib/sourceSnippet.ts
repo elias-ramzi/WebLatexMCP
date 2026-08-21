@@ -59,53 +59,82 @@ export interface SnippetReader extends LinkChecker {
 /**
  * Ceiling on how many distinct log-named paths are resolved to decide whether they may be handed
  * back. A document that names more than this many distinct files in its diagnostics is already
- * outside what any of this is for; past the cap a path is treated as unopenable rather than
- * trusted unchecked, because the two costs are not symmetric — hiding a location costs a
- * `file`/`line` in the result, offering an unverified one costs a file outside the project.
+ * outside what any of this is for; past the cap a path is withheld rather than trusted unchecked,
+ * because the two costs are not symmetric — hiding a location costs a `file`/`line` in the result,
+ * offering an unverified one costs a file outside the project.
  */
 export const MAX_REPORTED_PATH_CHECKS = 200;
 
+/** Paths held back from the result, and **why** — the two reasons are not the same claim. */
+export interface WithheldPaths {
+  /** Every path withheld, whichever reason: what {@link withoutUnopenableLocation} keys on. */
+  all: Set<string>;
+  /** Of those, how many were resolved and really do leave the project through a symlink. */
+  escaped: number;
+  /** Of those, how many were never resolved at all, being past {@link MAX_REPORTED_PATH_CHECKS}. */
+  unchecked: number;
+}
+
 /**
- * Of the paths these diagnostics name, the ones that must not be handed back as openable: those
- * that leave the project through a symlink.
+ * Of the paths these diagnostics name, the ones that must not be handed back as openable.
  *
  * A compile log and a synctex record are both written by the *document*, and a path out of one is
  * offered to the caller as somewhere to read next (`compile`'s `file`, `list_comments`' `file`).
  * Refusing only the server's own read leaves the guard one hop deep: the document chooses the
  * path, the server declines to read it, and then tells the caller they may. Resolved once per
  * distinct path, since a failing document names the same few files over and over.
+ *
+ * The two reasons are counted apart because they say different things. A path that escaped was
+ * looked at and found to leave the project. A path past the cap was never looked at — withholding
+ * it is caution, and reporting it as an escape accuses the document of something nobody checked,
+ * which sends the caller hunting for a symlink that is not there.
  */
 export async function unopenablePaths(
   files: LinkChecker,
   projectDir: string,
   diagnostics: Array<{ file?: string }>,
-): Promise<Set<string>> {
+): Promise<WithheldPaths> {
   const distinct = new Set<string>();
   for (const d of diagnostics) if (d.file) distinct.add(d.file);
-  const unopenable = new Set<string>();
+  const all = new Set<string>();
+  let escaped = 0;
+  let unchecked = 0;
   let checked = 0;
   for (const file of distinct) {
     if (checked >= MAX_REPORTED_PATH_CHECKS) {
-      unopenable.add(file);
+      all.add(file);
+      unchecked++;
       continue;
     }
     checked++;
-    if (await files.leavesProjectThroughLink(projectDir, file)) unopenable.add(file);
+    if (await files.leavesProjectThroughLink(projectDir, file)) {
+      all.add(file);
+      escaped++;
+    }
   }
-  return unopenable;
+  return { all, escaped, unchecked };
 }
 
 /**
  * The diagnostic without the location, when its path is not ours to hand back. The message is
  * kept: that the document failed is true whatever its log named, and dropping the whole
  * diagnostic would hide a real error behind a path problem.
+ *
+ * The **snippet goes with it**. It is five lines numbered from `snippetStartLine` and rendered
+ * against `line`, so source with no location to put it against is at best unreadable — and where
+ * the path escaped, it is source from outside the project, which is the thing being withheld.
  */
-export function withoutUnopenableLocation<T extends { file?: string; line?: number }>(
-  diagnostic: T,
-  unopenable: Set<string>,
-): T {
+export function withoutUnopenableLocation<
+  T extends { file?: string; line?: number; snippet?: string; snippetStartLine?: number },
+>(diagnostic: T, unopenable: Set<string>): T {
   if (!diagnostic.file || !unopenable.has(diagnostic.file)) return diagnostic;
-  return { ...diagnostic, file: undefined, line: undefined };
+  return {
+    ...diagnostic,
+    file: undefined,
+    line: undefined,
+    snippet: undefined,
+    snippetStartLine: undefined,
+  };
 }
 
 /**
@@ -118,8 +147,18 @@ export function isReadableSourcePath(file: string): boolean {
   return SOURCE_EXT.has(path.posix.extname(file.toLowerCase()));
 }
 
+/**
+ * One line, cut to {@link MAX_SNIPPET_LINE_CHARS} — on a character boundary. `slice` counts UTF-16
+ * code units, so a cut landing between the halves of an astral character (an emoji, a rare CJK
+ * ideograph, a maths alphanumeric) leaves a lone surrogate: not text, and something JSON encoders
+ * either reject or silently replace on its way through `structuredContent`. Backing off the
+ * orphaned half loses one character from a line that is already elided.
+ */
 function clip(line: string): string {
-  return line.length > MAX_SNIPPET_LINE_CHARS ? `${line.slice(0, MAX_SNIPPET_LINE_CHARS)}…` : line;
+  if (line.length <= MAX_SNIPPET_LINE_CHARS) return line;
+  const last = line.charCodeAt(MAX_SNIPPET_LINE_CHARS - 1);
+  const isLeadingHalf = last >= 0xd800 && last <= 0xdbff;
+  return `${line.slice(0, MAX_SNIPPET_LINE_CHARS - (isLeadingHalf ? 1 : 0))}…`;
 }
 
 /**

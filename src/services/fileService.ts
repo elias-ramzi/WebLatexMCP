@@ -154,6 +154,12 @@ async function assertNoSymlinkEscape(
  * file about to be created, and a **dangling** symlink is the case that matters most: `writeFile`
  * happily follows `notes.tex -> ~/.ssh/authorized_keys` and creates the file at the other end, so
  * the target has to be judged even when nothing is there yet.
+ *
+ * Resolution is followed all the way down on **both** branches. A link's target is itself a path
+ * whose own components can be links: `notes.tex -> sub/pwned` with `sub -> /elsewhere` lands at
+ * `/elsewhere/pwned`, and stopping at the literal target reported `<project>/sub/pwned` — inside
+ * the project as a string, outside it as a file, which is exactly the confusion the whole check
+ * exists to remove. A cycle surfaces as ELOOP from `realpath` and is thrown, not recursed into.
  */
 async function resolveThroughLinks(abs: string): Promise<string> {
   try {
@@ -162,7 +168,7 @@ async function resolveThroughLinks(abs: string): Promise<string> {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
   const link = await readlink(abs).catch(() => null);
-  if (link !== null) return path.resolve(path.dirname(abs), link);
+  if (link !== null) return resolveThroughLinks(path.resolve(path.dirname(abs), link));
   const parent = path.dirname(abs);
   if (parent === abs) return abs;
   // Nothing at this name: resolve the part that does exist, then re-attach the rest literally.

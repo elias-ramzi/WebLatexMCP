@@ -7,7 +7,12 @@ import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
 import { attachErrorSnippets } from '../lib/errorSnippets.js';
-import { formatSnippet, unopenablePaths, withoutUnopenableLocation } from '../lib/sourceSnippet.js';
+import {
+  formatSnippet,
+  unopenablePaths,
+  withoutUnopenableLocation,
+  MAX_REPORTED_PATH_CHECKS,
+} from '../lib/sourceSnippet.js';
 import {
   parseLog,
   filterLog,
@@ -218,9 +223,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // A path out of the project through a symlink is not handed back as somewhere to read
           // next — for warnings as much as errors, since both come off the same document-written
           // log. Refusing only the snippet read would leave the guard one hop deep.
-          const unopenable = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
-          const errors = located.map((e) => withoutUnopenableLocation(e, unopenable));
-          const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, unopenable));
+          const withheld = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
+          const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
+          const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
@@ -291,9 +296,17 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 `did not name the file and line outright (every diagnostic, under tectonic), or ` +
                 `they are unreadable, contradicted by the log, or past the 10-location cap`
               : '',
-            unopenable.size > 0
-              ? `  … ${unopenable.size} path(s) the log named leave the project through a symlink; ` +
+            withheld.escaped > 0
+              ? `  … ${withheld.escaped} path(s) the log named leave the project through a symlink; ` +
                 `reported without file/line, since a path the document chose is not one to open`
+              : '',
+            // Kept apart from the line above on purpose: past the cap nothing was resolved, so
+            // nothing is known — calling these escapes sends the caller after a link that is not
+            // there, and blames the document for the server's own bound.
+            withheld.unchecked > 0
+              ? `  … ${withheld.unchecked} path(s) past the ${MAX_REPORTED_PATH_CHECKS}-file limit ` +
+                `on resolving where a log's paths lead; reported without file/line because they ` +
+                `were never checked, not because anything is wrong with them`
               : '',
           ]
             .filter(Boolean)

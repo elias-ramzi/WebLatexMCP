@@ -87,11 +87,11 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
         }
         // Same rule as compile's diagnostics: a path the *document* chose that leaves the project
         // through a symlink is not reported as openable, not merely left without a snippet.
-        const unopenable = await unopenablePaths(ctx.files, dir, comments);
+        const withheld = await unopenablePaths(ctx.files, dir, comments);
 
         const enriched = await Promise.all(
           comments.map(async (raw) => {
-            const c = withoutUnopenableLocation(raw, unopenable);
+            const c = withoutUnopenableLocation(raw, withheld.all);
             let snippet: string | undefined;
             let snippetStartLine: number | undefined;
             if (c.file && c.line) {

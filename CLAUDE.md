@@ -189,7 +189,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   named (a compile log, a synctex record) that leaves the project is not handed back as openable either
   (`unopenablePaths`/`withoutUnopenableLocation` in `src/lib/sourceSnippet.ts`, applied by `compile` to
   errors _and_ warnings and by `list_comments` to every comment) — otherwise the server refuses the read
-  and then tells the caller they may make it.
+  and then tells the caller they may make it. Withholding takes the **snippet** with the location (it is
+  numbered against `line`), and the two reasons for withholding are counted apart: a path that escaped
+  was resolved and found to leave; a path past `MAX_REPORTED_PATH_CHECKS` was never resolved at all.
+  Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
+  stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
+  land outside.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location

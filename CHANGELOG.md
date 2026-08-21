@@ -104,7 +104,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   strings, so a `notes.tex` symlinked outside it — git stores one as mode 120000, so a collaborator can
   commit it — was read, written, edited and deleted at the far end. Every path resolves links first now,
   including for a file that does not exist yet: a write follows a dangling link and creates the file
-  wherever it points. That holds for **every** project, cloned or local: whether you or the server ran
+  wherever it points. A link's target is resolved in turn, component by component — `notes.tex ->
+sub/pwned` with `sub` itself linked outside lands outside, however innocent the literal target
+  looks. That holds for **every** project, cloned or local: whether you or the server ran
   `git clone` says nothing about who put a link in the tree, and a directory you registered in place is
   usually a working tree a co-author can push a symlink into. The one layout that needs links — a shared
   `refs.bib` or `figs/` linked into each paper — is a per-project opt-in you set yourself,
@@ -115,8 +117,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   symlinked path for a snippet and then reported it as a `file` you can pass straight to `read_file` —
   so the guard covered the read the server makes rather than the path it offers, and the caller took
   the next hop. A diagnostic (error or warning) whose file leaves the project through a symlink now
-  keeps its message and loses its `file`/`line`, and the result text says how many were hidden;
-  `list_comments` does the same for a synctex record, which the document controls just as much.
+  keeps its message and loses its `file`/`line` — and its snippet, which is rendered against that
+  line — and the result text says how many were hidden; `list_comments` does the same for a synctex
+  record, which the document controls just as much. Resolving those paths is capped, and a location
+  past the cap is withheld too but reported as **unchecked**, not as an escape: nobody looked at it,
+  so blaming a symlink would send you after a link that is not there.
 - **`read_file` no longer counts a phantom last line.** A file ending in a newline reported one line
   more than it has, and a range ending on it returned a blank line; CRLF and CR-only files are now split
   correctly instead of leaving `\r` on every line (or, for CR-only, returning the whole file as line 1).

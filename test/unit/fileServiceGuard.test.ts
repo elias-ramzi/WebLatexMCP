@@ -197,6 +197,35 @@ describe('FileService out-of-band edit guard', () => {
     });
   });
 
+  it('refuses a write whose dangling link points through a symlinked directory', async () => {
+    // The leaf-link branch resolved `notes.tex -> sub/pwned` to <project>/sub/pwned and stopped
+    // there — a string inside the project, so the guard passed — while `writeFile` kept following
+    // and landed at the far end of `sub`. Every component of a link's target has to be resolved,
+    // which is what the parent-directory branch below it already did.
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-viadir-'));
+    try {
+      await symlink(outside, path.join(dir, 'sub'), 'dir');
+      await symlink('sub/pwned', path.join(dir, 'notes.tex'));
+
+      await expect(files.write(dir, { path: 'notes.tex', content: 'PWNED\n' })).rejects.toThrow(
+        /escapes the project root/,
+      );
+      await expect(stat(path.join(outside, 'pwned'))).rejects.toThrow();
+      // The same chain by any other route into the sandbox.
+      await expect(files.read(dir, { path: 'sub/anything.tex' })).rejects.toThrow(/symlink/);
+      await expect(files.delete(dir, 'notes.tex')).rejects.toThrow(/escapes the project root/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('gives up on a self-referential symlink rather than resolving it forever', async () => {
+    // realpath reports ELOOP; the point is that it propagates instead of the resolver recursing.
+    await symlink(path.join(dir, 'loop.tex'), path.join(dir, 'loop.tex'));
+    await expect(files.read(dir, { path: 'loop.tex' })).rejects.toThrow();
+    await expect(files.write(dir, { path: 'loop.tex', content: 'x' })).rejects.toThrow();
+  });
+
   it('refuses a write through a symlink whose target does not exist yet', async () => {
     // realpath cannot see where a dangling link points, but writeFile follows it and creates the
     // file at the other end.

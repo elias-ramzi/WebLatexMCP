@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { logBaseDir } from '../../src/services/compiler.js';
+import { MAX_REPORTED_PATH_CHECKS } from '../../src/lib/sourceSnippet.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -275,6 +276,40 @@ describe('compile: source context', () => {
       arguments: { project: 'doc', path: 'notes.tex' },
     });
     expect((named.structuredContent as { content: string }).content).toContain('PRIVATE KEY');
+  });
+
+  it('does not blame a symlink for a path it never resolved', async () => {
+    // Resolving where a log's paths lead is capped, and past the cap a location is withheld. That
+    // is caution about a path nobody looked at — reporting it as a symlink escape accuses the
+    // document of something the server never checked, and sends the caller hunting for a link
+    // that does not exist. The withheld location must also take its snippet with it: the excerpt
+    // is rendered against `line`, so source with no line is source with nowhere to go.
+    const noise = Array.from(
+      { length: MAX_REPORTED_PATH_CHECKS },
+      (_, i) => `./aux-${i}.log:1: Undefined control sequence.`,
+    );
+    const { client } = await setup(
+      { 'main.tex': '\\documentclass{article}\n\\begin{document}\nhi $x\n\\end{document}\n' },
+      [...noise, './main.tex:3: Missing $ inserted.', ''].join('\n'),
+    );
+
+    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const structured = res.structuredContent as {
+      errors: Array<{ file?: string; line?: number; message: string; snippet?: string }>;
+      omittedSnippetLocations: number;
+    };
+    const real = structured.errors.find((e) => e.message.includes('Missing $'));
+    expect(real).toBeDefined();
+    // Withheld, because it sits past the cap — an in-project file that is perfectly fine.
+    expect(real?.file).toBeUndefined();
+    expect(real?.line).toBeUndefined();
+    // …and the snippet the server had already read goes with the location it belongs to.
+    expect(real?.snippet).toBeUndefined();
+
+    const text = textOf(res);
+    expect(text).toContain('never checked');
+    expect(text).toContain(`past the ${MAX_REPORTED_PATH_CHECKS}-file limit`);
+    expect(text).not.toContain('leave the project through a symlink');
   });
 
   it('says how many locations went without context instead of leaving a silent gap', async () => {
