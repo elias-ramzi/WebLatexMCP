@@ -116,6 +116,30 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+/**
+ * Refuse a path that leaves the project **after symlinks are followed**. `resolveInside` compares
+ * strings, which a symlink defeats: a `notes.tex` pointing at `~/.ssh/id_rsa` passes the string
+ * check and hands back the key. That matters most for the paths the server picks up from a compile
+ * log, which the document itself controls.
+ *
+ * This decides *whether* the file may be read; it deliberately does not decide what the file is
+ * **called**. The resolved string stays a file's one identity everywhere — the revision tracker,
+ * `write`, `applyEdits` and `delete` all key on it — because a read that filed its baseline under
+ * the real path while a write looked it up under the given one silently disarmed the
+ * out-of-band-edit guard on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+ */
+async function assertNoSymlinkEscape(
+  projectDir: string,
+  abs: string,
+  relPath: string,
+): Promise<void> {
+  const [realRoot, realAbs] = await Promise.all([realpath(projectDir), realpath(abs)]);
+  const rel = path.relative(realRoot, realAbs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
+  }
+}
+
 /** Sandboxed file access within a project's clone directory. */
 export class FileService {
   /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
@@ -167,7 +191,8 @@ export class FileService {
     projectDir: string,
     opts: { path: string; startLine?: number; endLine?: number; recordBaseline?: boolean },
   ): Promise<ReadResult> {
-    const abs = await this.resolveReadable(projectDir, opts.path);
+    const abs = resolveInside(projectDir, opts.path);
+    await assertNoSymlinkEscape(projectDir, abs, opts.path);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${opts.path}"`);
@@ -196,29 +221,6 @@ export class FileService {
   }
 
   /**
-   * Read a line range **without** recording a revision baseline, for context the server shows on
-   * its own initiative (the source around a compile error) rather than on the caller's request.
-   * Recording here would be wrong: it would tell the out-of-band-edit guard that the server has
-   * seen the current bytes of a file the user is hand-editing, so the next write would clobber
-   * those edits silently. Returns '' when there is nothing to show (binary, oversized, or a range
-   * past the end of the file).
-   */
-  async readExcerpt(
-    projectDir: string,
-    opts: { path: string; startLine: number; endLine: number },
-  ): Promise<{ content: string }> {
-    const abs = resolveInside(projectDir, opts.path);
-    const info = await stat(abs);
-    if (!info.isFile()) throw new Error(`Not a file: "${opts.path}"`);
-    const ext = path.extname(opts.path).toLowerCase();
-    if (ASSET_EXT.has(ext) || info.size > MAX_READ_BYTES) return { content: '' };
-    const lines = (await readFile(abs, 'utf8')).split('\n');
-    const start = Math.max(1, opts.startLine);
-    const end = Math.min(lines.length, opts.endLine);
-    return { content: lines.slice(start - 1, end).join('\n') };
-  }
-
-  /**
    * Read a file's full text, returning '' when it does not exist (used for appends).
    * `recordBaseline` carries the same meaning — and the same default — as in {@link read}.
    */
@@ -236,22 +238,6 @@ export class FileService {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
       throw err;
     }
-  }
-
-  /**
-   * Resolve a path to read, refusing one that leaves the project **after symlinks are followed**.
-   * `resolveInside` compares strings, which a symlink defeats: a `notes.tex` pointing at
-   * `~/.ssh/id_rsa` passes the string check and hands back the key. That matters most for paths the
-   * server picks up from a compile log, which the document itself controls.
-   */
-  private async resolveReadable(projectDir: string, relPath: string): Promise<string> {
-    const abs = resolveInside(projectDir, relPath);
-    const [realRoot, realAbs] = await Promise.all([realpath(projectDir), realpath(abs)]);
-    const rel = path.relative(realRoot, realAbs);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
-      throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
-    }
-    return realAbs;
   }
 
   /** Create or overwrite a file. */

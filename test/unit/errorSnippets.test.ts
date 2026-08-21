@@ -287,13 +287,23 @@ describe('attachErrorSnippets', () => {
   });
 
   it('does not go quadratic on a document that fails with thousands of errors', async () => {
-    const dir = await projectWith({ 'main.tex': 'a\nb\nc' });
-    const many = Array.from({ length: 5000 }, (_, i) => at('main.tex', (i % 3) + 1));
+    // Distinct *locations* are what the dedup scans, so co-located errors would not exercise it.
+    // Measured on this machine: a linear scan over 20k of them costs ~5ms, the `includes` it
+    // replaced ~2.8s — the bound below sits two orders of magnitude clear of the first and well
+    // under the second. All of this runs inside the per-project lock, where a peer session waits.
+    const dir = await projectWith({
+      'main.tex': Array.from({ length: 20_000 }, (_, i) => `line ${i + 1}`).join('\n'),
+    });
+    const many = Array.from({ length: 20_000 }, (_, i) => at('main.tex', i + 1));
+
     const started = process.hrtime.bigint();
-    const { errors } = await attachErrorSnippets(new FileService(), dir, many);
+    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, many);
     const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    expect(errors).toHaveLength(5000);
-    expect(ms).toBeLessThan(500);
+
+    expect(errors).toHaveLength(20_000);
+    expect(errors.filter((e) => e.snippet !== undefined)).toHaveLength(MAX_SNIPPET_LOCATIONS);
+    expect(omittedLocations).toBe(20_000 - MAX_SNIPPET_LOCATIONS);
+    expect(ms).toBeLessThan(1000);
   });
 });
 

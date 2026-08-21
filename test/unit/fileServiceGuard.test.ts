@@ -48,19 +48,6 @@ describe('FileService out-of-band edit guard', () => {
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('agent version\n');
   });
 
-  it('readExcerpt does not refresh the baseline, so the guard still fires', async () => {
-    await files.read(dir, { path: 'main.tex', recordBaseline: true });
-    await editOnDisk(dir, 'main.tex', 'edited by the user\n');
-    // compile showing the source around an error is the server's own initiative, not the caller
-    // acknowledging the change — it must not count as "the server has seen these bytes".
-    const excerpt = await files.readExcerpt(dir, { path: 'main.tex', startLine: 1, endLine: 5 });
-    expect(excerpt.content).toContain('edited by the user');
-
-    await expect(
-      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
-    ).rejects.toThrow(/changed on disk/);
-  });
-
   it('a read the server makes for itself does not refresh the baseline', async () => {
     await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'edited by the user\n');
@@ -74,6 +61,29 @@ describe('FileService out-of-band edit guard', () => {
       files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
     ).rejects.toThrow(/changed on disk/);
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
+  });
+
+  it('keeps one identity for a project reached through a symlink', async () => {
+    // macOS hands out /var/folders/… for a real /private/var/folders/…, and Windows a short 8.3
+    // path — so resolving reads through realpath while writes resolve the given string filed the
+    // baseline under a key the write never looks up, and the guard silently stopped firing.
+    const real = await mkdtemp(path.join(os.tmpdir(), 'ovl-real-'));
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-link-'));
+    const link = path.join(parent, 'project');
+    try {
+      await writeFile(path.join(real, 'main.tex'), 'original\n', 'utf8');
+      await symlink(real, link, 'dir');
+
+      await files.read(link, { path: 'main.tex', recordBaseline: true });
+      await writeFile(path.join(real, 'main.tex'), 'edited by the user\n', 'utf8');
+
+      await expect(
+        files.write(link, { path: 'main.tex', content: 'agent version\n' }),
+      ).rejects.toThrow(/changed on disk/);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+      await rm(real, { recursive: true, force: true });
+    }
   });
 
   it('refuses to read through a symlink that leaves the project', async () => {
