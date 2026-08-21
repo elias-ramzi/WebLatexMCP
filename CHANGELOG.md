@@ -12,13 +12,22 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 ### Added
 
 - **`session-feedback` skill** — a bundled skill to run at the _end_ of a session, which reviews the tool
-  calls that actually ran and writes a feedback report on the **server itself**: what broke, what cost
-  too many calls, what capability was missing, what the docs got wrong. Findings are classified
-  (`bug`/`friction`/`gap`/`docs`/`skill`), rated blocked/slowed/cosmetic, stamped with `server_info` and
-  `doctor` so they are reproducible, and checked against existing issues (best-effort, via `gh`) so a
-  known problem is marked rather than re-filed. It mutates nothing, scrubs credentials and manuscript
-  content before printing, and files a GitHub issue only when explicitly asked. Documented in
+  calls that actually ran and reports on the **server itself**: what broke, what cost too many calls,
+  what capability was missing, what the docs got wrong. Findings are classified
+  (`bug`/`friction`/`gap`/`docs`/`skill`), rated blocked/slowed/cosmetic, given a frequency, and checked
+  against existing issues (best-effort, via `gh`) so a known problem is marked rather than re-filed. The
+  output is **one ready-to-file issue body per finding**, laid out field for field against the repo's
+  issue forms — with a _measured_ environment block (server version and whether it is the latest, OS +
+  arch + WSL, Node, MCP client, model, install method, TeX toolchain, workspace and project kind): the
+  skill runs the commands rather than recalling values, and writes `<unknown — please fill in>` for
+  anything it could not measure or was not told. It mutates nothing, scrubs credentials and manuscript
+  content before printing, and files an issue only when explicitly asked. Documented in
   [CONTRIBUTING.md](CONTRIBUTING.md#feedback-from-a-session) as the fastest way to contribute.
+- **Issue forms ask what actually predicts a bug** — the bug report form gained **MCP client** (which app
+  was connected), **Model** (tool-use behavior differs between them), **How was it installed?** (npx,
+  global npm, `.mcpb` bundle, plugin, clone — it decides which dependencies shipped), and **TeX
+  toolchain** fields, the OS field now asks for architecture and WSL, and the remote dropdown covers a
+  local in-place project. `session-feedback` fills the same fields in the same order.
 - **`list_references`** — read a project's own references, structured: cite key, entry type, title,
   authors (with `truncatedAuthors` for an `and others` / "et al." list), year, venue, DOI/arXiv, the file
   and line each entry sits on, and its `raw` text. Reads three shapes of bibliography and says which one

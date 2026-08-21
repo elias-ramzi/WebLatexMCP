@@ -76,11 +76,25 @@ the **end** of a session spent working through the server:
 /session-feedback
 ```
 
-It walks back over the session's tool calls, keeps only what actually happened, and writes a short
-report: each finding classified (`bug`, `friction`, `gap`, `docs`, `skill`), rated for impact
-(**blocked** / **slowed** / **cosmetic**), stamped with `server_info` + `doctor` output so it is
-reproducible, and checked against the existing issues so it does not re-file a known one. The findings
-are ranked, the weakest are cut, and what got cut is stated.
+It walks back over the session's tool calls, keeps only what actually happened, and hands you **one
+ready-to-file issue body per finding** — headings in the same order as the fields of the
+[bug report](.github/ISSUE_TEMPLATE/bug_report.yml) and
+[feature request](.github/ISSUE_TEMPLATE/feature_request.yml) forms, so you paste a block straight down
+the form without editing it. Each finding is classified (`bug`, `friction`, `gap`, `docs`, `skill`),
+rated for impact (**blocked** / **slowed** / **cosmetic**), given a frequency (once / every time /
+intermittent), and checked against the existing issues so it does not re-file a known one. The findings
+are ranked, the weakest are cut, and what got cut is said out loud — in the chat summary, not in the
+issue body, which stays about the one thing it reports.
+
+**The environment is measured, not recalled.** The block every finding carries is filled by running the
+commands: server version from `server_info` (plus whether it is the latest on npm, and the commit if you
+run from a clone), OS + architecture + whether this is WSL, `node --version`, the compiler and TeX
+distribution from `doctor` when the session compiled, the workspace mode and whether the project is a
+git remote or a local in-place directory, and whether parallel sessions shared the clone. Three things
+cannot be read from inside a session — **which client** (CLI, VS Code extension, Desktop, Cursor, …),
+**which model** drove it, and **how the server was installed** (npx, global npm, `.mcpb` bundle, plugin,
+clone) — so it asks you, once, and writes `<unknown — please fill in>` rather than guessing. A blank
+field costs a question; an invented version number costs an afternoon on the wrong commit.
 
 Three properties make it safe to run and worth reading:
 
@@ -90,10 +104,12 @@ Three properties make it safe to run and worth reading:
   the manuscript's own content (title, abstract, results, co-authors) are stripped or generalized before
   anything is printed — a finding that cannot be described without them is dropped, and the drop is
   reported. The report is written to be handed to someone who was not there.
-- **It never files anything on its own.** You get the report in the chat; saving it to a file and
-  opening a GitHub issue each need an explicit yes. With `gh` installed it will run
-  `gh issue create --repo elias-ramzi/WebLatexMCP` for you, splitting unrelated findings so each issue
-  is one thing that can be closed; otherwise you get a title and a body to paste.
+- **It never files anything on its own.** You get the blocks in the chat; saving them to a file and
+  opening a GitHub issue each need an explicit yes, and the titles are shown before anything is created.
+  With `gh` installed it runs `gh issue create --repo elias-ramzi/WebLatexMCP --label bug` for you — one
+  issue per finding, so each is one thing that can be closed, and the label is set explicitly because
+  `gh` posts through the API and bypasses the form. Otherwise you get a title and a block to paste at
+  [issues/new/choose](https://github.com/elias-ramzi/WebLatexMCP/issues/new/choose).
 
 An empty report is a normal outcome — a clean session should produce two lines saying so, not a page of
 invented nits. If the skill is not installed in your client, it ships with the server anyway: pick

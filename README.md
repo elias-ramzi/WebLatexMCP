@@ -160,7 +160,7 @@ unless you ask:
 - **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
-- **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, ready to paste into an issue ([contributing](CONTRIBUTING.md#feedback-from-a-session)).
+- **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, and emitted as ready-to-file issue bodies — the environment (version, OS, client, model, install method, toolchain) measured rather than guessed ([contributing](CONTRIBUTING.md#feedback-from-a-session)).
 
 **How you get them depends on the client:**
 
@@ -197,10 +197,13 @@ welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up, run the l
 session spent working through the server, run the [`/session-feedback`](.claude/skills/session-feedback/SKILL.md)
 skill: it looks back over the tool calls that actually ran — the ones that failed, the detours, the
 guard that fired for the wrong reason, the thing you wanted and could not do — and writes a short,
-ranked report stamped with your server version and toolchain. It reports on the _server_, never on your
-paper: it edits nothing, commits nothing, pushes nothing, and it strips tokens, paths, and manuscript
-content before printing, because the report is written to be handed to a stranger. You get a report to
-paste into an issue (or, if you say so, `gh` files it for you). See
+ranked write-up. What comes back is **one ready-to-file issue body per finding**, in the same field
+order as this repo's issue forms, carrying an environment block it _measured_ — server version (and
+whether that is the latest), OS and architecture, Node, MCP client, model, install method, TeX
+toolchain — asking you for the few facts a session cannot read about itself rather than inventing them.
+It reports on the _server_, never on your paper: it edits nothing, commits nothing, pushes nothing, and
+it strips tokens, paths, and manuscript content before printing, because the report is written to be
+handed to a stranger. Paste a block into an issue, or say the word and `gh` files it. See
 [Feedback from a session](CONTRIBUTING.md#feedback-from-a-session).
 
 A note on maturity: this project is largely vibe-coded, so treat it as best-effort rather than
