@@ -11,17 +11,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
-- **`compile` returns the source around each error** — a LaTeX message is frequently uninterpretable on
-  its own (`Undefined control sequence` names no macro; `Missing $ inserted` points at the line where TeX
-  _noticed_, not where you erred), so each error now carries the 5 source lines around it (`snippet`,
-  numbered from `snippetStartLine`), rendered into the result **text** as well as `structuredContent` so
-  a client that strips structured output still sees it. Errors only — warnings never carry one — at most
-  10 distinct locations per compile, attached once per location, and never a guess: a location the parser
-  cannot confirm against the file, a line past the end of its file, or a file the document merely _named_
-  in its log gets none. `omittedSnippetLocations` says how many locations went without, so a gap is
+- **`compile` returns the source around each error** — a LaTeX message is frequently uninterpretable
+  on its own (`Undefined control sequence` names no macro; `Missing $ inserted` points at the line
+  where TeX _noticed_, not where you erred), so each error now carries the 5 source lines around it
+  (`snippet`, numbered from `snippetStartLine`), rendered into the result **text** as well as
+  `structuredContent` so a client that strips structured output still sees it. Errors only —
+  warnings never carry one — at most 10 distinct locations per compile, attached once per location,
+  and never a guess. Earning one takes more than a plausible line: the log has to name the file
+  **and** line on one diagnostic line (`-file-line-error`), so a location pieced together from the
+  parenthesis stack is counted rather than illustrated — which means **tectonic**, whose logs carry
+  no `file:line` at all, gets no snippets by design. A line past the end of its file, a file the
+  document merely _named_ in its log, and a location TeX's own echo of the source contradicts all
+  get none either. `omittedSnippetLocations` says how many locations went without, so a gap is
   reported rather than silent. `list_comments` snippets now have the same shape (`snippetStartLine`
   included).
-
 - **`session-feedback` skill** — a bundled skill to run at the _end_ of a session, which reviews the tool
   calls that actually ran and reports on the **server itself**: what broke, what cost too many calls,
   what capability was missing, what the docs got wrong. Findings are classified
@@ -101,18 +104,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   only when asked to, which only `read_file` and `list_references` do — the two that hand back a whole
   file the caller could base a write on.
 - **A symlink can no longer take a read or a write out of a project.** `resolveInside` compares
-  strings, so a `notes.tex` symlinked outside it — git stores one as mode 120000, so a collaborator can
-  commit it — was read, written, edited and deleted at the far end. Every path resolves links first now,
-  including for a file that does not exist yet: a write follows a dangling link and creates the file
-  wherever it points. A link's target is resolved in turn, component by component — `notes.tex ->
-sub/pwned` with `sub` itself linked outside lands outside, however innocent the literal target
-  looks. That holds for **every** project, cloned or local: whether you or the server ran
-  `git clone` says nothing about who put a link in the tree, and a directory you registered in place is
-  usually a working tree a co-author can push a symlink into. The one layout that needs links — a shared
-  `refs.bib` or `figs/` linked into each paper — is a per-project opt-in you set yourself,
-  **`followSymlinks: true`** on a local project (`register_project`, `WEB_LATEX_MCP_PROJECTS`, or the
-  workspace registry). Where it is on, `list_files` and every tool that scans on its own now see the
-  linked files too, so the shared `.bib` is findable instead of readable only by name.
+  strings, so a `notes.tex` symlinked outside it — git stores one as mode 120000, so a collaborator
+  can commit it — was read, written, edited and deleted at the far end. Every path resolves links
+  first now, including for a file that does not exist yet: a write follows a dangling link and
+  creates the file wherever it points. A link's target is resolved in turn, component by component:
+  a dangling `notes.tex` pointing at `sub/pwned`, with `sub` itself linked outside, lands outside
+  however innocent the literal target looks. That holds for **every** project, cloned or local:
+  whether you or the server ran `git clone` says nothing about who put a link in the tree, and a
+  directory you registered in place is usually a working tree a co-author can push a symlink into.
+  The one layout that needs links — a shared `refs.bib` or `figs/` linked into each paper — is a
+  per-project opt-in you set yourself, **`followSymlinks: true`** on a local project
+  (`register_project`, `WEB_LATEX_MCP_PROJECTS`, or the workspace registry). Where it is on,
+  `list_files` and every tool that scans on its own now see the linked files too, so the shared
+  `.bib` is findable instead of readable only by name.
 - **A path the _document_ chose is not handed back as one to open.** `compile` refused to read a
   symlinked path for a snippet and then reported it as a `file` you can pass straight to `read_file` —
   so the guard covered the read the server makes rather than the path it offers, and the caller took
