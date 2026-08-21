@@ -198,17 +198,24 @@ export class FileService {
    *
    * The guard exists for paths the **user did not choose**: a `notes.tex -> ~/.ssh/id_rsa` a
    * collaborator committed into a shared repository (git stores a symlink as mode 120000), or a
-   * file named by a compile log, which the document controls. Neither describes a `mode: 'local'`
-   * project — a directory the user registered in place and owns, where one shared `refs.bib`
-   * symlinked into each paper is an ordinary layout that worked before this guard existed.
+   * file named by a compile log, which the document controls. So the default everywhere is to
+   * refuse, and the exemption is something the project's owner **asserts** (`followSymlinks` on a
+   * `mode: 'local'` project) rather than something inferred from how the directory came to exist —
+   * a directory registered in place is usually a working tree with a remote, where the next pull
+   * can bring in a link nobody here placed.
    *
-   * Reads the server makes on its own initiative pass `strictLinks` and are refused regardless.
+   * Reads the server makes on its own initiative pass `strictLinks` and are refused regardless;
+   * so is a path the server would hand back as openable — see {@link leavesProjectThroughLink}.
    */
   setLinkPolicy(followsUserLinks: (projectDir: string) => boolean): void {
     this.followsUserLinks = followsUserLinks;
   }
 
-  /** The symlink check, unless this project is one whose owner places its own links. */
+  /**
+   * The symlink check, unless this project's owner has said its links are theirs. `strictLinks`
+   * overrides that: every method takes it, so a read the *server* initiates and a write it makes
+   * on a path it chose can both be held to the strict rule.
+   */
   private async guardLinks(
     projectDir: string,
     abs: string,
@@ -217,6 +224,34 @@ export class FileService {
   ): Promise<void> {
     if (!strictLinks && this.followsUserLinks(projectDir)) return;
     await assertNoSymlinkEscape(projectDir, abs, relPath);
+  }
+
+  /**
+   * Whether a project-relative path lands **outside** the project once symlinks are followed.
+   *
+   * The question to ask before handing back a path the *document* named — a compile log, a synctex
+   * record — as one the caller can open. Refusing the server's own read is only half the guard: a
+   * location it reports is a location the caller reads next, so a guard that stops at the read
+   * covers document-controlled *reads* rather than document-controlled *paths*.
+   *
+   * A path that was never inside the project (absolute, or climbing out with `..`) is not this:
+   * every method here refuses it outright whatever the link policy, and a diagnostic in
+   * `/usr/share/texlive/…/foo.sty` is still worth reporting. Anything this cannot resolve counts
+   * as outside — the safe direction costs a path in the result, the other costs a file.
+   */
+  async leavesProjectThroughLink(projectDir: string, relPath: string): Promise<boolean> {
+    let abs: string;
+    try {
+      abs = resolveInside(projectDir, relPath);
+    } catch {
+      return false; // never a project-relative path; not a link taking one out
+    }
+    try {
+      await assertNoSymlinkEscape(projectDir, abs, relPath);
+      return false;
+    } catch {
+      return true;
+    }
   }
 
   async list(
@@ -303,10 +338,10 @@ export class FileService {
   async readText(
     projectDir: string,
     relPath: string,
-    opts: { recordBaseline?: boolean } = {},
+    opts: { recordBaseline?: boolean; strictLinks?: boolean } = {},
   ): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
-    await this.guardLinks(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     try {
       const raw = await readFile(abs, 'utf8');
       if (opts.recordBaseline) this.revisions.record(abs, raw);
@@ -325,10 +360,12 @@ export class FileService {
       content: string;
       createDirs?: boolean;
       overrideExternalChanges?: boolean;
+      /** As in {@link read}: refuse a link out of the project even where the policy follows one. */
+      strictLinks?: boolean;
     },
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
-    await this.guardLinks(projectDir, abs, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
     let current: string | undefined;
     try {
       current = await readFile(abs, 'utf8');
@@ -364,13 +401,13 @@ export class FileService {
     projectDir: string,
     relPath: string,
     edits: EditOp[],
-    opts: { overrideExternalChanges?: boolean } = {},
+    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
   ): Promise<{ path: string; appliedEdits: number }> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
     }
     const abs = resolveInside(projectDir, relPath);
-    await this.guardLinks(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     const original = await readFile(abs, 'utf8');
     if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
       throw new ExternalChangeError(relPath);
@@ -403,10 +440,10 @@ export class FileService {
   async delete(
     projectDir: string,
     relPath: string,
-    opts: { overrideExternalChanges?: boolean } = {},
+    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
   ): Promise<{ path: string }> {
     const abs = resolveInside(projectDir, relPath);
-    await this.guardLinks(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
@@ -474,15 +511,44 @@ export class FileService {
     }
   }
 
-  private async walk(root: string, dir: string, out: string[]): Promise<void> {
+  /**
+   * Collect every file under `dir`, project-relative.
+   *
+   * A dirent for a symlink is neither `isFile()` nor `isDirectory()`, so a link is skipped unless
+   * this project follows its owner's links — and every auto-discovering tool is built on this walk
+   * (`list_files`, `detectRootFile`, `list_references`, `check_citations`). Skipping one there
+   * while `read` follows it makes the same project both follow and not follow its own links
+   * depending on which tool you call: the shared `refs.bib` the exemption exists for would be
+   * readable only by someone who already knew it was there.
+   */
+  private async walk(
+    root: string,
+    dir: string,
+    out: string[],
+    seen: Set<string> = new Set(),
+  ): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
+    const followLinks = this.followsUserLinks(root);
     for (const entry of entries) {
       if (entry.name === '.git') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        await this.walk(root, full, out);
+        await this.walk(root, full, out, seen);
       } else if (entry.isFile()) {
         out.push(path.relative(root, full));
+      } else if (entry.isSymbolicLink() && followLinks) {
+        // `stat` follows the link; a dangling one throws and is simply not there to list.
+        const target = await stat(full).catch(() => null);
+        if (target?.isFile()) {
+          out.push(path.relative(root, full));
+        } else if (target?.isDirectory()) {
+          // Keyed on the real directory, so `a -> ..` (or any longer cycle) is walked once
+          // instead of forever. `realpath` itself fails on a self-referential chain (ELOOP).
+          const real = await realpath(full).catch(() => null);
+          if (real === null || seen.has(real)) continue;
+          seen.add(real);
+          await this.walk(root, full, out, seen);
+        }
       }
     }
   }

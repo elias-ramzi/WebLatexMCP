@@ -85,12 +85,19 @@ function echoContradicts(rawEcho: string | undefined, source: string): boolean {
 }
 
 /**
- * The part of an elided echo that can be trusted to be intact: everything after the last
- * replacement character (the half-character the elision cut), capped to {@link ECHO_TAIL_CHARS}
- * from the right-hand end, which is the end TeX never truncates.
+ * The part of an elided echo that can be trusted to be intact: its **longest run without a
+ * replacement character**, capped to {@link ECHO_TAIL_CHARS} from that run's right-hand end.
+ *
+ * A replacement character marks a byte with no character behind it — the half of a UTF-8 character
+ * the elision cut, or an 8-bit byte in a latin-1 encoded `.tex` that the log is read as utf8. Only
+ * the byte itself is unreadable; the text around it is not. Taking everything after the *last* one
+ * threw away the whole echo when one landed at the right-hand end, which switched off a check
+ * whose entire job is to contradict — and a veto that fails open is not a veto.
  */
 function tailOf(echo: string): string {
-  const intact = echo.slice(echo.lastIndexOf('\uFFFD') + 1).trimStart();
+  const intact = echo
+    .split('\uFFFD')
+    .reduce((longest, run) => (run.trim().length > longest.length ? run.trim() : longest), '');
   return intact.length > ECHO_TAIL_CHARS ? intact.slice(-ECHO_TAIL_CHARS) : intact;
 }
 
@@ -98,8 +105,8 @@ export interface SnippetOutcome {
   errors: ErrorWithSnippet[];
   /**
    * Distinct attributed **locations** left without source context — over the cap, unreadable, of a
-   * kind not opened, contradicted by the log, past the end of their file, or never named outright
-   * by the log. Zero means every located error has its source.
+   * kind not opened, behind a symlink out of the project, contradicted by the log, past the end of
+   * their file, or never named outright by the log. Zero means every located error has its source.
    */
   omittedLocations: number;
 }

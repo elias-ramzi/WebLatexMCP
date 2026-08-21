@@ -111,11 +111,11 @@ describe('FileService out-of-band edit guard', () => {
     }
   });
 
-  describe('a project whose owner places its own links (mode: local)', () => {
+  describe('a project whose owner says its links are theirs (followSymlinks)', () => {
     it('follows a symlink the user put there', async () => {
-      // One shared refs.bib symlinked into each paper is an ordinary LaTeX layout, and a local
-      // project is a directory the user registered in place. The guard is for links the user did
-      // NOT choose: one committed into a shared clone, or one a compile log named.
+      // One shared refs.bib symlinked into each paper is an ordinary LaTeX layout, and the only
+      // reason the opt-in exists. It is an assertion the owner makes about THIS directory, never
+      // inferred from how the directory came to exist — see ProjectManager.followsUserLinks.
       const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-shared-'));
       try {
         await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
@@ -137,7 +137,8 @@ describe('FileService out-of-band edit guard', () => {
 
     it('still refuses a path the server picked up rather than the caller naming it', async () => {
       // A compile log is document-controlled, so `strictLinks` overrides the policy: this is the
-      // path compile's snippets and list_comments' snippets take.
+      // path compile's snippets and list_comments' snippets take. Every method takes the flag, so
+      // the rule can be honoured by a future server-initiative read or write, not just by `read`.
       const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside2-'));
       try {
         await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
@@ -150,6 +151,46 @@ describe('FileService out-of-band edit guard', () => {
         await expect(local.read(dir, { path: 'notes.tex', strictLinks: true })).rejects.toThrow(
           /symlink/,
         );
+        await expect(local.readText(dir, 'notes.tex', { strictLinks: true })).rejects.toThrow(
+          /symlink/,
+        );
+        await expect(
+          local.write(dir, { path: 'notes.tex', content: 'PWNED\n', strictLinks: true }),
+        ).rejects.toThrow(/symlink/);
+        await expect(
+          local.applyEdits(dir, 'notes.tex', [{ oldString: 'PRIVATE', newString: 'PWNED' }], {
+            strictLinks: true,
+          }),
+        ).rejects.toThrow(/symlink/);
+        await expect(local.delete(dir, 'notes.tex', { strictLinks: true })).rejects.toThrow(
+          /symlink/,
+        );
+        expect(await readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('PRIVATE KEY\n');
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('answers whether a path leaves the project, so a caller is never offered one that does', async () => {
+      // What `compile` and `list_comments` ask before handing back a path the *document* named.
+      // Refusing the server's own read is half the guard: the location it reports is the location
+      // the caller reads next, and in a project that follows its links that read succeeds.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside3-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+        await writeFile(path.join(dir, 'main.tex'), 'hello\n', 'utf8');
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+
+        expect(await local.leavesProjectThroughLink(dir, 'notes.tex')).toBe(true);
+        expect(await local.leavesProjectThroughLink(dir, 'main.tex')).toBe(false);
+        expect(await local.leavesProjectThroughLink(dir, 'never-written.tex')).toBe(false);
+        // A path that was never project-relative is a different thing: every method refuses it
+        // whatever the policy, and a diagnostic in the TeX installation is worth reporting.
+        expect(await local.leavesProjectThroughLink(dir, '/usr/share/texmf/foo.sty')).toBe(false);
+        expect(await local.leavesProjectThroughLink(dir, '../elsewhere/x.tex')).toBe(false);
       } finally {
         await rm(outside, { recursive: true, force: true });
       }

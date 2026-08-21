@@ -37,6 +37,19 @@ const inputSchema = {
     .min(1)
     .optional()
     .describe('Explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted.'),
+  followSymlinks: z
+    .boolean()
+    .optional()
+    .describe(
+      'Local projects only. Let reads and writes follow a symlink that leaves the directory — for ' +
+        'the layout where a shared file is linked into the project (`refs.bib -> ~/lab/refs.bib`, ' +
+        '`figs/ -> ~/lab/figs`). Default false, and off is the safe answer: a link is followed to ' +
+        'wherever it points, so a `notes.tex -> ~/.ssh/id_rsa` would be readable and writable. Set ' +
+        'it only when the links in that directory are ones YOU put there — if it is a git working ' +
+        'tree, a co-author can commit a symlink (git stores one as mode 120000) and a later pull ' +
+        'brings it in. Paths the server picks up on its own (a compile log, a synctex record) are ' +
+        'refused either way.',
+    ),
   branch: z.string().min(1).optional().describe('Branch to clone/track. Defaults to the remote.'),
   username: z
     .string()
@@ -141,12 +154,19 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
       gitUrl,
       path: localPath,
       rootFile,
+      followSymlinks,
       branch,
       username,
       tokenEnv,
       clone = true,
     }) => {
       try {
+        if (followSymlinks !== undefined && !localPath) {
+          throw new Error(
+            'followSymlinks applies to a local project (`path`) only. A clone is shared — anyone ' +
+              'with push access can commit a symlink into it — so links out of it are always refused.',
+          );
+        }
         if (gitUrl && localPath) {
           throw new Error(
             'Give either gitUrl (a remote to clone) or path (a directory to use in place), not both.',
@@ -169,6 +189,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               mode: 'local',
               path: dir,
               rootFile: resolvedRoot,
+              followSymlinks,
             };
             await ctx.projectManager.registerAndPersist(cfg);
             const payload = {
@@ -184,12 +205,19 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               ? `Pointed at "${target.pointedAtFile}", so registered the folder holding it. ` +
                 (target.rootFile ? `LaTeX root: ${target.rootFile}. ` : '')
               : '';
+            // Say which way the link policy landed: it is the one thing about a local project the
+            // caller cannot see from the path, and "refs.bib is not there" is otherwise a puzzle.
+            const links = followSymlinks
+              ? ' Symlinks out of that folder are followed, as you asked — anything linked from it ' +
+                'is readable and writable at the far end.'
+              : ' A symlink pointing out of that folder is not followed (re-register with ' +
+                'followSymlinks: true if the links in it are yours).';
             const text =
               `Registered "${project}" -> ${toPosix(dir)} (local, persisted to the workspace ` +
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
-              'workspace, not into that directory.';
+              `workspace, not into that directory.${links}`;
             return {
               content: [{ type: 'text', text }],
               structuredContent: { ...payload },

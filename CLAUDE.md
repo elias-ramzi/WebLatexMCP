@@ -176,13 +176,20 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   a path may be used, never what the file is **called**: the `resolveInside` string stays its one
   identity, or the revision tracker files a baseline under a key the write never looks up — which is how
   the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
-  **Whose link it is decides whether it is followed** (`setLinkPolicy`, injected in `context.ts` from
-  `ProjectManager.isLocalDir`). A clone is shared, so a link in it may be anyone's and is refused. A
-  `mode: 'local'` project is a directory the user registered in place and owns, so a link they put there
-  — one shared `refs.bib` symlinked into each paper is an ordinary layout — is followed. A path the
-  server picked up rather than the caller naming it passes `strictLinks: true` and is refused either way;
-  that is every read behind `compile`'s and `list_comments`' snippets, whose paths come from a
-  document-controlled log or synctex record. Keep that opt-in on any future server-initiative read.
+  **A link out is followed only where the project's owner said so** (`setLinkPolicy`, injected in
+  `context.ts` from `ProjectManager.followsUserLinks`): `mode: 'local'` **plus** an explicit
+  `followSymlinks: true`. It is an assertion, never an inference — who ran `git clone` says nothing
+  about who placed a link, a directory registered in place is usually a working tree with a remote, and
+  a pull can bring in a mode-120000 entry at any time. The layout it exists for is a shared `refs.bib`
+  or `figs/` linked into each paper, so `walk` follows linked entries under the same flag (cycle-guarded
+  by realpath): `list` skipping what `read` follows made the same project both follow and not follow its
+  own links. A path the server picked up rather than the caller naming it passes `strictLinks: true` and
+  is refused either way — every method takes the flag, so this stays honourable for a future
+  server-initiative read _or_ write. And the guard does not stop at the read: a path the **document**
+  named (a compile log, a synctex record) that leaves the project is not handed back as openable either
+  (`unopenablePaths`/`withoutUnopenableLocation` in `src/lib/sourceSnippet.ts`, applied by `compile` to
+  errors _and_ warnings and by `list_comments` to every comment) — otherwise the server refuses the read
+  and then tells the caller they may make it.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location

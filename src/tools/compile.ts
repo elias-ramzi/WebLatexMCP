@@ -7,7 +7,7 @@ import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
 import { attachErrorSnippets } from '../lib/errorSnippets.js';
-import { formatSnippet } from '../lib/sourceSnippet.js';
+import { formatSnippet, unopenablePaths, withoutUnopenableLocation } from '../lib/sourceSnippet.js';
 import {
   parseLog,
   filterLog,
@@ -61,7 +61,12 @@ const diagnosticShape = z.object({
   file: z
     .string()
     .optional()
-    .describe('Source file, project-relative — a path you can pass straight to read_file.'),
+    .describe(
+      'Source file — project-relative, so a path you can pass straight to read_file (a diagnostic ' +
+        'inside the TeX installation itself names an absolute path instead). Absent when the log ' +
+        'named none, and dropped when the one it named leaves the project through a symlink: the ' +
+        'log is written by the document, so a path out of it is not one this server hands back.',
+    ),
   line: z.number().optional(),
   message: z.string(),
   rule: z.string().optional(),
@@ -125,7 +130,8 @@ const outputSchema = {
     .number()
     .describe(
       'How many distinct error **locations** carry no `snippet` — over the 10-location cap, or ' +
-        'unreadable, or not named outright by the log, or contradicted by it. 0 means every ' +
+        'unreadable, or not named outright by the log, or contradicted by it, or naming a path ' +
+        'that leaves the project through a symlink. 0 means every ' +
         'located error has its source context: co-located errors share one snippet, so an error ' +
         'without one is not a gap when 0. This is the flag for "there is more to see".',
     ),
@@ -207,11 +213,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           });
           // Errors carry their source context; warnings do not — a normal build has hundreds of
           // them and attaching a snippet to each would bloat every successful compile's result.
-          const { errors, omittedLocations: omittedSnippetLocations } = await attachErrorSnippets(
-            ctx.files,
-            dir,
-            parsedErrors,
-          );
+          const { errors: located, omittedLocations: omittedSnippetLocations } =
+            await attachErrorSnippets(ctx.files, dir, parsedErrors);
+          // A path out of the project through a symlink is not handed back as somewhere to read
+          // next — for warnings as much as errors, since both come off the same document-written
+          // log. Refusing only the snippet read would leave the guard one hop deep.
+          const unopenable = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
+          const errors = located.map((e) => withoutUnopenableLocation(e, unopenable));
+          const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, unopenable));
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
@@ -240,7 +249,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             pdfUrl,
             durationSec: outcome.durationSec,
             errors,
-            warnings,
+            warnings: shownWarnings,
             missingPackages,
             logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
             logPath: outcome.logPath,
@@ -281,6 +290,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
                 `did not name the file and line outright (every diagnostic, under tectonic), or ` +
                 `they are unreadable, contradicted by the log, or past the 10-location cap`
+              : '',
+            unopenable.size > 0
+              ? `  … ${unopenable.size} path(s) the log named leave the project through a symlink; ` +
+                `reported without file/line, since a path the document chose is not one to open`
               : '',
           ]
             .filter(Boolean)

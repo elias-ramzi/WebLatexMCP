@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm, readFile, writeFile, readdir, symlink } from 'node:fs/promises';
+import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -65,11 +66,16 @@ function textOf(res: unknown): string {
   return JSON.stringify((res as { content?: unknown }).content ?? '');
 }
 
-describe('local (in-place) projects', () => {
-  it('follows a symlink the user placed in their own directory', async () => {
-    // A shared refs.bib symlinked into each paper is an ordinary LaTeX layout. The symlink guard
-    // is for links the user did not choose — one committed into a shared clone, or one named by a
-    // compile log — and a local project is a directory they registered in place and own.
+/**
+ * The symlink rule these pin: a link out of a project is followed only where the project's owner
+ * has said the links in it are theirs (`followSymlinks`). Registering a directory in place is not
+ * that assertion — the user running `git clone` themselves says nothing about who put a link in
+ * the tree, and a mode-120000 entry a co-author committed arrives on the next pull.
+ */
+describe('local (in-place) projects: symlinks', () => {
+  it('follows a link out only when the owner said the links here are theirs', async () => {
+    // A shared refs.bib symlinked into each paper is an ordinary LaTeX layout — and the reason the
+    // opt-in exists at all. Off (the default), the same layout is refused.
     const { client, userDir } = await setup();
     const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-sharedbib-'));
     cleanups.push(() => rm(shared, { recursive: true, force: true }));
@@ -80,6 +86,17 @@ describe('local (in-place) projects', () => {
       name: 'register_project',
       arguments: { project: 'cv', path: userDir },
     });
+    const refused = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'cv', path: 'refs.bib' },
+    });
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain('symlink');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir, followSymlinks: true },
+    });
     const res = await client.callTool({
       name: 'read_file',
       arguments: { project: 'cv', path: 'refs.bib' },
@@ -88,6 +105,127 @@ describe('local (in-place) projects', () => {
     expect((res.structuredContent as { content: string }).content).toContain('Shared');
   });
 
+  it('refuses a link a co-author committed, however the project was registered', async () => {
+    // The case the exemption used to turn on who ran `git clone`: the same repository, the same
+    // committed mode-120000 entry. Cloned by the server it was refused; cloned by the user and
+    // registered in place it handed back the key and overwrote it. Registration is not consent.
+    const { client, userDir } = await setup();
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside-'));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    const secret = path.join(outside, 'id_rsa');
+    await writeFile(secret, 'PRIVATE KEY BYTES\n', 'utf8');
+    await symlink(secret, path.join(userDir, 'notes.tex'));
+
+    const git = simpleGit(userDir);
+    await git.raw(['init', '-b', 'main']);
+    await git.addConfig('core.symlinks', 'true');
+    await git.addConfig('user.email', 'coauthor@example.com');
+    await git.addConfig('user.name', 'Co Author');
+    await git.add('.');
+    await git.commit('add notes');
+    // git stores a symlink as mode 120000, so this travels to every clone of the repository.
+    expect(await git.raw(['ls-files', '-s', 'notes.tex'])).toMatch(/^120000 /);
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', path: userDir },
+    });
+    const read = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'paper', path: 'notes.tex' },
+    });
+    expect(read.isError).toBe(true);
+    expect(textOf(read)).toContain('symlink');
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'paper', path: 'notes.tex', content: 'CLOBBERED' },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(await readFile(secret, 'utf8')).toBe('PRIVATE KEY BYTES\n');
+  });
+
+  it('lists what it follows, so the shared file is findable without knowing it is there', async () => {
+    // Every auto-discovering tool is built on the same walk, and a dirent for a symlink is neither
+    // isFile() nor isDirectory() — so the layout the opt-in exists for was readable only by
+    // someone who already knew the name to ask for.
+    const { client, userDir } = await setup();
+    const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-sharedlib-'));
+    cleanups.push(() => rm(shared, { recursive: true, force: true }));
+    await mkdir(path.join(shared, 'figs'), { recursive: true });
+    await writeFile(path.join(shared, 'refs.bib'), '@misc{shared2024, title={Shared}}\n', 'utf8');
+    await writeFile(path.join(shared, 'figs', 'macros.tex'), '% shared macros\n', 'utf8');
+    await symlink(path.join(shared, 'refs.bib'), path.join(userDir, 'refs.bib'));
+    await symlink(path.join(shared, 'figs'), path.join(userDir, 'figs'), 'dir');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir },
+    });
+    const hidden = await client.callTool({ name: 'list_files', arguments: { project: 'cv' } });
+    expect(textOf(hidden)).not.toContain('refs.bib');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir, followSymlinks: true },
+    });
+    const listed = await client.callTool({ name: 'list_files', arguments: { project: 'cv' } });
+    const paths = (listed.structuredContent as { files: Array<{ path: string }> }).files.map(
+      (f) => f.path,
+    );
+    expect(paths).toContain('refs.bib');
+    expect(paths).toContain('figs/macros.tex'); // through a linked directory, too
+
+    // ...and the tools that scan on their own find it, rather than needing to be told the path.
+    const refs = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'cv' },
+    });
+    expect(textOf(refs)).toContain('shared2024');
+    const cites = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'cv' },
+    });
+    expect(textOf(cites)).toContain('refs.bib');
+  });
+
+  it('refuses the opt-in on a git project, and persists it on a local one', async () => {
+    const { client, workspace, userDir } = await setup();
+    const onGit = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'remote', gitUrl: 'https://git.example/x', followSymlinks: true },
+    });
+    // A clone is shared — anyone with push access can commit a link into it — so there is nobody
+    // who could make the assertion this flag is.
+    expect(onGit.isError).toBe(true);
+    expect(textOf(onGit)).toContain('local project');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir, followSymlinks: true },
+    });
+    expect(readProjectRegistry(workspace)).toEqual([
+      { id: 'cv', mode: 'local', path: userDir, rootFile: undefined, followSymlinks: true },
+    ]);
+  });
+
+  it('walks a link that points back into the project exactly once', async () => {
+    const { client, userDir } = await setup();
+    await symlink(userDir, path.join(userDir, 'self'), 'dir');
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir, followSymlinks: true },
+    });
+    const listed = await client.callTool({ name: 'list_files', arguments: { project: 'cv' } });
+    const paths = (listed.structuredContent as { files: Array<{ path: string }> }).files.map(
+      (f) => f.path,
+    );
+    expect(paths).toContain('.context/resume.tex');
+    expect(paths.filter((p) => p.startsWith('self/self/'))).toEqual([]);
+  });
+});
+
+describe('local (in-place) projects', () => {
   it('registers a directory without cloning anything', async () => {
     const { client, workspace, userDir } = await setup();
 

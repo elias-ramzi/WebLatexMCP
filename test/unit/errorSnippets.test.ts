@@ -106,6 +106,8 @@ describe('attachErrorSnippets', () => {
         reads.push(opts.path);
         return files.read(projectDir, opts);
       },
+      leavesProjectThroughLink: (projectDir: string, rel: string) =>
+        files.leavesProjectThroughLink(projectDir, rel),
     };
     const { errors } = await attachErrorSnippets(spy, dir, [
       at('main.tex', 3, { message: 'first' }),
@@ -260,6 +262,31 @@ describe('attachErrorSnippets', () => {
       expect(omittedLocations).toBe(1);
     });
 
+    it('vetoes an echo whose only intact text is before a trailing replacement character', async () => {
+      // `slice(lastIndexOf('\uFFFD') + 1)` threw away everything before the *last* unreadable
+      // byte, so one at the right-hand end left an empty tail and the check passed by default.
+      // A latin-1 encoded .tex reaches this: the log echoes the 8-bit byte, and reading the log as
+      // utf8 turns it into U+FFFD wherever it fell. A veto that fails open is not a veto.
+      const dir = await projectWith({ 'main.tex': 'un\ndeux\ntrois' });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 2, { echo: '...nothing like line two at all here\uFFFD' }),
+      ]);
+      expect(errors[0]!.snippet).toBeUndefined();
+      expect(omittedLocations).toBe(1);
+    });
+
+    it('still accepts a good line whose echo has a replacement character at either end', async () => {
+      // The other half of the same change: taking the longest intact run must not turn the veto
+      // into one that fires on a location the file agrees with.
+      const line = 'la précision pour la tache etudiee ici \\undefmac';
+      const dir = await projectWith({ 'main.tex': `un\ndeux\n${line}\nquatre` });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 3, { echo: '...\uFFFDcision pour la tache etudiee ici \\undefmac\uFFFD' }),
+      ]);
+      expect(errors[0]!.snippet).toContain('undefmac');
+      expect(omittedLocations).toBe(0);
+    });
+
     it('accepts the left-elided echo TeX actually prints for a long line', async () => {
       // Real pdfTeX output for the sample fixture: "l.3 ... an undefined macro: \\thismacro…".
       const dir = await projectWith({
@@ -325,6 +352,8 @@ describe('attachErrorSnippets', () => {
         reads.push(opts.path);
         return real.read(projectDir, opts);
       },
+      leavesProjectThroughLink: (projectDir: string, rel: string) =>
+        real.leavesProjectThroughLink(projectDir, rel),
     };
     // 200 distinct files that do not exist: none yields a snippet, and the search must stop.
     const missing = Array.from({ length: 200 }, (_, i) => at(`gone-${i}.tex`, 1));

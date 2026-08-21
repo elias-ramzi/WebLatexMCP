@@ -43,12 +43,69 @@ export interface SourceSnippet {
   snippetStartLine: number;
 }
 
+/** The slice of `FileService` the reporting guard needs — narrow so tests can hand in a stub. */
+export interface LinkChecker {
+  leavesProjectThroughLink(projectDir: string, relPath: string): Promise<boolean>;
+}
+
 /** The slice of `FileService` this needs — narrow so tests can hand in a stub. */
-export interface SnippetReader {
+export interface SnippetReader extends LinkChecker {
   read(
     projectDir: string,
     opts: { path: string; recordBaseline?: boolean; strictLinks?: boolean },
   ): Promise<{ content: string; note?: string }>;
+}
+
+/**
+ * Ceiling on how many distinct log-named paths are resolved to decide whether they may be handed
+ * back. A document that names more than this many distinct files in its diagnostics is already
+ * outside what any of this is for; past the cap a path is treated as unopenable rather than
+ * trusted unchecked, because the two costs are not symmetric — hiding a location costs a
+ * `file`/`line` in the result, offering an unverified one costs a file outside the project.
+ */
+export const MAX_REPORTED_PATH_CHECKS = 200;
+
+/**
+ * Of the paths these diagnostics name, the ones that must not be handed back as openable: those
+ * that leave the project through a symlink.
+ *
+ * A compile log and a synctex record are both written by the *document*, and a path out of one is
+ * offered to the caller as somewhere to read next (`compile`'s `file`, `list_comments`' `file`).
+ * Refusing only the server's own read leaves the guard one hop deep: the document chooses the
+ * path, the server declines to read it, and then tells the caller they may. Resolved once per
+ * distinct path, since a failing document names the same few files over and over.
+ */
+export async function unopenablePaths(
+  files: LinkChecker,
+  projectDir: string,
+  diagnostics: Array<{ file?: string }>,
+): Promise<Set<string>> {
+  const distinct = new Set<string>();
+  for (const d of diagnostics) if (d.file) distinct.add(d.file);
+  const unopenable = new Set<string>();
+  let checked = 0;
+  for (const file of distinct) {
+    if (checked >= MAX_REPORTED_PATH_CHECKS) {
+      unopenable.add(file);
+      continue;
+    }
+    checked++;
+    if (await files.leavesProjectThroughLink(projectDir, file)) unopenable.add(file);
+  }
+  return unopenable;
+}
+
+/**
+ * The diagnostic without the location, when its path is not ours to hand back. The message is
+ * kept: that the document failed is true whatever its log named, and dropping the whole
+ * diagnostic would hide a real error behind a path problem.
+ */
+export function withoutUnopenableLocation<T extends { file?: string; line?: number }>(
+  diagnostic: T,
+  unopenable: Set<string>,
+): T {
+  if (!diagnostic.file || !unopenable.has(diagnostic.file)) return diagnostic;
+  return { ...diagnostic, file: undefined, line: undefined };
 }
 
 /**
@@ -104,8 +161,8 @@ export async function readSourceLines(
       path: file,
       recordBaseline: false,
       // The path came from a compile log or a synctex record, both of which the document
-      // controls — so a symlink out of the project is refused here even in a local project,
-      // where a link the *user* named is followed.
+      // controls — so a symlink out of the project is refused here even in a project whose
+      // owner opted into following the links they put there.
       strictLinks: true,
     });
     if (note) return undefined; // binary, or over the read cap

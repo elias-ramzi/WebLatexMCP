@@ -2,7 +2,13 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { formatSnippet, readSourceLines, sliceSnippet } from '../lib/sourceSnippet.js';
+import {
+  formatSnippet,
+  readSourceLines,
+  sliceSnippet,
+  unopenablePaths,
+  withoutUnopenableLocation,
+} from '../lib/sourceSnippet.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -24,7 +30,14 @@ const commentShape = z.object({
   page: z.number(),
   note: z.string(),
   quote: z.string().optional().describe('The PDF text the user selected, if any.'),
-  file: z.string().optional().describe('Source file (project-relative), when synctex resolved it.'),
+  file: z
+    .string()
+    .optional()
+    .describe(
+      'Source file (project-relative), when synctex resolved it — and when the path it resolved ' +
+        'to stays inside the project: a synctex record is written from the document, so one ' +
+        'pointing out through a symlink is not handed back as somewhere to read.',
+    ),
   line: z.number().optional().describe('Source line, when synctex resolved it.'),
   snippet: z
     .string()
@@ -72,9 +85,13 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
             sourceOf.set(c.file, await readSourceLines(ctx.files, dir, c.file));
           }
         }
+        // Same rule as compile's diagnostics: a path the *document* chose that leaves the project
+        // through a symlink is not reported as openable, not merely left without a snippet.
+        const unopenable = await unopenablePaths(ctx.files, dir, comments);
 
         const enriched = await Promise.all(
-          comments.map(async (c) => {
+          comments.map(async (raw) => {
+            const c = withoutUnopenableLocation(raw, unopenable);
             let snippet: string | undefined;
             let snippetStartLine: number | undefined;
             if (c.file && c.line) {

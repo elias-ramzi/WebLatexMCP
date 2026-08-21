@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile, symlink } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -38,7 +38,11 @@ function stubCompiler(log: string) {
   };
 }
 
-async function setup(files: Record<string, string>, log: string) {
+async function setup(
+  files: Record<string, string>,
+  log: string,
+  opts: { followSymlinks?: boolean } = {},
+) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-snipws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-snipdir-'));
   cleanups.push(
@@ -53,7 +57,7 @@ async function setup(files: Record<string, string>, log: string) {
   const config: ServerConfig = {
     workspaceRoot: workspace,
     sessionId: 'test',
-    projects: [{ id: 'doc', mode: 'local', path: userDir }],
+    projects: [{ id: 'doc', mode: 'local', path: userDir, followSymlinks: opts.followSymlinks }],
   };
   const ctx = createContext(
     config,
@@ -225,6 +229,52 @@ describe('compile: source context', () => {
     expect(structured.errors[0]?.snippet).toContain('undefmac');
     expect(structured.omittedSnippetLocations).toBe(0);
     expect(textOf(res)).toContain('> 3 |');
+  });
+
+  it('does not hand back a location whose path leaves the project through a symlink', async () => {
+    // The guard on the snippet read is one hop deep on its own: the document chooses the path, the
+    // server declines to read it — and then reports it as a `file` the caller can pass straight to
+    // read_file. In a project whose owner opted into following its links, that read succeeds.
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-snipout-'));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    await writeFile(path.join(outside, 'id_rsa'), 'PRIVATE KEY BYTES\n', 'utf8');
+
+    const { client, userDir } = await setup(
+      { 'main.tex': '\\documentclass{article}\n\\begin{document}\nhi\n\\end{document}\n' },
+      [
+        '(./notes.tex',
+        './notes.tex:1: Undefined control sequence.',
+        "LaTeX Warning: Reference `fig' undefined on input line 1.",
+        ')',
+        '',
+      ].join('\n'),
+      { followSymlinks: true },
+    );
+    await symlink(path.join(outside, 'id_rsa'), path.join(userDir, 'notes.tex'));
+
+    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const structured = res.structuredContent as {
+      errors: Array<{ file?: string; line?: number; message: string; snippet?: string }>;
+      warnings: Array<{ file?: string; line?: number }>;
+      omittedSnippetLocations: number;
+    };
+    // The diagnostic survives — the document did fail — but not as somewhere to go and read.
+    expect(structured.errors[0]?.message).toContain('Undefined control sequence');
+    expect(structured.errors[0]?.file).toBeUndefined();
+    expect(structured.errors[0]?.line).toBeUndefined();
+    expect(structured.errors[0]?.snippet).toBeUndefined();
+    // Warnings come off the same document-written log, so they are held to the same rule.
+    expect(structured.warnings[0]?.file).toBeUndefined();
+    expect(structured.omittedSnippetLocations).toBe(1);
+    expect(textOf(res)).toContain('leave the project through a symlink');
+
+    // What the redaction is worth: this project *does* follow its owner's links, so the read the
+    // caller would have made off that `file` reaches the key.
+    const named = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'doc', path: 'notes.tex' },
+    });
+    expect((named.structuredContent as { content: string }).content).toContain('PRIVATE KEY');
   });
 
   it('says how many locations went without context instead of leaving a silent gap', async () => {
