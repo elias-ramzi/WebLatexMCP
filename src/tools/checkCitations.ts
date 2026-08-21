@@ -114,7 +114,9 @@ async function collectEntries(
   const keylessIn: string[] = [];
   let keyless = 0;
   for (const rel of paths) {
-    const text = await ctx.files.readText(dir, rel);
+    // The caller receives these entries, `raw` included, so this read is the caller's — see
+    // FileService.read on why that decides whether it claims the baseline.
+    const text = await ctx.files.readText(dir, rel, { recordBaseline: true });
     if (!text) continue;
     const parsed = parseReferences(text, rel);
     const keyed = parsed.filter((e) => e.key);
@@ -192,7 +194,9 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         const uses = new Map<string, Array<{ path: string; line: number }>>();
         const scanned: string[] = [];
         for (const rel of docPaths) {
-          const text = await ctx.files.readText(dir, rel);
+          // Ditto: the caller is handed every citation site in these documents, and will act on
+          // them, so a later write must still be able to tell that the file moved underneath it.
+          const text = await ctx.files.readText(dir, rel, { recordBaseline: true });
           if (!text) continue;
           scanned.push(rel);
           for (const use of extractCitations(text, { markdown: isProseDocument(rel) })) {

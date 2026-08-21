@@ -55,22 +55,33 @@ const inputSchema = {
     ),
 };
 
-const errorShape = z.object({
+/** Shared by both arrays; only errors ever carry source context (see {@link errorShape}). */
+const diagnosticShape = z.object({
   severity: z.enum(['error', 'warning']),
-  file: z.string().optional(),
+  file: z
+    .string()
+    .optional()
+    .describe('Source file, project-relative — a path you can pass straight to read_file.'),
   line: z.number().optional(),
   message: z.string(),
   rule: z.string().optional(),
+});
+
+const warningShape = diagnosticShape;
+
+const errorShape = diagnosticShape.extend({
   snippet: z
     .string()
     .optional()
     .describe(
       'The 5 source lines around `line` (2 either side, clamped at the file bounds) — a LaTeX ' +
         'message is often uninterpretable without them, so this usually saves a read_file. ' +
-        'Errors only, at most 10 distinct locations per compile, and never a guess: a warning, a ' +
-        'diagnostic with no file/line, one whose location could not be confirmed against the ' +
-        'file, and one pointing past the end of its file all carry none. Where several errors ' +
-        'share a line, the snippet is attached to the first of them. See omittedSnippetLocations.',
+        'At most 10 distinct locations per compile, and never a guess: a diagnostic with no ' +
+        'file/line, one whose file the log did not name outright (which is every diagnostic ' +
+        'under tectonic, whose logs carry no file:line at all), one the log itself contradicts, ' +
+        'and one pointing past the end of its file all carry none. Where several errors share a ' +
+        'line they share one snippet, attached to the first of them; the result text prints it ' +
+        'once too. See omittedSnippetLocations for how many locations went without.',
     ),
   snippetStartLine: z
     .number()
@@ -94,7 +105,7 @@ const outputSchema = {
     .describe('Clickable file:// URL of the compiled PDF, when produced.'),
   durationSec: z.number(),
   errors: z.array(errorShape),
-  warnings: z.array(errorShape),
+  warnings: z.array(warningShape),
   missingPackages: z
     .array(z.string())
     .describe(
@@ -113,9 +124,10 @@ const outputSchema = {
   omittedSnippetLocations: z
     .number()
     .describe(
-      'How many distinct error locations carry no `snippet` — over the 10-location cap, or ' +
-        'unreadable, or not confirmed against the file. 0 means every attributed error has its ' +
-        'source context, so this is the flag for "there is more to see", not a silent gap.',
+      'How many distinct error **locations** carry no `snippet` — over the 10-location cap, or ' +
+        'unreadable, or not named outright by the log, or contradicted by it. 0 means every ' +
+        'located error has its source context: co-located errors share one snippet, so an error ' +
+        'without one is not a gap when 0. This is the flag for "there is more to see".',
     ),
   hint: z
     .string()
@@ -241,18 +253,29 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
           // Errors sharing a location print the snippet once.
-          const errorLines = errors
-            .slice(0, MAX_TEXT_ERRORS)
+          // Which errors the text lists: the first MAX_TEXT_ERRORS, plus any later one carrying a
+          // snippet. Snippets attach per location while this window counts errors, so capping
+          // purely by position dropped excerpts the server had already paid to read — and the
+          // client this rendering exists for is precisely the one that cannot read them out of
+          // structuredContent. The snippet cap bounds how many extras this can add.
+          let listed = 0;
+          const printable = errors.filter((e) => {
+            if (listed < MAX_TEXT_ERRORS) {
+              listed++;
+              return true;
+            }
+            return e.snippet !== undefined;
+          });
+          const errorLines = printable
             .map((e) => {
               const head = `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`;
-              // attachErrorSnippets already carries the snippet once per location, so printing
-              // whatever each error holds prints every excerpt exactly once.
+              // Each snippet is carried once per location, so this prints every excerpt once.
               return e.snippet ? `${head}\n${formatSnippet(e, e.line)}` : head;
             })
             .join('\n');
           const dropped = [
-            errors.length > MAX_TEXT_ERRORS
-              ? `  … ${errors.length - MAX_TEXT_ERRORS} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
+            errors.length > printable.length
+              ? `  … ${errors.length - printable.length} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
               : '',
             omittedSnippetLocations > 0
               ? `  … no source context for ${omittedSnippetLocations} error location(s) — over the cap, unreadable, or not confirmed against the file`

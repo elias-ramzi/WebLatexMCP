@@ -61,23 +61,6 @@ export interface StructuredError {
   message: string;
   /** Short classification, e.g. "Undefined control sequence". */
   rule?: string;
-  /**
-   * Parser provenance, not part of a tool's output — the snippet layer consumes both and strips
-   * them. Showing the wrong five lines under a `>` marker is worse than showing none, so source
-   * context is only ever attached to a location the parser can vouch for.
-   *
-   * `locatedPair` — `file` and `line` were read off one diagnostic line, so they describe one place
-   * in one file. Absent when they came from independent sources: the balanced-paren file stack for
-   * the file, an `l.<n>` lookahead for the line. A stray `)` echoed in log text pops that stack,
-   * and then the two describe different files.
-   */
-  locatedPair?: boolean;
-  /**
-   * The source text TeX echoed for `line` (its `l.<n> …` context line), when it printed one. Lets
-   * the snippet layer confirm against the file on disk that this really is the reported line — the
-   * only evidence available for a diagnostic whose file had to be inferred.
-   */
-  echo?: string;
 }
 
 /** Local compile backend. */

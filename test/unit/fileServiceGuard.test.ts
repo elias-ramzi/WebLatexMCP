@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat } from 'node:fs/promises';
 import { FileService } from '../../src/services/fileService.js';
 
 /** Simulate a user editing the clone directly, outside the server's tools. */
@@ -86,15 +86,53 @@ describe('FileService out-of-band edit guard', () => {
     }
   });
 
-  it('refuses to read through a symlink that leaves the project', async () => {
+  it('refuses every way through a symlink that leaves the project — writes included', async () => {
+    // Git stores a symlink as mode 120000, so a collaborator can commit one; write is the half
+    // that turns that into someone else's file being overwritten.
     const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside-'));
     try {
-      await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
-      await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+      const secret = path.join(outside, 'secret.txt');
+      await writeFile(secret, 'PRIVATE KEY\n', 'utf8');
+      await symlink(secret, path.join(dir, 'notes.tex'));
+
       await expect(files.read(dir, { path: 'notes.tex' })).rejects.toThrow(/symlink/);
+      await expect(files.readText(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+      await expect(files.write(dir, { path: 'notes.tex', content: 'PWNED\n' })).rejects.toThrow(
+        /symlink/,
+      );
+      await expect(
+        files.applyEdits(dir, 'notes.tex', [{ oldString: 'PRIVATE', newString: 'PWNED' }]),
+      ).rejects.toThrow(/symlink/);
+      await expect(files.delete(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+
+      expect(await readFile(secret, 'utf8')).toBe('PRIVATE KEY\n');
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+
+  it('refuses a write through a symlink whose target does not exist yet', async () => {
+    // realpath cannot see where a dangling link points, but writeFile follows it and creates the
+    // file at the other end.
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-dangling-'));
+    try {
+      const target = path.join(outside, 'not-yet.txt');
+      await symlink(target, path.join(dir, 'new.tex'));
+      await expect(files.write(dir, { path: 'new.tex', content: 'PWNED\n' })).rejects.toThrow(
+        /symlink/,
+      );
+      await expect(stat(target)).rejects.toThrow();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('still writes a file that does not exist yet, and one inside a new subdirectory', async () => {
+    expect((await files.write(dir, { path: 'fresh.tex', content: 'hi\n' })).created).toBe(true);
+    expect(
+      (await files.write(dir, { path: 'sub/deep/new.tex', content: 'hi\n', createDirs: true }))
+        .created,
+    ).toBe(true);
   });
 
   it('allows writing a file it never read (no baseline)', async () => {

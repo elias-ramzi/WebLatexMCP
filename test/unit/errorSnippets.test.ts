@@ -5,9 +5,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FileService } from '../../src/services/fileService.js';
 import { parseLog } from '../../src/services/logParser.js';
-import { attachErrorSnippets, MAX_SNIPPET_LOCATIONS } from '../../src/lib/errorSnippets.js';
+import {
+  attachErrorSnippets,
+  MAX_SNIPPET_FILE_READS,
+  MAX_SNIPPET_LOCATIONS,
+} from '../../src/lib/errorSnippets.js';
 import { formatSnippet, MAX_SNIPPET_LINE_CHARS } from '../../src/lib/sourceSnippet.js';
-import type { StructuredError } from '../../src/types.js';
+import type { ParsedDiagnostic } from '../../src/services/logParser.js';
 
 const FIXTURE = fileURLToPath(new URL('../fixtures/sample-latex', import.meta.url));
 
@@ -30,7 +34,7 @@ async function projectWith(files: Record<string, string>): Promise<string> {
 }
 
 /** An error located the way `-file-line-error` locates one: file and line off the same log line. */
-function at(file: string, line: number, extra: Partial<StructuredError> = {}): StructuredError {
+function at(file: string, line: number, extra: Partial<ParsedDiagnostic> = {}): ParsedDiagnostic {
   return { severity: 'error', file, line, message: 'boom', locatedPair: true, ...extra };
 }
 
@@ -131,12 +135,21 @@ describe('attachErrorSnippets', () => {
     expect(omittedLocations).toBe(0);
   });
 
+  it('counts a nonsensical line rather than treating it as unattributed', async () => {
+    const dir = await projectWith({ 'main.tex': 'a\nb\nc' });
+    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+      at('main.tex', 0, { message: 'line 0 is not a line' }),
+    ]);
+    expect(errors[0]!.snippet).toBeUndefined();
+    expect(omittedLocations).toBe(1);
+  });
+
   it('skips — and counts — a location it cannot read', async () => {
     const dir = await projectWith({ 'main.tex': 'a\nb\nc' });
     const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
       at('gone.tex', 2, { message: 'deleted since' }),
       at('/usr/share/texmf/tex/latex/foo.sty', 9, { message: 'outside the project' }),
-      at('../../etc/passwd', 1, { message: 'escapes the project' }),
+      at('../../etc/passwd.tex', 1, { message: 'escapes the project' }),
     ]);
     expect(errors.map((e) => e.snippet)).toEqual([undefined, undefined, undefined]);
     expect(omittedLocations).toBe(3);
@@ -176,30 +189,48 @@ describe('attachErrorSnippets', () => {
       expect(omittedLocations).toBe(2);
     });
 
-    it('shows an inferred location only when TeX’s echo matches the file', async () => {
-      const dir = await projectWith({ 'main.tex': 'one\ntwo\nthree\nfour\nfive' });
-      const inferred = (echo: string | undefined): StructuredError => ({
+    it('never shows a location the log did not name outright', async () => {
+      // The paren-stack + l.<n> pairing is what tectonic's logs (no -file-line-error) always give,
+      // and what latexmk gives for a bare "! ". TeX eliding a long line can drop an opening `(`,
+      // pop the stack, and land on a file whose line 4 is `\\end{itemize}` too — boilerplate
+      // corroborates a wrong file, so an inferred location is counted rather than illustrated.
+      const dir = await projectWith({
+        'main.tex': 'a\n\\begin{itemize}\n\\item x\n\\end{itemize}',
+      });
+      const inferred: ParsedDiagnostic = {
         severity: 'error',
         file: 'main.tex',
-        line: 3,
+        line: 4,
         message: 'Undefined control sequence.',
-        echo,
-      });
-
-      // Matches the real line 3 — the paren stack and the l.<n> agree.
-      const ok = await attachErrorSnippets(new FileService(), dir, [inferred('three')]);
-      expect(ok.errors[0]!.snippet).toBeDefined();
-
-      // The stack pointed at the wrong file: what TeX echoed is not what line 3 says.
-      const wrong = await attachErrorSnippets(new FileService(), dir, [
-        inferred('\\begin{tabular}{ll}'),
+        echo: '\\end{itemize}',
+      };
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        inferred,
       ]);
-      expect(wrong.errors[0]!.snippet).toBeUndefined();
-      expect(wrong.omittedLocations).toBe(1);
+      expect(errors[0]!.snippet).toBeUndefined();
+      expect(omittedLocations).toBe(1);
+    });
 
-      // No echo at all: nothing to confirm the pairing with.
-      const none = await attachErrorSnippets(new FileService(), dir, [inferred(undefined)]);
-      expect(none.errors[0]!.snippet).toBeUndefined();
+    it('vetoes a named location whose file contradicts the echo', async () => {
+      const dir = await projectWith({ 'main.tex': 'one\ntwo\nthree' });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 2, { echo: 'nothing like line two' }),
+      ]);
+      expect(errors[0]!.snippet).toBeUndefined();
+      expect(omittedLocations).toBe(1);
+    });
+
+    it('keeps a veto once earned, whatever a co-located diagnostic says', async () => {
+      // parseLog emits no echo whenever the l.<n> it found was for another line, so a
+      // contradicted location routinely sits beside a silent one. The contradiction is about the
+      // location, so it stands — the analogue of a shadow-store collision staying flagged.
+      const dir = await projectWith({ 'main.tex': 'one\ntwo\nthree' });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 2, { message: 'contradicted', echo: 'nothing like line two' }),
+        at('main.tex', 2, { message: 'silent' }),
+      ]);
+      expect(errors.map((e) => e.snippet)).toEqual([undefined, undefined]);
+      expect(omittedLocations).toBe(1);
     });
 
     it('accepts the left-elided echo TeX actually prints for a long line', async () => {
@@ -213,21 +244,15 @@ describe('attachErrorSnippets', () => {
       expect(errors[0]!.snippet).toContain('\\thismacrodoesnotexist');
     });
 
-    it('accepts an echo truncated at the error position', async () => {
-      const dir = await projectWith({ 'main.tex': 'a\n\\foo bar baz\nc' });
-      const { errors } = await attachErrorSnippets(new FileService(), dir, [
-        { severity: 'error', file: 'main.tex', line: 2, message: 'boom', echo: '\\foo' },
-      ]);
-      expect(errors[0]!.snippet).toContain('\\foo bar baz');
-    });
-
-    it('vetoes a located pair whose file contradicts the echo', async () => {
-      const dir = await projectWith({ 'main.tex': 'one\ntwo\nthree' });
-      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
-        at('main.tex', 2, { echo: 'nothing like line two' }),
-      ]);
-      expect(errors[0]!.snippet).toBeUndefined();
-      expect(omittedLocations).toBe(1);
+    it('does not veto a context line glued to its padded continuation by the 79-column unwrap', () => {
+      return (async () => {
+        const dir = await projectWith({ 'main.tex': 'a\n\\foo bar baz qux\nc' });
+        const { errors } = await attachErrorSnippets(new FileService(), dir, [
+          // unwrapLines joined "l.2 \\foo bar" with TeX's padded remainder "  baz qux".
+          at('main.tex', 2, { echo: '\\foo bar          baz qux' }),
+        ]);
+        expect(errors[0]!.snippet).toContain('\\foo bar baz qux');
+      })();
     });
   });
 
@@ -243,6 +268,42 @@ describe('attachErrorSnippets', () => {
     expect(omittedLocations).toBe(3);
     expect(errors.filter((e) => e.snippet !== undefined)).toHaveLength(MAX_SNIPPET_LOCATIONS);
     expect(errors[MAX_SNIPPET_LOCATIONS]!.snippet).toBeUndefined();
+  });
+
+  it('does not let unshowable locations eat the cap', async () => {
+    // A real log lists TeX-tree .sty paths freely — an \\usepackage[nosuchoption]{hyperref}
+    // compile emits /usr/share/texlive/…/hyperref.sty:4421: — and they are .sty, so they used to
+    // be selected, then die at the sandbox, having spent the whole quota before the real error.
+    const dir = await projectWith({ 'main.tex': 'one\ntwo\nthree\nfour\nfive' });
+    const junk = Array.from({ length: MAX_SNIPPET_LOCATIONS }, (_, i) =>
+      at(`/usr/share/texlive/texmf-dist/tex/latex/hyperref/hyperref.sty`, 4000 + i, {
+        message: 'package internals',
+      }),
+    );
+    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+      ...junk,
+      at('main.tex', 3, { message: 'the one that matters', echo: 'three' }),
+    ]);
+
+    expect(errors.at(-1)!.snippet).toContain('three');
+    expect(omittedLocations).toBe(MAX_SNIPPET_LOCATIONS);
+  });
+
+  it('bounds how many files it will open looking for showable locations', async () => {
+    const dir = await projectWith({ 'main.tex': 'a\nb\nc' });
+    const reads: string[] = [];
+    const real = new FileService();
+    const spy = {
+      read: (projectDir: string, opts: { path: string; recordBaseline?: boolean }) => {
+        reads.push(opts.path);
+        return real.read(projectDir, opts);
+      },
+    };
+    // 200 distinct files that do not exist: none yields a snippet, and the search must stop.
+    const missing = Array.from({ length: 200 }, (_, i) => at(`gone-${i}.tex`, 1));
+    const { omittedLocations } = await attachErrorSnippets(spy, dir, missing);
+    expect(reads.length).toBeLessThanOrEqual(MAX_SNIPPET_FILE_READS);
+    expect(omittedLocations).toBe(200);
   });
 
   it('bounds a snippet taken from a document written on one enormous line', async () => {
@@ -284,6 +345,26 @@ describe('attachErrorSnippets', () => {
     expect(text).toContain('> 4 | d');
     // No sixth, empty line borrowed from the file's trailing newline.
     expect(text.split('\n').at(-1)).toContain('d');
+  });
+
+  it('checks a location once, not once per diagnostic sitting on it', async () => {
+    // A generated or converted .tex puts the whole body on line 1, so every error is co-located on
+    // a line that can be megabytes. Verifying the echo per *error* re-normalized that line each
+    // time — 1.6s for a 500KB line and 1000 errors, inside the per-project lock. The echo below
+    // never matches, which is the case that used to re-run the check every time.
+    const huge = 'the quick brown fox jumps over the lazy dog. '.repeat(12_000); // ~500KB
+    const dir = await projectWith({ 'main.tex': `${huge}\nsecond line` });
+    const many = Array.from({ length: 1000 }, (_, i) =>
+      at('main.tex', 1, { message: `err ${i}`, echo: 'nothing like the line' }),
+    );
+
+    const started = process.hrtime.bigint();
+    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, many);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+
+    expect(errors.every((e) => e.snippet === undefined)).toBe(true); // contradicted, so counted
+    expect(omittedLocations).toBe(1);
+    expect(ms).toBeLessThan(500);
   });
 
   it('does not go quadratic on a document that fails with thousands of errors', async () => {

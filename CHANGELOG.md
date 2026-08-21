@@ -99,33 +99,31 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   recorded a revision baseline as though the caller had read those files, so a `write_file` after a
   hand edit could overwrite it with no `ExternalChangeError`. `FileService.read`/`readText` now record
   only when asked to, which only `read_file` and `add_citation` do.
+- **A symlink can no longer take a write out of the project.** `resolveInside` compares strings, so a
+  `notes.tex` symlinked outside the clone — git stores one as mode 120000, so a collaborator can commit
+  it — was written, edited and deleted at the far end. Every read and write resolves links first now,
+  including for a file that does not exist yet: a write follows a dangling link and creates the file
+  wherever it points.
 - **`read_file` no longer counts a phantom last line.** A file ending in a newline reported one line
   more than it has, and a range ending on it returned a blank line; CRLF and CR-only files are now split
   correctly instead of leaving `\r` on every line (or, for CR-only, returning the whole file as line 1).
+- **A ranged `read_file` hands back the bytes that are on disk.** Line endings were normalized to `\n`
+  on the way out, so pasting a range from a CRLF file into `edit_file`'s `oldString` failed to match;
+  the `ref` path also called a whole-file read truncated and dropped the trailing newline, which
+  `push` resolutions write straight back into the repository.
+- **Compile logs written on Windows parse at all.** pdfTeX writes its `.log` in text mode, so every line
+  arrives with a trailing `\r` — which the diagnostic patterns do not cross and `extname` keeps. Left
+  unhandled it emptied the parser, and CI's TeX job is Linux-only, so nothing caught it.
 - **`compile` resolves a root file in a subdirectory.** latexmk's `-cd` makes the log's paths relative
   to the root file's directory, so a document at `paper/main.tex` reported its errors in `main.tex`;
   they are now rebased onto the project root.
 - **The collapsed "TikZ externalization failed for N figures" error no longer claims a location** — it
   inherited the first figure's file and line, pointing at source where nothing is wrong.
-
-- **The `.mcpb` Desktop Extension could not start.** `.mcpbignore` excluded `src/` unanchored, which
-  matches a directory of that name at any depth — including `node_modules/debug/src/`, where that
-  package's `main` points. The packed bundle was therefore missing the entry point of a transitive
-  runtime dependency (via `simple-git`) and died on startup with
-  `Cannot find package …/debug/src/index.js`. This affected the published 0.4.0 bundle. Our own
-  directories are now anchored (`/src/`, `/test/`, …), and the bundle workflow starts the packed
-  server before attaching it to a release, so a bundle that cannot boot never ships again.
-- `manifest.json` had fallen a release behind the other version manifests, so a locally built
-  Desktop Extension (`npm run bundle`, which does not sync it the way the release workflow does) was
-  labelled with the previous version. A unit test now asserts `package.json`, `plugin.json`,
-  `marketplace.json`, `manifest.json` and the lockfile all agree, so the gate fails instead.
-- The per-project build directory is keyed by the project's full path rather than its basename, so two
-  projects whose directories share a name no longer share a build directory (and surface each other's
-  PDF).
-- `list_projects` no longer points at `OVERLEAF_MCP_PROJECTS`, an environment variable that no longer
-  exists; an empty workspace now explains how to register a project.
-- Relative paths in `WEB_LATEX_MCP_PROJECTS` resolve against the server's launch directory rather than
-  the process working directory.
+- **A diagnostic printed without a source position no longer borrows the next one's.** The `l.<n>` scan
+  ran past whatever followed, so a `! Package hyperref Error` above an unrelated
+  `! Undefined control sequence` was reported at that error's line.
+- **A warning's `file` is rebased like an error's**, so it too is a path `read_file` can open when the
+  root file lives in a subdirectory.
 
 ## [0.5.0] - 2026-08-20
 
@@ -154,6 +152,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - Writing guide gains a **Citations** section on where `\cite{}` goes in the prose: never in the
   abstract, on first mention in the main text, re-anchored at each major section boundary (readers jump
   straight to the Method or Experiments), and never twice for the same work within a section.
+
+### Fixed
+
+- **The `.mcpb` Desktop Extension could not start.** `.mcpbignore` excluded `src/` unanchored, which
+  matches a directory of that name at any depth — including `node_modules/debug/src/`, where that
+  package's `main` points. The packed bundle was therefore missing the entry point of a transitive
+  runtime dependency (via `simple-git`) and died on startup with
+  `Cannot find package …/debug/src/index.js`. This affected the published 0.4.0 bundle. Our own
+  directories are now anchored (`/src/`, `/test/`, …), and the bundle workflow starts the packed
+  server before attaching it to a release, so a bundle that cannot boot never ships again.
+- `manifest.json` had fallen a release behind the other version manifests, so a locally built
+  Desktop Extension (`npm run bundle`, which does not sync it the way the release workflow does) was
+  labelled with the previous version. A unit test now asserts `package.json`, `plugin.json`,
+  `marketplace.json`, `manifest.json` and the lockfile all agree, so the gate fails instead.
+- The per-project build directory is keyed by the project's full path rather than its basename, so two
+  projects whose directories share a name no longer share a build directory (and surface each other's
+  PDF).
+- `list_projects` no longer points at `OVERLEAF_MCP_PROJECTS`, an environment variable that no longer
+  exists; an empty workspace now explains how to register a project.
+- Relative paths in `WEB_LATEX_MCP_PROJECTS` resolve against the server's launch directory rather than
+  the process working directory.
 
 ## [0.4.0] - 2026-07-28
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
@@ -161,6 +161,88 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
     expect(againStructured.added).toBe(false);
     expect(againStructured.alreadyPresent).toBe(true);
     expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(onDisk);
+  });
+
+  it('a no-op add_citation does not re-arm the guard over a hand edit', async () => {
+    // The read that decides "already present" happens before the early return, so recording a
+    // baseline there re-filed the user's hand edit as seen — wiping out a refusal the caller's
+    // own earlier read had correctly armed. Same shape as a compile arming the guard while only
+    // sniffing for a root file: a path that writes nothing must claim nothing.
+    const { client, dir } = await setup({
+      'main.tex': 'x\n',
+      'refs.bib': '@misc{DBLP:conf/cvpr/HeZRS16, title={Already here}}\n',
+    });
+
+    // The caller reads it, so the guard is armed on what it saw.
+    await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'demo', path: 'refs.bib' },
+    });
+
+    // The user edits the bibliography by hand, in Overleaf.
+    const edited = '@misc{DBLP:conf/cvpr/HeZRS16, title={Edited by the user}}\n';
+    await writeFile(path.join(dir, 'refs.bib'), edited, 'utf8');
+
+    const noop = await client.callTool({
+      name: 'add_citation',
+      arguments: { key: 'conf/cvpr/HeZRS16' },
+    });
+    expect((noop.structuredContent as { added: boolean }).added).toBe(false);
+
+    const write = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'refs.bib',
+        content: '@misc{other, title={From the agent}}\n',
+        confirmBibEdit: true,
+      },
+    });
+    expect(JSON.stringify(write.content)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(edited);
+  });
+
+  it('add_citation still appends onto a hand-edited .bib rather than refusing', async () => {
+    // It only ever appends to the bytes it just read under the project lock, so a hand edit is
+    // built on, never lost — the staleness check would refuse a write that is already safe.
+    const { client, dir } = await setup({
+      'main.tex': 'x\n',
+      'refs.bib': '@misc{seed, title={Seed}}\n',
+    });
+    await client.callTool({ name: 'read_file', arguments: { project: 'demo', path: 'refs.bib' } });
+    await writeFile(path.join(dir, 'refs.bib'), '@misc{seed, title={Edited by hand}}\n', 'utf8');
+
+    const added = await client.callTool({
+      name: 'add_citation',
+      arguments: { key: 'conf/cvpr/HeZRS16' },
+    });
+    expect(added.isError).toBeFalsy();
+    const onDisk = await readFile(path.join(dir, 'refs.bib'), 'utf8');
+    expect(onDisk).toContain('Edited by hand');
+    expect(onDisk).toContain('Deep Residual Learning');
+  });
+
+  it('list_references arms the guard for the bibliography it hands back', async () => {
+    // Its entries go back to the caller verbatim, so a later whole-file write has to be able to
+    // tell that the file moved underneath it.
+    const { client, dir } = await setup({
+      'main.tex': 'x\n',
+      'refs.bib': '@misc{seed, title={Seed}}\n',
+    });
+
+    await client.callTool({ name: 'list_references', arguments: { project: 'demo' } });
+    await writeFile(path.join(dir, 'refs.bib'), '@misc{seed, title={Edited by hand}}\n', 'utf8');
+
+    const write = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'refs.bib',
+        content: '@misc{seed, title={From the agent}}\n',
+        confirmBibEdit: true,
+      },
+    });
+    expect(JSON.stringify(write.content)).toContain('changed on disk');
   });
 
   it('errors clearly when the target .bib is ambiguous', async () => {

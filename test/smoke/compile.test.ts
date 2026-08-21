@@ -112,14 +112,15 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
     }
   }, 60_000);
 
-  it('still finds the source when the log has no -file-line-error (tectonic’s shape)', async () => {
-    // Tectonic passes no -file-line-error, so every diagnostic takes the bare "! " branch: the file
-    // comes from the paren stack and the line from the l.<n> below it. The echo is what confirms
-    // the two agree before any source is shown.
+  it('shows no source when the log has no -file-line-error (tectonic’s shape)', async () => {
+    // Tectonic passes no -file-line-error, so every diagnostic takes the bare "! " branch, where
+    // the file comes from the balanced-paren stack and the line from a nearby l.<n>. TeX's own
+    // elision of a long line can drop an opening `(` and pop that stack, and boilerplate source
+    // corroborates the wrong file it lands on — so such a location is counted, never illustrated.
     const plain = await mkdtemp(path.join(os.tmpdir(), 'ovl-plain-'));
     try {
       await cp(FIXTURE, plain, { recursive: true });
-      const res = await execFileAsync(
+      await execFileAsync(
         'latexmk',
         [
           '-pdf',
@@ -128,17 +129,22 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
           'main-broken.tex',
         ],
         { cwd: plain },
-      ).catch((e: unknown) => e as { stdout?: string });
-      void res;
+      ).catch(() => undefined);
       const log = await readFile(path.join(plain, 'build', 'main-broken.log'), 'utf8');
+
       const parsed = parseLog(log);
       const bare = parsed.errors.find((e) => /undefined control sequence/i.test(e.message));
       expect(bare?.locatedPair).toBeUndefined(); // inferred, not read off one line
-      expect(bare?.line).toBe(3);
+      expect(bare).toMatchObject({ file: 'main-broken.tex', line: 3 });
 
-      const { errors } = await attachErrorSnippets(new FileService(), plain, parsed.errors);
+      const { errors, omittedLocations } = await attachErrorSnippets(
+        new FileService(),
+        plain,
+        parsed.errors,
+      );
       const shown = errors.find((e) => /undefined control sequence/i.test(e.message));
-      expect(shown?.snippet).toContain('\\thismacrodoesnotexist');
+      expect(shown?.snippet).toBeUndefined();
+      expect(omittedLocations).toBe(1); // reported, not silently missing
     } finally {
       await rm(plain, { recursive: true, force: true });
     }

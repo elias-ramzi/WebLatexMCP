@@ -124,6 +124,34 @@ describe('compile: source context', () => {
     expect(textOf(res)).toContain('> 3 | bad \\nope');
   });
 
+  it('rebases a warning’s file too, so read_file can open it', async () => {
+    const { client } = await setup(
+      {
+        'paper/main.tex': '\\documentclass{article}\n\\begin{document}\nhi\n\\end{document}\n',
+        'paper/sections/intro.tex': 'one\ntwo\nthree\n',
+      },
+      [
+        '(./sections/intro.tex',
+        "LaTeX Warning: Reference `fig:x' undefined on input line 2.",
+        ')',
+      ].join('\n'),
+    );
+
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc', rootFile: 'paper/main.tex' },
+    });
+    const structured = res.structuredContent as { warnings: Array<{ file?: string }> };
+    expect(structured.warnings[0]?.file).toBe('paper/sections/intro.tex');
+
+    // The point of rebasing: the path a diagnostic names is one the caller can open.
+    const read = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'doc', path: structured.warnings[0]?.file },
+    });
+    expect(read.isError ?? false).toBe(false);
+  });
+
   it('reads the root file’s own directory, not a same-named file at the project root', async () => {
     // latexmk's -cd makes the log say "./main.tex" for a document at paper/main.tex.
     const { client } = await setup(
@@ -146,6 +174,33 @@ describe('compile: source context', () => {
     expect(structured.errors[0]?.snippet).toContain('real \\nope');
     expect(structured.errors[0]?.snippet).not.toContain('DECOY');
     expect(textOf(res)).not.toContain('DECOY');
+  });
+
+  it('prints every excerpt it read, even past the error-listing window', async () => {
+    // The routine pair — "Undefined control sequence" then "Missing $ inserted" — puts two errors
+    // on each line, so twelve errors span six locations. Capping the text by error position
+    // dropped excerpts the client that cannot read structuredContent will never see otherwise.
+    const body = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n');
+    const log: string[] = [];
+    for (let i = 1; i <= 6; i++) {
+      log.push(`./main.tex:${i}: Undefined control sequence.`, `l.${i} line ${i}`);
+      log.push(`./main.tex:${i}: Missing $ inserted.`, `l.${i} line ${i}`);
+    }
+    const { client } = await setup({ 'main.tex': body }, log.join('\n'));
+
+    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const structured = res.structuredContent as {
+      errors: Array<{ snippet?: string }>;
+      omittedSnippetLocations: number;
+    };
+    const text = textOf(res);
+
+    expect(structured.errors).toHaveLength(12);
+    const withSnippet = structured.errors.filter((e) => e.snippet !== undefined);
+    expect(withSnippet).toHaveLength(6); // one per location
+    expect(structured.omittedSnippetLocations).toBe(0);
+    // Every one of them reaches the text, marked at its own line.
+    for (let i = 1; i <= 6; i++) expect(text).toContain(`> ${i} | line ${i}`);
   });
 
   it('says how many locations went without context instead of leaving a silent gap', async () => {

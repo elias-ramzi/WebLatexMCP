@@ -1,7 +1,6 @@
-import path from 'node:path';
 import type { StructuredError } from '../types.js';
-import { splitLines } from './lines.js';
-import { sliceSnippet } from './sourceSnippet.js';
+import type { ParsedDiagnostic } from '../services/logParser.js';
+import { isReadableSourcePath, readSourceLines, sliceSnippet } from './sourceSnippet.js';
 import type { SnippetReader, SourceSnippet } from './sourceSnippet.js';
 
 /**
@@ -11,16 +10,15 @@ import type { SnippetReader, SourceSnippet } from './sourceSnippet.js';
 export const MAX_SNIPPET_LOCATIONS = 10;
 
 /**
- * Extensions a compile log may send the server to read.
- *
- * The log is **document-controlled**: `\typeout{creds.txt:1: Undefined control sequence.}` in a
- * `.tex` prints a line indistinguishable from a real `-file-line-error` diagnostic, and without this
- * the server would read that file and echo it into the result. Restricting to the kinds of file a
- * LaTeX error can genuinely be attributed to costs nothing real and takes the interesting targets
- * off the table. It matters most for a `mode: 'local'` project registered over a working directory,
- * where the neighbours are the user's own files.
+ * Ceiling on the files opened while filling that quota. Locations that turn out to be unshowable
+ * do not consume a snippet slot (a real log names plenty: a `.sty` in the TeX tree, a file deleted
+ * since the build), so without a separate bound a pathological log could send the server through
+ * hundreds of files — inside the per-project lock, where the time is paid by peer sessions.
  */
-const SOURCE_EXT = new Set(['.tex', '.ltx', '.sty', '.cls', '.def', '.clo', '.bib', '.bbl']);
+export const MAX_SNIPPET_FILE_READS = 30;
+
+/** Shortest echo fragment that can contradict anything; below it, TeX told us too little. */
+const MIN_ECHO_CHARS = 4;
 
 /** A diagnostic plus the source it points at, when there is one we can vouch for. */
 export type ErrorWithSnippet = StructuredError & Partial<SourceSnippet>;
@@ -33,11 +31,11 @@ interface ErrorLocation {
 
 /** The location a diagnostic names, or undefined — half a location is not one. */
 function locationOf(err: StructuredError): ErrorLocation | undefined {
-  if (!err.file || !err.line) return undefined;
+  if (!err.file || err.line === undefined) return undefined;
   return { file: err.file, line: err.line };
 }
 
-/** Stable key for a location, for the Set/Map that group diagnostics by where they point. */
+/** Stable key for a location, for the Maps that group diagnostics by where they point. */
 function locationKey(loc: ErrorLocation): string {
   return `${loc.file} ${loc.line}`;
 }
@@ -47,29 +45,33 @@ function normalizeWhitespace(s: string): string {
 }
 
 /**
- * Confirm a location against the file on disk before showing it.
+ * Does TeX's echo of the source line contradict what the file actually says there?
  *
- * TeX echoes the offending source line under an error (`l.<n> …`), cut at the error position — and
- * elides the left of a long one with a literal `...`, so what it prints is a *fragment* of the real
- * line, not always a prefix of it. When the parser had to infer *which file* a diagnostic belongs
- * to — the balanced-paren stack, not a `file:line:` prefix — that fragment is the only evidence the
- * file and the line describe the same place, so it is required. Where the pair came off one
- * diagnostic line it is trusted, and the echo is used only to *veto*: if TeX's text and the file's
- * text disagree, something is stale or mis-resolved, and five lines under a `>` marker would be a
- * confident lie.
+ * TeX prints the offending line under an error as `l.<n> …`, cut at the error position and, for a
+ * long line, left-elided with a literal `...`. That echo is evidence *against* a location, never
+ * for one: it is checked to catch a stale or mis-resolved file, and anything it cannot settle
+ * counts as no contradiction rather than as agreement.
  */
-function echoAgrees(err: StructuredError, sourceLine: string): boolean {
-  const echo = normalizeWhitespace((err.echo ?? '').replace(/^\.\.\./, ''));
-  if (echo.length < 4) return err.locatedPair === true; // too little to tell anything from
-  return normalizeWhitespace(sourceLine).includes(echo);
+function echoContradicts(rawEcho: string | undefined, source: string): boolean {
+  if (!rawEcho) return false; // TeX printed no context line: nothing to check
+  const elided = rawEcho.startsWith('...');
+  const stripped = rawEcho.replace(/^\.\.\./, '');
+  // A context line landing exactly on TeX's 79-column wrap is glued to its padded continuation by
+  // unwrapLines, so also try the part before that padding rather than vetoing a good location.
+  for (const fragment of [stripped, stripped.split(/\s{2,}/)[0] ?? '']) {
+    const echo = normalizeWhitespace(fragment);
+    if (echo.length < MIN_ECHO_CHARS) return false;
+    if (elided ? source.includes(echo) : source.startsWith(echo)) return false;
+  }
+  return true;
 }
 
 export interface SnippetOutcome {
   errors: ErrorWithSnippet[];
   /**
-   * Distinct attributed locations left without source context — over the cap, unreadable, of a kind
-   * not read, unconfirmed, or pointing past the end of their file. Zero means every attributed
-   * error carries its source, which is the only reason to report it at all.
+   * Distinct attributed **locations** left without source context — over the cap, unreadable, of a
+   * kind not opened, contradicted by the log, past the end of their file, or never named outright
+   * by the log. Zero means every located error has its source.
    */
   omittedLocations: number;
 }
@@ -80,73 +82,68 @@ export interface SnippetOutcome {
  * line where TeX noticed rather than where the author erred — so without this the caller spends a
  * `read_file` round-trip per error.
  *
- * The rules, in order of what they protect:
+ * Showing the wrong five lines under a `>` marker is worse than showing none, so a location earns
+ * its snippet only by clearing all of:
  *
- * - **Never guessed.** A diagnostic with no `file`/`line`, one whose location the parser cannot
- *   vouch for (see {@link echoAgrees}), or one naming a line its file does not have gets none.
- * - **Never a file the document merely named** — see {@link SOURCE_EXT}.
- * - **Once per location.** Co-located errors share one read *and* one copy of the text: the snippet
- *   is attached to the first error at each location, exactly as the result text prints it once.
- * - **Capped** at `max` distinct locations, reading each file once rather than once per line.
+ * - **The log named it outright.** `file` and `line` must come off one diagnostic line
+ *   (`-file-line-error`). A location pieced together from the balanced-paren file stack and a
+ *   nearby `l.<n>` is not shown at all: TeX's own elision of a long line can drop an opening `(`
+ *   and pop that stack, and the wrong file it lands on is one that boilerplate source (`\item`,
+ *   `\end{itemize}`) will happily corroborate. Those locations are counted, not guessed at.
+ * - **The file is one we open** — see `isReadableSourcePath`.
+ * - **The line exists, and TeX's echo does not contradict it.** A contradiction sticks: a
+ *   co-located diagnostic carrying no echo cannot clear it, because the evidence was about the
+ *   location, not about one message.
+ *
+ * A location that fails is not charged against the cap — ten TeX-tree `.sty` paths ahead of the
+ * real error used to starve it of its snippet.
  */
 export async function attachErrorSnippets(
   files: SnippetReader,
   projectDir: string,
-  errors: StructuredError[],
+  errors: ParsedDiagnostic[],
   max: number = MAX_SNIPPET_LOCATIONS,
 ): Promise<SnippetOutcome> {
-  // Distinct locations in first-seen order. The Set is membership only — scanning the kept array
-  // instead is quadratic, and a failed compile can carry thousands of diagnostics.
-  const seen = new Set<string>();
-  const selected: ErrorLocation[] = [];
-  let omittedLocations = 0;
+  // Group by location, keeping first-seen order. A Map, not a scan of an array: a failed compile
+  // can carry thousands of diagnostics, and `includes` over the distinct ones is quadratic.
+  const order: ErrorLocation[] = [];
+  const grouped = new Map<string, ParsedDiagnostic[]>();
   for (const err of errors) {
     const loc = locationOf(err);
     if (!loc) continue;
     const key = locationKey(loc);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (selected.length < Math.max(0, max)) selected.push(loc);
-    else omittedLocations++;
+    const group = grouped.get(key);
+    if (group) group.push(err);
+    else {
+      grouped.set(key, [err]);
+      order.push(loc);
+    }
   }
 
-  // Group by file so a document with ten errors is read once, not ten times — this runs inside the
-  // per-project lock, where every millisecond is one a peer session waits.
-  const byFile = new Map<string, ErrorLocation[]>();
-  for (const loc of selected) {
-    const group = byFile.get(loc.file);
-    if (group) group.push(loc);
-    else byFile.set(loc.file, [loc]);
-  }
-
-  const snippets = new Map<string, SourceSnippet>();
-  const lineText = new Map<string, string>();
-  await Promise.all(
-    [...byFile.entries()].map(async ([file, locs]) => {
-      const lines = await readSourceLines(files, projectDir, file);
-      for (const loc of locs) {
-        const slice = lines ? sliceSnippet(lines, loc.line) : undefined;
-        if (!slice || !lines) {
-          omittedLocations++;
-          continue;
-        }
-        snippets.set(locationKey(loc), slice);
-        lineText.set(locationKey(loc), lines[loc.line - 1] ?? '');
-      }
-    }),
-  );
-
-  // Verification is a property of the location, not of one diagnostic: several errors can sit on
-  // one line and only some of them carry an echo. Decide once, then attach once.
-  const showable = new Set<string>();
-  for (const err of errors) {
-    const loc = locationOf(err);
-    if (!loc) continue;
+  const shown = new Map<string, SourceSnippet>();
+  const fileLines = new Map<string, string[] | undefined>();
+  let filesRead = 0;
+  for (const loc of order) {
+    if (shown.size >= Math.max(0, max)) break;
     const key = locationKey(loc);
-    if (!snippets.has(key) || showable.has(key)) continue;
-    if (echoAgrees(err, lineText.get(key) ?? '')) showable.add(key);
+    const group = grouped.get(key) ?? [];
+    if (!group.some((e) => e.locatedPair)) continue;
+    if (!isReadableSourcePath(loc.file)) continue;
+    if (!fileLines.has(loc.file)) {
+      if (filesRead >= MAX_SNIPPET_FILE_READS) continue;
+      filesRead++;
+      fileLines.set(loc.file, await readSourceLines(files, projectDir, loc.file));
+    }
+    const lines = fileLines.get(loc.file);
+    if (!lines) continue;
+    const slice = sliceSnippet(lines, loc.line);
+    if (!slice) continue;
+    // Normalized once per location, not once per diagnostic: a generated one-line document puts
+    // every error on line 1, and re-normalizing a 2MB line per error cost seconds under the lock.
+    const source = normalizeWhitespace(lines[loc.line - 1] ?? '');
+    if (group.some((e) => echoContradicts(e.echo, source))) continue;
+    shown.set(key, slice);
   }
-  omittedLocations += [...snippets.keys()].filter((key) => !showable.has(key)).length;
 
   const attached = new Set<string>();
   const enriched = errors.map((err) => {
@@ -155,31 +152,12 @@ export async function attachErrorSnippets(
     const loc = locationOf(err);
     if (!loc) return clean;
     const key = locationKey(loc);
-    const slice = snippets.get(key);
-    if (!slice || !showable.has(key) || attached.has(key)) return clean;
+    const slice = shown.get(key);
+    // Once per location: the co-located errors after the first carry no copy of the text.
+    if (!slice || attached.has(key)) return clean;
     attached.add(key);
     return { ...clean, ...slice };
   });
 
-  return { errors: enriched, omittedLocations };
-}
-
-/**
- * Read one source file into lines, or undefined when it is not ours to read, is not there, or has
- * nothing to show. A file that has moved, sits outside the project, or is over the read cap is
- * skipped silently — missing context is not a failure worth reporting, only worth counting.
- */
-async function readSourceLines(
-  files: SnippetReader,
-  projectDir: string,
-  file: string,
-): Promise<string[] | undefined> {
-  if (!SOURCE_EXT.has(path.posix.extname(file.toLowerCase()))) return undefined;
-  try {
-    const { content, note } = await files.read(projectDir, { path: file, recordBaseline: false });
-    if (note) return undefined; // binary or over the read cap
-    return splitLines(content);
-  } catch {
-    return undefined; // moved, deleted, outside the project, or behind a symlink out of it
-  }
+  return { errors: enriched, omittedLocations: order.length - shown.size };
 }

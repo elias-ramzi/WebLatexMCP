@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { formatSnippet, readSnippet } from '../lib/sourceSnippet.js';
+import { formatSnippet, readSourceLines, sliceSnippet } from '../lib/sourceSnippet.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -62,20 +62,26 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         const comments = ctx.comments.list(id, { includeResolved });
 
+        // Comments cluster in the file under review, so read each file once rather than once per
+        // comment. Records no baseline either way: the user did not ask to read these files, the
+        // server went and got context for them — same contract as compile's snippets.
+        const sourceOf = new Map<string, string[] | undefined>();
+        for (const c of comments) {
+          if (c.file && c.line && !sourceOf.has(c.file)) {
+            sourceOf.set(c.file, await readSourceLines(ctx.files, dir, c.file));
+          }
+        }
+
         const enriched = await Promise.all(
           comments.map(async (c) => {
             let snippet: string | undefined;
             let snippetStartLine: number | undefined;
             if (c.file && c.line) {
-              try {
-                // Records no baseline: the user did not ask to read this file, the server went and
-                // got context for them. Same path, and same contract, as compile's snippets.
-                const slice = await readSnippet(ctx.files, dir, c.file, c.line);
-                snippet = slice?.snippet;
-                snippetStartLine = slice?.snippetStartLine;
-              } catch {
-                // File may have moved/been deleted since the comment was made — skip the snippet.
-              }
+              const lines = sourceOf.get(c.file);
+              // The file may have moved or shrunk since the comment was made — then no snippet.
+              const slice = lines && sliceSnippet(lines, c.line);
+              snippet = slice?.snippet;
+              snippetStartLine = slice?.snippetStartLine;
             }
             return {
               id: c.id,

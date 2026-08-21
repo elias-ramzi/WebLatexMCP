@@ -1,7 +1,16 @@
 import path from 'node:path';
-import { readdir, readFile, writeFile, mkdir, stat, rm, realpath } from 'node:fs/promises';
+import {
+  readdir,
+  readFile,
+  writeFile,
+  mkdir,
+  stat,
+  rm,
+  realpath,
+  readlink,
+} from 'node:fs/promises';
 import { resolveInside, toPosix } from '../lib/paths.js';
-import { splitLines } from '../lib/lines.js';
+import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
@@ -133,11 +142,32 @@ async function assertNoSymlinkEscape(
   abs: string,
   relPath: string,
 ): Promise<void> {
-  const [realRoot, realAbs] = await Promise.all([realpath(projectDir), realpath(abs)]);
-  const rel = path.relative(realRoot, realAbs);
+  const [realRoot, target] = await Promise.all([realpath(projectDir), resolveThroughLinks(abs)]);
+  const rel = path.relative(realRoot, target);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
   }
+}
+
+/**
+ * Where a path really lands, whether or not it exists yet. `realpath` alone cannot answer for a
+ * file about to be created, and a **dangling** symlink is the case that matters most: `writeFile`
+ * happily follows `notes.tex -> ~/.ssh/authorized_keys` and creates the file at the other end, so
+ * the target has to be judged even when nothing is there yet.
+ */
+async function resolveThroughLinks(abs: string): Promise<string> {
+  try {
+    return await realpath(abs);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const link = await readlink(abs).catch(() => null);
+  if (link !== null) return path.resolve(path.dirname(abs), link);
+  const parent = path.dirname(abs);
+  if (parent === abs) return abs;
+  // Nothing at this name: resolve the part that does exist, then re-attach the rest literally.
+  // `resolveInside` has already normalized the string, so no component can climb back out.
+  return path.join(await resolveThroughLinks(parent), path.basename(abs));
 }
 
 /** Sandboxed file access within a project's clone directory. */
@@ -209,14 +239,14 @@ export class FileService {
     }
     const raw = await readFile(abs, 'utf8');
     if (opts.recordBaseline) this.revisions.record(abs, raw);
-    const lines = splitLines(raw);
-    const totalLines = lines.length;
+    const totalLines = splitLines(raw).length;
     if (opts.startLine === undefined && opts.endLine === undefined) {
       return { path: opts.path, content: raw, totalLines, truncated: false };
     }
     const start = Math.max(1, opts.startLine ?? 1);
     const end = Math.min(totalLines, opts.endLine ?? totalLines);
-    const content = lines.slice(start - 1, end).join('\n');
+    // Byte-exact, so what comes back can go straight into edit_file's oldString.
+    const content = sliceLineRange(raw, start, end);
     return { path: opts.path, content, totalLines, truncated: start > 1 || end < totalLines };
   }
 
@@ -230,6 +260,7 @@ export class FileService {
     opts: { recordBaseline?: boolean } = {},
   ): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
+    await assertNoSymlinkEscape(projectDir, abs, relPath);
     try {
       const raw = await readFile(abs, 'utf8');
       if (opts.recordBaseline) this.revisions.record(abs, raw);
@@ -251,6 +282,7 @@ export class FileService {
     },
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
+    await assertNoSymlinkEscape(projectDir, abs, opts.path);
     let current: string | undefined;
     try {
       current = await readFile(abs, 'utf8');
@@ -292,6 +324,7 @@ export class FileService {
       throw new Error('No edits provided.');
     }
     const abs = resolveInside(projectDir, relPath);
+    await assertNoSymlinkEscape(projectDir, abs, relPath);
     const original = await readFile(abs, 'utf8');
     if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
       throw new ExternalChangeError(relPath);
@@ -327,6 +360,7 @@ export class FileService {
     opts: { overrideExternalChanges?: boolean } = {},
   ): Promise<{ path: string }> {
     const abs = resolveInside(projectDir, relPath);
+    await assertNoSymlinkEscape(projectDir, abs, relPath);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
@@ -362,6 +396,7 @@ export class FileService {
       const abs = resolveInside(projectDir, rel);
       let content: string;
       try {
+        await assertNoSymlinkEscape(projectDir, abs, rel);
         content = await readFile(abs, 'utf8');
       } catch {
         continue;

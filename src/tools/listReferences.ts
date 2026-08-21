@@ -127,7 +127,10 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         const sources: Array<{ path: string; format: string; count: number }> = [];
         const found: Located[] = [];
         for (const candidate of candidates) {
-          const text = await ctx.files.readText(dir, candidate);
+          // The caller gets these bytes back — each entry's verbatim `raw` — so this read is the
+          // caller's, and claims the out-of-band-edit baseline. Without it a bibliography listed
+          // here and hand-edited afterwards would be overwritten with no ExternalChangeError.
+          const text = await ctx.files.readText(dir, candidate, { recordBaseline: true });
           if (!text) continue;
           const parsed = parseReferences(text, candidate);
           if (parsed.length === 0) continue;

@@ -82,7 +82,11 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           const target = await resolveBibFile(ctx, dir, bibFile);
           // Re-fetch from DBLP so the appended text always originates from the API.
           const bibtex = await ctx.dblp.fetchBibtex(key);
-          const existing = await ctx.files.readText(dir, target, { recordBaseline: true });
+          // No baseline from this read: it happens before the already-present early return, and a
+          // path that writes nothing must not claim the caller has seen the file (that is exactly
+          // what made every compile disarm the guard). The write below is safe without it — see
+          // there.
+          const existing = await ctx.files.readText(dir, target);
           const merged = mergeBibEntry(existing, bibtex);
 
           if (merged.alreadyPresent) {
@@ -106,7 +110,16 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
             };
           }
 
-          await ctx.files.write(dir, { path: target, content: merged.content, createDirs: true });
+          // `merged.content` is the bytes just read under this project's lock plus one entry
+          // appended, so it cannot lose a hand edit — it is built on top of it. The staleness
+          // check would only refuse a write that is already safe, which is why this read did not
+          // need to arm the guard to get past it.
+          await ctx.files.write(dir, {
+            path: target,
+            content: merged.content,
+            createDirs: true,
+            overrideExternalChanges: true,
+          });
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, target);
           const at = entryLine(merged.content, merged.key);
           const summary = `added ${merged.key} to ${target}:${at}\n\n${bibtex}`;

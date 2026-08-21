@@ -8,6 +8,9 @@ import {
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
+/** pdfTeX/latexmk hard-wrap column, mirrored from the parser. */
+const WRAP_WIDTH = 79;
+
 /** One real per-figure TikZ externalization failure, as latexmk prints it (file-line-error). */
 function tikzShellEscapeError(figure: number): string {
   return (
@@ -42,6 +45,34 @@ describe('parseLog', () => {
       message: 'Undefined control sequence.',
       rule: 'Undefined control sequence',
     });
+  });
+
+  it('parses a log with Windows line endings', () => {
+    // pdfTeX writes the .log in text mode, so on Windows every line ends \r\n. tex-smoke CI is
+    // ubuntu-only and cannot see this; left unhandled it emptied the parser on Windows entirely.
+    const log = [
+      '(./main.tex',
+      './main.tex:3: Undefined control sequence.',
+      'l.3 bad \\nope',
+      '',
+    ].join('\r\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ file: 'main.tex', line: 3, echo: 'bad \\nope' });
+    expect(errors[0]?.file).not.toMatch(/\r/);
+    expect(errors[0]?.message).not.toMatch(/\r/);
+  });
+
+  it('parses a log with CR-only line endings', () => {
+    const log = ['(./main.tex', './main.tex:7: Missing $ inserted.', 'l.7 x^2', ''].join('\r');
+    const { errors } = parseLog(log);
+    expect(errors[0]).toMatchObject({ file: 'main.tex', line: 7, echo: 'x^2' });
+  });
+
+  it('still un-wraps TeX’s 79-column hard wrap when the log is CRLF', () => {
+    const long = 'x'.repeat(WRAP_WIDTH) + 'tail';
+    const wrapped = [long.slice(0, WRAP_WIDTH), long.slice(WRAP_WIDTH)].join('\r\n');
+    expect(unwrapLines(wrapped)).toEqual([long]);
   });
 
   it('rebases the log’s paths onto the project root (latexmk -cd)', () => {

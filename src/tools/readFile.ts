@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { splitLines } from '../lib/lines.js';
+import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { resolveInside, toPosix } from '../lib/paths.js';
 
 const inputSchema = {
@@ -31,15 +31,6 @@ const outputSchema = {
   ref: z.string().optional(),
 };
 
-/** Slice a 1-based inclusive line range out of full content (both bounds optional). */
-function sliceLines(content: string, startLine?: number, endLine?: number): string {
-  if (startLine === undefined && endLine === undefined) return content;
-  const lines = splitLines(content);
-  const start = startLine ? startLine - 1 : 0;
-  const end = endLine ?? lines.length;
-  return lines.slice(start, end).join('\n');
-}
-
 export function registerReadFile(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'read_file',
@@ -63,8 +54,12 @@ export function registerReadFile(server: McpServer, ctx: AppContext): void {
           const rel = toPosix(path.relative(dir, abs));
           const full = await ctx.git.showAtRef(dir, ref, rel);
           const totalLines = splitLines(full).length;
-          const content = sliceLines(full, startLine, endLine);
-          const truncated = content !== full;
+          const content = sliceLineRange(full, startLine, endLine);
+          // From the bounds, exactly as the working-tree branch does — comparing content to the
+          // blob called a whole-file read truncated, and `push` resolutions are fetched this way.
+          const truncated =
+            (startLine !== undefined && startLine > 1) ||
+            (endLine !== undefined && endLine < totalLines);
           return {
             content: [{ type: 'text', text: content }],
             structuredContent: { path: relPath, content, totalLines, truncated, ref },

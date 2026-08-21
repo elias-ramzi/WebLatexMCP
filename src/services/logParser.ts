@@ -1,9 +1,26 @@
 import path from 'node:path';
 import type { StructuredError } from '../types.js';
 
+/**
+ * A diagnostic plus how the parser came by its location. Both extra fields are parser provenance
+ * for the snippet layer, which consumes and strips them: they exist so that "never show source for
+ * a location we cannot vouch for" is decidable at all, and they are deliberately not on
+ * {@link StructuredError}, which is what tools return.
+ */
+export interface ParsedDiagnostic extends StructuredError {
+  /**
+   * `file` and `line` were read off one diagnostic line, so they describe one place in one file.
+   * Absent when they came from independent sources — the balanced-paren file stack for the file, a
+   * nearby `l.<n>` for the line — which a stray `)` in log text can pull apart.
+   */
+  locatedPair?: boolean;
+  /** The source text TeX echoed for `line` (its `l.<n> …` context line), when it printed one. */
+  echo?: string;
+}
+
 export interface ParsedLog {
-  errors: StructuredError[];
-  warnings: StructuredError[];
+  errors: ParsedDiagnostic[];
+  warnings: ParsedDiagnostic[];
 }
 
 /** pdfTeX/latexmk hard-wrap column (`max_print_line` default). */
@@ -23,7 +40,11 @@ export function logTail(log: string, n = 60): string {
  * exactly 79 chars is (rarely) joined too, the accepted cost of every LaTeX-log parser.
  */
 export function unwrapLines(log: string, width = WRAP_WIDTH): string[] {
-  const physical = log.split('\n');
+  // Split on every line ending, not just \n. pdfTeX writes its .log through C stdio in text mode,
+  // so on Windows every line arrives with a trailing \r — which `.`/`$` do not cross, which
+  // `extname` keeps ('.tex\r'), and which pushes a wrapped line to 80 chars so the un-wrap below
+  // never fires. Left in, it silently emptied every diagnostic this parser produces on Windows.
+  const physical = log.split(/\r\n|\n|\r/);
   const logical: string[] = [];
   let buf = '';
   let wrapped = false;
@@ -118,10 +139,10 @@ export function findMissingPackages(log: string): string[] {
  * error per figure — they share a single cause (shell escape disabled), so collapse them into one
  * diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.
  */
-function collapseShellEscapeErrors(errors: StructuredError[]): StructuredError[] {
+function collapseShellEscapeErrors(errors: ParsedDiagnostic[]): ParsedDiagnostic[] {
   const matched = errors.filter((e) => SHELL_ESCAPE_FAILURE.test(e.message));
   if (matched.length <= 1) return errors;
-  const collapsed: StructuredError = {
+  const collapsed: ParsedDiagnostic = {
     severity: 'error',
     // Deliberately unattributed. This entry stands for N figures, so the first one's file and line
     // are not its location — inheriting them pointed the caller (and the snippet layer) at one
@@ -158,10 +179,22 @@ function looksLikeFile(token: string): boolean {
  */
 const CONTEXT_LOOKAHEAD = 8;
 
-/** The `l.<n>` context below index `i`, if TeX printed one within the lookahead. */
+/** `-file-line-error` form: "./main.tex:12: Undefined control sequence." */
+const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
+
+/**
+ * The `l.<n>` context TeX printed for the diagnostic at index `i`, if any.
+ *
+ * The scan stops at the next diagnostic, because a context line below *that* one belongs to it: a
+ * `! Package hyperref Error` printed with no source position would otherwise adopt the `l.3` of the
+ * `! Undefined control sequence` beneath it, and be reported — and, once it drove the excerpt,
+ * illustrated — at a line that has nothing to do with it.
+ */
 function nextContext(lines: string[], i: number): { line: number; echo?: string } | undefined {
   for (let j = i + 1; j < Math.min(i + CONTEXT_LOOKAHEAD, lines.length); j++) {
-    const lm = /^l\.(\d+)(.*)$/.exec(lines[j] ?? '');
+    const line = lines[j] ?? '';
+    if (j > i + 1 && (line.startsWith('! ') || FILE_LINE_ERROR.test(line))) return undefined;
+    const lm = /^l\.(\d+)(.*)$/.exec(line);
     if (lm && lm[1]) {
       const echo = (lm[2] ?? '').trim();
       return { line: Number(lm[1]), echo: echo || undefined };
@@ -221,8 +254,8 @@ function scanParens(line: string, stack: Array<string | null>): void {
 export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLog {
   const baseDir = opts.baseDir ? normalizeFile(opts.baseDir).replace(/\/+$/, '') : '';
   const lines = unwrapLines(log);
-  const errors: StructuredError[] = [];
-  const warnings: StructuredError[] = [];
+  const errors: ParsedDiagnostic[] = [];
+  const warnings: ParsedDiagnostic[] = [];
   const stack: Array<string | null> = [];
 
   for (let i = 0; i < lines.length; i++) {
@@ -233,7 +266,7 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
     scanParens(line, stack);
 
     // file-line-error format: "./main.tex:12: Undefined control sequence."
-    const fle = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/.exec(line);
+    const fle = FILE_LINE_ERROR.exec(line);
     if (fle && fle[1] && fle[2] && fle[3]) {
       const lineNo = Number(fle[2]);
       errors.push({
@@ -276,7 +309,7 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
         /on input line (\d+)/.exec(message) ?? /on input line (\d+)/.exec(lines[i + 1] ?? '');
       warnings.push({
         severity: 'warning',
-        file: openFile,
+        file: openFile ? rebase(openFile, baseDir) : undefined,
         message,
         line: onLine && onLine[1] ? Number(onLine[1]) : undefined,
         rule: warn[1] ?? warn[2] ?? 'LaTeX',
@@ -290,7 +323,7 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
       const lm = /at lines? (\d+)/.exec(line);
       warnings.push({
         severity: 'warning',
-        file: openFile,
+        file: openFile ? rebase(openFile, baseDir) : undefined,
         message: line.trim(),
         line: lm && lm[1] ? Number(lm[1]) : undefined,
         rule: `${box[1]} \\${box[2]}box`,
@@ -344,9 +377,9 @@ export function filterLog(log: string, opts: { maxLines?: number } = {}): string
   return kept.join('\n');
 }
 
-function dedupe(items: StructuredError[]): StructuredError[] {
+function dedupe(items: ParsedDiagnostic[]): ParsedDiagnostic[] {
   const seen = new Set<string>();
-  const out: StructuredError[] = [];
+  const out: ParsedDiagnostic[] = [];
   for (const item of items) {
     const key = `${item.severity}|${item.file ?? ''}|${item.line ?? ''}|${item.message}`;
     if (!seen.has(key)) {
