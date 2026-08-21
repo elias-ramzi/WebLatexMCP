@@ -82,7 +82,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           const target = await resolveBibFile(ctx, dir, bibFile);
           // Re-fetch from DBLP so the appended text always originates from the API.
           const bibtex = await ctx.dblp.fetchBibtex(key);
-          const existing = await ctx.files.readText(dir, target);
+          const existing = await ctx.files.readText(dir, target, { recordBaseline: true });
           const merged = mergeBibEntry(existing, bibtex);
 
           if (merged.alreadyPresent) {

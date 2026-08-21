@@ -1,6 +1,7 @@
 import path from 'node:path';
-import { readdir, readFile, writeFile, mkdir, stat, rm } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdir, stat, rm, realpath } from 'node:fs/promises';
 import { resolveInside, toPosix } from '../lib/paths.js';
+import { splitLines } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
@@ -151,11 +152,22 @@ export class FileService {
       .sort((a, b) => a.path.localeCompare(b.path));
   }
 
+  /**
+   * Read a file, or a line range of it.
+   *
+   * `recordBaseline` says whether **the caller has seen these bytes**, and so defaults to false:
+   * only a read whose content goes back to the caller may claim it. A read the server makes on its
+   * own initiative — detecting the root file, the source around a compile error, scanning for a
+   * bibliography — must not, or the out-of-band-edit guard is told the server has seen the current
+   * bytes of a file the user is editing by hand, and the next write clobbers those edits with no
+   * `ExternalChangeError`. Wrong in the safe direction costs one refusal the caller can override;
+   * wrong the other way destroys the user's work, so the default is the safe one.
+   */
   async read(
     projectDir: string,
-    opts: { path: string; startLine?: number; endLine?: number },
+    opts: { path: string; startLine?: number; endLine?: number; recordBaseline?: boolean },
   ): Promise<ReadResult> {
-    const abs = resolveInside(projectDir, opts.path);
+    const abs = await this.resolveReadable(projectDir, opts.path);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${opts.path}"`);
@@ -171,10 +183,8 @@ export class FileService {
       };
     }
     const raw = await readFile(abs, 'utf8');
-    // The whole file is read into memory even for a range request, so this is the content the
-    // server now knows to be on disk — record it as the baseline for out-of-band-edit detection.
-    this.revisions.record(abs, raw);
-    const lines = raw.split('\n');
+    if (opts.recordBaseline) this.revisions.record(abs, raw);
+    const lines = splitLines(raw);
     const totalLines = lines.length;
     if (opts.startLine === undefined && opts.endLine === undefined) {
       return { path: opts.path, content: raw, totalLines, truncated: false };
@@ -208,17 +218,40 @@ export class FileService {
     return { content: lines.slice(start - 1, end).join('\n') };
   }
 
-  /** Read a file's full text, returning '' when it does not exist (used for appends). */
-  async readText(projectDir: string, relPath: string): Promise<string> {
+  /**
+   * Read a file's full text, returning '' when it does not exist (used for appends).
+   * `recordBaseline` carries the same meaning — and the same default — as in {@link read}.
+   */
+  async readText(
+    projectDir: string,
+    relPath: string,
+    opts: { recordBaseline?: boolean } = {},
+  ): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
     try {
       const raw = await readFile(abs, 'utf8');
-      this.revisions.record(abs, raw);
+      if (opts.recordBaseline) this.revisions.record(abs, raw);
       return raw;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
       throw err;
     }
+  }
+
+  /**
+   * Resolve a path to read, refusing one that leaves the project **after symlinks are followed**.
+   * `resolveInside` compares strings, which a symlink defeats: a `notes.tex` pointing at
+   * `~/.ssh/id_rsa` passes the string check and hands back the key. That matters most for paths the
+   * server picks up from a compile log, which the document itself controls.
+   */
+  private async resolveReadable(projectDir: string, relPath: string): Promise<string> {
+    const abs = resolveInside(projectDir, relPath);
+    const [realRoot, realAbs] = await Promise.all([realpath(projectDir), realpath(abs)]);
+    const rel = path.relative(realRoot, realAbs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
+    }
+    return realAbs;
   }
 
   /** Create or overwrite a file. */

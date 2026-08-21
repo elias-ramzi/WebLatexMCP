@@ -6,7 +6,8 @@ import { detectRootFile } from '../lib/rootFile.js';
 import { toFileUrl } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
-import { attachErrorSnippets, formatSnippet } from '../lib/errorSnippets.js';
+import { attachErrorSnippets } from '../lib/errorSnippets.js';
+import { formatSnippet } from '../lib/sourceSnippet.js';
 import {
   parseLog,
   filterLog,
@@ -65,8 +66,11 @@ const errorShape = z.object({
     .optional()
     .describe(
       'The 5 source lines around `line` (2 either side, clamped at the file bounds) — a LaTeX ' +
-        'message is often uninterpretable without them. Errors only: warnings never carry one, and ' +
-        'neither does a diagnostic the log parser could not attribute to a file and line.',
+        'message is often uninterpretable without them, so this usually saves a read_file. ' +
+        'Errors only, at most 10 distinct locations per compile, and never a guess: a warning, a ' +
+        'diagnostic with no file/line, one whose location could not be confirmed against the ' +
+        'file, and one pointing past the end of its file all carry none. Where several errors ' +
+        'share a line, the snippet is attached to the first of them. See omittedSnippetLocations.',
     ),
   snippetStartLine: z
     .number()
@@ -106,6 +110,13 @@ const outputSchema = {
         'and memory noise stripped). Pass rawLog: true for the unfiltered tail; logPath has the full log.',
     ),
   logPath: z.string().optional(),
+  omittedSnippetLocations: z
+    .number()
+    .describe(
+      'How many distinct error locations carry no `snippet` — over the 10-location cap, or ' +
+        'unreadable, or not confirmed against the file. 0 means every attributed error has its ' +
+        'source context, so this is the flag for "there is more to see", not a silent gap.',
+    ),
   hint: z
     .string()
     .optional()
@@ -177,10 +188,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             shellEscape,
             restrictedShellEscape,
           });
-          const { errors: parsedErrors, warnings } = parseLog(outcome.log);
+          // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
+          // to the project root — rebase them there so a `file` is one the caller can open.
+          const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
+            baseDir: outcome.logBaseDir,
+          });
           // Errors carry their source context; warnings do not — a normal build has hundreds of
           // them and attaching a snippet to each would bloat every successful compile's result.
-          const { errors, omittedLocations } = await attachErrorSnippets(
+          const { errors, omittedLocations: omittedSnippetLocations } = await attachErrorSnippets(
             ctx.files,
             dir,
             parsedErrors,
@@ -217,6 +232,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             missingPackages,
             logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
             logPath: outcome.logPath,
+            omittedSnippetLocations,
             hint,
           };
           const headline = outcome.timedOut
@@ -225,23 +241,21 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
           // Errors sharing a location print the snippet once.
-          const shownSnippets = new Set<string>();
           const errorLines = errors
             .slice(0, MAX_TEXT_ERRORS)
             .map((e) => {
               const head = `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`;
-              const key = `${e.file} ${e.line}`;
-              if (!e.snippet || shownSnippets.has(key)) return head;
-              shownSnippets.add(key);
-              return `${head}\n${formatSnippet(e)}`;
+              // attachErrorSnippets already carries the snippet once per location, so printing
+              // whatever each error holds prints every excerpt exactly once.
+              return e.snippet ? `${head}\n${formatSnippet(e, e.line)}` : head;
             })
             .join('\n');
           const dropped = [
             errors.length > MAX_TEXT_ERRORS
               ? `  … ${errors.length - MAX_TEXT_ERRORS} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
               : '',
-            omittedLocations > 0
-              ? `  … source context omitted for ${omittedLocations} further error location(s)`
+            omittedSnippetLocations > 0
+              ? `  … no source context for ${omittedSnippetLocations} error location(s) — over the cap, unreadable, or not confirmed against the file`
               : '',
           ]
             .filter(Boolean)

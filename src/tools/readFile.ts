@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { splitLines } from '../lib/lines.js';
 import { resolveInside, toPosix } from '../lib/paths.js';
 
 const inputSchema = {
@@ -33,7 +34,7 @@ const outputSchema = {
 /** Slice a 1-based inclusive line range out of full content (both bounds optional). */
 function sliceLines(content: string, startLine?: number, endLine?: number): string {
   if (startLine === undefined && endLine === undefined) return content;
-  const lines = content.split('\n');
+  const lines = splitLines(content);
   const start = startLine ? startLine - 1 : 0;
   const end = endLine ?? lines.length;
   return lines.slice(start, end).join('\n');
@@ -61,7 +62,7 @@ export function registerReadFile(server: McpServer, ctx: AppContext): void {
           const abs = resolveInside(dir, relPath);
           const rel = toPosix(path.relative(dir, abs));
           const full = await ctx.git.showAtRef(dir, ref, rel);
-          const totalLines = full.split('\n').length;
+          const totalLines = splitLines(full).length;
           const content = sliceLines(full, startLine, endLine);
           const truncated = content !== full;
           return {
@@ -70,7 +71,14 @@ export function registerReadFile(server: McpServer, ctx: AppContext): void {
           };
         }
 
-        const result = await ctx.files.read(dir, { path: relPath, startLine, endLine });
+        // The one read whose bytes go back to the caller, so the one read that may claim the
+        // out-of-band-edit baseline — see FileService.read.
+        const result = await ctx.files.read(dir, {
+          path: relPath,
+          startLine,
+          endLine,
+          recordBaseline: true,
+        });
         return {
           content: [{ type: 'text', text: result.note ?? result.content }],
           structuredContent: { ...result },

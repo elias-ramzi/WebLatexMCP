@@ -53,7 +53,9 @@ describe('FileService', () => {
   it('reads a full text file', async () => {
     const res = await files.read(dir, { path: 'main.tex' });
     expect(res.content).toBe('line1\nline2\nline3\n');
-    expect(res.totalLines).toBe(4); // trailing newline => 4 split parts
+    // A trailing newline ends the third line; it does not start a fourth. Counting the empty
+    // string after it put a line number on a line the file does not have.
+    expect(res.totalLines).toBe(3);
     expect(res.truncated).toBe(false);
   });
 

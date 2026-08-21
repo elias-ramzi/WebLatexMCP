@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { formatSnippet, readSnippet } from '../lib/sourceSnippet.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -25,16 +26,23 @@ const commentShape = z.object({
   quote: z.string().optional().describe('The PDF text the user selected, if any.'),
   file: z.string().optional().describe('Source file (project-relative), when synctex resolved it.'),
   line: z.number().optional().describe('Source line, when synctex resolved it.'),
-  snippet: z.string().optional().describe('A few source lines around `line` for context.'),
+  snippet: z
+    .string()
+    .optional()
+    .describe(
+      'The 5 source lines around `line` (2 either side, clamped at the file bounds), so the ' +
+        "comment can be acted on without a read_file. Same shape as `compile`'s error snippets.",
+    ),
+  snippetStartLine: z
+    .number()
+    .optional()
+    .describe("1-based source line of `snippet`'s first line, so the caller can number it."),
   resolved: z.boolean(),
 });
 
 const outputSchema = {
   comments: z.array(commentShape),
 };
-
-/** How many source lines of context to include on either side of a comment's line. */
-const CONTEXT_LINES = 2;
 
 export function registerListComments(server: McpServer, ctx: AppContext): void {
   server.registerTool(
@@ -57,15 +65,14 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
         const enriched = await Promise.all(
           comments.map(async (c) => {
             let snippet: string | undefined;
+            let snippetStartLine: number | undefined;
             if (c.file && c.line) {
               try {
-                const start = Math.max(1, c.line - CONTEXT_LINES);
-                const res = await ctx.files.read(dir, {
-                  path: c.file,
-                  startLine: start,
-                  endLine: c.line + CONTEXT_LINES,
-                });
-                snippet = res.content;
+                // Records no baseline: the user did not ask to read this file, the server went and
+                // got context for them. Same path, and same contract, as compile's snippets.
+                const slice = await readSnippet(ctx.files, dir, c.file, c.line);
+                snippet = slice?.snippet;
+                snippetStartLine = slice?.snippetStartLine;
               } catch {
                 // File may have moved/been deleted since the comment was made — skip the snippet.
               }
@@ -79,6 +86,7 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
               file: c.file,
               line: c.line,
               snippet,
+              snippetStartLine,
               resolved: c.resolved,
             };
           }),
@@ -89,7 +97,7 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
               .map((c) => {
                 const loc = c.file ? `${c.file}:${c.line}` : `(unresolved — page ${c.page})`;
                 const quote = c.quote ? `\n   quote: "${c.quote}"` : '';
-                const snip = c.snippet ? `\n   source:\n${indent(c.snippet)}` : '';
+                const snip = c.snippet ? `\n   source:\n${formatSnippet(c, c.line, '     ')}` : '';
                 return `#${c.number} [${c.id}] ${loc}\n   note: ${c.note}${quote}${snip}`;
               })
               .join('\n\n')
@@ -104,11 +112,4 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
       }
     },
   );
-}
-
-function indent(s: string): string {
-  return s
-    .split('\n')
-    .map((l) => `     ${l}`)
-    .join('\n');
 }

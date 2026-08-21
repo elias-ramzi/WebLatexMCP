@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
 import { FileService } from '../../src/services/fileService.js';
 
 /** Simulate a user editing the clone directly, outside the server's tools. */
@@ -25,7 +25,7 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('refuses to overwrite a file changed on disk since it was read', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'edited by the user\n');
 
     await expect(
@@ -36,7 +36,7 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('overwrites anyway with overrideExternalChanges', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'edited by the user\n');
 
     const res = await files.write(dir, {
@@ -49,7 +49,7 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('readExcerpt does not refresh the baseline, so the guard still fires', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'edited by the user\n');
     // compile showing the source around an error is the server's own initiative, not the caller
     // acknowledging the change — it must not count as "the server has seen these bytes".
@@ -61,6 +61,32 @@ describe('FileService out-of-band edit guard', () => {
     ).rejects.toThrow(/changed on disk/);
   });
 
+  it('a read the server makes for itself does not refresh the baseline', async () => {
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
+    await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+    // Detecting the root file, or showing the source around a compile error, is the server's own
+    // initiative — not the caller acknowledging the change. So neither claims the bytes.
+    const seen = await files.read(dir, { path: 'main.tex' });
+    expect(seen.content).toContain('edited by the user');
+    await files.readText(dir, 'main.tex');
+
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
+  });
+
+  it('refuses to read through a symlink that leaves the project', async () => {
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside-'));
+    try {
+      await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+      await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+      await expect(files.read(dir, { path: 'notes.tex' })).rejects.toThrow(/symlink/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
   it('allows writing a file it never read (no baseline)', async () => {
     // No prior read of new.tex — a deliberate create, not a stale overwrite.
     const res = await files.write(dir, { path: 'new.tex', content: 'fresh\n' });
@@ -68,9 +94,9 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('re-reading refreshes the baseline so the next write succeeds', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'edited by the user\n');
-    await files.read(dir, { path: 'main.tex' }); // acknowledge the change
+    await files.read(dir, { path: 'main.tex', recordBaseline: true }); // acknowledge the change
 
     await expect(
       files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
@@ -78,7 +104,7 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('refuses edit_file on an out-of-band change', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'user rewrote everything\n');
 
     await expect(
@@ -87,14 +113,14 @@ describe('FileService out-of-band edit guard', () => {
   });
 
   it('refuses delete on an out-of-band change', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'user is still working here\n');
 
     await expect(files.delete(dir, 'main.tex')).rejects.toThrow(/changed on disk/);
   });
 
   it('resetBaselines clears the guard (used after pull/discard)', async () => {
-    await files.read(dir, { path: 'main.tex' });
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
     await editOnDisk(dir, 'main.tex', 'rewritten by git\n');
     files.resetBaselines(dir);
 
@@ -109,7 +135,7 @@ describe('FileService out-of-band edit guard', () => {
       // tool-written file: baseline matches disk
       await files.write(dir, { path: 'tool.tex', content: 'by tool\n' });
       // user-edited file: read, then changed on disk
-      await files.read(dir, { path: 'main.tex' });
+      await files.read(dir, { path: 'main.tex', recordBaseline: true });
       await editOnDisk(dir, 'main.tex', 'by user\n');
       // brand-new file the user dropped in: never seen by the tools
       await editOnDisk(dir, 'user-new.tex', 'user new\n');

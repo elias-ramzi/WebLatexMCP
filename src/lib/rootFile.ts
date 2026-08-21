@@ -15,6 +15,10 @@ export async function detectRootFile(files: FileService, projectDir: string): Pr
   if (main) return main.path;
 
   for (const f of tex) {
+    // No baseline: this sniffs every .tex in the project to find the root, and the caller asked for
+    // none of them. Recording here would tell the out-of-band-edit guard the server has seen the
+    // current bytes of files the user may be hand-editing — and `compile` and the viewer's PDF
+    // poller both come through here, so it would keep re-arming all session.
     const { content } = await files.read(projectDir, { path: f.path });
     if (content.includes('\\documentclass')) return f.path;
   }

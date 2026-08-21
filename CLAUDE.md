@@ -150,12 +150,30 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
-- **Out-of-band edits are guarded.** `FileService` holds a `FileRevisionTracker`
-  (`src/services/fileRevisions.ts`) that hashes each file it reads/writes. `write_file`/`edit_file`/
-  `delete_file` refuse (throw `ExternalChangeError`) when the on-disk bytes changed since the server last
-  saw them — the user editing the clone directly — unless `overrideExternalChanges: true`. `status`
-  surfaces `externalChanges`. Baselines reset after `project_sync`/`discard` (`ctx.files.resetBaselines`),
-  since those rewrite the tree. Keep this so a hand-edited clone isn't silently clobbered.
+- **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
+  `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
+  "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)
+  when the on-disk bytes changed since — the user editing the clone directly — unless
+  `overrideExternalChanges: true`. `status` surfaces `externalChanges`. Baselines reset after
+  `project_sync`/`discard` (`ctx.files.resetBaselines`), since those rewrite the tree.
+  **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
+  false.** Recording is a claim that _the caller has seen these bytes_, so only a read whose content goes
+  back to the caller may make it: `read_file` does, and `add_citation` (which re-reads to append and
+  writes straight back). Every read the server makes on its own initiative must not — `detectRootFile`
+  (`compile` and the viewer's PDF poller both go through it), the source context behind `compile`'s error
+  snippets and `list_comments`, `check_citations` and `list_references` scanning for a bibliography.
+  Getting this wrong the safe way costs one refusal the caller can override; getting it wrong the other
+  way silently destroys a user's hand edits, which is exactly what the guard exists to prevent.
+- **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
+  each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
+  uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so: the log is
+  **document-controlled** (`\typeout` can forge a `file:line:` diagnostic) and only source extensions are
+  ever read; the paths in it are relative to the engine's cwd, not the project root, so `parseLog` rebases
+  them with `outcome.logBaseDir` (latexmk gets `-cd`); a location whose file was _inferred_ from the
+  paren stack is shown only when TeX's `l.<n>` echo matches the file on disk (`StructuredError.echo` /
+  `locatedPair`, both stripped before output); and a line past the end of its file, or a synthetic
+  aggregate like the collapsed TikZ error, gets nothing. Anything skipped is counted into
+  `omittedSnippetLocations` rather than left as a silent gap.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it

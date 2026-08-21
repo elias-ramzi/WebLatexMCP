@@ -11,6 +11,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`compile` returns the source around each error** — a LaTeX message is frequently uninterpretable on
+  its own (`Undefined control sequence` names no macro; `Missing $ inserted` points at the line where TeX
+  _noticed_, not where you erred), so each error now carries the 5 source lines around it (`snippet`,
+  numbered from `snippetStartLine`), rendered into the result **text** as well as `structuredContent` so
+  a client that strips structured output still sees it. Errors only — warnings never carry one — at most
+  10 distinct locations per compile, attached once per location, and never a guess: a location the parser
+  cannot confirm against the file, a line past the end of its file, or a file the document merely _named_
+  in its log gets none. `omittedSnippetLocations` says how many locations went without, so a gap is
+  reported rather than silent. `list_comments` snippets now have the same shape (`snippetStartLine`
+  included).
+
 - **`session-feedback` skill** — a bundled skill to run at the _end_ of a session, which reviews the tool
   calls that actually ran and reports on the **server itself**: what broke, what cost too many calls,
   what capability was missing, what the docs got wrong. Findings are classified
@@ -81,6 +92,41 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   read the project's `.bib`, and points at `list_references` for searching the references already there.
   It was not clear which side of the boundary the tool sat on.
 
+### Fixed
+
+- **A read the server makes for itself no longer disarms the out-of-band-edit guard.** Detecting the
+  root file (`compile`, and the viewer's PDF poller, on a timer) and building `list_comments` snippets
+  recorded a revision baseline as though the caller had read those files, so a `write_file` after a
+  hand edit could overwrite it with no `ExternalChangeError`. `FileService.read`/`readText` now record
+  only when asked to, which only `read_file` and `add_citation` do.
+- **`read_file` no longer counts a phantom last line.** A file ending in a newline reported one line
+  more than it has, and a range ending on it returned a blank line; CRLF and CR-only files are now split
+  correctly instead of leaving `\r` on every line (or, for CR-only, returning the whole file as line 1).
+- **`compile` resolves a root file in a subdirectory.** latexmk's `-cd` makes the log's paths relative
+  to the root file's directory, so a document at `paper/main.tex` reported its errors in `main.tex`;
+  they are now rebased onto the project root.
+- **The collapsed "TikZ externalization failed for N figures" error no longer claims a location** — it
+  inherited the first figure's file and line, pointing at source where nothing is wrong.
+
+- **The `.mcpb` Desktop Extension could not start.** `.mcpbignore` excluded `src/` unanchored, which
+  matches a directory of that name at any depth — including `node_modules/debug/src/`, where that
+  package's `main` points. The packed bundle was therefore missing the entry point of a transitive
+  runtime dependency (via `simple-git`) and died on startup with
+  `Cannot find package …/debug/src/index.js`. This affected the published 0.4.0 bundle. Our own
+  directories are now anchored (`/src/`, `/test/`, …), and the bundle workflow starts the packed
+  server before attaching it to a release, so a bundle that cannot boot never ships again.
+- `manifest.json` had fallen a release behind the other version manifests, so a locally built
+  Desktop Extension (`npm run bundle`, which does not sync it the way the release workflow does) was
+  labelled with the previous version. A unit test now asserts `package.json`, `plugin.json`,
+  `marketplace.json`, `manifest.json` and the lockfile all agree, so the gate fails instead.
+- The per-project build directory is keyed by the project's full path rather than its basename, so two
+  projects whose directories share a name no longer share a build directory (and surface each other's
+  PDF).
+- `list_projects` no longer points at `OVERLEAF_MCP_PROJECTS`, an environment variable that no longer
+  exists; an empty workspace now explains how to register a project.
+- Relative paths in `WEB_LATEX_MCP_PROJECTS` resolve against the server's launch directory rather than
+  the process working directory.
+
 ## [0.5.0] - 2026-08-20
 
 ### Added
@@ -108,27 +154,6 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - Writing guide gains a **Citations** section on where `\cite{}` goes in the prose: never in the
   abstract, on first mention in the main text, re-anchored at each major section boundary (readers jump
   straight to the Method or Experiments), and never twice for the same work within a section.
-
-### Fixed
-
-- **The `.mcpb` Desktop Extension could not start.** `.mcpbignore` excluded `src/` unanchored, which
-  matches a directory of that name at any depth — including `node_modules/debug/src/`, where that
-  package's `main` points. The packed bundle was therefore missing the entry point of a transitive
-  runtime dependency (via `simple-git`) and died on startup with
-  `Cannot find package …/debug/src/index.js`. This affected the published 0.4.0 bundle. Our own
-  directories are now anchored (`/src/`, `/test/`, …), and the bundle workflow starts the packed
-  server before attaching it to a release, so a bundle that cannot boot never ships again.
-- `manifest.json` had fallen a release behind the other version manifests, so a locally built
-  Desktop Extension (`npm run bundle`, which does not sync it the way the release workflow does) was
-  labelled with the previous version. A unit test now asserts `package.json`, `plugin.json`,
-  `marketplace.json`, `manifest.json` and the lockfile all agree, so the gate fails instead.
-- The per-project build directory is keyed by the project's full path rather than its basename, so two
-  projects whose directories share a name no longer share a build directory (and surface each other's
-  PDF).
-- `list_projects` no longer points at `OVERLEAF_MCP_PROJECTS`, an environment variable that no longer
-  exists; an empty workspace now explains how to register a project.
-- Relative paths in `WEB_LATEX_MCP_PROJECTS` resolve against the server's launch directory rather than
-  the process working directory.
 
 ## [0.4.0] - 2026-07-28
 

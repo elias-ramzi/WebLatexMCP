@@ -44,6 +44,45 @@ describe('parseLog', () => {
     });
   });
 
+  it('rebases the log’s paths onto the project root (latexmk -cd)', () => {
+    // With -cd the engine runs in the root file's directory, so a document at paper/main.tex
+    // reports its own errors as "./main.tex".
+    const log = './main.tex:3: Undefined control sequence.';
+    expect(parseLog(log, { baseDir: 'paper' }).errors[0]?.file).toBe('paper/main.tex');
+    // An absolute path (a .sty from the TeX tree) is not a project-relative path to be joined.
+    const abs = '/usr/share/texlive/tex/latex/foo.sty:9: Undefined control sequence.';
+    expect(parseLog(abs, { baseDir: 'paper' }).errors[0]?.file).toBe(
+      '/usr/share/texlive/tex/latex/foo.sty',
+    );
+    // No baseDir (tectonic, or a root at the project root) leaves it alone.
+    expect(parseLog(log).errors[0]?.file).toBe('main.tex');
+  });
+
+  it('records how a location was obtained, for the snippet layer to check', () => {
+    const fle = [
+      './main.tex:3: Undefined control sequence.',
+      'l.3 This line uses an undefined macro: \\thismacrodoesnotexist',
+    ].join('\n');
+    expect(parseLog(fle).errors[0]).toMatchObject({
+      locatedPair: true,
+      echo: 'This line uses an undefined macro: \\thismacrodoesnotexist',
+    });
+
+    // The bare "! " branch takes its file from the paren stack and its line from the l.<n>: two
+    // independent sources, so it claims no pair — only the echo can confirm them.
+    const bare = ['(./main.tex', '! Undefined control sequence.', 'l.9 \\badmacro'].join('\n');
+    const inferred = parseLog(bare).errors[0];
+    expect(inferred?.locatedPair).toBeUndefined();
+    expect(inferred).toMatchObject({ file: 'main.tex', line: 9, echo: '\\badmacro' });
+  });
+
+  it('does not take an l.<n> that belongs to a different line as this error’s echo', () => {
+    const log = ['./main.tex:3: Undefined control sequence.', 'l.42 something else'].join('\n');
+    const err = parseLog(log).errors[0];
+    expect(err?.line).toBe(3);
+    expect(err?.echo).toBeUndefined();
+  });
+
   it('parses a bare TeX error and recovers the line from l.<n>', () => {
     const log = ['! Misplaced alignment tab character &.', 'l.42 a & b', ''].join('\n');
     const { errors } = parseLog(log);
@@ -87,6 +126,10 @@ describe('parseLog', () => {
     expect(errors[0]).toMatchObject({ severity: 'error', rule: 'shell escape disabled' });
     expect(errors[0]?.message).toMatch(/3 figures/);
     expect(errors[0]?.message).toMatch(/restrictedShellEscape: true|shellEscape: true/);
+    // It stands for N figures, so it claims no location: inheriting the first figure's file and
+    // line pointed the caller (and the source snippet) at a line where nothing is wrong.
+    expect(errors[0]?.file).toBeUndefined();
+    expect(errors[0]?.line).toBeUndefined();
   });
 
   it('leaves a single shell-escape error uncollapsed but keeps other errors intact', () => {
