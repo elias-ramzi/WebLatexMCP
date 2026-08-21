@@ -179,12 +179,44 @@ export class FileService {
   private recorder?: MutationRecorder;
 
   /**
+   * Whether a project may follow a symlink its owner placed. Injected, because the answer is about
+   * the project rather than the file — see {@link setLinkPolicy}.
+   */
+  private followsUserLinks: (projectDir: string) => boolean = () => false;
+
+  /**
    * Set after construction because the recorder needs services that are built later (it resolves
    * a clone dir to a project and reads git HEAD). Every mutating method funnels through
    * `notify`, so this is the single seam where session attribution attaches.
    */
   setMutationRecorder(recorder: MutationRecorder): void {
     this.recorder = recorder;
+  }
+
+  /**
+   * Decide, per project, whether a symlink inside it may be followed.
+   *
+   * The guard exists for paths the **user did not choose**: a `notes.tex -> ~/.ssh/id_rsa` a
+   * collaborator committed into a shared repository (git stores a symlink as mode 120000), or a
+   * file named by a compile log, which the document controls. Neither describes a `mode: 'local'`
+   * project — a directory the user registered in place and owns, where one shared `refs.bib`
+   * symlinked into each paper is an ordinary layout that worked before this guard existed.
+   *
+   * Reads the server makes on its own initiative pass `strictLinks` and are refused regardless.
+   */
+  setLinkPolicy(followsUserLinks: (projectDir: string) => boolean): void {
+    this.followsUserLinks = followsUserLinks;
+  }
+
+  /** The symlink check, unless this project is one whose owner places its own links. */
+  private async guardLinks(
+    projectDir: string,
+    abs: string,
+    relPath: string,
+    strictLinks = false,
+  ): Promise<void> {
+    if (!strictLinks && this.followsUserLinks(projectDir)) return;
+    await assertNoSymlinkEscape(projectDir, abs, relPath);
   }
 
   async list(
@@ -209,20 +241,34 @@ export class FileService {
   /**
    * Read a file, or a line range of it.
    *
-   * `recordBaseline` says whether **the caller has seen these bytes**, and so defaults to false:
-   * only a read whose content goes back to the caller may claim it. A read the server makes on its
-   * own initiative — detecting the root file, the source around a compile error, scanning for a
-   * bibliography — must not, or the out-of-band-edit guard is told the server has seen the current
-   * bytes of a file the user is editing by hand, and the next write clobbers those edits with no
-   * `ExternalChangeError`. Wrong in the safe direction costs one refusal the caller can override;
-   * wrong the other way destroys the user's work, so the default is the safe one.
+   * `recordBaseline` says whether **the caller could now base a write on this file**, and so
+   * defaults to false. Record only when the caller asked for this file and received all of it:
+   * `read_file` does, and `list_references` (which hands back every entry verbatim). Nothing else
+   * qualifies — not a file the server chose for its own purposes (`detectRootFile` sniffing every
+   * `.tex` for `\documentclass`), not five lines of context around a location a *log* named
+   * (`compile`, `list_comments`), and not a file read only to answer a question about it
+   * (`check_citations`, which returns keys and line numbers and no content at all). Note that
+   * "the bytes reached the caller" is not the test: a snippet's bytes do reach them, and recording
+   * one would tell the guard the server has seen a file the user is editing by hand, so the next
+   * write clobbers those edits with no `ExternalChangeError`. Wrong in the safe direction costs one
+   * refusal the caller can override; wrong the other way destroys the user's work.
    */
   async read(
     projectDir: string,
-    opts: { path: string; startLine?: number; endLine?: number; recordBaseline?: boolean },
+    opts: {
+      path: string;
+      startLine?: number;
+      endLine?: number;
+      recordBaseline?: boolean;
+      /**
+       * Refuse a symlink out of the project even where the project's owner places its own — for a
+       * path the server picked up rather than the caller naming it. See {@link setLinkPolicy}.
+       */
+      strictLinks?: boolean;
+    },
   ): Promise<ReadResult> {
     const abs = resolveInside(projectDir, opts.path);
-    await assertNoSymlinkEscape(projectDir, abs, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${opts.path}"`);
@@ -260,7 +306,7 @@ export class FileService {
     opts: { recordBaseline?: boolean } = {},
   ): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
-    await assertNoSymlinkEscape(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath);
     try {
       const raw = await readFile(abs, 'utf8');
       if (opts.recordBaseline) this.revisions.record(abs, raw);
@@ -282,7 +328,7 @@ export class FileService {
     },
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
-    await assertNoSymlinkEscape(projectDir, abs, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path);
     let current: string | undefined;
     try {
       current = await readFile(abs, 'utf8');
@@ -324,7 +370,7 @@ export class FileService {
       throw new Error('No edits provided.');
     }
     const abs = resolveInside(projectDir, relPath);
-    await assertNoSymlinkEscape(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath);
     const original = await readFile(abs, 'utf8');
     if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
       throw new ExternalChangeError(relPath);
@@ -360,7 +406,7 @@ export class FileService {
     opts: { overrideExternalChanges?: boolean } = {},
   ): Promise<{ path: string }> {
     const abs = resolveInside(projectDir, relPath);
-    await assertNoSymlinkEscape(projectDir, abs, relPath);
+    await this.guardLinks(projectDir, abs, relPath);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
@@ -396,7 +442,7 @@ export class FileService {
       const abs = resolveInside(projectDir, rel);
       let content: string;
       try {
-        await assertNoSymlinkEscape(projectDir, abs, rel);
+        await this.guardLinks(projectDir, abs, rel);
         content = await readFile(abs, 'utf8');
       } catch {
         continue;

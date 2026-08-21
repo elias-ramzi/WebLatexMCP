@@ -278,7 +278,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               ? `  … ${errors.length - printable.length} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
               : '',
             omittedSnippetLocations > 0
-              ? `  … no source context for ${omittedSnippetLocations} error location(s) — over the cap, unreadable, or not confirmed against the file`
+              ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
+                `did not name the file and line outright (every diagnostic, under tectonic), or ` +
+                `they are unreadable, contradicted by the log, or past the 10-location cap`
               : '',
           ]
             .filter(Boolean)

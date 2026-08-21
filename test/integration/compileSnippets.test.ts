@@ -203,6 +203,30 @@ describe('compile: source context', () => {
     for (let i = 1; i <= 6; i++) expect(text).toContain(`> ${i} | line ${i}`);
   });
 
+  it('shows source for an accented document, where the elision cuts a character in half', async () => {
+    // The whole log line, verbatim from a real pdflatex run on the source below.
+    const line =
+      'Nous considérons une méthode qui améliore nettement la précision pour la tache ' +
+      'etudiee ici \\undefmac3 fin.';
+    const { client } = await setup(
+      { 'main.tex': `\\documentclass{article}\n\\begin{document}\n${line}\n\\end{document}\n` },
+      [
+        './main.tex:3: Undefined control sequence.',
+        '...\uFFFDcision pour la tache etudiee ici \\undefmac'.replace(/^/, 'l.3 '),
+        '',
+      ].join('\n'),
+    );
+
+    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const structured = res.structuredContent as {
+      errors: Array<{ snippet?: string }>;
+      omittedSnippetLocations: number;
+    };
+    expect(structured.errors[0]?.snippet).toContain('undefmac');
+    expect(structured.omittedSnippetLocations).toBe(0);
+    expect(textOf(res)).toContain('> 3 |');
+  });
+
   it('says how many locations went without context instead of leaving a silent gap', async () => {
     const { client } = await setup(
       { 'main.tex': '\\documentclass{article}\n\\begin{document}\nhi\n\\end{document}\n' },
@@ -221,6 +245,10 @@ describe('compile: source context', () => {
     };
     expect(structured.errors.every((e) => e.snippet === undefined)).toBe(true);
     expect(structured.omittedSnippetLocations).toBe(2);
-    expect(textOf(res)).toContain('no source context for 2 error location(s)');
+    const text = textOf(res);
+    expect(text).toContain('no source context for 2 error location(s)');
+    // The reason that dominates in practice — and always, under tectonic — has to be among the
+    // ones named, or the caller goes hunting for a cap that was never hit.
+    expect(text).toMatch(/did not name the file and line outright/);
   });
 });

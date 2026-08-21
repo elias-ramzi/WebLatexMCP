@@ -20,6 +20,18 @@ export const MAX_SNIPPET_FILE_READS = 30;
 /** Shortest echo fragment that can contradict anything; below it, TeX told us too little. */
 const MIN_ECHO_CHARS = 4;
 
+/**
+ * How much of an elided echo is compared against the file: its **tail**.
+ *
+ * pdfTeX elides a long context line at a byte offset, so it can cut a UTF-8 character in half —
+ * `précision` in a French paragraph arrives as `...\uFFFDcision`, since the log is read as utf8 and
+ * the orphan byte has no character. The right-hand end is never truncated (it stops at the error
+ * position), so comparing a tail is what makes this survive an accented document; comparing the
+ * whole fragment vetoed one location in eight on real French prose, and told the caller its source
+ * was "over the cap, unreadable, or not confirmed" when the file was perfectly fine.
+ */
+const ECHO_TAIL_CHARS = 24;
+
 /** A diagnostic plus the source it points at, when there is one we can vouch for. */
 export type ErrorWithSnippet = StructuredError & Partial<SourceSnippet>;
 
@@ -61,9 +73,25 @@ function echoContradicts(rawEcho: string | undefined, source: string): boolean {
   for (const fragment of [stripped, stripped.split(/\s{2,}/)[0] ?? '']) {
     const echo = normalizeWhitespace(fragment);
     if (echo.length < MIN_ECHO_CHARS) return false;
-    if (elided ? source.includes(echo) : source.startsWith(echo)) return false;
+    if (!elided) {
+      if (source.startsWith(echo)) return false; // TeX prints an un-elided line from column 1
+      continue;
+    }
+    const tail = tailOf(echo);
+    if (tail.length < MIN_ECHO_CHARS) return false; // the cut left too little to judge
+    if (source.includes(tail)) return false;
   }
   return true;
+}
+
+/**
+ * The part of an elided echo that can be trusted to be intact: everything after the last
+ * replacement character (the half-character the elision cut), capped to {@link ECHO_TAIL_CHARS}
+ * from the right-hand end, which is the end TeX never truncates.
+ */
+function tailOf(echo: string): string {
+  const intact = echo.slice(echo.lastIndexOf('\uFFFD') + 1).trimStart();
+  return intact.length > ECHO_TAIL_CHARS ? intact.slice(-ECHO_TAIL_CHARS) : intact;
 }
 
 export interface SnippetOutcome {

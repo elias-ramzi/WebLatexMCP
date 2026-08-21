@@ -59,6 +59,10 @@ export function createContext(
   // Every mutation this server makes is folded into this session's shadow, so `commit` can later
   // stage this session's lines alone. FileService is handed the hook rather than the store so it
   // stays unaware of sessions; the project id comes from the clone directory it was given.
+  // A symlink inside a clone can have been committed by anyone with push access; one inside a
+  // local project was placed by the user, in a directory that is theirs. See setLinkPolicy.
+  files.setLinkPolicy((dir) => projectManager.isLocalDir(dir));
+
   files.setMutationRecorder({
     record: async (projectDir, relPath, before, after) => {
       const id = projectManager.idForDir(projectDir);

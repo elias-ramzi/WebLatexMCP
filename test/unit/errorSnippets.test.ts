@@ -233,6 +233,33 @@ describe('attachErrorSnippets', () => {
       expect(omittedLocations).toBe(1);
     });
 
+    it('accepts an elided echo the cut left half a character in', async () => {
+      // pdfTeX elides at a byte offset, so a long line of French prose is cut inside `é`: the log
+      // is read as utf8 and the orphan byte arrives as U+FFFD. This is the exact echo a real
+      // pdflatex compile prints for the source line below. Comparing the whole fragment vetoed
+      // it, and the caller was told its source was unreadable when the file was perfectly fine.
+      const line =
+        'Nous considérons une méthode qui améliore nettement la précision pour la tache ' +
+        'etudiee ici \\undefmac3 fin.';
+      const dir = await projectWith({ 'main.tex': `un\ndeux\n${line}\nquatre` });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 3, { echo: '...\uFFFDcision pour la tache etudiee ici \\undefmac' }),
+      ]);
+      expect(errors[0]!.snippet).toContain('undefmac');
+      expect(omittedLocations).toBe(0);
+    });
+
+    it('still vetoes an elided echo whose intact tail is nowhere in the line', async () => {
+      const dir = await projectWith({
+        'main.tex': 'un\ndeux\nune ligne tout à fait autre\nquatre',
+      });
+      const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, [
+        at('main.tex', 3, { echo: '...\uFFFDcision pour la tache etudiee ici \\undefmac' }),
+      ]);
+      expect(errors[0]!.snippet).toBeUndefined();
+      expect(omittedLocations).toBe(1);
+    });
+
     it('accepts the left-elided echo TeX actually prints for a long line', async () => {
       // Real pdfTeX output for the sample fixture: "l.3 ... an undefined macro: \\thismacro…".
       const dir = await projectWith({

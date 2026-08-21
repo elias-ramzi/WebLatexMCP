@@ -99,11 +99,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   recorded a revision baseline as though the caller had read those files, so a `write_file` after a
   hand edit could overwrite it with no `ExternalChangeError`. `FileService.read`/`readText` now record
   only when asked to, which only `read_file` and `add_citation` do.
-- **A symlink can no longer take a write out of the project.** `resolveInside` compares strings, so a
-  `notes.tex` symlinked outside the clone — git stores one as mode 120000, so a collaborator can commit
-  it — was written, edited and deleted at the far end. Every read and write resolves links first now,
-  including for a file that does not exist yet: a write follows a dangling link and creates the file
-  wherever it points.
+- **A symlink can no longer take a read or a write out of a cloned project.** `resolveInside` compares
+  strings, so a `notes.tex` symlinked outside the clone — git stores one as mode 120000, so a
+  collaborator can commit it — was read, written, edited and deleted at the far end. Every path resolves
+  links first now, including for a file that does not exist yet: a write follows a dangling link and
+  creates the file wherever it points. **A `mode: 'local'` project is exempt**, because it is a
+  directory you registered in place and own, and one shared `refs.bib` symlinked into each paper is an
+  ordinary layout — but a path the server picked up rather than you naming it is refused there too,
+  which covers the source context behind `compile` errors and PDF comments (a compile log is written by
+  the document, so it can name any file it likes).
 - **`read_file` no longer counts a phantom last line.** A file ending in a newline reported one line
   more than it has, and a range ending on it returned a blank line; CRLF and CR-only files are now split
   correctly instead of leaving `\r` on every line (or, for CR-only, returning the whole file as line 1).
@@ -111,6 +115,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   on the way out, so pasting a range from a CRLF file into `edit_file`'s `oldString` failed to match;
   the `ref` path also called a whole-file read truncated and dropped the trailing newline, which
   `push` resolutions write straight back into the repository.
+- **`rawLog` and the log tail no longer carry `\r`** on a Windows log — the last path that still split
+  on `\n` alone.
 - **Compile logs written on Windows parse at all.** pdfTeX writes its `.log` in text mode, so every line
   arrives with a trailing `\r` — which the diagnostic patterns do not cross and `extname` keeps. Left
   unhandled it emptied the parser, and CI's TeX job is Linux-only, so nothing caught it.
@@ -121,7 +127,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   inherited the first figure's file and line, pointing at source where nothing is wrong.
 - **A diagnostic printed without a source position no longer borrows the next one's.** The `l.<n>` scan
   ran past whatever followed, so a `! Package hyperref Error` above an unrelated
-  `! Undefined control sequence` was reported at that error's line.
+  `! Undefined control sequence` was reported at that error's line — including when latexmk printed the
+  two on adjacent lines, which is the usual shape.
+- **Source context survives an accented document.** pdfTeX elides a long context line at a byte offset,
+  so it can cut a UTF-8 character in half; the resulting replacement character made the check that
+  guards against a stale location reject a file that was perfectly correct. Measured on real French
+  prose, that silently withheld the source for one error location in eight.
 - **A warning's `file` is rebased like an error's**, so it too is a path `read_file` can open when the
   root file lives in a subdirectory.
 

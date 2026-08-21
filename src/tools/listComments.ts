@@ -63,8 +63,9 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
         const comments = ctx.comments.list(id, { includeResolved });
 
         // Comments cluster in the file under review, so read each file once rather than once per
-        // comment. Records no baseline either way: the user did not ask to read these files, the
-        // server went and got context for them — same contract as compile's snippets.
+        // comment. Records no baseline: the caller asked for the comments, not for these files,
+        // and five lines of one is not something they could base a write on — same contract as
+        // compile's snippets (see FileService.read).
         const sourceOf = new Map<string, string[] | undefined>();
         for (const c of comments) {
           if (c.file && c.line && !sourceOf.has(c.file)) {

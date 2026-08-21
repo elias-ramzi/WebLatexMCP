@@ -245,11 +245,13 @@ Because clones are ordinary git working trees — and, with [workspace-local clo
 sit right in your editor — you may edit a `.tex` file directly while the agent is working. The server
 guards against silently clobbering those edits, the same way `push` refuses when the remote moved:
 
-- The server remembers the content of each file **you were shown** — `read_file`, and the tools that hand
-  back a file's contents such as `list_references` and `check_citations` — along with everything it
-  writes. Reads it makes for its own purposes do not count: finding the root file to compile, or fetching
-  the five lines around a compile error, must not be mistaken for you having seen the file, or a later
-  write would clobber your edits believing they had already been read. Before `write_file`, `edit_file`,
+- The server remembers the content of each file **it gave you in full** — `read_file`, and
+  `list_references`, which hands back every entry verbatim — along with everything it writes. Other reads
+  do not count, even when some of their bytes reach you: finding the root file to compile, fetching the
+  five lines around a compile error or a PDF comment, or scanning your documents to answer a question
+  about them (`check_citations` returns cite keys and line numbers, not content). None of those is
+  something an edit could be based on, and treating them as if they were would let a later write clobber
+  your edits believing they had already been read. Before `write_file`, `edit_file`,
   or `delete_file` touches a file, it re-checks the bytes on disk. If they changed since the server last
   saw them, the tool **refuses** with a message telling the agent to re-read first. Re-reading
   acknowledges your version and lets the next write through; passing `overrideExternalChanges: true`

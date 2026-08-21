@@ -47,7 +47,7 @@ export interface SourceSnippet {
 export interface SnippetReader {
   read(
     projectDir: string,
-    opts: { path: string; recordBaseline?: boolean },
+    opts: { path: string; recordBaseline?: boolean; strictLinks?: boolean },
   ): Promise<{ content: string; note?: string }>;
 }
 
@@ -87,8 +87,9 @@ export function sliceSnippet(lines: string[], line: number): SourceSnippet | und
 
 /**
  * Read one source file into lines, or undefined when it is not ours to open, is not there, or has
- * nothing to show. Never records a revision baseline: showing context is the server's own
- * initiative, not the caller reading a file (see `FileService.read`). A file that has moved, sits
+ * nothing to show. Never records a revision baseline, and never follows a symlink out of the
+ * project: showing context is the server's own initiative acting on a path the *document* named,
+ * not the caller reading a file they chose (see `FileService.read` and `setLinkPolicy`). A file that has moved, sits
  * outside the project, or is over the read cap is skipped silently — missing context is not a
  * failure worth reporting, only worth counting.
  */
@@ -99,7 +100,14 @@ export async function readSourceLines(
 ): Promise<string[] | undefined> {
   if (!isReadableSourcePath(file)) return undefined;
   try {
-    const { content, note } = await files.read(projectDir, { path: file, recordBaseline: false });
+    const { content, note } = await files.read(projectDir, {
+      path: file,
+      recordBaseline: false,
+      // The path came from a compile log or a synctex record, both of which the document
+      // controls — so a symlink out of the project is refused here even in a local project,
+      // where a link the *user* named is followed.
+      strictLinks: true,
+    });
     if (note) return undefined; // binary, or over the read cap
     return splitLines(content);
   } catch {

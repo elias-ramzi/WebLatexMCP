@@ -157,17 +157,18 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `overrideExternalChanges: true`. `status` surfaces `externalChanges`. Baselines reset after
   `project_sync`/`discard` (`ctx.files.resetBaselines`), since those rewrite the tree.
   **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
-  false.** Recording is a claim that _the caller has seen these bytes_. The test is whether the file's
-  content is what the caller asked about: `read_file` records, and so do `list_references` and
-  `check_citations`, which hand back entries verbatim and every citation site. A read the server makes to
-  answer a different question does not — `detectRootFile` sniffing every `.tex` for `\documentclass`
-  (`compile` and the viewer's PDF poller both go through it), and the five lines `compile` and
-  `list_comments` fetch around a location the _log_ chose. `add_citation` reads without recording too:
+  false.** Recording is a claim that _the caller could now base a write on this file_, so record only
+  when the caller asked for that file and got all of it: `read_file`, and `list_references` (every entry
+  verbatim). Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
+  PR fixed. So: `detectRootFile` sniffing every `.tex` for `\documentclass` does not record (`compile`
+  and the viewer's PDF poller both go through it); the five lines `compile`/`list_comments` fetch around
+  a location the _log_ chose do not; `check_citations` does not, since it returns cite keys and line
+  numbers and no content, and it scans _every_ document in the project. `add_citation` does not either:
   its read sits before the already-present early return, and a path that writes nothing must claim
-  nothing; its write passes `overrideExternalChanges` instead, since what it writes is the bytes it just
+  nothing — its write passes `overrideExternalChanges` instead, since what it writes is the bytes it just
   read plus one entry and so cannot lose a hand edit. Wrong in the safe direction costs one refusal the
-  caller can override; the other way silently destroys a user's hand edits, which is exactly what the
-  guard exists to prevent.
+  caller can override; the other way silently destroys a user's hand edits, which is what the guard
+  exists to prevent.
   **Every path resolves symlinks before acting** (`assertNoSymlinkEscape`): `resolveInside` compares
   strings, which a `notes.tex` pointing outside the clone defeats — and git stores a symlink as mode
   120000, so a collaborator can commit one. The check covers writes and deletes, not just reads, and a
@@ -175,6 +176,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   a path may be used, never what the file is **called**: the `resolveInside` string stays its one
   identity, or the revision tracker files a baseline under a key the write never looks up — which is how
   the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+  **Whose link it is decides whether it is followed** (`setLinkPolicy`, injected in `context.ts` from
+  `ProjectManager.isLocalDir`). A clone is shared, so a link in it may be anyone's and is refused. A
+  `mode: 'local'` project is a directory the user registered in place and owns, so a link they put there
+  — one shared `refs.bib` symlinked into each paper is an ordinary layout — is followed. A path the
+  server picked up rather than the caller naming it passes `strictLinks: true` and is refused either way;
+  that is every read behind `compile`'s and `list_comments`' snippets, whose paths come from a
+  document-controlled log or synctex record. Keep that opt-in on any future server-initiative read.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location

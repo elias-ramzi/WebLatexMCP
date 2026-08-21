@@ -28,6 +28,21 @@ function hardWrap(line: string, width = 79): string {
   return out.join('\n');
 }
 
+describe('logTail', () => {
+  it('does not hand back the \\r of a Windows log', () => {
+    const log = ['This is pdfTeX', './main.tex:3: Undefined control sequence.', 'l.3 bad'].join(
+      '\r\n',
+    );
+    expect(logTail(log, 4)).not.toMatch(/\r/);
+    expect(logTail(log, 4).split('\n')).toHaveLength(3);
+  });
+
+  it('is clean through filterLog’s fallback too, when nothing matched', () => {
+    // Nothing here matches KEEP_PATTERNS, so filterLog falls back to the raw tail.
+    expect(filterLog(['aaa', 'bbb', 'ccc'].join('\r\n'))).toBe('aaa\nbbb\nccc');
+  });
+});
+
 describe('parseLog', () => {
   it('parses file-line-error format errors', () => {
     const log = [
@@ -61,6 +76,28 @@ describe('parseLog', () => {
     expect(errors[0]).toMatchObject({ file: 'main.tex', line: 3, echo: 'bad \\nope' });
     expect(errors[0]?.file).not.toMatch(/\r/);
     expect(errors[0]?.message).not.toMatch(/\r/);
+  });
+
+  it('does not let a diagnostic borrow the l.<n> of the one printed right below it', () => {
+    // TeX prints some errors with no source position at all. The scan for a context line stops at
+    // the next diagnostic — including one on the very next line, which is how latexmk prints two
+    // errors from the same pass.
+    const log = [
+      '(./main.tex',
+      '! Package hyperref Error: Wrong driver option.',
+      '! Undefined control sequence.',
+      'l.3 \\foo',
+    ].join('\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(2);
+    const hyperref = errors.find((e) => /hyperref/.test(e.message));
+    expect(hyperref?.line).toBeUndefined();
+    expect(hyperref?.echo).toBeUndefined();
+    // …while the one TeX did print a position for keeps it.
+    expect(errors.find((e) => /Undefined control/.test(e.message))).toMatchObject({
+      line: 3,
+      echo: '\\foo',
+    });
   });
 
   it('parses a log with CR-only line endings', () => {

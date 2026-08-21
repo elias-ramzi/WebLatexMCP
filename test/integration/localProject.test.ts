@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile, readdir, symlink } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -66,6 +66,28 @@ function textOf(res: unknown): string {
 }
 
 describe('local (in-place) projects', () => {
+  it('follows a symlink the user placed in their own directory', async () => {
+    // A shared refs.bib symlinked into each paper is an ordinary LaTeX layout. The symlink guard
+    // is for links the user did not choose — one committed into a shared clone, or one named by a
+    // compile log — and a local project is a directory they registered in place and own.
+    const { client, userDir } = await setup();
+    const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-sharedbib-'));
+    cleanups.push(() => rm(shared, { recursive: true, force: true }));
+    await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={Shared}}\n', 'utf8');
+    await symlink(path.join(shared, 'refs.bib'), path.join(userDir, 'refs.bib'));
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir },
+    });
+    const res = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'cv', path: 'refs.bib' },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect((res.structuredContent as { content: string }).content).toContain('Shared');
+  });
+
   it('registers a directory without cloning anything', async () => {
     const { client, workspace, userDir } = await setup();
 

@@ -26,9 +26,15 @@ export interface ParsedLog {
 /** pdfTeX/latexmk hard-wrap column (`max_print_line` default). */
 const WRAP_WIDTH = 79;
 
-/** Return the last `n` lines of a log verbatim, for the raw escape hatch. */
+/**
+ * The last `n` lines of a log, for the raw escape hatch (`compile`'s `rawLog: true`, and
+ * `filterLog`'s fallback when nothing matched). Splits on every line ending, not just `\n`: pdfTeX
+ * writes its .log in text mode, so on Windows each line would otherwise come back with a trailing
+ * `\r` — the matched path is clean because it goes through {@link unwrapLines}, and this was the
+ * last one that was not.
+ */
 export function logTail(log: string, n = 60): string {
-  const lines = log.split('\n');
+  const lines = log.split(/\r\n|\n|\r/);
   return lines.slice(Math.max(0, lines.length - n)).join('\n');
 }
 
@@ -193,7 +199,7 @@ const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
 function nextContext(lines: string[], i: number): { line: number; echo?: string } | undefined {
   for (let j = i + 1; j < Math.min(i + CONTEXT_LOOKAHEAD, lines.length); j++) {
     const line = lines[j] ?? '';
-    if (j > i + 1 && (line.startsWith('! ') || FILE_LINE_ERROR.test(line))) return undefined;
+    if (line.startsWith('! ') || FILE_LINE_ERROR.test(line)) return undefined;
     const lm = /^l\.(\d+)(.*)$/.exec(line);
     if (lm && lm[1]) {
       const echo = (lm[2] ?? '').trim();

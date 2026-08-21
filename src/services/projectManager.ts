@@ -148,6 +148,16 @@ export class ProjectManager {
     return this.knownIds().find((id) => path.resolve(this.projectPath(id)) === resolved);
   }
 
+  /**
+   * Whether a directory belongs to a local (in-place) project — one the user registered as their
+   * own, rather than a clone this server made. `FileService` asks before refusing a symlink: a
+   * link inside a directory the user owns is one they placed.
+   */
+  isLocalDir(dir: string): boolean {
+    const id = this.idForDir(dir);
+    return id !== undefined && this.isLocal(id);
+  }
+
   /** Whether a project's working directory is there: cloned (git) or simply present (local). */
   async hasClone(id: string): Promise<boolean> {
     return this.isReady(this.getProjectConfig(id));

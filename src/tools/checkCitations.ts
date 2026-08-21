@@ -114,9 +114,11 @@ async function collectEntries(
   const keylessIn: string[] = [];
   let keyless = 0;
   for (const rel of paths) {
-    // The caller receives these entries, `raw` included, so this read is the caller's — see
-    // FileService.read on why that decides whether it claims the baseline.
-    const text = await ctx.files.readText(dir, rel, { recordBaseline: true });
+    // No baseline. This tool answers a question *about* the bibliography — which keys exist,
+    // where, and what they are missing — and returns none of its content, so the caller cannot
+    // base a write on having called it. Claiming otherwise would let the next write_file overwrite
+    // a hand edit made before the scan, and would hide the file from status's externalChanges.
+    const text = await ctx.files.readText(dir, rel);
     if (!text) continue;
     const parsed = parseReferences(text, rel);
     const keyed = parsed.filter((e) => e.key);
@@ -194,9 +196,10 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         const uses = new Map<string, Array<{ path: string; line: number }>>();
         const scanned: string[] = [];
         for (const rel of docPaths) {
-          // Ditto: the caller is handed every citation site in these documents, and will act on
-          // them, so a later write must still be able to tell that the file moved underneath it.
-          const text = await ctx.files.readText(dir, rel, { recordBaseline: true });
+          // Ditto, and more so: this scans *every* .tex and prose file in the project looking for
+          // \cite uses, so recording here would file the whole project as seen — detectRootFile's
+          // hole in another tool.
+          const text = await ctx.files.readText(dir, rel);
           if (!text) continue;
           scanned.push(rel);
           for (const use of extractCitations(text, { markdown: isProseDocument(rel) })) {

@@ -111,6 +111,51 @@ describe('FileService out-of-band edit guard', () => {
     }
   });
 
+  describe('a project whose owner places its own links (mode: local)', () => {
+    it('follows a symlink the user put there', async () => {
+      // One shared refs.bib symlinked into each paper is an ordinary LaTeX layout, and a local
+      // project is a directory the user registered in place. The guard is for links the user did
+      // NOT choose: one committed into a shared clone, or one a compile log named.
+      const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-shared-'));
+      try {
+        await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+        await symlink(path.join(shared, 'refs.bib'), path.join(dir, 'refs.bib'));
+        await symlink(shared, path.join(dir, 'shared'), 'dir');
+        await writeFile(path.join(shared, 'macros.tex'), 'macros\n', 'utf8');
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+
+        expect(await local.readText(dir, 'refs.bib')).toContain('@misc{a');
+        expect((await local.read(dir, { path: 'shared/macros.tex' })).content).toBe('macros\n');
+        await local.write(dir, { path: 'refs.bib', content: '@misc{a, title={B}}\n' });
+        expect(await readFile(path.join(shared, 'refs.bib'), 'utf8')).toBe('@misc{a, title={B}}\n');
+      } finally {
+        await rm(shared, { recursive: true, force: true });
+      }
+    });
+
+    it('still refuses a path the server picked up rather than the caller naming it', async () => {
+      // A compile log is document-controlled, so `strictLinks` overrides the policy: this is the
+      // path compile's snippets and list_comments' snippets take.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside2-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+
+        expect((await local.read(dir, { path: 'notes.tex' })).content).toContain('PRIVATE');
+        await expect(local.read(dir, { path: 'notes.tex', strictLinks: true })).rejects.toThrow(
+          /symlink/,
+        );
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('refuses a write through a symlink whose target does not exist yet', async () => {
     // realpath cannot see where a dangling link points, but writeFile follows it and creates the
     // file at the other end.

@@ -222,6 +222,35 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
     expect(onDisk).toContain('Deep Residual Learning');
   });
 
+  it('check_citations does not claim the files it scans have been seen', async () => {
+    // It returns keys, paths, lines and titles — no file content — and it scans every .tex in the
+    // project. Recording a baseline for all of them would let the next write overwrite a hand
+    // edit made before the scan, and would hide those files from status's externalChanges.
+    const { client, dir } = await setup({
+      'main.tex': 'Text \\cite{seed} more.\n',
+      'refs.bib': '@misc{seed, title={Seed}}\n',
+    });
+
+    await client.callTool({ name: 'read_file', arguments: { project: 'demo', path: 'main.tex' } });
+    const edited = 'Edited by the user \\cite{seed}.\n';
+    await writeFile(path.join(dir, 'main.tex'), edited, 'utf8');
+
+    await client.callTool({ name: 'check_citations', arguments: { project: 'demo' } });
+
+    const write = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'From the agent.\n' },
+    });
+    expect(JSON.stringify(write.content)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe(edited);
+
+    // …and the user's edit is still visible as one.
+    const status = await client.callTool({ name: 'status', arguments: { project: 'demo' } });
+    expect((status.structuredContent as { externalChanges?: string[] }).externalChanges).toContain(
+      'main.tex',
+    );
+  });
+
   it('list_references arms the guard for the bibliography it hands back', async () => {
     // Its entries go back to the caller verbatim, so a later whole-file write has to be able to
     // tell that the file moved underneath it.
