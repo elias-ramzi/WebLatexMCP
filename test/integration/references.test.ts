@@ -54,6 +54,28 @@ const BIB = [
   '',
 ].join('\n');
 
+/**
+ * The group's shared bibliography, as it actually looks: the draft's entries plus a few hundred
+ * (here, a few) belonging to everyone else. `unused2021gap` is incomplete and `never2019cited` is
+ * defined twice — both real defects of *that* project, and neither this draft's problem.
+ */
+const SHARED_BIB = [
+  BIB,
+  '@article{unused2021gap,',
+  '  title  = {An Entry With No Journal},',
+  '  author = {Other, Pat},',
+  '  year   = {2021},',
+  '}',
+  '',
+  '@inproceedings{never2019cited,',
+  '  title     = {A Clashing Copy Nobody Cites},',
+  '  booktitle = {Elsewhere},',
+  '  author    = {Lonely, Ann},',
+  '  year      = {2019},',
+  '}',
+  '',
+].join('\n');
+
 const cleanups: Array<() => Promise<unknown>> = [];
 
 afterEach(async () => {
@@ -87,6 +109,14 @@ async function setup(): Promise<{ client: Client; userDir: string }> {
     arguments: { project: 'proposal', path: userDir },
   });
   return { client, userDir };
+}
+
+/** A second project, registered in place, so a cross-project call has somewhere to reach. */
+async function registerLocalProject(client: Client, id: string): Promise<string> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), `ovl-refs-${id}-`));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  await client.callTool({ name: 'register_project', arguments: { project: id, path: dir } });
+  return dir;
 }
 
 function textOf(res: unknown): string {
@@ -278,5 +308,162 @@ describe('references in a local, non-.bib document', () => {
     };
     expect(undefinedCitations).toEqual([]);
     expect(uncitedEntries).toEqual([]);
+  });
+});
+
+/**
+ * The original field report behind this: a proposal drafted in markdown, in a plain local folder,
+ * whose citations point at the group's shared `.bib` living in a *different* registered project.
+ */
+describe('a bibliography in another project', () => {
+  interface Report {
+    documents: string[];
+    bibliographySources: string[];
+    bibliographyProject?: string;
+    entryCount: number;
+    undefinedCitations: Array<{ key: string; uses: Array<{ path: string; line: number }> }>;
+    uncitedEntries: Array<{ key: string }>;
+    duplicateKeys: Array<{ key: string }>;
+    incompleteEntries: Array<{ key: string; path: string }>;
+  }
+
+  async function setupPair(): Promise<{ client: Client; draftDir: string; sharedDir: string }> {
+    const { client, userDir: draftDir } = await setup();
+    const sharedDir = await registerLocalProject(client, 'shared-bib');
+    await writeFile(path.join(sharedDir, 'ref.bib'), SHARED_BIB);
+    return { client, draftDir, sharedDir };
+  }
+
+  it('cross-checks a draft against a bibliography in another project, in one call', async () => {
+    const { client } = await setupPair();
+
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'shared-bib' },
+    });
+    expect(res.isError).toBeFalsy();
+    const report = res.structuredContent as Report;
+
+    // Documents come from one project, entries from the other, each named by its own root.
+    expect(report.documents).toEqual(['proposal.md']);
+    expect(report.bibliographySources).toEqual(['ref.bib']);
+    expect(report.bibliographyProject).toBe('shared-bib');
+    expect(report.entryCount).toBe(5);
+
+    // The finding that matters: cited in the draft, missing from the shared bibliography.
+    expect(report.undefinedCitations).toEqual([
+      { key: 'ghost2030', uses: [{ path: 'proposal.md', line: 4 }] },
+    ]);
+
+    // And it survives a client that drops structuredContent.
+    expect(textOf(res)).toContain('ghost2030');
+    expect(textOf(res)).toContain('shared-bib');
+  });
+
+  it('does not report a shared bibliography\u2019s own entries as this draft\u2019s problem', async () => {
+    const { client } = await setupPair();
+
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'shared-bib' },
+    });
+    const report = res.structuredContent as Report;
+
+    // A shared .bib is *meant* to hold entries this draft does not cite.
+    expect(report.uncitedEntries).toEqual([]);
+    // Defects in entries nobody here cites belong to that project, not this call.
+    expect(report.duplicateKeys).toEqual([]);
+    expect(report.incompleteEntries.map((e) => e.key)).toEqual(['cabon2020virtual']);
+    expect(textOf(res)).not.toContain('unused2021gap');
+    expect(textOf(res)).not.toContain('never2019cited');
+    // The size of what was checked is still reported, so "5 entries" is not mistaken for all of it.
+    expect(textOf(res)).toContain('5 entries');
+  });
+
+  it('reports a duplicate or incomplete entry once the draft actually cites it', async () => {
+    const { client, sharedDir } = await setupPair();
+    await writeFile(
+      path.join(sharedDir, 'extra.bib'),
+      '@misc{he2016deep, title={A Clashing Copy}, year={2016}}\n',
+    );
+
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'shared-bib' },
+    });
+    const { duplicateKeys } = res.structuredContent as Report;
+    expect(duplicateKeys.map((d) => d.key)).toEqual(['he2016deep']);
+  });
+
+  it('resolves each path inside its own project, never the caller\u2019s', async () => {
+    const { client, draftDir } = await setupPair();
+    // A same-named file in the *draft* project that would answer the question differently.
+    await writeFile(
+      path.join(draftDir, 'ref.bib'),
+      '@misc{ghost2030, title={Only Defined Locally}, year={2030}}\n',
+    );
+
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: {
+        project: 'proposal',
+        bibliographyProject: 'shared-bib',
+        bibliography: ['ref.bib'],
+      },
+    });
+    const report = res.structuredContent as Report;
+    // `ref.bib` resolved in "shared-bib", so the local definition of ghost2030 is not in play.
+    expect(report.undefinedCitations.map((u) => u.key)).toEqual(['ghost2030']);
+    expect(report.entryCount).toBe(5);
+  });
+
+  it('refuses a bibliography path that walks out of its project', async () => {
+    const { client } = await setupPair();
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: {
+        project: 'proposal',
+        bibliographyProject: 'shared-bib',
+        bibliography: ['../ref.bib'],
+      },
+    });
+    expect(res.isError).toBe(true);
+    // Refused by the sandbox, not merely absent — the escape never reaches the filesystem.
+    expect(textOf(res)).toMatch(/Path escapes the project root/);
+  });
+
+  it('names an unknown bibliography project instead of failing obscurely', async () => {
+    const { client } = await setupPair();
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'nope' },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/Unknown project \\?"nope\\?"/);
+  });
+
+  it('says where the entries were looked for when the other project has none', async () => {
+    const { client } = await setup();
+    await registerLocalProject(client, 'empty-bib');
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'empty-bib' },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/No reference entries found in project \\?"empty-bib\\?"/);
+  });
+
+  it('treats naming the document\u2019s own project as the ordinary single-project check', async () => {
+    const { client, userDir } = await setup();
+    await writeFile(path.join(userDir, 'ref.bib'), BIB);
+
+    const res = await client.callTool({
+      name: 'check_citations',
+      arguments: { project: 'proposal', bibliographyProject: 'proposal' },
+    });
+    const report = res.structuredContent as Report;
+    // Not foreign, so nothing is narrowed: the uncited entry is still dead weight worth reporting.
+    expect(report.bibliographyProject).toBeUndefined();
+    expect(report.uncitedEntries.map((e) => e.key)).toEqual(['never2019cited']);
   });
 });

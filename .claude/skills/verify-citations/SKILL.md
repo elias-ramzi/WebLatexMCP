@@ -170,29 +170,38 @@ says nothing about whether a reference is factually right. That is what the DBLP
 ## When the bibliography lives in a different project
 
 A draft often cites a `.bib` that belongs somewhere else — a proposal in one folder, the group's
-shared bibliography in an Overleaf project. **`check_citations` cannot span two projects**: its paths
-stay sandboxed inside one project, which is a property worth keeping, not a bug to work around by
-reaching outside it.
-
-Do it in two calls and compare yourself:
+shared bibliography in an Overleaf project. Register both projects, then name the second one:
 
 ```
-list_references { project: "proposal" }    // the draft's own reference list, or its cite keys
-list_references { project: "shared-bib", filter: "<surname or title words>" }
+check_citations { project: "proposal", bibliographyProject: "shared-bib" }
 ```
 
-Then, per reference in the draft, look for it in the other project's entries — match on cite key when
-the draft cites keys, otherwise on title plus first-author surname plus year. Report the three
-outcomes separately, because they need different fixes:
+`documents` resolve inside `project` and the bibliography inside `bibliographyProject`, each sandboxed
+to its own — that boundary is the property worth keeping, so never try to reach another project by
+writing a path that walks out of this one.
 
-- **present in both** — verify it against DBLP as usual;
-- **in the draft, absent from the shared `.bib`** — the entry has to be added there (`add_citation`
-  from the DBLP key is the sanctioned path, and it needs that project's permission, not this one's);
-- **fields disagree between the two** — say which project you are quoting for each field. Do not
-  assume the `.bib` is right; it is a _candidate_, and DBLP is the arbiter.
+Read the result with the shared bibliography in mind:
 
-`filter` is what keeps this cheap: query the shared bibliography once per reference rather than
-reading a 300-entry `.bib` into context.
+- **`undefinedCitations`** — cited in the draft, absent from the shared `.bib`. This is the finding
+  that matters. The entry has to be added **there**: `add_citation { project: "shared-bib", … }` from
+  a DBLP result, and it needs that project's permission, not this one's.
+- **`uncitedEntries`** comes back **empty**, and that is correct rather than a miss — a shared
+  bibliography is supposed to hold entries this draft does not cite. Do not report it as a finding,
+  and do not go looking for the entries by hand. To audit the shared bibliography as a whole, run
+  `check_citations { project: "shared-bib" }` on its own.
+- **`duplicateKeys` / `incompleteEntries`** cover only the entries the draft cites, for the same
+  reason. `entryCount` still tells you how large the shared `.bib` is.
+
+Then verify each cited entry against DBLP as usual, reading it with
+`list_references { project: "shared-bib", filter: "<surname or title words>" }` — `filter` is what
+keeps this cheap: one query per reference rather than a 300-entry `.bib` in context. When the draft's
+own prose reference list and the shared `.bib` disagree on a field, say which project you are quoting
+for each. Do not assume the `.bib` is right; it is a _candidate_, and DBLP is the arbiter.
+
+A prose reference list carries no cite keys, so `check_citations` has nothing to match on. In that
+case, keep to the two-call comparison: `list_references { project: "proposal" }` for the draft's own
+list, then look each reference up in the shared bibliography by title plus first-author surname plus
+year.
 
 ## Pace DBLP requests
 

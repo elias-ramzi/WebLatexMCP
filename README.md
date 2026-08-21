@@ -138,11 +138,9 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
   from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
 - **Read the references you already have** — `list_references` returns them structured (key, title, authors, year, venue, DOI/arXiv, file and line) from a `.bib`, a LaTeX `thebibliography`, **or a reference list written as prose in a markdown document** — and `check_citations` diffs what the draft cites against what the bibliography defines ([details](docs/tools.md#references-in-any-format)).
-  _Nice to have, not there yet:_ `check_citations` works within **one** project, since its paths stay
-  sandboxed there. A draft that cites a `.bib` belonging to another registered project — a shared group
-  bibliography — is cross-checked today with two `list_references` calls and a comparison (the
-  [`/verify-citations` skill](docs/skills.md#verify-citations--audit-citations-against-dblp) spells out
-  how); a single cross-project tool would be nicer. [Ideas and PRs welcome.](CONTRIBUTING.md)
+  A draft that cites a `.bib` belonging to **another** registered project — a shared group bibliography —
+  is cross-checked in one call with `bibliographyProject`: the draft and the bibliography each stay
+  sandboxed in their own project ([details](docs/tools.md#a-bibliography-in-another-project)).
 - **Review & push** — inspect `status` / `diff` (`diff` takes a `ref`, so a session that already
   committed a few times is still reviewable as a whole — `ref: "HEAD~3"`), commit, then push safely (rebase, never force; conflicts
   come back to you with both sides, and you resolve them by pushing the merged content back — or rewind

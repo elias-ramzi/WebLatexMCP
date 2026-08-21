@@ -39,6 +39,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `duplicateKeys`, and `incompleteEntries` (missing a field the BibTeX entry type requires). Reads the
   `\cite` family in `.tex` (multi-key and optional-argument forms, skipping commented-out ones) and
   pandoc `[@key]` / `@key` in markdown. Structural only; correctness is still the DBLP pass.
+- **`check_citations` spans two projects** — `bibliographyProject` checks a draft against a shared
+  bibliography that lives in _another_ registered project, in one call instead of two `list_references`
+  calls and a comparison by hand. `documents` resolve inside `project` and `bibliography` inside
+  `bibliographyProject`, each sandboxed to its own; the parameter is a **project id**, never a
+  `"project:path"` string, so another project is reachable only by naming one you registered. Reading
+  only — writing into another project's `.bib` stays a separate, permissioned `add_citation` there.
+  Findings are limited to the keys the draft actually cites, since a shared bibliography is supposed to
+  hold entries this draft does not use: `uncitedEntries` comes back empty and `duplicateKeys` /
+  `incompleteEntries` cover cited entries only (`entryCount` still reports the full size). The answer you
+  came for — `undefinedCitations`, the keys the shared `.bib` does not define — is unaffected.
+  `list_references` needs no equivalent: it already reads whichever project `project` names.
 - **`list_files` filter `docs`** — prose documents (`.md`, `.markdown`, `.txt`, `.rst`, `.org`) are now a
   first-class file `type` (`doc`) rather than `other`, so a markdown draft is findable.
 - **`add_citation` returns `line`** — the file and line the entry landed on, so a caller can confirm the
@@ -69,13 +80,6 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`search_references` description** — says outright that it queries DBLP over the network and does not
   read the project's `.bib`, and points at `list_references` for searching the references already there.
   It was not clear which side of the boundary the tool sat on.
-
-### Known limits
-
-- **`check_citations` works within one project.** Its paths stay sandboxed inside a single project, so a
-  draft that cites a `.bib` belonging to _another_ registered project (a shared group bibliography) is
-  cross-checked with two `list_references` calls and a comparison, not one call — the `verify-citations`
-  skill spells out how.
 
 ## [0.5.0] - 2026-08-20
 
