@@ -8,6 +8,9 @@ import {
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
+/** pdfTeX/latexmk hard-wrap column, mirrored from the parser. */
+const WRAP_WIDTH = 79;
+
 /** One real per-figure TikZ externalization failure, as latexmk prints it (file-line-error). */
 function tikzShellEscapeError(figure: number): string {
   return (
@@ -24,6 +27,21 @@ function hardWrap(line: string, width = 79): string {
   for (let i = 0; i < line.length; i += width) out.push(line.slice(i, i + width));
   return out.join('\n');
 }
+
+describe('logTail', () => {
+  it('does not hand back the \\r of a Windows log', () => {
+    const log = ['This is pdfTeX', './main.tex:3: Undefined control sequence.', 'l.3 bad'].join(
+      '\r\n',
+    );
+    expect(logTail(log, 4)).not.toMatch(/\r/);
+    expect(logTail(log, 4).split('\n')).toHaveLength(3);
+  });
+
+  it('is clean through filterLog’s fallback too, when nothing matched', () => {
+    // Nothing here matches KEEP_PATTERNS, so filterLog falls back to the raw tail.
+    expect(filterLog(['aaa', 'bbb', 'ccc'].join('\r\n'))).toBe('aaa\nbbb\nccc');
+  });
+});
 
 describe('parseLog', () => {
   it('parses file-line-error format errors', () => {
@@ -42,6 +60,95 @@ describe('parseLog', () => {
       message: 'Undefined control sequence.',
       rule: 'Undefined control sequence',
     });
+  });
+
+  it('parses a log with Windows line endings', () => {
+    // pdfTeX writes the .log in text mode, so on Windows every line ends \r\n. tex-smoke CI is
+    // ubuntu-only and cannot see this; left unhandled it emptied the parser on Windows entirely.
+    const log = [
+      '(./main.tex',
+      './main.tex:3: Undefined control sequence.',
+      'l.3 bad \\nope',
+      '',
+    ].join('\r\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ file: 'main.tex', line: 3, echo: 'bad \\nope' });
+    expect(errors[0]?.file).not.toMatch(/\r/);
+    expect(errors[0]?.message).not.toMatch(/\r/);
+  });
+
+  it('does not let a diagnostic borrow the l.<n> of the one printed right below it', () => {
+    // TeX prints some errors with no source position at all. The scan for a context line stops at
+    // the next diagnostic — including one on the very next line, which is how latexmk prints two
+    // errors from the same pass.
+    const log = [
+      '(./main.tex',
+      '! Package hyperref Error: Wrong driver option.',
+      '! Undefined control sequence.',
+      'l.3 \\foo',
+    ].join('\n');
+    const { errors } = parseLog(log);
+    expect(errors).toHaveLength(2);
+    const hyperref = errors.find((e) => /hyperref/.test(e.message));
+    expect(hyperref?.line).toBeUndefined();
+    expect(hyperref?.echo).toBeUndefined();
+    // …while the one TeX did print a position for keeps it.
+    expect(errors.find((e) => /Undefined control/.test(e.message))).toMatchObject({
+      line: 3,
+      echo: '\\foo',
+    });
+  });
+
+  it('parses a log with CR-only line endings', () => {
+    const log = ['(./main.tex', './main.tex:7: Missing $ inserted.', 'l.7 x^2', ''].join('\r');
+    const { errors } = parseLog(log);
+    expect(errors[0]).toMatchObject({ file: 'main.tex', line: 7, echo: 'x^2' });
+  });
+
+  it('still un-wraps TeX’s 79-column hard wrap when the log is CRLF', () => {
+    const long = 'x'.repeat(WRAP_WIDTH) + 'tail';
+    const wrapped = [long.slice(0, WRAP_WIDTH), long.slice(WRAP_WIDTH)].join('\r\n');
+    expect(unwrapLines(wrapped)).toEqual([long]);
+  });
+
+  it('rebases the log’s paths onto the project root (latexmk -cd)', () => {
+    // With -cd the engine runs in the root file's directory, so a document at paper/main.tex
+    // reports its own errors as "./main.tex".
+    const log = './main.tex:3: Undefined control sequence.';
+    expect(parseLog(log, { baseDir: 'paper' }).errors[0]?.file).toBe('paper/main.tex');
+    // An absolute path (a .sty from the TeX tree) is not a project-relative path to be joined.
+    const abs = '/usr/share/texlive/tex/latex/foo.sty:9: Undefined control sequence.';
+    expect(parseLog(abs, { baseDir: 'paper' }).errors[0]?.file).toBe(
+      '/usr/share/texlive/tex/latex/foo.sty',
+    );
+    // No baseDir (tectonic, or a root at the project root) leaves it alone.
+    expect(parseLog(log).errors[0]?.file).toBe('main.tex');
+  });
+
+  it('records how a location was obtained, for the snippet layer to check', () => {
+    const fle = [
+      './main.tex:3: Undefined control sequence.',
+      'l.3 This line uses an undefined macro: \\thismacrodoesnotexist',
+    ].join('\n');
+    expect(parseLog(fle).errors[0]).toMatchObject({
+      locatedPair: true,
+      echo: 'This line uses an undefined macro: \\thismacrodoesnotexist',
+    });
+
+    // The bare "! " branch takes its file from the paren stack and its line from the l.<n>: two
+    // independent sources, so it claims no pair — only the echo can confirm them.
+    const bare = ['(./main.tex', '! Undefined control sequence.', 'l.9 \\badmacro'].join('\n');
+    const inferred = parseLog(bare).errors[0];
+    expect(inferred?.locatedPair).toBeUndefined();
+    expect(inferred).toMatchObject({ file: 'main.tex', line: 9, echo: '\\badmacro' });
+  });
+
+  it('does not take an l.<n> that belongs to a different line as this error’s echo', () => {
+    const log = ['./main.tex:3: Undefined control sequence.', 'l.42 something else'].join('\n');
+    const err = parseLog(log).errors[0];
+    expect(err?.line).toBe(3);
+    expect(err?.echo).toBeUndefined();
   });
 
   it('parses a bare TeX error and recovers the line from l.<n>', () => {
@@ -87,6 +194,10 @@ describe('parseLog', () => {
     expect(errors[0]).toMatchObject({ severity: 'error', rule: 'shell escape disabled' });
     expect(errors[0]?.message).toMatch(/3 figures/);
     expect(errors[0]?.message).toMatch(/restrictedShellEscape: true|shellEscape: true/);
+    // It stands for N figures, so it claims no location: inheriting the first figure's file and
+    // line pointed the caller (and the source snippet) at a line where nothing is wrong.
+    expect(errors[0]?.file).toBeUndefined();
+    expect(errors[0]?.line).toBeUndefined();
   });
 
   it('leaves a single shell-escape error uncollapsed but keeps other errors intact', () => {

@@ -11,6 +11,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`compile` returns the source around each error** — a LaTeX message is frequently uninterpretable
+  on its own (`Undefined control sequence` names no macro; `Missing $ inserted` points at the line
+  where TeX _noticed_, not where you erred), so each error now carries the 5 source lines around it
+  (`snippet`, numbered from `snippetStartLine`), rendered into the result **text** as well as
+  `structuredContent` so a client that strips structured output still sees it. Errors only —
+  warnings never carry one — at most 10 distinct locations per compile, attached once per location,
+  and never a guess. Earning one takes more than a plausible line: the log has to name the file
+  **and** line on one diagnostic line (`-file-line-error`), so a location pieced together from the
+  parenthesis stack is counted rather than illustrated — which means **tectonic**, whose logs carry
+  no `file:line` at all, gets no snippets by design. A line past the end of its file, a file the
+  document merely _named_ in its log, and a location TeX's own echo of the source contradicts all
+  get none either. `omittedSnippetLocations` says how many locations went without, so a gap is
+  reported rather than silent. `list_comments` snippets now have the same shape (`snippetStartLine`
+  included).
 - **`session-feedback` skill** — a bundled skill to run at the _end_ of a session, which reviews the tool
   calls that actually ran and reports on the **server itself**: what broke, what cost too many calls,
   what capability was missing, what the docs got wrong. Findings are classified
@@ -80,6 +94,65 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`search_references` description** — says outright that it queries DBLP over the network and does not
   read the project's `.bib`, and points at `list_references` for searching the references already there.
   It was not clear which side of the boundary the tool sat on.
+
+### Fixed
+
+- **A read the server makes for itself no longer disarms the out-of-band-edit guard.** Detecting the
+  root file (`compile`, and the viewer's PDF poller, on a timer) and building `list_comments` snippets
+  recorded a revision baseline as though the caller had read those files, so a `write_file` after a
+  hand edit could overwrite it with no `ExternalChangeError`. `FileService.read`/`readText` now record
+  only when asked to, which only `read_file` and `list_references` do — the two that hand back a whole
+  file the caller could base a write on.
+- **A symlink can no longer take a read or a write out of a project.** `resolveInside` compares
+  strings, so a `notes.tex` symlinked outside it — git stores one as mode 120000, so a collaborator
+  can commit it — was read, written, edited and deleted at the far end. Every path resolves links
+  first now, including for a file that does not exist yet: a write follows a dangling link and
+  creates the file wherever it points. A link's target is resolved in turn, component by component:
+  a dangling `notes.tex` pointing at `sub/pwned`, with `sub` itself linked outside, lands outside
+  however innocent the literal target looks. That holds for **every** project, cloned or local:
+  whether you or the server ran `git clone` says nothing about who put a link in the tree, and a
+  directory you registered in place is usually a working tree a co-author can push a symlink into.
+  The one layout that needs links — a shared `refs.bib` or `figs/` linked into each paper — is a
+  per-project opt-in you set yourself, **`followSymlinks: true`** on a local project
+  (`register_project`, `WEB_LATEX_MCP_PROJECTS`, or the workspace registry). Where it is on,
+  `list_files` and every tool that scans on its own now see the linked files too, so the shared
+  `.bib` is findable instead of readable only by name.
+- **A path the _document_ chose is not handed back as one to open.** `compile` refused to read a
+  symlinked path for a snippet and then reported it as a `file` you can pass straight to `read_file` —
+  so the guard covered the read the server makes rather than the path it offers, and the caller took
+  the next hop. A diagnostic (error or warning) whose file leaves the project through a symlink now
+  keeps its message and loses its `file`/`line` — and its snippet, which is rendered against that
+  line — and the result text says how many were hidden; `list_comments` does the same for a synctex
+  record, which the document controls just as much. Resolving those paths is capped, and a location
+  past the cap is withheld too but reported as **unchecked**, not as an escape: nobody looked at it,
+  so blaming a symlink would send you after a link that is not there.
+- **`read_file` no longer counts a phantom last line.** A file ending in a newline reported one line
+  more than it has, and a range ending on it returned a blank line; CRLF and CR-only files are now split
+  correctly instead of leaving `\r` on every line (or, for CR-only, returning the whole file as line 1).
+- **A ranged `read_file` hands back the bytes that are on disk.** Line endings were normalized to `\n`
+  on the way out, so pasting a range from a CRLF file into `edit_file`'s `oldString` failed to match;
+  the `ref` path also called a whole-file read truncated and dropped the trailing newline, which
+  `push` resolutions write straight back into the repository.
+- **`rawLog` and the log tail no longer carry `\r`** on a Windows log — the last path that still split
+  on `\n` alone.
+- **Compile logs written on Windows parse at all.** pdfTeX writes its `.log` in text mode, so every line
+  arrives with a trailing `\r` — which the diagnostic patterns do not cross and `extname` keeps. Left
+  unhandled it emptied the parser, and CI's TeX job is Linux-only, so nothing caught it.
+- **`compile` resolves a root file in a subdirectory.** latexmk's `-cd` makes the log's paths relative
+  to the root file's directory, so a document at `paper/main.tex` reported its errors in `main.tex`;
+  they are now rebased onto the project root.
+- **The collapsed "TikZ externalization failed for N figures" error no longer claims a location** — it
+  inherited the first figure's file and line, pointing at source where nothing is wrong.
+- **A diagnostic printed without a source position no longer borrows the next one's.** The `l.<n>` scan
+  ran past whatever followed, so a `! Package hyperref Error` above an unrelated
+  `! Undefined control sequence` was reported at that error's line — including when latexmk printed the
+  two on adjacent lines, which is the usual shape.
+- **Source context survives an accented document.** pdfTeX elides a long context line at a byte offset,
+  so it can cut a UTF-8 character in half; the resulting replacement character made the check that
+  guards against a stale location reject a file that was perfectly correct. Measured on real French
+  prose, that silently withheld the source for one error location in eight.
+- **A warning's `file` is rebased like an error's**, so it too is a path `read_file` can open when the
+  root file lives in a subdirectory.
 
 ## [0.5.0] - 2026-08-20
 

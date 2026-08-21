@@ -161,6 +161,25 @@ describe('loadConfig', () => {
     expect(gitUrlOf(byId.thesis!)).toBe('https://git.overleaf.com/abc');
   });
 
+  it('carries a local project’s followSymlinks through from the environment', () => {
+    // The one way to say "the links in this directory are mine" — so it has to survive parsing,
+    // or the guard silently refuses the layout the user configured for.
+    const cfg = loadConfig(
+      {
+        WEB_LATEX_MCP_PROJECTS: JSON.stringify({
+          cv: { mode: 'local', path: '/work/cv', followSymlinks: true },
+          notes: { mode: 'local', path: '/work/notes' },
+        }),
+      },
+      '/work',
+      notInRepo,
+    );
+
+    const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p]));
+    expect(byId.cv).toMatchObject({ mode: 'local', followSymlinks: true });
+    expect(byId.notes).not.toHaveProperty('followSymlinks');
+  });
+
   it('rejects a project entry that is neither a remote nor a path', () => {
     expect(() =>
       loadConfig({ WEB_LATEX_MCP_PROJECTS: JSON.stringify({ cv: { rootFile: 'cv.tex' } }) }),

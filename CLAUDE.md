@@ -150,12 +150,75 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
-- **Out-of-band edits are guarded.** `FileService` holds a `FileRevisionTracker`
-  (`src/services/fileRevisions.ts`) that hashes each file it reads/writes. `write_file`/`edit_file`/
-  `delete_file` refuse (throw `ExternalChangeError`) when the on-disk bytes changed since the server last
-  saw them — the user editing the clone directly — unless `overrideExternalChanges: true`. `status`
-  surfaces `externalChanges`. Baselines reset after `project_sync`/`discard` (`ctx.files.resetBaselines`),
-  since those rewrite the tree. Keep this so a hand-edited clone isn't silently clobbered.
+- **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
+  `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
+  "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)
+  when the on-disk bytes changed since — the user editing the clone directly — unless
+  `overrideExternalChanges: true`. `status` surfaces `externalChanges`. Baselines reset after
+  `project_sync`/`discard` (`ctx.files.resetBaselines`), since those rewrite the tree.
+  **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
+  false.** Recording is a claim that _the caller could now base a write on this file_, so record only
+  when the caller asked for that file and got all of it: `read_file`, and `list_references` (every entry
+  verbatim). Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
+  PR fixed. So: `detectRootFile` sniffing every `.tex` for `\documentclass` does not record (`compile`
+  and the viewer's PDF poller both go through it); the five lines `compile`/`list_comments` fetch around
+  a location the _log_ chose do not; `check_citations` does not, since it returns cite keys and line
+  numbers and no content, and it scans _every_ document in the project. `add_citation` does not either:
+  its read sits before the already-present early return, and a path that writes nothing must claim
+  nothing — its write passes `overrideExternalChanges` instead, since what it writes is the bytes it just
+  read plus one entry and so cannot lose a hand edit. Wrong in the safe direction costs one refusal the
+  caller can override; the other way silently destroys a user's hand edits, which is what the guard
+  exists to prevent.
+  **Every path resolves symlinks before acting** (`assertNoSymlinkEscape`): `resolveInside` compares
+  strings, which a `notes.tex` pointing outside the clone defeats — and git stores a symlink as mode
+  120000, so a collaborator can commit one. The check covers writes and deletes, not just reads, and a
+  link whose target does not exist yet (which a write would create out there). It decides only _whether_
+  a path may be used, never what the file is **called**: the `resolveInside` string stays its one
+  identity, or the revision tracker files a baseline under a key the write never looks up — which is how
+  the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+  **A link out is followed only where the project's owner said so** (`setLinkPolicy`, injected in
+  `context.ts` from `ProjectManager.followsUserLinks`): `mode: 'local'` **plus** an explicit
+  `followSymlinks: true`. It is an assertion, never an inference — who ran `git clone` says nothing
+  about who placed a link, a directory registered in place is usually a working tree with a remote, and
+  a pull can bring in a mode-120000 entry at any time. The layout it exists for is a shared `refs.bib`
+  or `figs/` linked into each paper, so `walk` follows linked entries under the same flag (cycle-guarded
+  by realpath): `list` skipping what `read` follows made the same project both follow and not follow its
+  own links. A path the server picked up rather than the caller naming it passes `strictLinks: true` and
+  is refused either way — every method takes the flag, so this stays honourable for a future
+  server-initiative read _or_ write. And the guard does not stop at the read: a path the **document**
+  named (a compile log, a synctex record) that leaves the project is not handed back as openable either
+  (`unopenablePaths`/`withoutUnopenableLocation` in `src/lib/sourceSnippet.ts`, applied by `compile` to
+  errors _and_ warnings and by `list_comments` to every comment) — otherwise the server refuses the read
+  and then tells the caller they may make it. Withholding takes the **snippet** with the location (it is
+  numbered against `line`), and the two reasons for withholding are counted apart: a path that escaped
+  was resolved and found to leave; a path past `MAX_REPORTED_PATH_CHECKS` was never resolved at all.
+  Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
+  stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
+  land outside.
+- **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
+  each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
+  uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location
+  earns its snippet only by clearing every one of these:
+  - **The log named it outright** — `file` and `line` off one `-file-line-error` line
+    (`ParsedDiagnostic.locatedPair`). A location pieced together from the balanced-paren file stack plus
+    a nearby `l.<n>` is never shown: TeX elides a long line with `...`, which can drop an opening `(`,
+    pop the stack, and land on a file whose line boilerplate (`\item`, `\end{itemize}`) corroborates.
+    That is every diagnostic under **tectonic**, which passes no `-file-line-error` — it gets no
+    snippets, by design.
+  - **The path is one we open** — only source extensions, because the log is document-controlled
+    (`\typeout` can forge a `file:line:` diagnostic naming any file).
+  - **The line exists and the log does not contradict it.** TeX's `l.<n>` echo (`ParsedDiagnostic.echo`)
+    is evidence _against_ a location, never for one, and a contradiction **sticks** — a co-located
+    diagnostic carrying no echo cannot clear it, the same way a shadow-store collision stays flagged.
+  - Paths are rebased onto the project root with `outcome.logBaseDir` first (latexmk gets `-cd`, so a
+    document at `paper/main.tex` logs `./main.tex`) — **errors and warnings alike**, since every `file` a
+    tool returns is one the caller can pass to `read_file`.
+
+  Failing locations are counted into `omittedSnippetLocations`, never left as a silent gap, and they do
+  not consume the 10-location cap (a log listing ten TeX-tree `.sty` paths first would otherwise starve
+  the real error). `ParsedDiagnostic` lives in `logParser`, not `types.ts`: provenance decides what may
+  be shown and never reaches a tool's output.
+
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it

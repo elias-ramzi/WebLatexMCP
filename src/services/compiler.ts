@@ -5,6 +5,7 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
 import type { CompilerKind } from '../types.js';
+import { toPosix } from '../lib/paths.js';
 
 export type Engine = 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -37,6 +38,13 @@ export interface CompileOutcome {
   log: string;
   logPath?: string;
   timedOut: boolean;
+  /**
+   * Directory the engine ran in, relative to the project root ('' for the root itself). The log's
+   * paths are relative to it, not to the project: latexmk gets `-cd` and chdirs into the root
+   * file's directory, so `paper/main.tex` reports its own errors as `./main.tex`. `parseLog` needs
+   * it to hand back paths a caller can open.
+   */
+  logBaseDir: string;
 }
 
 export interface LatexCompiler {
@@ -111,6 +119,16 @@ function shellEscapeFlag(req: CompileRequest): string | undefined {
 }
 
 /**
+ * The directory latexmk's `-cd` puts the engine in, relative to the project root: the root file's
+ * own directory, or '' when it sits at the root. Exported so the rebasing of log paths is unit
+ * testable against the flag that causes it.
+ */
+export function logBaseDir(rootFile: string): string {
+  const dir = path.posix.dirname(toPosix(rootFile));
+  return dir === '.' || dir === '/' ? '' : dir;
+}
+
+/**
  * The full latexmk argument vector for a request. Pure and exported so the arg construction —
  * in particular that a shell-escape flag is present only when explicitly requested — is unit
  * testable without a TeX install.
@@ -158,6 +176,7 @@ async function collectOutcome(
   rootFile: string,
   res: ExecResult,
   durationSec: number,
+  logBase: string,
 ): Promise<CompileOutcome> {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
   const logPath = path.join(buildDir, `${rootBase}.log`);
@@ -180,6 +199,7 @@ async function collectOutcome(
     log,
     logPath: resolvedLogPath,
     timedOut: res.timedOut,
+    logBaseDir: logBase,
   };
 }
 
@@ -205,7 +225,14 @@ export class LatexmkCompiler implements LatexCompiler {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
-    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000);
+    // `-cd` chdirs into the root file's directory: that is what the log's paths are relative to.
+    return collectOutcome(
+      buildDir,
+      req.rootFile,
+      res,
+      (Date.now() - start) / 1000,
+      logBaseDir(req.rootFile),
+    );
   }
 }
 
@@ -244,7 +271,8 @@ export class TectonicCompiler implements LatexCompiler {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
-    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000);
+    // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are.
+    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '');
   }
 }
 

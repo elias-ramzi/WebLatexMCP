@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { FileService } from '../../src/services/fileService.js';
 
 describe('FileService', () => {
@@ -53,7 +53,25 @@ describe('FileService', () => {
   it('reads a full text file', async () => {
     const res = await files.read(dir, { path: 'main.tex' });
     expect(res.content).toBe('line1\nline2\nline3\n');
-    expect(res.totalLines).toBe(4); // trailing newline => 4 split parts
+    // A trailing newline ends the third line; it does not start a fourth. Counting the empty
+    // string after it put a line number on a line the file does not have.
+    expect(res.totalLines).toBe(3);
+    expect(res.truncated).toBe(false);
+  });
+
+  it('returns a ranged read byte-exactly, CRLF included', async () => {
+    // What comes back has to go straight back in as edit_file's oldString.
+    await writeFile(path.join(dir, 'crlf.tex'), 'line one\r\nline two\r\nline three\r\n', 'utf8');
+    const res = await files.read(dir, { path: 'crlf.tex', startLine: 1, endLine: 2 });
+    expect(res.content).toBe('line one\r\nline two');
+
+    await files.applyEdits(dir, 'crlf.tex', [{ oldString: res.content, newString: 'replaced' }]);
+    expect(await readFile(path.join(dir, 'crlf.tex'), 'utf8')).toBe('replaced\r\nline three\r\n');
+  });
+
+  it('does not call a whole-file range truncated', async () => {
+    const res = await files.read(dir, { path: 'main.tex', startLine: 1 });
+    expect(res.content).toBe('line1\nline2\nline3\n');
     expect(res.truncated).toBe(false);
   });
 

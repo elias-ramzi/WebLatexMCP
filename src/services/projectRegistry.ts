@@ -43,6 +43,7 @@ const registrySchema = z.record(
       mode: z.literal('local'),
       path: z.string().min(1),
       rootFile: z.string().min(1).optional(),
+      followSymlinks: z.boolean().optional(),
     }),
   ]),
 );
@@ -126,8 +127,8 @@ export class ProjectRegistry {
 /** Drop the synthetic `id` field — the file keys projects by id. */
 function toEntry(cfg: ProjectConfig): RegistryFile[string] {
   if (isLocalProject(cfg)) {
-    const { mode, path: dir, rootFile } = cfg;
-    return { mode, path: dir, rootFile };
+    const { mode, path: dir, rootFile, followSymlinks } = cfg;
+    return { mode, path: dir, rootFile, followSymlinks };
   }
   const { gitUrl, rootFile, branch, username, tokenEnv } = cfg;
   return { gitUrl, rootFile, branch, username, tokenEnv };

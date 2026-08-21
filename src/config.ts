@@ -25,6 +25,7 @@ const projectsSchema = z.record(
       mode: z.literal('local'),
       path: z.string().min(1),
       rootFile: z.string().min(1).optional(),
+      followSymlinks: z.boolean().optional(),
     }),
   ]),
 );
