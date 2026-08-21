@@ -7,7 +7,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 This log starts with the changes made after 0.2.0; for anything earlier, see the git history.
 
-## [Unreleased]
+## [0.6.0] - 2026-08-21
 
 ### Added
 
@@ -84,6 +84,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **README trimmed.** "Highlights" merges the multi-project and no-remote bullets into one, and the
+  surgical-edit and reviewable-push bullets into another; the references bullet now leads with what the
+  citation checks do rather than which formats they parse. "What you can do" is five one-line entries
+  instead of a paragraph each — the parameters, guards, and edge cases it restated all live in
+  [tools.md](docs/tools.md), which it now points at.
 - **`verify-citations` works on a document that is neither a `.bib` nor on a remote.** The skill now
   branches on the project's `mode`: it skips `project_sync` and the git-exclude step for a local project
   instead of failing on them, registers an unregistered folder in place, and drives `list_references` /

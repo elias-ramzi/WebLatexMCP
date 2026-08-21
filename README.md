@@ -49,16 +49,14 @@ document.
 
 ## Highlights
 
-- 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
-- 📂 **Or no remote at all** — register a folder you already have and work on it in place, so what Claude compiles is the file your editor has open.
-- ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
+- 🗂️ **Any project, with or without a remote** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials — or a folder you already have, worked on **in place**, so what Claude compiles is the file your editor has open.
 - 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. Each error comes with the 5 source lines around it, so a bare `Undefined control sequence` is readable on the spot. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
-- 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
+- ✏️ **Surgical edits, reviewable pushes** — atomic, exact-match string replacements; `commit` and `push` stay separate, so nothing leaves your machine implicitly.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
-- 📚 **References in any format** — read them structured out of a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft, and cross-check what the document cites against what it defines.
+- 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
 ## Install
@@ -129,24 +127,14 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
-- **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
-- **Compile what you already have** — register by `path` instead of a git URL — a directory, or just the document itself (`~/proposals/eurohpc.md`), and the folder holding it is used — and the server reads, edits and compiles it **in place**: no clone, no second copy of the document to drift apart ([details](docs/tools.md#local-in-place-projects)).
-- **Sync & browse** — clone/pull a git project, list and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
-- **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).
-- **Diagnose the toolchain** — `doctor` reports what the machine actually has (engines, TeX distribution and its age, the package manager and the repository it would install from, writable install paths), so a missing package or an end-of-life TeX Live is a one-call answer instead of a chain of failed compiles ([details](docs/tools.md#missing-packages)).
-- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
-  from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
-- **Read the references you already have** — `list_references` returns them structured (key, title, authors, year, venue, DOI/arXiv, file and line) from a `.bib`, a LaTeX `thebibliography`, **or a reference list written as prose in a markdown document** — and `check_citations` diffs what the draft cites against what the bibliography defines ([details](docs/tools.md#references-in-any-format)).
-  A draft that cites a `.bib` belonging to **another** registered project — a shared group bibliography —
-  is cross-checked in one call with `bibliographyProject`: the draft and the bibliography each stay
-  sandboxed in their own project ([details](docs/tools.md#a-bibliography-in-another-project)).
-- **Review & push** — inspect `status` / `diff` (`diff` takes a `ref`, so a session that already
-  committed a few times is still reviewable as a whole — `ref: "HEAD~3"`), commit, then push safely (rebase, never force; conflicts
-  come back to you with both sides, and you resolve them by pushing the merged content back — or rewind
-  the clone to the current remote with `reset_to_remote` and redo your edits cleanly).
+- **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
+- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
+- **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error, and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
+- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
+- **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
 
-See the [full tool reference](docs/tools.md).
+See the [full tool reference](docs/tools.md) for every parameter, the safety guards, and how conflicts,
+shell-escape, and parallel sessions work.
 
 ## Skills
 
