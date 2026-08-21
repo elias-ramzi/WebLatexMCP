@@ -69,8 +69,13 @@ const diagnosticShape = z.object({
     .describe(
       'Source file — project-relative, so a path you can pass straight to read_file (a diagnostic ' +
         'inside the TeX installation itself names an absolute path instead). Absent when the log ' +
-        'named none, and dropped when the one it named leaves the project through a symlink: the ' +
-        'log is written by the document, so a path out of it is not one this server hands back.',
+        'named none, and dropped for two different reasons, which the result text tells apart: ' +
+        'the path leaves the project through a symlink (the log is written by the document, so a ' +
+        'path out of it is not one this server hands back), OR it was never resolved at all — ' +
+        `checking where a log’s paths lead is capped at ${MAX_REPORTED_PATH_CHECKS} distinct ` +
+        'files per compile, and anything past that is withheld the same way but reported as ' +
+        'unchecked rather than as an escape. So a missing `file` is not by itself evidence of a ' +
+        'symlink.',
     ),
   line: z.number().optional(),
   message: z.string(),
@@ -136,7 +141,9 @@ const outputSchema = {
     .describe(
       'How many distinct error **locations** carry no `snippet` — over the 10-location cap, or ' +
         'unreadable, or not named outright by the log, or contradicted by it, or naming a path ' +
-        'that leaves the project through a symlink. 0 means every ' +
+        'that leaves the project through a symlink, or naming one past the ' +
+        `${MAX_REPORTED_PATH_CHECKS}-file cap on resolving where the log’s paths lead (never ` +
+        'checked, which is not the same claim as an escape). 0 means every ' +
         'located error has its source context: co-located errors share one snippet, so an error ' +
         'without one is not a gap when 0. This is the flag for "there is more to see".',
     ),
@@ -224,6 +231,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // next — for warnings as much as errors, since both come off the same document-written
           // log. Refusing only the snippet read would leave the guard one hop deep.
           const withheld = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
+          // Note the order: `omittedSnippetLocations` was counted in the pass above, so a snippet
+          // taken away here is not added to it. Only a past-the-cap location can lose one (a path
+          // that escapes is refused the read, so it never had a snippet), and reaching that cap
+          // takes 200+ distinct paths — the count is in the hundreds by then, so the promise that
+          // matters, "0 means every located error has its source context", still holds: 0 is not
+          // reachable in the one case that undercounts.
           const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
           const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
           const missingPackages = findMissingPackages(outcome.log);
