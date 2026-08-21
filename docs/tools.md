@@ -16,7 +16,7 @@ POSIX (`/`-separated), on every OS.
 | `edit_file`         | Surgical string-replacement edits (unique match unless `replaceAll`; atomic). Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `delete_file`       | Delete a file from the project. Same out-of-band-edit guard. A `.bib` target needs `confirmBibEdit: true`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `list_references`   | Parse the project's **own** references and return them structured — key, type, title, authors, year, venue, DOI/arXiv, plus the file and line each sits on and the entry `raw`. Reads a BibTeX `.bib` (resolving `@string` macros), a LaTeX `thebibliography`, **or a reference list written as prose in a markdown/plain-text document**; each entry says which (`format`). `filter` searches key/title/authors/venue. Needs no remote, so it works on a local project. Read-only — see [References in any format](#references-in-any-format).                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `check_citations`   | Cross-check what the document **cites** against what the bibliography **defines**, in one call: `undefinedCitations` (cited, no entry — these render as `[?]`), `uncitedEntries`, `duplicateKeys`, `incompleteEntries` (missing a field the BibTeX type requires). Reads the `\cite` family in `.tex` and pandoc `[@key]` in markdown. Structural only — for whether a reference is _correct_, use `search_references`. Read-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `check_citations`   | Cross-check what the document **cites** against what the bibliography **defines**, in one call: `undefinedCitations` (cited, no entry — these render as `[?]`), `uncitedEntries`, `duplicateKeys`, `incompleteEntries` (missing a field the BibTeX type requires). Reads the `\cite` family in `.tex` and pandoc `[@key]` in markdown. `bibliographyProject` checks the draft against a **shared bibliography in another registered project**. Structural only — for whether a reference is _correct_, use `search_references`. Read-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `search_references` | Look a publication up on **DBLP** over the network; returns candidates and their DBLP keys. Does **not** read the project — that's `list_references`. Read-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `add_citation`      | Fetch a reference from DBLP by key and append it to a `.bib` file, returning the `path` and `line` it landed on. The only sanctioned way to add a citation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `compile`           | Compile locally with latexmk; returns success, PDF path, structured errors/warnings (each with the originating source `file` when it can be determined) + a **de-noised** log tail (only errors/warnings and the `Output written on` summary — font/memory noise stripped; pass `rawLog: true` for the unfiltered tail, or read `logPath` for the full log). For workspace-local clones the PDF is surfaced at `.web_latex_mcp/<project>.pdf`. TikZ externalization (`\tikzexternalize`) needs system calls: pass `restrictedShellEscape: true` (preferred) or `shellEscape: true` — see [Shell escape](#shell-escape-for-tikz-externalization). A failure caused by a package missing from your **local TeX installation** names it in `missingPackages` (e.g. `["fontawesome"]`, parsed from the log's ``File `fontawesome.sty' not found`` errors) and carries a `hint` with the install command — only `.sty`/`.cls` names appear there, since a missing image is a document problem, not a missing package. |
@@ -179,6 +179,43 @@ entry verbatim.
 Both are read-only and neither touches git, so they work on a [local project](#local-in-place-projects)
 with no remote at all. The [`/verify-citations` skill](skills.md) drives them, then checks each entry
 against DBLP.
+
+### A bibliography in another project
+
+A draft often does not carry the bibliography it cites: a proposal in one folder, the group's shared
+`ref.bib` in an Overleaf project. `bibliographyProject` names the project the entries live in, and the
+cross-check happens in one call:
+
+```jsonc
+// check_citations { project: "proposal", bibliographyProject: "shared-bib" }
+{
+  "bibliographySources": ["ref.bib"], // paths relative to "shared-bib"
+  "bibliographyProject": "shared-bib",
+  "entryCount": 312,
+  "undefinedCitations": [{ "key": "ghost2030", "uses": [{ "path": "proposal.md", "line": 4 }] }],
+  "uncitedEntries": [], // see below
+}
+```
+
+Two things about it are deliberate:
+
+- **Each path stays sandboxed in its own project.** `documents` resolve inside `project`,
+  `bibliography` inside `bibliographyProject`. Nothing crosses over, and the parameter takes a
+  **project id**, not a `"project:path"` string — you reach another project only by naming one you
+  registered, never by writing a path that walks out of this one. Reading is all it does: writing across
+  projects (`add_citation` into someone else's `.bib`) stays a separate, deliberate act in that project.
+- **The findings cover only what your draft cites.** A shared bibliography is _meant_ to hold hundreds of
+  entries this draft does not use, so `uncitedEntries` comes back empty and `duplicateKeys` /
+  `incompleteEntries` are limited to cited keys — `entryCount` still tells you how big it is. To audit
+  the shared bibliography as a whole, run `check_citations` with `project: "shared-bib"` instead.
+
+`undefinedCitations` is the answer you came for: keys the draft cites that the shared bibliography does
+not define. Each one has to be added **there** — `add_citation { project: "shared-bib", … }`, from a
+DBLP result, with that project's permission.
+
+`list_references` has no equivalent parameter and needs none: it already reads whichever project
+`project` names, so listing another project's references is just `list_references { project:
+"shared-bib", filter: "…" }`. Only `check_citations` joins two sets, so only it names two projects.
 
 ## Shell escape (for TikZ externalization)
 

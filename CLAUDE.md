@@ -122,6 +122,29 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   parenthesized year) so a wrong guess never sends a DBLP lookup after the wrong paper. `list_references`
   and `check_citations` are the tools over it, and `src/lib/referenceSources.ts` decides which files to
   scan. Neither touches git — the case they exist for is a draft with no remote and no `.bib`.
+- **`check_citations` may read a second project — read-only, and only where the draft touches it.**
+  `bibliographyProject` names another registered project whose bibliography to check against (a shared
+  group `.bib` the draft cites but does not contain). This is a deliberate widening of what one call can
+  reach, and it holds only under these rules — keep them:
+  - **Two sandboxes, never one.** `documents` resolve inside `project` and `bibliography` inside
+    `bibliographyProject`, each through `requireProjectDir` + `FileService`. No path crosses over; a
+    caller cannot reach a directory by naming it as a path, only by naming a **registered** project
+    (which the user registered and owns). That is why the field is a project id, not a `"project:path"`
+    string — a namespace overloaded onto a path field is one parse bug away from an escape.
+  - **Read-only only.** Nothing writes across projects. `add_citation` into someone else's `.bib` stays a
+    separate, permissioned act, because the `.bib` guard and "entry text originates from DBLP" both
+    depend on that staying narrow.
+  - **No lock is taken**, as for every read-only tool. `runExclusive` is per project and serialises
+    writers; two concurrent reads of a `.bib` need nothing, and taking two locks would invite a deadlock
+    against a peer session locking them in the other order.
+  - **A foreign bibliography is reported on only where the draft cites it** (`uncitedEntries` empty,
+    the rest filtered to cited keys). A shared `.bib` is supposed to hold entries this draft does not
+    cite; listing 300 of them re-creates the context burn the parameter exists to remove.
+
+  `list_references` deliberately gets **no** equivalent: it already reads whichever project `project`
+  names, and a cross-project listing is two calls with nothing to join. Only `check_citations` joins two
+  sets, so only it needs to name two projects.
+
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the

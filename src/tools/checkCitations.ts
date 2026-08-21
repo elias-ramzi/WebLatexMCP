@@ -25,8 +25,18 @@ const inputSchema = {
     .optional()
     .describe(
       'Files holding the reference entries — a .bib, or a .tex with a thebibliography. Omit to ' +
-        'use every bibliography the project has. Point this at another project’s .bib by ' +
-        'registering that project and checking there instead; paths stay inside one project.',
+        'use every bibliography the project has. Resolved inside `bibliographyProject` when that ' +
+        'is set, otherwise inside `project`.',
+    ),
+  bibliographyProject: z
+    .string()
+    .optional()
+    .describe(
+      'Check against ANOTHER registered project’s bibliography — a shared group .bib the draft ' +
+        'cites but does not contain. `documents` still resolve in `project` and `bibliography` in ' +
+        'this one, each sandboxed to its own project. Findings are then limited to entries this ' +
+        'draft actually cites: a shared bibliography is not dead weight for one draft, so ' +
+        'uncitedEntries comes back empty (run check_citations inside that project to audit it).',
     ),
 };
 
@@ -35,6 +45,14 @@ const placeSchema = z.object({ path: z.string(), line: z.number() });
 const outputSchema = {
   documents: z.array(z.string()).describe('Files whose citations were collected.'),
   bibliographySources: z.array(z.string()).describe('Files the reference entries came from.'),
+  bibliographyProject: z
+    .string()
+    .optional()
+    .describe(
+      'Set only when the bibliography came from a DIFFERENT project than the documents; ' +
+        '`bibliographySources` paths are then relative to that project’s root, and every finding ' +
+        'below is limited to the keys these documents cite.',
+    ),
   entryCount: z.number(),
   citationCount: z.number().describe('Distinct cite keys used across the documents.'),
   undefinedCitations: z
@@ -49,10 +67,18 @@ const outputSchema = {
         title: z.string().optional(),
       }),
     )
-    .describe('In the bibliography but never cited — dead weight, not an error.'),
+    .describe(
+      'In the bibliography but never cited — dead weight, not an error. Always empty when ' +
+        '`bibliographyProject` is set: a shared bibliography is meant to hold entries this draft ' +
+        'does not cite, so listing them would be noise. Audit it by running check_citations ' +
+        'inside that project.',
+    ),
   duplicateKeys: z
     .array(z.object({ key: z.string(), occurrences: z.array(placeSchema) }))
-    .describe('The same cite key defined more than once; later definitions are ignored.'),
+    .describe(
+      'The same cite key defined more than once; later definitions are ignored. Limited to cited ' +
+        'keys when `bibliographyProject` is set.',
+    ),
   incompleteEntries: z
     .array(
       z.object({
@@ -63,7 +89,10 @@ const outputSchema = {
         missing: z.array(z.string()),
       }),
     )
-    .describe('BibTeX entries missing a field their type requires ("a|b" means either will do).'),
+    .describe(
+      'BibTeX entries missing a field their type requires ("a|b" means either will do). Limited ' +
+        'to cited entries when `bibliographyProject` is set.',
+    ),
 };
 
 type Located = ReferenceEntry & { path: string };
@@ -112,31 +141,48 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         '\\citep / \\textcite / \\autocite and friends in .tex, and pandoc `[@key]` in markdown, ' +
         'against .bib files and \\bibitem lists. This is the regex diff you would otherwise write ' +
         'by hand. It does NOT check whether a reference is factually correct — that is ' +
-        'search_references against DBLP, or the verify-citations skill. Read-only; no git remote ' +
-        'needed, so it works on a local project.',
+        'search_references against DBLP, or the verify-citations skill. Pass ' +
+        '`bibliographyProject` to check a draft against a SHARED bibliography that lives in ' +
+        'another registered project. Read-only; no git remote needed, so it works on a local ' +
+        'project.',
       inputSchema,
       outputSchema,
     },
-    async ({ project, documents, bibliography }) => {
+    async ({ project, documents, bibliography, bibliographyProject }) => {
       try {
-        const { dir } = await ctx.projectManager.requireProjectDir(project);
+        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
+        // Resolved separately, so each path stays sandboxed inside the project it belongs to —
+        // the boundary that makes reading across two registered projects safe.
+        const bib =
+          bibliographyProject === undefined
+            ? { id, dir }
+            : await ctx.projectManager.requireProjectDir(bibliographyProject);
+        // A `bibliographyProject` that resolves to the project we are already in is not foreign,
+        // whatever the caller typed — naming the same project (or the default) must not silently
+        // narrow the report.
+        const foreign = bib.id !== id;
+        const where = foreign ? ` in project "${bib.id}"` : '';
 
-        const bibPaths = bibliography ?? (await referenceSourceCandidates(ctx, dir));
-        const { entries, sources, keyless, keylessIn } = await collectEntries(ctx, dir, bibPaths);
+        const bibPaths = bibliography ?? (await referenceSourceCandidates(ctx, bib.dir));
+        const { entries, sources, keyless, keylessIn } = await collectEntries(
+          ctx,
+          bib.dir,
+          bibPaths,
+        );
         if (entries.length === 0) {
           // Found references, but they are numbered rather than keyed — a prose reference list.
           // There is nothing to cross-reference *by*, so say that rather than "none found".
           if (keyless > 0) {
             throw new Error(
-              `Found ${keyless} reference(s) in ${keylessIn.join(', ')}, but none carry a cite ` +
+              `Found ${keyless} reference(s) in ${keylessIn.join(', ')}${where}, but none carry a cite ` +
                 'key — they are a numbered/prose reference list. check_citations matches cite keys, ' +
                 'so there is nothing here to cross-reference. Use list_references to read the list, ' +
                 'and verify each entry against DBLP with search_references.',
             );
           }
           throw new Error(
-            'No reference entries found. Pass `bibliography` with the file that holds them ' +
-              '(a .bib, or the .tex carrying the thebibliography environment).',
+            `No reference entries found${where}. Pass \`bibliography\` with the file that holds ` +
+              'them (a .bib, or the .tex carrying the thebibliography environment).',
           );
         }
 
@@ -168,13 +214,22 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
           .map(([key, places]) => ({ key, uses: places }))
           .sort((a, b) => a.key.localeCompare(b.key));
 
-        const uncitedEntries = entries
-          .filter((e) => !uses.has(e.key!))
-          .map((e) => ({ key: e.key!, path: e.path, line: e.line, title: e.title }))
-          .sort((a, b) => a.key.localeCompare(b.key));
+        // A bibliography belonging to another project is reported on only where this draft
+        // touches it. A shared group .bib is *supposed* to hold hundreds of entries this draft
+        // does not cite, and its formatting defects are its own project's business — listing them
+        // all would bury the one finding that matters under the noise the caller came here to
+        // avoid. Within one project every entry is the caller's, so nothing is filtered.
+        const relevant = (key: string): boolean => !foreign || uses.has(key);
+
+        const uncitedEntries = foreign
+          ? []
+          : entries
+              .filter((e) => !uses.has(e.key!))
+              .map((e) => ({ key: e.key!, path: e.path, line: e.line, title: e.title }))
+              .sort((a, b) => a.key.localeCompare(b.key));
 
         const duplicateKeys = [...defined.entries()]
-          .filter(([, list]) => list.length > 1)
+          .filter(([key, list]) => list.length > 1 && relevant(key))
           .map(([key, list]) => ({
             key,
             occurrences: list.map((e) => ({ path: e.path, line: e.line })),
@@ -182,6 +237,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
           .sort((a, b) => a.key.localeCompare(b.key));
 
         const incompleteEntries = entries
+          .filter((e) => relevant(e.key!))
           .map((e) => ({
             key: e.key!,
             path: e.path,
@@ -195,6 +251,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         const result = {
           documents: scanned,
           bibliographySources: sources,
+          ...(foreign ? { bibliographyProject: bib.id } : {}),
           entryCount: entries.length,
           citationCount: uses.size,
           undefinedCitations,
@@ -217,6 +274,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
 interface Report {
   documents: string[];
   bibliographySources: string[];
+  bibliographyProject?: string;
   entryCount: number;
   citationCount: number;
   undefinedCitations: Array<{ key: string; uses: Array<{ path: string; line: number }> }>;
@@ -227,10 +285,21 @@ interface Report {
 
 /** The findings as text, so a client that drops `structuredContent` still gets the whole report. */
 function render(r: Report): string {
+  const from = r.bibliographyProject ? ` (project "${r.bibliographyProject}")` : '';
   const lines = [
-    `${r.entryCount} entries in ${r.bibliographySources.join(', ') || '(none)'} · ` +
+    `${r.entryCount} entries in ${r.bibliographySources.join(', ') || '(none)'}${from} · ` +
       `${r.citationCount} distinct keys cited across ${r.documents.length} document(s)`,
   ];
+  if (r.bibliographyProject) {
+    lines.push(
+      `Findings below cover only the keys these documents cite — "${r.bibliographyProject}" is a ` +
+        'shared bibliography, so its uncited and unrelated entries are not this draft’s problem. ' +
+        `Run check_citations with project: "${r.bibliographyProject}" to audit it as a whole.`,
+    );
+  }
+  // Where the header ends, so "no problems" stays right whether or not the cross-project note
+  // above added a line.
+  const headerLines = lines.length;
   const section = (title: string, items: string[]): void => {
     if (items.length === 0) return;
     lines.push('', `${title} (${items.length}):`, ...items.map((i) => `  ${i}`));
@@ -255,6 +324,6 @@ function render(r: Report): string {
     'Missing required fields',
     r.incompleteEntries.map((e) => `${e.key} (${e.path}:${e.line}) — ${e.missing.join(', ')}`),
   );
-  if (lines.length === 1) lines.push('', 'No problems found.');
+  if (lines.length === headerLines) lines.push('', 'No problems found.');
   return lines.join('\n');
 }
