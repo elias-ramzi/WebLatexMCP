@@ -43,20 +43,20 @@ An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a gi
 commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
 **macOS, Linux, and Windows**.
 
-Already have the `.tex` on your machine? Point it at that folder instead and it reads, edits and
-compiles the real files **in place** — no remote, no clone, no second copy of the document.
+Already have the `.tex` on your machine? Point it at that folder — or straight at the file — and it
+reads, edits and compiles the real files **in place** — no remote, no clone, no second copy of the
+document.
 
 ## Highlights
 
-- 🗂️ **Multi-project** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials.
-- 📂 **Or no remote at all** — register a folder you already have and work on it in place, so what Claude compiles is the file your editor has open.
-- ✏️ **Surgical edits** — atomic, exact-match string replacements; read with optional line ranges.
-- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
+- 🗂️ **Any project, with or without a remote** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials — or a folder you already have, worked on **in place**, so what Claude compiles is the file your editor has open.
+- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. Each error comes with the 5 source lines around it, so a bare `Undefined control sequence` is readable on the spot. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
-- 🔍 **Reviewable pushes** — `commit` and `push` are separate; nothing leaves your machine implicitly.
+- ✏️ **Surgical edits, reviewable pushes** — atomic, exact-match string replacements; `commit` and `push` stay separate, so nothing leaves your machine implicitly.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
 - 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
 ## Install
@@ -127,19 +127,14 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
-- **Add a project from the chat** — paste a git URL and Claude registers it (`register_project`), persisted across restarts and sessions — no env config needed ([details](docs/configuration.md#registering-a-project-without-env-config)).
-- **Compile what you already have** — register a directory by `path` instead of a git URL and the server reads, edits and compiles it **in place**: no clone, no second copy of the document to drift apart ([details](docs/tools.md#local-in-place-projects)).
-- **Sync & browse** — clone/pull a git project, list and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits to `.tex` files.
-- **Compile** — run `latexmk` (or `tectonic`) locally and get back structured errors, warnings, and a clickable `file://` link to the PDF. For TikZ externalization, opt in per compile with `restrictedShellEscape` (preferred) or `shellEscape` — both **default off** and never auto-enabled, since `-shell-escape` lets a `.tex` run arbitrary commands ([details](docs/tools.md#shell-escape-for-tikz-externalization)).
-- **Diagnose the toolchain** — `doctor` reports what the machine actually has (engines, TeX distribution and its age, the package manager and the repository it would install from, writable install paths), so a missing package or an end-of-life TeX Live is a one-call answer instead of a chain of failed compiles ([details](docs/tools.md#missing-packages)).
-- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries (`.bib` files are protected
-  from hand-edits — see [Citations](docs/tools.md#citations-via-dblp)).
-- **Review & push** — inspect `status` / `diff`, commit, then push safely (rebase, never force; conflicts
-  come back to you with both sides, and you resolve them by pushing the merged content back — or rewind
-  the clone to the current remote with `reset_to_remote` and redo your edits cleanly).
+- **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
+- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
+- **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error, and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
+- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
+- **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
 
-See the [full tool reference](docs/tools.md).
+See the [full tool reference](docs/tools.md) for every parameter, the safety guards, and how conflicts,
+shell-escape, and parallel sessions work.
 
 ## Skills
 
@@ -148,9 +143,10 @@ unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
-- **`/verify-citations`** — audit every `.bib` entry against DBLP, flag discrepancies, and write a local git-excluded audit report (read-only for the `.bib`).
+- **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
+- **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, and emitted as ready-to-file issue bodies — the environment (version, OS, client, model, install method, toolchain) measured rather than guessed ([contributing](CONTRIBUTING.md#feedback-from-a-session)).
 
 **How you get them depends on the client:**
 
@@ -182,6 +178,19 @@ and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 
 This repo **accepts pull requests** — bug reports, feature ideas, docs fixes, and code changes are all
 welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up, run the local gate, and open a PR.
+
+**Telling us how a session went is a contribution too**, and the fastest one to make. At the end of a
+session spent working through the server, run the [`/session-feedback`](.claude/skills/session-feedback/SKILL.md)
+skill: it looks back over the tool calls that actually ran — the ones that failed, the detours, the
+guard that fired for the wrong reason, the thing you wanted and could not do — and writes a short,
+ranked write-up. What comes back is **one ready-to-file issue body per finding**, in the same field
+order as this repo's issue forms, carrying an environment block it _measured_ — server version (and
+whether that is the latest), OS and architecture, Node, MCP client, model, install method, TeX
+toolchain — asking you for the few facts a session cannot read about itself rather than inventing them.
+It reports on the _server_, never on your paper: it edits nothing, commits nothing, pushes nothing, and
+it strips tokens, paths, and manuscript content before printing, because the report is written to be
+handed to a stranger. Paste a block into an issue, or say the word and `gh` files it. See
+[Feedback from a session](CONTRIBUTING.md#feedback-from-a-session).
 
 A note on maturity: this project is largely vibe-coded, so treat it as best-effort rather than
 battle-tested. Robustness isn't guaranteed — expect rough edges, and please report them. It has been

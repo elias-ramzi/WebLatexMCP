@@ -24,9 +24,19 @@ const outputSchema = {
   key: z.string(),
   added: z.boolean(),
   alreadyPresent: z.boolean(),
+  /** Where the entry now sits, so the caller can confirm it without re-reading the file. */
+  line: z.number().describe('1-based line the entry starts on, in the file after the write.'),
   bibtex: z.string(),
   diff: z.string(),
 };
+
+/** 1-based line of the `@type{key,` header in a bibliography, or 1 when it cannot be located. */
+function entryLine(content: string, key: string): number {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const idx = content.search(new RegExp(`@\\w+\\s*[{(]\\s*${escaped}\\s*,`));
+  if (idx === -1) return 1;
+  return content.slice(0, idx).split('\n').length;
+}
 
 /** Resolve the .bib file to write to: the explicit one, or the project's sole .bib. */
 async function resolveBibFile(
@@ -72,28 +82,47 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           const target = await resolveBibFile(ctx, dir, bibFile);
           // Re-fetch from DBLP so the appended text always originates from the API.
           const bibtex = await ctx.dblp.fetchBibtex(key);
+          // No baseline from this read: it happens before the already-present early return, and a
+          // path that writes nothing must not claim the caller has seen the file (that is exactly
+          // what made every compile disarm the guard). The write below is safe without it — see
+          // there.
           const existing = await ctx.files.readText(dir, target);
           const merged = mergeBibEntry(existing, bibtex);
 
           if (merged.alreadyPresent) {
+            const at = entryLine(existing, merged.key);
             return {
               content: [
-                { type: 'text', text: `${merged.key} is already in ${target}; nothing added.` },
+                {
+                  type: 'text',
+                  text: `${merged.key} is already in ${target}:${at}; nothing added.`,
+                },
               ],
               structuredContent: {
                 path: target,
                 key: merged.key,
                 added: false,
                 alreadyPresent: true,
+                line: at,
                 bibtex,
                 diff: '',
               },
             };
           }
 
-          await ctx.files.write(dir, { path: target, content: merged.content, createDirs: true });
+          // `merged.content` is the bytes just read under this project's lock plus one entry
+          // appended, so it cannot lose a hand edit — it is built on top of it. The staleness
+          // check would only refuse a write that is already safe, which is why this read did not
+          // need to arm the guard to get past it.
+          await ctx.files.write(dir, {
+            path: target,
+            content: merged.content,
+            createDirs: true,
+            overrideExternalChanges: true,
+          });
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, target);
-          const summary = `added ${merged.key} to ${target}\n\n${bibtex}`;
+          const at = entryLine(merged.content, merged.key);
+          const summary = `added ${merged.key} to ${target}:${at}\n\n${bibtex}`;
           return {
             content: [{ type: 'text', text: diff ? `${summary}\n\n${diff}` : summary }],
             structuredContent: {
@@ -101,6 +130,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
               key: merged.key,
               added: true,
               alreadyPresent: false,
+              line: at,
               bibtex,
               diff,
             },

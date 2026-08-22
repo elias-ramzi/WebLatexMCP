@@ -86,6 +86,8 @@ describe('createServer tool registration', () => {
     const names = tools.map((t) => t.name);
     expect(names).toContain('search_references');
     expect(names).toContain('add_citation');
+    expect(names).toContain('list_references');
+    expect(names).toContain('check_citations');
     await client.close();
   });
 

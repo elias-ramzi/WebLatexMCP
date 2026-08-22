@@ -71,6 +71,23 @@ describe('ProjectRegistry', () => {
     expect(raw).toEqual({ cv: { mode: 'local', path: '/home/me/docs/cv', rootFile: 'cv.tex' } });
   });
 
+  it('persists followSymlinks, so the opt-in survives a restart', async () => {
+    const reg = new ProjectRegistry(workspaceRoot);
+    await reg.upsert({ id: 'cv', mode: 'local', path: '/home/me/docs/cv', followSymlinks: true });
+
+    expect(reg.read()).toEqual([
+      {
+        id: 'cv',
+        mode: 'local',
+        path: '/home/me/docs/cv',
+        rootFile: undefined,
+        followSymlinks: true,
+      },
+    ]);
+    const raw = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8'));
+    expect(raw.cv.followSymlinks).toBe(true);
+  });
+
   it('reads a registry holding both kinds of project', async () => {
     await writeFile(
       registryPath(workspaceRoot),

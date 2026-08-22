@@ -6,9 +6,12 @@ import { errorResult } from '../lib/errors.js';
 const inputSchema = {
   project: z.string().optional(),
   filter: z
-    .enum(['tex', 'bib', 'assets', 'all'])
+    .enum(['tex', 'bib', 'docs', 'assets', 'all'])
     .optional()
-    .describe('tex -> .tex, bib -> .bib, assets -> images/pdf, all (default).'),
+    .describe(
+      'tex -> .tex, bib -> .bib, docs -> prose documents (.md/.markdown/.txt/.rst/.org), ' +
+        'assets -> images/pdf, all (default).',
+    ),
   subdir: z.string().optional().describe('Restrict listing to a subdirectory of the project.'),
 };
 
@@ -16,7 +19,7 @@ const outputSchema = {
   files: z.array(
     z.object({
       path: z.string(),
-      type: z.enum(['tex', 'bib', 'asset', 'other']),
+      type: z.enum(['tex', 'bib', 'doc', 'asset', 'other']),
       sizeBytes: z.number(),
     }),
   ),
@@ -27,7 +30,9 @@ export function registerListFiles(server: McpServer, ctx: AppContext): void {
     'list_files',
     {
       title: 'List project files',
-      description: 'List files in a cloned project, optionally filtered to .tex / .bib / assets.',
+      description:
+        'List files in a project, optionally filtered to .tex / .bib / prose documents / ' +
+        'assets. Works on a local project as well as a clone.',
       inputSchema,
       outputSchema,
     },

@@ -148,6 +148,22 @@ export class ProjectManager {
     return this.knownIds().find((id) => path.resolve(this.projectPath(id)) === resolved);
   }
 
+  /**
+   * Whether this directory's owner has told the server it may follow a symlink out of it —
+   * `mode: 'local'` **plus** `followSymlinks: true`. `FileService` asks before refusing one.
+   *
+   * It is an assertion, not an inference: a directory registered in place is usually a working
+   * tree with a remote, and git stores a symlink as mode 120000, so "the user registered it" does
+   * not establish that the links in it are the user's. Only the user can say that, so only the
+   * user does — see `LocalProjectConfig.followSymlinks`.
+   */
+  followsUserLinks(dir: string): boolean {
+    const id = this.idForDir(dir);
+    if (id === undefined) return false;
+    const cfg = this.projects.get(id);
+    return cfg !== undefined && isLocalProject(cfg) && cfg.followSymlinks === true;
+  }
+
   /** Whether a project's working directory is there: cloned (git) or simply present (local). */
   async hasClone(id: string): Promise<boolean> {
     return this.isReady(this.getProjectConfig(id));

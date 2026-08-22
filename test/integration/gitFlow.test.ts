@@ -107,4 +107,88 @@ describe('read-only git flow against a bare-repo stand-in', () => {
     expect(status.clean).toBe(false);
     expect(status.unstaged).toContain('main.tex');
   });
+
+  describe('diff against a ref', () => {
+    /** Clone, then land `count` local commits each appending a line to main.tex. */
+    async function withLocalCommits(count: number): Promise<{ git: GitService; dir: string }> {
+      const { remote, git, dir } = await setup({ 'main.tex': 'one\n' });
+      await git.clone(remote.url, dir, { username: 'git' });
+      const local = simpleGit(dir);
+      await local.addConfig('user.email', 'me@example.com');
+      await local.addConfig('user.name', 'Me');
+      let content = 'one\n';
+      for (let i = 0; i < count; i++) {
+        content += `line-${i}\n`;
+        await writeFile(path.join(dir, 'main.tex'), content);
+        await local.add('.');
+        await local.commit(`local ${i}`);
+      }
+      return { git, dir };
+    }
+
+    it('spans commits already made, unlike the plain working-tree diff', async () => {
+      const { git, dir } = await withLocalCommits(3);
+      // Everything is committed, so the default diff sees nothing at all.
+      expect((await git.diff(dir, {})).files).toHaveLength(0);
+
+      const session = await git.diff(dir, { ref: 'HEAD~3' });
+      expect(session.files[0]).toMatchObject({ path: 'main.tex', added: 3, removed: 0 });
+      expect(session.diff).toContain('+line-0');
+      expect(session.diff).toContain('+line-2');
+    });
+
+    it('includes uncommitted work on top of the ref, and honours `path`', async () => {
+      const { git, dir } = await withLocalCommits(1);
+      await writeFile(path.join(dir, 'main.tex'), 'one\nline-0\nuncommitted\n');
+      await writeFile(path.join(dir, 'other.tex'), 'elsewhere\n');
+
+      const all = await git.diff(dir, { ref: 'HEAD~1' });
+      expect(all.diff).toContain('+line-0');
+      expect(all.diff).toContain('+uncommitted');
+
+      const scoped = await git.diff(dir, { ref: 'HEAD~1', path: 'main.tex' });
+      expect(scoped.files.map((f) => f.path)).toEqual(['main.tex']);
+      expect(scoped.diff).not.toContain('elsewhere');
+    });
+
+    it('diffs what the branch has that the remote does not', async () => {
+      const { git, dir } = await withLocalCommits(2);
+      const ahead = await git.diff(dir, { ref: `origin/master` });
+      expect(ahead.files[0]).toMatchObject({ path: 'main.tex', added: 2, removed: 0 });
+    });
+
+    it('accepts a two-dot range between two commits', async () => {
+      const { git, dir } = await withLocalCommits(3);
+      const range = await git.diff(dir, { ref: 'HEAD~2..HEAD~1' });
+      expect(range.files[0]).toMatchObject({ path: 'main.tex', added: 1, removed: 0 });
+      expect(range.diff).toContain('+line-1');
+      expect(range.diff).not.toContain('+line-2');
+    });
+
+    it('fails readably on an unresolvable ref, naming the bad endpoint', async () => {
+      const { git, dir } = await withLocalCommits(1);
+      await expect(git.diff(dir, { ref: 'no-such-branch' })).rejects.toThrow(
+        /Unknown git ref "no-such-branch"/,
+      );
+      await expect(git.diff(dir, { ref: 'HEAD~1..nope' })).rejects.toThrow(
+        /Unknown git ref "nope"/,
+      );
+      await expect(git.diff(dir, { ref: '--output=/tmp/pwned' })).rejects.toThrow(/Invalid ref/);
+    });
+
+    it('rejects `ref` combined with `staged` instead of preferring one', async () => {
+      const { git, dir } = await withLocalCommits(1);
+      await expect(git.diff(dir, { ref: 'HEAD~1', staged: true })).rejects.toThrow(
+        /cannot be combined/,
+      );
+    });
+
+    it('does not treat a ref that also names a file as ambiguous', async () => {
+      const { git, dir } = await withLocalCommits(1);
+      const local = simpleGit(dir);
+      await local.raw(['branch', 'main.tex']);
+      const byBranch = await git.diff(dir, { ref: 'main.tex' });
+      expect(byBranch.files).toHaveLength(0);
+    });
+  });
 });

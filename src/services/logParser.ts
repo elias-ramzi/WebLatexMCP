@@ -1,16 +1,40 @@
+import path from 'node:path';
 import type { StructuredError } from '../types.js';
 
+/**
+ * A diagnostic plus how the parser came by its location. Both extra fields are parser provenance
+ * for the snippet layer, which consumes and strips them: they exist so that "never show source for
+ * a location we cannot vouch for" is decidable at all, and they are deliberately not on
+ * {@link StructuredError}, which is what tools return.
+ */
+export interface ParsedDiagnostic extends StructuredError {
+  /**
+   * `file` and `line` were read off one diagnostic line, so they describe one place in one file.
+   * Absent when they came from independent sources — the balanced-paren file stack for the file, a
+   * nearby `l.<n>` for the line — which a stray `)` in log text can pull apart.
+   */
+  locatedPair?: boolean;
+  /** The source text TeX echoed for `line` (its `l.<n> …` context line), when it printed one. */
+  echo?: string;
+}
+
 export interface ParsedLog {
-  errors: StructuredError[];
-  warnings: StructuredError[];
+  errors: ParsedDiagnostic[];
+  warnings: ParsedDiagnostic[];
 }
 
 /** pdfTeX/latexmk hard-wrap column (`max_print_line` default). */
 const WRAP_WIDTH = 79;
 
-/** Return the last `n` lines of a log verbatim, for the raw escape hatch. */
+/**
+ * The last `n` lines of a log, for the raw escape hatch (`compile`'s `rawLog: true`, and
+ * `filterLog`'s fallback when nothing matched). Splits on every line ending, not just `\n`: pdfTeX
+ * writes its .log in text mode, so on Windows each line would otherwise come back with a trailing
+ * `\r` — the matched path is clean because it goes through {@link unwrapLines}, and this was the
+ * last one that was not.
+ */
 export function logTail(log: string, n = 60): string {
-  const lines = log.split('\n');
+  const lines = log.split(/\r\n|\n|\r/);
   return lines.slice(Math.max(0, lines.length - n)).join('\n');
 }
 
@@ -22,7 +46,11 @@ export function logTail(log: string, n = 60): string {
  * exactly 79 chars is (rarely) joined too, the accepted cost of every LaTeX-log parser.
  */
 export function unwrapLines(log: string, width = WRAP_WIDTH): string[] {
-  const physical = log.split('\n');
+  // Split on every line ending, not just \n. pdfTeX writes its .log through C stdio in text mode,
+  // so on Windows every line arrives with a trailing \r — which `.`/`$` do not cross, which
+  // `extname` keeps ('.tex\r'), and which pushes a wrapped line to 80 chars so the un-wrap below
+  // never fires. Left in, it silently emptied every diagnostic this parser produces on Windows.
+  const physical = log.split(/\r\n|\n|\r/);
   const logical: string[] = [];
   let buf = '';
   let wrapped = false;
@@ -42,6 +70,22 @@ export function unwrapLines(log: string, width = WRAP_WIDTH): string[] {
 
 function normalizeFile(file: string): string {
   return file.replace(/^\.\//, '');
+}
+
+/**
+ * Put a path the log printed back onto the project root.
+ *
+ * The log's paths are relative to the directory the engine ran in, which is **not** the project
+ * root: latexmk is passed `-cd`, so it chdirs into the root file's directory first, and a document
+ * at `paper/main.tex` reports its own errors as `./main.tex`. Left unjoined, a snippet either
+ * misses — or, when a same-named file happens to sit at the project root, silently shows five lines
+ * of the wrong file under a `>` marker. Absolute paths (a `.sty` from the TeX tree) are left alone,
+ * as is anything that would climb out of the project.
+ */
+function rebase(file: string, baseDir: string): string {
+  if (!baseDir || path.posix.isAbsolute(file) || path.win32.isAbsolute(file)) return file;
+  const joined = path.posix.normalize(path.posix.join(baseDir, file));
+  return joined.startsWith('..') ? file : joined;
 }
 
 /**
@@ -101,14 +145,14 @@ export function findMissingPackages(log: string): string[] {
  * error per figure — they share a single cause (shell escape disabled), so collapse them into one
  * diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.
  */
-function collapseShellEscapeErrors(errors: StructuredError[]): StructuredError[] {
+function collapseShellEscapeErrors(errors: ParsedDiagnostic[]): ParsedDiagnostic[] {
   const matched = errors.filter((e) => SHELL_ESCAPE_FAILURE.test(e.message));
   if (matched.length <= 1) return errors;
-  const first = matched[0] as StructuredError;
-  const collapsed: StructuredError = {
+  const collapsed: ParsedDiagnostic = {
     severity: 'error',
-    file: first.file,
-    line: first.line,
+    // Deliberately unattributed. This entry stands for N figures, so the first one's file and line
+    // are not its location — inheriting them pointed the caller (and the snippet layer) at one
+    // arbitrary figure's source, where nothing is wrong, as though it were the error site.
     message:
       `TikZ externalization failed for ${matched.length} figures: the system call did NOT ` +
       'result in a usable output file because shell escape is disabled. Retry compile with ' +
@@ -131,6 +175,44 @@ function deriveRule(message: string): string {
  */
 function looksLikeFile(token: string): boolean {
   return token.includes('/') || /\.[A-Za-z]/.test(token);
+}
+
+/**
+ * TeX prints the offending source line under an error as `l.<n> <text>`, splitting it at the error
+ * position (the remainder goes on the next line). `<text>` is therefore a *prefix* of the real
+ * source line — enough to check a location against the file on disk, which is all it is used for.
+ * The lookahead spans the message, its "See the … documentation" advice and the blank line between.
+ */
+const CONTEXT_LOOKAHEAD = 8;
+
+/** `-file-line-error` form: "./main.tex:12: Undefined control sequence." */
+const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
+
+/**
+ * The `l.<n>` context TeX printed for the diagnostic at index `i`, if any.
+ *
+ * The scan stops at the next diagnostic, because a context line below *that* one belongs to it: a
+ * `! Package hyperref Error` printed with no source position would otherwise adopt the `l.3` of the
+ * `! Undefined control sequence` beneath it, and be reported — and, once it drove the excerpt,
+ * illustrated — at a line that has nothing to do with it.
+ */
+function nextContext(lines: string[], i: number): { line: number; echo?: string } | undefined {
+  for (let j = i + 1; j < Math.min(i + CONTEXT_LOOKAHEAD, lines.length); j++) {
+    const line = lines[j] ?? '';
+    if (line.startsWith('! ') || FILE_LINE_ERROR.test(line)) return undefined;
+    const lm = /^l\.(\d+)(.*)$/.exec(line);
+    if (lm && lm[1]) {
+      const echo = (lm[2] ?? '').trim();
+      return { line: Number(lm[1]), echo: echo || undefined };
+    }
+  }
+  return undefined;
+}
+
+/** The echoed source text for a known line number, ignoring a context line for a different line. */
+function echoFor(lines: string[], i: number, lineNo: number): string | undefined {
+  const context = nextContext(lines, i);
+  return context?.line === lineNo ? context.echo : undefined;
 }
 
 /** Topmost real (non-`null`) file on the stack — the file currently being read. */
@@ -170,11 +252,16 @@ function scanParens(line: string, stack: Array<string | null>): void {
  * was emitted, tracked via the log's balanced `(path … )` nesting (`file`), so a warning in an
  * `\input`-ed section maps back to that section rather than the main file. Attribution is omitted
  * when it cannot be determined.
+ *
+ * `baseDir` is the directory the engine ran in, relative to the project root — `dirname(rootFile)`
+ * under latexmk's `-cd`, empty for tectonic. Paths are rebased onto the project root with it, so a
+ * `file` this returns is one the caller can open (see {@link rebase}).
  */
-export function parseLog(log: string): ParsedLog {
+export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLog {
+  const baseDir = opts.baseDir ? normalizeFile(opts.baseDir).replace(/\/+$/, '') : '';
   const lines = unwrapLines(log);
-  const errors: StructuredError[] = [];
-  const warnings: StructuredError[] = [];
+  const errors: ParsedDiagnostic[] = [];
+  const warnings: ParsedDiagnostic[] = [];
   const stack: Array<string | null> = [];
 
   for (let i = 0; i < lines.length; i++) {
@@ -185,14 +272,18 @@ export function parseLog(log: string): ParsedLog {
     scanParens(line, stack);
 
     // file-line-error format: "./main.tex:12: Undefined control sequence."
-    const fle = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/.exec(line);
+    const fle = FILE_LINE_ERROR.exec(line);
     if (fle && fle[1] && fle[2] && fle[3]) {
+      const lineNo = Number(fle[2]);
       errors.push({
         severity: 'error',
-        file: normalizeFile(fle[1]),
-        line: Number(fle[2]),
+        file: rebase(normalizeFile(fle[1]), baseDir),
+        line: lineNo,
         message: fle[3].trim(),
         rule: deriveRule(fle[3]),
+        // File and line come off this one line, so they describe one place.
+        locatedPair: true,
+        echo: echoFor(lines, i, lineNo),
       });
       continue;
     }
@@ -200,20 +291,18 @@ export function parseLog(log: string): ParsedLog {
     // TeX error line: "! Undefined control sequence." possibly followed by "l.12 ..."
     if (line.startsWith('! ')) {
       const message = line.slice(2).trim();
-      let lineNo: number | undefined;
-      for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
-        const lm = /^l\.(\d+)/.exec(lines[j] ?? '');
-        if (lm && lm[1]) {
-          lineNo = Number(lm[1]);
-          break;
-        }
-      }
+      const context = nextContext(lines, i);
       errors.push({
         severity: 'error',
-        file: openFile,
+        file: openFile ? rebase(openFile, baseDir) : undefined,
         message,
-        line: lineNo,
+        line: context?.line,
         rule: deriveRule(message),
+        // The file comes from the paren stack and the line from the `l.<n>` below: two independent
+        // sources a stray `)` in log text can pull apart. `echo` is the only evidence they agree,
+        // so the snippet layer requires it here. Tectonic takes this branch for every diagnostic,
+        // since it has no -file-line-error.
+        echo: context?.echo,
       });
       continue;
     }
@@ -226,7 +315,7 @@ export function parseLog(log: string): ParsedLog {
         /on input line (\d+)/.exec(message) ?? /on input line (\d+)/.exec(lines[i + 1] ?? '');
       warnings.push({
         severity: 'warning',
-        file: openFile,
+        file: openFile ? rebase(openFile, baseDir) : undefined,
         message,
         line: onLine && onLine[1] ? Number(onLine[1]) : undefined,
         rule: warn[1] ?? warn[2] ?? 'LaTeX',
@@ -240,7 +329,7 @@ export function parseLog(log: string): ParsedLog {
       const lm = /at lines? (\d+)/.exec(line);
       warnings.push({
         severity: 'warning',
-        file: openFile,
+        file: openFile ? rebase(openFile, baseDir) : undefined,
         message: line.trim(),
         line: lm && lm[1] ? Number(lm[1]) : undefined,
         rule: `${box[1]} \\${box[2]}box`,
@@ -294,9 +383,9 @@ export function filterLog(log: string, opts: { maxLines?: number } = {}): string
   return kept.join('\n');
 }
 
-function dedupe(items: StructuredError[]): StructuredError[] {
+function dedupe(items: ParsedDiagnostic[]): ParsedDiagnostic[] {
   const seen = new Set<string>();
-  const out: StructuredError[] = [];
+  const out: ParsedDiagnostic[] = [];
   for (const item of items) {
     const key = `${item.severity}|${item.file ?? ''}|${item.line ?? ''}|${item.message}`;
     if (!seen.has(key)) {

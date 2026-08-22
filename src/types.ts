@@ -38,6 +38,20 @@ export interface LocalProjectConfig {
   path: string;
   /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
   rootFile?: string;
+  /**
+   * Follow a symlink that leaves this directory — default **false**, like any other project.
+   *
+   * The one layout that needs it is a shared file linked into the project (`refs.bib ->
+   * ~/lab/refs.bib`, `figs/ -> ~/lab/figs`). It is opt-in rather than implied by `mode: 'local'`
+   * because who ran `git clone` says nothing about who placed a link: a directory registered in
+   * place is very often a working tree with a remote, git stores a symlink as mode 120000, so a
+   * co-author can commit `notes.tex -> ~/.ssh/id_rsa` and the next `git pull` brings it in. Setting
+   * this is the user asserting the links here are theirs; the server cannot check that for them.
+   *
+   * Paths the *server* picked up rather than the caller naming them — a compile log, a synctex
+   * record — are refused whatever this says.
+   */
+  followSymlinks?: boolean;
 }
 
 /** Where a configured project lives, and whether it is ready to use. */

@@ -114,17 +114,111 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   its base is stale and committing it would revert what landed. State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`), outside the clones. Keep this: the
   guarantee is that a commit contains one session's lines and nobody else's.
+- **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
+  shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
+  reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
+  `format` and its verbatim `raw`, because only `bibtex` fields are exact; the prose extractor
+  deliberately under-claims (a `title` only when the text delimits it, authors only before a
+  parenthesized year) so a wrong guess never sends a DBLP lookup after the wrong paper. `list_references`
+  and `check_citations` are the tools over it, and `src/lib/referenceSources.ts` decides which files to
+  scan. Neither touches git — the case they exist for is a draft with no remote and no `.bib`.
+- **`check_citations` may read a second project — read-only, and only where the draft touches it.**
+  `bibliographyProject` names another registered project whose bibliography to check against (a shared
+  group `.bib` the draft cites but does not contain). This is a deliberate widening of what one call can
+  reach, and it holds only under these rules — keep them:
+  - **Two sandboxes, never one.** `documents` resolve inside `project` and `bibliography` inside
+    `bibliographyProject`, each through `requireProjectDir` + `FileService`. No path crosses over; a
+    caller cannot reach a directory by naming it as a path, only by naming a **registered** project
+    (which the user registered and owns). That is why the field is a project id, not a `"project:path"`
+    string — a namespace overloaded onto a path field is one parse bug away from an escape.
+  - **Read-only only.** Nothing writes across projects. `add_citation` into someone else's `.bib` stays a
+    separate, permissioned act, because the `.bib` guard and "entry text originates from DBLP" both
+    depend on that staying narrow.
+  - **No lock is taken**, as for every read-only tool. `runExclusive` is per project and serialises
+    writers; two concurrent reads of a `.bib` need nothing, and taking two locks would invite a deadlock
+    against a peer session locking them in the other order.
+  - **A foreign bibliography is reported on only where the draft cites it** (`uncitedEntries` empty,
+    the rest filtered to cited keys). A shared `.bib` is supposed to hold entries this draft does not
+    cite; listing 300 of them re-creates the context burn the parameter exists to remove.
+
+  `list_references` deliberately gets **no** equivalent: it already reads whichever project `project`
+  names, and a cross-project listing is two calls with nothing to join. Only `check_citations` joins two
+  sets, so only it needs to name two projects.
+
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
-- **Out-of-band edits are guarded.** `FileService` holds a `FileRevisionTracker`
-  (`src/services/fileRevisions.ts`) that hashes each file it reads/writes. `write_file`/`edit_file`/
-  `delete_file` refuse (throw `ExternalChangeError`) when the on-disk bytes changed since the server last
-  saw them — the user editing the clone directly — unless `overrideExternalChanges: true`. `status`
-  surfaces `externalChanges`. Baselines reset after `project_sync`/`discard` (`ctx.files.resetBaselines`),
-  since those rewrite the tree. Keep this so a hand-edited clone isn't silently clobbered.
+- **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
+  `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
+  "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)
+  when the on-disk bytes changed since — the user editing the clone directly — unless
+  `overrideExternalChanges: true`. `status` surfaces `externalChanges`. Baselines reset after
+  `project_sync`/`discard` (`ctx.files.resetBaselines`), since those rewrite the tree.
+  **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
+  false.** Recording is a claim that _the caller could now base a write on this file_, so record only
+  when the caller asked for that file and got all of it: `read_file`, and `list_references` (every entry
+  verbatim). Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
+  PR fixed. So: `detectRootFile` sniffing every `.tex` for `\documentclass` does not record (`compile`
+  and the viewer's PDF poller both go through it); the five lines `compile`/`list_comments` fetch around
+  a location the _log_ chose do not; `check_citations` does not, since it returns cite keys and line
+  numbers and no content, and it scans _every_ document in the project. `add_citation` does not either:
+  its read sits before the already-present early return, and a path that writes nothing must claim
+  nothing — its write passes `overrideExternalChanges` instead, since what it writes is the bytes it just
+  read plus one entry and so cannot lose a hand edit. Wrong in the safe direction costs one refusal the
+  caller can override; the other way silently destroys a user's hand edits, which is what the guard
+  exists to prevent.
+  **Every path resolves symlinks before acting** (`assertNoSymlinkEscape`): `resolveInside` compares
+  strings, which a `notes.tex` pointing outside the clone defeats — and git stores a symlink as mode
+  120000, so a collaborator can commit one. The check covers writes and deletes, not just reads, and a
+  link whose target does not exist yet (which a write would create out there). It decides only _whether_
+  a path may be used, never what the file is **called**: the `resolveInside` string stays its one
+  identity, or the revision tracker files a baseline under a key the write never looks up — which is how
+  the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+  **A link out is followed only where the project's owner said so** (`setLinkPolicy`, injected in
+  `context.ts` from `ProjectManager.followsUserLinks`): `mode: 'local'` **plus** an explicit
+  `followSymlinks: true`. It is an assertion, never an inference — who ran `git clone` says nothing
+  about who placed a link, a directory registered in place is usually a working tree with a remote, and
+  a pull can bring in a mode-120000 entry at any time. The layout it exists for is a shared `refs.bib`
+  or `figs/` linked into each paper, so `walk` follows linked entries under the same flag (cycle-guarded
+  by realpath): `list` skipping what `read` follows made the same project both follow and not follow its
+  own links. A path the server picked up rather than the caller naming it passes `strictLinks: true` and
+  is refused either way — every method takes the flag, so this stays honourable for a future
+  server-initiative read _or_ write. And the guard does not stop at the read: a path the **document**
+  named (a compile log, a synctex record) that leaves the project is not handed back as openable either
+  (`unopenablePaths`/`withoutUnopenableLocation` in `src/lib/sourceSnippet.ts`, applied by `compile` to
+  errors _and_ warnings and by `list_comments` to every comment) — otherwise the server refuses the read
+  and then tells the caller they may make it. Withholding takes the **snippet** with the location (it is
+  numbered against `line`), and the two reasons for withholding are counted apart: a path that escaped
+  was resolved and found to leave; a path past `MAX_REPORTED_PATH_CHECKS` was never resolved at all.
+  Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
+  stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
+  land outside.
+- **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
+  each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
+  uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location
+  earns its snippet only by clearing every one of these:
+  - **The log named it outright** — `file` and `line` off one `-file-line-error` line
+    (`ParsedDiagnostic.locatedPair`). A location pieced together from the balanced-paren file stack plus
+    a nearby `l.<n>` is never shown: TeX elides a long line with `...`, which can drop an opening `(`,
+    pop the stack, and land on a file whose line boilerplate (`\item`, `\end{itemize}`) corroborates.
+    That is every diagnostic under **tectonic**, which passes no `-file-line-error` — it gets no
+    snippets, by design.
+  - **The path is one we open** — only source extensions, because the log is document-controlled
+    (`\typeout` can forge a `file:line:` diagnostic naming any file).
+  - **The line exists and the log does not contradict it.** TeX's `l.<n>` echo (`ParsedDiagnostic.echo`)
+    is evidence _against_ a location, never for one, and a contradiction **sticks** — a co-located
+    diagnostic carrying no echo cannot clear it, the same way a shadow-store collision stays flagged.
+  - Paths are rebased onto the project root with `outcome.logBaseDir` first (latexmk gets `-cd`, so a
+    document at `paper/main.tex` logs `./main.tex`) — **errors and warnings alike**, since every `file` a
+    tool returns is one the caller can pass to `read_file`.
+
+  Failing locations are counted into `omittedSnippetLocations`, never left as a silent gap, and they do
+  not consume the 10-location cap (a log listing ten TeX-tree `.sty` paths first would otherwise starve
+  the real error). `ParsedDiagnostic` lives in `logParser`, not `types.ts`: provenance decides what may
+  be shown and never reaches a tool's output.
+
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it
@@ -145,6 +239,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
   gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
   directly. Keep the merged text originating from the caller.
+- **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
+  range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
+  rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,
+  not silently resolved. History is shared across sessions even though `commit` isn't, so a ref diff
+  spans peers' commits — it answers "what changed", never "what did I change". Say so wherever it is
+  documented.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
 - **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
 - **Cross-platform (macOS/Linux/Windows).** Tool output paths are POSIX via `toPosix` (`src/lib/paths.ts`);

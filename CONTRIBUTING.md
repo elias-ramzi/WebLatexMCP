@@ -63,7 +63,61 @@ matches `package.json`'s version, and runs `npm publish --provenance --access pu
 first publish lands, the `npx -y web-latex-mcp` install path (README's npm section and the Claude Code
 plugin) will not resolve — publishing is what makes them work.
 
+## Feedback from a session
+
+The most useful bug reports come from the sessions themselves — the call that failed, the detour that
+should not have been needed, the capability that was not there. That evidence is sitting in the
+transcript, and it evaporates when the session closes.
+
+The [`session-feedback`](.claude/skills/session-feedback/SKILL.md) skill is how you keep it. Run it at
+the **end** of a session spent working through the server:
+
+```
+/session-feedback
+```
+
+It walks back over the session's tool calls, keeps only what actually happened, and hands you **one
+ready-to-file issue body per finding** — headings in the same order as the fields of the
+[bug report](.github/ISSUE_TEMPLATE/bug_report.yml) and
+[feature request](.github/ISSUE_TEMPLATE/feature_request.yml) forms, so you paste a block straight down
+the form without editing it. Each finding is classified (`bug`, `friction`, `gap`, `docs`, `skill`),
+rated for impact (**blocked** / **slowed** / **cosmetic**), given a frequency (once / every time /
+intermittent), and checked against the existing issues so it does not re-file a known one. The findings
+are ranked, the weakest are cut, and what got cut is said out loud — in the chat summary, not in the
+issue body, which stays about the one thing it reports.
+
+**The environment is measured, not recalled.** The block every finding carries is filled by running the
+commands: server version from `server_info` (plus whether it is the latest on npm, and the commit if you
+run from a clone), OS + architecture + whether this is WSL, `node --version`, the compiler and TeX
+distribution from `doctor` when the session compiled, the workspace mode and whether the project is a
+git remote or a local in-place directory, and whether parallel sessions shared the clone. Three things
+cannot be read from inside a session — **which client** (CLI, VS Code extension, Desktop, Cursor, …),
+**which model** drove it, and **how the server was installed** (npx, global npm, `.mcpb` bundle, plugin,
+clone) — so it asks you, once, and writes `<unknown — please fill in>` rather than guessing. A blank
+field costs a question; an invented version number costs an afternoon on the wrong commit.
+
+Three properties make it safe to run and worth reading:
+
+- **It changes nothing.** No `write_file` into a project, no `compile`, no `commit`, no `push`. It looks
+  at the server and its skills, never at your paper.
+- **It scrubs.** Tokens, credential-bearing remotes, private repo URLs, usernames in absolute paths, and
+  the manuscript's own content (title, abstract, results, co-authors) are stripped or generalized before
+  anything is printed — a finding that cannot be described without them is dropped, and the drop is
+  reported. The report is written to be handed to someone who was not there.
+- **It never files anything on its own.** You get the blocks in the chat; saving them to a file and
+  opening a GitHub issue each need an explicit yes, and the titles are shown before anything is created.
+  With `gh` installed it runs `gh issue create --repo elias-ramzi/WebLatexMCP --label bug` for you — one
+  issue per finding, so each is one thing that can be closed, and the label is set explicitly because
+  `gh` posts through the API and bypasses the form. Otherwise you get a title and a block to paste at
+  [issues/new/choose](https://github.com/elias-ramzi/WebLatexMCP/issues/new/choose).
+
+An empty report is a normal outcome — a clean session should produce two lines saying so, not a page of
+invented nits. If the skill is not installed in your client, it ships with the server anyway: pick
+`session-feedback` from the prompt menu, or ask Claude to fetch it with `list_skills`
+(see [docs/skills.md](docs/skills.md#two-ways-a-skill-runs)).
+
 ## Reporting bugs
 
 Open an issue with steps to reproduce, what you expected, and what happened. Include your OS, Node
-version, and any relevant (token-free) error output.
+version, and any relevant (token-free) error output. A `/session-feedback` report already contains all
+of that — pasting one is a complete bug report.

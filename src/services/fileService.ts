@@ -1,6 +1,16 @@
 import path from 'node:path';
-import { readdir, readFile, writeFile, mkdir, stat, rm } from 'node:fs/promises';
+import {
+  readdir,
+  readFile,
+  writeFile,
+  mkdir,
+  stat,
+  rm,
+  realpath,
+  readlink,
+} from 'node:fs/promises';
 import { resolveInside, toPosix } from '../lib/paths.js';
+import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
@@ -15,8 +25,8 @@ export class ExternalChangeError extends Error {
   }
 }
 
-export type FileFilter = 'tex' | 'bib' | 'assets' | 'all';
-export type FileType = 'tex' | 'bib' | 'asset' | 'other';
+export type FileFilter = 'tex' | 'bib' | 'docs' | 'assets' | 'all';
+export type FileType = 'tex' | 'bib' | 'doc' | 'asset' | 'other';
 
 export interface FileEntry {
   path: string;
@@ -57,6 +67,13 @@ const ASSET_EXT = new Set([
   '.webp',
 ]);
 
+/**
+ * Prose formats. Their own type because a document is not always LaTeX: a proposal drafted in
+ * markdown still has a reference list to verify and citations to cross-check, and it has to be
+ * findable to be worked on.
+ */
+const DOC_EXT = new Set(['.md', '.markdown', '.txt', '.rst', '.org']);
+
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 /**
@@ -77,6 +94,7 @@ function classify(file: string): FileType {
   const ext = path.extname(file).toLowerCase();
   if (ext === '.tex') return 'tex';
   if (ext === '.bib') return 'bib';
+  if (DOC_EXT.has(ext)) return 'doc';
   if (ASSET_EXT.has(ext)) return 'asset';
   return 'other';
 }
@@ -89,6 +107,8 @@ function matchesFilter(type: FileType, filter: FileFilter): boolean {
       return type === 'tex';
     case 'bib':
       return type === 'bib';
+    case 'docs':
+      return type === 'doc';
     case 'assets':
       return type === 'asset';
   }
@@ -105,6 +125,57 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+/**
+ * Refuse a path that leaves the project **after symlinks are followed**. `resolveInside` compares
+ * strings, which a symlink defeats: a `notes.tex` pointing at `~/.ssh/id_rsa` passes the string
+ * check and hands back the key. That matters most for the paths the server picks up from a compile
+ * log, which the document itself controls.
+ *
+ * This decides *whether* the file may be read; it deliberately does not decide what the file is
+ * **called**. The resolved string stays a file's one identity everywhere — the revision tracker,
+ * `write`, `applyEdits` and `delete` all key on it — because a read that filed its baseline under
+ * the real path while a write looked it up under the given one silently disarmed the
+ * out-of-band-edit guard on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+ */
+async function assertNoSymlinkEscape(
+  projectDir: string,
+  abs: string,
+  relPath: string,
+): Promise<void> {
+  const [realRoot, target] = await Promise.all([realpath(projectDir), resolveThroughLinks(abs)]);
+  const rel = path.relative(realRoot, target);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
+  }
+}
+
+/**
+ * Where a path really lands, whether or not it exists yet. `realpath` alone cannot answer for a
+ * file about to be created, and a **dangling** symlink is the case that matters most: `writeFile`
+ * happily follows `notes.tex -> ~/.ssh/authorized_keys` and creates the file at the other end, so
+ * the target has to be judged even when nothing is there yet.
+ *
+ * Resolution is followed all the way down on **both** branches. A link's target is itself a path
+ * whose own components can be links: `notes.tex -> sub/pwned` with `sub -> /elsewhere` lands at
+ * `/elsewhere/pwned`, and stopping at the literal target reported `<project>/sub/pwned` — inside
+ * the project as a string, outside it as a file, which is exactly the confusion the whole check
+ * exists to remove. A cycle surfaces as ELOOP from `realpath` and is thrown, not recursed into.
+ */
+async function resolveThroughLinks(abs: string): Promise<string> {
+  try {
+    return await realpath(abs);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const link = await readlink(abs).catch(() => null);
+  if (link !== null) return resolveThroughLinks(path.resolve(path.dirname(abs), link));
+  const parent = path.dirname(abs);
+  if (parent === abs) return abs;
+  // Nothing at this name: resolve the part that does exist, then re-attach the rest literally.
+  // `resolveInside` has already normalized the string, so no component can climb back out.
+  return path.join(await resolveThroughLinks(parent), path.basename(abs));
+}
+
 /** Sandboxed file access within a project's clone directory. */
 export class FileService {
   /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
@@ -114,12 +185,79 @@ export class FileService {
   private recorder?: MutationRecorder;
 
   /**
+   * Whether a project may follow a symlink its owner placed. Injected, because the answer is about
+   * the project rather than the file — see {@link setLinkPolicy}.
+   */
+  private followsUserLinks: (projectDir: string) => boolean = () => false;
+
+  /**
    * Set after construction because the recorder needs services that are built later (it resolves
    * a clone dir to a project and reads git HEAD). Every mutating method funnels through
    * `notify`, so this is the single seam where session attribution attaches.
    */
   setMutationRecorder(recorder: MutationRecorder): void {
     this.recorder = recorder;
+  }
+
+  /**
+   * Decide, per project, whether a symlink inside it may be followed.
+   *
+   * The guard exists for paths the **user did not choose**: a `notes.tex -> ~/.ssh/id_rsa` a
+   * collaborator committed into a shared repository (git stores a symlink as mode 120000), or a
+   * file named by a compile log, which the document controls. So the default everywhere is to
+   * refuse, and the exemption is something the project's owner **asserts** (`followSymlinks` on a
+   * `mode: 'local'` project) rather than something inferred from how the directory came to exist —
+   * a directory registered in place is usually a working tree with a remote, where the next pull
+   * can bring in a link nobody here placed.
+   *
+   * Reads the server makes on its own initiative pass `strictLinks` and are refused regardless;
+   * so is a path the server would hand back as openable — see {@link leavesProjectThroughLink}.
+   */
+  setLinkPolicy(followsUserLinks: (projectDir: string) => boolean): void {
+    this.followsUserLinks = followsUserLinks;
+  }
+
+  /**
+   * The symlink check, unless this project's owner has said its links are theirs. `strictLinks`
+   * overrides that: every method takes it, so a read the *server* initiates and a write it makes
+   * on a path it chose can both be held to the strict rule.
+   */
+  private async guardLinks(
+    projectDir: string,
+    abs: string,
+    relPath: string,
+    strictLinks = false,
+  ): Promise<void> {
+    if (!strictLinks && this.followsUserLinks(projectDir)) return;
+    await assertNoSymlinkEscape(projectDir, abs, relPath);
+  }
+
+  /**
+   * Whether a project-relative path lands **outside** the project once symlinks are followed.
+   *
+   * The question to ask before handing back a path the *document* named — a compile log, a synctex
+   * record — as one the caller can open. Refusing the server's own read is only half the guard: a
+   * location it reports is a location the caller reads next, so a guard that stops at the read
+   * covers document-controlled *reads* rather than document-controlled *paths*.
+   *
+   * A path that was never inside the project (absolute, or climbing out with `..`) is not this:
+   * every method here refuses it outright whatever the link policy, and a diagnostic in
+   * `/usr/share/texlive/…/foo.sty` is still worth reporting. Anything this cannot resolve counts
+   * as outside — the safe direction costs a path in the result, the other costs a file.
+   */
+  async leavesProjectThroughLink(projectDir: string, relPath: string): Promise<boolean> {
+    let abs: string;
+    try {
+      abs = resolveInside(projectDir, relPath);
+    } catch {
+      return false; // never a project-relative path; not a link taking one out
+    }
+    try {
+      await assertNoSymlinkEscape(projectDir, abs, relPath);
+      return false;
+    } catch {
+      return true;
+    }
   }
 
   async list(
@@ -141,11 +279,37 @@ export class FileService {
       .sort((a, b) => a.path.localeCompare(b.path));
   }
 
+  /**
+   * Read a file, or a line range of it.
+   *
+   * `recordBaseline` says whether **the caller could now base a write on this file**, and so
+   * defaults to false. Record only when the caller asked for this file and received all of it:
+   * `read_file` does, and `list_references` (which hands back every entry verbatim). Nothing else
+   * qualifies — not a file the server chose for its own purposes (`detectRootFile` sniffing every
+   * `.tex` for `\documentclass`), not five lines of context around a location a *log* named
+   * (`compile`, `list_comments`), and not a file read only to answer a question about it
+   * (`check_citations`, which returns keys and line numbers and no content at all). Note that
+   * "the bytes reached the caller" is not the test: a snippet's bytes do reach them, and recording
+   * one would tell the guard the server has seen a file the user is editing by hand, so the next
+   * write clobbers those edits with no `ExternalChangeError`. Wrong in the safe direction costs one
+   * refusal the caller can override; wrong the other way destroys the user's work.
+   */
   async read(
     projectDir: string,
-    opts: { path: string; startLine?: number; endLine?: number },
+    opts: {
+      path: string;
+      startLine?: number;
+      endLine?: number;
+      recordBaseline?: boolean;
+      /**
+       * Refuse a symlink out of the project even where the project's owner places its own — for a
+       * path the server picked up rather than the caller naming it. See {@link setLinkPolicy}.
+       */
+      strictLinks?: boolean;
+    },
   ): Promise<ReadResult> {
     const abs = resolveInside(projectDir, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${opts.path}"`);
@@ -161,26 +325,32 @@ export class FileService {
       };
     }
     const raw = await readFile(abs, 'utf8');
-    // The whole file is read into memory even for a range request, so this is the content the
-    // server now knows to be on disk — record it as the baseline for out-of-band-edit detection.
-    this.revisions.record(abs, raw);
-    const lines = raw.split('\n');
-    const totalLines = lines.length;
+    if (opts.recordBaseline) this.revisions.record(abs, raw);
+    const totalLines = splitLines(raw).length;
     if (opts.startLine === undefined && opts.endLine === undefined) {
       return { path: opts.path, content: raw, totalLines, truncated: false };
     }
     const start = Math.max(1, opts.startLine ?? 1);
     const end = Math.min(totalLines, opts.endLine ?? totalLines);
-    const content = lines.slice(start - 1, end).join('\n');
+    // Byte-exact, so what comes back can go straight into edit_file's oldString.
+    const content = sliceLineRange(raw, start, end);
     return { path: opts.path, content, totalLines, truncated: start > 1 || end < totalLines };
   }
 
-  /** Read a file's full text, returning '' when it does not exist (used for appends). */
-  async readText(projectDir: string, relPath: string): Promise<string> {
+  /**
+   * Read a file's full text, returning '' when it does not exist (used for appends).
+   * `recordBaseline` carries the same meaning — and the same default — as in {@link read}.
+   */
+  async readText(
+    projectDir: string,
+    relPath: string,
+    opts: { recordBaseline?: boolean; strictLinks?: boolean } = {},
+  ): Promise<string> {
     const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     try {
       const raw = await readFile(abs, 'utf8');
-      this.revisions.record(abs, raw);
+      if (opts.recordBaseline) this.revisions.record(abs, raw);
       return raw;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
@@ -196,9 +366,12 @@ export class FileService {
       content: string;
       createDirs?: boolean;
       overrideExternalChanges?: boolean;
+      /** As in {@link read}: refuse a link out of the project even where the policy follows one. */
+      strictLinks?: boolean;
     },
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
     let current: string | undefined;
     try {
       current = await readFile(abs, 'utf8');
@@ -234,12 +407,13 @@ export class FileService {
     projectDir: string,
     relPath: string,
     edits: EditOp[],
-    opts: { overrideExternalChanges?: boolean } = {},
+    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
   ): Promise<{ path: string; appliedEdits: number }> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
     }
     const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     const original = await readFile(abs, 'utf8');
     if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
       throw new ExternalChangeError(relPath);
@@ -272,9 +446,10 @@ export class FileService {
   async delete(
     projectDir: string,
     relPath: string,
-    opts: { overrideExternalChanges?: boolean } = {},
+    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
   ): Promise<{ path: string }> {
     const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
     const info = await stat(abs);
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
@@ -310,6 +485,7 @@ export class FileService {
       const abs = resolveInside(projectDir, rel);
       let content: string;
       try {
+        await this.guardLinks(projectDir, abs, rel);
         content = await readFile(abs, 'utf8');
       } catch {
         continue;
@@ -341,15 +517,44 @@ export class FileService {
     }
   }
 
-  private async walk(root: string, dir: string, out: string[]): Promise<void> {
+  /**
+   * Collect every file under `dir`, project-relative.
+   *
+   * A dirent for a symlink is neither `isFile()` nor `isDirectory()`, so a link is skipped unless
+   * this project follows its owner's links — and every auto-discovering tool is built on this walk
+   * (`list_files`, `detectRootFile`, `list_references`, `check_citations`). Skipping one there
+   * while `read` follows it makes the same project both follow and not follow its own links
+   * depending on which tool you call: the shared `refs.bib` the exemption exists for would be
+   * readable only by someone who already knew it was there.
+   */
+  private async walk(
+    root: string,
+    dir: string,
+    out: string[],
+    seen: Set<string> = new Set(),
+  ): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
+    const followLinks = this.followsUserLinks(root);
     for (const entry of entries) {
       if (entry.name === '.git') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        await this.walk(root, full, out);
+        await this.walk(root, full, out, seen);
       } else if (entry.isFile()) {
         out.push(path.relative(root, full));
+      } else if (entry.isSymbolicLink() && followLinks) {
+        // `stat` follows the link; a dangling one throws and is simply not there to list.
+        const target = await stat(full).catch(() => null);
+        if (target?.isFile()) {
+          out.push(path.relative(root, full));
+        } else if (target?.isDirectory()) {
+          // Keyed on the real directory, so `a -> ..` (or any longer cycle) is walked once
+          // instead of forever. `realpath` itself fails on a self-referential chain (ELOOP).
+          const real = await realpath(full).catch(() => null);
+          if (real === null || seen.has(real)) continue;
+          seen.add(real);
+          await this.walk(root, full, out, seen);
+        }
       }
     }
   }
