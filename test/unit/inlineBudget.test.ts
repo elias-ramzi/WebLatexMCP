@@ -117,4 +117,21 @@ describe('planInlining', () => {
     expect(plan.note).toMatch(/dpi|clip/);
     expect(plan.note).not.toMatch(/undefined|\?/);
   });
+
+  it('names the remedy in the multi-page note too, not only the single-page one', () => {
+    // The caller who most needs "lower the resolution or clip" is the one who asked for several
+    // poster pages and got a cut-off tail — and that was the caller the note used not to tell.
+    const plan = planInlining(
+      [
+        { page: 1, bytes: 900 },
+        { page: 2, bytes: 900 },
+        { page: 3, bytes: 900 },
+      ],
+      { inline: true, budgetBytes: 1400 },
+    );
+
+    expect(plan.inlined).toEqual([true, false, false]);
+    expect(plan.note).toMatch(/paths-only/);
+    expect(plan.note).toMatch(/dpi|clip/);
+  });
 });

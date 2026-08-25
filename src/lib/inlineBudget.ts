@@ -86,6 +86,7 @@ export function planInlining(
         `read it from pngPath, or ask for fewer pixels (lower dpi/maxEdgePx) or a clip of the ` +
         `region you care about`
       : `the ${budgetMb} was reached after page ${lastInlinedPage} — page(s) ` +
-        `${pathsOnly.join(', ')} are paths-only`;
+        `${pathsOnly.join(', ')} are paths-only; ask for fewer pixels (lower dpi/maxEdgePx) or a ` +
+        `clip of the region you care about to fit more of them in`;
   return { inlined, note };
 }

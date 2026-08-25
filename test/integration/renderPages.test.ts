@@ -243,6 +243,22 @@ describe('render_pages', () => {
     expect(text).toContain('3');
   });
 
+  it('rejects an empty pages array instead of silently rendering nothing', async () => {
+    // The value just outside: `pages` omitted means every page, but `[]` is not nullish, so
+    // without the schema guard it selects zero pages and the call reports success with no images
+    // — a caller who built the array programmatically and got an empty one is told it worked.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', pages: [] },
+    });
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/empty array|Omit pages/i);
+  });
+
   it('errors naming compile when nothing has been compiled yet', async () => {
     const { client } = await setup();
     // Deliberately no stagePdf call.

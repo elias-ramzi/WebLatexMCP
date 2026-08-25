@@ -337,9 +337,19 @@ export class PdfRenderer implements PdfRenderService {
             viewport: page.getViewport({ scale: 1 }),
             background: '#ffffff',
           }).promise;
+          // Encode too, not just paint: `render` proves the canvas can be created and drawn on,
+          // but what the caller ultimately gets is a PNG, and that is a separate code path in the
+          // backend. Probing one and reporting on the other is how `doctor` ends up green while
+          // `render_pages` fails.
+          entry.canvas.toBuffer('image/png');
         } finally {
-          factory.destroy(entry);
-          page.cleanup();
+          // Separate blocks so a throw in one teardown cannot skip the other — `renderOnePage`
+          // nests them the same way, and the two paths should not differ.
+          try {
+            factory.destroy(entry);
+          } finally {
+            page.cleanup();
+          }
         }
         return true;
       } finally {
