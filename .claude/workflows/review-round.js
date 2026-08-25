@@ -1,15 +1,22 @@
 export const meta = {
-  name: 'fix-review-round',
+  name: 'review-round',
   description:
-    'Fix one review round: fable plans, sonnet implements, opus verifies, fable signs off',
+    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, fable signs off',
   whenToUse:
-    'After a review round is posted on a PR: Workflow({name: "fix-review-round", args: {review: "<comment URL>"}}). ' +
-    'Optional args: {pr: <number>, branch: "<name>", max_attempts: 2, commit: true}. pr/branch are parsed from the ' +
-    'URL / current checkout when omitted. Batches run sequentially (shared files), so wall-clock is the sum of batches.',
+    'To review-and-fix a branch or PR in one pass: Workflow({name: "review-round"}) reviews the current branch ' +
+    'against origin/dev itself. Optional args: {review: "<posted review-comment URL>" to fix an existing review ' +
+    'instead of producing one, pr: <number>, branch: "<name>", base: "origin/dev", max_attempts: 2, commit: true}. ' +
+    'Batches run sequentially (shared files), so wall-clock is the sum of batches.',
   phases: [
     {
+      title: 'Review',
+      detail:
+        'opus reviews the target diff adversarially and writes the findings (skipped when a posted review is given)',
+      model: 'opus',
+    },
+    {
       title: 'Plan',
-      detail: 'fable reads the review and batches the findings into coherent fixes',
+      detail: 'fable batches the findings into coherent fixes',
       model: 'fable',
     },
     {
@@ -31,20 +38,20 @@ export const meta = {
 };
 
 // ---- inputs -------------------------------------------------------------
-const review = args && args.review;
-if (!review) throw new Error('pass args: {review: "<PR review-comment URL>"}');
+const review = (args && args.review) || null;
 const MAX_ATTEMPTS = (args && args.max_attempts) || 2;
 const COMMIT = args && args.commit === false ? false : true;
+const BASE = (args && args.base) || 'origin/dev';
 
 const REPO = '/home/eramzi/workspace/overleaf_mcp';
-const prFromUrl = (review.match(/\/pull\/(\d+)/) || [])[1];
-const PR = (args && args.pr) || (prFromUrl && Number(prFromUrl));
-if (!PR) throw new Error('could not parse a PR number from the review URL; pass args.pr');
+const prFromUrl = review ? (review.match(/\/pull\/(\d+)/) || [])[1] : null;
+const PR = (args && args.pr) || (prFromUrl && Number(prFromUrl)) || null;
 const BRANCH =
   (args && args.branch) ||
-  '(the currently checked-out branch — verify with git branch --show-current that it is the PR branch, and stop if it is not)';
+  '(the currently checked-out branch — verify with git branch --show-current, and stop if it is a protected branch: dev or main)';
+const TARGET = PR ? `PR #${PR} (branch ${BRANCH})` : `branch ${BRANCH}, reviewed against ${BASE}`;
 const HOUSE = `
-Repo: ${REPO}, branch ${BRANCH} (PR #${PR}). This is WebLatexMCP, a TypeScript MCP server
+Repo: ${REPO}. Target of this round: ${TARGET}. This is WebLatexMCP, a TypeScript MCP server
 (stdio transport). Read CLAUDE.md first; its rules are load-bearing:
 tools (src/tools/*) do only zod validation + formatting — all logic lives in services/lib so it
 is testable without an MCP client; stdout is the JSON-RPC channel (never console.log — stderr
@@ -61,10 +68,54 @@ A new regression test must fail on the pre-fix code (mutation-check it). The TeX
 behaviour unless a non-smoke test covers it via the LatexCompiler interface or real log
 fixtures; a skip is fine, a failure is not. Integration tests use the local bare-repo helper
 (test/helpers/bareRepo.ts, branch master) — no network, no secrets.
-Gate:
+The only gate is that the local CI passes:
   npm run typecheck && npm run lint && npm run format:check && npm test
 (typecheck covers src AND test; the build does not, so a clean build proves nothing about
 tests). Single test file: npx vitest run test/unit/<file>.test.ts; by name: npx vitest run -t "...".`;
+
+// ---- Phase 0: obtain the review -----------------------------------------
+// Either fetch a posted review round (args.review) or produce one ourselves.
+let findingsSource;
+if (review) {
+  findingsSource = `Fetch the review with: gh pr view ${PR} --comments — the review to fix is the comment at
+${review} (match it by URL; it is the latest review-round comment). Read the findings, the
+cleanup list, and any "verified clean" section. Then read the cited code.`;
+} else {
+  phase('Review');
+  const reviewText = await agent(
+    `You are the reviewer for this round. ${HOUSE}
+
+Review the round's diff end to end: ${
+      PR
+        ? `gh pr diff ${PR} (and gh pr view ${PR} for its description)`
+        : `git diff ${BASE}...HEAD (run git fetch origin first so ${BASE} is current)`
+    }.
+Your job is to refute the claim "this change is correct and complete", not to confirm it.
+Verify claims by reading the surrounding code in the tree, not the diff context alone.
+
+Hunt, in order of severity: real defects (a failure scenario you can state in one sentence);
+weakened or bypassed guards (requireGitProject, runExclusive, confirmBibEdit, recordBaseline,
+symlink resolution, ff-only pull / push-refuses-behind, conflicted-stays-flagged, snippet
+provenance); logic leaked into a tool handler, a catch not going through errorResult, a
+non-spread structuredContent, stdout writes from server code; session-isolation leaks near the
+shadow store or commitContents; vacuously green tests (a smoke skip claimed as coverage, a
+probe whose path never fired, a regression test that would pass on the pre-fix code);
+cross-platform breakage (hardcoded separators, string-built file:// URLs, paths not through
+toPosix); stale docs (README's tool list, CLAUDE.md conventions, CHANGELOG). Then a cleanup
+list: smaller reuse/clarity items worth fixing while here.
+
+Your final text is the review round itself, for a planner who has not seen the diff: numbered
+findings ranked most-severe first, each with file and symbol, what is wrong, the failure
+scenario in one sentence, and the required direction of the fix; then the numbered cleanup
+list; then a "verified clean" section naming what you tried to break and could not. If there
+are NO findings and NO cleanup items, say exactly that.`,
+    { model: 'opus', label: 'review', phase: 'Review' },
+  );
+  findingsSource = `The review round below was just produced against the working tree — trust it as the round to
+fix, and read the cited code yourself:
+
+${reviewText}`;
+}
 
 // ---- Phase 1: fable plans ----------------------------------------------
 phase('Plan');
@@ -75,11 +126,11 @@ const PLAN_SCHEMA = {
     shared_context: {
       type: 'string',
       description:
-        'Facts every implementer needs: review URL, round title, cross-batch interactions, ordering constraints, whether guard/lock/session code is involved',
+        'Facts every implementer needs: round title, cross-batch interactions, ordering constraints, whether guard/lock/session code is involved. Empty-string sentinel "NOTHING_TO_FIX" if the review found nothing.',
     },
     batches: {
       type: 'array',
-      minItems: 1,
+      minItems: 0,
       maxItems: 4,
       items: {
         type: 'object',
@@ -103,9 +154,7 @@ const PLAN_SCHEMA = {
 const plan = await agent(
   `You are the planner for a fix round. ${HOUSE}
 
-Fetch the review with: gh pr view ${PR} --comments — the review to fix is the comment at ${review}
-(match it by URL; it is the latest review-round comment). Read the findings, the cleanup
-list, and any "verified clean" section. Then read the cited code.
+${findingsSource}
 
 Produce a plan that groups all findings AND cleanup items into 1-4 coherent batches, where a
 batch = changes that belong in one reviewable unit (same defect family or same functions;
@@ -118,9 +167,14 @@ boundary in the spec, name the test for the value just outside it, and say which
 in (unit with temp dirs / integration against the bare-repo helper / TeX-gated smoke). Flag
 explicitly any batch that touches guard code, runExclusive/lock paths, the shadow store, or
 credential handling — those need the invariant-preservation treatment. Note in each spec which
-findings interact with fixes from earlier batches in this same run.`,
+findings interact with fixes from earlier batches in this same run. If the review genuinely
+found nothing to fix, return zero batches and shared_context "NOTHING_TO_FIX".`,
   { model: 'fable', label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
 );
+if (!plan.batches.length) {
+  log('review found nothing to fix — done');
+  return { review: review || 'produced in-run', batches: [], signoff: 'nothing to fix' };
+}
 log(`plan: ${plan.batches.length} batch(es): ${plan.batches.map((b) => b.name).join(', ')}`);
 
 // ---- Phase 2+3: sequential implement -> verify loop per batch -----------
@@ -237,10 +291,10 @@ Batch outcomes: ${JSON.stringify(results)}
    another's caller, duplicate helpers introduced twice, README's tool list or CLAUDE.md
    conventions describing pre-fix behavior of another batch, two batches touching the same
    guard from different directions.
-2. Sync before committing, per CLAUDE.md: git fetch origin, rebase onto the PR branch's
-   upstream, resolve any conflicts, then run the complete gate. Fix trivial gate failures
-   (a prettier reflow, a lint autofix, an import) yourself; anything substantive gets
-   reported, not patched.
+2. Sync before committing, per CLAUDE.md: git fetch origin, rebase onto the branch's
+   upstream (or its base if it has none), resolve any conflicts, then run the complete gate.
+   Fix trivial gate failures (a prettier reflow, a lint autofix, an import) yourself;
+   anything substantive gets reported, not patched.
 3. Self-review for the boundary class: for every guard in the diff, name the value just
    outside it and confirm a test covers it — in the right tier (a TeX-gated smoke does not
    count as coverage on machines without latexmk).
@@ -249,7 +303,7 @@ Batch outcomes: ${JSON.stringify(results)}
    disk or a result message, and errors stay token-scrubbed.
 ${
   COMMIT && unapproved.length === 0
-    ? `5. If and only if the gate is green and you found no substantive problem: commit everything to the PR branch with a message describing the round (Co-Authored-By trailer per house style), and push.`
+    ? `5. If and only if the gate is green and you found no substantive problem: commit everything to the branch with a message describing the round (Co-Authored-By trailer per house style), and push. Never commit directly on dev or main — stop and report instead if that is where you are.`
     : `5. DO NOT COMMIT: ${unapproved.length ? `batches not approved: ${unapproved.map((r) => r.batch).join(', ')}` : 'commit disabled by args'}. Leave the tree for a human.`
 }
 
@@ -257,4 +311,4 @@ Your final text: gate result, whether you committed (and the SHA), unresolved co
   { model: 'fable', label: 'sign-off', phase: 'Sign-off' },
 );
 
-return { batches: results, signoff };
+return { review: review || 'produced in-run', batches: results, signoff };

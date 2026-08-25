@@ -11,9 +11,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
-- **A `fix-review-round` workflow and the two agents it drives** — contributor tooling under
+- **A `review-round` workflow and the two agents it drives** — contributor tooling under
   `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
-  workflow takes one posted PR review round end to end — a planner batches every finding and cleanup
+  workflow performs one review round end to end: by default an adversarial reviewer produces the
+  round itself against the current branch's diff (a posted PR review-comment URL can be supplied to
+  fix an existing round instead), then a planner batches every finding and cleanup
   item into 1–4 self-contained specs ordered so an earlier batch cannot invalidate a later one, an
   `implementer` agent fixes each batch test-first, a `plan-verifier` agent tries adversarially to
   refute it and sends rework back (up to `max_attempts`), and a final auditor reads the whole diff for
@@ -27,6 +29,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   this repo's own: `test/smoke/**` auto-skips wherever `latexmk` is absent, so a green `npm test` is
   never accepted as coverage of compile-adjacent code, and `typecheck` is run for the tests the build
   excludes.
+- **An `/implement` command** — orchestrates a request the same way by hand: the session writes the
+  spec (files, invariants, tests-first with a case just outside every new guard, and the right test
+  tier), delegates each bounded task to the `implementer` agent, verifies the assembled diff with
+  `plan-verifier`, and proves the work with the one gate this repo has: the local CI
+  (`typecheck` + `lint` + `format:check` + `test`) passing.
 
 ## [0.6.0] - 2026-08-21
 
