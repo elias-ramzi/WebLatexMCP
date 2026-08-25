@@ -161,6 +161,233 @@ describe('DoctorService', () => {
     expect(result.hints.join('\n')).toContain('not on PATH');
   });
 
+  /**
+   * The RHEL case this pair of statuses exists for: tectonic on PATH, no latexmk. Whether that is a
+   * `fail` or a `warn` is decided by *who chose* latexmk — a mere default is substituted by
+   * `compile`, so nothing the server needs is actually missing.
+   */
+  function tectonicOnly(): Canned {
+    const canned = eolTeXLive(home, SYSTEM_TEXMF);
+    delete canned['latexmk -v'];
+    canned['tectonic --version'] = 'Tectonic 0.15.0';
+    return canned;
+  }
+
+  /**
+   * The bug report's machine, exactly: RHEL 8 with `tectonic 0.16.9` and `git`, and nothing else —
+   * no TeX Live, so no `latexmk`, no `pdflatex`/`xelatex`/`lualatex`, no `tlmgr`, no `kpsewhich`.
+   *
+   * `tectonicOnly` above is NOT this machine: it is a full TeX Live with `latexmk` deleted, which
+   * essentially does not exist (latexmk ships with TeX Live, MacTeX and MiKTeX alike). That table
+   * let `ok: true` pass because a TeX install was present, not because the fallback rescued
+   * anything — so it could not catch `engines: fail` overriding the compiler `warn`.
+   */
+  function rhelTectonicOnly(): Canned {
+    return {
+      'tectonic --version': 'Tectonic 0.16.9',
+      'git --version': 'git version 2.39.3',
+    };
+  }
+
+  it('calls a tectonic-only machine healthy: the fallback compiles, so nothing needed is missing', async () => {
+    const doctor = new DoctorService({
+      run: runner(rhelTectonicOnly()).run,
+      now: NOW,
+      canWrite: () => Promise.resolve(true),
+    });
+
+    const result = await doctor.diagnose({
+      compiler: 'latexmk',
+      compilerExplicit: false,
+      workspaceRoot: tmp,
+    });
+
+    // The point of the whole feature: this machine compiles fine, so `doctor` must not call it
+    // broken. A `fail` on any check would sink `ok`, since ok = every(status !== 'fail').
+    expect(result.ok).toBe(true);
+    expect(statusOf(result.checks, 'compiler')).toBe('warn');
+    // Tectonic bundles its own XeTeX, so "no LaTeX engine on PATH" is a category error, not a
+    // finding — and it is what used to override the compiler `warn` and report ok: false.
+    expect(statusOf(result.checks, 'engines')).toBe('ok');
+    expect(result.checks.find((c) => c.name === 'engines')?.detail).toMatch(/tectonic bundles/i);
+    // Same for the package manager: tectonic fetches its own packages.
+    expect(statusOf(result.checks, 'package-manager')).toBe('ok');
+    expect(result.checks.every((c) => c.status !== 'fail')).toBe(true);
+  });
+
+  it('still fails a tectonic-only machine when latexmk was the explicit choice', async () => {
+    // Just outside the guard: same machine, but the user asserted latexmk, so nothing compiles —
+    // and `engines` must not be softened into hiding that.
+    const doctor = new DoctorService({
+      run: runner(rhelTectonicOnly()).run,
+      now: NOW,
+      canWrite: () => Promise.resolve(true),
+    });
+
+    const result = await doctor.diagnose({
+      compiler: 'latexmk',
+      compilerExplicit: true,
+      workspaceRoot: tmp,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(statusOf(result.checks, 'compiler')).toBe('fail');
+    // No fallback is in play, so the engines check speaks about latexmk's needs, as before.
+    expect(statusOf(result.checks, 'engines')).toBe('fail');
+  });
+
+  it('does not call a tectonic machine engine-less when tectonic is the configured backend', async () => {
+    // The same category error, reachable without any fallback: someone who set
+    // WEB_LATEX_MCP_COMPILER=tectonic on a machine with no system TeX was told their toolchain
+    // was broken. That predates the fallback and is fixed by the same grading.
+    const doctor = new DoctorService({
+      run: runner(rhelTectonicOnly()).run,
+      now: NOW,
+      canWrite: () => Promise.resolve(true),
+    });
+
+    const result = await doctor.diagnose({
+      compiler: 'tectonic',
+      compilerExplicit: true,
+      workspaceRoot: tmp,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(statusOf(result.checks, 'compiler')).toBe('ok');
+    expect(statusOf(result.checks, 'engines')).toBe('ok');
+  });
+
+  it('claims nothing on behalf of a tectonic that is not installed either', async () => {
+    // `effective` stays tectonic when an explicit tectonic is missing, but nothing about what
+    // tectonic provides may be asserted on a machine that does not have it.
+    const doctor = new DoctorService({
+      run: runner({ 'git --version': 'git version 2.39.3' }).run,
+      now: NOW,
+      canWrite: () => Promise.resolve(true),
+    });
+
+    const result = await doctor.diagnose({ compiler: 'tectonic', compilerExplicit: true });
+
+    expect(result.ok).toBe(false);
+    expect(statusOf(result.checks, 'engines')).toBe('fail');
+    const engines = result.checks.find((c) => c.name === 'engines')?.detail ?? '';
+    expect(engines).not.toMatch(/bundles its own/i);
+  });
+
+  it('does not warn about a frozen tlmgr repository when tectonic is what compiles', async () => {
+    // An EOL TeX Live with latexmk removed and tectonic installed: tectonic never consults tlmgr,
+    // so a frozen-archive warning sends the user to fix something that was not going to be used.
+    const canned = eolTeXLive(home, SYSTEM_TEXMF);
+    delete canned['latexmk -v'];
+    canned['tectonic --version'] = 'Tectonic 0.16.9';
+    const doctor = new DoctorService({
+      run: runner(canned).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    expect(result.ok).toBe(true);
+    expect(statusOf(result.checks, 'package-manager')).toBe('ok');
+    expect(result.hints.join('\n')).not.toMatch(/frozen archive/i);
+    // The tlmgr that IS there is still reported, just as not-used rather than as a problem.
+    expect(result.checks.find((c) => c.name === 'package-manager')?.detail).toMatch(/not used/i);
+  });
+
+  it('warns, rather than failing, when a defaulted compiler is missing but the other is there', async () => {
+    const doctor = new DoctorService({
+      run: runner(tectonicOnly()).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    // A fallback carries the compile, so nothing the server needs is missing.
+    expect(statusOf(result.checks, 'compiler')).toBe('warn');
+    expect(result.ok).toBe(true);
+    expect(result.checks.find((c) => c.name === 'compiler')?.detail).toContain('tectonic');
+    // One hint has to carry both halves: that the substitution happens, and what it costs.
+    expect(result.hints.some((h) => /falling back/i.test(h) && /no source snippets/i.test(h))).toBe(
+      true,
+    );
+    // Setting the variable makes a backend a *choice*, never a "default" — calling it a default
+    // is what builds the wrong model, since "default" is precisely the state that falls back.
+    const text = result.hints.join('\n');
+    expect(text).not.toMatch(/make it the default/);
+    // Unset, empty and whitespace-only all reach here, so "is unset" is false for two of them.
+    expect(text).not.toMatch(/is unset/);
+    expect(text).toMatch(/names no backend/);
+  });
+
+  it('fails instead when the missing compiler was named explicitly, since it is never substituted', async () => {
+    const doctor = new DoctorService({
+      run: runner(tectonicOnly()).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: true });
+
+    // Same machine as the test above — only the assertion differs, and it decides the grade.
+    expect(statusOf(result.checks, 'compiler')).toBe('fail');
+    expect(result.ok).toBe(false);
+    expect(
+      result.hints.some(
+        (h) => h.includes('WEB_LATEX_MCP_COMPILER') && h.includes('compiler: "tectonic"'),
+      ),
+    ).toBe(true);
+  });
+
+  it('fails, claiming no substitute, when neither backend is installed', async () => {
+    const canned = eolTeXLive(home, SYSTEM_TEXMF);
+    delete canned['latexmk -v'];
+    const doctor = new DoctorService({
+      run: runner(canned).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    expect(statusOf(result.checks, 'compiler')).toBe('fail');
+    expect(result.ok).toBe(false);
+    // Promising a fallback that is not installed is worse than saying nothing.
+    expect(result.hints.some((h) => /falling back/i.test(h))).toBe(false);
+    expect(result.hints.join('\n')).toContain('tectonic');
+  });
+
+  it('carries the tectonic caveats only when tectonic is the substitute', async () => {
+    const canned = eolTeXLive(home, SYSTEM_TEXMF); // latexmk present, tectonic absent
+    const doctor = new DoctorService({
+      run: runner(canned).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'tectonic', compilerExplicit: false });
+
+    expect(statusOf(result.checks, 'compiler')).toBe('warn');
+    expect(result.ok).toBe(true);
+    expect(result.checks.find((c) => c.name === 'compiler')?.detail).toContain('latexmk');
+    // latexmk honours `engine`, cleans, and logs file:line — none of the caveats apply to it.
+    expect(result.hints.some((h) => /XeTeX/i.test(h) || /no source snippets/i.test(h))).toBe(false);
+  });
+
+  it('does not probe the other backend when the configured one is there', async () => {
+    const { run, calls } = runner(eolTeXLive(home, SYSTEM_TEXMF));
+    const doctor = new DoctorService({ run, now: NOW, canWrite: rootOwnedSystemTexmf });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    // The happy path pays for exactly the probes it paid for before.
+    expect(calls.some((c) => c.startsWith('tectonic'))).toBe(false);
+    expect(result.checks.find((c) => c.name === 'compiler')?.detail).toBe(
+      'latexmk: Latexmk, John Collins, 26 Dec. 2019. Version 4.67',
+    );
+  });
+
   it('fails when git is missing, since every sync and push shells out to it', async () => {
     const canned = eolTeXLive(home, '/usr/local/share/texmf');
     delete canned['git --version'];

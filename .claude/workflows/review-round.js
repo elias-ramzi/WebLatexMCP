@@ -1,11 +1,12 @@
 export const meta = {
   name: 'review-round',
   description:
-    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, fable signs off',
+    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, fable signs off (fable swappable for opus)',
   whenToUse:
     'To review-and-fix a branch or PR in one pass: Workflow({name: "review-round"}) reviews the current branch ' +
     'against origin/dev itself. Optional args: {review: "<posted review-comment URL>" to fix an existing review ' +
-    'instead of producing one, pr: <number>, branch: "<name>", base: "origin/dev", max_attempts: 2, commit: true}. ' +
+    'instead of producing one, pr: <number>, branch: "<name>", base: "origin/dev", max_attempts: 2, commit: true, ' +
+    'fable: false — or fable_model: "opus" — to run the planner and sign-off on opus instead}. ' +
     'Batches run sequentially (shared files), so wall-clock is the sum of batches.',
   phases: [
     {
@@ -16,7 +17,7 @@ export const meta = {
     },
     {
       title: 'Plan',
-      detail: 'fable batches the findings into coherent fixes',
+      detail: 'fable (or opus, with args.fable === false) batches the findings into coherent fixes',
       model: 'fable',
     },
     {
@@ -31,7 +32,8 @@ export const meta = {
     },
     {
       title: 'Sign-off',
-      detail: 'fable audits the whole diff, runs the gate, commits',
+      detail:
+        'fable (or opus, with args.fable === false) audits the whole diff, runs the gate, commits',
       model: 'fable',
     },
   ],
@@ -42,6 +44,14 @@ const review = (args && args.review) || null;
 const MAX_ATTEMPTS = (args && args.max_attempts) || 2;
 const COMMIT = args && args.commit === false ? false : true;
 const BASE = (args && args.base) || 'origin/dev';
+// The planner and the sign-off auditor both run on fable by default. Pass {fable: false} — or
+// name one outright with {fable_model: 'opus'} — to run both on opus instead. One knob for both:
+// they are the two ends of the same whole-round view, and splitting them invites a plan written
+// at one altitude being audited at another.
+const FABLE = args && args.fable === false ? 'opus' : (args && args.fable_model) || 'fable';
+if (FABLE !== 'fable' && FABLE !== 'opus') {
+  throw new Error(`fable_model must be "fable" or "opus", got ${JSON.stringify(FABLE)}`);
+}
 
 const REPO = '/home/eramzi/workspace/overleaf_mcp';
 const prFromUrl = review ? (review.match(/\/pull\/(\d+)/) || [])[1] : null;
@@ -169,11 +179,16 @@ explicitly any batch that touches guard code, runExclusive/lock paths, the shado
 credential handling — those need the invariant-preservation treatment. Note in each spec which
 findings interact with fixes from earlier batches in this same run. If the review genuinely
 found nothing to fix, return zero batches and shared_context "NOTHING_TO_FIX".`,
-  { model: 'fable', label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
+  { model: FABLE, label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
 );
 if (!plan.batches.length) {
   log('review found nothing to fix — done');
-  return { review: review || 'produced in-run', batches: [], signoff: 'nothing to fix' };
+  return {
+    review: review || 'produced in-run',
+    planner: FABLE,
+    batches: [],
+    signoff: 'nothing to fix',
+  };
 }
 log(`plan: ${plan.batches.length} batch(es): ${plan.batches.map((b) => b.name).join(', ')}`);
 
@@ -308,7 +323,7 @@ ${
 }
 
 Your final text: gate result, whether you committed (and the SHA), unresolved concerns.`,
-  { model: 'fable', label: 'sign-off', phase: 'Sign-off' },
+  { model: FABLE, label: 'sign-off', phase: 'Sign-off' },
 );
 
-return { review: review || 'produced in-run', batches: results, signoff };
+return { review: review || 'produced in-run', planner: FABLE, batches: results, signoff };

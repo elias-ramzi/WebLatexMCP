@@ -109,6 +109,12 @@ export interface ServerConfig {
   defaultProject?: string;
   /** Local compile backend. `loadConfig` always resolves this; omit to default to `latexmk`. */
   compiler?: CompilerKind;
+  /**
+   * True when `WEB_LATEX_MCP_COMPILER` named the backend. False means `compiler` is only a
+   * default, which is what licenses `compile` to fall back to whichever backend is actually
+   * installed. An explicit choice is an assertion and is never substituted.
+   */
+  compilerExplicit?: boolean;
   /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
   viewerPort?: number;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */

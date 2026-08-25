@@ -60,6 +60,43 @@ const ENGINE_FLAG: Record<Engine, string> = {
   lualatex: '-pdflua',
 };
 
+/**
+ * Whether a spawn rejection means "the binary is not there" — `ENOENT`, which is also what a
+ * missing binary surfaces as on Windows. Exported because it is the whole of the availability
+ * decision: everything else `spawn` can reject with (`EACCES` — present but not executable,
+ * `EAGAIN`/`EMFILE` — process or fd exhaustion) is a real fault on a machine that *does* have
+ * the backend, and must never be read as "not installed".
+ */
+export function isNotFound(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT';
+}
+
+/**
+ * Probe a backend binary by running its version flag. Resolves `true` if it ran at all (a
+ * non-zero exit still means the binary is there), `false` only when it is absent — and
+ * **rethrows** any other spawn failure. Swallowing those into `false` is what would let a
+ * transient `EAGAIN` under fork pressure silently switch a healthy machine's engine, which is
+ * precisely the silent substitution `CompilerResolver` exists to prevent: only the caller can
+ * be told that latexmk is installed but unrunnable.
+ *
+ * `run` is injectable so the rethrow can be tested: a real non-ENOENT spawn failure needs fd or
+ * process exhaustion to reproduce, and a test that cannot cause one cannot pin the branch that
+ * matters most here.
+ */
+export async function probeOnPath(
+  cmd: string,
+  versionArg: string,
+  run: typeof execCapture = execCapture,
+): Promise<boolean> {
+  try {
+    await run(cmd, [versionArg], { timeoutMs: 5000 });
+    return true;
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw err;
+  }
+}
+
 async function exists(p: string): Promise<boolean> {
   try {
     await stat(p);
@@ -205,14 +242,8 @@ async function collectOutcome(
 
 /** Compiles a project locally with latexmk. Build artifacts go to a temp dir, keeping the clone clean. */
 export class LatexmkCompiler implements LatexCompiler {
-  async isAvailable(): Promise<boolean> {
-    try {
-      // Resolves regardless of exit code; rejects only if latexmk is not found.
-      await execCapture('latexmk', ['-v'], { timeoutMs: 5000 });
-      return true;
-    } catch {
-      return false;
-    }
+  isAvailable(): Promise<boolean> {
+    return probeOnPath('latexmk', '-v');
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
@@ -248,13 +279,8 @@ export class LatexmkCompiler implements LatexCompiler {
  * (`--keep-logs`), which the parser needs.
  */
 export class TectonicCompiler implements LatexCompiler {
-  async isAvailable(): Promise<boolean> {
-    try {
-      await execCapture('tectonic', ['--version'], { timeoutMs: 5000 });
-      return true;
-    } catch {
-      return false;
-    }
+  isAvailable(): Promise<boolean> {
+    return probeOnPath('tectonic', '--version');
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {

@@ -195,6 +195,30 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
   stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
   land outside.
+- **The compile backend is preflighted, and only an _unchosen_ default is ever substituted.**
+  `CompilerResolver` (`src/services/compilerResolver.ts`) calls `isAvailable()` before compiling —
+  which nothing did until a user on a tectonic-only machine got a raw `spawn latexmk ENOENT` naming
+  neither `WEB_LATEX_MCP_COMPILER` nor the backend on their PATH that would have worked. What licenses
+  a substitution is **`config.compilerExplicit`, not availability**: an unset `WEB_LATEX_MCP_COMPILER`
+  leaves `latexmk` a _default_, so a missing one may be swapped for whatever is installed — reported
+  in the result's `hint`, never silently. Set — to anything, `latexmk` included — it is an
+  _assertion_, and a missing backend is an error; a per-call `compiler` argument is always an
+  assertion. Same shape as `followSymlinks`: an assertion, never an inference. Derive both answers
+  from one place (`parseCompilerChoice` in `src/config.ts`), or a whitespace-only env value makes
+  `compiler` a default while `compilerExplicit` calls it a choice. Every refusal names what _is_
+  installed (and never claims one when none is), both routes out (`compiler:` and the env var), and —
+  when the substitute is tectonic — that it yields **no snippets at all**, because that is a silent
+  behaviour change rather than an error: the fallback must not quietly undo the snippet guarantee the
+  next bullet exists to make. `compile` returns the backend that actually ran as `compiler`;
+  `server_info` reports only the _configured_ one and says so. **`doctor` grades the backend-dependent
+  checks — `engines` and `package-manager` — against the _effective_ backend, not the configured
+  one, and only when that backend is actually installed.** A substitutable missing backend is `warn`, not
+  `fail` — `ok` means "nothing the server needs is missing", and under a working fallback nothing
+  is. But `ok` is `every(status !== 'fail')`, so any _other_ check that fails silently overrides
+  that grade: a tectonic machine has no engine and no `tlmgr` on PATH, and reporting either as a
+  failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
+  XeTeX and fetches its own packages, so those are category errors, not findings — grade them
+  against `effective` or the `warn` above is decorative.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location

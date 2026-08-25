@@ -4,6 +4,9 @@ import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { readProjectRegistry } from './services/projectRegistry.js';
+// One list of backends, shared with the resolver's fallback loop: a private copy here could
+// accept a kind the fallback never tries (or reject one it does).
+import { COMPILER_KINDS } from './services/compilerResolver.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 /**
@@ -127,18 +130,25 @@ function parseProjects(raw: string | undefined, cwd: string): ProjectConfig[] {
   );
 }
 
-const COMPILERS: readonly CompilerKind[] = ['latexmk', 'tectonic'];
-
-/** Select the compile backend from env, defaulting to latexmk. */
-function parseCompiler(raw: string | undefined): CompilerKind {
+/**
+ * Select the compile backend from env, defaulting to latexmk — and say whether that was a
+ * *choice* or merely the default. Both answers come from this one emptiness test so they can
+ * never disagree: unset, empty, and whitespace-only alike mean "not chosen", which is what
+ * licenses a downstream fallback to whichever backend is installed. Naming a backend — even
+ * the default one — is an assertion, never substituted.
+ */
+function parseCompilerChoice(raw: string | undefined): {
+  kind: CompilerKind;
+  explicit: boolean;
+} {
   const value = raw?.trim().toLowerCase();
-  if (!value) return 'latexmk';
-  if (!(COMPILERS as readonly string[]).includes(value)) {
+  if (!value) return { kind: 'latexmk', explicit: false };
+  if (!(COMPILER_KINDS as readonly string[]).includes(value)) {
     throw new Error(
-      `WEB_LATEX_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILERS.join(', ')}.`,
+      `WEB_LATEX_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILER_KINDS.join(', ')}.`,
     );
   }
-  return value as CompilerKind;
+  return { kind: value as CompilerKind, explicit: true };
 }
 
 /**
@@ -174,7 +184,9 @@ export function loadConfig(
     );
   }
 
-  const compiler = parseCompiler(env.WEB_LATEX_MCP_COMPILER);
+  const { kind: compiler, explicit: compilerExplicit } = parseCompilerChoice(
+    env.WEB_LATEX_MCP_COMPILER,
+  );
   const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
 
@@ -185,6 +197,7 @@ export function loadConfig(
     projects,
     defaultProject,
     compiler,
+    compilerExplicit,
     viewerPort,
     viewerTarget,
   };

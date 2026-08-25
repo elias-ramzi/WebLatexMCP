@@ -2,7 +2,8 @@ import { ProjectManager } from './services/projectManager.js';
 import type { ProjectRegistryStore } from './services/projectManager.js';
 import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
-import { createCompiler, buildPdfPath } from './services/compiler.js';
+import { buildPdfPath } from './services/compiler.js';
+import { CompilerResolver } from './services/compilerResolver.js';
 import { ViewerService } from './services/viewer.js';
 import { SyncTexService } from './services/synctex.js';
 import { CommentStore } from './services/commentStore.js';
@@ -14,7 +15,6 @@ import { ShadowStore } from './services/shadowStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { detectRootFile } from './lib/rootFile.js';
 import { locateProjectPdf } from './lib/pdfLocate.js';
-import type { LatexCompiler } from './services/compiler.js';
 import type { CommitIdentity } from './services/auth.js';
 import type { ServerConfig } from './types.js';
 
@@ -24,7 +24,12 @@ export interface AppContext {
   projectManager: ProjectManager;
   git: GitService;
   files: FileService;
-  compiler: LatexCompiler;
+  /**
+   * Picks the compile backend that actually runs — see `src/services/compilerResolver.ts`. This is
+   * the resolver rather than one `LatexCompiler` because the configured backend may not be on PATH,
+   * and an *unchosen* default may then be substituted (an explicit choice never is).
+   */
+  compiler: CompilerResolver;
   viewer: ViewerService;
   synctex: SyncTexService;
   comments: CommentStore;
@@ -124,7 +129,9 @@ export function createContext(
     projectManager,
     git,
     files,
-    compiler: createCompiler(config.compiler ?? 'latexmk'),
+    // `compilerExplicit` is the whole licence for a fallback: unset means `compiler` is only a
+    // default and may be substituted when it is not installed; set means the user asserted it.
+    compiler: new CompilerResolver(config.compiler ?? 'latexmk', config.compilerExplicit ?? false),
     viewer,
     synctex,
     comments,

@@ -41,10 +41,12 @@ export function registerDoctor(server: McpServer, ctx: AppContext): void {
     {
       title: 'Check the local LaTeX toolchain',
       description:
-        'Report the local toolchain a compile depends on: the configured compiler, which engines ' +
-        'are installed, the TeX distribution and its age, the package manager and the repository ' +
-        'it would install from, where a package can be installed without root, git, and whether ' +
-        'the workspace is writable. Read-only and local — pass checkRepository: true to also test ' +
+        'Report the local toolchain a compile depends on: the configured compiler — and, when it ' +
+        'is missing, whether the other supported backend (latexmk/tectonic) is installed and ' +
+        'whether compiles fall back to it — which engines are installed, the TeX distribution ' +
+        'and its age, the package manager and the repository it would install from, where a ' +
+        'package can be installed without root, git, and whether the workspace is writable. ' +
+        'Read-only and local — pass checkRepository: true to also test ' +
         'the repository over the network. Call this when a compile fails for a reason that is ' +
         'about the machine rather than the document (missing package, unknown engine), instead of ' +
         'discovering each limitation by failing into it.',
@@ -55,6 +57,7 @@ export function registerDoctor(server: McpServer, ctx: AppContext): void {
       try {
         const result = await ctx.doctor.diagnose({
           compiler: ctx.config.compiler ?? 'latexmk',
+          compilerExplicit: ctx.config.compilerExplicit ?? false,
           workspaceRoot: ctx.config.workspaceRoot,
           checkRepository,
         });
