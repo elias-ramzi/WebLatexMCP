@@ -1,0 +1,73 @@
+# Every PR into `dev` moves the `[Unreleased]` section of CHANGELOG.md.
+#
+# This log is not a list of commit subjects — the entries carry the reasoning that is nowhere else:
+# why a guard exists, what the alternative was, what a fallback silently changes. A forgotten entry
+# loses that, and it is never reconstructed later. So the rule is checked here rather than trusted.
+#
+# Deliberately narrow:
+#   - PRs into `dev` only. A `dev -> main` release PR is the changelog, and the auto-merged
+#     `main -> dev` back-merge PR from back-merge.yml carries no entry by construction — a required
+#     check that blocks a bot's PR is a repo you have to babysit.
+#   - A `no-changelog` label opts out, because a PR that genuinely has nothing to log (a CI tweak, a
+#     typo) would otherwise get a junk entry written to satisfy a bot, and junk entries cost the log
+#     more than the missing rule does.
+#   - The check is that the `[Unreleased]` section CHANGED, not that the file appears in the diff:
+#     the actual mistake is appending to the last released section out of habit, which touching the
+#     file does not catch.
+name: Changelog
+
+on:
+  pull_request:
+    branches: [dev]
+    # labeled/unlabeled so adding or removing `no-changelog` re-runs the check rather than leaving a
+    # stale red (or a stale green) on the PR.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  unreleased-entry:
+    name: CHANGELOG [Unreleased] updated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip the back-merge PR
+        id: skip
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if [ "$HEAD_REF" = "main" ]; then
+            echo "reason=back-merge from main" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"no-changelog"'; then
+            echo "reason=labelled no-changelog" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.skip.outputs.reason == ''
+        with:
+          fetch-depth: 0
+
+      - name: Compare the [Unreleased] section against the base
+        if: steps.skip.outputs.reason == ''
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_REF"
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+
+          # Everything between `## [Unreleased]` and the next `## [` heading.
+          unreleased() {
+            git show "$1:CHANGELOG.md" 2>/dev/null |
+              awk '/^## \[Unreleased\]/ { f = 1; next } /^## \[/ { f = 0 } f'
+          }
+
+          if [ "$(unreleased "$base")" = "$(unreleased HEAD)" ]; then
+            echo "::error file=CHANGELOG.md::The [Unreleased] section is unchanged since $BASE_REF." \
+                 "Add an entry saying what changed and why, or label the PR 'no-changelog' if there" \
+                 "is genuinely nothing to log."
+            exit 1
+          fi
+          echo "[Unreleased] changed since $BASE_REF."
+
+      - name: Report the skip
+        if: steps.skip.outputs.reason != ''
+        run: echo "Changelog check skipped — ${{ steps.skip.outputs.reason }}."

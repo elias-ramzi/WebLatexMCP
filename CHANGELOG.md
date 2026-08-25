@@ -78,6 +78,21 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   pipeline, with the issue's words treated as evidence rather than as a spec, and a close that drafts
   (never posts) the reply owed to the reporter, discarded parts included.
 
+- **A CI check that a PR into `dev` moved the `[Unreleased]` section of this file.** The log is not a
+  list of commit subjects — its entries carry the reasoning that is nowhere else: why a guard exists,
+  what the alternative was, what a fallback silently changes. A forgotten entry loses that and it is
+  never reconstructed later, so the rule is checked rather than trusted. It is a workflow and not a
+  test, because it is a fact about a PR rather than about the code: `on: pull_request` hands over the
+  base ref, while `npm test` runs on `push` and locally, where there is no base branch and mid-work
+  there is legitimately no entry yet — a check that is red all afternoon teaches people to ignore red.
+  Narrow on purpose. PRs into `dev` only: a `dev -> main` release PR _is_ the changelog, and the
+  auto-merged `main -> dev` back-merge carries no entry by construction, so requiring one there means
+  a bot PR that has to be babysat every release. A `no-changelog` label opts out, because the
+  alternative for a PR with genuinely nothing to log is a junk entry written to satisfy a bot, which
+  costs the log more than the missing rule does. And what is compared is the `[Unreleased]` section
+  itself, base-vs-head, not whether the file appears in the diff — the mistake actually made is
+  appending to the last released section out of habit, which touching the file does not catch.
+
 ### Changed
 
 - **The `session-feedback` skill saves its report itself when there is no way to file it.** The report
