@@ -7,6 +7,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 This log starts with the changes made after 0.2.0; for anything earlier, see the git history.
 
+## [Unreleased]
+
+### Added
+
+- **A `fix-review-round` workflow and the two agents it drives** — contributor tooling under
+  `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
+  workflow takes one posted PR review round end to end — a planner batches every finding and cleanup
+  item into 1–4 self-contained specs ordered so an earlier batch cannot invalidate a later one, an
+  `implementer` agent fixes each batch test-first, a `plan-verifier` agent tries adversarially to
+  refute it and sends rework back (up to `max_attempts`), and a final auditor reads the whole diff for
+  the cross-batch interactions no per-batch reviewer could see, syncs with the remote, runs the gate,
+  and commits only when every batch was approved. Adapted from a sibling repo, so what carried over is
+  the shape and what was rewritten is every rule: the agents encode _this_ repo's invariants (thin tool
+  layer over services, stdout as the JSON-RPC channel, and the guards — `requireGitProject`,
+  `runExclusive`, `confirmBibEdit`, `recordBaseline`, symlink resolution, ff-only pull, a
+  shadow-store `conflicted` flag that stays flagged, snippets only for log-vouched locations) as
+  things a verifier hunts for having been weakened. The vacuous-pass mode they are built to catch is
+  this repo's own: `test/smoke/**` auto-skips wherever `latexmk` is absent, so a green `npm test` is
+  never accepted as coverage of compile-adjacent code, and `typecheck` is run for the tests the build
+  excludes.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added

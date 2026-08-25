@@ -1,29 +1,48 @@
 export const meta = {
   name: 'fix-review-round',
-  description: 'Fix one review round: fable plans, sonnet implements, opus verifies, fable signs off',
+  description:
+    'Fix one review round: fable plans, sonnet implements, opus verifies, fable signs off',
   whenToUse:
     'After a review round is posted on a PR: Workflow({name: "fix-review-round", args: {review: "<comment URL>"}}). ' +
     'Optional args: {pr: <number>, branch: "<name>", max_attempts: 2, commit: true}. pr/branch are parsed from the ' +
     'URL / current checkout when omitted. Batches run sequentially (shared files), so wall-clock is the sum of batches.',
   phases: [
-    { title: 'Plan', detail: 'fable reads the review and batches the findings into coherent fixes', model: 'fable' },
-    { title: 'Implement', detail: 'sonnet fixes one batch at a time, tests first', model: 'sonnet' },
-    { title: 'Verify', detail: 'opus adversarially verifies each batch and demands rework', model: 'opus' },
-    { title: 'Sign-off', detail: 'fable audits the whole diff, runs the gate, commits', model: 'fable' },
+    {
+      title: 'Plan',
+      detail: 'fable reads the review and batches the findings into coherent fixes',
+      model: 'fable',
+    },
+    {
+      title: 'Implement',
+      detail: 'sonnet fixes one batch at a time, tests first',
+      model: 'sonnet',
+    },
+    {
+      title: 'Verify',
+      detail: 'opus adversarially verifies each batch and demands rework',
+      model: 'opus',
+    },
+    {
+      title: 'Sign-off',
+      detail: 'fable audits the whole diff, runs the gate, commits',
+      model: 'fable',
+    },
   ],
-}
+};
 
 // ---- inputs -------------------------------------------------------------
-const review = args && args.review
-if (!review) throw new Error('pass args: {review: "<PR review-comment URL>"}')
-const MAX_ATTEMPTS = (args && args.max_attempts) || 2
-const COMMIT = args && args.commit === false ? false : true
+const review = args && args.review;
+if (!review) throw new Error('pass args: {review: "<PR review-comment URL>"}');
+const MAX_ATTEMPTS = (args && args.max_attempts) || 2;
+const COMMIT = args && args.commit === false ? false : true;
 
-const REPO = '/home/eramzi/workspace/overleaf_mcp'
-const prFromUrl = (review.match(/\/pull\/(\d+)/) || [])[1]
-const PR = (args && args.pr) || (prFromUrl && Number(prFromUrl))
-if (!PR) throw new Error('could not parse a PR number from the review URL; pass args.pr')
-const BRANCH = (args && args.branch) || '(the currently checked-out branch — verify with git branch --show-current that it is the PR branch, and stop if it is not)'
+const REPO = '/home/eramzi/workspace/overleaf_mcp';
+const prFromUrl = (review.match(/\/pull\/(\d+)/) || [])[1];
+const PR = (args && args.pr) || (prFromUrl && Number(prFromUrl));
+if (!PR) throw new Error('could not parse a PR number from the review URL; pass args.pr');
+const BRANCH =
+  (args && args.branch) ||
+  '(the currently checked-out branch — verify with git branch --show-current that it is the PR branch, and stop if it is not)';
 const HOUSE = `
 Repo: ${REPO}, branch ${BRANCH} (PR #${PR}). This is WebLatexMCP, a TypeScript MCP server
 (stdio transport). Read CLAUDE.md first; its rules are load-bearing:
@@ -45,17 +64,18 @@ fixtures; a skip is fine, a failure is not. Integration tests use the local bare
 Gate:
   npm run typecheck && npm run lint && npm run format:check && npm test
 (typecheck covers src AND test; the build does not, so a clean build proves nothing about
-tests). Single test file: npx vitest run test/unit/<file>.test.ts; by name: npx vitest run -t "...".`
+tests). Single test file: npx vitest run test/unit/<file>.test.ts; by name: npx vitest run -t "...".`;
 
 // ---- Phase 1: fable plans ----------------------------------------------
-phase('Plan')
+phase('Plan');
 const PLAN_SCHEMA = {
   type: 'object',
   required: ['batches', 'shared_context'],
   properties: {
     shared_context: {
       type: 'string',
-      description: 'Facts every implementer needs: review URL, round title, cross-batch interactions, ordering constraints, whether guard/lock/session code is involved',
+      description:
+        'Facts every implementer needs: review URL, round title, cross-batch interactions, ordering constraints, whether guard/lock/session code is involved',
     },
     batches: {
       type: 'array',
@@ -79,7 +99,7 @@ const PLAN_SCHEMA = {
       },
     },
   },
-}
+};
 const plan = await agent(
   `You are the planner for a fix round. ${HOUSE}
 
@@ -100,8 +120,8 @@ explicitly any batch that touches guard code, runExclusive/lock paths, the shado
 credential handling — those need the invariant-preservation treatment. Note in each spec which
 findings interact with fixes from earlier batches in this same run.`,
   { model: 'fable', label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
-)
-log(`plan: ${plan.batches.length} batch(es): ${plan.batches.map((b) => b.name).join(', ')}`)
+);
+log(`plan: ${plan.batches.length} batch(es): ${plan.batches.map((b) => b.name).join(', ')}`);
 
 // ---- Phase 2+3: sequential implement -> verify loop per batch -----------
 const VERDICT_SCHEMA = {
@@ -117,19 +137,22 @@ const VERDICT_SCHEMA = {
     },
     boundary_probes: {
       type: 'string',
-      description: 'The just-outside-the-guard values you actually ran, what happened, and proof the probed path fired (a probe whose path never executed proves nothing)',
+      description:
+        'The just-outside-the-guard values you actually ran, what happened, and proof the probed path fired (a probe whose path never executed proves nothing)',
     },
   },
-}
+};
 
-const results = []
+const results = [];
 for (const batch of plan.batches) {
-  let attempt = 0
-  let feedback = ''
-  let verdict = { approved: false, feedback: 'never ran' }
+  let attempt = 0;
+  let feedback = '';
+  let verdict = { approved: false, feedback: 'never ran' };
   while (attempt < MAX_ATTEMPTS) {
-    attempt += 1
-    const done = results.map((r) => `${r.batch}: ${r.approved ? 'landed' : 'landed unapproved'}`).join('; ') || 'none yet'
+    attempt += 1;
+    const done =
+      results.map((r) => `${r.batch}: ${r.approved ? 'landed' : 'landed unapproved'}`).join('; ') ||
+      'none yet';
     await agent(
       `You are the implementer. ${HOUSE}
 
@@ -147,7 +170,7 @@ Run the gate before finishing. Your final text: a factual change list (files, fu
 tests added and which were watched failing pre-fix, gate result) for the verifier — raw data,
 not prose for a human.`,
       { model: 'sonnet', label: `impl:${batch.name}#${attempt}`, phase: 'Implement' },
-    )
+    );
     verdict = await agent(
       `You are the adversarial verifier. ${HOUSE}
 
@@ -178,19 +201,31 @@ Verify adversarially, in this order:
    import type, a hardcoded path separator or string-built file:// URL, or a survivor of the
    batch's defect pattern elsewhere in src/? Grep.
 Approve ONLY if all pass. If rejecting, give file:symbol-precise rework instructions.`,
-      { model: 'opus', label: `verify:${batch.name}#${attempt}`, phase: 'Verify', schema: VERDICT_SCHEMA },
-    )
-    if (verdict.approved) break
-    feedback = verdict.feedback
-    log(`${batch.name}: rejected on attempt ${attempt} — ${feedback.slice(0, 120)}`)
+      {
+        model: 'opus',
+        label: `verify:${batch.name}#${attempt}`,
+        phase: 'Verify',
+        schema: VERDICT_SCHEMA,
+      },
+    );
+    if (verdict.approved) break;
+    feedback = verdict.feedback;
+    log(`${batch.name}: rejected on attempt ${attempt} — ${feedback.slice(0, 120)}`);
   }
-  results.push({ batch: batch.name, approved: verdict.approved, attempts: attempt, notes: verdict.feedback })
-  log(`${batch.name}: ${verdict.approved ? 'approved' : 'NOT approved'} after ${attempt} attempt(s)`)
+  results.push({
+    batch: batch.name,
+    approved: verdict.approved,
+    attempts: attempt,
+    notes: verdict.feedback,
+  });
+  log(
+    `${batch.name}: ${verdict.approved ? 'approved' : 'NOT approved'} after ${attempt} attempt(s)`,
+  );
 }
 
 // ---- Phase 4: fable signs off -------------------------------------------
-phase('Sign-off')
-const unapproved = results.filter((r) => !r.approved)
+phase('Sign-off');
+const unapproved = results.filter((r) => !r.approved);
 const signoff = await agent(
   `You are the final auditor. ${HOUSE}
 
@@ -220,6 +255,6 @@ ${
 
 Your final text: gate result, whether you committed (and the SHA), unresolved concerns.`,
   { model: 'fable', label: 'sign-off', phase: 'Sign-off' },
-)
+);
 
-return { batches: results, signoff }
+return { batches: results, signoff };
