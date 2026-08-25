@@ -2,6 +2,7 @@ import { access, constants, stat } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
+import { COMPILER_KINDS } from './compilerResolver.js';
 import type { CompilerKind } from '../types.js';
 
 /**
@@ -41,6 +42,12 @@ export interface Diagnosis {
 export interface DoctorOptions {
   /** The compiler backend the server is configured to use — the one that must exist. */
   compiler: CompilerKind;
+  /**
+   * Whether `compiler` was named by WEB_LATEX_MCP_COMPILER rather than defaulted. An explicit
+   * choice is never substituted, so a missing one is a hard failure; a defaulted one falls back
+   * to whichever backend is installed, which is a warning at most. Defaults to false.
+   */
+  compilerExplicit?: boolean;
   /** Where clones live; unwritable means nothing works, so it is worth one `access` call. */
   workspaceRoot?: string;
   /** Actually reach the package repository over the network (off by default). */
@@ -49,6 +56,33 @@ export interface DoctorOptions {
 
 /** The engines `compile` accepts, which is what makes this list worth probing. */
 const ENGINES = ['pdflatex', 'xelatex', 'lualatex'] as const;
+
+/**
+ * The flag each backend prints its version for. They disagree — tectonic rejects `-v` — and this
+ * is the only place in this file that needs to know it.
+ */
+function versionFlag(kind: CompilerKind): string {
+  return kind === 'tectonic' ? '--version' : '-v';
+}
+
+/**
+ * The backend `compile` would fall back to — the first of the others, matching the order
+ * `CompilerResolver` tries them in, so `doctor` names the backend that would actually be picked.
+ * Derived from `COMPILER_KINDS` rather than written as `kind === 'latexmk' ? …`, which silently
+ * returns a wrong answer the day a third backend is added instead of failing loudly.
+ */
+function otherCompiler(kind: CompilerKind): CompilerKind | undefined {
+  return COMPILER_KINDS.find((k) => k !== kind);
+}
+
+/**
+ * What changes when tectonic is the backend rather than latexmk. Each one is a silent behaviour
+ * change rather than an error, so any hint that offers tectonic has to say them outright — and
+ * only then, since none of it is true of latexmk.
+ */
+const TECTONIC_CAVEAT =
+  'Note that tectonic is XeTeX-only, so `engine` is ignored and `clean` is a no-op, and its log ' +
+  'carries no file:line, so compile errors come back with no source snippets.';
 
 /** Long enough for a cold binary on a slow disk, short enough not to stall the caller. */
 const PROBE_TIMEOUT_MS = 10_000;
@@ -92,7 +126,7 @@ export class DoctorService {
 
     // Independent probes, so pay for the slowest rather than the sum.
     const [compiler, engineVersions, tlmgr, texmfHome, texmfLocal, git] = await Promise.all([
-      this.version(opts.compiler, opts.compiler === 'tectonic' ? ['--version'] : ['-v']),
+      this.version(opts.compiler, [versionFlag(opts.compiler)]),
       Promise.all(ENGINES.map((e) => this.version(e, ['--version']))),
       this.version('tlmgr', ['--version']),
       this.kpsewhich('TEXMFHOME'),
@@ -100,25 +134,103 @@ export class DoctorService {
       this.version('git', ['--version']),
     ]);
 
-    // 1. The configured backend. Without it every compile fails the same opaque way.
+    // 1. The configured backend, and — only when it is absent — the other one. Whether a missing
+    //    backend is fatal is not a question about this machine but about who chose it: `compile`
+    //    substitutes a mere default and never an explicit choice, so the grade has to follow that
+    //    or `doctor` calls a working setup broken. The alternative is probed here rather than in
+    //    the batch above so the happy path pays for exactly the probes it always did.
+    //
+    //    `effective` is the backend a compile would really use, which is not always the configured
+    //    one. Checks below are graded against it rather than `opts.compiler`, or `doctor` reports on
+    //    a toolchain nobody is using — and since `ok` is `every(status !== 'fail')`, one such check
+    //    silently overrides the grade decided here.
+    let effective: CompilerKind = opts.compiler;
+    // ...and whether that backend is actually *there*. The two come apart when nothing can compile
+    // (an explicit choice that is missing, or no backend at all): `effective` still names the
+    // backend that would run, but nothing may be claimed about what it provides. Softening a check
+    // on the strength of a backend this machine does not have asserts a capability nothing has.
+    let effectiveAvailable = false;
     if (compiler) {
+      effectiveAvailable = true;
       checks.push({ name: 'compiler', status: 'ok', detail: `${opts.compiler}: ${compiler}` });
     } else {
-      checks.push({
-        name: 'compiler',
-        status: 'fail',
-        detail: `${opts.compiler} not found on PATH`,
-      });
-      hints.push(
-        `The configured compiler (${opts.compiler}) is not on PATH — no document can be built. ` +
-          'Install a TeX distribution (TeX Live: https://tug.org/texlive, MiKTeX: ' +
-          'https://miktex.org) and make sure its bin directory is on PATH.',
-      );
+      const other = otherCompiler(opts.compiler);
+      const otherVersion = other ? await this.version(other, [versionFlag(other)]) : undefined;
+      const caveat = other === 'tectonic' ? ` ${TECTONIC_CAVEAT}` : '';
+      if (other === undefined || otherVersion === undefined) {
+        // `other` is undefined only if `COMPILER_KINDS` ever shrinks to one; say nothing about a
+        // backend that does not exist rather than interpolating "undefined" into the report.
+        checks.push({
+          name: 'compiler',
+          status: 'fail',
+          detail: `${opts.compiler} not found on PATH` + (other ? ` (nor is ${other})` : ''),
+        });
+        hints.push(
+          `The configured compiler (${opts.compiler}) is not on PATH` +
+            (other ? `, and neither is ${other}` : '') +
+            ' — no document can be built. Install a TeX distribution (TeX Live: ' +
+            'https://tug.org/texlive, MiKTeX: https://miktex.org) or tectonic ' +
+            '(https://tectonic-typesetting.github.io) and make sure its bin directory is on PATH.',
+        );
+      } else if (opts.compilerExplicit ?? false) {
+        // An assertion, so nothing is picked for the caller — but say what would work.
+        checks.push({
+          name: 'compiler',
+          status: 'fail',
+          detail:
+            `${opts.compiler} not found on PATH — ${other} (${otherVersion}) is installed, but ` +
+            `WEB_LATEX_MCP_COMPILER names ${opts.compiler} explicitly`,
+        });
+        hints.push(
+          `The configured compiler (${opts.compiler}) is not on PATH, so no document can be ` +
+            `built. ${other} is installed, but WEB_LATEX_MCP_COMPILER names ${opts.compiler} ` +
+            'explicitly and an explicit choice is never substituted. Set ' +
+            `WEB_LATEX_MCP_COMPILER=${other} to select it for every compile, or pass ` +
+            `compiler: "${other}" on a single compile call.${caveat}`,
+        );
+      } else {
+        // Only a default, so `compile` falls back: the toolchain works, it is just not the one
+        // configured. `warn` keeps `ok` true, which is the truth about this machine.
+        effective = other;
+        effectiveAvailable = true;
+        checks.push({
+          name: 'compiler',
+          status: 'warn',
+          detail: `${opts.compiler} not found on PATH — falling back to ${other} (${otherVersion})`,
+        });
+        hints.push(
+          `The configured compiler (${opts.compiler}) is not on PATH, so compiles are falling ` +
+            // "names no backend", not "is unset": unset, empty, and whitespace-only all land
+            // here, and telling a user with WEB_LATEX_MCP_COMPILER="  " that it is unset sends
+            // them looking anywhere but at the variable that caused this.
+            `back to ${other}, which is installed — WEB_LATEX_MCP_COMPILER names no backend, so ` +
+            `${opts.compiler} was only the default.${caveat} Set ` +
+            `WEB_LATEX_MCP_COMPILER=${other} to choose it explicitly — an explicit choice is ` +
+            'never substituted.',
+        );
+      }
     }
 
-    // 2. Engines, named the way `compile`'s `engine` argument names them.
+    // 2. Engines, named the way `compile`'s `engine` argument names them — but only latexmk needs
+    //    them. Tectonic bundles its own XeTeX and drives it directly, so "no LaTeX engine on PATH"
+    //    is not a finding about a tectonic machine, it is a category error: it would mark the one
+    //    setup this whole fallback exists to rescue as broken, and `ok` is `every(!== 'fail')`, so
+    //    a `fail` here would override the `warn` above and undo the grade entirely.
+    //    Gated on the backend actually being installed: an explicitly-chosen tectonic that is
+    //    absent leaves `effective` as tectonic, and claiming "none needed, tectonic bundles its
+    //    own" on a machine that has no tectonic asserts a capability nothing there has.
     const engines = ENGINES.filter((_, i) => engineVersions[i]);
-    if (engines.length > 0) {
+    const tectonicRuns = effective === 'tectonic' && effectiveAvailable;
+    if (tectonicRuns) {
+      checks.push({
+        name: 'engines',
+        status: 'ok',
+        detail:
+          (engines.length > 0
+            ? `${engines.join(', ')} — not used: `
+            : 'none on PATH, none needed: ') + 'tectonic bundles its own XeTeX',
+      });
+    } else if (engines.length > 0) {
       checks.push({ name: 'engines', status: 'ok', detail: engines.join(', ') });
     } else {
       checks.push({ name: 'engines', status: 'fail', detail: 'no LaTeX engine found on PATH' });
@@ -139,9 +251,22 @@ export class DoctorService {
       });
     }
 
-    // 4. The package manager, and whether it can still reach anything.
-    const repository = tlmgr ? await this.tlmgrRepository() : undefined;
-    if (tlmgr) {
+    // 4. The package manager, and whether it can still reach anything — a question about a system
+    //    TeX installation, so it is only a question at all when latexmk is what runs. Under
+    //    tectonic the whole branch is a category error: a frozen `tlmgr` repository cannot affect
+    //    a backend that never consults tlmgr, and warning about one sends the user to fix
+    //    something that was not going to be used.
+    const repository = tlmgr && !tectonicRuns ? await this.tlmgrRepository() : undefined;
+    if (tectonicRuns) {
+      checks.push({
+        name: 'package-manager',
+        status: 'ok',
+        detail:
+          (tlmgr ? `${tlmgr} — not used: ` : 'none on PATH, none needed: ') +
+          'tectonic fetches packages into its own cache ' +
+          '(which needs network access on the first compile of a project)',
+      });
+    } else if (tlmgr) {
       const frozen = repository !== undefined && FROZEN_REPOSITORY.test(repository);
       const reachable =
         opts.checkRepository && repository ? await this.reach(repository) : undefined;

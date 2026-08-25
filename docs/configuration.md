@@ -11,7 +11,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override.                                                                                                                                                                                                                                                                                                                                                                          |
 | `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. Setting it is an **assertion**: that backend is never substituted, and a missing one is an error. Left unset, a missing `latexmk` falls back to an installed `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                               |
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -132,7 +132,38 @@ Two backends are supported; select with `WEB_LATEX_MCP_COMPILER`.
   Documents that rely on pdfLaTeX-specific behavior may render differently. Requires `tectonic` on your
   `PATH` (`brew install tectonic`, `cargo install tectonic`, or see <https://tectonic-typesetting.github.io>).
 
-Both return the same structured errors/warnings and PDF path, so switching backends changes nothing else.
+Both return the same structured errors/warnings and PDF path, but not the same **source snippets**:
+latexmk is run with `-file-line-error`, tectonic passes no such flag, so its log names no `file:line`
+for any diagnostic and every error comes back with no `snippet`/`snippetStartLine` — all of them
+counted in `omittedSnippetLocations` instead. A snippet is never guessed, so under tectonic the 5
+lines around each error cost a `read_file`.
+
+### Choosing a backend, and when one is substituted
+
+The backend is also selectable **per call**: `compile { compiler: "tectonic" }` uses that backend for
+that one compile. Previously the only way to pick one was at launch, so a mis-set backend meant
+editing the MCP client config and restarting the server.
+
+Whichever backend is selected is **preflighted** before the compile runs. If it is not on your
+`PATH`, `compile` fails with an error naming the missing backend, which backends _are_ installed, the
+`compiler:` argument to retry with, and `WEB_LATEX_MCP_COMPILER` — rather than a raw
+`spawn latexmk ENOENT` from Node.
+
+**A default falls back; a choice does not.**
+
+- **`WEB_LATEX_MCP_COMPILER` unset** — `latexmk` is only a _default_. If it is missing and `tectonic`
+  is installed, `compile` uses tectonic and says so: the result's `hint` reports the substitution, and
+  its `compiler` field always names the backend that actually ran.
+- **`WEB_LATEX_MCP_COMPILER` set** — to anything, `latexmk` included — or a per-call `compiler:`
+  argument: **never** substituted. A missing backend is an error, the one above.
+
+The reason is the one behind [`followSymlinks`](tools.md#local-in-place-projects): a setting is an
+assertion, never an inference. Someone who never set the variable never chose `latexmk` — it was the
+server's guess, and swapping in the engine that is actually installed keeps the guess honest rather
+than failing on a machine that can compile perfectly well. Someone who set it _did_ choose, so
+substituting would silently override them — and the two backends are not interchangeable (tectonic is
+XeTeX-only and drops every snippet), so the override would surface as a changed PDF rather than as an
+error.
 
 ## Tokens — resolved per host
 

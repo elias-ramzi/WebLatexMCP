@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import { loadConfig } from '../../src/config.js';
+import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -123,6 +124,46 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ WEB_LATEX_MCP_COMPILER: 'pdflatex' })).toThrow(
       /WEB_LATEX_MCP_COMPILER/,
     );
+    expect(() => loadConfig({ WEB_LATEX_MCP_COMPILER: 'pdflatex' })).toThrow(
+      'WEB_LATEX_MCP_COMPILER "pdflatex" is invalid; expected one of: latexmk, tectonic.',
+    );
+  });
+
+  it('accepts exactly the backends the fallback knows how to try', () => {
+    // One list, not two: validating against a private copy lets loadConfig accept a kind the
+    // resolver's fallback loop never iterates (or reject one it does).
+    for (const kind of COMPILER_KINDS) {
+      expect(loadConfig({ WEB_LATEX_MCP_COMPILER: kind }).compiler).toBe(kind);
+    }
+  });
+
+  it('does not call an unset compiler var a choice', () => {
+    expect(loadConfig({}).compilerExplicit).toBe(false);
+  });
+
+  it('records a named compiler as an explicit choice', () => {
+    expect(loadConfig({ WEB_LATEX_MCP_COMPILER: 'tectonic' }).compilerExplicit).toBe(true);
+  });
+
+  it('treats explicitly naming the default as a choice, not a default', () => {
+    // The case a naive `compiler !== 'latexmk'` test gets wrong: naming latexmk outright is an
+    // assertion, and must suppress any fallback to whichever backend happens to be installed.
+    const cfg = loadConfig({ WEB_LATEX_MCP_COMPILER: 'LATEXMK' });
+    expect(cfg.compiler).toBe('latexmk');
+    expect(cfg.compilerExplicit).toBe(true);
+  });
+
+  it('treats a whitespace-only compiler var as no choice at all', () => {
+    // Both answers come from one emptiness rule, so they can never disagree about one input.
+    const cfg = loadConfig({ WEB_LATEX_MCP_COMPILER: '   ' });
+    expect(cfg.compiler).toBe('latexmk');
+    expect(cfg.compilerExplicit).toBe(false);
+  });
+
+  it('treats an empty compiler var as no choice at all', () => {
+    const cfg = loadConfig({ WEB_LATEX_MCP_COMPILER: '' });
+    expect(cfg.compiler).toBe('latexmk');
+    expect(cfg.compilerExplicit).toBe(false);
   });
 
   it('parses the viewer target (default undefined = browser)', () => {

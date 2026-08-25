@@ -50,7 +50,7 @@ document.
 ## Highlights
 
 - 🗂️ **Any project, with or without a remote** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials — or a folder you already have, worked on **in place**, so what Claude compiles is the file your editor has open.
-- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. Each error comes with the 5 source lines around it, so a bare `Undefined control sequence` is readable on the spot. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
+- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. Each error comes with the 5 source lines around it, so a bare `Undefined control sequence` is readable on the spot (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none). A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
 - 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
 - ✏️ **Surgical edits, reviewable pushes** — atomic, exact-match string replacements; `commit` and `push` stay separate, so nothing leaves your machine implicitly.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
@@ -62,7 +62,10 @@ document.
 ## Install
 
 Pick your client below. Either way, editing, git, and the PDF viewer work without TeX — only `compile`
-needs `latexmk` (default) or `tectonic` on your `PATH`. Not sure what you have? Ask Claude to run
+needs `latexmk` (default) or `tectonic` on your `PATH` — pick either per call with
+`compile { compiler: "tectonic" }`, and a missing _default_ falls back to whichever of the two is
+installed (a backend you actually chose never does; see
+[Compile backend](docs/configuration.md#compile-backend)). Not sure what you have? Ask Claude to run
 `doctor` and it reports your engines, TeX distribution, and where packages can be installed.
 
 ### Claude Code (CLI or the VS Code extension)
@@ -129,7 +132,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 
 - **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
-- **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error, and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
+- **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
 

@@ -18,7 +18,15 @@ const outputSchema = {
         'presence means the directory is already handled — do not add a .gitignore entry for it. ' +
         'Absent when nothing was excluded.',
     ),
-  compiler: z.string(),
+  compiler: z
+    .string()
+    .describe(
+      'The *configured* compile backend, which is not always the one that runs: when it is only ' +
+        'the default (WEB_LATEX_MCP_COMPILER names no backend) and is not installed, compile ' +
+        'substitutes a ' +
+        'backend that is. This field does not probe PATH — run doctor for what is actually ' +
+        "installed, or read a compile result's own `compiler` for what ran.",
+    ),
 };
 
 export function registerServerInfo(server: McpServer, ctx: AppContext): void {
@@ -29,7 +37,9 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       description:
         'Report the web-latex-mcp server version and runtime configuration (workspace root, ' +
         'whether the workspace is local to the launch dir, whether the clone dir was git-excluded ' +
-        'from the host repo, and the configured compiler). Use this to confirm which version of ' +
+        'from the host repo, and the configured compiler — which is not necessarily the backend a ' +
+        'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
+        'there). Use this to confirm which version of ' +
         'the MCP server is running.',
       inputSchema: {},
       outputSchema,

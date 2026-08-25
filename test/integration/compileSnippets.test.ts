@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { logBaseDir } from '../../src/services/compiler.js';
+import { CompilerResolver } from '../../src/services/compilerResolver.js';
 import { MAX_REPORTED_PATH_CHECKS } from '../../src/lib/sourceSnippet.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -66,7 +67,9 @@ async function setup(
     { name: 'Test', email: 'test@example.com' },
     new ProjectRegistry(workspace),
   );
-  ctx.compiler = stubCompiler(log);
+  // `ctx.compiler` is the backend *resolver*; hand it a factory that always yields the stub, so
+  // these tests exercise the real selection path (latexmk, present, no fallback) with no TeX.
+  ctx.compiler = new CompilerResolver('latexmk', false, () => stubCompiler(log));
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test', version: '0.0.0' });
@@ -92,7 +95,12 @@ describe('compile: source context', () => {
     await client.callTool({ name: 'read_file', arguments: { project: 'doc', path: 'paper.tex' } });
     // The user edits the file directly, in their own editor.
     await writeFile(path.join(userDir, 'paper.tex'), 'EDITED BY HAND\n', 'utf8');
-    await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const compiled = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    // This test asserts the *absence* of a recorded baseline, so it would pass just as well if
+    // compile never ran at all — and backend preflight gave compile a new way to bail out before
+    // touching a file. Pin that it really got as far as compiling, or the guard below is vacuous.
+    expect(compiled.isError).toBeFalsy();
+    expect((compiled.structuredContent as { rootFile?: string }).rootFile).toBe('paper.tex');
 
     const write = await client.callTool({
       name: 'write_file',

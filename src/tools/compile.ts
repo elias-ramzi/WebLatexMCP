@@ -20,6 +20,7 @@ import {
   needsShellEscape,
   findMissingPackages,
 } from '../services/logParser.js';
+import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
@@ -31,6 +32,18 @@ const inputSchema = {
   project: z.string().optional(),
   rootFile: z.string().optional().describe('Root .tex file. Auto-detected when omitted.'),
   engine: z.enum(['pdflatex', 'xelatex', 'lualatex']).optional().describe('Default pdflatex.'),
+  compiler: z
+    .enum(['latexmk', 'tectonic'])
+    .optional()
+    .describe(
+      'Compile backend for this one call, overriding WEB_LATEX_MCP_COMPILER — so a backend that ' +
+        'is not installed can be switched without editing the client config and restarting. ' +
+        'Naming one here is an assertion: it is never substituted, and a backend that is not on ' +
+        'PATH is an error naming what is installed. Omitted, the configured backend is used, and ' +
+        'if it is merely the default (WEB_LATEX_MCP_COMPILER names no backend) and missing, an ' +
+        'installed one ' +
+        'is substituted and reported in `hint`. `compiler` in the result always names what ran.',
+    ),
   clean: z.boolean().optional().describe('Force a full rebuild.'),
   timeoutSec: z.number().int().positive().optional().describe('Compile timeout (default 120s).'),
   restrictedShellEscape: z
@@ -107,6 +120,15 @@ const errorShape = diagnosticShape.extend({
 const outputSchema = {
   success: z.boolean(),
   rootFile: z.string(),
+  compiler: z
+    .enum(['latexmk', 'tectonic'])
+    .describe(
+      'The backend that actually ran. Usually the configured one, but when that is only a default ' +
+        '(WEB_LATEX_MCP_COMPILER names no backend) and is not on PATH, an installed backend is ' +
+        'substituted ' +
+        'and `hint` says so. Worth checking before reading the diagnostics: tectonic produces no ' +
+        'source snippets at all, since its log names no file:line.',
+    ),
   pdfPath: z
     .string()
     .optional()
@@ -158,13 +180,29 @@ const outputSchema = {
 };
 
 /**
- * What to do about packages the local TeX installation does not have. The server never installs
- * anything itself, so this is advice, not an action: it names the distribution's own installer and
- * the no-root variant, since a missing package on a shared machine is usually a permissions problem
- * rather than a missing mirror.
+ * What to do about packages the compile could not find. The server never installs anything itself,
+ * so this is advice, not an action — and it depends on which backend ran: latexmk draws on a system
+ * TeX installation, where the answer is that distribution's own installer and its no-root variant
+ * (a missing package on a shared machine is usually a permissions problem rather than a missing
+ * mirror), while tectonic has no system installation to install into at all.
  */
-function missingPackageHint(names: string[]): string {
+function missingPackageHint(names: string[], backend: CompilerKind): string {
   const args = names.join(' ');
+  // Graded against the backend that actually ran, not the configured one — a default-configured
+  // user on a machine with no TeX is now routed onto tectonic by the fallback, and `tlmgr` is
+  // neither installed there nor able to affect tectonic's cache. Sending them after it is exactly
+  // the wrong-path detour this whole change exists to stop.
+  if (backend === 'tectonic') {
+    return (
+      `Not in tectonic's bundle, or not fetched: ${names.join(', ')}. tectonic downloads what a ` +
+      'document needs into its own cache, so this is usually either no network on a cold cache ' +
+      '(retry once connected) or a package its bundle genuinely does not carry. `tlmgr` and ' +
+      '`mpm` do not apply — they manage a system TeX installation, which is not what compiled ' +
+      'this. If the package is essential, compile with latexmk against a full TeX distribution ' +
+      '(set WEB_LATEX_MCP_COMPILER=latexmk, or pass compiler: "latexmk"); if the document does ' +
+      'not actually need it, drop the \\usepackage line instead.'
+    );
+  }
   return (
     `Missing from your local TeX installation: ${names.join(', ')}. Install with your TeX ` +
     `distribution and compile again — TeX Live: \`tlmgr install ${args}\` (or ` +
@@ -181,7 +219,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
     {
       title: 'Compile the project locally',
       description:
-        'Compile the project locally (latexmk by default, or tectonic) and return success, ' +
+        'Compile the project locally (latexmk by default, or tectonic — pass `compiler` to pick ' +
+        'one for this call, and read it back in the result to see which actually ran) and return success, ' +
         'the PDF path, and structured errors/warnings (each attributed to its source .tex file ' +
         'when known — an error also carries the 5 source lines around it, so you rarely need a ' +
         'read_file to interpret it) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
@@ -204,12 +243,17 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       rawLog,
       shellEscape,
       restrictedShellEscape,
+      compiler,
     }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
+        // Preflight the backend before taking the project lock: choosing one is global, touches no
+        // project file, and throwing here costs nothing. Without it a missing backend surfaced as a
+        // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
+        const backend = await ctx.compiler.select(compiler);
         return await ctx.projectManager.runExclusive(id, async () => {
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
-          const outcome = await ctx.compiler.compile({
+          const outcome = await backend.compiler.compile({
             projectDir: dir,
             rootFile: root,
             engine,
@@ -244,6 +288,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // execution without consent. Surface a hint and let the caller opt in explicitly.
           const shellEscapeOn = shellEscape || restrictedShellEscape;
           const hints: string[] = [];
+          // First: it reframes everything below it. A substituted backend means the caller is not
+          // reading the diagnostics they expected — under tectonic, notably, none of them carry a
+          // snippet — so say which engine spoke before explaining what it said.
+          if (backend.note) hints.push(backend.note);
           if (!shellEscapeOn && needsShellEscape(outcome.log)) {
             hints.push(
               'This document uses TikZ externalization, which needs system calls. Retry compile ' +
@@ -251,7 +299,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 'this for a project you trust — shell escape lets the .tex run arbitrary commands.',
             );
           }
-          if (missingPackages.length > 0) hints.push(missingPackageHint(missingPackages));
+          if (missingPackages.length > 0)
+            hints.push(missingPackageHint(missingPackages, backend.kind));
           const hint = hints.length > 0 ? hints.join('\n') : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.
@@ -263,6 +312,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
+            compiler: backend.kind,
             pdfPath,
             pdfUrl,
             durationSec: outcome.durationSec,
@@ -274,9 +324,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             omittedSnippetLocations,
             hint,
           };
+          // Name the backend in the text too, not only structuredContent: which engine spoke
+          // decides how to read what follows (tectonic attaches no snippets to anything), and the
+          // client this rendering exists for is the one that cannot read structuredContent at all.
           const headline = outcome.timedOut
-            ? `compile timed out after ${outcome.durationSec.toFixed(1)}s`
-            : `${outcome.success ? 'compiled' : 'FAILED'} ${root} in ${outcome.durationSec.toFixed(1)}s — ${errors.length} error(s), ${warnings.length} warning(s)`;
+            ? `compile timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
+            : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ${errors.length} error(s), ${warnings.length} warning(s)`;
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
           // Errors sharing a location print the snippet once.
