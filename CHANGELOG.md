@@ -11,6 +11,33 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
+  `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels
+  where the model could read them, so every visual question had to be answered outside the server — in the
+  session this came from, a 140x100cm poster, by installing PyMuPDF and rasterizing by hand six times, which
+  moved the whole compile-look-fix loop into the shell and lost the structured error payload on the way.
+  `render_pages` rasterizes the last compiled PDF to PNG and returns the images inlined **and** as written
+  paths — inlined up to a 5 MB budget on the base64-encoded payload, after which the tail comes back as paths
+  only and says so, rather than as a hole in the middle of the page range; a single page too big to inline is
+  told what to do about it. At most 8 pages per call, the rest reported in `skippedPages`. It takes `pages`, a
+  `clip` rectangle in page fractions, and two sizing knobs: `maxEdgePx` (default 1600)
+  fits the returned image to a token-sane size, while `dpi` sets the resolution directly and wins — the precise
+  path being to clip one column and ask for 150 dpi. Both are bounded by a 4000px hard cap, and a request that
+  reaches it says so (`clamped`) and reports the resolution actually used. Read-only over the last build: it
+  never compiles. It takes `runExclusive` despite being read-only _with respect to the project_, because it
+  reads the build-dir PDF a peer session's `compile` can rewrite mid-read and writes its PNGs into that same
+  build dir — never inside the project, since a `local` project is edited in place, not littered in place.
+  Both need the native canvas backend `@napi-rs/canvas`, now declared as an **optional** dependency and reported
+  by `doctor` (`pdf-render`). The page count needs it as much as the rasterizing does — pdf.js reaches for DOM
+  geometry globals in Node and it is this backend that supplies them, so without it pdf.js cannot open a PDF at
+  all; that failure is reported as the missing backend rather than as a broken document. The check is a
+  _warning_ and never a failure, because nothing else the server does — compiling, the viewer, editing, the
+  whole git side — needs it. The cheap half is `compile`'s new `pageCount`, read from the PDF rather than the
+  log: a layout that spilled onto a second page is neither an error nor a warning in TeX's eyes, so one number
+  is the only thing that reports it — and the log's own `Output written on … (N pages` line is hard-wrapped at
+  79 columns, which is a second reason not to parse it. A count that cannot be read never fails a compile that produced a
+  document.
+
 - **A `review-round` workflow and the two agents it drives** — contributor tooling under
   `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
   workflow performs one review round end to end: by default an adversarial reviewer produces the

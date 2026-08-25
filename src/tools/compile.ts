@@ -140,6 +140,17 @@ const outputSchema = {
     .string()
     .optional()
     .describe('Clickable file:// URL of the compiled PDF, when produced.'),
+  pageCount: z
+    .number()
+    .optional()
+    .describe(
+      'How many pages the compiled PDF has, read from the PDF itself rather than the log. This is ' +
+        'the cheapest way to catch what a log cannot report: a layout that silently spilled onto a ' +
+        'second page is not an error or a warning in TeX’s eyes — it is just `pageCount: 2`. ' +
+        'Absent when no PDF was produced, or when it could not be read (rasterization and page ' +
+        'counting need the optional native canvas backend — run doctor). Use render_pages to ' +
+        'actually look at those pages.',
+    ),
   durationSec: z.number(),
   errors: z.array(errorShape),
   warnings: z.array(warningShape),
@@ -309,12 +320,26 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
           }
           const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
+          // Read the page count off the PDF, not the log's "Output written on … (N pages" line:
+          // that line is absent from a failed run that still produced a PDF, and the PDF is the
+          // thing the caller actually has. Never fatal — a compile that produced a document must
+          // not be reported as failed because a count could not be read (the count needs the
+          // optional native canvas backend, which may not be installed).
+          let pageCount: number | undefined;
+          if (pdfPath) {
+            try {
+              pageCount = await ctx.pdfRenderer.pageCount(pdfPath);
+            } catch {
+              pageCount = undefined;
+            }
+          }
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
             compiler: backend.kind,
             pdfPath,
             pdfUrl,
+            pageCount,
             durationSec: outcome.durationSec,
             errors,
             warnings: shownWarnings,
@@ -329,7 +354,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // client this rendering exists for is the one that cannot read structuredContent at all.
           const headline = outcome.timedOut
             ? `compile timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
-            : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ${errors.length} error(s), ${warnings.length} warning(s)`;
+            : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
+              `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
+              `${errors.length} error(s), ${warnings.length} warning(s)`;
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
           // Errors sharing a location print the snippet once.

@@ -4,6 +4,7 @@ import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
 import { buildPdfPath } from './services/compiler.js';
 import { CompilerResolver } from './services/compilerResolver.js';
+import { PdfRenderer } from './services/pdfRender.js';
 import { ViewerService } from './services/viewer.js';
 import { SyncTexService } from './services/synctex.js';
 import { CommentStore } from './services/commentStore.js';
@@ -15,6 +16,7 @@ import { ShadowStore } from './services/shadowStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { detectRootFile } from './lib/rootFile.js';
 import { locateProjectPdf } from './lib/pdfLocate.js';
+import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
 import type { ServerConfig } from './types.js';
 
@@ -30,6 +32,12 @@ export interface AppContext {
    * and an *unchosen* default may then be substituted (an explicit choice never is).
    */
   compiler: CompilerResolver;
+  /**
+   * Rasterizes the compiled PDF so the model can *see* it — see `src/services/pdfRender.ts`.
+   * Separate from `compiler` because it reads a finished PDF rather than producing one: it is
+   * what `render_pages` renders through and where `compile` gets its `pageCount`.
+   */
+  pdfRenderer: PdfRenderService;
   viewer: ViewerService;
   synctex: SyncTexService;
   comments: CommentStore;
@@ -132,6 +140,7 @@ export function createContext(
     // `compilerExplicit` is the whole licence for a fallback: unset means `compiler` is only a
     // default and may be substituted when it is not installed; set means the user asserted it.
     compiler: new CompilerResolver(config.compiler ?? 'latexmk', config.compilerExplicit ?? false),
+    pdfRenderer: new PdfRenderer(),
     viewer,
     synctex,
     comments,

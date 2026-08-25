@@ -3,6 +3,7 @@ import type { Stats } from 'node:fs';
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
 import { COMPILER_KINDS } from './compilerResolver.js';
+import { PdfRenderer } from './pdfRender.js';
 import type { CompilerKind } from '../types.js';
 
 /**
@@ -104,6 +105,7 @@ export class DoctorService {
   private readonly fetchImpl: FetchLike;
   private readonly now: () => Date;
   private readonly canWrite: (target: string) => Promise<boolean>;
+  private readonly canRasterize: () => Promise<boolean>;
 
   constructor(
     deps: {
@@ -112,12 +114,15 @@ export class DoctorService {
       now?: () => Date;
       /** Injectable so tests decide what is writable — the real answer varies by OS and machine. */
       canWrite?: (target: string) => Promise<boolean>;
+      /** Injectable so a test can assert both answers — the real one depends on the machine's platform. */
+      canRasterize?: () => Promise<boolean>;
     } = {},
   ) {
     this.run = deps.run ?? execCapture;
     this.fetchImpl = deps.fetch ?? ((url, init) => fetch(url, init));
     this.now = deps.now ?? (() => new Date());
     this.canWrite = deps.canWrite ?? isWritablePath;
+    this.canRasterize = deps.canRasterize ?? (() => new PdfRenderer().canRasterize());
   }
 
   async diagnose(opts: DoctorOptions): Promise<Diagnosis> {
@@ -125,14 +130,16 @@ export class DoctorService {
     const hints: string[] = [];
 
     // Independent probes, so pay for the slowest rather than the sum.
-    const [compiler, engineVersions, tlmgr, texmfHome, texmfLocal, git] = await Promise.all([
-      this.version(opts.compiler, [versionFlag(opts.compiler)]),
-      Promise.all(ENGINES.map((e) => this.version(e, ['--version']))),
-      this.version('tlmgr', ['--version']),
-      this.kpsewhich('TEXMFHOME'),
-      this.kpsewhich('TEXMFLOCAL'),
-      this.version('git', ['--version']),
-    ]);
+    const [compiler, engineVersions, tlmgr, texmfHome, texmfLocal, git, pdfRasterize] =
+      await Promise.all([
+        this.version(opts.compiler, [versionFlag(opts.compiler)]),
+        Promise.all(ENGINES.map((e) => this.version(e, ['--version']))),
+        this.version('tlmgr', ['--version']),
+        this.kpsewhich('TEXMFHOME'),
+        this.kpsewhich('TEXMFLOCAL'),
+        this.version('git', ['--version']),
+        this.canRasterize(),
+      ]);
 
     // 1. The configured backend, and — only when it is absent — the other one. Whether a missing
     //    backend is fatal is not a question about this machine but about who chose it: `compile`
@@ -349,6 +356,32 @@ export class DoctorService {
             'WEB_LATEX_MCP_WORKSPACE to a directory you own.',
         );
       }
+    }
+
+    // 9. Whether `render_pages` can rasterize at all. `@napi-rs/canvas` is an optional dependency
+    // (declared that way so npm can skip it on an unsupported platform or under --omit=optional),
+    // so its absence is silent until a render call fails into it. This is `warn`, never `fail`:
+    // nothing else the server does — compile, the viewer, page counts, the whole git side — needs
+    // it, so a missing rasterizer must not make `ok` (checks.every(status !== 'fail')) go false.
+    if (pdfRasterize) {
+      checks.push({
+        name: 'pdf-render',
+        status: 'ok',
+        detail: '@napi-rs/canvas — page rasterization available',
+      });
+    } else {
+      checks.push({
+        name: 'pdf-render',
+        status: 'warn',
+        detail: 'no native canvas backend — no render_pages, and no pageCount from compile',
+      });
+      hints.push(
+        'No native canvas backend is installed, so render_pages cannot rasterize pages to PNG, ' +
+          'and compile cannot report a pageCount — pdf.js needs this backend for the DOM geometry ' +
+          'globals it uses in Node, so it cannot even open a PDF without it. Install it with ' +
+          "`npm i @napi-rs/canvas` in the server's directory. Nothing else is affected: compiling, " +
+          'the viewer, editing and the whole git side work without it.',
+      );
     }
 
     return { ok: checks.every((c) => c.status !== 'fail'), checks, engines, hints };
