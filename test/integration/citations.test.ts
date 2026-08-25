@@ -9,6 +9,7 @@ import { createServer } from '../../src/server.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
+import { PdfRenderer } from '../../src/services/pdfRender.js';
 import { ViewerService } from '../../src/services/viewer.js';
 import { SyncTexService } from '../../src/services/synctex.js';
 import { CommentStore } from '../../src/services/commentStore.js';
@@ -73,6 +74,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       files: new FileService(),
       // Never used here (no compile in this suite) — the resolver is inert until `select` is called.
       compiler: new CompilerResolver('latexmk', false),
+      pdfRenderer: new PdfRenderer(),
       viewer: new ViewerService({
         knownIds: () => [],
         resolvePdfPath: async () => null,

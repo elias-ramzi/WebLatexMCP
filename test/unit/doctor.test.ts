@@ -135,6 +135,10 @@ describe('DoctorService', () => {
       run: runner(canned).run,
       now: NOW,
       canWrite: rootOwnedSystemTexmf,
+      // Pinned rather than left to the real probe — whether @napi-rs/canvas is actually installed
+      // depends on the machine running the test, and this case is about a toolchain with nothing
+      // missing, not about this repo's install state.
+      canRasterize: () => Promise.resolve(true),
     });
 
     const result = await doctor.diagnose({ compiler: 'latexmk', workspaceRoot: tmp });
@@ -508,6 +512,68 @@ describe('DoctorService', () => {
     expect(statusOf(result.checks, 'package-manager')).toBe('ok');
     expect(result.checks.find((c) => c.name === 'package-manager')?.detail).toContain('MiKTeX');
     expect(result.checks.find((c) => c.name === 'distribution')?.detail).toContain('MiKTeX 25.4');
+  });
+
+  describe('pdf-render', () => {
+    it('reports ok when the native canvas backend is available', async () => {
+      const { run } = runner(eolTeXLive(home, '/usr/local/share/texmf'));
+      const doctor = new DoctorService({
+        run,
+        now: NOW,
+        canWrite: rootOwnedSystemTexmf,
+        canRasterize: () => Promise.resolve(true),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk' });
+
+      expect(statusOf(result.checks, 'pdf-render')).toBe('ok');
+      expect(result.hints.join('\n')).not.toContain('@napi-rs/canvas');
+    });
+
+    it('warns — with a remedy — when no native canvas backend is installed', async () => {
+      const { run } = runner(eolTeXLive(home, '/usr/local/share/texmf'));
+      const doctor = new DoctorService({
+        run,
+        now: NOW,
+        canWrite: rootOwnedSystemTexmf,
+        canRasterize: () => Promise.resolve(false),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk' });
+
+      expect(statusOf(result.checks, 'pdf-render')).toBe('warn');
+      expect(result.hints.join('\n')).toContain('npm i @napi-rs/canvas');
+    });
+
+    it('never fails the whole toolchain just because rasterization is missing', async () => {
+      const canned = eolTeXLive(home, '/usr/local/share/texmf');
+      canned['pdflatex --version'] = 'pdfTeX 3.141592653-2.6-1.40.26 (TeX Live 2026)';
+      canned['lualatex --version'] = 'This is LuaHBTeX, Version 1.18.0 (TeX Live 2026)';
+      canned['xelatex --version'] = 'XeTeX 3.141592653-2.6-0.999996 (TeX Live 2026)';
+      canned['tlmgr option'] =
+        'Default package repository (repository): https://mirror.ctan.org/systems/texlive/tlnet';
+      const doctor = new DoctorService({
+        run: runner(canned).run,
+        now: NOW,
+        canWrite: rootOwnedSystemTexmf,
+        canRasterize: () => Promise.resolve(false),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk', workspaceRoot: tmp });
+
+      // The one thing this test exists to prove: a missing rasterizer must not flip `ok` to false.
+      expect(result.ok).toBe(true);
+      expect(statusOf(result.checks, 'pdf-render')).toBe('warn');
+    });
+
+    it('wires the real probe by default, without throwing', async () => {
+      const { run } = runner(eolTeXLive(home, '/usr/local/share/texmf'));
+      const doctor = new DoctorService({ run, now: NOW, canWrite: rootOwnedSystemTexmf });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk' });
+
+      expect(['ok', 'warn']).toContain(statusOf(result.checks, 'pdf-render'));
+    });
   });
 });
 

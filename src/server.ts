@@ -10,6 +10,7 @@ import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
 import { registerEditFile } from './tools/editFile.js';
 import { registerCompile } from './tools/compile.js';
+import { registerRenderPages } from './tools/renderPages.js';
 import { registerViewer } from './tools/viewer.js';
 import { registerListComments } from './tools/listComments.js';
 import { registerResolveComments } from './tools/resolveComments.js';
@@ -72,6 +73,7 @@ export function createServer(
   registerEditFile(server, ctx);
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
+  registerRenderPages(server, ctx);
   registerViewer(server, ctx);
   registerListComments(server, ctx);
   registerResolveComments(server, ctx);
