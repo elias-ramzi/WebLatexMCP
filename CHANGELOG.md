@@ -61,6 +61,37 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   tier), delegates each bounded task to the `implementer` agent, verifies the assembled diff with
   `plan-verifier`, and proves the work with the one gate this repo has: the local CI
   (`typecheck` + `lint` + `format:check` + `test`) passing.
+- **An `/implement-issue` command** — `/implement` assumes the request is worth building because I
+  wrote it; an issue or a saved feedback report is written by someone else, so this one triages before
+  it builds. It loads the source verbatim (a `gh issue view` including the **comments**, since a
+  maintainer reply often narrows or kills the ask; or a markdown file, each issue block in a saved
+  feedback report being its own candidate), delegates the judgment to a single agent whose model is
+  picked by `--triage-model` (fable or opus, fable by default, and the run says which one ran). It
+  separates the observed problem from
+  the proposed solution (the proposal being the half more often wrong) and checks the claim against the
+  tree with files and lines named, since the behaviour may already exist, may have been fixed since the
+  reporter's version, may be a CLAUDE.md guard working as designed, or may be a docs fix rather than a
+  code one. The agent advises; the session forms its own call and says where it disagrees. Then it
+  **stops**: a building / discarding / deviating / open-questions report, and no `implementer` is
+  launched and no file edited until I approve it — an empty accept list being a valid outcome, stated
+  outright so a run cannot manufacture work to justify itself. After approval it is `/implement`'s
+  pipeline, with the issue's words treated as evidence rather than as a spec, and a close that drafts
+  (never posts) the reply owed to the reporter, discarded parts included.
+
+### Changed
+
+- **The `session-feedback` skill saves its report itself when there is no way to file it.** The report
+  was always optional to write, which is right when `gh` can file the findings and wrong when it
+  cannot: with `gh` missing or merely logged out, the blocks existed only in the transcript and died
+  with the session. The skill now checks `gh auth status` before printing and, on a non-zero exit,
+  writes the summary and every issue block to `.claude/session_feedbacks/web-latex-mcp-feedback-<date>.md`
+  without asking (appending under a timestamped heading rather than overwriting a report I have not
+  filed yet), says why it went there, and names `gh auth login` as the one command that unblocks
+  filing. Authenticated, nothing changes: the file stays offered, not written. The same exit code now
+  gates the known-issues search, too — an installed-but-logged-out `gh` fails it with an auth error,
+  which is not "nothing found", so it counts as skipped and the confirmation checkbox stays unticked.
+  The directory ships with its own `.gitignore` (`*`, `!.gitignore`) so a report is never committed,
+  and the skill writes those same two lines wherever else it creates the directory.
 
 ## [0.6.0] - 2026-08-21
 

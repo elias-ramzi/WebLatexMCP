@@ -61,28 +61,62 @@ session to look at.
 5. **Check what is already known**, best-effort, so the report does not re-file a known issue:
    - the README carries a _"Nice to have, not there yet"_ note or two — a `gap` already named there is
      already known;
-   - if `gh` is available, `gh issue list --repo elias-ramzi/WebLatexMCP --search "<keywords>" --state all`;
+   - if `gh` is available **and authenticated** (`gh auth status` exits 0 — an installed-but-logged-out
+     `gh` fails the search with an auth error, which is not the same as "nothing found"), then
+     `gh issue list --repo elias-ramzi/WebLatexMCP --search "<keywords>" --state all`;
    - `CHANGELOG.md` (in a clone, or on GitHub) may show it was already fixed after the version
      `server_info` reported — check the `[Unreleased]` section too.
 
    Mark each finding _new_ or _already tracked (#N)_; drop the already-fixed ones and say so. Never let
-   this step block the report: if `gh` is missing or offline, say the check was skipped — that is what
-   the first confirmation checkbox is asserting, so it must be honest.
+   this step block the report: if `gh` is missing, unauthenticated, or offline, say the check was skipped
+   — that is what the first confirmation checkbox is asserting, so it must be honest.
 
 6. **Rank and cut.** Order by impact (blocked → slowed → cosmetic), keep the strongest **five to eight**,
    and say in the chat summary what you dropped and why. A silent truncation reads as "that was
    everything".
 7. **Print the chat summary, then one issue block per finding** (templates below). The blocks are the
    deliverable, and in a client with no filesystem access they are the _only_ deliverable.
-8. **Offer to save**, do not save unasked. Default path: `web-latex-mcp-feedback-<YYYY-MM-DD>.md` in the
-   directory the client was launched from, holding the summary and every block. **Never** write it with
-   `write_file`, and never place it inside a project clone or a local project directory: it is not part
-   of the user's manuscript, and inside a clone it is one `commit` away from being pushed to their
-   co-authors. If the user insists on a path inside a clone, git-exclude it first via that clone's
-   `.git/info/exclude` (the trick `summarize-paper` uses).
+8. **Save or offer to save**, depending on whether the findings have anywhere else to go — decide this
+   by **checking `gh` before you print**, not after:
+
+   ```bash
+   gh auth status   # exit 0 = installed and logged in; anything else = no filing route
+   ```
+
+   - **`gh` authenticated** — filing is available, so the file is optional: offer it, do not write it
+     unasked. Default path: `web-latex-mcp-feedback-<YYYY-MM-DD>.md` in the directory the client was
+     launched from.
+   - **`gh` missing, unauthenticated, or offline** — there is no filing route, so the report would exist
+     only in the transcript and be lost when the session closes. **Write it without asking** to
+     `.claude/session_feedbacks/web-latex-mcp-feedback-<YYYY-MM-DD>.md`, relative to the directory the
+     client was launched from, creating the directory if it is not there. It holds the chat summary and
+     every issue block verbatim, so the user (or a later session with a logged-in `gh`) can file it
+     unchanged. If a file for today already exists, append the new findings under a
+     `## <HH:MM> — second session` heading rather than overwriting a report the user has not filed yet.
+     Say in the chat summary where it went and why (`gh` is not authenticated), and give the one command
+     that unblocks filing: `gh auth login`.
+
+   The reports must never reach a commit. In the WebLatexMCP repo the directory ships with a
+   `.gitignore` that ignores everything inside it (keeping only itself) — leave that file alone. If you
+   create the directory somewhere else and that place is a git repo, write the same three lines into
+   `.claude/session_feedbacks/.gitignore` before writing the report:
+
+   ```gitignore
+   *
+   !.gitignore
+   ```
+
+   Either way, never `git add` a report.
+
+   **Never** write the report with `write_file`, and never place it inside a project clone or a local
+   project directory: it is not part of the user's manuscript, and inside a clone it is one `commit`
+   away from being pushed to their co-authors. `.claude/session_feedbacks/` is the agent's own working
+   directory, not the paper's. If the user insists on a path inside a clone, git-exclude it first via
+   that clone's `.git/info/exclude` (the trick `summarize-paper` uses).
+
 9. **Offer to file.** Filing is outward-facing and public, so it needs an explicit yes — never file as a
-   side effect of writing the report. Show the exact titles first, then, with permission and `gh`
-   available, one call per finding:
+   side effect of writing the report, and never as a side effect of step 8's write. Show the exact
+   titles first, then, with permission and `gh` authenticated, one call per finding:
 
    ```bash
    gh issue create --repo elias-ramzi/WebLatexMCP \
@@ -91,10 +125,12 @@ session to look at.
    ```
 
    `--label` is not optional: `gh` posts through the API and bypasses the form, so the label the form
-   would have applied (`bug` / `enhancement`) has to be set by hand. Without `gh`, hand back the title
-   and the block and point at
+   would have applied (`bug` / `enhancement`) has to be set by hand. Without a usable `gh`, the saved
+   file from step 8 _is_ the hand-off: name its path, and point at
    <https://github.com/elias-ramzi/WebLatexMCP/issues/new/choose> — blank issues are disabled, so the
-   user picks **Bug report** or **Feature request** and pastes field by field.
+   user picks **Bug report** or **Feature request** and pastes field by field. An unauthenticated `gh`
+   is the same case as a missing one: do not run `gh issue create` to find out, it fails after the
+   report is already written.
 
 **Titles.** `bug: <what breaks>` / `feat: <the capability>` / `docs: <what is wrong>`, under ~70
 characters, naming the tool: `bug: edit_file refuses after project_sync rewrites the tree`. Not
@@ -263,5 +299,6 @@ whether the sandbox boundary allows it.
 ## After you finish
 
 Report concisely: how many findings by bucket, the single highest-impact one in a sentence, whether the
-`gh` search ran, where the file was saved (or that nothing was written), and whether anything was filed.
+`gh` search ran, where the file was saved (or that nothing was written — and if it was written because
+`gh` is not authenticated, say so and name `gh auth login`), and whether anything was filed.
 If the session was clean, say that plainly — it is a real result, not an empty one.
