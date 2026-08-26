@@ -38,6 +38,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   79 columns, which is a second reason not to parse it. A count that cannot be read never fails a compile that produced a
   document.
 
+- **Two new skills — `proofread-document` and `review-writing-guide` — and three Claude Code commands that
+  parallelize them.** The typo hunter and the guide reviewer existed only as a `.claude/` command and agent, which
+  meant they existed only in Claude Code: Claude Desktop and every other MCP client got no proofreading procedure at
+  all, and no writing review — not a degraded one, none, since `.claude/commands` and subagents are a Claude Code
+  mechanism and the server advertises only `.claude/skills`. Both are now skills, so they ship as MCP prompts and
+  through `list_skills` like the other five, each with a single-agent workflow that stands on its own.
+  `proofread-document` reports typos as exact minimal substitutions and applies nothing until asked, with the hard
+  rule that a sentence you would have phrased differently is not a typo. `review-writing-guide` reviews against
+  [`docs/writing-guide.md`](docs/writing-guide.md) — which already reaches every client as the server's own
+  instructions, so the guide stays the authority and the skill only says how to review against it — and writes
+  nothing whatsoever, not even a report file: it proposes, and the author disposes. Alongside them,
+  `/format-latex`, `/hunt-typo` and `/review-writing` fan the per-file reading out across one subagent per file
+  (`formatter` and `corrector` on sonnet, `writing-reviewer` on opus with a `--sonnet` override), which is cheaper
+  and parallel. The commands and agents **fetch their rules from the skill through `list_skills` at run time**
+  rather than restating them, and stop rather than improvise if that call fails — a paraphrased rule is a wrong
+  rule, and two copies of a taxonomy drift the first time one is edited. What stays in each command is only what a
+  skill cannot say: which part is serial (splitting one main file has nothing to parallelize), which findings need
+  more than one file to see (an acronym defined twice, a float never referenced) and so cannot be delegated to a
+  single-file agent, and how the fan-out is batched. Contributor tooling under `.claude/` throughout: no tool, no
+  runtime behaviour, and nothing in `src/` changed.
+
 - **A `review-round` workflow and the two agents it drives** — contributor tooling under
   `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
   workflow performs one review round end to end: by default an adversarial reviewer produces the

@@ -11,6 +11,8 @@ the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-
 | [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                                                                       | local report; opt-in bib | `/verify-citations`     |
 | [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                                                                  | `.bib` + `.tex`          | `/format-bibliography`  |
 | [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                                                                   | local note only          | `/summarize-paper`      |
+| [`proofread-document`](../.claude/skills/proofread-document/SKILL.md)     | Hunts **typos** — spelling, doubled or missing words, agreement, punctuation, quotes, unescaped LaTeX characters, inconsistent hyphenation of a repeated term. Reports each as an exact minimal substitution and applies nothing until you say so. Never rewrites prose for style; never touches a `.bib`.                                                                                                                      | opt-in `.tex`            | `/proofread-document`   |
+| [`review-writing-guide`](../.claude/skills/review-writing-guide/SKILL.md) | Reviews the paper against the [writing guide](writing-guide.md) — tense, first-person overuse, signposting, captions and floats, equation punctuation and notation, citation placement, acronyms, dashes, `\autoref`. Reports prioritized findings with a concrete suggested rewrite each. **Proposes, never applies**; writes nothing at all.                                                                                  | nothing                  | `/review-writing-guide` |
 | [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and reporting on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong. Emits one ready-to-file issue body per finding, field for field against the repo's issue forms, with a measured environment (version, OS, client, model, install method, toolchain) and no manuscript content. Filed only when you ask. | nothing                  | `/session-feedback`     |
 
 ## Two ways a skill runs
@@ -171,6 +173,28 @@ never shows up in `status`/`diff`, never pushed to Overleaf/GitHub, and survives
 local exclude rather than a committed `.gitignore` keeps it purely local — no change is ever destined for
 the remote. Ask Claude to "summarize the paper" or "update the paper summary"; read the note first at the
 start of a session to save the re-reading cost.
+
+## `proofread-document` — hunt typos
+
+Reads every `.tex`/`.md`/`.txt` in the project and reports **errors only** — misspellings, doubled or
+dropped words, subject/verb disagreement, punctuation, ` ` ``/`''`quotes, unescaped`%`/`&`/`\_`/`#`, a
+term hyphenated two ways. Each finding is a minimal in-place substitution with its line, so line breaks
+(and the one-sentence-per-line convention) survive untouched. It is **report-only by default** and applies
+nothing until you approve, then compiles to prove nothing broke. The hard rule is that a sentence you would
+have phrased differently is not a typo: style, flow, and word choice are out of scope, as is the `.bib`.
+Ask Claude to "proofread the paper" or "check for typos".
+
+## `review-writing-guide` — check the prose against the guide
+
+Reviews the paper against [`writing-guide.md`](writing-guide.md) — which reaches the client as the server's
+own instructions, so the guide, not the skill, is the authority on every rule. Per-file checks cover tense,
+`we`/`our` overuse, section signposting, caption and float conventions, equation punctuation and notation,
+citation placement, dashes and English usage, `\autoref` and quote marks; a second whole-paper pass catches
+what no single file shows — an acronym defined twice, a float never referenced, a citation never re-anchored
+in a later section. Every finding quotes the source, names the guide section it diverges from, and proposes
+the concrete replacement; anything that cannot be tied to a rule is dropped as taste. **It writes nothing** —
+no `.tex`, no `.bib`, not even a report file — and the findings come back in the reply. Ask Claude to
+"review the writing" or "does this follow the writing guide".
 
 ## `session-feedback` — report back on the server itself
 

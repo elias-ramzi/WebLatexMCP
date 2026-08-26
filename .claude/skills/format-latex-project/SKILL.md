@@ -1,6 +1,6 @@
 ---
 name: format-latex-project
-description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, move every figure and table into its own \input file, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, to extract figures/tables into separate files, or to apply the one-sentence-per-line convention. Operates on projects served by the web-latex-mcp MCP server.
+description: Reformat an existing LaTeX/Overleaf project for clean diffs and modular structure — split the monolithic main file into per-section \input files, move every figure and table into its own \input file, and rewrite paragraphs to one-sentence-per-line. Use when the user asks to "format", "restructure", "modularize", or "clean up" an Overleaf/LaTeX project, to extract figures/tables into separate files, or to apply the one-sentence-per-line convention. Operates on projects served by the web-latex-mcp MCP server. In Claude Code, prefer the /format-latex command, which parallelizes this across sonnet agents; follow this procedure directly in clients without subagents.
 ---
 
 # Format a LaTeX project
