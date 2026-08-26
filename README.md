@@ -58,7 +58,7 @@ document.
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 - 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
-- 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
+- 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, DBLP citation audits, bibliography normalization.
 
 ## Install
 
@@ -149,6 +149,8 @@ unless you ask:
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
 - **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
+- **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes) and report each as an exact minimal fix; applies nothing until you approve, and never rewrites prose for style.
+- **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each. Proposes, never applies — it writes nothing at all.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 - **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, and emitted as ready-to-file issue bodies — the environment (version, OS, client, model, install method, toolchain) measured rather than guessed ([contributing](CONTRIBUTING.md#feedback-from-a-session)).
 
@@ -165,6 +167,13 @@ unless you ask:
   your account: zip each folder under [`.claude/skills/`](.claude/skills/), then upload them under
   **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an
   uploaded copy is a snapshot, so re-upload when a skill changes.
+
+**In Claude Code, three of them have a faster front door.** [`/format-latex`](.claude/commands/format-latex.md),
+[`/hunt-typo`](.claude/commands/hunt-typo.md), and [`/review-writing`](.claude/commands/review-writing.md) do the same
+work as `format-latex-project`, `proofread-document`, and `review-writing-guide`, but fan the per-file reading out
+across one subagent per file — cheaper, and parallel. They load the rules from the skill at run time rather than
+restating them, so the skill stays the single source of truth and the two cannot drift. Subagents are a Claude Code
+mechanism, so everywhere else the skill is the path, and it works on its own.
 
 See the [skills guide](docs/skills.md) for what each skill does, [step-by-step installation](docs/skills.md#installing),
 and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
