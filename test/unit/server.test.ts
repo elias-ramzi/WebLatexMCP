@@ -4,6 +4,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { WRITING_GUIDE_URI } from '../../src/resources/writingGuide.js';
 import { CONCURRENCY_GUIDE_URI } from '../../src/resources/concurrencyGuide.js';
+import { composeWritingGuide } from '../../src/lib/writingGuide.js';
 import type { AppContext } from '../../src/context.js';
 import type { Skill } from '../../src/lib/skills.js';
 
@@ -74,6 +75,31 @@ describe('createServer writing guide', () => {
     const content = read.contents[0];
     expect(content?.mimeType).toBe('text/markdown');
     expect(content && 'text' in content ? content.text : undefined).toBe(concurrency);
+
+    await client.close();
+  });
+
+  it('surfaces the SAME composed text (base + extra) to instructions AND the writing-guide resource', async () => {
+    const { text: composed, hasExtra } = composeWritingGuide(
+      '# Base guide\n\nUse the present tense.',
+      'Write lidar, never LiDAR.',
+    );
+    expect(hasExtra).toBe(true);
+    const server = createServer(fakeCtx, composed, undefined, undefined, hasExtra);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const instructions = client.getInstructions();
+    expect(instructions).toContain('Write lidar, never LiDAR.');
+    expect(instructions).toContain('Use the present tense.');
+
+    const read = await client.readResource({ uri: WRITING_GUIDE_URI });
+    const content = read.contents[0];
+    const resourceText = content && 'text' in content ? content.text : undefined;
+    expect(resourceText).toBe(composed);
+    // The resource text must be a substring of instructions too (same string, not a re-derivation).
+    expect(instructions).toContain(resourceText as string);
 
     await client.close();
   });
@@ -238,6 +264,76 @@ describe('server_info', () => {
       (res.structuredContent as Record<string, unknown>).workspaceExcludePattern,
     ).toBeUndefined();
     expect((res.content as Array<{ text: string }>)[0]?.text).not.toContain('.git/info/exclude');
+
+    await client.close();
+  });
+
+  it('omits the extra writing guide fields when not configured', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBeUndefined();
+    expect(structured.writingGuideExtraLoaded).toBeUndefined();
+
+    await client.close();
+  });
+
+  it('reports the extra writing guide path when configured and loaded', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        extraWritingGuidePath: '/home/user/paper/conventions.md',
+        extraWritingGuideLoaded: true,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBe('/home/user/paper/conventions.md');
+    expect(structured.writingGuideExtraLoaded).toBe(true);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('/home/user/paper/conventions.md');
+    expect(text.toLowerCase()).toContain('loaded');
+
+    await client.close();
+  });
+
+  it('reports the extra writing guide as NOT in effect when it failed to load', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        extraWritingGuidePath: '/home/user/paper/conventions.md',
+        extraWritingGuideLoaded: false,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBe('/home/user/paper/conventions.md');
+    expect(structured.writingGuideExtraLoaded).toBe(false);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('/home/user/paper/conventions.md');
+    // The critical case: a user must be able to see that their conventions are NOT in effect.
+    expect(text.toLowerCase()).toContain('not in effect');
 
     await client.close();
   });

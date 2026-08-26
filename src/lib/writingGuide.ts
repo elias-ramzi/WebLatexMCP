@@ -30,6 +30,57 @@ export async function loadWritingGuide(
   }
 }
 
+/** Heading under which an extra, project-specific guide is appended to the base one. */
+export const EXTRA_GUIDE_HEADING = '## Project-specific conventions';
+
+/**
+ * Read an ADDITIONAL, project-specific writing guide (e.g. "write `lidar`, never `LiDAR`"),
+ * to be appended to (never replacing) the base guide. `absPath` is undefined when the user
+ * named nothing — that is not an assertion, so it returns `undefined` silently. A named path
+ * that is missing, unreadable, or empty is a typo worth surfacing loudly (the model would
+ * otherwise silently ignore the user's conventions with no signal), so that case logs to
+ * stderr before returning `undefined` — it never throws, so a bad path never blocks startup.
+ */
+export async function loadExtraWritingGuide(
+  absPath: string | undefined,
+): Promise<string | undefined> {
+  if (!absPath) return undefined;
+  try {
+    const text = (await readFile(absPath, 'utf8')).trim();
+    if (text.length === 0) {
+      console.error(`[web-latex-mcp] extra writing guide at ${absPath} is empty; ignoring it`);
+      return undefined;
+    }
+    return text;
+  } catch (err) {
+    console.error(
+      `[web-latex-mcp] extra writing guide not loaded from ${absPath}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Compose the base guide with the additional, project-specific one — extra always LAST, under
+ * `EXTRA_GUIDE_HEADING`, so the base guide's own structure (headings, ordering) is never
+ * disturbed by an overlay appended to it.
+ *
+ * `hasExtra` is true only when BOTH a base and an extra guide were actually composed together —
+ * it is the one place that fact is decided, so `buildInstructions` never has to re-derive it by
+ * sniffing the composed text for `EXTRA_GUIDE_HEADING` (which the base guide could itself
+ * contain, or which would be vacuously "present" with no base guide to take precedence over).
+ */
+export function composeWritingGuide(
+  base: string | undefined,
+  extra: string | undefined,
+): { text: string | undefined; hasExtra: boolean } {
+  if (base && extra)
+    return { text: `${base}\n\n${EXTRA_GUIDE_HEADING}\n\n${extra}`, hasExtra: true };
+  if (base) return { text: base, hasExtra: false };
+  if (extra) return { text: `${EXTRA_GUIDE_HEADING}\n\n${extra}`, hasExtra: false };
+  return { text: undefined, hasExtra: false };
+}
+
 /**
  * Always-on guidance so a vague request reliably drives the PDF-comment loop. The user places
  * comments by selecting text in the local `viewer` and attaching a note; these instructions tell
@@ -58,12 +109,22 @@ const COMMENT_WORKFLOW =
 export function buildInstructions(
   writingGuide?: string,
   concurrencyGuide?: string,
+  hasExtra = false,
 ): string | undefined {
   const sections: string[] = [];
   if (writingGuide) {
+    // `hasExtra` travels as data from `composeWritingGuide`, not re-derived by sniffing the text
+    // for `EXTRA_GUIDE_HEADING` — a base guide could itself contain that literal heading (a false
+    // claim of precedence with no extra guide configured), and an extra-only guide (no base)
+    // would otherwise vacuously claim precedence over a "rest of the guide" that doesn't exist.
     sections.push(
       'When reading, writing, editing, or reviewing LaTeX (.tex) files through this ' +
-        "server, follow the project's LaTeX writing guide below.\n\n" +
+        "server, follow the project's LaTeX writing guide below." +
+        (hasExtra
+          ? ' Where the "Project-specific conventions" section contradicts the rest of the ' +
+            'guide, the project-specific conventions take precedence.'
+          : '') +
+        '\n\n' +
         writingGuide,
     );
   }

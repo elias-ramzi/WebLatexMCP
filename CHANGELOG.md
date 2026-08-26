@@ -11,6 +11,26 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
+  existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
+  swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,
+  never LiDAR") forced copying the whole base guide just to add one line, and any later upstream change
+  to that base guide had to be hand-merged back in. The new var names an _additional_ guide (a plain path
+  or a `file:///...` URL, so Claude Desktop users can paste a file link) that is composed in **after** the
+  base guide, under a "Project-specific conventions" heading, and takes precedence where the two
+  contradict — the base guide stays the default and the project layers its exceptions on top. Setting
+  both is legal: your replacement base plus your extra on top.
+  `add_writing_convention` takes a single `rule` string and appends it as a bullet to that configured
+  file, creating it on first use, behind the same cross-process file lock every mutating tool uses. It
+  takes no path — the destination is always the one file the server was configured with, never one the
+  model names — and it is strictly append-only: it cannot rewrite or drop a line a human already wrote
+  there. The rule takes effect starting with the **next** session, not the current one, because MCP
+  `instructions` are fixed at connect time; no live-refresh machinery was built for this, since a rule
+  that changed what "the current session already agreed to" mid-conversation is a stranger source of
+  confusion than a one-session delay. `server_info` now reports the configured path and whether the file
+  actually loaded, because a typo'd path would otherwise mean the conventions are silently ignored
+  forever with no way to notice.
+
 - **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
   `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels
   where the model could read them, so every visual question had to be answered outside the server — in the

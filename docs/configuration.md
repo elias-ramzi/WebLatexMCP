@@ -13,7 +13,8 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. Setting it is an **assertion**: that backend is never substituted, and a missing one is an error. Left unset, a missing `latexmk` falls back to an installed `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                               |
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. Default bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. **Replaces** the bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`                        | no       | Path or `file://` URL to an ADDITIONAL, project-specific writing guide, **appended to** (never replacing) the base guide. See [Project-specific writing conventions](#project-specific-writing-conventions).                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `WEB_LATEX_MCP_SKILLS_DIR`                                 | no       | Directory of skills exposed as MCP prompts (one subdirectory per skill, each with a `SKILL.md`). Default bundled [`.claude/skills`](skills.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Output-schema client compatibility. Default **auto-detects Claude Desktop** and omits `outputSchema`/`structuredContent` for it only; `1` forces omit for every client, `0` disables. See [Claude Desktop compatibility](#claude-desktop-compatibility).                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -236,6 +237,49 @@ reach it).
 Point a guide variable at your own file to override it, or at a non-existent path to ship no guide (the
 server starts normally either way; with no guide, neither the instructions nor the resource is
 advertised).
+
+### Project-specific writing conventions
+
+`WEB_LATEX_MCP_WRITING_GUIDE` and `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA` do different things, and the names
+are easy to mix up:
+
+- `WEB_LATEX_MCP_WRITING_GUIDE` **replaces** the base guide outright — point it at your own guide and the
+  bundled one is not read at all.
+- `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA` **appends** an additional guide on top of whatever base guide is in
+  effect (bundled, or your `WEB_LATEX_MCP_WRITING_GUIDE` replacement) — it never replaces anything. Setting
+  both is legal: your replacement base, plus your extra guide layered on top of it.
+
+The extra guide is composed in **last**, under its own `## Project-specific conventions` heading, and
+**takes precedence** where it contradicts the base guide — the instructions say so explicitly, so the
+model treats a project-specific rule as the tie-breaker rather than picking one at random.
+
+The value accepts either a filesystem path (absolute, `~`-relative, or relative to the launch dir) or a
+`file://` URL — the latter so Claude Desktop users, who can't easily hand-edit a JSON `env` block, can
+instead paste a file link. Only the **authority form** of a `file://` URL is accepted (e.g.
+`file:///home/user/conventions.md`, with the triple slash); a bare `file:relative.md` is rejected. A
+malformed value, a missing file, or an unreadable one is a loud warning to **stderr** — it never blocks
+startup. In that case the variable is treated as unset: no extra guide is composed, and the base guide
+loads normally.
+
+Because the guide is loaded once per server process, scoping a set of conventions to one paper is done
+by pointing this variable at a **different file per workspace** — a `.mcp.json` `env` block in Claude
+Code, or the equivalent per-project Desktop config.
+
+**Worked example.** A paper's workspace sets:
+
+```json
+{ "env": { "WEB_LATEX_MCP_WRITING_GUIDE_EXTRA": "./conventions.md" } }
+```
+
+and `conventions.md` (relative to the launch dir) holds:
+
+```markdown
+- Always write "lidar", never "LiDAR".
+```
+
+Every session started in that workspace now gets the base writing guide plus this rule, with the rule
+winning if the two ever disagree. Use the `add_writing_convention` tool (see
+[tools.md](tools.md#tools)) to append new rules to this file from the chat instead of hand-editing it.
 
 ## Claude Desktop compatibility
 
