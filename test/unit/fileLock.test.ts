@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile, utimes } from 'node:fs/promises';
-import { withFileLock, LockTimeoutError } from '../../src/lib/fileLock.js';
+import { withFileLock, LockTimeoutError, isLockContentionError } from '../../src/lib/fileLock.js';
 
 describe('withFileLock', () => {
   let dir: string;
@@ -105,5 +105,140 @@ describe('withFileLock', () => {
     await expect(
       withFileLock(lock, () => Promise.resolve('stolen'), { timeoutMs: 120, staleMs: 60_000 }),
     ).rejects.toThrow(LockTimeoutError);
+  });
+
+  it('does not claim another session holds the lock when no holder was recorded', () => {
+    const err = new LockTimeoutError(lock, null);
+    expect(err.message).not.toMatch(/held by/);
+    expect(err.message).not.toMatch(/pid \?/);
+    expect(err.message).toMatch(/no holder was recorded/);
+  });
+
+  it('keeps the existing message wording for a real holder unchanged', () => {
+    const err = new LockTimeoutError(lock, {
+      pid: 4242,
+      owner: 'method-section',
+      acquiredAt: '2024-01-01T00:00:00.000Z',
+    });
+    expect(err.message).toBe(
+      `Timed out waiting for the lock on nested — held by session "method-section" ` +
+        `since 2024-01-01T00:00:00.000Z. Another session is mid-operation; retry shortly.`,
+    );
+  });
+
+  it('keeps the existing message wording for a real holder with no owner', () => {
+    const err = new LockTimeoutError(lock, {
+      pid: 4242,
+      acquiredAt: '2024-01-01T00:00:00.000Z',
+    });
+    expect(err.message).toBe(
+      `Timed out waiting for the lock on nested — held by pid 4242 ` +
+        `since 2024-01-01T00:00:00.000Z. Another session is mid-operation; retry shortly.`,
+    );
+  });
+});
+
+describe('isLockContentionError', () => {
+  it('treats EEXIST as contention on every platform', () => {
+    expect(isLockContentionError('EEXIST', 'linux', () => false)).toBe(true);
+    expect(isLockContentionError('EEXIST', 'win32', () => false)).toBe(true);
+    expect(isLockContentionError('EEXIST', 'darwin', () => true)).toBe(true);
+  });
+
+  it('treats win32 EPERM/EACCES as contention only when the lock file is present', () => {
+    expect(isLockContentionError('EPERM', 'win32', () => true)).toBe(true);
+    expect(isLockContentionError('EACCES', 'win32', () => true)).toBe(true);
+  });
+
+  it('does not treat win32 EPERM/EACCES as contention when the lock file is absent', () => {
+    // No lock file means there is nothing pending deletion: a genuine permission problem
+    // (read-only volume, restrictive ACL, antivirus hold) that will never resolve on its own.
+    expect(isLockContentionError('EPERM', 'win32', () => false)).toBe(false);
+    expect(isLockContentionError('EACCES', 'win32', () => false)).toBe(false);
+  });
+
+  it('never treats EPERM/EACCES as contention off win32, file present or not', () => {
+    expect(isLockContentionError('EPERM', 'linux', () => true)).toBe(false);
+    expect(isLockContentionError('EACCES', 'darwin', () => true)).toBe(false);
+    expect(isLockContentionError('EPERM', 'linux', () => false)).toBe(false);
+  });
+
+  it('treats any other error code as a real failure', () => {
+    expect(isLockContentionError('ENOSPC', 'win32', () => true)).toBe(false);
+    expect(isLockContentionError(undefined, 'win32', () => true)).toBe(false);
+  });
+
+  it('does not consult lockFileExists on the EEXIST path (defect B regression)', () => {
+    // EEXIST is contention unconditionally on every platform, so the (synchronous,
+    // disk-touching) existence check must never even be invoked for it — otherwise every
+    // ordinary poll of every lock wait, on every platform, pays a stat() it doesn't need.
+    let called = false;
+    const lockFileExists = () => {
+      called = true;
+      return false;
+    };
+    expect(isLockContentionError('EEXIST', 'win32', lockFileExists)).toBe(true);
+    expect(isLockContentionError('EEXIST', 'linux', lockFileExists)).toBe(true);
+    expect(called).toBe(false);
+  });
+
+  it('does not consult lockFileExists for a non-win32, non-EEXIST code', () => {
+    let called = false;
+    const lockFileExists = () => {
+      called = true;
+      return true;
+    };
+    expect(isLockContentionError('EPERM', 'linux', lockFileExists)).toBe(false);
+    expect(called).toBe(false);
+  });
+
+  it('does consult lockFileExists on the win32 EPERM/EACCES path', () => {
+    let called = false;
+    const lockFileExists = () => {
+      called = true;
+      return true;
+    };
+    expect(isLockContentionError('EPERM', 'win32', lockFileExists)).toBe(true);
+    expect(called).toBe(true);
+  });
+});
+
+describe('win32 delete-pending retry decision (defect A)', () => {
+  // The real retry lives inside tryAcquire, which is not exported (it talks to the filesystem
+  // directly), and the win32 branch cannot execute on this Linux machine anyway. What's
+  // unit-testable everywhere is the *decision* tryAcquire makes: given a first-attempt outcome,
+  // does it retry once before rethrowing, and does a retry that succeeds (or finds contention)
+  // suppress the original error? This mirrors that decision in isolation.
+  function decide(
+    platform: string,
+    firstCode: string | undefined,
+    firstLockFileExists: boolean,
+    retryOutcome: 'acquired' | 'contended' | 'permission-failure',
+  ): 'acquired' | 'contended' | 'rethrow-first' | 'rethrow-retry' {
+    if (isLockContentionError(firstCode, platform, () => firstLockFileExists)) return 'contended';
+    const isPermissionCode = firstCode === 'EPERM' || firstCode === 'EACCES';
+    if (platform !== 'win32' || !isPermissionCode) return 'rethrow-first';
+    // Retry once.
+    if (retryOutcome === 'acquired') return 'acquired';
+    if (retryOutcome === 'contended') return 'contended';
+    return 'rethrow-retry';
+  }
+
+  it('retries once when the lock file was absent at the first EPERM/EACCES, and succeeds if the delete-pending race has resolved', () => {
+    expect(decide('win32', 'EPERM', false, 'acquired')).toBe('acquired');
+    expect(decide('win32', 'EACCES', false, 'contended')).toBe('contended');
+  });
+
+  it('still rethrows when the retry also fails with a permission code and the file is still absent', () => {
+    expect(decide('win32', 'EPERM', false, 'permission-failure')).toBe('rethrow-retry');
+  });
+
+  it('never retries off win32', () => {
+    expect(decide('linux', 'EPERM', false, 'acquired')).toBe('rethrow-first');
+    expect(decide('darwin', 'EACCES', false, 'acquired')).toBe('rethrow-first');
+  });
+
+  it('never retries a non-permission code', () => {
+    expect(decide('win32', 'ENOSPC', false, 'acquired')).toBe('rethrow-first');
   });
 });

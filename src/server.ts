@@ -26,6 +26,7 @@ import { registerAddCitation } from './tools/addCitation.js';
 import { registerListReferences } from './tools/listReferences.js';
 import { registerCheckCitations } from './tools/checkCitations.js';
 import { registerServerInfo } from './tools/serverInfo.js';
+import { registerAddWritingConvention } from './tools/addWritingConvention.js';
 import { registerListSkills } from './tools/listSkills.js';
 import { registerDoctor } from './tools/doctor.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
@@ -52,8 +53,9 @@ export function createServer(
   writingGuide?: string,
   concurrencyGuide?: string,
   skills: Skill[] = [],
+  writingGuideHasExtra = false,
 ): McpServer {
-  const instructions = buildInstructions(writingGuide, concurrencyGuide);
+  const instructions = buildInstructions(writingGuide, concurrencyGuide, writingGuideHasExtra);
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
@@ -88,6 +90,7 @@ export function createServer(
   registerListReferences(server, ctx);
   registerCheckCitations(server, ctx);
   registerServerInfo(server, ctx);
+  registerAddWritingConvention(server, ctx);
   registerListSkills(server, skills);
   registerDoctor(server, ctx);
 
