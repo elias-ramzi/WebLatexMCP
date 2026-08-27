@@ -528,6 +528,39 @@ describe('server_info', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('includes the conventions count in the text even when the guide did not load', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-server-info-guide-notloaded-'));
+    const guidePath = path.join(dir, 'conventions.md');
+    try {
+      await writeFile(guidePath, '- rule one\n- rule two\n', 'utf8');
+
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          workspaceIsLocal: false,
+          compiler: 'latexmk',
+          extraWritingGuidePath: guidePath,
+          extraWritingGuideLoaded: false,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const result = await client.callTool({ name: 'server_info', arguments: {} });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.writingGuideExtraRuleCount).toBe(2);
+      const text = (result.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('NOT loaded');
+      expect(text).toContain('2 conventions');
+
+      await client.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('doctor', () => {

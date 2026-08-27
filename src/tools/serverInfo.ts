@@ -112,8 +112,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             : '';
         writingGuideLine = info.writingGuideExtraLoaded
           ? `writing guide (project-specific): ${info.writingGuideExtraPath} — loaded${countClause}\n`
-          : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT loaded; these ` +
-            'conventions are not in effect\n';
+          : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT ` +
+            `loaded${countClause}; these conventions are not in effect\n`;
       }
       const text =
         `web-latex-mcp v${info.version}\n` +

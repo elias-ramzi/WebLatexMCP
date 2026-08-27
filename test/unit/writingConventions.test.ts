@@ -256,4 +256,29 @@ describe('countWritingConventions', () => {
     expect(contents).toContain('- - a rule that itself starts with a bullet');
     await expect(countWritingConventions(target)).resolves.toBe(1);
   });
+
+  it('counts hand-written "*" and "+" top-level bullets, not just "-"', async () => {
+    await writeFile(target, '* star bullet\n+ plus bullet\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('does not count an indented bullet as top-level', async () => {
+    await writeFile(target, '- top level\n  - x\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('does not count bullets inside a fenced code block', async () => {
+    await writeFile(target, '- real rule\n```\n- a\n- b\n```\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('does not count a spaced thematic break as a rule', async () => {
+    await writeFile(target, '- real rule\n\n* * *\n\n- - -\n\n- another rule\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('does not count bullets inside a fence indented by up to three spaces', async () => {
+    await writeFile(target, '- real rule\n   ```\n- a\n- b\n   ```\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
 });

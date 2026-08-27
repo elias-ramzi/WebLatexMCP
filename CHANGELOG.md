@@ -33,7 +33,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   refusing otherwise with an actionable error — mirroring the `.bib` guard's shape, but for the opposite
   reason: the appended rule originates from the model, not a trusted source, and it is the one write in
   the server that lands outside every project sandbox and into every future session's instructions, so
-  the gate stands in for the user's explicit acknowledgement. `server_info` also now reports
+  the gate stands in for the user's explicit acknowledgement. When no guide is configured at all, the
+  unconfigured error wins outright — there is nothing to confirm writing to a destination that doesn't
+  exist, so no confirmation round trip precedes it. `server_info` also now reports
   `writingGuideExtraRuleCount`, a live count of the top-level bullets currently in that file (including
   any the user wrote by hand) — read fresh on every call, so unlike the loaded instructions and the
   `guide://latex/writing-guide` resource (both fixed at startup) it reflects a rule appended earlier in

@@ -146,9 +146,19 @@ export function guideEditBlockedMessage(targetPath: string): string {
  * so at the call site (`server_info`'s schema `.describe()`), not just here, so a caller doesn't
  * mistake this for "rules the server itself appended".
  *
- * A top-level bullet is a line matching `/^- /` — no leading whitespace. `formatBullet` writes
- * every rule's first line at column 0 and indents continuation lines by two spaces, so anchoring
- * at column 0 counts one multi-line rule once, not once per line.
+ * A top-level bullet is a line matching `/^[-*+][ \t]/` — no leading whitespace, and any of the
+ * three CommonMark bullet markers (`-`, `*`, `+`) followed by a space or a tab. `formatBullet`
+ * always writes `-` followed by a space, but a user hand-editing the file is free to use `*` or
+ * `+`, or to separate the marker from the text with a tab — all valid top-level CommonMark
+ * bullets — and those must count too. Anchoring at column 0 counts one multi-line rule once, not
+ * once per line (continuation lines are indented by `formatBullet`), and still excludes a rule
+ * whose own text starts with "- " (appended as `- - text`, itself only one match at column 0).
+ *
+ * Lines inside a fenced code block (delimited by a line starting with ` ``` `, indented by at
+ * most the three spaces CommonMark allows) are skipped even when they look like a bullet: a
+ * hand-written region quoting `- a\n- b` inside a fence is example text, not a rule, and counting
+ * it would over-report. A line of only markers and whitespace (a spaced thematic break such as
+ * `* * *` or `- - -`) is not counted either — it matches the bullet shape but carries no rule.
  *
  * Never throws: an unconfigured path, a missing file, or a permission error all resolve to
  * `undefined` rather than failing the call, because `server_info` is a diagnostic tool a caller
@@ -167,12 +177,18 @@ export async function countWritingConventions(
   }
   const lines = contents.split(/\r\n|\n/);
   let count = 0;
+  let inFence = false;
   for (const line of lines) {
-    // Belt-and-braces: INTRO_NOTE starts with "Rules below are added by", so the /^- / test
+    if (/^ {0,3}```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    // Belt-and-braces: INTRO_NOTE starts with "Rules below are added by", so the bullet test
     // below already rejects it on its own — this branch cannot currently fire. Kept in case
     // INTRO_NOTE's wording ever changes to start with "- ".
     if (line === INTRO_NOTE) continue;
-    if (/^- /.test(line)) count += 1;
+    if (/^[-*+][ \t]/.test(line) && !/^[-*+\s]+$/.test(line)) count += 1;
   }
   return count;
 }
