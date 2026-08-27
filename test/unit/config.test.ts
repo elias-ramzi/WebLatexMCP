@@ -306,16 +306,26 @@ describe('parseExtraWritingGuide', () => {
     expect(spy).toHaveBeenCalled();
   });
 
-  it('never returns a non-absolute path from a file:// value', () => {
-    // Defense in depth: even if a future URL form parses "successfully", the result must be
-    // absolute or it is rejected the same way.
+  it('rejects "file://" (resolves to the filesystem root) rather than returning the root', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const result = parseExtraWritingGuide('file://', cwd);
-    if (result.path !== undefined) {
-      expect(path.isAbsolute(result.path)).toBe(true);
-    } else {
-      expect(spy).toHaveBeenCalled();
-    }
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects "file:///" (resolves to the filesystem root) rather than returning the root', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file:///', cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects a bare filesystem root on the plain-path branch rather than returning it', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const root = path.parse(path.resolve('/')).root;
+    const result = parseExtraWritingGuide(root, cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
   });
 });
 

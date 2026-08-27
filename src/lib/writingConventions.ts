@@ -73,12 +73,36 @@ export async function appendWritingConvention(
   );
 }
 
-/** Format a rule as a markdown bullet; continuation lines of a multi-line rule stay indented. */
+/**
+ * Format a rule as a markdown bullet; continuation lines of a multi-line rule stay indented.
+ *
+ * Every line is escaped (`escapeLeadingBlockMarker`) before the bullet/indent prefix is added:
+ * a rule's first line is already shielded from being parsed as a heading or blockquote by the
+ * `- ` bullet marker in front of it, but a *continuation* line only gets a 2-space indent, and
+ * CommonMark still parses an ATX heading (`#`) or blockquote (`>`) with up to 3 leading spaces.
+ * Composed guide text is spliced under `EXTRA_GUIDE_HEADING` (an H2) and read by a heading-aware
+ * consumer that treats that heading as delimiting the "Project-specific conventions" section —
+ * an unescaped `##`/`>` from rule text could open a heading or blockquote that silently ends (or
+ * restructures) that section, so a rule must never be able to do that on any of its lines.
+ */
 function formatBullet(rule: string): string {
-  const lines = rule.split('\n');
+  const lines = rule.split('\n').map(escapeLeadingBlockMarker);
   const first = lines[0] ?? '';
   const rest = lines.slice(1).map((line) => `  ${line}`);
   return [`- ${first}`, ...rest].join('\n') + '\n';
+}
+
+/**
+ * Neutralise a leading heading (`#`) or blockquote (`>`) marker on one line by escaping it with
+ * a backslash — which CommonMark renders as the literal character — rather than rejecting the
+ * rule outright. Escaping (not rejecting) is chosen so a rule that merely *starts* with one of
+ * these characters (e.g. quoting a hashtag, or starting a sentence with "> " as an arrow) is
+ * still recorded, byte-preserved apart from the one inserted backslash; only the character that
+ * would open a new block is touched, up to 3 leading spaces of indent (CommonMark still parses a
+ * heading/blockquote through that much indent) plus the marker itself.
+ */
+function escapeLeadingBlockMarker(line: string): string {
+  return line.replace(/^( {0,3})([#>])/, '$1\\$2');
 }
 
 async function exists(p: string): Promise<boolean> {

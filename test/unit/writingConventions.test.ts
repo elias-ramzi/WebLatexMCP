@@ -75,6 +75,61 @@ describe('appendWritingConvention', () => {
     expect(contents).toContain('- first line\n  second line\n  third line');
   });
 
+  it('never lets a rule beginning with a heading marker inject a heading line', async () => {
+    const original = await (async () => {
+      await appendWritingConvention(target, 'placeholder');
+      return readFile(target, 'utf8');
+    })();
+
+    await appendWritingConvention(target, '## Something that looks like a heading');
+    const after = await readFile(target, 'utf8');
+    expect(after.startsWith(original)).toBe(true);
+    // The leading `#` is escaped with a backslash so no heading-aware reader can parse the
+    // bullet's first line as an ATX heading — the `- ` bullet prefix alone does NOT neutralise
+    // it (a heading-aware parser still recognises `- ## text` as list-item text starting with a
+    // literal heading marker in some renderers, and this asserts the actual escape, not an
+    // accident of the bullet prefix).
+    expect(after).toContain('- \\## Something that looks like a heading');
+    // No line anywhere in the file may match an ATX heading at or above EXTRA_GUIDE_HEADING's
+    // level (H1-H6) — that would silently end the "Project-specific conventions" section for a
+    // heading-aware reader, taking every rule appended after it outside the precedence sentence.
+    for (const line of after.split('\n')) {
+      expect(line).not.toMatch(/^#{1,6}\s/);
+    }
+    // The visible text survives — only the leading marker is neutralised.
+    expect(after).toContain('Something that looks like a heading');
+  });
+
+  it('never lets a rule beginning with a blockquote marker inject a blockquote line', async () => {
+    const original = await (async () => {
+      await appendWritingConvention(target, 'placeholder');
+      return readFile(target, 'utf8');
+    })();
+
+    await appendWritingConvention(target, '> Something that looks like a quote');
+    const after = await readFile(target, 'utf8');
+    expect(after.startsWith(original)).toBe(true);
+    // The leading `>` is escaped with a backslash so the bullet's first line cannot be parsed as
+    // a blockquote — asserting the escape itself, not just the absence of a bare `>` line (which
+    // the `- ` bullet prefix alone would already guarantee).
+    expect(after).toContain('- \\> Something that looks like a quote');
+    for (const line of after.split('\n')) {
+      expect(line).not.toMatch(/^\s*>/);
+    }
+    expect(after).toContain('Something that looks like a quote');
+  });
+
+  it('neutralises a heading marker on a continuation line too, not just the first line', async () => {
+    await appendWritingConvention(target, 'first line\n## second line looks like a heading');
+    const after = await readFile(target, 'utf8');
+    // CommonMark allows up to 3 leading spaces before the `#` and still parses an ATX heading,
+    // so the 2-space list-continuation indent alone does not neutralise it.
+    for (const line of after.split('\n')) {
+      expect(line).not.toMatch(/^\s{0,3}#{1,6}\s/);
+    }
+    expect(after).toContain('second line looks like a heading');
+  });
+
   it('throws WritingConventionsUnconfiguredError with both spellings when path is undefined', async () => {
     await expect(appendWritingConvention(undefined, 'a rule')).rejects.toThrow(
       WritingConventionsUnconfiguredError,

@@ -146,6 +146,13 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 
+  it('registers the add_writing_convention tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('add_writing_convention');
+    await client.close();
+  });
+
   it('registers the register_project tool', async () => {
     const client = await connect();
     const { tools } = await client.listTools();

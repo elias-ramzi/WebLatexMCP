@@ -188,9 +188,23 @@ export function parseExtraWritingGuide(raw: string | undefined, cwd: string): { 
       warnMalformedWritingGuideExtra(value, `resolved to a non-absolute path "${resolved}"`);
       return {};
     }
+    if (isFilesystemRoot(resolved)) {
+      warnMalformedWritingGuideExtra(value, `resolved to the filesystem root "${resolved}"`);
+      return {};
+    }
     return { path: resolved };
   }
-  return { path: path.resolve(cwd, expandHome(value)) };
+  const plainResolved = path.resolve(cwd, expandHome(value));
+  if (isFilesystemRoot(plainResolved)) {
+    warnMalformedWritingGuideExtra(value, `resolved to the filesystem root "${plainResolved}"`);
+    return {};
+  }
+  return { path: plainResolved };
+}
+
+/** True when `resolved` is a filesystem root (POSIX `/`, or a Windows drive root like `C:\`). */
+function isFilesystemRoot(resolved: string): boolean {
+  return path.dirname(resolved) === resolved || path.basename(resolved) === '';
 }
 
 function warnMalformedWritingGuideExtra(raw: string, reason: string): void {

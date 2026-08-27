@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { open, mkdir, readFile, rm, stat, utimes } from 'node:fs/promises';
 
 /**
@@ -38,11 +39,15 @@ const POLL_MS = 50;
 /** Thrown when the lock could not be taken before `timeoutMs` elapsed. */
 export class LockTimeoutError extends Error {
   constructor(lockPath: string, holder: LockFileContents | null) {
-    const who = holder?.owner ? `session "${holder.owner}"` : `pid ${holder?.pid ?? '?'}`;
-    super(
-      `Timed out waiting for the lock on ${path.basename(path.dirname(lockPath))} — held by ${who} ` +
-        `since ${holder?.acquiredAt ?? 'an unknown time'}. Another session is mid-operation; retry shortly.`,
-    );
+    const name = path.basename(path.dirname(lockPath));
+    const message = holder
+      ? `Timed out waiting for the lock on ${name} — held by ${
+          holder.owner ? `session "${holder.owner}"` : `pid ${holder.pid}`
+        } since ${holder.acquiredAt}. Another session is mid-operation; retry shortly.`
+      : `Timed out waiting for the lock on ${name} — no holder was recorded. The lock file may be ` +
+        `unwritable (permissions, a read-only volume, an antivirus hold) or was removed after this ` +
+        `wait began.`;
+    super(message);
     this.name = 'LockTimeoutError';
   }
 }
@@ -76,8 +81,41 @@ async function readHolder(lockPath: string): Promise<LockFileContents | null> {
   }
 }
 
-/** Try to take the lock once. Returns false if someone else currently holds it. */
-async function tryAcquire(lockPath: string, owner: string | undefined): Promise<boolean> {
+/**
+ * Whether an open() failure with `code` should be treated as ordinary contention (another holder
+ * has the lock) rather than a real failure to surface. Exported so the decision is unit-testable
+ * on every platform, since the win32-only EPERM/EACCES case cannot actually execute on Linux/macOS
+ * CI runners.
+ *
+ * On Windows a delete-pending file — the previous holder called `rm` but its handle is not yet
+ * fully closed — is reported as EPERM/EACCES rather than EEXIST. That is contention, not a real
+ * failure, so treat it as "held" and let the caller poll. But that is only true while the lock
+ * file is still visible on disk: if it is not there, there is nothing pending deletion, and
+ * EPERM/EACCES means a genuine permission problem (read-only volume, restrictive ACL, an
+ * antivirus hold) that will never resolve itself — surface it immediately rather than burning the
+ * full timeout on a wait that can never succeed.
+ *
+ * `lockFileExists` is a thunk rather than a plain boolean so the (synchronous, disk-touching)
+ * `existsSync` check is paid only on the win32 EPERM/EACCES path — never on the far more common
+ * EEXIST contention path, which every platform hits on every poll of every lock wait.
+ */
+export function isLockContentionError(
+  code: string | undefined,
+  platform: string,
+  lockFileExists: () => boolean,
+): boolean {
+  if (code === 'EEXIST') return true;
+  if (platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+    return lockFileExists();
+  }
+  return false;
+}
+
+/** The outcome of one raw attempt to create the lock file. */
+type OpenAttempt = 'acquired' | 'contended' | NodeJS.ErrnoException;
+
+/** Attempt to create the lock file once, with no retry. */
+async function attemptOpen(lockPath: string, owner: string | undefined): Promise<OpenAttempt> {
   try {
     const handle = await open(lockPath, 'wx');
     const contents: LockFileContents = {
@@ -90,17 +128,35 @@ async function tryAcquire(lockPath: string, owner: string | undefined): Promise<
     } finally {
       await handle.close();
     }
-    return true;
+    return 'acquired';
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST') return false;
-    // Windows reports a *delete-pending* file — the previous holder called `rm` but its handle is
-    // not yet fully closed — as EPERM/EACCES rather than EEXIST. That is contention, not a real
-    // failure, so treat it as "held" and let the caller poll; if it truly is a permission problem
-    // the wait ends in a LockTimeoutError rather than a spurious hard failure mid-operation.
-    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) return false;
-    throw err;
+    if (isLockContentionError(code, process.platform, () => existsSync(lockPath))) {
+      return 'contended';
+    }
+    return err as NodeJS.ErrnoException;
   }
+}
+
+/** Try to take the lock once. Returns false if someone else currently holds it. */
+async function tryAcquire(lockPath: string, owner: string | undefined): Promise<boolean> {
+  const first = await attemptOpen(lockPath, owner);
+  if (first === 'acquired') return true;
+  if (first === 'contended') return false;
+
+  // A win32 EPERM/EACCES with no lock file on disk is judged a genuine failure by
+  // isLockContentionError — but that judgement can be a TOCTOU false negative: the previous
+  // holder's delete may complete in the gap between our failed open() and the existsSync check
+  // inside it, so "no lock file" at that instant doesn't mean the open() itself wasn't racing a
+  // delete-pending handle. Re-attempt once before treating it as real: if the retry succeeds or
+  // finds contention, this was the race; only a second permission failure is surfaced.
+  if (process.platform === 'win32' && (first.code === 'EPERM' || first.code === 'EACCES')) {
+    const retry = await attemptOpen(lockPath, owner);
+    if (retry === 'acquired') return true;
+    if (retry === 'contended') return false;
+    throw retry;
+  }
+  throw first;
 }
 
 /**

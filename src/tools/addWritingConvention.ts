@@ -9,10 +9,12 @@ const inputSchema = {
   rule: z
     .string()
     .min(1)
+    .max(2000)
     .describe(
       'One self-contained writing convention, phrased as an instruction (e.g. "Always write ' +
         "'lidar', never 'LiDAR'.\"). Appended as a bullet to the project's extra writing " +
-        'guide file — do not include multiple unrelated rules in one call.',
+        'guide file — do not include multiple unrelated rules in one call. Max 2000 characters ' +
+        '(a single convention, not a document).',
     ),
 };
 

@@ -268,10 +268,16 @@ Code, or the equivalent per-project Desktop config.
 **Worked example.** A paper's workspace sets:
 
 ```json
-{ "env": { "WEB_LATEX_MCP_WRITING_GUIDE_EXTRA": "./conventions.md" } }
+{ "env": { "WEB_LATEX_MCP_WRITING_GUIDE_EXTRA": "/home/you/papers/lidar-survey/conventions.md" } }
 ```
 
-and `conventions.md` (relative to the launch dir) holds:
+Prefer an **absolute** path (or a `file:///...` URL) here. A relative value is resolved against the
+**server process's launch directory**, not against the config file — which is the workspace in Claude
+Code, but is the app bundle or `/` under Claude Desktop, where `./conventions.md` would silently become
+`/conventions.md` and never load. If a relative path does not take, `server_info` reports the resolved
+path and whether it loaded.
+
+That `conventions.md` holds:
 
 ```markdown
 - Always write "lidar", never "LiDAR".
