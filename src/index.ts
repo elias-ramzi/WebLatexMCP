@@ -5,7 +5,11 @@ import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createContext } from './context.js';
 import { createServer } from './server.js';
 import { ProjectRegistry } from './services/projectRegistry.js';
-import { loadWritingGuide } from './lib/writingGuide.js';
+import {
+  loadWritingGuide,
+  loadExtraWritingGuide,
+  composeWritingGuide,
+} from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
 import { loadSkills } from './lib/skills.js';
 import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
@@ -35,10 +39,16 @@ async function main(): Promise<void> {
   const identity = loadIdentity(process.env);
   const registry = new ProjectRegistry(config.workspaceRoot);
   const ctx = createContext(config, credentials, identity, registry);
-  const writingGuide = await loadWritingGuide(process.env);
+  const baseWritingGuide = await loadWritingGuide(process.env);
+  const extraWritingGuide = await loadExtraWritingGuide(config.extraWritingGuidePath);
+  config.extraWritingGuideLoaded = extraWritingGuide !== undefined;
+  const { text: writingGuide, hasExtra: writingGuideHasExtra } = composeWritingGuide(
+    baseWritingGuide,
+    extraWritingGuide,
+  );
   const concurrencyGuide = await loadConcurrencyGuide(process.env);
   const skills = await loadSkills(process.env);
-  const server = createServer(ctx, writingGuide, concurrencyGuide, skills);
+  const server = createServer(ctx, writingGuide, concurrencyGuide, skills, writingGuideHasExtra);
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
@@ -69,6 +79,7 @@ async function main(): Promise<void> {
   console.error(
     `[web-latex-mcp] server ready on stdio as session "${config.sessionId}"` +
       `${writingGuide ? ' (writing guide loaded)' : ''}` +
+      `${config.extraWritingGuideLoaded ? ' (extra writing guide loaded)' : ''}` +
       `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}` +
       `${skills.length > 0 ? ` (${skills.length} skills as prompts)` : ''}`,
   );

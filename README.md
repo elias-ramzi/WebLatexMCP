@@ -127,6 +127,26 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 [macOS](docs/install/macos.md) / [Linux](docs/install/linux.md) / [Windows](docs/install/windows.md) ·
 [Gemini](docs/install/gemini.md) · [Copilot](docs/install/copilot.md).
 
+### Project-specific writing conventions
+
+The bundled [writing guide](docs/writing-guide.md) is general — for a per-paper rule ("always write
+lidar, never LiDAR", a house citation style), set `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA` to a markdown file
+(a plain path, or a `file:///...` URL, so you can paste a file link straight from Claude Desktop). It is
+**additional**, not a replacement: it is appended after the base guide under a "Project-specific
+conventions" heading, and wins where the two disagree. (Contrast `WEB_LATEX_MCP_WRITING_GUIDE`, which
+_replaces_ the base guide outright — setting both is legal and means your replacement base plus your
+extra on top.)
+
+Point it at a per-paper `conventions.md` and Claude's `add_writing_convention` tool can append a rule to
+it for you — "always write lidar, never LiDAR" becomes a bullet the model follows in later sessions
+(new sessions only: MCP `instructions` are fixed at connect time, so a rule added mid-session takes
+effect the next time you connect). `server_info` reports the configured path and whether it actually
+loaded, so a typo in the path doesn't silently drop your conventions with nothing to tell you.
+
+Scope the variable per project with a per-workspace MCP config `env` block — a `.mcp.json` in Claude
+Code, or the equivalent in the Desktop config file — since the env var is per server process, not per
+project.
+
 ## What you can do
 
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
@@ -136,6 +156,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 - **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
+- **Remember a convention** — `add_writing_convention` appends one rule as a bullet to your configured project-specific writing guide (see [above](#project-specific-writing-conventions)), creating the file on first use. It takes no path — the destination is always the configured file — and the rule takes effect starting with your next session.
 
 See the [full tool reference](docs/tools.md) for every parameter, the safety guards, and how conflicts,
 shell-escape, and parallel sessions work.

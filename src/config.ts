@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { readProjectRegistry } from './services/projectRegistry.js';
@@ -185,6 +186,70 @@ export function parseRewriteMode(raw: string | undefined): {
 }
 
 /**
+ * Resolve `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA` — a path or a `file://` URL to an ADDITIONAL
+ * writing guide, appended to (never replacing) the base one.
+ *
+ * A `file:` value MUST use the authority form `file://...` — a bare `file:conventions.md` (no
+ * `//`) is not a relative-path shorthand, it's a URL whose path component is `conventions.md`,
+ * which `fileURLToPath` resolves to `/conventions.md` (the filesystem root) — and on Windows to
+ * the current drive's root. So: only `/^file:\/\//i` is treated as a URL; anything else starting
+ * with `file:` but lacking `//` is malformed and must NOT fall through to the plain-path branch
+ * either (that would silently turn it into `<cwd>/file:conventions.md`). Malformed input here is
+ * never fatal — an optional overlay must not be able to take the whole server down — so this logs
+ * a loud `[web-latex-mcp]` line to stderr (never stdout: that's the JSON-RPC channel) and returns
+ * the same "nothing named" result as unset, for `loadConfig` to pass along unchanged.
+ */
+export function parseExtraWritingGuide(raw: string | undefined, cwd: string): { path?: string } {
+  const value = raw?.trim();
+  if (!value) return {};
+  if (/^file:/i.test(value)) {
+    if (!/^file:\/\//i.test(value)) {
+      warnMalformedWritingGuideExtra(
+        value,
+        'a file: value must use the authority form file:// (e.g. file:///path/to/conventions.md), not a bare file:path',
+      );
+      return {};
+    }
+    let resolved: string;
+    try {
+      resolved = fileURLToPath(new URL(value));
+    } catch (err) {
+      warnMalformedWritingGuideExtra(value, `not a usable file:// URL: ${(err as Error).message}`);
+      return {};
+    }
+    if (!path.isAbsolute(resolved)) {
+      warnMalformedWritingGuideExtra(value, `resolved to a non-absolute path "${resolved}"`);
+      return {};
+    }
+    if (isFilesystemRoot(resolved)) {
+      warnMalformedWritingGuideExtra(value, `resolved to the filesystem root "${resolved}"`);
+      return {};
+    }
+    return { path: resolved };
+  }
+  const plainResolved = path.resolve(cwd, expandHome(value));
+  if (isFilesystemRoot(plainResolved)) {
+    warnMalformedWritingGuideExtra(value, `resolved to the filesystem root "${plainResolved}"`);
+    return {};
+  }
+  return { path: plainResolved };
+}
+
+/** True when `resolved` is a filesystem root (POSIX `/`, or a Windows drive root like `C:\`). */
+function isFilesystemRoot(resolved: string): boolean {
+  return path.dirname(resolved) === resolved || path.basename(resolved) === '';
+}
+
+function warnMalformedWritingGuideExtra(raw: string, reason: string): void {
+  console.error(
+    `[web-latex-mcp] WEB_LATEX_MCP_WRITING_GUIDE_EXTRA "${raw}" is not usable: ${reason}. ` +
+      'Accepted forms: a plain path (e.g. /path/to/conventions.md) or a file:// URL with the ' +
+      'authority form (e.g. file:///path/to/conventions.md). Ignoring it; no extra writing ' +
+      'guide will be loaded.',
+  );
+}
+
+/**
  * Build the server configuration from environment variables. Reads the filesystem only to
  * detect whether the launch dir is a git repo (for the workspace default); inject `insideRepo`
  * to keep unit tests hermetic.
@@ -225,6 +290,10 @@ export function loadConfig(
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
   );
+  const { path: extraWritingGuidePath } = parseExtraWritingGuide(
+    env.WEB_LATEX_MCP_WRITING_GUIDE_EXTRA,
+    cwd,
+  );
 
   return {
     workspaceRoot,
@@ -238,6 +307,7 @@ export function loadConfig(
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,
+    extraWritingGuidePath,
   };
 }
 

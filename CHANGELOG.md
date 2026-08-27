@@ -31,6 +31,26 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   and `arxiv-clean-project` already strips comments before submission. `list_projects` and `server_info`
   report the effective/default mode so it is never a hidden setting.
 
+- **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
+  existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
+  swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,
+  never LiDAR") forced copying the whole base guide just to add one line, and any later upstream change
+  to that base guide had to be hand-merged back in. The new var names an _additional_ guide (a plain path
+  or a `file:///...` URL, so Claude Desktop users can paste a file link) that is composed in **after** the
+  base guide, under a "Project-specific conventions" heading, and takes precedence where the two
+  contradict — the base guide stays the default and the project layers its exceptions on top. Setting
+  both is legal: your replacement base plus your extra on top.
+  `add_writing_convention` takes a single `rule` string and appends it as a bullet to that configured
+  file, creating it on first use, behind the same cross-process file lock every mutating tool uses. It
+  takes no path — the destination is always the one file the server was configured with, never one the
+  model names — and it is strictly append-only: it cannot rewrite or drop a line a human already wrote
+  there. The rule takes effect starting with the **next** session, not the current one, because MCP
+  `instructions` are fixed at connect time; no live-refresh machinery was built for this, since a rule
+  that changed what "the current session already agreed to" mid-conversation is a stranger source of
+  confusion than a one-session delay. `server_info` now reports the configured path and whether the file
+  actually loaded, because a typo'd path would otherwise mean the conventions are silently ignored
+  forever with no way to notice.
+
 - **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
   `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels
   where the model could read them, so every visual question had to be answered outside the server — in the
@@ -78,6 +98,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   more than one file to see (an acronym defined twice, a float never referenced) and so cannot be delegated to a
   single-file agent, and how the fan-out is batched. Contributor tooling under `.claude/` throughout: no tool, no
   runtime behaviour, and nothing in `src/` changed.
+
+- **A `/review` command** — the review half of `review-round`, driven by hand instead of by a
+  workflow script, so it costs a session rather than a fleet and reports before it touches
+  anything. It scopes the target itself (a PR number through `gh`, a branch, or the working tree),
+  resolving the base as the PR's own base and otherwise `origin/dev` — the integration branch —
+  rather than `main`, and groups the touched files by the risk they carry here: the
+  `src/services`/`src/lib` core, the `src/tools` + `src/server.ts` surface, the `context.ts` /
+  `config.ts` wiring, skills and prompts, tests, docs. Then it runs the one gate this repo has
+  (`typecheck` + `lint` + `format:check` + `test`) **itself** before delegating, because a green a
+  subagent reports is not evidence, and it reads the skip count rather than the pass line — the
+  TeX smokes auto-skip wherever `latexmk` is absent, so a green `npm test` over compile-adjacent
+  code is a vacuous pass, which is the failure mode the whole review exists to catch. The review
+  goes to the existing `plan-verifier` agent (there is no separate reviewer agent here, and one
+  more agent restating the same invariants is one more copy to drift), with the stated intent as
+  the spec and the CLAUDE.md guards the diff comes near named outright. Report-only by default:
+  the implement/verify loop runs only under `--fix`, capped at three rounds, and a finding that is
+  really the author's call — a design disagreement, a scope question — is reported and never
+  "fixed". Posting the verdict to the PR and pushing the fixes are two separate steps, each gated
+  on an explicit go, which is the deliberate difference from the workflow's unattended commit.
+  Adapted from a sibling repo: the shape carried over, every rule was rewritten for this one.
+  Contributor tooling under `.claude/`; no tool, no runtime behaviour, nothing in `src/`.
 
 - **A `review-round` workflow and the two agents it drives** — contributor tooling under
   `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
@@ -135,6 +176,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   appending to the last released section out of habit, which touching the file does not catch.
 
 ### Changed
+
+- **A regression test that passes before its fix is now a finding, not a footnote.** The `implementer`
+  agent already had to watch each new test fail on the pre-fix code and report the result, and it did —
+  during the review of #52 it said plainly that two of three new tests passed pre-fix, because the `- `
+  bullet prefix in front of them already satisfied their regexes. Nothing said what to _do_ with that
+  disclosure, so it was read as a status line and passed upward; the vacuous tests were caught two steps
+  later by `plan-verifier`. The agent's brief now closes that loop — such a test is rewritten until it
+  fails for the right reason, or deleted, and never reported as covered — and `/review` step 3 treats an
+  implementer's "passed pre-fix" as a confirmed finding to send back in the same round. A test that
+  passes before the fix cannot catch the bug returning, and is also evidence the fix may be aimed at the
+  wrong thing, which is the easier signal to skim past. No extra verification round was added: the
+  existing one worked, catching both these tests and a TOCTOU race that a fix had itself introduced.
 
 - **The `session-feedback` skill saves its report itself when there is no way to file it.** The report
   was always optional to write, which is right when `gh` can file the findings and wrong when it

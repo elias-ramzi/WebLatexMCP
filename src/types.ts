@@ -136,6 +136,17 @@ export interface ServerConfig {
    * only way a reporting tool can avoid presenting the default as the user's own configuration.
    */
   rewriteModeExplicit?: boolean;
+  /**
+   * Absolute path to an ADDITIONAL writing guide, appended to (never replacing) the base one.
+   * From `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, which accepts a path or a `file://` URL.
+   */
+  extraWritingGuidePath?: string;
+  /**
+   * Set at startup once the file has been read: whether the extra guide actually loaded.
+   * `server_info` reports it, because a typo'd path otherwise means the model silently ignores
+   * the user's conventions with no signal.
+   */
+  extraWritingGuideLoaded?: boolean;
 }
 
 /** Where the `viewer` tool expects the PDF viewer to be opened. */

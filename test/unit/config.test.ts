@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
-import { loadConfig, parseRewriteMode } from '../../src/config.js';
+import { loadConfig, parseRewriteMode, parseExtraWritingGuide } from '../../src/config.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
 
@@ -297,5 +298,128 @@ describe('parseRewriteMode', () => {
       loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo)
         .rewriteModeExplicit,
     ).toBe(true);
+  });
+});
+
+describe('parseExtraWritingGuide', () => {
+  // Absolute paths are platform-shaped: on Windows `/work/paper` resolves onto the current
+  // drive, so the expectations are built from `path.resolve` rather than POSIX literals.
+  const cwd = path.resolve('/work/paper');
+  const absoluteGuide = path.resolve('/etc/conventions.md');
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('resolves a plain absolute path', () => {
+    const result = parseExtraWritingGuide(absoluteGuide, cwd);
+    expect(result).toEqual({ path: absoluteGuide });
+  });
+
+  it('resolves a relative path against cwd', () => {
+    const result = parseExtraWritingGuide('conventions.md', cwd);
+    expect(result).toEqual({ path: path.join(cwd, 'conventions.md') });
+  });
+
+  it('expands a leading ~', () => {
+    const result = parseExtraWritingGuide('~/conventions.md', cwd);
+    expect(result).toEqual({
+      path: path.join(os.homedir(), 'conventions.md'),
+    });
+  });
+
+  it('accepts a file:// URL and resolves to the same path as the plain-path case', () => {
+    const url = pathToFileURL(absoluteGuide).toString();
+    const result = parseExtraWritingGuide(url, cwd);
+    expect(result).toEqual({ path: absoluteGuide });
+  });
+
+  it('is unset when nothing was named', () => {
+    expect(parseExtraWritingGuide(undefined, cwd)).toEqual({});
+  });
+
+  it('treats a whitespace-only value identically to unset', () => {
+    expect(parseExtraWritingGuide('   ', cwd)).toEqual({});
+  });
+
+  it('does not throw on an invalid file:// URL, logs to stderr naming both spellings, and returns unset', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file://%', cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+    const message = spy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(message).toContain('WEB_LATEX_MCP_WRITING_GUIDE_EXTRA');
+    expect(message).toContain('file://%');
+    expect(message).toContain('file:///path/to/conventions.md');
+    expect(message).toContain('/path/to/conventions.md');
+  });
+
+  it('rejects a bare "file:conventions.md" (no authority) rather than writing to the filesystem root', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file:conventions.md', cwd);
+    expect(result).toEqual({});
+    // Must NOT fall through to the plain-path branch and become <cwd>/file:conventions.md.
+    expect(result.path).not.toBe(path.join(cwd, 'file:conventions.md'));
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects a bare "file:" (yields the filesystem root) rather than resolving to "/"', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file:', cwd);
+    expect(result).toEqual({});
+    expect(result.path).not.toBe('/');
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects "file:/single-slash" rather than resolving it to a filesystem root path', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file:/single-slash', cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects "file://" (resolves to the filesystem root) rather than returning the root', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file://', cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects "file:///" (resolves to the filesystem root) rather than returning the root', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = parseExtraWritingGuide('file:///', cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('rejects a bare filesystem root on the plain-path branch rather than returning it', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const root = path.parse(path.resolve('/')).root;
+    const result = parseExtraWritingGuide(root, cwd);
+    expect(result).toEqual({});
+    expect(spy).toHaveBeenCalled();
+  });
+});
+
+describe('loadConfig with a malformed WEB_LATEX_MCP_WRITING_GUIDE_EXTRA', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not throw (a bad optional overlay must not take the whole server down)', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() =>
+      loadConfig({ WEB_LATEX_MCP_WRITING_GUIDE_EXTRA: 'file:conventions.md' }, '/work/paper'),
+    ).not.toThrow();
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('leaves extraWritingGuidePath undefined, same as unset', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig(
+      { WEB_LATEX_MCP_WRITING_GUIDE_EXTRA: 'file:conventions.md' },
+      '/work/paper',
+    );
+    expect(cfg.extraWritingGuidePath).toBeUndefined();
   });
 });
