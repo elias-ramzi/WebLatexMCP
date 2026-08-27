@@ -287,6 +287,12 @@ Every session started in that workspace now gets the base writing guide plus thi
 winning if the two ever disagree. Use the `add_writing_convention` tool (see
 [tools.md](tools.md#tools)) to append new rules to this file from the chat instead of hand-editing it.
 
+To check how much has accumulated without opening the file, `server_info` reports
+`writingGuideExtraRuleCount` — a live count of the file's top-level bullets, read fresh on every call
+(so it also reflects a rule appended earlier in the same session, unlike the instructions text and the
+`guide://latex/writing-guide` resource, both fixed at startup). It counts bullets, not text, so use it
+to decide whether the file is worth opening for a full read, not as a substitute for reading it.
+
 ## Claude Desktop compatibility
 
 Some Claude Desktop builds **silently fail to dispatch tool calls** to an MCP server whose tools

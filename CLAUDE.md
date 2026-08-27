@@ -150,6 +150,22 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
+- **`add_writing_convention` is guarded too, for the opposite reason.** When no extra writing guide is
+  configured (`ctx.config.extraWritingGuidePath` unset), the unconfigured-guide error wins outright —
+  there is nothing to confirm writing to a destination that doesn't exist, so the tool goes straight to
+  `appendWritingConvention`'s actionable "set `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`" error, no
+  confirmation round trip. Only once a destination IS configured does it refuse
+  (`guideEditBlockedMessage`, `src/lib/writingConventions.ts`) unless `confirmGuideEdit: true` — keep
+  this. Where the `.bib` guard exists because entry text must never originate from the model, here the
+  appended rule originates **only** from the model (a caller-phrased convention), so the gate cannot be
+  "re-fetch from a trusted source" the way `add_citation` is; it is the user's acknowledgement instead.
+  This is also the one write in the whole server that lands outside every project sandbox: the target
+  file is loaded into the server's MCP `instructions`, and served over `guide://latex/writing-guide`, at
+  **every future startup**, so one unguarded call would persist model-authored text into every later
+  session's system prompt. The check is `!== true` in the tool layer (an optional boolean, not a
+  schema-level `z.literal(true)`), mirroring `confirmBibEdit`'s shape exactly; `appendWritingConvention`
+  itself stays unchanged and keeps writing only to `ctx.config.extraWritingGuidePath`, never a
+  caller-named path.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)

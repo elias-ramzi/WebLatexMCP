@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { getServerVersion } from '../lib/version.js';
 import { toPosix } from '../lib/paths.js';
+import { countWritingConventions } from '../lib/writingConventions.js';
 
 const outputSchema = {
   name: z.string(),
@@ -44,6 +45,17 @@ const outputSchema = {
         'writingGuideExtraPath is set. false means the conventions in that file are NOT in effect ' +
         'for this session — the path is wrong or the file is unreadable.',
     ),
+  writingGuideExtraRuleCount: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      'The number of top-level bullets currently in the extra writing guide file — including any ' +
+        'the user wrote by hand, not only rules add_writing_convention appended. Read live from ' +
+        "the file on every call, so it reflects a rule appended during THIS session; the server's " +
+        'MCP instructions and the guide://latex/writing-guide resource are both fixed at startup ' +
+        'and do not. Absent when no guide is configured or the file cannot be read.',
+    ),
 };
 
 export function registerServerInfo(server: McpServer, ctx: AppContext): void {
@@ -58,8 +70,11 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
         'there) plus whether a project-specific writing guide (WEB_LATEX_MCP_WRITING_GUIDE_EXTRA) is ' +
         'configured and, if so, whether it actually loaded — a typo in that path otherwise means the ' +
-        "user's conventions are silently ignored forever with nothing to tell them. Use this to " +
-        'confirm which version of the MCP server is running.',
+        "user's conventions are silently ignored forever with nothing to tell them — plus a live " +
+        'count of the bullets currently in that file (writingGuideExtraRuleCount), which reflects a ' +
+        'rule added during this session even though the loaded instructions and the ' +
+        'guide://latex/writing-guide resource are both fixed at startup. Use this to confirm which ' +
+        'version of the MCP server is running.',
       inputSchema: {},
       outputSchema,
     },
@@ -77,6 +92,7 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         writingGuideExtraLoaded: ctx.config.extraWritingGuidePath
           ? (ctx.config.extraWritingGuideLoaded ?? false)
           : undefined,
+        writingGuideExtraRuleCount: await countWritingConventions(ctx.config.extraWritingGuidePath),
       };
       // Say it out loud: the exclude is real but lives in .git/info/exclude, which is invisible to
       // anyone who did not run this server — the user may still want a tracked .gitignore entry.
@@ -90,8 +106,12 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       // silently otherwise, forever, with no other signal).
       let writingGuideLine = '';
       if (info.writingGuideExtraPath) {
+        const countClause =
+          info.writingGuideExtraRuleCount !== undefined
+            ? `, ${info.writingGuideExtraRuleCount} conventions`
+            : '';
         writingGuideLine = info.writingGuideExtraLoaded
-          ? `writing guide (project-specific): ${info.writingGuideExtraPath} — loaded\n`
+          ? `writing guide (project-specific): ${info.writingGuideExtraPath} — loaded${countClause}\n`
           : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT loaded; these ` +
             'conventions are not in effect\n';
       }
