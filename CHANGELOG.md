@@ -182,6 +182,21 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   The directory ships with its own `.gitignore` (`*`, `!.gitignore`) so a report is never committed,
   and the skill writes those same two lines wherever else it creates the directory.
 
+- **The win32 delete-pending retry in `withFileLock` is covered through the real code, not a mirror of it.**
+  `tryAcquire` (`src/lib/fileLock.ts`) re-attempts once on a win32 `EPERM`/`EACCES` where the lock file
+  is absent, because the previous holder's delete can complete between the failed `open()` and the
+  existence check. That retry was covered only by a test-local `decide()` helper that re-implemented the
+  decision in isolation — honestly labelled as a mirror, but a copy: deleting the retry from the source
+  left the suite green, on a code path shared by every mutating tool. `tryAcquire` now takes an internal
+  `LockAttemptDeps` seam (an injectable opener and platform string, defaulting per call to
+  `open(p, 'wx')` and `process.platform`), so the tests drive the real function on any platform and
+  assert both the outcome and how many times the opener was called — one call for the immediate
+  rethrow, two for the race. The platform is threaded from one object into both `attemptOpen`'s
+  contention classification and the retry guard, so the two cannot disagree; a test pins the case just
+  outside the guard (a win32 `EPERM` with the lock file _present_, which is contention and must not
+  retry) and fails if they are split apart again. No behaviour change: `withFileLock`'s signature and
+  call site are unchanged, `isLockContentionError` is untouched, and `existsSync` stays uninjected.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
