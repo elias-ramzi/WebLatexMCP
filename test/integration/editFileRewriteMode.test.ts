@@ -582,6 +582,73 @@ describe('edit_file rewrite-preservation mode', () => {
     expect(resultContent).not.toContain('%');
   });
 
+  // Characterization test: this pins documented, ACCEPTED behaviour, not desirable behaviour.
+  // Preservation duplicates `oldString` into the file (once live, once in a `% `-commented
+  // block above it). `editFile.ts`'s `preserveOriginal` schema description and `docs/tools.md`
+  // both say outright that a later `replaceAll: true` edit matching a phrase that now lives in
+  // both places silently rewrites the preserved comment right along with the live text — there
+  // is no special-casing to leave the comment alone. That is the opposite of the byte-exactness
+  // the feature exists to guarantee, so a future change to `replaceAll` (e.g. to skip preserved
+  // comments) should have to touch this test, not slip past it unnoticed.
+  it('a later replaceAll edit rewrites the preserved comment along with the live text', async () => {
+    const { client, userDir } = await setup();
+    await writeFile(path.join(userDir, 'main.tex'), `${PARAGRAPH_OLD}\n`, 'utf8');
+    await client.callTool({ name: 'register_project', arguments: { project: 'p', path: userDir } });
+    await client.callTool({
+      name: 'set_rewrite_mode',
+      arguments: { project: 'p', mode: 'always' },
+    });
+
+    // Preserve a rewrite of the paragraph — "dog" now occurs twice: once inside the preserved
+    // `% ...` comment (a substring of the commented-out PARAGRAPH_OLD), and once in the live
+    // replacement text (a substring of PARAGRAPH_NEW).
+    const first = await client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'p',
+        path: 'main.tex',
+        edits: [{ oldString: PARAGRAPH_OLD, newString: PARAGRAPH_NEW }],
+      },
+    });
+    expect(first.isError ?? false).toBe(false);
+    const afterFirst = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'p', path: 'main.tex' },
+    });
+    const contentAfterFirst = structured<{ content: string }>(afterFirst).content;
+    expect(contentAfterFirst).toBe(`% ${PARAGRAPH_OLD}\n${PARAGRAPH_NEW}\n`);
+    expect(contentAfterFirst).toContain('lazy dog');
+    expect(contentAfterFirst).toContain('sleeping dog');
+
+    // A replaceAll edit on "dog" hits both occurrences — including the one inside the
+    // preserved comment — and rewrites both, silently.
+    const second = await client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'p',
+        path: 'main.tex',
+        edits: [{ oldString: 'dog', newString: 'wolf', replaceAll: true }],
+      },
+    });
+    expect(second.isError ?? false).toBe(false);
+
+    const afterSecond = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'p', path: 'main.tex' },
+    });
+    const contentAfterSecond = structured<{ content: string }>(afterSecond).content;
+    expect(contentAfterSecond).toBe(
+      `% ${PARAGRAPH_OLD.replace('dog', 'wolf')}\n${PARAGRAPH_NEW.replace('dog', 'wolf')}\n`,
+    );
+    // The preserved comment line no longer holds the original phrase: "dog" is gone from it
+    // entirely, even though that line is the preserved record of the ORIGINAL text.
+    const commentLine = contentAfterSecond.split('\n')[0] ?? '';
+    expect(commentLine.startsWith('%')).toBe(true);
+    expect(commentLine).not.toContain('dog');
+    expect(commentLine).toContain('wolf');
+    expect(contentAfterSecond).not.toContain('dog');
+  });
+
   it('oldString === newString still errors under preserveOriginal: true', async () => {
     const { client, userDir } = await setup();
     await writeFile(path.join(userDir, 'main.tex'), `${PARAGRAPH_OLD}\n`, 'utf8');

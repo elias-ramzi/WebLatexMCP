@@ -28,7 +28,9 @@ function applyWithTransform(
 ): string {
   const matchIndex = content.indexOf(edit.oldString);
   const newString = transform(edit, matchIndex, content);
-  return content.replace(edit.oldString, newString);
+  return (
+    content.slice(0, matchIndex) + newString + content.slice(matchIndex + edit.oldString.length)
+  );
 }
 
 describe('commentOut', () => {
@@ -172,6 +174,20 @@ describe('classifyEdit', () => {
     expect(classifyEdit(oldString, belowThreshold)).toBe('prose');
   });
 
+  it('does not classify an 8-token single-word typo fix as prose — pins the 0.014 margin above NEAR_IDENTICAL_OVERLAP_THRESHOLD the docstring describes', () => {
+    // NEAR_IDENTICAL_OVERLAP_THRESHOLD's docstring states its worst case: a single interior-token
+    // fix in an 8-token string floors the bigram overlap at 5/7 ≈ 0.714, clearing the 0.7
+    // threshold by only 0.014. The existing boundary test above only compares the computed
+    // overlap against the implementation's own constant, so it can't tell you *why* the margin
+    // matters — raising the threshold to, say, 0.72 would break that assertion without saying
+    // what breaks for a real caller. This test pins the consequence directly: an 8-token typo fix
+    // (exactly the docstring's shape) must stay 'minor', not get silently preserved as 'prose'.
+    const oldString = 'one two three four five six seven eight';
+    const newString = 'one two THREE four five six seven eight';
+    expect(nearIdenticalOverlap(oldString.split(' '), newString.split(' '))).toBeCloseTo(5 / 7);
+    expect(classifyEdit(oldString, newString)).toBe('minor');
+  });
+
   it('classifies a pure reordering of the same clauses as prose (order-sensitive measure)', () => {
     // A bag-of-tokens count sees these as ~identical; the bigram measure sees the pipeline
     // order inverted, which is exactly the kind of change that must not be silently lost.
@@ -191,6 +207,12 @@ describe('classifyEdit', () => {
   });
 
   it('classifies a clause swap as prose', () => {
+    // Not a discriminating case for order-sensitivity: measured against a bag-of-tokens
+    // counterfactual, this scores 'prose' either way (unigram overlap ~0.69, bigram ~0.58), since
+    // the two clauses share almost no bigrams across their new boundary regardless of order. The
+    // pipeline-reorder and active-to-passive tests above are what actually pin that the measure is
+    // order-sensitive (they score 'minor' under unigram overlap but 'prose' under bigram overlap).
+    // This test is kept because it is still a real, common rewrite shape worth covering.
     const oldString =
       'Although the baseline is simple, it performs surprisingly well across every benchmark tested.';
     const newString =
@@ -210,6 +232,20 @@ describe('classifyEdit', () => {
     const oldString =
       'This entire paragraph should be preserved in a comment above when it is deleted outright.';
     expect(classifyEdit(oldString, '')).toBe('prose');
+  });
+
+  it('does not let an unclosed "$" mask the rest of oldString as markup', () => {
+    // Regression coverage: markupMask used to toggle inMath on any odd-"$"-count token and never
+    // untoggle if the span was never closed, so one unbalanced "$" (invalid LaTeX, but exactly
+    // the kind of draft text a prose rewrite targets) marked every later token as markup, failed
+    // the strict-majority prose test, and silently dropped a genuine paragraph rewrite to
+    // 'minor'. Only 1 of oldString's 20 tokens ("$50") even contains a "$"; the rest of the
+    // sentence is plain prose and must count as such.
+    const oldString =
+      'The annual compute budget for this project is about $50 thousand which limits the number of runs we can afford.';
+    const newString =
+      'Compute for the project costs roughly fifty thousand dollars, capping how many runs are affordable.';
+    expect(classifyEdit(oldString, newString)).toBe('prose');
   });
 
   it('classifies a total rewrite of a sentence containing escaped currency as prose', () => {
@@ -238,13 +274,17 @@ describe('classifyEdit', () => {
   });
 
   describe('absolute-loss floor (MIN_UNMATCHED_BIGRAMS_FOR_PROSE)', () => {
-    // A ~110-token paragraph built from ten independent ~11-token sentences. Deleting one
-    // sentence from the end or the start creates exactly one rejoin seam, so the *fraction* of
-    // surviving bigrams stays high (89.9%, well above NEAR_IDENTICAL_OVERLAP_THRESHOLD) even
-    // though a whole sentence — an 11-token clause, well past the floor — is gone. Before the
-    // absolute floor existed, that scored 'minor': a real deletion silently not preserved, and
-    // inconsistently so, since the identical deletion from the *middle* of the same paragraph
-    // (two seams) already scored 'prose'.
+    // A 110-token paragraph built from ten ~11-token sentences. Deleting one whole sentence loses
+    // 11 of the paragraph's 109 bigrams, and on this fixture all three positions measure the same
+    // overlap — 0.8997 for leading, interior and trailing alike. Position is not merely a small
+    // effect here, it is no effect: an edge deletion breaks one rejoin seam and an interior one
+    // breaks two, but the repeated sentence shape means the seam bigram matches either way.
+    // So the *fraction* of surviving bigrams stays far above NEAR_IDENTICAL_OVERLAP_THRESHOLD in
+    // every case — diluted away by the length of the paragraph, which is the failure the absolute
+    // floor exists for. Before the floor existed all three scored 'minor': a whole missing
+    // sentence, well past the floor, silently not preserved. The three cases below pin that the
+    // floor catches it wherever the sentence sat; none of them demonstrates a mid-vs-end contrast,
+    // because on these numbers there is none to demonstrate.
     function sentences(n: number): string[] {
       const out: string[] = [];
       for (let i = 1; i <= n; i++) {
@@ -265,7 +305,12 @@ describe('classifyEdit', () => {
       expect(classifyEdit(oldString, newString)).toBe('prose');
     });
 
-    it('classifies an interior sentence deleted from a long paragraph as prose', () => {
+    it('classifies an interior sentence deleted from a long paragraph as prose (same floor, two seams)', () => {
+      // Not a discriminating case on its own — it scores 'prose' for the same reason the
+      // leading/trailing deletions above do (the absolute floor), and would flip to 'minor'
+      // alongside them if the floor were removed. Kept because it pins that the floor applies
+      // uniformly regardless of where in the paragraph the missing sentence sat, including the
+      // two-seam (interior) case, not because it demonstrates a different fraction outcome.
       const newString = allSentences.slice(0, 4).concat(allSentences.slice(5)).join(' ');
       expect(classifyEdit(oldString, newString)).toBe('prose');
     });
@@ -355,6 +400,29 @@ describe('markupMask', () => {
     // backslash rule), but the tokens after it must stay unmasked.
     const tokens = ['The', 'cost', 'is', '\\$100', 'today', 'and', 'tomorrow', 'too'];
     expect(markupMask(tokens)).toEqual([false, false, false, true, false, false, false, false]);
+  });
+
+  it('masks only itself for an unclosed math-span opener, not the rest of the tokens', () => {
+    // Regression coverage for the $50 case: a toggling token with no matching close (an
+    // unbalanced "$", e.g. a stray currency sign in draft prose) must not mark every later token
+    // as markup. Only "$50" itself is masked; "which" and "note" on either side stay prose.
+    const tokens = ['about', '$50', 'which', 'limits', 'note'];
+    expect(markupMask(tokens)).toEqual([false, true, false, false, false]);
+  });
+
+  it('still masks the whole interior of a properly closed math span (regression guard)', () => {
+    // The case the pairing logic exists to get right, unchanged from before the fix: a span
+    // opened in one token and closed in a later one still masks everything from the opener
+    // through the closer inclusive.
+    const tokens = ['we', 'have', '$x', '=', '1$', 'here'];
+    expect(markupMask(tokens)).toEqual([false, false, true, true, true, false]);
+  });
+
+  it('masks only the first unclosed opener when a second span never closes either', () => {
+    // Two togglers with no third one to close the second: the first pair (both togglers) closes
+    // the first span, and the trailing odd-one-out masks only itself — never everything after it.
+    const tokens = ['$a', 'b$', 'plain', '$c', 'more', 'prose', 'here'];
+    expect(markupMask(tokens)).toEqual([true, true, false, true, false, false, false]);
   });
 });
 
@@ -589,6 +657,26 @@ describe('createPreserveTransform', () => {
     });
   });
 
+  describe('splice correctness against literal "$"-patterns (Finding 1)', () => {
+    // String.prototype.replace treats "$$", "$&", "$`", "$'" and "$<n>" in its *replacement*
+    // argument as substitution patterns, not literal text. LaTeX inline math ("$a$", "$b$") is
+    // exactly this shape, so a harness that applies the transform's output via `content.replace`
+    // (instead of splicing by index, the way `FileService.applyEdits` actually does) can silently
+    // corrupt output containing these sequences. This fixture pins the splice against that.
+    it("preserves an oldString/newString pair containing literal $&, $$, $`, $', $1 byte-exact, with no substitution-pattern expansion", () => {
+      const oldString = 'The mean score $a$ improves over the baseline $b$ today.';
+      const newString = "A totally different result $$1 with $& and $` and $' patterns emerges.";
+      const edit: EditOp = { oldString, newString };
+      const content = `Intro line here.\n${oldString}\nOutro line here.\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe(
+        `Intro line here.\n${commentOut(oldString)}\n${newString}\nOutro line here.\n`,
+      );
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+  });
+
   describe('replaceAll defence in depth', () => {
     it(
       "createPreserveTransform's transform refuses to preserve a replaceAll edit even when " +
@@ -661,6 +749,8 @@ describe('supportsLineComments', () => {
     expect(supportsLineComments('refs.bbl')).toBe(true);
     expect(supportsLineComments('MAIN.TEX')).toBe(true);
     expect(supportsLineComments('sections/intro.Tex')).toBe(true);
+    expect(supportsLineComments('paper.latex')).toBe(true);
+    expect(supportsLineComments('paper.ltx')).toBe(true);
   });
 
   it('is false for a .bib and for non-LaTeX documents', () => {

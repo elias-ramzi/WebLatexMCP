@@ -39,6 +39,15 @@ const outputSchema = {
         'wins over it, and a per-call preserveOriginal wins over both. Read list_projects for ' +
         'the effective mode a specific project resolves to.',
     ),
+  envConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_REWRITE_MODE actually names a mode on this server, as opposed to ' +
+        '`rewriteMode` merely holding the built-in "off" default. Without this, a deliberately ' +
+        'configured `WEB_LATEX_MCP_REWRITE_MODE=off` is byte-identical to nobody having ' +
+        'configured anything — both report `rewriteMode: "off"`. This is the only field that ' +
+        'tells them apart.',
+    ),
   writingGuideExtraPath: z
     .string()
     .optional()
@@ -69,7 +78,9 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         'from the host repo, the configured compiler — which is not necessarily the backend a ' +
         'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
         'there — and the configured rewrite-preservation default, which is not necessarily what ' +
-        "a given project uses since a project's own set_rewrite_mode setting wins over it) plus " +
+        "a given project uses since a project's own set_rewrite_mode setting wins over it, plus " +
+        'whether WEB_LATEX_MCP_REWRITE_MODE actually set that default or it is only the built-in ' +
+        'one) plus ' +
         'whether a project-specific writing guide (WEB_LATEX_MCP_WRITING_GUIDE_EXTRA) is configured ' +
         'and, if so, whether it actually loaded — a typo in that path otherwise means the ' +
         "user's conventions are silently ignored forever with nothing to tell them. Use this to " +
@@ -86,6 +97,10 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         workspaceExcludePattern: ctx.config.workspaceExcludePattern,
         compiler: ctx.config.compiler ?? 'latexmk',
         rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
+        // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
+        // default when the env names nothing, so that form would call every default install
+        // "configured". Matches listProjects.ts exactly.
+        envConfigured: ctx.config.rewriteModeExplicit === true,
         writingGuideExtraPath: ctx.config.extraWritingGuidePath
           ? toPosix(ctx.config.extraWritingGuidePath)
           : undefined,
@@ -116,7 +131,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         excludeLine +
         writingGuideLine +
         `compiler: ${info.compiler}\n` +
-        `rewrite mode (default): ${info.rewriteMode}`;
+        `rewrite mode (default): ${info.rewriteMode}` +
+        (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
       return {
         content: [{ type: 'text', text }],
         structuredContent: { ...info },

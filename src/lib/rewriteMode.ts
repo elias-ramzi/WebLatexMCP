@@ -89,7 +89,8 @@ export function resolveRewriteMode(input: ResolveRewriteModeInput): ResolvedRewr
 /**
  * Prefix every line of `text` with `% `.
  *
- * A line that already starts with `%` is prefixed anyway, producing `%% ...`. This is
+ * A line that already starts with `%` is prefixed anyway, producing `% % ...` — the prefix is
+ * always the literal two bytes `% `, never merged into an existing marker. This is
  * intentional, not an oversight: the preserved block must be a faithful copy of the bytes that
  * were there, not a "smart" re-comment. A `text` that starts with `%` is exactly the kind of
  * content that must survive round-trip unaltered, and a special case for it would make the
@@ -176,17 +177,20 @@ export const NEAR_IDENTICAL_OVERLAP_THRESHOLD = 0.7;
  * `classifyEdit` for how this combines with `NEAR_IDENTICAL_OVERLAP_THRESHOLD`.
  *
  * The fraction test alone is one-sided: it is the share of `oldString`'s bigrams that survive,
- * with no penalty for *where* the loss falls. Deleting a contiguous run of `k` tokens from the
- * **end** (or start) of an `n`-token paragraph creates exactly one rejoin seam and loses only `k`
- * of the paragraph's `n - 1` bigrams — no seam in the middle costs more. A 10-token trailing
- * sentence cut from a 100-token paragraph scores 89/99 ≈ 0.899, clearing 0.7 by a wide margin and
- * landing `'minor'` — silently not preserved — while the identical 10-token deletion from the
- * *middle* of the same paragraph breaks two seams and scores ≈0.64, landing `'prose'`. The
- * fraction test is therefore least reliable exactly where paragraphs are longest, and gives an
- * inconsistent answer for the same deletion depending only on where in the paragraph it happens
- * to sit. An absolute floor on the unmatched count catches the case the fraction dilutes away in a
- * long paragraph, without touching the fraction test's behaviour on short-to-medium strings where
- * the two floors below already draw the line correctly.
+ * with no penalty for the *size* of the loss relative to how much text surrounds it. Deleting a
+ * contiguous run of `k` tokens costs `k` of the paragraph's `n - 1` bigrams at an edge and `k + 1`
+ * in the interior (an edge deletion breaks one rejoin seam, an interior one breaks two) — a
+ * difference of a single bigram, which never changes the verdict. The fraction therefore scales
+ * with `k / n`, not with `k`. Measured on the 110-token fixture in `rewriteMode.test.ts`, one
+ * deleted sentence scores 0.8997 whether it sat at the start, the middle or the end — identical to
+ * four decimal places, because the repeated sentence shape means the seam bigram matches either
+ * way. All three clear 0.7 by a wide margin and would land `'minor'` — a whole sentence silently
+ * not preserved — on the fraction alone. That is the failure this floor exists for, and it is a
+ * dilution failure, not a positional one: the longer the surrounding paragraph, the smaller a
+ * genuinely lost clause looks to the fraction. An absolute floor on the unmatched count does not
+ * scale with `n`, so it catches that clause at any paragraph length, without touching the fraction
+ * test's behaviour on short-to-medium strings where the two floors below already draw the line
+ * correctly.
  *
  * 6 is chosen from the same per-edit arithmetic the threshold's own docstring uses — a single
  * interior token change in an `n`-token string loses exactly 2 of its `n - 1` bigrams (the one
@@ -361,35 +365,64 @@ function isMarkupToken(token: string): boolean {
  * Mark every token that falls inside (or delimits) a `$...$` or `$$...$$` math span as markup.
  * `isMarkupToken` already catches a standalone delimiter (`$`, `$$`) and a token that is a
  * *complete* span by itself (`"$x$"`); this function additionally tracks the case a per-token
- * check cannot see — a span opened in one token and closed in a later one (`"$x" "=" "1$"`) — by
- * scanning tokens left to right and toggling in/out of math state on a token with an odd count of
- * `$` characters (a standalone `"$$"` toggles once, as one display-math delimiter).
+ * check cannot see — a span opened in one token and closed in a later one (`"$x" "=" "1$"`).
  *
- * The token that *opens* such a span is itself masked, not just the tokens strictly inside it:
- * the toggle is evaluated before deciding `mask[i]`, so the opening delimiter — which is markup,
- * not a prose word — is folded into the `inMath` state for this same token rather than only
- * affecting the ones after it. Without that, `"$x" "=" "1$"` would count `"$x"` as a prose word.
+ * It does this in two passes, deliberately, rather than a single left-to-right toggle:
+ *
+ *  1. Find every "toggling" token — one with an odd count of unescaped `$` characters (a
+ *     standalone `"$$"` counts as one toggle, as one display-math delimiter) — and **pair them
+ *     up in order**: the first toggler opens a span, the next toggler closes it, the one after
+ *     that opens the next span, and so on.
+ *  2. For each **closed** pair, mask the opening token, the closing token, and every token
+ *     strictly between them. A toggling token left **without a partner** (there were an odd
+ *     number of togglers overall — always true of the *last* one when the count is odd) masks
+ *     **only itself**: with no matching close, it never opened a real span, so there is nothing
+ *     for it to be "inside" of.
+ *
+ * This is the fix for a real, dangerous failure mode of the naive single-pass toggle: draft prose
+ * containing one unbalanced `$` (invalid LaTeX, but exactly the kind of sloppy text a `prose`
+ * rewrite exists to clean up — e.g. `"the budget is about $50 thousand which..."`, where the `$`
+ * before `50` is never closed) used to flip `inMath` on and never flip it back, marking every
+ * later token in the string as markup for the rest of the scan. That failed `classifyEdit`'s
+ * strict-majority-prose test on a perfectly ordinary paragraph, silently downgrading a genuine
+ * rewrite to `'minor'` — the exact harm the preserve feature exists to prevent, since `'minor'`
+ * means the original is thrown away with nothing kept. Pairing up only *closed* spans is strictly
+ * narrower than the old toggle: it can only mask tokens the old code also masked (every closed
+ * span here was already toggled-into by the old code) minus the unpaired tail it wrongly swept
+ * in, so this can never cause a new suppression — only prevent one.
+ *
+ * The token that *opens* a closed span is itself masked, not just the tokens strictly inside it —
+ * the opening delimiter is markup, not a prose word. Without that, `"$x" "=" "1$"` would count
+ * `"$x"` as a prose word.
  *
  * This is intentionally crude (it does not track nesting) — good enough to keep an inline
  * formula's variable names from being counted as prose words, which is all `classifyEdit` needs.
  *
  * An escaped `\$` (currency, not a math delimiter) is stripped before counting toggles: a token
  * like `"\$100"` contains a literal dollar sign that is not opening or closing a math span, so
- * counting it would flip `inMath` and misclassify every token for the rest of the string as
- * markup. `\$100` is already markup on its own via `isMarkupToken`'s leading-backslash rule, so
- * stripping it here loses nothing and only removes the toggle's false signal.
+ * counting it would incorrectly make it a toggler. `\$100` is already markup on its own via
+ * `isMarkupToken`'s leading-backslash rule, so stripping it here loses nothing and only removes
+ * the toggle's false signal.
  */
 export function markupMask(tokens: string[]): boolean[] {
   const mask = tokens.map(isMarkupToken);
-  let inMath = false;
+  const togglerIndices: number[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i] ?? '';
     const unescaped = token.replace(/\\\$/g, '');
     // A standalone "$$" token is one display-math delimiter, toggling once; any other
     // occurrence of "$" toggles once per (odd count of) dollar sign in the token.
     const toggles = token === '$$' ? 1 : (unescaped.match(/\$/g) ?? []).length % 2;
-    if (inMath || toggles === 1) mask[i] = true;
-    if (toggles === 1) inMath = !inMath;
+    if (toggles === 1) togglerIndices.push(i);
+  }
+  for (let i = 0; i + 1 < togglerIndices.length; i += 2) {
+    const open = togglerIndices[i] ?? 0;
+    const close = togglerIndices[i + 1] ?? 0;
+    for (let j = open; j <= close; j++) mask[j] = true;
+  }
+  if (togglerIndices.length % 2 === 1) {
+    const lastIndex = togglerIndices[togglerIndices.length - 1] ?? 0;
+    mask[lastIndex] = true;
   }
   return mask;
 }
@@ -458,14 +491,73 @@ export function classifyEdit(oldString: string, newString: string): 'prose' | 'm
   return 'prose';
 }
 
-/** Join a commented block with what follows it, using exactly one line terminator between them
- * and never doubling one `commentOut` already produced. `lineEnding` is `'\r\n'` or `'\n'` — the
- * separator must mirror the line ending the original match actually sat on, or a CRLF file comes
- * back with one stray LF-only line in an otherwise all-CRLF file (the repo forces
- * `core.autocrlf=false`, so a mixed-ending file is a real, persisted defect, not cosmetic). */
+/**
+ * Join a commented block with what follows it, using exactly one line terminator between them
+ * and never doubling one `commentOut` already produced.
+ *
+ * `lineEnding` is the terminator to use when `commented` supplies none of its own — but
+ * `commented` can already end in one of two ways `commentOut` produces without stripping:
+ *
+ *  - It already ends in `'\n'` (whether that `'\n'` is bare or the tail of a `'\r\n'` pair):
+ *    nothing to add, or the file would gain a doubled terminator.
+ *  - It ends in a **bare `'\r'`** with no paired `'\n'` after it. `commentOut` only strips a
+ *    `'\r'` as part of an end-of-line when it is immediately followed, *within the same
+ *    original string*, by the `'\n'` that closes that line (see `commentOut`'s own docstring on
+ *    splitting on bare `'\n'`). When `oldString` itself ends in a lone `'\r'` — its own last byte,
+ *    with no `'\n'` after it inside `oldString` — there is no such pairing to strip, so that
+ *    `'\r'` survives into `commented` as its very last character. That `'\r'` is already half of
+ *    the CRLF terminator this join is trying to place, so completing it takes only a `'\n'`,
+ *    regardless of what `lineEnding` says — appending `lineEnding` in full here would double the
+ *    `'\r'` (`'\r\r\n'`), not complete it.
+ *
+ * Only once neither of those applies does `lineEnding` (the caller's best guess at the line
+ * ending the original match actually sat on) get used — the separator that keeps a CRLF file
+ * from coming back with one stray LF-only line in an otherwise all-CRLF file (the repo forces
+ * `core.autocrlf=false`, so a mixed-ending file is a real, persisted defect, not cosmetic).
+ */
 function joinCommentedBlock(commented: string, rest: string, lineEnding: '\n' | '\r\n'): string {
-  const separator = commented.endsWith('\n') ? '' : lineEnding;
-  return commented + separator + rest;
+  if (commented.endsWith('\n')) return commented + rest;
+  if (commented.endsWith('\r')) return commented + '\n' + rest;
+  return commented + lineEnding + rest;
+}
+
+/**
+ * The one place that decides which line terminator separates a preserved comment block from its
+ * replacement (`computeResult`'s `separatorLineEnding`), for the cases `joinCommentedBlock`
+ * itself cannot already resolve from `commented`'s own trailing bytes (see there for the bare-
+ * `'\r'` and trailing-`'\n'` cases it handles unconditionally, regardless of what this returns).
+ * Every remaining signal available at the match boundary is considered here, in order of how
+ * much it can be trusted, so no caller has to re-derive this and risk disagreeing about it
+ * elsewhere (the `parseCompilerChoice` lesson):
+ *
+ *  1. `content[end..end+1]` is literally `'\r\n'` — the strongest signal: the terminator is
+ *     still sitting whole in `content`, right after the match.
+ *  2. `content[end]` is `'\n'` alone, with no `'\r'` before it in `content` — a plain LF line.
+ *     (A lone `'\r'` consumed as `oldString`'s own trailing byte, leaving just this `'\n'`
+ *     behind, is not a case this function ever needs to tell apart from a bare LF line:
+ *     `joinCommentedBlock` already produces the correct pairing for that shape unconditionally,
+ *     from `commented`'s own trailing `'\r'`, whatever this function returns.)
+ *  3. Neither of the above: the match ends at EOF, and there is nothing left in `content` to
+ *     inspect at all (`content[end]` is `undefined`). The only remaining evidence is whether
+ *     `oldString` itself contains a `'\r\n'` pair anywhere — if so, the match plainly sat in a
+ *     CRLF-terminated stretch of text even though nothing survives after it to prove that.
+ *  4. Truly no evidence anywhere at the boundary: fall back to whether `content` contains a
+ *     `'\r\n'` pair *at all* rather than hardcoding `'\n'` — a file that is CRLF everywhere else
+ *     but happens to have its very last line unterminated must not have that last line's
+ *     replacement pushed back to LF. Note this is "any CRLF", not a majority vote: in a genuinely
+ *     mixed file one CRLF elsewhere wins. That is deliberate — the repo forces
+ *     `core.autocrlf=false`, so a mixed file is already defective, and guessing CRLF there costs a
+ *     cosmetic diff line where guessing LF would corrupt an otherwise-CRLF file.
+ */
+function resolveSeparatorLineEnding(
+  oldString: string,
+  content: string,
+  end: number,
+): '\n' | '\r\n' {
+  if (content[end] === '\r' && content[end + 1] === '\n') return '\r\n';
+  if (content[end] === '\n') return '\n';
+  if (oldString.includes('\r\n')) return '\r\n';
+  return content.includes('\r\n') ? '\r\n' : '\n';
 }
 
 /**
@@ -474,23 +566,60 @@ function joinCommentedBlock(commented: string, rest: string, lineEnding: '\n' | 
  * `.txt`, ...) the mode must be inert: the edit applies unchanged. Kept here, exported, and unit
  * tested rather than duplicated inline in `edit_file` — a second copy of this list is exactly how
  * the tool and the transform eventually disagree about what counts as "commentable".
+ *
+ * Known, accepted limitation — this check is extension-based only, with no awareness of the
+ * *content* of the file it is looking at. Inside a `verbatim`, `lstlisting`, `minted`, or
+ * `Verbatim` environment, `%` is not a comment character at all; it is literal text that the
+ * engine reproduces in the compiled output. A preservation that lands inside one of those
+ * environments therefore does not silently vanish into a comment the way it does everywhere else
+ * in the file — it becomes a visible extra line in the rendered PDF (`% <original text>`, printed
+ * verbatim, right above the replacement). Detecting "am I inside a verbatim-like environment at
+ * this byte offset" reliably needs real LaTeX parsing (nested environments, `\verb` in its many
+ * delimiter forms, environments defined by `\newenvironment`, ...), which is far more machinery
+ * than this file otherwise needs. We accept the risk instead of building that: the blast radius
+ * is narrow (one stray visible line, under an opt-in mode, in a document the author is about to
+ * look at), and an author compiling the PDF sees the artifact immediately rather than it silently
+ * corrupting anything — the opposite failure mode of the one `markupMask` exists to prevent,
+ * where an unnoticed silent loss can survive indefinitely. This is a decision, not a TODO: fixing
+ * it is not planned unless it turns out to matter in practice.
  */
-const LINE_COMMENT_EXTENSIONS: readonly string[] = ['.tex', '.sty', '.cls', '.bbl'];
+const LINE_COMMENT_EXTENSIONS: readonly string[] = [
+  '.tex',
+  '.sty',
+  '.cls',
+  '.bbl',
+  '.latex',
+  '.ltx',
+];
 
-/** Whether `relPath`'s extension uses `%` for line comments (case-insensitive). */
+/**
+ * Whether `relPath`'s extension uses `%` for line comments (case-insensitive). See
+ * `LINE_COMMENT_EXTENSIONS`'s docstring for the accepted verbatim-environment limitation this
+ * check does not, and cannot cheaply, account for.
+ */
 export function supportsLineComments(relPath: string): boolean {
   const lower = relPath.toLowerCase();
   return LINE_COMMENT_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
-/** A `FileService.applyEdits` `transformNewString` hook, plus a way to read how many edits it
+/** A `FileService.applyEdits` rewrite-preservation hook, plus a way to read how many edits it
  * actually preserved once `applyEdits` has called it for every eligible edit — surfaced by
  * `edit_file` so preservation is never silent. */
 export interface PreserveTransform {
-  /** Pass as `opts.transformNewString` to `FileService.applyEdits`. */
+  /** Pass the whole object as `opts.preserve` to `FileService.applyEdits`. */
   transform: (edit: EditOp, matchIndex: number, content: string) => string;
   /** How many edits were actually preserved — call only after `applyEdits` has run. */
   preservedEdits: () => number;
+  /**
+   * Pass the whole object as `opts.preserve` to `FileService.applyEdits`. Reports, for the
+   * *most recent* `transform()` call only, the length of the preserved comment block at the
+   * start of the string that call returned (or `undefined` if that call preserved nothing) — not
+   * a cumulative ledger. `applyEdits` is the only code that knows every splice offset a call
+   * produces (including each occurrence a `replaceAll` edit touches), so it — not this hook —
+   * keeps the ledger of already-preserved ranges that refuses a later edit in the same call from
+   * matching inside text an earlier edit already commented out.
+   */
+  lastInsertion: () => number | undefined;
 }
 
 /**
@@ -533,22 +662,42 @@ export interface PreserveTransform {
  * one. When `oldString` consumed its own trailing newline, a non-empty `newString` gets that
  * newline put back after it (so the line that used to follow does not merge onto the
  * replacement's line) — see the comment inline below.
+ *
+ * Known, accepted limitation, shared with `supportsLineComments` (see its docstring on
+ * `LINE_COMMENT_EXTENSIONS` for the full reasoning): this transform has no idea whether the match
+ * it is commenting out sits inside a `verbatim`/`lstlisting`/`minted`/`Verbatim` environment,
+ * where `%` is not a comment character but literal content the engine reproduces verbatim in the
+ * compiled output. A preservation landing inside one of those environments becomes a visible
+ * extra line in the rendered PDF rather than a harmless comment. Fixing this needs real LaTeX
+ * parsing to track the enclosing environment at every match offset, which this module
+ * deliberately does not attempt; the accepted trade is a narrow, immediately visible artifact
+ * under an opt-in mode, not a silent one.
  */
 export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
   let preservedEdits = 0;
+  // The `commentedLength` of the most recent `transform()` call, for `lastInsertion()` to read —
+  // reset (or set) on every call, never accumulated, since `applyEdits` reads it once immediately
+  // after each `transform()` call and keeps its own ledger of every range across the whole call.
+  let lastCommentedLength: number | undefined;
 
-  function transform(edit: EditOp, matchIndex: number, content: string): string {
-    if (mode === 'off') return edit.newString;
-    if (edit.oldString === edit.newString) return edit.newString;
+  /** The actual transform logic, factored out so `transform` can stay a thin adapter that also
+   * records `lastCommentedLength` for `lastInsertion()`. */
+  function computeResult(
+    edit: EditOp,
+    matchIndex: number,
+    content: string,
+  ): { result: string; commentedLength?: number } {
+    if (mode === 'off') return { result: edit.newString };
+    if (edit.oldString === edit.newString) return { result: edit.newString };
     // Belt-and-braces: FileService.applyEdits already never calls this hook for a replaceAll
     // edit (there is no single match position to comment above), but checking it again here too
     // means this function can never be the reason that guard goes quiet if the call order or a
     // future caller ever changes.
-    if (edit.replaceAll) return edit.newString;
+    if (edit.replaceAll) return { result: edit.newString };
 
     const shouldPreserve =
       mode === 'always' || classifyEdit(edit.oldString, edit.newString) === 'prose';
-    if (!shouldPreserve) return edit.newString;
+    if (!shouldPreserve) return { result: edit.newString };
 
     const atLineStart = matchIndex === 0 || content[matchIndex - 1] === '\n';
     const end = matchIndex + edit.oldString.length;
@@ -560,15 +709,16 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
     const matchEndsWithCrlf = content[end] === '\r' && content[end + 1] === '\n';
     const atLineEnd =
       oldEndsWithNewline || end === content.length || content[end] === '\n' || matchEndsWithCrlf;
-    if (!atLineStart || !atLineEnd) return edit.newString;
+    if (!atLineStart || !atLineEnd) return { result: edit.newString };
 
     preservedEdits++;
     const commented = commentOut(edit.oldString);
-    if (edit.newString === '') return commented;
+    if (edit.newString === '') return { result: commented, commentedLength: commented.length };
 
-    // Mirror the line ending the match sat on (falls back to '\n' at EOF, where there is no
-    // terminator to mirror and a bare '\n' is as good a default as any).
-    const separatorLineEnding: '\n' | '\r\n' = matchEndsWithCrlf ? '\r\n' : '\n';
+    // Mirror the line ending the match sat on — see `resolveSeparatorLineEnding` for every signal
+    // considered and in what order, including the EOF case where nothing follows the match in
+    // `content` to inspect directly.
+    const separatorLineEnding = resolveSeparatorLineEnding(edit.oldString, content, end);
     const joined = joinCommentedBlock(commented, edit.newString, separatorLineEnding);
 
     // When oldString's own bytes already included its trailing terminator, the match consumed
@@ -583,10 +733,20 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
     // never asked for. Testing `'\n'` covers `'\r\n'` as well, since CRLF ends in `\n`.
     if (oldEndsWithNewline && end !== content.length && !edit.newString.endsWith('\n')) {
       const restoredLineEnding: '\n' | '\r\n' = edit.oldString.endsWith('\r\n') ? '\r\n' : '\n';
-      return joined + restoredLineEnding;
+      return { result: joined + restoredLineEnding, commentedLength: commented.length };
     }
-    return joined;
+    return { result: joined, commentedLength: commented.length };
   }
 
-  return { transform, preservedEdits: () => preservedEdits };
+  function transform(edit: EditOp, matchIndex: number, content: string): string {
+    const { result, commentedLength } = computeResult(edit, matchIndex, content);
+    lastCommentedLength = commentedLength;
+    return result;
+  }
+
+  return {
+    transform,
+    preservedEdits: () => preservedEdits,
+    lastInsertion: () => lastCommentedLength,
+  };
 }

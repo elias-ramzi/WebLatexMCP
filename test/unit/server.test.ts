@@ -344,6 +344,58 @@ describe('server_info', () => {
 
     await client.close();
   });
+
+  it('reports envConfigured false when WEB_LATEX_MCP_REWRITE_MODE is unset', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        rewriteMode: 'off',
+        rewriteModeExplicit: false,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.rewriteMode).toBe('off');
+    expect(structured.envConfigured).toBe(false);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('built-in');
+
+    await client.close();
+  });
+
+  it('reports envConfigured true when WEB_LATEX_MCP_REWRITE_MODE=off is explicitly set', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        rewriteMode: 'off',
+        rewriteModeExplicit: true,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    // Byte-identical rewriteMode to the unset case above ('off') — envConfigured is the ONLY
+    // signal that distinguishes a deliberate server-wide `off` from nobody configuring anything.
+    expect(structured.rewriteMode).toBe('off');
+    expect(structured.envConfigured).toBe(true);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('WEB_LATEX_MCP_REWRITE_MODE');
+
+    await client.close();
+  });
 });
 
 describe('doctor', () => {

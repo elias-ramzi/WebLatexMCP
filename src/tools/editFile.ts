@@ -42,7 +42,10 @@ const inputSchema = {
         'replacement), so a later edit_file call whose oldString still occurs in that preserved ' +
         'comment will match it too: without replaceAll the call is refused as non-unique (add ' +
         'more surrounding context); with replaceAll: true the preserved comment is silently ' +
-        'rewritten right along with the live text.',
+        'rewritten right along with the live text. Within a single call it is stricter: a later ' +
+        'edit in this same edits array that matches ONLY inside a block an earlier edit preserved ' +
+        'is refused outright, since its live target was already replaced and applying it would ' +
+        'rewrite dead commented-out text; the whole call fails and the file is left untouched.',
     ),
   edits: z
     .array(
@@ -110,7 +113,7 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           const preserve = createPreserveTransform(effectiveMode);
           const res = await ctx.files.applyEdits(dir, relPath, edits, {
             overrideExternalChanges,
-            transformNewString: preserve.transform,
+            preserve,
           });
           const preservedEdits = preserve.preservedEdits();
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);

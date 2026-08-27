@@ -223,6 +223,75 @@ describe('set_rewrite_mode on a local (in-place) project', () => {
   });
 });
 
+describe('set_rewrite_mode concurrency', () => {
+  it('serialises concurrent set_rewrite_mode calls, so no two report the same previous', async () => {
+    // Protects the schema's advertised guarantee (outputSchema.previous in
+    // src/tools/setRewriteMode.ts): "Read inside the same lock as the write, so it can never be
+    // a stale value from a peer session racing this one." The existing "reports the mode it
+    // moved away from" test above calls set_rewrite_mode sequentially, so it would pass
+    // identically even if the `previous` read were hoisted outside runExclusive — it does not
+    // pin the concurrency claim at all.
+    //
+    // Here three calls fire together (Promise.all), each setting a different mode. Under real
+    // serialization inside the lock, exactly one call sees the pre-existing "off" default as its
+    // `previous`, and the other two each see the mode set by whichever call ran immediately
+    // before it — forming one consistent serial chain with no two calls reporting the same
+    // `previous`. If the `previous` read were hoisted outside the lock, two racers could both
+    // read "off" before either write lands, and this test would see a duplicate `previous`
+    // value — see the mutation drill in the task report for the observed failure.
+    const { client } = await setup();
+
+    const modes = ['always', 'prose', 'off'] as const;
+    const results = await Promise.all(
+      modes.map((mode) =>
+        client
+          .callTool({ name: 'set_rewrite_mode', arguments: { project: 'draft', mode } })
+          .then((res) => structured(res)),
+      ),
+    );
+
+    const previousValues = results.map((r) => r.previous as string);
+    const setValues = results.map((r) => r.mode as string);
+
+    // No two calls may report the same previous — the assertion that actually catches a hoisted
+    // read: two racers reading the same pre-write value would both report "off".
+    expect(new Set(previousValues).size).toBe(previousValues.length);
+
+    // Exactly one call reports the pre-existing starting state ("off", the default with nothing
+    // stored) as its previous — the call that acquired the lock first. "off" is also one of the
+    // three modes being set, so a call could legitimately report previous: "off" because a peer
+    // just set it to off too; the chain built below disambiguates the two cases rather than just
+    // counting occurrences of "off".
+
+    // Build the serial chain: start at "off" (the pre-existing default), and repeatedly find the
+    // call whose `previous` matches the current head, extending the chain by that call's `mode`.
+    // A correct serialization produces a chain of exactly modes.length links with no leftovers.
+    let current = 'off';
+    const consumed = new Set<number>();
+    const chain: string[] = [current];
+    for (let step = 0; step < modes.length; step++) {
+      const idx = results.findIndex(
+        (r, i) => !consumed.has(i) && (r.previous as string) === current,
+      );
+      expect(idx).toBeGreaterThanOrEqual(0);
+      consumed.add(idx);
+      const nextMode = setValues[idx];
+      if (nextMode === undefined) throw new Error('unreachable: idx was just found in results');
+      current = nextMode;
+      chain.push(current);
+    }
+    // Every call was consumed into the chain — none left over reporting a `previous` nobody ever
+    // set (which would mean the chain forked or a value came from nowhere).
+    expect(consumed.size).toBe(modes.length);
+
+    // The final persisted state equals the mode set by whichever call ran last in the chain.
+    const finalReport = structured(
+      await client.callTool({ name: 'set_rewrite_mode', arguments: { project: 'draft' } }),
+    );
+    expect(finalReport.mode).toBe(chain[chain.length - 1]);
+  });
+});
+
 describe('list_projects reports the effective rewrite mode', () => {
   it('says nothing in the text about a mode nobody chose, and names one that was', async () => {
     // The built-in default is not a setting: announcing it on every line of a fresh install is

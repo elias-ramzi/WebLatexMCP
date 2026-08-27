@@ -30,8 +30,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   and ending at the end of one — and never on a `replaceAll` edit, since neither leaves a single safe
   place to put a `%`-comment; either case applies the edit unchanged instead. The preserved block carries
   no sentinel marker on purpose — it should look exactly like a paragraph a human commented out by hand,
-  and `arxiv-clean-project` already strips comments before submission. `list_projects` and `server_info`
-  report the effective/default mode so it is never a hidden setting.
+  and `arxiv-clean-project` already strips comments before submission. `list_projects` reports the
+  effective mode per project and `server_info` the server-wide default, both with an `envConfigured`
+  flag distinguishing a mode someone actually set from the built-in `off`, so it is never a hidden
+  setting. Because preserving duplicates `oldString` into the file, a later edit **in the same call**
+  that matches only inside a block an earlier edit preserved is refused rather than applied — it would
+  otherwise rewrite dead commented-out text and report success for a change no reader would ever see.
 
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
