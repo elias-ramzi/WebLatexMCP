@@ -232,16 +232,26 @@ describe('set_rewrite_mode concurrency', () => {
     // identically even if the `previous` read were hoisted outside runExclusive — it does not
     // pin the concurrency claim at all.
     //
-    // Here three calls fire together (Promise.all), each setting a different mode. Under real
-    // serialization inside the lock, exactly one call sees the pre-existing "off" default as its
-    // `previous`, and the other two each see the mode set by whichever call ran immediately
-    // before it — forming one consistent serial chain with no two calls reporting the same
-    // `previous`. If the `previous` read were hoisted outside the lock, two racers could both
-    // read "off" before either write lands, and this test would see a duplicate `previous`
-    // value — see the mutation drill in the task report for the observed failure.
+    // Two calls, not three, and neither of them sets the starting mode. That is forced, not
+    // stylistic: "no two report the same previous" only holds when every call actually CHANGES
+    // the stored mode. A call that sets the mode it already has is a no-op transition, so the
+    // next caller in the chain correctly reports the same `previous` — a duplicate produced by
+    // textbook serialization, not by a race. With three modes and a starting state of 'off',
+    // any set of three concurrent calls must repeat a mode or set 'off' onto 'off', so two
+    // calls setting 'prose' and 'always' from 'off' is the largest fan-out whose `previous`
+    // values are distinct under every interleaving:
+    //
+    //   prose first  -> previous: ['off', 'prose']
+    //   always first -> previous: ['off', 'always']
+    //
+    // Both orders are legal and both are duplicate-free, so the assertion below is decided by
+    // serialization alone and never by scheduling. (A three-call version of this test failed on
+    // the Windows runner for exactly that reason, having passed on Linux and macOS: the 'off'
+    // call happened to win the lock first.) Under a `previous` read hoisted outside the lock,
+    // both racers read 'off' before either write lands and both report it — still caught here.
     const { client } = await setup();
 
-    const modes = ['always', 'prose', 'off'] as const;
+    const modes = ['prose', 'always'] as const;
     const results = await Promise.all(
       modes.map((mode) =>
         client
@@ -253,19 +263,14 @@ describe('set_rewrite_mode concurrency', () => {
     const previousValues = results.map((r) => r.previous as string);
     const setValues = results.map((r) => r.mode as string);
 
-    // No two calls may report the same previous — the assertion that actually catches a hoisted
-    // read: two racers reading the same pre-write value would both report "off".
+    // The assertion that catches a hoisted read: two racers both reading the pre-write 'off'
+    // would report it twice. Sound here only because neither call sets 'off' (see above).
     expect(new Set(previousValues).size).toBe(previousValues.length);
 
-    // Exactly one call reports the pre-existing starting state ("off", the default with nothing
-    // stored) as its previous — the call that acquired the lock first. "off" is also one of the
-    // three modes being set, so a call could legitimately report previous: "off" because a peer
-    // just set it to off too; the chain built below disambiguates the two cases rather than just
-    // counting occurrences of "off".
-
-    // Build the serial chain: start at "off" (the pre-existing default), and repeatedly find the
-    // call whose `previous` matches the current head, extending the chain by that call's `mode`.
-    // A correct serialization produces a chain of exactly modes.length links with no leftovers.
+    // Build the serial chain: start at 'off' (the pre-existing default, nothing stored), and
+    // repeatedly find the call whose `previous` matches the current head, extending by that
+    // call's `mode`. Distinct `previous` values make this reconstruction unambiguous — with
+    // duplicates, findIndex could consume the wrong call and hide a genuine fork.
     let current = 'off';
     const consumed = new Set<number>();
     const chain: string[] = [current];
