@@ -47,6 +47,13 @@ export class LockTimeoutError extends Error {
   }
 }
 
+/**
+ * Removing the lock file is the release. Windows can transiently refuse it (EPERM/EBUSY) while a
+ * handle is still closing, so ask `rm` to retry rather than letting a release fail and strand the
+ * lock. Elsewhere the retries never fire.
+ */
+const RM_OPTS = { force: true, maxRetries: 5, retryDelay: 20 } as const;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Whether `pid` is a live process. Meaningful only on this machine — see the module comment. */
@@ -85,7 +92,13 @@ async function tryAcquire(lockPath: string, owner: string | undefined): Promise<
     }
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return false;
+    // Windows reports a *delete-pending* file — the previous holder called `rm` but its handle is
+    // not yet fully closed — as EPERM/EACCES rather than EEXIST. That is contention, not a real
+    // failure, so treat it as "held" and let the caller poll; if it truly is a permission problem
+    // the wait ends in a LockTimeoutError rather than a spurious hard failure mid-operation.
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) return false;
     throw err;
   }
 }
@@ -101,7 +114,7 @@ async function reclaimIfStale(lockPath: string, staleMs: number): Promise<boolea
   // once it has stopped being touched.
   const abandoned = holder && !pidAlive(holder.pid) ? true : await olderThan(lockPath, staleMs);
   if (!abandoned) return false;
-  await rm(lockPath, { force: true });
+  await rm(lockPath, RM_OPTS);
   return true;
 }
 
@@ -148,6 +161,6 @@ export async function withFileLock<T>(
     return await fn();
   } finally {
     clearInterval(heartbeat);
-    await rm(lockPath, { force: true });
+    await rm(lockPath, RM_OPTS);
   }
 }

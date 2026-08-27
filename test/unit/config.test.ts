@@ -230,15 +230,18 @@ describe('loadConfig', () => {
 });
 
 describe('parseExtraWritingGuide', () => {
-  const cwd = '/work/paper';
+  // Absolute paths are platform-shaped: on Windows `/work/paper` resolves onto the current
+  // drive, so the expectations are built from `path.resolve` rather than POSIX literals.
+  const cwd = path.resolve('/work/paper');
+  const absoluteGuide = path.resolve('/etc/conventions.md');
 
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   it('resolves a plain absolute path', () => {
-    const result = parseExtraWritingGuide('/etc/conventions.md', cwd);
-    expect(result).toEqual({ path: '/etc/conventions.md' });
+    const result = parseExtraWritingGuide(absoluteGuide, cwd);
+    expect(result).toEqual({ path: absoluteGuide });
   });
 
   it('resolves a relative path against cwd', () => {
@@ -254,9 +257,9 @@ describe('parseExtraWritingGuide', () => {
   });
 
   it('accepts a file:// URL and resolves to the same path as the plain-path case', () => {
-    const url = pathToFileURL('/etc/conventions.md').toString();
+    const url = pathToFileURL(absoluteGuide).toString();
     const result = parseExtraWritingGuide(url, cwd);
-    expect(result).toEqual({ path: '/etc/conventions.md' });
+    expect(result).toEqual({ path: absoluteGuide });
   });
 
   it('is unset when nothing was named', () => {
