@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile, utimes } from 'node:fs/promises';
-import { withFileLock, LockTimeoutError, isLockContentionError } from '../../src/lib/fileLock.js';
+import type { FileHandle } from 'node:fs/promises';
+import {
+  withFileLock,
+  LockTimeoutError,
+  isLockContentionError,
+  tryAcquire,
+} from '../../src/lib/fileLock.js';
+import type { LockAttemptDeps } from '../../src/lib/fileLock.js';
 
 describe('withFileLock', () => {
   let dir: string;
@@ -203,42 +210,128 @@ describe('isLockContentionError', () => {
   });
 });
 
-describe('win32 delete-pending retry decision (defect A)', () => {
-  // The real retry lives inside tryAcquire, which is not exported (it talks to the filesystem
-  // directly), and the win32 branch cannot execute on this Linux machine anyway. What's
-  // unit-testable everywhere is the *decision* tryAcquire makes: given a first-attempt outcome,
-  // does it retry once before rethrowing, and does a retry that succeeds (or finds contention)
-  // suppress the original error? This mirrors that decision in isolation.
-  function decide(
-    platform: string,
-    firstCode: string | undefined,
-    firstLockFileExists: boolean,
-    retryOutcome: 'acquired' | 'contended' | 'permission-failure',
-  ): 'acquired' | 'contended' | 'rethrow-first' | 'rethrow-retry' {
-    if (isLockContentionError(firstCode, platform, () => firstLockFileExists)) return 'contended';
-    const isPermissionCode = firstCode === 'EPERM' || firstCode === 'EACCES';
-    if (platform !== 'win32' || !isPermissionCode) return 'rethrow-first';
-    // Retry once.
-    if (retryOutcome === 'acquired') return 'acquired';
-    if (retryOutcome === 'contended') return 'contended';
-    return 'rethrow-retry';
+describe('tryAcquire (win32 delete-pending retry)', () => {
+  let dir: string;
+  let lock: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-tryacquire-'));
+    lock = path.join(dir, 'project.lock');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  type FakeHandle = Pick<FileHandle, 'writeFile' | 'close'>;
+  /** A scripted attempt: `'ok'` to acquire, otherwise the errno code the open() rejects with. */
+  type Outcome = 'ok' | 'EPERM' | 'EACCES' | 'EEXIST' | 'ENOSPC';
+
+  /** Builds a fake opener from a scripted list of outcomes; tracks how many times it was called. */
+  function fakeOpener(outcomes: Outcome[]): {
+    opener: (lockPath: string) => Promise<FakeHandle>;
+    calls: () => number;
+    written: () => string[];
+  } {
+    let callCount = 0;
+    const writes: string[] = [];
+    const opener = async (_lockPath: string): Promise<FakeHandle> => {
+      const outcome = outcomes[callCount];
+      callCount += 1;
+      if (outcome === undefined) {
+        throw new Error(`fakeOpener called more times (${callCount}) than scripted`);
+      }
+      if (outcome === 'ok') {
+        const handle: FakeHandle = {
+          writeFile: async (data) => {
+            writes.push(typeof data === 'string' ? data : data.toString());
+          },
+          close: async () => {},
+        };
+        return handle;
+      }
+      const err = new Error(`scripted failure: ${outcome}`) as NodeJS.ErrnoException;
+      err.code = outcome;
+      throw err;
+    };
+    return { opener, calls: () => callCount, written: () => writes };
   }
 
-  it('retries once when the lock file was absent at the first EPERM/EACCES, and succeeds if the delete-pending race has resolved', () => {
-    expect(decide('win32', 'EPERM', false, 'acquired')).toBe('acquired');
-    expect(decide('win32', 'EACCES', false, 'contended')).toBe('contended');
+  function deps(outcomes: Outcome[], platform: string): LockAttemptDeps & { calls: () => number } {
+    const fake = fakeOpener(outcomes);
+    return { opener: fake.opener, platform, calls: fake.calls };
+  }
+
+  it('default deps still work on a fresh path, and a second call sees contention', async () => {
+    const acquired = await tryAcquire(lock, 'owner-a');
+    expect(acquired).toBe(true);
+    const contents = JSON.parse(await readFile(lock, 'utf8')) as { pid: number; owner?: string };
+    expect(contents.pid).toBe(process.pid);
+    expect(contents.owner).toBe('owner-a');
+
+    const second = await tryAcquire(lock, 'owner-b');
+    expect(second).toBe(false);
   });
 
-  it('still rethrows when the retry also fails with a permission code and the file is still absent', () => {
-    expect(decide('win32', 'EPERM', false, 'permission-failure')).toBe('rethrow-retry');
+  it('win32 EPERM, lock file absent, retry acquires', async () => {
+    const d = deps(['EPERM', 'ok'], 'win32');
+    await expect(tryAcquire(lock, 'owner', d)).resolves.toBe(true);
+    expect(d.calls()).toBe(2);
   });
 
-  it('never retries off win32', () => {
-    expect(decide('linux', 'EPERM', false, 'acquired')).toBe('rethrow-first');
-    expect(decide('darwin', 'EACCES', false, 'acquired')).toBe('rethrow-first');
+  it('win32 EACCES, lock file absent, retry finds contention', async () => {
+    const d = deps(['EACCES', 'EEXIST'], 'win32');
+    await expect(tryAcquire(lock, 'owner', d)).resolves.toBe(false);
+    expect(d.calls()).toBe(2);
   });
 
-  it('never retries a non-permission code', () => {
-    expect(decide('win32', 'ENOSPC', false, 'acquired')).toBe('rethrow-first');
+  it('win32 EPERM, lock file absent, retry fails EPERM again — throws the retry error', async () => {
+    let callIndex = 0;
+    const messages = ['first failure', 'second failure'];
+    const opener = async (): Promise<FakeHandle> => {
+      const message = messages[callIndex];
+      callIndex += 1;
+      const err = new Error(message) as NodeJS.ErrnoException;
+      err.code = 'EPERM';
+      throw err;
+    };
+    const d: LockAttemptDeps = { opener, platform: 'win32' };
+    await expect(tryAcquire(lock, 'owner', d)).rejects.toThrow('second failure');
+    expect(callIndex).toBe(2);
+  });
+
+  it('win32 EPERM with the lock file present — treated as contention, no retry', async () => {
+    await writeFile(lock, 'existing-holder');
+    const d = deps(['EPERM'], 'win32');
+    await expect(tryAcquire(lock, 'owner', d)).resolves.toBe(false);
+    expect(d.calls()).toBe(1);
+  });
+
+  it('not win32 — EPERM/EACCES are surfaced immediately, no retry', async () => {
+    const linuxDeps = deps(['EPERM'], 'linux');
+    await expect(tryAcquire(lock, 'owner', linuxDeps)).rejects.toThrow();
+    expect(linuxDeps.calls()).toBe(1);
+
+    const darwinDeps = deps(['EACCES'], 'darwin');
+    await expect(tryAcquire(lock, 'owner', darwinDeps)).rejects.toThrow();
+    expect(darwinDeps.calls()).toBe(1);
+  });
+
+  it('win32, non-permission code — surfaced immediately, no retry', async () => {
+    const d = deps(['ENOSPC'], 'win32');
+    await expect(tryAcquire(lock, 'owner', d)).rejects.toThrow();
+    expect(d.calls()).toBe(1);
+  });
+
+  it('the written contents go through the injected opener', async () => {
+    const fake = fakeOpener(['ok']);
+    const d: LockAttemptDeps = { opener: fake.opener, platform: 'linux' };
+    await expect(tryAcquire(lock, 'owner-c', d)).resolves.toBe(true);
+    const written = fake.written();
+    expect(written).toHaveLength(1);
+    expect(JSON.parse(written[0] as string)).toMatchObject({
+      pid: process.pid,
+      owner: 'owner-c',
+    });
   });
 });

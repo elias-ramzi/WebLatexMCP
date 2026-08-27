@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { open, mkdir, readFile, rm, stat, utimes } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 
 /**
  * An advisory cross-process lock built on exclusive file creation (`O_EXCL`), which is atomic on
@@ -114,10 +115,25 @@ export function isLockContentionError(
 /** The outcome of one raw attempt to create the lock file. */
 type OpenAttempt = 'acquired' | 'contended' | NodeJS.ErrnoException;
 
+/** The part of a FileHandle the lock file needs — narrow so a test can supply a fake. */
+type LockHandle = Pick<FileHandle, 'writeFile' | 'close'>;
+/** Exclusive-create open of the lock file. Injectable so the win32 retry is testable off win32. */
+type LockOpener = (lockPath: string) => Promise<LockHandle>;
+
+/** Test seam for `tryAcquire`. Defaults are the real filesystem and the real platform. */
+export interface LockAttemptDeps {
+  opener: LockOpener;
+  platform: string;
+}
+
 /** Attempt to create the lock file once, with no retry. */
-async function attemptOpen(lockPath: string, owner: string | undefined): Promise<OpenAttempt> {
+async function attemptOpen(
+  lockPath: string,
+  owner: string | undefined,
+  deps: LockAttemptDeps,
+): Promise<OpenAttempt> {
   try {
-    const handle = await open(lockPath, 'wx');
+    const handle = await deps.opener(lockPath);
     const contents: LockFileContents = {
       pid: process.pid,
       owner,
@@ -131,16 +147,27 @@ async function attemptOpen(lockPath: string, owner: string | undefined): Promise
     return 'acquired';
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (isLockContentionError(code, process.platform, () => existsSync(lockPath))) {
+    if (isLockContentionError(code, deps.platform, () => existsSync(lockPath))) {
       return 'contended';
     }
     return err as NodeJS.ErrnoException;
   }
 }
 
-/** Try to take the lock once. Returns false if someone else currently holds it. */
-async function tryAcquire(lockPath: string, owner: string | undefined): Promise<boolean> {
-  const first = await attemptOpen(lockPath, owner);
+/**
+ * Try to take the lock once. Returns false if someone else currently holds it.
+ *
+ * Exported as an internal test seam only — `deps` lets a test drive the win32 delete-pending
+ * retry (below) without a Windows machine. `withFileLock` is the sole production caller, and it
+ * always uses the default `deps`, which read the real filesystem and the real platform live on
+ * each call.
+ */
+export async function tryAcquire(
+  lockPath: string,
+  owner: string | undefined,
+  deps: LockAttemptDeps = { opener: (p) => open(p, 'wx'), platform: process.platform },
+): Promise<boolean> {
+  const first = await attemptOpen(lockPath, owner, deps);
   if (first === 'acquired') return true;
   if (first === 'contended') return false;
 
@@ -150,8 +177,8 @@ async function tryAcquire(lockPath: string, owner: string | undefined): Promise<
   // inside it, so "no lock file" at that instant doesn't mean the open() itself wasn't racing a
   // delete-pending handle. Re-attempt once before treating it as real: if the retry succeeds or
   // finds contention, this was the race; only a second permission failure is surfaced.
-  if (process.platform === 'win32' && (first.code === 'EPERM' || first.code === 'EACCES')) {
-    const retry = await attemptOpen(lockPath, owner);
+  if (deps.platform === 'win32' && (first.code === 'EPERM' || first.code === 'EACCES')) {
+    const retry = await attemptOpen(lockPath, owner, deps);
     if (retry === 'acquired') return true;
     if (retry === 'contended') return false;
     throw retry;
