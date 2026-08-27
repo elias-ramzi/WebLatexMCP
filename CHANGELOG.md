@@ -59,6 +59,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   single-file agent, and how the fan-out is batched. Contributor tooling under `.claude/` throughout: no tool, no
   runtime behaviour, and nothing in `src/` changed.
 
+- **A `/review` command** — the review half of `review-round`, driven by hand instead of by a
+  workflow script, so it costs a session rather than a fleet and reports before it touches
+  anything. It scopes the target itself (a PR number through `gh`, a branch, or the working tree),
+  resolving the base as the PR's own base and otherwise `origin/dev` — the integration branch —
+  rather than `main`, and groups the touched files by the risk they carry here: the
+  `src/services`/`src/lib` core, the `src/tools` + `src/server.ts` surface, the `context.ts` /
+  `config.ts` wiring, skills and prompts, tests, docs. Then it runs the one gate this repo has
+  (`typecheck` + `lint` + `format:check` + `test`) **itself** before delegating, because a green a
+  subagent reports is not evidence, and it reads the skip count rather than the pass line — the
+  TeX smokes auto-skip wherever `latexmk` is absent, so a green `npm test` over compile-adjacent
+  code is a vacuous pass, which is the failure mode the whole review exists to catch. The review
+  goes to the existing `plan-verifier` agent (there is no separate reviewer agent here, and one
+  more agent restating the same invariants is one more copy to drift), with the stated intent as
+  the spec and the CLAUDE.md guards the diff comes near named outright. Report-only by default:
+  the implement/verify loop runs only under `--fix`, capped at three rounds, and a finding that is
+  really the author's call — a design disagreement, a scope question — is reported and never
+  "fixed". Posting the verdict to the PR and pushing the fixes are two separate steps, each gated
+  on an explicit go, which is the deliberate difference from the workflow's unattended commit.
+  Adapted from a sibling repo: the shape carried over, every rule was rewritten for this one.
+  Contributor tooling under `.claude/`; no tool, no runtime behaviour, nothing in `src/`.
+
 - **A `review-round` workflow and the two agents it drives** — contributor tooling under
   `.claude/`, which changes nothing about the server itself: no tool, no runtime behaviour. The
   workflow performs one review round end to end: by default an adversarial reviewer produces the
