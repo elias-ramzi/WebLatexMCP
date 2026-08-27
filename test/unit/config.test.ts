@@ -276,4 +276,26 @@ describe('parseRewriteMode', () => {
     const message = spy.mock.calls[0]?.[0] as string;
     expect(message).toContain('bogus');
   });
+
+  it('wires rewriteModeExplicit into loadConfig too, distinguishing a configured default from the built-in one', () => {
+    // rewriteMode is populated the same way whether or not the user set anything — only
+    // rewriteModeExplicit tells `list_projects` (envConfigured) apart from a plain default
+    // install, so it has to be asserted on its own, not inferred from rewriteMode alone.
+    expect(loadConfig({}, '/some/dir', notInRepo).rewriteModeExplicit).toBe(false);
+
+    // A rejected value is not a choice: even though the invalid input falls back to the same
+    // mode as unset, it must NOT be reported as explicit — this is the case a hardcoded
+    // `rewriteModeExplicit: true` in loadConfig would sail through undetected.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir', notInRepo)
+        .rewriteModeExplicit,
+    ).toBe(false);
+    spy.mockRestore();
+
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo)
+        .rewriteModeExplicit,
+    ).toBe(true);
+  });
 });

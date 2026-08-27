@@ -24,9 +24,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   defaults from `WEB_LATEX_MCP_REWRITE_MODE`; a per-call `preserveOriginal` on `edit_file` always wins
   over both, in either direction. Never applies to `write_file` (no single old paragraph to comment out
   above — the whole prior file isn't the same thing) or to a `.bib` (already gated by `confirmBibEdit`).
-  The preserved block carries no sentinel marker on purpose — it should look exactly like a paragraph a
-  human commented out by hand, and `arxiv-clean-project` already strips comments before submission.
-  `list_projects` and `server_info` report the effective/default mode so it is never a hidden setting.
+  Preservation only fires on a **line-aligned** match — `oldString` starting at the beginning of a line
+  and ending at the end of one — and never on a `replaceAll` edit, since neither leaves a single safe
+  place to put a `%`-comment; either case applies the edit unchanged instead. The preserved block carries
+  no sentinel marker on purpose — it should look exactly like a paragraph a human commented out by hand,
+  and `arxiv-clean-project` already strips comments before submission. `list_projects` and `server_info`
+  report the effective/default mode so it is never a hidden setting.
 
 - **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
   `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels

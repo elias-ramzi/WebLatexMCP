@@ -407,7 +407,20 @@ export class FileService {
     projectDir: string,
     relPath: string,
     edits: EditOp[],
-    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
+    opts: {
+      overrideExternalChanges?: boolean;
+      strictLinks?: boolean;
+      /**
+       * Optional hook letting a caller rewrite the replacement text for a single edit, given the
+       * position of the (unique, non-replaceAll) match in the file's *current* content. Used by
+       * `edit_file`'s rewrite-preservation feature to decide, with the actual match position in
+       * hand, whether commenting out the original text is safe (see `src/lib/rewriteMode.ts`) —
+       * a decision `FileService` deliberately stays ignorant of, since it knows nothing about
+       * comment syntax. Not called for a `replaceAll` edit: there is no single match position,
+       * so preservation is skipped for those unconditionally.
+       */
+      transformNewString?: (edit: EditOp, matchIndex: number, content: string) => string;
+    } = {},
   ): Promise<{ path: string; appliedEdits: number }> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
@@ -432,9 +445,26 @@ export class FileService {
           `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
         );
       }
-      content = edit.replaceAll
-        ? content.split(edit.oldString).join(edit.newString)
-        : content.replace(edit.oldString, edit.newString);
+      const matchIndex = content.indexOf(edit.oldString);
+      const newString =
+        opts.transformNewString && !edit.replaceAll
+          ? opts.transformNewString(edit, matchIndex, content)
+          : edit.newString;
+      if (edit.replaceAll) {
+        // split/join is already literal-safe (no replacement-pattern interpretation) — leave it.
+        content = content.split(edit.oldString).join(edit.newString);
+      } else {
+        // Not `content.replace(edit.oldString, newString)`: String.prototype.replace treats a
+        // string *replacement* argument specially — $$, $&, $`, $', $1 etc. are substitution
+        // patterns, not literal text — and LaTeX is full of literal `$`. That corrupts both a
+        // caller-supplied newString containing e.g. `$$100$$` and, since preservation generates
+        // the replacement text server-side, text the user never typed at all. Splice at the
+        // already-computed matchIndex instead so newString lands byte-exact, unconditionally.
+        content =
+          content.slice(0, matchIndex) +
+          newString +
+          content.slice(matchIndex + edit.oldString.length);
+      }
     });
     await writeFile(abs, content, 'utf8');
     this.revisions.record(abs, content);

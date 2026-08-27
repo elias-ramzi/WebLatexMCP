@@ -159,8 +159,10 @@ To add a reference, use the two-step DBLP flow:
 
 Overleaf users commonly comment out the paragraph they are replacing rather than delete it, so the
 old wording stays in the source next to the new one. `edit_file` can do this automatically on a
-`.tex`/`.sty`/`.cls`/`.bbl` file — commenting the original text out with `% ` above the replacement,
-never deleting it — controlled by a project's **rewrite mode**:
+`.tex`/`.sty`/`.cls`/`.bbl` file — commenting the original text out with `% ` above the
+replacement, in place of deleting it — controlled by a project's **rewrite mode**. This only
+happens for an edit that qualifies at all (see the line-alignment and `replaceAll` restrictions
+below); an edit that doesn't qualify always applies the ordinary way, whatever the mode:
 
 - **`off`** — never preserve; the edit replaces the text as usual.
 - **`prose`** (default) — preserve only when the edit looks like a rewritten sentence or paragraph:
@@ -169,7 +171,9 @@ never deleting it — controlled by a project's **rewrite mode**:
   `\cite` key, or a renamed `\label` all fall through as `minor` and are not preserved.
   `edit_file`'s result names the resolved mode as `rewriteMode` and how many of the call's edits were
   preserved as `preservedEdits`.
-- **`always`** — preserve every edit on an applicable file, regardless of shape.
+- **`always`** — preserve every edit that qualifies (see below) on an applicable file. This is not
+  "regardless of shape": a mid-line match or a `replaceAll` edit is never preserved, whatever the
+  mode.
 
 It never applies to `write_file` (a whole-file overwrite has no single old paragraph to comment out
 above the new one — commenting out the entire previous file is not what preserving a rewrite means)
@@ -189,14 +193,23 @@ The preserved block is never marked — it looks exactly like a paragraph a huma
 Overleaf, with no sentinel. `arxiv-clean-project` already strips comments before submission, so this
 never needs undoing programmatically.
 
+**Preservation requires a line-aligned match, and never applies to `replaceAll`.** An edit is only
+ever preserved when `oldString` starts at the beginning of a line and ends at the end of a line in
+the file's current content — either because a line terminator (or end of file) immediately follows
+the match, or because `oldString` itself already ends with one (a caller can include the trailing
+newline in what it wants replaced or deleted). A mid-line match has nowhere safe to put a
+`%`-comment (a mid-line deletion would swallow the rest of that line into the comment; a mid-line
+replacement would reflow trailing text onto the replacement's line). And an edit with
+`replaceAll: true` is never preserved at all, since there is no single match position to comment
+above it — it always applies unchanged. Neither case counts toward `preservedEdits`.
+
 **A preservation duplicates `oldString` in the file.** `edit_file` counts occurrences of
 `oldString` in the file's _current_ content, so once a rewrite has been preserved, the same
 `oldString` now exists twice — once live, once in the commented-out block above it. A later
 `edit_file` call whose `oldString` still occurs verbatim in that preserved block therefore matches
 both: without `replaceAll` it is refused as non-unique ("add more surrounding context"), and with
-`replaceAll: true` it silently rewrites the preserved comment too, defeating the "provably the
-bytes that were there" guarantee. Prefer including enough surrounding context in `oldString` to
-land only on the live text.
+`replaceAll: true` it silently rewrites the preserved comment too, right along with the live text.
+Prefer including enough surrounding context in `oldString` to land only on the live text.
 
 ## References in any format
 

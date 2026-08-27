@@ -380,6 +380,161 @@ describe('edit_file rewrite-preservation mode', () => {
     expect(textOf(res)).toContain('changed');
   });
 
+  it(
+    'a mid-line deletion under the default prose mode leaves the rest of the line ' +
+      'intact and uncommented, and reports preservedEdits: 0',
+    async () => {
+      const { client, userDir } = await setup();
+      const MID_LINE_OLD =
+        'This is a long prose sentence with many ordinary words here to satisfy the prose gate.';
+      const content = `Alpha beta. ${MID_LINE_OLD} Gamma delta.\n`;
+      await writeFile(path.join(userDir, 'main.tex'), content, 'utf8');
+      await client.callTool({
+        name: 'register_project',
+        arguments: { project: 'p', path: userDir },
+      });
+      // Default mode: no set_rewrite_mode call — the env/project default is 'prose'.
+
+      const res = await client.callTool({
+        name: 'edit_file',
+        arguments: {
+          project: 'p',
+          path: 'main.tex',
+          edits: [{ oldString: MID_LINE_OLD, newString: '' }],
+        },
+      });
+      expect(res.isError ?? false).toBe(false);
+      const out = structured<{ rewriteMode: string; preservedEdits: number }>(res);
+      expect(out.rewriteMode).toBe('prose');
+      // Not line-aligned (MID_LINE_OLD starts and ends mid-line), so preservation must decline —
+      // otherwise "Gamma delta." would be silently commented out even though it was never part
+      // of oldString.
+      expect(out.preservedEdits).toBe(0);
+
+      const read = await client.callTool({
+        name: 'read_file',
+        arguments: { project: 'p', path: 'main.tex' },
+      });
+      const resultContent = structured<{ content: string }>(read).content;
+      expect(resultContent).toBe('Alpha beta.  Gamma delta.\n');
+      expect(resultContent).not.toContain('%');
+      expect(resultContent).toContain('Gamma delta.');
+    },
+  );
+
+  it(
+    'a preserved comment survives verbatim when the original prose contains $-patterns ' +
+      '(the server generates the replacement text server-side here, so this hits text the ' +
+      'user never typed — String.prototype.replace would otherwise mangle $&/$$/etc. in it)',
+    async () => {
+      const { client, userDir } = await setup();
+      const DOLLAR_OLD =
+        'The mean score $a$&$b$ improves over every previous published baseline here today.';
+      const DOLLAR_NEW =
+        'The updated score now clearly exceeds every previous published baseline reported here.';
+      await writeFile(path.join(userDir, 'main.tex'), `${DOLLAR_OLD}\n`, 'utf8');
+      await client.callTool({
+        name: 'register_project',
+        arguments: { project: 'p', path: userDir },
+      });
+      await client.callTool({
+        name: 'set_rewrite_mode',
+        arguments: { project: 'p', mode: 'always' },
+      });
+
+      const res = await client.callTool({
+        name: 'edit_file',
+        arguments: {
+          project: 'p',
+          path: 'main.tex',
+          edits: [{ oldString: DOLLAR_OLD, newString: DOLLAR_NEW }],
+        },
+      });
+      expect(res.isError ?? false).toBe(false);
+      const out = structured<{ preservedEdits: number }>(res);
+      expect(out.preservedEdits).toBe(1);
+
+      const read = await client.callTool({
+        name: 'read_file',
+        arguments: { project: 'p', path: 'main.tex' },
+      });
+      const content = structured<{ content: string }>(read).content;
+      expect(content).toBe(`% ${DOLLAR_OLD}\n${DOLLAR_NEW}\n`);
+    },
+  );
+
+  it('a whole-line deletion under always is still preserved (line-aligned match)', async () => {
+    const { client, userDir } = await setup();
+    const WHOLE_LINE_OLD =
+      'This whole line should be preserved as a comment when it is deleted outright entirely.';
+    await writeFile(
+      path.join(userDir, 'main.tex'),
+      `${WHOLE_LINE_OLD}\nsecond line stays.\n`,
+      'utf8',
+    );
+    await client.callTool({ name: 'register_project', arguments: { project: 'p', path: userDir } });
+    await client.callTool({
+      name: 'set_rewrite_mode',
+      arguments: { project: 'p', mode: 'always' },
+    });
+
+    const res = await client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'p',
+        path: 'main.tex',
+        edits: [{ oldString: WHOLE_LINE_OLD, newString: '' }],
+      },
+    });
+    const out = structured<{ preservedEdits: number }>(res);
+    expect(out.preservedEdits).toBe(1);
+
+    const read = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'p', path: 'main.tex' },
+    });
+    expect(structured<{ content: string }>(read).content).toBe(
+      `% ${WHOLE_LINE_OLD}\nsecond line stays.\n`,
+    );
+  });
+
+  it('an edit with replaceAll is never preserved, even under always', async () => {
+    const { client, userDir } = await setup();
+    const REPEATED =
+      'The quick brown fox jumps over the lazy dog while the sun sets slowly behind the hills.';
+    await writeFile(
+      path.join(userDir, 'main.tex'),
+      `${REPEATED}\nsomething else here.\n${REPEATED}\n`,
+      'utf8',
+    );
+    await client.callTool({ name: 'register_project', arguments: { project: 'p', path: userDir } });
+    await client.callTool({
+      name: 'set_rewrite_mode',
+      arguments: { project: 'p', mode: 'always' },
+    });
+
+    const res = await client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'p',
+        path: 'main.tex',
+        edits: [{ oldString: REPEATED, newString: PARAGRAPH_NEW, replaceAll: true }],
+      },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structured<{ rewriteMode: string; preservedEdits: number }>(res);
+    expect(out.rewriteMode).toBe('always');
+    expect(out.preservedEdits).toBe(0);
+
+    const read = await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'p', path: 'main.tex' },
+    });
+    const resultContent = structured<{ content: string }>(read).content;
+    expect(resultContent).toBe(`${PARAGRAPH_NEW}\nsomething else here.\n${PARAGRAPH_NEW}\n`);
+    expect(resultContent).not.toContain('%');
+  });
+
   it('oldString === newString still errors under preserveOriginal: true', async () => {
     const { client, userDir } = await setup();
     await writeFile(path.join(userDir, 'main.tex'), `${PARAGRAPH_OLD}\n`, 'utf8');

@@ -174,12 +174,24 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `% [preserved by web-latex-mcp]`, so a co-author sees a normal commented-out paragraph, not a
   machine-generated one, and `arxiv-clean-project` already strips comments before submission regardless.
   The cost — no tool can later tell an old paragraph from an author's own commented-out note — is
-  accepted, not overlooked. An edit with `oldString === newString` is left untransformed rather than
-  wrapped: `applyEdits` rejects that pair to catch a no-op edit, and transforming first would turn it into
-  `old` vs. `"% " + old + old`, which no longer matches and would silently disarm the check. As with
-  `parseCompilerChoice`, the mode is resolved in exactly one function — per-call `preserveOriginal` >
-  stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'prose'` — so no second code path can derive a
-  different answer.
+  accepted, not overlooked. The transform is not a pre-pass over the edit list — it runs _inside_
+  `FileService.applyEdits`, as a `transformNewString` hook called after that method's own
+  identical/not-found/non-unique guards, with the actual match position and file content in hand
+  (`src/lib/rewriteMode.ts`'s `createPreserveTransform`). That placement is load-bearing, not
+  incidental: an edit with `oldString === newString` never reaches the hook at all (`applyEdits`
+  rejects it first as a no-op), so there is no risk of the hook turning it into `old` vs.
+  `"% " + old + old` — a wrapping pass running _before_ that guard would silently disarm it. Two
+  more restrictions on when preservation actually fires, both easy to miss because they read as
+  "preserve every edit" from the mode name alone: **only a line-aligned match is ever preserved**
+  — `oldString` must start at the beginning of a line and end at the end of one (in the file's
+  current content, or by ending with its own trailing newline), because a mid-line match has no
+  safe place to put a `%`-comment without swallowing or reflowing text that was never part of
+  `oldString`; and **a `replaceAll` edit is never preserved**, since there is no single match
+  position to comment above — `applyEdits` skips the hook entirely for one, and the hook itself
+  checks `edit.replaceAll` again regardless, so neither call site can be the reason this guard
+  goes quiet. As with `parseCompilerChoice`, the mode is resolved in exactly one function —
+  per-call `preserveOriginal` > stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'prose'` —
+  so no second code path can derive a different answer.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)

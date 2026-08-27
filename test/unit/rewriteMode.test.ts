@@ -2,15 +2,33 @@ import { describe, it, expect } from 'vitest';
 import {
   commentOut,
   classifyEdit,
-  applyRewriteMode,
+  createPreserveTransform,
   resolveRewriteMode,
   supportsLineComments,
   NEAR_IDENTICAL_OVERLAP_THRESHOLD,
+  MIN_UNMATCHED_BIGRAMS_FOR_PROSE,
   nearIdenticalOverlap,
   tokenMultisetOverlap,
   markupMask,
 } from '../../src/lib/rewriteMode.js';
 import type { EditOp } from '../../src/services/fileService.js';
+
+/**
+ * Apply `edit` to `content` exactly the way `FileService.applyEdits` does for a non-replaceAll
+ * edit: find the (first, and here always unique) match, hand it to the transform to get the
+ * actual replacement text, then splice it in. Used so these unit tests exercise the transform
+ * the same way the real caller does, rather than calling it in isolation with a hand-picked
+ * `matchIndex` that might not correspond to a real match.
+ */
+function applyWithTransform(
+  content: string,
+  edit: EditOp,
+  transform: (edit: EditOp, matchIndex: number, content: string) => string,
+): string {
+  const matchIndex = content.indexOf(edit.oldString);
+  const newString = transform(edit, matchIndex, content);
+  return content.replace(edit.oldString, newString);
+}
 
 describe('commentOut', () => {
   it('prefixes a single line', () => {
@@ -38,6 +56,14 @@ describe('commentOut', () => {
   it('round-trips CRLF line endings', () => {
     expect(commentOut('a\r\nb\r\n')).toBe('% a\r\n% b\r\n');
     expect(commentOut('a\r\nb')).toBe('% a\r\n% b');
+  });
+
+  it('turns an empty CRLF line into a bare "%\\r" — no trailing space before the \\r', () => {
+    // Regression coverage: an earlier version of the map only special-cased the '' segment,
+    // missing the '\r'-only segment an empty CRLF line splits into, so it produced '% \r'
+    // (trailing space) instead of '%\r'.
+    expect(commentOut('\r\n')).toBe('%\r\n');
+    expect(commentOut('a\r\n\r\nb')).toBe('% a\r\n%\r\n% b');
   });
 
   it('handles an empty string', () => {
@@ -185,6 +211,20 @@ describe('classifyEdit', () => {
     expect(classifyEdit(oldString, '')).toBe('prose');
   });
 
+  it('classifies a total rewrite of a sentence containing escaped currency as prose', () => {
+    // Regression coverage: an earlier version let the escaped "\$100" toggle markupMask's inMath
+    // state, masking every token after it as markup for the rest of the string — only 4 of 13
+    // tokens counted as prose (a minority), so classifyEdit returned 'minor' for a totally
+    // different sentence. Now "\$100" is markup on its own (leading-backslash rule) but does not
+    // mask its neighbors, so the majority of tokens are prose and the near-identical check (very
+    // low overlap) correctly calls this a rewrite worth preserving.
+    const oldString =
+      'The annual budget of \\$100 covers every compute cost for the whole project.';
+    const newString =
+      'This entirely unrelated sentence discusses completely different topics using other words.';
+    expect(classifyEdit(oldString, newString)).toBe('prose');
+  });
+
   it('classifies a pure in-place expansion (old text wholly retained) as minor', () => {
     // Deliberate decision (see classifyEdit's doc comment): nothing is lost when the old text
     // survives verbatim inside the new text, so there is nothing to protect with a comment.
@@ -195,6 +235,79 @@ describe('classifyEdit', () => {
       ' Additional analysis in the appendix further supports this conclusion in detail.';
     expect(classifyEdit(oldString, newString)).toBe('minor');
   });
+
+  describe('absolute-loss floor (MIN_UNMATCHED_BIGRAMS_FOR_PROSE)', () => {
+    // A ~110-token paragraph built from ten independent ~11-token sentences. Deleting one
+    // sentence from the end or the start creates exactly one rejoin seam, so the *fraction* of
+    // surviving bigrams stays high (89.9%, well above NEAR_IDENTICAL_OVERLAP_THRESHOLD) even
+    // though a whole sentence — an 11-token clause, well past the floor — is gone. Before the
+    // absolute floor existed, that scored 'minor': a real deletion silently not preserved, and
+    // inconsistently so, since the identical deletion from the *middle* of the same paragraph
+    // (two seams) already scored 'prose'.
+    function sentences(n: number): string[] {
+      const out: string[] = [];
+      for (let i = 1; i <= n; i++) {
+        out.push(`The method achieves strong results in experimental setting number ${i} today.`);
+      }
+      return out;
+    }
+    const allSentences = sentences(10);
+    const oldString = allSentences.join(' ');
+
+    it('classifies a trailing sentence deleted from a long paragraph as prose', () => {
+      const newString = allSentences.slice(0, 9).join(' ');
+      expect(classifyEdit(oldString, newString)).toBe('prose');
+    });
+
+    it('classifies a leading sentence deleted from a long paragraph as prose', () => {
+      const newString = allSentences.slice(1).join(' ');
+      expect(classifyEdit(oldString, newString)).toBe('prose');
+    });
+
+    it('classifies an interior sentence deleted from a long paragraph as prose', () => {
+      const newString = allSentences.slice(0, 4).concat(allSentences.slice(5)).join(' ');
+      expect(classifyEdit(oldString, newString)).toBe('prose');
+    });
+
+    it('classifies a single one-token change in a long paragraph as minor', () => {
+      // Loses exactly 2 bigrams — well under the floor of 6 — and the fraction alone is also
+      // still high, so both tests agree: minor.
+      const newString = oldString.replace('setting number 5', 'setting count 5');
+      const oldTokens = oldString.split(/\s+/);
+      const newTokens = newString.split(/\s+/);
+      expect(nearIdenticalOverlap(oldTokens, newTokens)).toBeGreaterThanOrEqual(
+        NEAR_IDENTICAL_OVERLAP_THRESHOLD,
+      );
+      expect(classifyEdit(oldString, newString)).toBe('minor');
+    });
+
+    it('classifies two scattered one-token changes in a long paragraph as minor', () => {
+      // Loses exactly 4 bigrams — still under the floor of 6 — so this stays minor too, distinct
+      // from the three-change case documented on MIN_UNMATCHED_BIGRAMS_FOR_PROSE which crosses it.
+      const newString = oldString
+        .replace('setting number 5', 'setting count 5')
+        .replace('setting number 8', 'setting count 8');
+      expect(classifyEdit(oldString, newString)).toBe('minor');
+    });
+
+    it('is documented as 6 with the arithmetic that justifies it', () => {
+      expect(MIN_UNMATCHED_BIGRAMS_FOR_PROSE).toBe(6);
+    });
+  });
+
+  it(
+    'characterization: a hyphenation fix in a long sentence scores well below the fraction ' +
+      "threshold and is classified 'prose' — a known, safe-direction cost, not a bug. See " +
+      "NEAR_IDENTICAL_OVERLAP_THRESHOLD's docstring; this pins current behaviour rather than " +
+      'endorsing it.',
+    () => {
+      const oldString =
+        'The state of the art detector reaches ninety percent accuracy on this benchmark.';
+      const newString =
+        'The state-of-the-art detector reaches ninety percent accuracy on this benchmark.';
+      expect(classifyEdit(oldString, newString)).toBe('prose');
+    },
+  );
 });
 
 describe('nearIdenticalOverlap / tokenMultisetOverlap degenerate cases', () => {
@@ -233,9 +346,25 @@ describe('markupMask', () => {
     const tokens = ['we', '$x', '=', '1$', 'note'];
     expect(markupMask(tokens)).toEqual([false, true, true, true, false]);
   });
+
+  it('does not treat an escaped \\$ (currency) as a math-span toggle', () => {
+    // Regression coverage: an earlier version toggled inMath on any odd count of literal "$"
+    // chars, even when the "$" was escaped (currency, not a math delimiter), masking every token
+    // for the rest of the string as markup. "\$100" is already markup on its own (leading-
+    // backslash rule), but the tokens after it must stay unmasked.
+    const tokens = ['The', 'cost', 'is', '\\$100', 'today', 'and', 'tomorrow', 'too'];
+    expect(markupMask(tokens)).toEqual([false, false, false, true, false, false, false, false]);
+  });
 });
 
-describe('applyRewriteMode', () => {
+describe('createPreserveTransform', () => {
+  // NOTE: this describe block used to be `applyRewriteMode` (a function that transformed a whole
+  // edit list up front, with no idea where `oldString` sat in the file). That function is gone —
+  // the decision moved into `FileService.applyEdits`, where the match position and file content
+  // are actually known, so it can refuse to preserve a mid-line match. The tests below are
+  // written against `createPreserveTransform`'s `transform` hook, driven the same way
+  // `FileService.applyEdits` drives it (see `applyWithTransform` above): find the match, ask the
+  // hook for the replacement, splice it in.
   const longProse: EditOp = {
     oldString:
       'The proposed method achieves strong results on the benchmark and generalizes well across ' +
@@ -249,39 +378,50 @@ describe('applyRewriteMode', () => {
     newString: 'We propose a novel method that improves accuracy across all benchmarks tested.',
   };
 
-  it('off preserves nothing and leaves edits unchanged', () => {
-    const result = applyRewriteMode([longProse, minorTypo], 'off');
-    expect(result.preservedEdits).toBe(0);
-    expect(result.edits).toEqual([longProse, minorTypo]);
+  it('off preserves nothing and leaves content unchanged', () => {
+    const content = `${longProse.oldString}\n${minorTypo.oldString}\n`;
+    const preserve = createPreserveTransform('off');
+    const afterFirst = applyWithTransform(content, longProse, preserve.transform);
+    expect(afterFirst).toBe(`${longProse.newString}\n${minorTypo.oldString}\n`);
+    expect(preserve.preservedEdits()).toBe(0);
   });
 
-  it('always preserves every edit, including a deletion with no trailing blank line', () => {
+  it('always preserves a whole-line edit, and a whole-line deletion with no trailing blank line', () => {
     const deletion: EditOp = {
       oldString: 'delete this whole sentence please right now today.',
       newString: '',
     };
-    const result = applyRewriteMode([longProse, deletion], 'always');
-    expect(result.preservedEdits).toBe(2);
-    expect(result.edits[0]!.newString).toBe(
-      commentOut(longProse.oldString) + '\n' + longProse.newString,
+    const content = `${longProse.oldString}\n${deletion.oldString}\n`;
+    const preserve = createPreserveTransform('always');
+
+    const afterFirst = applyWithTransform(content, longProse, preserve.transform);
+    expect(afterFirst).toBe(
+      `${commentOut(longProse.oldString)}\n${longProse.newString}\n${deletion.oldString}\n`,
     );
-    expect(result.edits[1]!.newString).toBe(commentOut(deletion.oldString));
-    expect(result.edits[1]!.newString.endsWith('\n')).toBe(false);
+
+    const afterSecond = applyWithTransform(afterFirst, deletion, preserve.transform);
+    // The deletion's line (including its own trailing newline in the file) is replaced by just
+    // the commented block — no stray blank line left behind.
+    expect(afterSecond).toBe(
+      `${commentOut(longProse.oldString)}\n${longProse.newString}\n${commentOut(deletion.oldString)}\n`,
+    );
+    expect(preserve.preservedEdits()).toBe(2);
   });
 
   it('prose mode discriminates: preserves the prose edit, not the minor one', () => {
-    const result = applyRewriteMode([longProse, minorTypo], 'prose');
-    expect(result.preservedEdits).toBe(1);
-    expect(result.edits[0]!.newString).toBe(
-      commentOut(longProse.oldString) + '\n' + longProse.newString,
-    );
-    expect(result.edits[1]!).toEqual(minorTypo);
-  });
+    const content = `${longProse.oldString}\n${minorTypo.oldString}\n`;
+    const preserve = createPreserveTransform('prose');
 
-  it('carries replaceAll and other fields through untouched', () => {
-    const edit: EditOp = { ...longProse, replaceAll: true };
-    const result = applyRewriteMode([edit], 'always');
-    expect(result.edits[0]!.replaceAll).toBe(true);
+    const afterFirst = applyWithTransform(content, longProse, preserve.transform);
+    expect(afterFirst).toBe(
+      `${commentOut(longProse.oldString)}\n${longProse.newString}\n${minorTypo.oldString}\n`,
+    );
+
+    const afterSecond = applyWithTransform(afterFirst, minorTypo, preserve.transform);
+    expect(afterSecond).toBe(
+      `${commentOut(longProse.oldString)}\n${longProse.newString}\n${minorTypo.newString}\n`,
+    );
+    expect(preserve.preservedEdits()).toBe(1);
   });
 
   it('passes an identical oldString/newString edit through untransformed in every mode', () => {
@@ -289,23 +429,182 @@ describe('applyRewriteMode', () => {
       oldString: 'same text here and nothing changes at all whatsoever',
       newString: 'same text here and nothing changes at all whatsoever',
     };
+    const content = `${noop.oldString}\n`;
     for (const mode of ['off', 'prose', 'always'] as const) {
-      const result = applyRewriteMode([noop], mode);
-      expect(result.edits[0]!).toEqual(noop);
-      expect(result.preservedEdits).toBe(0);
+      const preserve = createPreserveTransform(mode);
+      const result = applyWithTransform(content, noop, preserve.transform);
+      expect(result).toBe(content);
+      expect(preserve.preservedEdits()).toBe(0);
     }
   });
 
-  it('does not double a trailing newline when commentOut already produced one', () => {
+  it('does not double a trailing newline when commentOut already produced one (EOF case)', () => {
     const edit: EditOp = {
       oldString: 'a multi line block\nthat already ends\nwith a trailing newline right here now\n',
       newString: 'replacement text goes here instead of the original content shown above',
     };
-    const result = applyRewriteMode([edit], 'always');
+    // oldString itself already ends in "\n", so its match is line-aligned trivially at both ends
+    // when it is the entire (single-edit) file content.
+    const content = edit.oldString;
+    const preserve = createPreserveTransform('always');
+    const result = applyWithTransform(content, edit, preserve.transform);
     const expectedCommented = commentOut(edit.oldString);
     expect(expectedCommented.endsWith('\n')).toBe(true);
-    expect(result.edits[0]!.newString).toBe(expectedCommented + edit.newString);
-    expect(result.edits[0]!.newString).not.toContain('\n\n' + edit.newString);
+    expect(result).toBe(expectedCommented + edit.newString);
+    expect(result).not.toContain('\n\n' + edit.newString);
+    expect(preserve.preservedEdits()).toBe(1);
+  });
+
+  describe('oldString whose own bytes include the trailing newline (Finding 4)', () => {
+    // Round 1's fix rewrote the EOF case above so oldString === content exactly — the match's
+    // "end" is content.length either way, so atLineEnd was trivially true regardless of whether
+    // it checked oldString's own trailing newline. That sidesteps the actual bug: atLineStart
+    // and end-of-file are not the only ways to be line-aligned — a match can also END with its
+    // own trailing "\n" and still have real content (another line) after it in the file. Before
+    // the fix, `atLineEnd` only looked at `content[end]`, which in that case is the first
+    // character of the *next* line, not a newline — so a flagship "delete this whole paragraph"
+    // edit was judged not line-aligned and silently dropped uncommented.
+    it('preserves a mid-file paragraph whose oldString itself ends with "\\n", with real content after it', () => {
+      const para =
+        'This entire paragraph should be preserved in a comment above when it is deleted outright.';
+      const edit: EditOp = { oldString: `${para}\n`, newString: '' };
+      const content = `first.\n${edit.oldString}last.\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      // Pre-fix this silently deleted the paragraph outright (preservedEdits: 0). Post-fix, the
+      // commented block already carries its own trailing "\n" (from oldString's own bytes), so
+      // no separator is added and "last." is untouched on its own line.
+      expect(result).toBe(`first.\n${commentOut(edit.oldString)}last.\n`);
+      expect(result).toContain('% This entire paragraph');
+      expect(result).toContain('last.\n');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('preserves a mid-file replacement whose oldString ends with "\\n", joining with the replacement on its own line', () => {
+      const para =
+        'This entire paragraph should be preserved in a comment above the replacement text.';
+      const replacement = 'A completely different paragraph now stands in its place instead.';
+      const edit: EditOp = { oldString: `${para}\n`, newString: replacement };
+      const content = `first.\n${edit.oldString}last.\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe(`first.\n${commentOut(edit.oldString)}${replacement}\nlast.\n`);
+      expect(result).not.toContain('\n\n' + replacement);
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    // The terminator is restored only when newString does not already carry one. A caller that
+    // mirrors its oldString — including the trailing newline on both sides — is the natural way
+    // to write a whole-line replacement, and restoring unconditionally gave it a second
+    // terminator: a blank line, which LaTeX reads as a paragraph break the edit never asked for.
+    it('does not double the terminator when newString already ends with one', () => {
+      const para =
+        'This entire paragraph should be preserved in a comment above the replacement text.';
+      const replacement = 'A completely different paragraph now stands in its place instead.';
+      const edit: EditOp = { oldString: `${para}\n`, newString: `${replacement}\n` };
+      const content = `first.\n${edit.oldString}last.\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe(`first.\n${commentOut(edit.oldString)}${replacement}\nlast.\n`);
+      expect(result).not.toContain('\n\n');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('does not double a CRLF terminator when newString already ends with one', () => {
+      const para =
+        'This entire paragraph should be preserved in a comment above the replacement text.';
+      const replacement = 'A completely different paragraph now stands in its place instead.';
+      const edit: EditOp = { oldString: `${para}\r\n`, newString: `${replacement}\r\n` };
+      const content = `first.\r\n${edit.oldString}last.\r\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe(`first.\r\n${commentOut(edit.oldString)}${replacement}\r\nlast.\r\n`);
+      expect(result).not.toContain('\r\n\r\n');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+  });
+
+  describe('line-alignment (Finding 1)', () => {
+    it('declines a mid-line deletion: the rest of the line survives, uncommented', () => {
+      const oldString = 'This is a long prose sentence with many ordinary words here.';
+      const content = `Alpha beta. ${oldString} Gamma delta.\n`;
+      const edit: EditOp = { oldString, newString: '' };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      // Reproduction from the task: Gamma delta. was never in oldString and must not be
+      // swallowed into a "%" comment, nor lost.
+      expect(result).toBe('Alpha beta.  Gamma delta.\n');
+      expect(result).not.toContain('%');
+      expect(preserve.preservedEdits()).toBe(0);
+    });
+
+    it('declines a mid-line replacement: no reflow onto the replacement line', () => {
+      const oldString =
+        'This is a long prose sentence with enough ordinary words to qualify as prose here.';
+      const newString =
+        'A completely different clause replaces the old one with entirely unrelated wording.';
+      const content = `Alpha beta. ${oldString} Gamma delta.\n`;
+      const edit: EditOp = { oldString, newString };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe(`Alpha beta. ${newString} Gamma delta.\n`);
+      expect(result).not.toContain('%');
+      expect(preserve.preservedEdits()).toBe(0);
+    });
+
+    it('preserves a whole-line match at the very start of the file', () => {
+      const content = `${longProse.oldString}\nsecond line stays put here always.\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, longProse, preserve.transform);
+      expect(result).toBe(
+        `${commentOut(longProse.oldString)}\n${longProse.newString}\nsecond line stays put here always.\n`,
+      );
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('preserves a whole-line match at end of file with no trailing newline', () => {
+      const content = `first line stays put here always.\n${longProse.oldString}`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, longProse, preserve.transform);
+      expect(result).toBe(
+        `first line stays put here always.\n${commentOut(longProse.oldString)}\n${longProse.newString}`,
+      );
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('preserves a whole-line match with CRLF line endings, using \\r\\n between the comment and the replacement (Finding 3)', () => {
+      // Corrected in review: the separator between the commented block and the replacement must
+      // mirror the line ending the match actually sat on. Before the fix this was hardcoded to a
+      // bare '\n', so a CRLF file came back with one stray LF-only line in an otherwise all-CRLF
+      // file — a mixed-ending file produced by a fix whose own stated scope was CRLF correctness.
+      const content = `first line stays put here always.\r\n${longProse.oldString}\r\nlast line here too.\r\n`;
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, longProse, preserve.transform);
+      expect(result).toBe(
+        `first line stays put here always.\r\n${commentOut(longProse.oldString)}\r\n${longProse.newString}\r\nlast line here too.\r\n`,
+      );
+      expect(result).not.toMatch(/[^\r]\n/); // no lone LF anywhere in this all-CRLF file
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+  });
+
+  describe('replaceAll defence in depth', () => {
+    it(
+      "createPreserveTransform's transform refuses to preserve a replaceAll edit even when " +
+        'called directly with an otherwise whole-line, aligned match — belt-and-braces on top ' +
+        'of FileService.applyEdits never calling this hook for a replaceAll edit at all (proven ' +
+        'in test/unit/editFile.test.ts), so this function can never be the reason that guard ' +
+        'goes quiet if the call order or a future caller ever changes',
+      () => {
+        const preserve = createPreserveTransform('always');
+        const edit: EditOp = { ...longProse, replaceAll: true };
+        const content = `${edit.oldString}\n`;
+        const result = applyWithTransform(content, edit, preserve.transform);
+        // Applies unchanged: no comment, no preservation, whatever the alignment looks like.
+        expect(result).toBe(`${edit.newString}\n`);
+        expect(preserve.preservedEdits()).toBe(0);
+      },
+    );
   });
 });
 

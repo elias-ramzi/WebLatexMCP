@@ -88,6 +88,9 @@ describe('set_rewrite_mode on a local (in-place) project', () => {
     expect(reported.mode).toBe('prose');
     expect(reported.source).toBe('default');
     expect(reported.changed).toBe(false);
+    // Nothing was configured via setup() (no rewriteMode argument), so envConfigured must say so
+    // even though `mode` still reports the built-in "prose" default — the two are orthogonal.
+    expect(reported.envConfigured).toBe(false);
     // Reporting must not create state — "nothing stored" has to stay distinguishable from
     // "stored, and it happens to equal the default", or the env default could never move. The
     // *directory* is not the assertion: the session registry creates that for its own heartbeat.
@@ -188,7 +191,20 @@ describe('set_rewrite_mode on a local (in-place) project', () => {
     const reported = structured(
       await client.callTool({ name: 'set_rewrite_mode', arguments: { project: 'draft' } }),
     );
-    expect(reported).toMatchObject({ mode: 'always', source: 'default' });
+    expect(reported).toMatchObject({ mode: 'always', source: 'default', envConfigured: true });
+  });
+
+  it('reports envConfigured alongside source on the setting branch too, not just report-only', async () => {
+    // set_rewrite_mode's "storing" branch builds structuredContent separately from the
+    // report-only branch — this pins that envConfigured reaches both, not just one.
+    const { client } = await setup('always');
+    const set = structured(
+      await client.callTool({
+        name: 'set_rewrite_mode',
+        arguments: { project: 'draft', mode: 'off' },
+      }),
+    );
+    expect(set).toMatchObject({ mode: 'off', source: 'project', envConfigured: true });
   });
 
   it('refuses an unknown mode at the schema, rather than storing it', async () => {
@@ -242,6 +258,7 @@ describe('list_projects reports the effective rewrite mode', () => {
       mode: 'local',
       rewriteMode: 'prose',
       rewriteModeSource: 'default',
+      envConfigured: false,
     });
 
     await client.callTool({
@@ -252,6 +269,20 @@ describe('list_projects reports the effective rewrite mode', () => {
     expect((after.projects as Array<Record<string, unknown>>)[0]).toMatchObject({
       rewriteMode: 'always',
       rewriteModeSource: 'project',
+    });
+  });
+
+  it('carries envConfigured in structuredContent even when the text suffix is suppressed', async () => {
+    // The text line's "(env default)" suffix and structuredContent.envConfigured must read the
+    // same underlying value (ctx.config.rewriteModeExplicit) — this is the one the text-only
+    // rendering logic in list_projects.ts is not allowed to diverge from.
+    const configured = await setup('always');
+    const result = structured(
+      await configured.client.callTool({ name: 'list_projects', arguments: {} }),
+    );
+    expect((result.projects as Array<Record<string, unknown>>)[0]).toMatchObject({
+      rewriteModeSource: 'default',
+      envConfigured: true,
     });
   });
 });

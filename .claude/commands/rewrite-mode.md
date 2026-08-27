@@ -17,5 +17,8 @@ Target: $ARGUMENTS
    given, so the call reports the current effective mode without changing anything.
 
 3. **Report.** State the resulting mode plainly. If you changed it, say what it changed from and
-   to; if you only read it, say where it came from (this project's own setting, the server's
-   `WEB_LATEX_MCP_REWRITE_MODE` default, or the built-in `prose` default) per the tool's result.
+   to. If you only read it, say where it came from, derived from the result's `source` and
+   `envConfigured` fields — never guess or assume: `source: "project"` means this project's own
+   stored setting; `source: "default"` with `envConfigured: true` means the server's
+   `WEB_LATEX_MCP_REWRITE_MODE` default; `source: "default"` with `envConfigured: false` means the
+   built-in `prose` default.

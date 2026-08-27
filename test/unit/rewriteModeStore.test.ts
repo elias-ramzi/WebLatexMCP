@@ -61,6 +61,27 @@ describe('RewriteModeStore', () => {
     stderr.mockRestore();
   });
 
+  it.each([
+    // Only 'null' is a real regression case: a plain `JSON.parse` of the literal `null` passes
+    // any naive `typeof x === 'object'` check (`typeof null === 'object'`), so a store that
+    // didn't explicitly reject `null` would try to read a `.mode` property off it — the other
+    // three (a number, a bare string, an array) already failed that same shape check before this
+    // test existed, and are kept here for breadth, not because they ever broke.
+    ['null', 'null'],
+    ['a number', '123'],
+    ['a bare string', JSON.stringify('off')],
+    ['an array', JSON.stringify([])],
+  ])('resolves a well-formed JSON file holding %s to null without throwing', async (_desc, raw) => {
+    const file = rewriteModePath(workspace, 'non-object');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, raw, 'utf8');
+
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(store.get('non-object')).resolves.toBeNull();
+    expect(stderr).toHaveBeenCalled();
+    stderr.mockRestore();
+  });
+
   it('stores an object with a mode field, not a bare string', async () => {
     await store.set('paper', 'prose');
     const raw = await import('node:fs/promises').then((fs) =>

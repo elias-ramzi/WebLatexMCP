@@ -5,7 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 import { changeDiff } from '../lib/changeDiff.js';
 import {
-  applyRewriteMode,
+  createPreserveTransform,
   resolveRewriteMode,
   supportsLineComments,
   DEFAULT_REWRITE_MODE,
@@ -36,10 +36,13 @@ const inputSchema = {
     .describe(
       'Force the original text to be preserved (true) or not (false) for this call, ' +
         "overriding the project's rewrite-preservation mode either way. Omit to use that mode. " +
+        'An edit with replaceAll set never CREATES a preservation itself (there is no single ' +
+        'match position to comment above) — it applies unchanged regardless of this setting. ' +
         'Note: preserving duplicates oldString into the file (as a commented-out block above the ' +
-        'replacement), so a later edit_file call whose oldString still occurs verbatim in that ' +
-        'preserved block will now match it too — it may be refused as non-unique, or with ' +
-        'replaceAll silently rewrite the preserved comment as well.',
+        'replacement), so a later edit_file call whose oldString still occurs in that preserved ' +
+        'comment will match it too: without replaceAll the call is refused as non-unique (add ' +
+        'more surrounding context); with replaceAll: true the preserved comment is silently ' +
+        'rewritten right along with the live text.',
     ),
   edits: z
     .array(
@@ -104,10 +107,12 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           const eligible = !isBib && supportsLineComments(relPath);
           const effectiveMode: RewriteMode = eligible ? resolved.mode : 'off';
 
-          const { edits: rewrittenEdits, preservedEdits } = applyRewriteMode(edits, effectiveMode);
-          const res = await ctx.files.applyEdits(dir, relPath, rewrittenEdits, {
+          const preserve = createPreserveTransform(effectiveMode);
+          const res = await ctx.files.applyEdits(dir, relPath, edits, {
             overrideExternalChanges,
+            transformNewString: preserve.transform,
           });
+          const preservedEdits = preserve.preservedEdits();
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
           let headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
           if (preservedEdits > 0) {

@@ -45,6 +45,13 @@ export class RewriteModeStore {
       );
       return null;
     }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      console.error(
+        `rewriteModeStore: ${file} holds ${JSON.stringify(parsed)}, expected an object with a ` +
+          `mode field. Ignoring.`,
+      );
+      return null;
+    }
     const record = parsed as Partial<RewriteModeRecord>;
     if (typeof record.mode !== 'string' || !isRewriteMode(record.mode)) {
       console.error(

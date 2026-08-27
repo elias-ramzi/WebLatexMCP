@@ -2,35 +2,15 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { REWRITE_MODES, resolveRewriteMode, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
-import type { RewriteMode, RewriteModeSource } from '../lib/rewriteMode.js';
+import {
+  REWRITE_MODES,
+  resolveRewriteMode,
+  DEFAULT_REWRITE_MODE,
+  rewriteModeSourceEnum,
+} from '../lib/rewriteMode.js';
+import type { RewriteMode } from '../lib/rewriteMode.js';
 
 const modeEnum = z.enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]]);
-
-/**
- * Where a resolved mode came from, shared with `list_projects` rather than each tool keeping a
- * private copy (the same reason `REWRITE_MODES` itself is shared). `'call'` is unreachable from
- * either tool's own source enum: neither takes a per-call `preserveOriginal`-equivalent, so a
- * mode reported by these two tools can only be `'project'` or `'default'`. It stays in the
- * vocabulary because it names a real value `resolveRewriteMode` can return (and `edit_file` does
- * report it) — narrowing it away here would make this a different type from the one
- * `resolveRewriteMode` actually produces.
- */
-export const rewriteModeSourceEnum = z.enum([
-  'call',
-  'project',
-  'default',
-] as const satisfies readonly RewriteModeSource[]);
-
-/**
- * Fail the build if `RewriteModeSource` ever gains a member this enum does not list. `satisfies`
- * above catches a value that stops being a source; this catches a source that stops being a
- * value. Without both directions the schema drifts silently from the type it claims to mirror,
- * and a tool would report a source no client's schema admits.
- */
-type UnlistedSource = Exclude<RewriteModeSource, (typeof rewriteModeSourceEnum.options)[number]>;
-const _sourcesAreExhaustive: UnlistedSource extends never ? true : never = true;
-void _sourcesAreExhaustive;
 
 const inputSchema = {
   project: z.string().optional(),
@@ -47,6 +27,14 @@ const outputSchema = {
     'Where the reported mode came from: "project" if stored for this project, "default" if it ' +
       'is only the WEB_LATEX_MCP_REWRITE_MODE default (or the built-in one) and nothing is stored.',
   ),
+  envConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_REWRITE_MODE actually names a mode on this server, as opposed to ' +
+        '`mode` merely holding the built-in "prose" default. Orthogonal to `source` (which only ' +
+        'distinguishes stored from not-stored): when `source` is "project" the stored mode wins ' +
+        'regardless of this value.',
+    ),
   changed: z.boolean().describe('False when the call only reported the mode.'),
   previous: modeEnum.describe(
     'The mode that was in effect just before this call. When mode is omitted (a report-only ' +
@@ -78,6 +66,7 @@ export function registerSetRewriteMode(server: McpServer, ctx: AppContext): void
         // does as much as a clone does.
         const { id } = await ctx.projectManager.requireProjectDir(project);
         const envDefault = ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE;
+        const envConfigured = ctx.config.rewriteModeExplicit === true;
         // Reporting takes no lock — it is a read, like every other read-only tool.
         if (mode === undefined) {
           const stored = await ctx.rewriteModes.get(id);
@@ -91,7 +80,12 @@ export function registerSetRewriteMode(server: McpServer, ctx: AppContext): void
                   (current.source === 'default' ? ' (the default — nothing stored)' : ''),
               },
             ],
-            structuredContent: { ...current, changed: false, previous: current.mode },
+            structuredContent: {
+              ...current,
+              envConfigured,
+              changed: false,
+              previous: current.mode,
+            },
           };
         }
         // Storing mutates per-project state, so it serialises with every other writer. The
@@ -107,6 +101,7 @@ export function registerSetRewriteMode(server: McpServer, ctx: AppContext): void
             structuredContent: {
               mode,
               source: 'project' as const,
+              envConfigured,
               changed: true,
               previous: before.mode,
             },
