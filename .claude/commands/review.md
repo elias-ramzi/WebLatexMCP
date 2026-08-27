@@ -17,7 +17,7 @@ verdict, changing nothing.
    `--fix`); a branch name diffs against its base (a PR's base if there is one, else
    `origin/dev`, the integration branch, falling back to `origin/main`); no target means
    the current branch vs that same base, plus any uncommitted changes. Assemble the
-   *stated intent* — PR description, commit messages, linked issues, `CHANGELOG` entry —
+   _stated intent_ — PR description, commit messages, linked issues, `CHANGELOG` entry —
    and read enough of the surrounding code to know what the diff plugs into. Produce the
    review scope: the intent in your own words, the files touched grouped by risk
    (`src/services/*` and `src/lib/*` core, `src/tools/*` + `src/server.ts` surface,
@@ -38,7 +38,7 @@ verdict, changing nothing.
 
    A failing gate is a finding in its own right (blocker), and so is a vacuous green:
    check the skip count, since the TeX smokes auto-skip without `latexmk` (`npm run
-   test:smoke` if it is installed). The output goes to the reviewer as evidence, not as
+test:smoke` if it is installed). The output goes to the reviewer as evidence, not as
    a substitute for reading the code. Then send the diff (or each slice, in parallel) to
    the `plan-verifier` agent with the stated intent as the spec and your scope notes:
    the agent starts with empty context, so restate everything — how to get the diff, the
