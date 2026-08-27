@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile, readFile, utimes } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import {
@@ -274,18 +275,21 @@ describe('tryAcquire (win32 delete-pending retry)', () => {
   });
 
   it('win32 EPERM, lock file absent, retry acquires', async () => {
+    expect(existsSync(lock)).toBe(false);
     const d = deps(['EPERM', 'ok'], 'win32');
     await expect(tryAcquire(lock, 'owner', d)).resolves.toBe(true);
     expect(d.calls()).toBe(2);
   });
 
   it('win32 EACCES, lock file absent, retry finds contention', async () => {
+    expect(existsSync(lock)).toBe(false);
     const d = deps(['EACCES', 'EEXIST'], 'win32');
     await expect(tryAcquire(lock, 'owner', d)).resolves.toBe(false);
     expect(d.calls()).toBe(2);
   });
 
   it('win32 EPERM, lock file absent, retry fails EPERM again — throws the retry error', async () => {
+    expect(existsSync(lock)).toBe(false);
     let callIndex = 0;
     const messages = ['first failure', 'second failure'];
     const opener = async (): Promise<FakeHandle> => {
