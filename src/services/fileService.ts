@@ -54,6 +54,39 @@ export interface EditOp {
   replaceAll?: boolean;
 }
 
+/**
+ * The structural shape `applyEdits` needs from a rewrite-preservation hook: a callback that
+ * rewrites the replacement text for one match, plus an accessor reporting — for the *most
+ * recent* `transform()` call only — whether (and how much of) its returned string begins with a
+ * preserved comment block. `src/lib/rewriteMode.ts`'s `PreserveTransform` satisfies this
+ * structurally (it carries one more field, `preservedEdits`, that `applyEdits` never looks at).
+ *
+ * `lastInsertion()` reports only the latest call's result, never a cumulative ledger: the ledger
+ * of already-preserved ranges — used to refuse a later edit in the same call that only matches
+ * dead, already-commented-out text — is owned entirely by `applyEdits` itself, not by this hook.
+ * `applyEdits` is the only code that knows every splice offset a call produces, including every
+ * occurrence a `replaceAll` edit touches, so it is the only place that can keep that ledger
+ * correctly shifted as edits apply. A hook that owned the ledger itself (an earlier shape of this
+ * type did) went stale the moment a `replaceAll` edit spliced text without ever being routed
+ * through the hook at all.
+ *
+ * Defined here — rather than importing `PreserveTransform` itself — so `FileService` never needs
+ * to know anything about what a "preserved" block actually is (comment syntax, `%`-prefixing,
+ * line alignment, …). It only ever sees a callback and integer offsets; the decision of *what* to
+ * preserve and *how* to render it stays entirely in `src/lib/rewriteMode.ts`. Importing the real
+ * type would work today, but it would tempt a future change to `PreserveTransform` to add a
+ * comment-syntax-flavoured member that `FileService` would then transitively depend on.
+ */
+export interface EditTransform {
+  /** Rewrite the replacement text for one (unique, non-`replaceAll`) match, given its position in
+   * the file's *current* content. */
+  transform: (edit: EditOp, matchIndex: number, content: string) => string;
+  /** Length of the preserved comment block at the start of the string this hook's *most recent*
+   * `transform()` call returned, or `undefined` if that call preserved nothing. Must be read
+   * immediately after each `transform()` call and before the next one — it is not a ledger. */
+  lastInsertion: () => number | undefined;
+}
+
 const ASSET_EXT = new Set([
   '.png',
   '.jpg',
@@ -407,7 +440,28 @@ export class FileService {
     projectDir: string,
     relPath: string,
     edits: EditOp[],
-    opts: { overrideExternalChanges?: boolean; strictLinks?: boolean } = {},
+    opts: {
+      overrideExternalChanges?: boolean;
+      strictLinks?: boolean;
+      /**
+       * Optional hook letting a caller rewrite the replacement text for each edit, given the
+       * position of the (unique, non-`replaceAll`) match in the file's *current* content. Used by
+       * `edit_file`'s rewrite-preservation feature to decide, with the actual match position in
+       * hand, whether commenting out the original text is safe (see `src/lib/rewriteMode.ts`) — a
+       * decision `FileService` deliberately stays ignorant of, since it knows nothing about
+       * comment syntax; it only reads back the reported `commentedLength` as an integer offset.
+       * The ledger of already-preserved ranges lives entirely in this method (see the `preserved`
+       * array below), not in the hook — `applyEdits` is the only code that knows every splice
+       * offset a call produces, `replaceAll` included.
+       *
+       * Not consulted for a `replaceAll` edit: there is no single match position, so preservation
+       * is skipped for those unconditionally, and matching inside an earlier preserved comment
+       * under `replaceAll` is documented, intended behaviour (see `edit_file`'s
+       * `preserveOriginal` description) — a `replaceAll` edit still shifts the ledger as it
+       * splices, it just never adds to it.
+       */
+      preserve?: EditTransform;
+    } = {},
   ): Promise<{ path: string; appliedEdits: number }> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
@@ -419,6 +473,39 @@ export class FileService {
       throw new ExternalChangeError(relPath);
     }
     let content = original;
+    // [start, end) ranges, in `content`'s *current* coordinate space, of every preserved comment
+    // block spliced in so far by this call. Owned here — not by `opts.preserve` — because this is
+    // the only place that knows every splice offset a call produces, including each individual
+    // occurrence a `replaceAll` edit touches; a hook that owned this ledger itself could only ever
+    // shift it for the non-`replaceAll` edits it was actually called for, leaving it stale the
+    // moment a `replaceAll` edit spliced text without going through the hook at all.
+    const preserved: { start: number; end: number }[] = [];
+    /**
+     * Adjust every recorded range for a splice of `[spliceStart, spliceEnd)` (pre-splice
+     * coordinates) that changed the content's length by `delta`. Three cases, since a
+     * `replaceAll` occurrence can land anywhere relative to a preserved range — including,
+     * intentionally, *inside* one (rewriting a preserved comment is documented behaviour):
+     *
+     *  - The splice sits entirely after the range (`spliceStart >= range.end`): the range is
+     *    untouched — nothing before it moved.
+     *  - The splice sits entirely before the range (`spliceEnd <= range.start`): the whole range
+     *    slides by `delta`, same as any other coordinate after the splice point.
+     *  - The splice overlaps or sits inside the range: the range's own content changed length, so
+     *    only its `end` grows/shrinks by `delta` — its `start` is unaffected since the splice
+     *    began at or after it.
+     */
+    const shiftPreserved = (spliceStart: number, spliceEnd: number, delta: number) => {
+      if (delta === 0) return;
+      for (const range of preserved) {
+        if (spliceStart >= range.end) continue;
+        if (spliceEnd <= range.start) {
+          range.start += delta;
+          range.end += delta;
+        } else {
+          range.end += delta;
+        }
+      }
+    };
     edits.forEach((edit, i) => {
       if (edit.oldString === edit.newString) {
         throw new Error(`Edit ${i + 1}: oldString and newString are identical.`);
@@ -432,9 +519,50 @@ export class FileService {
           `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
         );
       }
-      content = edit.replaceAll
-        ? content.split(edit.oldString).join(edit.newString)
-        : content.replace(edit.oldString, edit.newString);
+      if (edit.replaceAll) {
+        // Splice one occurrence at a time (never String.prototype.replace / split-join with a
+        // pattern-interpreting replacement — see the non-replaceAll branch below for why) so
+        // each individual splice's offset is known and the preserved-range ledger can be shifted
+        // per occurrence, left to right. A replaceAll edit is never routed through opts.preserve
+        // (there is no single match position to comment above, and rewriting inside an earlier
+        // preserved comment is documented, intended behaviour), but it still changes the file's
+        // length at every occurrence, so the ledger must move regardless.
+        let idx = content.indexOf(edit.oldString);
+        while (idx !== -1) {
+          const spliceEnd = idx + edit.oldString.length;
+          content = content.slice(0, idx) + edit.newString + content.slice(spliceEnd);
+          shiftPreserved(idx, spliceEnd, edit.newString.length - edit.oldString.length);
+          idx = content.indexOf(edit.oldString, idx + edit.newString.length);
+        }
+        return;
+      }
+      const matchIndex = content.indexOf(edit.oldString);
+      const matchEnd = matchIndex + edit.oldString.length;
+      if (opts.preserve) {
+        const intersectsPreserved = preserved.some(
+          (range) => matchIndex < range.end && matchEnd > range.start,
+        );
+        if (intersectsPreserved) {
+          throw new Error(
+            `Edit ${i + 1}: oldString only matches text preserved (commented out) by an earlier edit in this same call, not the live document; the live occurrence was already replaced by that edit.`,
+          );
+        }
+      }
+      const newString = opts.preserve
+        ? opts.preserve.transform(edit, matchIndex, content)
+        : edit.newString;
+      const commentedLength = opts.preserve ? opts.preserve.lastInsertion() : undefined;
+      // Not `content.replace(edit.oldString, newString)`: String.prototype.replace treats a
+      // string *replacement* argument specially — $$, $&, $`, $', $1 etc. are substitution
+      // patterns, not literal text — and LaTeX is full of literal `$`. That corrupts both a
+      // caller-supplied newString containing e.g. `$$100$$` and, since preservation generates
+      // the replacement text server-side, text the user never typed at all. Splice at the
+      // already-computed matchIndex instead so newString lands byte-exact, unconditionally.
+      content = content.slice(0, matchIndex) + newString + content.slice(matchEnd);
+      shiftPreserved(matchIndex, matchEnd, newString.length - edit.oldString.length);
+      if (commentedLength !== undefined) {
+        preserved.push({ start: matchIndex, end: matchIndex + commentedLength });
+      }
     });
     await writeFile(abs, content, 'utf8');
     this.revisions.record(abs, content);

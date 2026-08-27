@@ -1,0 +1,118 @@
+import { z } from 'zod';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { AppContext } from '../context.js';
+import { errorResult } from '../lib/errors.js';
+import {
+  REWRITE_MODES,
+  resolveRewriteMode,
+  DEFAULT_REWRITE_MODE,
+  rewriteModeSourceEnum,
+} from '../lib/rewriteMode.js';
+import type { RewriteMode } from '../lib/rewriteMode.js';
+
+const modeEnum = z.enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]]);
+
+const inputSchema = {
+  project: z.string().optional(),
+  mode: modeEnum
+    .optional()
+    .describe(
+      'The mode to store for this project. Omit to report the current mode without changing it.',
+    ),
+};
+
+const outputSchema = {
+  mode: modeEnum.describe('The mode in effect after this call.'),
+  source: rewriteModeSourceEnum.describe(
+    'Where the reported mode came from: "project" if stored for this project, "default" if it ' +
+      'is only the WEB_LATEX_MCP_REWRITE_MODE default (or the built-in one) and nothing is stored.',
+  ),
+  envConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_REWRITE_MODE actually names a mode on this server, as opposed to ' +
+        '`mode` merely holding the built-in "off" default. Orthogonal to `source` (which only ' +
+        'distinguishes stored from not-stored): when `source` is "project" the stored mode wins ' +
+        'regardless of this value.',
+    ),
+  changed: z.boolean().describe('False when the call only reported the mode.'),
+  previous: modeEnum.describe(
+    'The mode that was in effect just before this call. When mode is omitted (a report-only ' +
+      'call), equal to the reported mode. Read inside the same lock as the write, so it can ' +
+      'never be a stale value from a peer session racing this one.',
+  ),
+};
+
+export function registerSetRewriteMode(server: McpServer, ctx: AppContext): void {
+  server.registerTool(
+    'set_rewrite_mode',
+    {
+      title: 'Set rewrite preservation mode',
+      description:
+        'Choose what edit_file does with the text it replaces in a .tex file. "off": replace ' +
+        'outright, no trace of the original kept (the default — nothing is preserved unless you ' +
+        'turn it on). "always": comment the original out above the replacement, the way ' +
+        'Overleaf users do by hand. "prose": do that only for what looks like a prose rewrite, ' +
+        'so a typo fix or a changed cite key is not preserved. To get the Overleaf habit back, ' +
+        'set this to "prose" (or "always" to preserve every eligible edit) — server-wide via ' +
+        'WEB_LATEX_MCP_REWRITE_MODE, or per project with this tool. The choice is stored per ' +
+        "project and outlives this session; edit_file's preserveOriginal overrides it for one " +
+        'call. Omit `mode` to report the current setting. When setting a mode, the result ' +
+        'reports `previous` (the mode in effect just before the call) alongside `mode`, so a ' +
+        'caller can say what it changed from and to.',
+      inputSchema,
+      outputSchema,
+    },
+    async ({ project, mode }) => {
+      try {
+        // Not requireGitProject: the mode is about editing prose, which a local in-place draft
+        // does as much as a clone does.
+        const { id } = await ctx.projectManager.requireProjectDir(project);
+        const envDefault = ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE;
+        const envConfigured = ctx.config.rewriteModeExplicit === true;
+        // Reporting takes no lock — it is a read, like every other read-only tool.
+        if (mode === undefined) {
+          const stored = await ctx.rewriteModes.get(id);
+          const current = resolveRewriteMode({ stored, envDefault });
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `${id}: rewrite mode is "${current.mode}"` +
+                  (current.source === 'default' ? ' (the default — nothing stored)' : ''),
+              },
+            ],
+            structuredContent: {
+              ...current,
+              envConfigured,
+              changed: false,
+              previous: current.mode,
+            },
+          };
+        }
+        // Storing mutates per-project state, so it serialises with every other writer. The
+        // "previous" read happens inside this same lock, so it cannot be a stale value raced by
+        // a peer session's concurrent set_rewrite_mode call.
+        return await ctx.projectManager.runExclusive(id, async () => {
+          const storedBefore = await ctx.rewriteModes.get(id);
+          const before = resolveRewriteMode({ stored: storedBefore, envDefault });
+          await ctx.rewriteModes.set(id, mode);
+          const transition = before.mode === mode ? '' : ` (was "${before.mode}")`;
+          return {
+            content: [{ type: 'text', text: `${id}: rewrite mode set to "${mode}"${transition}.` }],
+            structuredContent: {
+              mode,
+              source: 'project' as const,
+              envConfigured,
+              changed: true,
+              previous: before.mode,
+            },
+          };
+        });
+      } catch (err) {
+        return errorResult(err, ctx.credentials.allSecrets());
+      }
+    },
+  );
+}

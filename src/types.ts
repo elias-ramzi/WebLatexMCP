@@ -1,3 +1,5 @@
+import type { RewriteMode } from './lib/rewriteMode.js';
+
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
  * document are separate jobs: a **git** project is a remote the server clones and pushes back to,
@@ -119,6 +121,21 @@ export interface ServerConfig {
   viewerPort?: number;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
+  /**
+   * Default rewrite-preservation mode from `WEB_LATEX_MCP_REWRITE_MODE`, used by
+   * `resolveRewriteMode` (`src/lib/rewriteMode.ts`) when a project has no stored mode of its
+   * own. `loadConfig` always resolves this (falling back to `DEFAULT_REWRITE_MODE` on an unset
+   * or invalid value); optional here (like `compiler`) only so existing hand-built configs in
+   * tests still type-check — callers should treat a missing value as `DEFAULT_REWRITE_MODE`.
+   * `server_info` reports it and says it is only the default.
+   */
+  rewriteMode?: RewriteMode;
+  /**
+   * Whether `WEB_LATEX_MCP_REWRITE_MODE` actually named a mode, as opposed to `rewriteMode`
+   * merely holding the built-in default. `rewriteMode` is populated either way, so this is the
+   * only way a reporting tool can avoid presenting the default as the user's own configuration.
+   */
+  rewriteModeExplicit?: boolean;
   /**
    * Absolute path to an ADDITIONAL writing guide, appended to (never replacing) the base one.
    * From `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, which accepts a path or a `file://` URL.

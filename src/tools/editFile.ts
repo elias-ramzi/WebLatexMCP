@@ -4,6 +4,14 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 import { changeDiff } from '../lib/changeDiff.js';
+import {
+  createPreserveTransform,
+  resolveRewriteMode,
+  supportsLineComments,
+  DEFAULT_REWRITE_MODE,
+  REWRITE_MODES,
+} from '../lib/rewriteMode.js';
+import type { RewriteMode } from '../lib/rewriteMode.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -21,6 +29,23 @@ const inputSchema = {
     .describe(
       'Required to edit a .bib file directly. Add references via add_citation instead; ' +
         'only set this after the user approves a manual bibliography change.',
+    ),
+  preserveOriginal: z
+    .boolean()
+    .optional()
+    .describe(
+      'Force the original text to be preserved (true) or not (false) for this call, ' +
+        "overriding the project's rewrite-preservation mode either way. Omit to use that mode. " +
+        'An edit with replaceAll set never CREATES a preservation itself (there is no single ' +
+        'match position to comment above) — it applies unchanged regardless of this setting. ' +
+        'Note: preserving duplicates oldString into the file (as a commented-out block above the ' +
+        'replacement), so a later edit_file call whose oldString still occurs in that preserved ' +
+        'comment will match it too: without replaceAll the call is refused as non-unique (add ' +
+        'more surrounding context); with replaceAll: true the preserved comment is silently ' +
+        'rewritten right along with the live text. Within a single call it is stricter: a later ' +
+        'edit in this same edits array that matches ONLY inside a block an earlier edit preserved ' +
+        'is refused outright, since its live target was already replaced and applying it would ' +
+        'rewrite dead commented-out text; the whole call fails and the file is left untouched.',
     ),
   edits: z
     .array(
@@ -40,6 +65,10 @@ const outputSchema = {
   path: z.string(),
   appliedEdits: z.number(),
   diff: z.string(),
+  rewriteMode: z
+    .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
+    .describe('The mode that actually applied for this call.'),
+  preservedEdits: z.number(),
 };
 
 export function registerEditFile(server: McpServer, ctx: AppContext): void {
@@ -54,16 +83,44 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath, edits, overrideExternalChanges, confirmBibEdit }) => {
+    async ({
+      project,
+      path: relPath,
+      edits,
+      overrideExternalChanges,
+      confirmBibEdit,
+      preserveOriginal,
+    }) => {
       try {
-        if (isBibFile(relPath) && !confirmBibEdit) {
+        const isBib = isBibFile(relPath);
+        if (isBib && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
+          // The only place the effective rewrite mode is derived (the `parseCompilerChoice`
+          // lesson) — every other reader of "what mode applies" must call through here.
+          const resolved = resolveRewriteMode({
+            perCall: preserveOriginal,
+            stored: await ctx.rewriteModes.get(id),
+            envDefault: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
+          });
+          // .bib never preserves (a narrowing on top of the confirmBibEdit gate above, not a
+          // replacement for it), and preservation is meaningless outside %-comment documents.
+          const eligible = !isBib && supportsLineComments(relPath);
+          const effectiveMode: RewriteMode = eligible ? resolved.mode : 'off';
+
+          const preserve = createPreserveTransform(effectiveMode);
+          const res = await ctx.files.applyEdits(dir, relPath, edits, {
+            overrideExternalChanges,
+            preserve,
+          });
+          const preservedEdits = preserve.preservedEdits();
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
-          const headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
+          let headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
+          if (preservedEdits > 0) {
+            headline += ` (preserved the original text of ${preservedEdits} edit(s) as comments)`;
+          }
           return {
             content: [
               {
@@ -71,7 +128,7 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
                 text: diff ? `${headline}\n\n${diff}` : headline,
               },
             ],
-            structuredContent: { ...res, diff },
+            structuredContent: { ...res, diff, rewriteMode: effectiveMode, preservedEdits },
           };
         });
       } catch (err) {

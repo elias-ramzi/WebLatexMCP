@@ -3,6 +3,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { getServerVersion } from '../lib/version.js';
 import { toPosix } from '../lib/paths.js';
+import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
+import type { RewriteMode } from '../lib/rewriteMode.js';
 
 const outputSchema = {
   name: z.string(),
@@ -26,6 +28,25 @@ const outputSchema = {
         'substitutes a ' +
         'backend that is. This field does not probe PATH — run doctor for what is actually ' +
         "installed, or read a compile result's own `compiler` for what ran.",
+    ),
+  rewriteMode: z
+    .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
+    .describe(
+      'The *configured default* rewrite-preservation mode for edit_file ' +
+        '(WEB_LATEX_MCP_REWRITE_MODE, or the built-in "off" default — nothing is preserved ' +
+        'unless configured), which is not ' +
+        "necessarily what any given project uses: a project's own set_rewrite_mode setting " +
+        'wins over it, and a per-call preserveOriginal wins over both. Read list_projects for ' +
+        'the effective mode a specific project resolves to.',
+    ),
+  envConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_REWRITE_MODE actually names a mode on this server, as opposed to ' +
+        '`rewriteMode` merely holding the built-in "off" default. Without this, a deliberately ' +
+        'configured `WEB_LATEX_MCP_REWRITE_MODE=off` is byte-identical to nobody having ' +
+        'configured anything — both report `rewriteMode: "off"`. This is the only field that ' +
+        'tells them apart.',
     ),
   writingGuideExtraPath: z
     .string()
@@ -54,10 +75,14 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       description:
         'Report the web-latex-mcp server version and runtime configuration (workspace root, ' +
         'whether the workspace is local to the launch dir, whether the clone dir was git-excluded ' +
-        'from the host repo, and the configured compiler — which is not necessarily the backend a ' +
+        'from the host repo, the configured compiler — which is not necessarily the backend a ' +
         'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
-        'there) plus whether a project-specific writing guide (WEB_LATEX_MCP_WRITING_GUIDE_EXTRA) is ' +
-        'configured and, if so, whether it actually loaded — a typo in that path otherwise means the ' +
+        'there — and the configured rewrite-preservation default, which is not necessarily what ' +
+        "a given project uses since a project's own set_rewrite_mode setting wins over it, plus " +
+        'whether WEB_LATEX_MCP_REWRITE_MODE actually set that default or it is only the built-in ' +
+        'one) plus ' +
+        'whether a project-specific writing guide (WEB_LATEX_MCP_WRITING_GUIDE_EXTRA) is configured ' +
+        'and, if so, whether it actually loaded — a typo in that path otherwise means the ' +
         "user's conventions are silently ignored forever with nothing to tell them. Use this to " +
         'confirm which version of the MCP server is running.',
       inputSchema: {},
@@ -71,6 +96,11 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         workspaceLocal: ctx.config.workspaceIsLocal ?? false,
         workspaceExcludePattern: ctx.config.workspaceExcludePattern,
         compiler: ctx.config.compiler ?? 'latexmk',
+        rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
+        // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
+        // default when the env names nothing, so that form would call every default install
+        // "configured". Matches listProjects.ts exactly.
+        envConfigured: ctx.config.rewriteModeExplicit === true,
         writingGuideExtraPath: ctx.config.extraWritingGuidePath
           ? toPosix(ctx.config.extraWritingGuidePath)
           : undefined,
@@ -100,7 +130,9 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
         excludeLine +
         writingGuideLine +
-        `compiler: ${info.compiler}`;
+        `compiler: ${info.compiler}\n` +
+        `rewrite mode (default): ${info.rewriteMode}` +
+        (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
       return {
         content: [{ type: 'text', text }],
         structuredContent: { ...info },

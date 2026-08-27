@@ -150,6 +150,80 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
+- **Rewritten prose can be preserved by commenting it out, and the transform lives server-side, not in
+  the writing guide.** `edit_file` can prefix the old text with `% ` above the replacement instead of
+  discarding it — the habit Overleaf users already have. This has to be a guard the server enforces, not
+  a prompt rule asking the model to retype the old text as `%`-commented lines: a preserved block is only
+  worth anything if it is provably the bytes that were there, the same reasoning that keeps BibTeX entry
+  text originating from DBLP rather than from the model retyping it. **`edit_file` only, never
+  `write_file`**: a whole-file write has no "old paragraph" to splice a comment above, only an entire old
+  file, and commenting out all of it is never what is meant. A `.bib` target stays exempt regardless of
+  mode — that file already has its own guard, and a `.bib`'s entries are not prose to preserve either way.
+  Modes are `off` / `prose` / `always`, default **`off`**: preservation writes bytes the caller did not
+  ask for, so it is opt-in, never a silent default. A user turns it on per project with
+  `set_rewrite_mode` (sticky state under `<workspace>/.sessions/<projectId>/`, never inside a clone) or
+  server-wide with `WEB_LATEX_MCP_REWRITE_MODE`, with a per-call `preserveOriginal` on `edit_file` that
+  always wins in both directions, same shape as `compilerExplicit`.
+  **`prose` is a deliberate, documented exception to "an assertion, never an inference" — but only once a
+  user has made the assertion of turning it on.** The rule otherwise governs `followSymlinks` and
+  `compilerExplicit`: an inference the server makes on its own initiative. `prose` never does that — the
+  server infers nothing until a user has explicitly opted into preservation (per project or server-wide),
+  and only inside that opted-in mode does it guess _which_ edits look like a rewrite. That guess is
+  allowed here specifically because the two things "assertion, never inference" protects against don't
+  apply: `followSymlinks` guards a sandbox escape and `compilerExplicit` guards a silently changed compile
+  backend, and getting either wrong is a security hole or a wrong PDF. Guessing wrong about `prose` costs
+  a stray `%`-commented paragraph sitting in a diff the tool already returns and the user already reviews
+  before pushing — cosmetic, reversible, and visible, with an explicit `preserveOriginal` sitting on top
+  for whenever the guess is wrong. That is a cost worth inferring around, once the user has opted in; the
+  other two are not, and neither ever fires without the user's own initiative. The preserved block carries
+  **no sentinel marker on
+  purpose** — it is byte-identical to what a human would have typed on Overleaf, not something stamped
+  `% [preserved by web-latex-mcp]`, so a co-author sees a normal commented-out paragraph, not a
+  machine-generated one, and `arxiv-clean-project` already strips comments before submission regardless.
+  The cost — no tool can later tell an old paragraph from an author's own commented-out note — is
+  accepted, not overlooked. The transform is not a pre-pass over the edit list — it runs _inside_
+  `FileService.applyEdits`, as the single `opts.preserve` hook called after that method's own
+  identical/not-found/non-unique guards, with the actual match position and file content in hand
+  (`src/lib/rewriteMode.ts`'s `createPreserveTransform`). That placement is load-bearing, not
+  incidental: an edit with `oldString === newString` never reaches the hook at all (`applyEdits`
+  rejects it first as a no-op), so there is no risk of the hook turning it into `old` vs.
+  `"% " + old + old` — a wrapping pass running _before_ that guard would silently disarm it. Two
+  more restrictions on when preservation actually fires, both easy to miss because they read as
+  "preserve every edit" from the mode name alone: **only a line-aligned match is ever preserved**
+  — `oldString` must start at the beginning of a line and end at the end of one (in the file's
+  current content, or by ending with its own trailing newline), because a mid-line match has no
+  safe place to put a `%`-comment without swallowing or reflowing text that was never part of
+  `oldString`; and **a `replaceAll` edit is never preserved**, since there is no single match
+  position to comment above — `applyEdits` skips the hook entirely for one, and the hook itself
+  checks `edit.replaceAll` again regardless, so neither call site can be the reason this guard
+  goes quiet. As with `parseCompilerChoice`, the mode is resolved in exactly one function —
+  per-call `preserveOriginal` > stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'off'` —
+  so no second code path can derive a different answer.
+- **Preservation duplicates `oldString`, so `applyEdits` tracks what it inserted.** Once an edit's
+  original is commented in above its replacement, that text is in the file — and the _next_ edit in the
+  same call sees it, because each iteration re-counts against the current content. Left alone, a later
+  edit whose live target the earlier edit just replaced would match the comment instead: it would rewrite
+  dead text, report success for a change no reader sees, and mutate the block this feature calls
+  byte-exact — turning what should be a loud `oldString not found` into silence. So `applyEdits` keeps the
+  `[start, end)` ranges of the blocks it inserted and refuses a non-`replaceAll` edit whose match falls
+  inside one. **The ranges must be shifted on _every_ splice, `replaceAll` included** — a `replaceAll`
+  runs no hook but still changes length, at every occurrence, and stale ranges fail in both directions:
+  they miss a real hit (the original bug, back in full) and refuse edits that only touch live text. Keep
+  the ledger in `applyEdits`, which is the only code that sees every splice offset; `FileService` stays on
+  pure integer offsets and learns nothing about `%`. The two halves — the hook and its ranges — are one
+  option for that reason: passing a hook without its ranges silently restored the bug, so the type must
+  not permit it.
+- **`applyEdits` splices by index; it must never go back to `String.prototype.replace`.** A string
+  _replacement_ argument is not literal — `replace` expands `$$`, `$&`, `` $` ``, `$'` and `$1` inside
+  it — and LaTeX is full of literal `$`, so `content.replace(oldString, newString)` corrupts any
+  `newString` carrying inline math (`$a$`, `$b$`) or a literal `$1`. It was doing so before
+  preservation existed; preservation makes it worse, because the replacement is now generated
+  server-side and the corruption lands in the block this feature calls byte-exact. The non-`replaceAll`
+  path therefore splices at the already-computed `matchIndex` **unconditionally**, not only when a
+  transform is present, and `replaceAll` uses `split`/`join` (already literal-safe). Reverting either to
+  `replace` reads as a harmless simplification and is not one — a test pins it, with `$`-patterns in
+  both `oldString` and `newString`. The same rule binds test helpers that stand in for `applyEdits`:
+  one that used `replace` made the whole unit layer structurally unable to catch this regression.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)
