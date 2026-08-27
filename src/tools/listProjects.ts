@@ -39,7 +39,7 @@ const outputSchema = {
         .boolean()
         .describe(
           'Whether WEB_LATEX_MCP_REWRITE_MODE actually names a mode on this server, as opposed ' +
-            'to `rewriteMode` merely holding the built-in "prose" default. Orthogonal to ' +
+            'to `rewriteMode` merely holding the built-in "off" default. Orthogonal to ' +
             '`rewriteModeSource` (which only distinguishes stored from not-stored): when ' +
             '`rewriteModeSource` is "project" the stored mode wins regardless of this value.',
         ),

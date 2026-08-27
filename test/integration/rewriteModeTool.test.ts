@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
+import { DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
 
 const DOC = ['\\documentclass{article}', '\\begin{document}', 'Hello', '\\end{document}', ''].join(
   '\n',
@@ -39,7 +40,7 @@ async function setup(rewriteMode?: ServerConfig['rewriteMode']): Promise<Harness
     workspaceRoot: workspace,
     sessionId: 'test',
     projects: [],
-    rewriteMode: rewriteMode ?? 'prose',
+    rewriteMode: rewriteMode ?? DEFAULT_REWRITE_MODE,
     // The distinction the text line turns on: `rewriteMode` is populated either way, so only
     // this says whether the user named a mode. Mirrors what `loadConfig` produces.
     rewriteModeExplicit: rewriteMode !== undefined,
@@ -85,11 +86,11 @@ describe('set_rewrite_mode on a local (in-place) project', () => {
     const reported = structured(
       await client.callTool({ name: 'set_rewrite_mode', arguments: { project: 'draft' } }),
     );
-    expect(reported.mode).toBe('prose');
+    expect(reported.mode).toBe('off');
     expect(reported.source).toBe('default');
     expect(reported.changed).toBe(false);
     // Nothing was configured via setup() (no rewriteMode argument), so envConfigured must say so
-    // even though `mode` still reports the built-in "prose" default — the two are orthogonal.
+    // even though `mode` still reports the built-in "off" default — the two are orthogonal.
     expect(reported.envConfigured).toBe(false);
     // Reporting must not create state — "nothing stored" has to stay distinguishable from
     // "stored, and it happens to equal the default", or the env default could never move. The
@@ -169,7 +170,7 @@ describe('set_rewrite_mode on a local (in-place) project', () => {
       }),
     );
     // Moving off the unstored default: `previous` is what was in effect, not what was stored.
-    expect(first).toMatchObject({ previous: 'prose', mode: 'always', changed: true });
+    expect(first).toMatchObject({ previous: 'off', mode: 'always', changed: true });
 
     const second = structured(
       await client.callTool({
@@ -256,7 +257,7 @@ describe('list_projects reports the effective rewrite mode', () => {
     expect((before.projects as Array<Record<string, unknown>>)[0]).toMatchObject({
       project: 'draft',
       mode: 'local',
-      rewriteMode: 'prose',
+      rewriteMode: 'off',
       rewriteModeSource: 'default',
       envConfigured: false,
     });

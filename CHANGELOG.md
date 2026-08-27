@@ -17,10 +17,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   rewrite reads in the diff the way a human's would — the old wording still there, commented, for a
   co-author to see. This has to be enforced server-side rather than asked of the model as a writing-guide
   rule: a preserved block is only trustworthy if it is provably the bytes that were there, the same
-  reason BibTeX entry text comes from DBLP rather than from the model retyping it. Three modes — `off`,
-  `prose` (default), `always` — with `prose` preserving only edits that look like an actual rewrite (>= 8
-  words, mostly non-markup, not a near-identical replacement), so a typo fix or a swapped `\cite` key is
-  left alone. The mode is sticky per project (`set_rewrite_mode`, persisted outside the clone) and
+  reason BibTeX entry text comes from DBLP rather than from the model retyping it. Three modes — `off`
+  (default — preservation is opt-in, since it writes bytes the caller did not ask for), `prose`, `always`
+  — with `prose` preserving only edits that look like an actual rewrite (>= 8 words, mostly non-markup,
+  not a near-identical replacement), so a typo fix or a swapped `\cite` key is left alone. Turn preservation
+  on with `set_rewrite_mode` (per project) or `WEB_LATEX_MCP_REWRITE_MODE` (server-wide). The mode is
+  sticky per project (`set_rewrite_mode`, persisted outside the clone) and
   defaults from `WEB_LATEX_MCP_REWRITE_MODE`; a per-call `preserveOriginal` on `edit_file` always wins
   over both, in either direction. Never applies to `write_file` (no single old paragraph to comment out
   above — the whole prior file isn't the same thing) or to a `.bib` (already gated by `confirmBibEdit`).

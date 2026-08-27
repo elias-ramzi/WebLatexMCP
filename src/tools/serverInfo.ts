@@ -33,7 +33,8 @@ const outputSchema = {
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
     .describe(
       'The *configured default* rewrite-preservation mode for edit_file ' +
-        '(WEB_LATEX_MCP_REWRITE_MODE, or the built-in "prose" default), which is not ' +
+        '(WEB_LATEX_MCP_REWRITE_MODE, or the built-in "off" default — nothing is preserved ' +
+        'unless configured), which is not ' +
         "necessarily what any given project uses: a project's own set_rewrite_mode setting " +
         'wins over it, and a per-call preserveOriginal wins over both. Read list_projects for ' +
         'the effective mode a specific project resolves to.',

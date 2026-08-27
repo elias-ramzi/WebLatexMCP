@@ -159,17 +159,24 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `write_file`**: a whole-file write has no "old paragraph" to splice a comment above, only an entire old
   file, and commenting out all of it is never what is meant. A `.bib` target stays exempt regardless of
   mode — that file already has its own guard, and a `.bib`'s entries are not prose to preserve either way.
-  Modes are `off` / `prose` / `always` (default `prose`), resolved per project via `set_rewrite_mode`
-  (sticky state under `<workspace>/.sessions/<projectId>/`, never inside a clone) with a per-call
-  `preserveOriginal` on `edit_file` that always wins in both directions, same shape as `compilerExplicit`.
-  **`prose` is a deliberate, documented exception to "an assertion, never an inference"** — the rule that
-  otherwise governs `followSymlinks` and `compilerExplicit`. It is allowed here specifically because the
-  two things that rule protects against don't apply: `followSymlinks` guards a sandbox escape and
-  `compilerExplicit` guards a silently changed compile backend, and getting either wrong is a security
-  hole or a wrong PDF. Guessing wrong about `prose` costs a stray `%`-commented paragraph sitting in a
-  diff the tool already returns and the user already reviews before pushing — cosmetic, reversible, and
-  visible, with an explicit `preserveOriginal` sitting on top for whenever the guess is wrong. That is a
-  cost worth inferring around; the other two are not. The preserved block carries **no sentinel marker on
+  Modes are `off` / `prose` / `always`, default **`off`**: preservation writes bytes the caller did not
+  ask for, so it is opt-in, never a silent default. A user turns it on per project with
+  `set_rewrite_mode` (sticky state under `<workspace>/.sessions/<projectId>/`, never inside a clone) or
+  server-wide with `WEB_LATEX_MCP_REWRITE_MODE`, with a per-call `preserveOriginal` on `edit_file` that
+  always wins in both directions, same shape as `compilerExplicit`.
+  **`prose` is a deliberate, documented exception to "an assertion, never an inference" — but only once a
+  user has made the assertion of turning it on.** The rule otherwise governs `followSymlinks` and
+  `compilerExplicit`: an inference the server makes on its own initiative. `prose` never does that — the
+  server infers nothing until a user has explicitly opted into preservation (per project or server-wide),
+  and only inside that opted-in mode does it guess _which_ edits look like a rewrite. That guess is
+  allowed here specifically because the two things "assertion, never inference" protects against don't
+  apply: `followSymlinks` guards a sandbox escape and `compilerExplicit` guards a silently changed compile
+  backend, and getting either wrong is a security hole or a wrong PDF. Guessing wrong about `prose` costs
+  a stray `%`-commented paragraph sitting in a diff the tool already returns and the user already reviews
+  before pushing — cosmetic, reversible, and visible, with an explicit `preserveOriginal` sitting on top
+  for whenever the guess is wrong. That is a cost worth inferring around, once the user has opted in; the
+  other two are not, and neither ever fires without the user's own initiative. The preserved block carries
+  **no sentinel marker on
   purpose** — it is byte-identical to what a human would have typed on Overleaf, not something stamped
   `% [preserved by web-latex-mcp]`, so a co-author sees a normal commented-out paragraph, not a
   machine-generated one, and `arxiv-clean-project` already strips comments before submission regardless.
@@ -190,7 +197,7 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   position to comment above — `applyEdits` skips the hook entirely for one, and the hook itself
   checks `edit.replaceAll` again regardless, so neither call site can be the reason this guard
   goes quiet. As with `parseCompilerChoice`, the mode is resolved in exactly one function —
-  per-call `preserveOriginal` > stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'prose'` —
+  per-call `preserveOriginal` > stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'off'` —
   so no second code path can derive a different answer.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for

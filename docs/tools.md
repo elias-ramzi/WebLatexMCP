@@ -165,8 +165,8 @@ replacement, in place of deleting it — controlled by a project's **rewrite mod
 happens for an edit that qualifies at all (see the line-alignment and `replaceAll` restrictions
 below); an edit that doesn't qualify always applies the ordinary way, whatever the mode:
 
-- **`off`** — never preserve; the edit replaces the text as usual.
-- **`prose`** (default) — preserve only when the edit looks like a rewritten sentence or paragraph:
+- **`off`** (default) — never preserve; the edit replaces the text as usual.
+- **`prose`** — preserve only when the edit looks like a rewritten sentence or paragraph:
   the replaced text has at least 8 words, most of them ordinary prose rather than LaTeX markup, and
   the replacement isn't nearly identical to the original. A typo fix, a changed number, a swapped
   `\cite` key, or a renamed `\label` all fall through as `minor` and are not preserved.
@@ -186,9 +186,11 @@ per-project so every session sees it; call it with `mode` omitted to read the cu
 without changing anything. A per-call `preserveOriginal: true`/`false` on `edit_file` always wins over
 the project's stored mode, in both directions — force it on for one particularly important rewrite, or
 off for a mechanical one. Resolution order: `preserveOriginal` (this call), then the project's stored
-mode, then `WEB_LATEX_MCP_REWRITE_MODE` (the server's default), then `prose`. See
+mode, then `WEB_LATEX_MCP_REWRITE_MODE` (the server's default), then `off`. See
 [`WEB_LATEX_MCP_REWRITE_MODE`](configuration.md#environment-variables) to change the default, and
-`list_projects`/`server_info` for where a project's effective mode is reported.
+`list_projects`/`server_info` for where a project's effective mode is reported. To get the Overleaf
+habit back, set the mode to `prose` (or `always`) — per project with `set_rewrite_mode`, or
+server-wide with `WEB_LATEX_MCP_REWRITE_MODE`.
 
 The preserved block is never marked — it looks exactly like a paragraph a human commented out on
 Overleaf, with no sentinel. `arxiv-clean-project` already strips comments before submission, so this

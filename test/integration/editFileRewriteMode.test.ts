@@ -215,7 +215,7 @@ describe('edit_file rewrite-preservation mode', () => {
     await writeFile(path.join(userDir, 'main.tex'), `${PARAGRAPH_OLD}\n`, 'utf8');
     await client.callTool({ name: 'register_project', arguments: { project: 'p', path: userDir } });
     // No set_rewrite_mode call: the project has nothing stored, so it must fall through to the
-    // env-configured default rather than the built-in 'prose'.
+    // env-configured default rather than the built-in 'off'.
 
     const res = await client.callTool({
       name: 'edit_file',
@@ -381,7 +381,49 @@ describe('edit_file rewrite-preservation mode', () => {
   });
 
   it(
-    'a mid-line deletion under the default prose mode leaves the rest of the line ' +
+    'a paragraph rewrite under the default mode (nothing configured) applies unchanged, with ' +
+      'no % comment added, because the built-in default is "off" — preservation is opt-in',
+    async () => {
+      const { client, userDir } = await setup();
+      // A line-aligned, majority-prose, genuinely-rewritten paragraph: exactly the shape
+      // classifyEdit calls 'prose' and, under the old 'prose' default, would have been preserved
+      // as a commented-out block above the replacement. Under the new 'off' default it must not
+      // be — the point of this test is that a caller who configures nothing gets their document
+      // edited and nothing else.
+      await writeFile(path.join(userDir, 'main.tex'), `${PARAGRAPH_OLD}\n`, 'utf8');
+      await client.callTool({
+        name: 'register_project',
+        arguments: { project: 'p', path: userDir },
+      });
+      // Default mode: no set_rewrite_mode call, and setup() passes no envDefault, so this
+      // exercises the built-in DEFAULT_REWRITE_MODE end to end.
+
+      const res = await client.callTool({
+        name: 'edit_file',
+        arguments: {
+          project: 'p',
+          path: 'main.tex',
+          edits: [{ oldString: PARAGRAPH_OLD, newString: PARAGRAPH_NEW }],
+        },
+      });
+      expect(res.isError ?? false).toBe(false);
+      const out = structured<{ rewriteMode: string; preservedEdits: number }>(res);
+      expect(out.rewriteMode).toBe('off');
+      expect(out.preservedEdits).toBe(0);
+
+      const read = await client.callTool({
+        name: 'read_file',
+        arguments: { project: 'p', path: 'main.tex' },
+      });
+      const resultContent = structured<{ content: string }>(read).content;
+      expect(resultContent).toBe(`${PARAGRAPH_NEW}\n`);
+      expect(resultContent).not.toContain('%');
+      expect(resultContent).not.toContain(PARAGRAPH_OLD);
+    },
+  );
+
+  it(
+    'a mid-line deletion under an explicit prose mode leaves the rest of the line ' +
       'intact and uncommented, and reports preservedEdits: 0',
     async () => {
       const { client, userDir } = await setup();
@@ -393,7 +435,12 @@ describe('edit_file rewrite-preservation mode', () => {
         name: 'register_project',
         arguments: { project: 'p', path: userDir },
       });
-      // Default mode: no set_rewrite_mode call — the env/project default is 'prose'.
+      // Explicit, since the built-in default is now 'off' and this test is about the
+      // line-alignment guard within 'prose', not about what the default is.
+      await client.callTool({
+        name: 'set_rewrite_mode',
+        arguments: { project: 'p', mode: 'prose' },
+      });
 
       const res = await client.callTool({
         name: 'edit_file',

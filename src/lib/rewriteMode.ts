@@ -18,8 +18,13 @@ export type RewriteMode = 'off' | 'prose' | 'always';
  * than keeping private copies (the same reason `COMPILER_KINDS` is shared with the resolver). */
 export const REWRITE_MODES: readonly RewriteMode[] = ['off', 'prose', 'always'];
 
-/** The mode when nothing else says otherwise. */
-export const DEFAULT_REWRITE_MODE: RewriteMode = 'prose';
+/**
+ * The mode when nothing else says otherwise: `'off'`. Preservation changes the bytes of the
+ * user's document beyond what they asked for, so it is opt-in, not a silent default — a user who
+ * wants the Overleaf habit of commenting the original above a rewrite turns it on per project with
+ * `set_rewrite_mode`, or server-wide with `WEB_LATEX_MCP_REWRITE_MODE`.
+ */
+export const DEFAULT_REWRITE_MODE: RewriteMode = 'off';
 
 /** Where a resolved mode came from, so it is never a hidden setting. */
 export type RewriteModeSource = 'call' | 'project' | 'default';

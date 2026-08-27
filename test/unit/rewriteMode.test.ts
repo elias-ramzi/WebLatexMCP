@@ -10,6 +10,7 @@ import {
   nearIdenticalOverlap,
   tokenMultisetOverlap,
   markupMask,
+  DEFAULT_REWRITE_MODE,
 } from '../../src/lib/rewriteMode.js';
 import type { EditOp } from '../../src/services/fileService.js';
 
@@ -605,6 +606,14 @@ describe('createPreserveTransform', () => {
         expect(preserve.preservedEdits()).toBe(0);
       },
     );
+  });
+});
+
+describe('DEFAULT_REWRITE_MODE', () => {
+  it('is "off" — preservation writes bytes the caller did not ask for, so it must stay opt-in;', () => {
+    // flipping this back to a mode that preserves-by-default is a deliberate act that should
+    // fail this test, never a silent side effect of some other change.
+    expect(DEFAULT_REWRITE_MODE).toBe('off');
   });
 });
 

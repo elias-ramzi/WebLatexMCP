@@ -21,4 +21,4 @@ Target: $ARGUMENTS
    `envConfigured` fields — never guess or assume: `source: "project"` means this project's own
    stored setting; `source: "default"` with `envConfigured: true` means the server's
    `WEB_LATEX_MCP_REWRITE_MODE` default; `source: "default"` with `envConfigured: false` means the
-   built-in `prose` default.
+   built-in `off` default.
