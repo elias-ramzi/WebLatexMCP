@@ -29,7 +29,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   that changed what "the current session already agreed to" mid-conversation is a stranger source of
   confusion than a one-session delay. `server_info` now reports the configured path and whether the file
   actually loaded, because a typo'd path would otherwise mean the conventions are silently ignored
-  forever with no way to notice.
+  forever with no way to notice. `add_writing_convention` now also requires `confirmGuideEdit: true`,
+  refusing otherwise with an actionable error — mirroring the `.bib` guard's shape, but for the opposite
+  reason: the appended rule originates from the model, not a trusted source, and it is the one write in
+  the server that lands outside every project sandbox and into every future session's instructions, so
+  the gate stands in for the user's explicit acknowledgement. When no guide is configured at all, the
+  unconfigured error wins outright — there is nothing to confirm writing to a destination that doesn't
+  exist, so no confirmation round trip precedes it. `server_info` also now reports
+  `writingGuideExtraRuleCount`, a live count of the top-level bullets currently in that file (including
+  any the user wrote by hand) — read fresh on every call, so unlike the loaded instructions and the
+  `guide://latex/writing-guide` resource (both fixed at startup) it reflects a rule appended earlier in
+  the same session; absent when no guide is configured or the file can't be read. Deliberately a count,
+  not the rule text, to keep `server_info` cheap and bounded — open the reported path for the text.
 
 - **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
   `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels

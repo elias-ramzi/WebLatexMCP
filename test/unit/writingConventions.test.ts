@@ -4,7 +4,9 @@ import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile, mkdir } from 'node:fs/promises';
 import {
   appendWritingConvention,
+  countWritingConventions,
   WritingConventionsUnconfiguredError,
+  guideEditBlockedMessage,
 } from '../../src/lib/writingConventions.js';
 
 describe('appendWritingConvention', () => {
@@ -189,5 +191,94 @@ describe('appendWritingConvention', () => {
     // must not each seed the intro, doubling it up.
     const introMatches = contents.match(/add_writing_convention/g);
     expect(introMatches).toHaveLength(1);
+  });
+});
+
+describe('guideEditBlockedMessage', () => {
+  it('names the target path and the confirmGuideEdit flag', () => {
+    const msg = guideEditBlockedMessage('/home/user/writing-conventions.md');
+    expect(msg).toContain('/home/user/writing-conventions.md');
+    expect(msg).toContain('confirmGuideEdit');
+  });
+});
+
+describe('countWritingConventions', () => {
+  let dir: string;
+  let target: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-writing-conventions-count-'));
+    target = path.join(dir, 'conventions.md');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('counts 2 bullets after two appendWritingConvention calls', async () => {
+    await appendWritingConvention(target, 'first rule');
+    await appendWritingConvention(target, 'second rule');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('counts a multi-line rule as 1, not one per line', async () => {
+    await appendWritingConvention(target, 'first line\nsecond line\nthird line');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('returns undefined for an unconfigured (undefined) path', async () => {
+    await expect(countWritingConventions(undefined)).resolves.toBeUndefined();
+  });
+
+  it('returns undefined rather than throwing for a nonexistent file', async () => {
+    await expect(countWritingConventions(path.join(dir, 'missing.md'))).resolves.toBeUndefined();
+  });
+
+  it('counts correctly in a file with CRLF line endings', async () => {
+    await writeFile(target, '- rule one\r\n- rule two\r\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('counts a user-hand-written bullet too, alongside an appended one', async () => {
+    await appendWritingConvention(target, 'appended rule');
+    const contents = await readFile(target, 'utf8');
+    await writeFile(target, `${contents}- a hand-written bullet\n`, 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('returns undefined rather than throwing when targetPath is a directory, not a file', async () => {
+    await expect(countWritingConventions(dir)).resolves.toBeUndefined();
+  });
+
+  it('counts a rule whose own text starts with "- " as exactly 1, not 2', async () => {
+    await appendWritingConvention(target, '- a rule that itself starts with a bullet');
+    const contents = await readFile(target, 'utf8');
+    expect(contents).toContain('- - a rule that itself starts with a bullet');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('counts hand-written "*" and "+" top-level bullets, not just "-"', async () => {
+    await writeFile(target, '* star bullet\n+ plus bullet\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('does not count an indented bullet as top-level', async () => {
+    await writeFile(target, '- top level\n  - x\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('does not count bullets inside a fenced code block', async () => {
+    await writeFile(target, '- real rule\n```\n- a\n- b\n```\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
+  });
+
+  it('does not count a spaced thematic break as a rule', async () => {
+    await writeFile(target, '- real rule\n\n* * *\n\n- - -\n\n- another rule\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('does not count bullets inside a fence indented by up to three spaces', async () => {
+    await writeFile(target, '- real rule\n   ```\n- a\n- b\n   ```\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(1);
   });
 });

@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -175,6 +178,131 @@ describe('createServer tool registration', () => {
   });
 });
 
+describe('add_writing_convention confirmGuideEdit gate', () => {
+  async function connectWithGuide(): Promise<{ client: Client; target: string; dir: string }> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-guide-gate-'));
+    const target = path.join(dir, 'conventions.md');
+    const ctx = {
+      config: { extraWritingGuidePath: target, sessionId: 'test-session' },
+      credentials: { allSecrets: () => [] },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return { client, target, dir };
+  }
+
+  async function notCreated(target: string): Promise<boolean> {
+    try {
+      await stat(target);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  it('refuses without confirmGuideEdit and does not touch the target file', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR' },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('confirmGuideEdit');
+      expect(await notCreated(target)).toBe(true);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses with confirmGuideEdit: false identically to an absent flag', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR', confirmGuideEdit: false },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('confirmGuideEdit');
+      expect(await notCreated(target)).toBe(true);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses without confirmGuideEdit and leaves an existing guide file byte-identical', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    const original = '# Existing conventions\n\n- an existing hand-written rule\n';
+    await writeFile(target, original, 'utf8');
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR' },
+      });
+      expect(res.isError).toBe(true);
+      // Not-created alone would pass a regression that appends before checking the gate as long
+      // as the file already existed — this proves the existing content is untouched, not just
+      // that the file wasn't freshly created.
+      expect(await readFile(target, 'utf8')).toBe(original);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('appends the rule when confirmGuideEdit is true', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR', confirmGuideEdit: true },
+      });
+      expect(res.isError).toBeFalsy();
+      const structured = res.structuredContent as Record<string, unknown>;
+      expect(structured.created).toBe(true);
+      const contents = await readFile(target, 'utf8');
+      expect(contents).toContain('- always write lidar, never LiDAR');
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the unconfigured-guide error, not the confirm gate, when no guide is configured', async () => {
+    const ctx = {
+      config: { extraWritingGuidePath: undefined, sessionId: 'test-session' },
+      credentials: { allSecrets: () => [] },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      // Called WITHOUT confirmGuideEdit: with no configured path there is nothing to confirm,
+      // so the unconfigured-guide check must win outright rather than asking for a confirmation
+      // that could never lead anywhere.
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'a rule' },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('WEB_LATEX_MCP_WRITING_GUIDE_EXTRA');
+      expect(text).toContain('nowhere to remember this convention');
+      // The confirm gate never fires in this case.
+      expect(text).not.toContain('confirmGuideEdit');
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('createServer skill prompts', () => {
   const skills: Skill[] = [
     { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
@@ -343,6 +471,95 @@ describe('server_info', () => {
     expect(text.toLowerCase()).toContain('not in effect');
 
     await client.close();
+  });
+
+  it('omits writingGuideExtraRuleCount when no guide is configured', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraRuleCount).toBeUndefined();
+
+    await client.close();
+  });
+
+  it('reports a live writingGuideExtraRuleCount that reflects a rule appended after server construction', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-server-info-guide-'));
+    const guidePath = path.join(dir, 'conventions.md');
+    try {
+      await writeFile(guidePath, '- rule one\n- rule two\n', 'utf8');
+
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          workspaceIsLocal: false,
+          compiler: 'latexmk',
+          extraWritingGuidePath: guidePath,
+          extraWritingGuideLoaded: true,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const first = await client.callTool({ name: 'server_info', arguments: {} });
+      const firstStructured = first.structuredContent as Record<string, unknown>;
+      expect(firstStructured.writingGuideExtraRuleCount).toBe(2);
+      const firstText = (first.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(firstText).toContain('2 conventions');
+
+      // A rule appended AFTER the server (and its startup snapshot) were built must still show
+      // up: this is the whole point of reading the file live rather than from that snapshot.
+      await writeFile(guidePath, '- rule one\n- rule two\n- rule three\n', 'utf8');
+
+      const second = await client.callTool({ name: 'server_info', arguments: {} });
+      const secondStructured = second.structuredContent as Record<string, unknown>;
+      expect(secondStructured.writingGuideExtraRuleCount).toBe(3);
+
+      await client.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('includes the conventions count in the text even when the guide did not load', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-server-info-guide-notloaded-'));
+    const guidePath = path.join(dir, 'conventions.md');
+    try {
+      await writeFile(guidePath, '- rule one\n- rule two\n', 'utf8');
+
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          workspaceIsLocal: false,
+          compiler: 'latexmk',
+          extraWritingGuidePath: guidePath,
+          extraWritingGuideLoaded: false,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const result = await client.callTool({ name: 'server_info', arguments: {} });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.writingGuideExtraRuleCount).toBe(2);
+      const text = (result.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('NOT loaded');
+      expect(text).toContain('2 conventions');
+
+      await client.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
