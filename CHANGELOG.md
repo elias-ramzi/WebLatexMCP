@@ -157,6 +157,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **A regression test that passes before its fix is now a finding, not a footnote.** The `implementer`
+  agent already had to watch each new test fail on the pre-fix code and report the result, and it did —
+  during the review of #52 it said plainly that two of three new tests passed pre-fix, because the `- `
+  bullet prefix in front of them already satisfied their regexes. Nothing said what to _do_ with that
+  disclosure, so it was read as a status line and passed upward; the vacuous tests were caught two steps
+  later by `plan-verifier`. The agent's brief now closes that loop — such a test is rewritten until it
+  fails for the right reason, or deleted, and never reported as covered — and `/review` step 3 treats an
+  implementer's "passed pre-fix" as a confirmed finding to send back in the same round. A test that
+  passes before the fix cannot catch the bug returning, and is also evidence the fix may be aimed at the
+  wrong thing, which is the easier signal to skim past. No extra verification round was added: the
+  existing one worked, catching both these tests and a TOCTOU race that a fix had itself introduced.
+
 - **The `session-feedback` skill saves its report itself when there is no way to file it.** The report
   was always optional to write, which is right when `gh` can file the findings and wrong when it
   cannot: with `gh` missing or merely logged out, the blocks existed only in the transcript and died

@@ -58,6 +58,10 @@ test:smoke` if it is installed). The output goes to the reviewer as evidence, no
    sharing files sequentially. Keep for yourself anything requiring design judgment or
    touching more than ~3 files. Findings that are really the author's call (design
    disagreements, scope questions) are not fixed — they stay in the report.
+   Read what each agent reports back about its regression test: an implementer saying a
+   test **passed before the fix** is a confirmed finding of its own, not a status line to
+   pass upward. That test proves nothing, and the fix under it may be aimed at the wrong
+   thing — send it back in this round rather than letting step 4 find it.
 
 4. **Verify** (only with `--fix`). Re-run the gate yourself after every fix, then send
    the fix diff to the `plan-verifier` agent with the findings list from step 2 as the
