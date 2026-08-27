@@ -8,6 +8,7 @@ import path from 'node:path';
  *   .sessions/
  *     <projectId>/
  *       project.lock              cross-process lock for mutating operations
+ *       rewrite-mode.json         sticky rewrite-preservation mode, shared by every session
  *       <sessionId>/
  *         session.json            heartbeat + metadata, so peers can see each other
  *         shadow.json             which files this session has touched
@@ -35,4 +36,14 @@ export function projectLockPath(workspaceRoot: string, projectId: string): strin
 /** State directory for one session's view of one project. */
 export function sessionDir(workspaceRoot: string, projectId: string, sessionId: string): string {
   return path.join(sessionStateDir(workspaceRoot, projectId), sessionId);
+}
+
+/**
+ * The sticky rewrite-preservation mode for a project — per project, shared by every session
+ * (not under `<sessionId>/`), since it is "how we work on this paper" rather than session state.
+ * Lives beside the clones, never inside them, so it can never be committed or mistaken for
+ * project content.
+ */
+export function rewriteModePath(workspaceRoot: string, projectId: string): string {
+  return path.join(sessionStateDir(workspaceRoot, projectId), 'rewrite-mode.json');
 }

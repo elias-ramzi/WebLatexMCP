@@ -7,6 +7,8 @@ import { readProjectRegistry } from './services/projectRegistry.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
 import { COMPILER_KINDS } from './services/compilerResolver.js';
+import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from './lib/rewriteMode.js';
+import type { RewriteMode } from './lib/rewriteMode.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 /**
@@ -152,6 +154,37 @@ function parseCompilerChoice(raw: string | undefined): {
 }
 
 /**
+ * Select the default rewrite-preservation mode from `WEB_LATEX_MCP_REWRITE_MODE`. Unlike
+ * `parseCompilerChoice`, an invalid value does not throw: a bad compiler choice is unrecoverable
+ * (the server cannot compile), whereas this setting is cosmetic — refusing to start the whole
+ * server over a typo in a comment-style preference would be out of proportion. Instead, fall
+ * back to the default and log the rejection to stderr (never stdout — that is the JSON-RPC
+ * channel) so the typo is still visible.
+ */
+export function parseRewriteMode(raw: string | undefined): {
+  mode: RewriteMode;
+  explicit: boolean;
+} {
+  const value = raw?.trim().toLowerCase();
+  // Both answers come from this one emptiness test so they can never disagree — the same shape
+  // as `parseCompilerChoice`. `explicit` is what lets a *reporting* tool tell "the user set this"
+  // from "nobody set anything": the resolved mode is populated either way, so a caller testing
+  // `rewriteMode !== undefined` would call the built-in default a configured one.
+  if (!value) return { mode: DEFAULT_REWRITE_MODE, explicit: false };
+  if ((REWRITE_MODES as readonly string[]).includes(value)) {
+    return { mode: value as RewriteMode, explicit: true };
+  }
+  console.error(
+    `WEB_LATEX_MCP_REWRITE_MODE "${raw}" is invalid; expected one of: ${REWRITE_MODES.join(
+      ', ',
+    )}. Falling back to "${DEFAULT_REWRITE_MODE}".`,
+  );
+  // A rejected value is not a choice: fall back to the default *and* report it as unchosen, so
+  // nothing downstream describes the fallback as something the user asked for.
+  return { mode: DEFAULT_REWRITE_MODE, explicit: false };
+}
+
+/**
  * Build the server configuration from environment variables. Reads the filesystem only to
  * detect whether the launch dir is a git repo (for the workspace default); inject `insideRepo`
  * to keep unit tests hermetic.
@@ -189,6 +222,9 @@ export function loadConfig(
   );
   const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
+  const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
+    env.WEB_LATEX_MCP_REWRITE_MODE,
+  );
 
   return {
     workspaceRoot,
@@ -200,6 +236,8 @@ export function loadConfig(
     compilerExplicit,
     viewerPort,
     viewerTarget,
+    rewriteMode,
+    rewriteModeExplicit,
   };
 }
 

@@ -150,6 +150,36 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
+- **Rewritten prose is preserved by commenting it out, and the transform lives server-side, not in the
+  writing guide.** `edit_file` can prefix the old text with `% ` above the replacement instead of
+  discarding it — the habit Overleaf users already have. This has to be a guard the server enforces, not
+  a prompt rule asking the model to retype the old text as `%`-commented lines: a preserved block is only
+  worth anything if it is provably the bytes that were there, the same reasoning that keeps BibTeX entry
+  text originating from DBLP rather than from the model retyping it. **`edit_file` only, never
+  `write_file`**: a whole-file write has no "old paragraph" to splice a comment above, only an entire old
+  file, and commenting out all of it is never what is meant. A `.bib` target stays exempt regardless of
+  mode — that file already has its own guard, and a `.bib`'s entries are not prose to preserve either way.
+  Modes are `off` / `prose` / `always` (default `prose`), resolved per project via `set_rewrite_mode`
+  (sticky state under `<workspace>/.sessions/<projectId>/`, never inside a clone) with a per-call
+  `preserveOriginal` on `edit_file` that always wins in both directions, same shape as `compilerExplicit`.
+  **`prose` is a deliberate, documented exception to "an assertion, never an inference"** — the rule that
+  otherwise governs `followSymlinks` and `compilerExplicit`. It is allowed here specifically because the
+  two things that rule protects against don't apply: `followSymlinks` guards a sandbox escape and
+  `compilerExplicit` guards a silently changed compile backend, and getting either wrong is a security
+  hole or a wrong PDF. Guessing wrong about `prose` costs a stray `%`-commented paragraph sitting in a
+  diff the tool already returns and the user already reviews before pushing — cosmetic, reversible, and
+  visible, with an explicit `preserveOriginal` sitting on top for whenever the guess is wrong. That is a
+  cost worth inferring around; the other two are not. The preserved block carries **no sentinel marker on
+  purpose** — it is byte-identical to what a human would have typed on Overleaf, not something stamped
+  `% [preserved by web-latex-mcp]`, so a co-author sees a normal commented-out paragraph, not a
+  machine-generated one, and `arxiv-clean-project` already strips comments before submission regardless.
+  The cost — no tool can later tell an old paragraph from an author's own commented-out note — is
+  accepted, not overlooked. An edit with `oldString === newString` is left untransformed rather than
+  wrapped: `applyEdits` rejects that pair to catch a no-op edit, and transforming first would turn it into
+  `old` vs. `"% " + old + old`, which no longer matches and would silently disarm the check. As with
+  `parseCompilerChoice`, the mode is resolved in exactly one function — per-call `preserveOriginal` >
+  stored project mode > `WEB_LATEX_MCP_REWRITE_MODE` > `'prose'` — so no second code path can derive a
+  different answer.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)

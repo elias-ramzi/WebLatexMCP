@@ -19,6 +19,7 @@ import { DoctorService } from '../../src/services/doctor.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
+import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -96,6 +97,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
         git.readAtRef(d, 'HEAD', rel),
       ),
+      rewriteModes: new RewriteModeStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
     };
     ctx.files.setMutationRecorder({

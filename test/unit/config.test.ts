@@ -1,9 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
-import { loadConfig } from '../../src/config.js';
+import { loadConfig, parseRewriteMode } from '../../src/config.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
+import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -225,5 +226,54 @@ describe('loadConfig', () => {
     expect(() =>
       loadConfig({ WEB_LATEX_MCP_PROJECTS: JSON.stringify({ cv: { rootFile: 'cv.tex' } }) }),
     ).toThrow(/invalid/);
+  });
+});
+
+describe('parseRewriteMode', () => {
+  const notInRepo = () => false;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('defaults when unset, empty, or whitespace-only', () => {
+    expect(parseRewriteMode(undefined)).toEqual({ mode: DEFAULT_REWRITE_MODE, explicit: false });
+    expect(parseRewriteMode('')).toEqual({ mode: DEFAULT_REWRITE_MODE, explicit: false });
+    expect(parseRewriteMode('   ')).toEqual({ mode: DEFAULT_REWRITE_MODE, explicit: false });
+  });
+
+  it('accepts a valid mode, case-insensitively and trimmed', () => {
+    for (const mode of REWRITE_MODES) {
+      expect(parseRewriteMode(mode)).toEqual({ mode, explicit: true });
+      expect(parseRewriteMode(`  ${mode.toUpperCase()}  `)).toEqual({ mode, explicit: true });
+    }
+  });
+
+  it('falls back to the default (never throws) on a garbage value, and logs the rejection', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // A rejected value falls back *and* stays unchosen: naming the default a configuration the
+    // user made is how `list_projects` came to label every default install "(env default)".
+    expect(parseRewriteMode('sometimes')).toEqual({ mode: DEFAULT_REWRITE_MODE, explicit: false });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const message = spy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('sometimes');
+    for (const mode of REWRITE_MODES) {
+      expect(message).toContain(mode);
+    }
+  });
+
+  it('wires the env default into loadConfig as rewriteMode', () => {
+    expect(loadConfig({}, '/some/dir', notInRepo).rewriteMode).toBe(DEFAULT_REWRITE_MODE);
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo).rewriteMode,
+    ).toBe('always');
+
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir', notInRepo).rewriteMode,
+    ).toBe(DEFAULT_REWRITE_MODE);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const message = spy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('bogus');
   });
 });

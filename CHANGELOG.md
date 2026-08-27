@@ -11,6 +11,23 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Rewrite-preservation mode** — a habit Overleaf users already have, that the model had no way to
+  match: when `edit_file` rewrites a sentence or paragraph in a `.tex`/`.sty`/`.cls`/`.bbl` file, it can
+  now comment the original out (`% ` on every line) above the replacement instead of discarding it, so a
+  rewrite reads in the diff the way a human's would — the old wording still there, commented, for a
+  co-author to see. This has to be enforced server-side rather than asked of the model as a writing-guide
+  rule: a preserved block is only trustworthy if it is provably the bytes that were there, the same
+  reason BibTeX entry text comes from DBLP rather than from the model retyping it. Three modes — `off`,
+  `prose` (default), `always` — with `prose` preserving only edits that look like an actual rewrite (>= 8
+  words, mostly non-markup, not a near-identical replacement), so a typo fix or a swapped `\cite` key is
+  left alone. The mode is sticky per project (`set_rewrite_mode`, persisted outside the clone) and
+  defaults from `WEB_LATEX_MCP_REWRITE_MODE`; a per-call `preserveOriginal` on `edit_file` always wins
+  over both, in either direction. Never applies to `write_file` (no single old paragraph to comment out
+  above — the whole prior file isn't the same thing) or to a `.bib` (already gated by `confirmBibEdit`).
+  The preserved block carries no sentinel marker on purpose — it should look exactly like a paragraph a
+  human commented out by hand, and `arxiv-clean-project` already strips comments before submission.
+  `list_projects` and `server_info` report the effective/default mode so it is never a hidden setting.
+
 - **A `render_pages` tool, and `pageCount` on `compile`** — the model could not see what it compiled.
   `compile` returned a log and a PDF path; `viewer` served a pdf.js page for a _human_. Neither put pixels
   where the model could read them, so every visual question had to be answered outside the server — in the

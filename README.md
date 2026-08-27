@@ -132,7 +132,7 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
 - **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
+- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on. Rewriting a `.tex` paragraph preserves the original by commenting it out above the replacement, the way Overleaf users already do — controlled per project by `set_rewrite_mode` or `WEB_LATEX_MCP_REWRITE_MODE`, and per call by `edit_file`'s `preserveOriginal` (see [Tools](docs/tools.md#rewrite-preservation-mode)).
 - **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.

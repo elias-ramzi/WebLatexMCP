@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
+import { REWRITE_MODES, resolveRewriteMode, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
+import type { RewriteMode } from '../lib/rewriteMode.js';
+import { rewriteModeSourceEnum } from './setRewriteMode.js';
 
 const outputSchema = {
   projects: z.array(
@@ -17,6 +20,16 @@ const outputSchema = {
       cloned: z
         .boolean()
         .describe('Git: whether it is cloned yet. Local: whether the directory is there.'),
+      rewriteMode: z
+        .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
+        .describe(
+          'What edit_file does with replaced text in this project: "always" comments the original ' +
+            'out above the replacement, "prose" does so only for prose rewrites, "off" replaces ' +
+            'outright. Change it with set_rewrite_mode.',
+        ),
+      rewriteModeSource: rewriteModeSourceEnum.describe(
+        '"project" if stored for this project, "default" if nothing is stored.',
+      ),
     }),
   ),
 };
@@ -35,7 +48,28 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
       outputSchema,
     },
     async () => {
-      const projects = await ctx.projectManager.listProjects();
+      const listed = await ctx.projectManager.listProjects();
+      // The mode is reported here rather than in `status` because `status` requires a git
+      // project, and a local in-place draft — the case this mode suits best — would never see it.
+      const envDefault = ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE;
+      // Whether to show the mode in the text line at all: suppress it only when the mode is
+      // purely the *built-in* default (nothing stored, and no env var configured) — showing
+      // nothing there is right, since there is nothing to say. But when
+      // WEB_LATEX_MCP_REWRITE_MODE is set, that is a real configured setting a text-only client
+      // must still see, even with nothing stored per-project (source stays "default" either way,
+      // since that only distinguishes "stored" from "not stored").
+      // Not `rewriteMode !== undefined`: loadConfig populates it with the built-in default when
+      // the env names nothing, so that test calls every default install "configured".
+      const envConfigured = ctx.config.rewriteModeExplicit === true;
+      const projects = await Promise.all(
+        listed.map(async (p) => {
+          const resolved = resolveRewriteMode({
+            stored: await ctx.rewriteModes.get(p.project),
+            envDefault,
+          });
+          return { ...p, rewriteMode: resolved.mode, rewriteModeSource: resolved.source };
+        }),
+      );
       // An empty workspace is the one moment the caller definitely does not know the workflow, so
       // spend the empty state teaching it rather than reporting a bare "none".
       const text =
@@ -54,7 +88,13 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
                     : p.cloned
                       ? 'cloned'
                       : 'not cloned';
-                return `- ${p.project} [${state}] -> ${p.path}`;
+                const rewrite =
+                  p.rewriteModeSource === 'project'
+                    ? `, rewrites: ${p.rewriteMode}`
+                    : envConfigured
+                      ? `, rewrites: ${p.rewriteMode} (env default)`
+                      : '';
+                return `- ${p.project} [${state}${rewrite}] -> ${p.path}`;
               })
               .join('\n');
       return {
