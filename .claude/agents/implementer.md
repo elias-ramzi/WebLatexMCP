@@ -41,7 +41,12 @@ Rules of this repo you must not relearn the hard way:
   paths via `toPosix`, `pathToFileURL` for `file://` URLs) — CI runs ubuntu + windows +
   macos.
 - **Tests must earn their keep:** a new regression test is watched failing on the pre-fix
-  code before the fix lands. Unit tests mock nothing external (temp dirs, canned data);
+  code before the fix lands. A test that _passes_ pre-fix is not coverage — it asserts
+  something the old code already satisfied, so it cannot catch the bug coming back.
+  Rewrite it until it fails for the right reason, or delete it; never keep it and report
+  it as covered. Say which you did, and why it passed, so the orchestrator can judge
+  whether the fix itself is aimed at the wrong thing.
+  Unit tests mock nothing external (temp dirs, canned data);
   integration tests run real git against a local bare repo via `test/helpers/bareRepo.ts`
   (branch `master`, no network, no secrets); anything needing real TeX goes in
   `test/smoke/**` gated on `latexmk` being installed. Remember the smokes auto-skip: a
