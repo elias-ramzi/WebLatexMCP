@@ -150,8 +150,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked.
-- **Rewritten prose is preserved by commenting it out, and the transform lives server-side, not in the
-  writing guide.** `edit_file` can prefix the old text with `% ` above the replacement instead of
+- **Rewritten prose can be preserved by commenting it out, and the transform lives server-side, not in
+  the writing guide.** `edit_file` can prefix the old text with `% ` above the replacement instead of
   discarding it — the habit Overleaf users already have. This has to be a guard the server enforces, not
   a prompt rule asking the model to retype the old text as `%`-commented lines: a preserved block is only
   worth anything if it is provably the bytes that were there, the same reasoning that keeps BibTeX entry
