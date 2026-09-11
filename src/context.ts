@@ -67,7 +67,7 @@ export function createContext(
 
   const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
   const shadows = new ShadowStore(config.workspaceRoot, config.sessionId, (dir, rel) =>
-    git.readAtRef(dir, 'HEAD', rel),
+    git.readAtRefBytes(dir, 'HEAD', rel),
   );
   // Every mutation this server makes is folded into this session's shadow, so `commit` can later
   // stage this session's lines alone. FileService is handed the hook rather than the store so it

@@ -152,7 +152,7 @@ project.
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
 - **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
+- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on; `add_asset` imports a figure/image from your machine when it isn't already in the project.
 - **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.

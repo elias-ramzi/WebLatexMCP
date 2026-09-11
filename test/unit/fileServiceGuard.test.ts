@@ -104,6 +104,12 @@ describe('FileService out-of-band edit guard', () => {
         files.applyEdits(dir, 'notes.tex', [{ oldString: 'PRIVATE', newString: 'PWNED' }]),
       ).rejects.toThrow(/symlink/);
       await expect(files.delete(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+      // The byte-exact counterparts of read/write must refuse the same escape — they run the same
+      // guardLinks() call in the same position, but that was never actually proven here.
+      await expect(files.readBytes(dir, { path: 'notes.tex' })).rejects.toThrow(/symlink/);
+      await expect(
+        files.writeBytes(dir, { path: 'notes.tex', bytes: Buffer.from('PWNED') }),
+      ).rejects.toThrow(/symlink/);
 
       expect(await readFile(secret, 'utf8')).toBe('PRIVATE KEY\n');
     } finally {
@@ -165,6 +171,16 @@ describe('FileService out-of-band edit guard', () => {
         await expect(local.delete(dir, 'notes.tex', { strictLinks: true })).rejects.toThrow(
           /symlink/,
         );
+        await expect(
+          local.readBytes(dir, { path: 'notes.tex', strictLinks: true }),
+        ).rejects.toThrow(/symlink/);
+        await expect(
+          local.writeBytes(dir, {
+            path: 'notes.tex',
+            bytes: Buffer.from('PWNED'),
+            strictLinks: true,
+          }),
+        ).rejects.toThrow(/symlink/);
         expect(await readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('PRIVATE KEY\n');
       } finally {
         await rm(outside, { recursive: true, force: true });

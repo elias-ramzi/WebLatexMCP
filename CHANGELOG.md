@@ -100,6 +100,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `lockHeldBy` — the session that held the lock, which `LockTimeoutError` already named but only after
   the 30 s timeout. The lock reports more and acquires exactly as before; `withFileLock` and
   `runExclusive` hand the acquisition to their callback, which every other caller ignores.
+
+- **`add_asset`: a figure on your laptop can finally reach the project.** `write_file` takes a
+  `content: string` and wrote it as UTF-8, so there was no way to add a PNG that was not already in
+  the project — and the corruption ran deeper than the tool layer: `ShadowStore` stored every shadow
+  as UTF-8 and `GitService.hashObject` piped a string into `git hash-object`, so even bytes that
+  reached disk were destroyed by the default `scope: "session"` commit. (`scope: "all"`/`"paths"`
+  stage through `git add` and were always binary-safe, which is why this only bit the default path.)
+  The write path is now byte-exact end to end: `FileService.readBytes`/`writeBytes`, a `binary` flag
+  on each shadow entry, and `Buffer` support through `commitContents`. A binary shadow is **never**
+  three-way merged — there is no such thing as a merged PNG — so a peer changing the same bytes is
+  reported as a conflict and, as everywhere else, a conflicted entry stays flagged.
+  `add_asset` takes either `sourcePath` (an absolute path on the machine running the server, `~`
+  expanded) or `contentBase64` (for clients with no filesystem access, capped lower since those bytes
+  cross the model's context). Both the destination AND the resolved (realpath'd) source must be an
+  asset type: that two-sided allowlist is the security gate on the one read that leaves every project
+  sandbox — the destination side alone does not constrain what `sourcePath` may name, so it is checked
+  too, on the path a symlink actually resolves to rather than the name it was given, before any file is
+  opened. The result reports the resolved source path and a sha256 of what landed; it deliberately
+  carries no diff (an added binary tool needing to echo the copied bytes back would be its own way to
+  leak a file that slipped the allowlist).
+
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
   swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,
@@ -257,6 +278,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
+  `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`
+  classification and `read_file`'s binary-file refusal, a `.tif` or `.ico` that previously read as
+  text through `read_file` now returns a path note instead, the same as every other asset type.
+
 - **A regression test that passes before its fix is now a finding, not a footnote.** The `implementer`
   agent already had to watch each new test fail on the pre-fix code and report the result, and it did —
   during the review of #52 it said plainly that two of three new tests passed pre-fix, because the `- `
@@ -296,6 +322,38 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   outside the guard (a win32 `EPERM` with the lock file _present_, which is contention and must not
   retry) and fails if they are split apart again. No behaviour change: `withFileLock`'s signature and
   call site are unchanged, `isLockContentionError` is untouched, and `existsSync` stays uninjected.
+
+### Fixed
+
+- **A missing parent directory now names the flag that creates it.** Writing
+  `sections/new/intro.tex` without `createDirs: true` failed with a raw
+  `ENOENT: no such file or directory, open '/abs/...'` that mentioned neither the missing directory
+  nor the flag, which read as "the server cannot create folders". It now names the parent and points
+  at `createDirs`. A different `ENOENT` still propagates unchanged. (`createDirs` keeps its `false`
+  default on `write_file`; `add_asset`, having no existing callers to surprise, defaults it to true.)
+- **A non-UTF-8 `.tex` is no longer reported as edited-outside-the-server forever.** Comparing raw
+  bytes (above) fixed binaries but broke the other direction: `read`/`readText` record a baseline from
+  the _lossily decoded_ string, so a latin-1 `.tex` — common enough in LaTeX — could never match its
+  own baseline again. A path now counts as externally modified only when it fails to match **both** as
+  bytes and as the decoded string, which is right for binary and latin-1 alike.
+- **Deleting or replacing a figure you just imported no longer claims someone edited it.** The
+  byte-vs-string baseline mismatch above also reached the three _refusal_ sites: `write_file`,
+  `edit_file` and `delete_file` compared a `Buffer` baseline against a UTF-8 rehash of the server's
+  own write, so `add_asset figures/plot.png` followed by `delete_file figures/plot.png` was refused
+  with "changed on disk … it was likely edited directly" — advice the caller could not act on, since
+  `read_file` will not return a binary. All four refusal sites and `status` now share one comparison,
+  so the two halves of the guard cannot disagree again.
+
+- **A text edit to an `.svg`/`.eps` an `add_asset` had touched could silently become an unfixable
+  conflict.** A shadow entry is sticky-binary once bytes land in it, and `write_file`/`edit_file` hand
+  the shadow store a UTF-8-decoded `before`, which can never equal the true bytes — so the entry was
+  flagged conflicted and, correctly, never unflagged, leaving the file uncommittable for the session.
+  The comparison now also accepts a string `before` that the shadow decodes to; a genuine
+  Buffer-vs-Buffer mismatch still conflicts, because that one is real.
+
+- **Binary files no longer show up as permanently edited-outside-the-server.**
+  `FileService.externalModifications` read every file as UTF-8, so a figure's bytes never matched
+  their own recorded baseline and `status` reported it under `externalChanges` forever.
 
 ## [0.6.0] - 2026-08-21
 

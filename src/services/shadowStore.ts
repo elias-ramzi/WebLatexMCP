@@ -6,10 +6,12 @@ import { toPosix } from '../lib/paths.js';
 import { writeAtomic } from './sessionRegistry.js';
 
 /**
- * Reads a path out of the clone's HEAD commit. Injected so the store never depends on GitService
- * (which depends on nothing here), and so tests can drive it without a repository.
+ * Reads a path out of the clone's HEAD commit, as raw bytes. Injected so the store never depends
+ * on GitService (which depends on nothing here), and so tests can drive it without a repository.
+ * Returning bytes (rather than a decoded string) is what lets the store hold a binary shadow
+ * (e.g. a PNG) byte-identically instead of mangling it through a UTF-8 round trip.
  */
-export type HeadReader = (projectDir: string, relPath: string) => Promise<string | null>;
+export type HeadReader = (projectDir: string, relPath: string) => Promise<Buffer | null>;
 
 /** One file this session has changed, as tracked on disk. */
 interface ShadowIndexEntry {
@@ -32,6 +34,13 @@ interface ShadowIndexEntry {
    * existed; such entries parse as `touchedAt: null` via `peerEntries`.
    */
   touchedAt?: string;
+  /**
+   * True once this session has written non-text bytes to the file. A binary shadow is never
+   * three-way merged — there is no such thing as a merged PNG — so a collision is reported
+   * rather than resolved. Absent on indexes written before this field existed, which parse as
+   * text, matching how those entries were actually stored.
+   */
+  binary?: boolean;
 }
 
 interface ShadowIndex {
@@ -49,11 +58,17 @@ export interface PeerShadowEntry {
 /** A file this session has changed, with content resolved. */
 export interface ShadowChange {
   path: string;
-  /** The file as it would be with only this session's edits — null when this session deleted it. */
-  content: string | null;
+  /**
+   * The file as it would be with only this session's edits — null when this session deleted it.
+   * A binary entry (`binary: true`) yields a `Buffer`; a text entry yields a `string`, exactly as
+   * before this type widened.
+   */
+  content: string | Buffer | null;
   /** The HEAD content the change is expressed against — null when the file is new. */
-  base: string | null;
+  base: string | Buffer | null;
   conflicted: boolean;
+  /** True when this file's shadow holds raw bytes rather than text — see `ShadowIndexEntry.binary`. */
+  binary: boolean;
 }
 
 export interface RefreshResult {
@@ -102,17 +117,18 @@ export class ShadowStore {
     projectId: string,
     projectDir: string,
     relPath: string,
-    before: string | null,
-    after: string | null,
+    before: string | Buffer | null,
+    after: string | Buffer | null,
   ): Promise<void> {
     const rel = toPosix(relPath);
     const index = await this.readIndex(projectId);
     let entry = index.entries[rel];
+    const isBinaryChange = Buffer.isBuffer(before) || Buffer.isBuffer(after);
 
     if (!entry) {
       // First touch: anchor to HEAD, and start the shadow at the same content.
       const head = await this.readHead(projectDir, rel);
-      entry = { deleted: false, baseExists: head !== null };
+      entry = { deleted: false, baseExists: head !== null, binary: isBinaryChange };
       await this.writeBase(projectId, rel, head);
       await this.writeShadow(projectId, rel, head);
     }
@@ -121,6 +137,11 @@ export class ShadowStore {
     // branch below where the shadow itself cannot be updated — so this is set unconditionally,
     // before that branch's early return.
     entry.touchedAt = new Date(this.now()).toISOString();
+
+    // Sticky: once a path has carried binary bytes it stays binary for the life of the entry —
+    // a later text write to the same path (unlikely, but not impossible) must not fall back to
+    // three-way text merging, which would treat the bytes as UTF-8 and corrupt them.
+    entry.binary = entry.binary === true || isBinaryChange;
 
     if (entry.conflicted) {
       // Once a file is conflicted its shadow is anchored to a base that HEAD has moved past, so
@@ -137,16 +158,49 @@ export class ShadowStore {
       entry.deleted = true;
       entry.conflicted = false;
       await this.removeShadow(projectId, rel);
+    } else if (entry.binary) {
+      // Binary content has no honest merge — there is no such thing as a merged PNG. A peer
+      // changing the bytes under us (the working-tree bytes we started from no longer match what
+      // we last wrote as the shadow) is reported as a collision, exactly like the text path
+      // reports an unmergeable one, rather than silently adopting either side.
+      const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
+      const shadowBuf = shadow === null ? null : toBuffer(shadow);
+      const beforeBuf = before === null ? null : toBuffer(before);
+      // A text-tool write (write_file/edit_file) reads the working tree as a *string*, even on a
+      // path whose shadow is sticky-binary — so `before` arrives here as the UTF-8 decoding of
+      // whatever bytes are on disk, which is LOSSY when those bytes are not valid UTF-8 (every
+      // invalid byte becomes U+FFFD). Comparing that string, re-encoded, against the true shadow
+      // bytes can then never match even though nothing actually conflicts — the bytes we started
+      // from are exactly the shadow's. So when `before` arrived as a string, also accept a match
+      // by decoding the *shadow* the same lossy way and comparing strings: that is honest, because
+      // `after` is a string too, and `toBuffer(after)` below re-encodes exactly what the text tool
+      // wrote — only the comparison was lossy, never the write. A Buffer `before` never takes this
+      // branch, so a genuine byte-level collision between two binary writers still conflicts.
+      const beforeMatchesShadow =
+        shadowBuf === null ||
+        beforeBuf === null ||
+        shadowBuf.equals(beforeBuf) ||
+        (typeof before === 'string' && shadowBuf.toString('utf8') === before);
+      if (beforeMatchesShadow) {
+        entry.deleted = false;
+        entry.conflicted = false;
+        await this.writeShadow(projectId, rel, toBuffer(after));
+      } else {
+        entry.conflicted = true;
+      }
     } else {
       const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
-      if (shadow === null || before === null || shadow === before) {
+      const shadowStr = shadow === null ? null : shadow.toString('utf8');
+      const beforeStr = before === null ? null : before.toString('utf8');
+      const afterStr = after.toString('utf8');
+      if (shadowStr === null || beforeStr === null || shadowStr === beforeStr) {
         // Nothing to reconcile: a new file, one we are re-creating, or a working tree that has
         // not diverged from our shadow — the edit applies to the shadow directly.
         entry.deleted = false;
         entry.conflicted = false;
-        await this.writeShadow(projectId, rel, after);
+        await this.writeShadow(projectId, rel, Buffer.from(afterStr, 'utf8'));
       } else {
-        const { merged, conflicted } = await merge3(shadow, before, after);
+        const { merged, conflicted } = await merge3(shadowStr, beforeStr, afterStr);
         if (conflicted) {
           // This session just edited lines a peer had already changed in the working tree. There
           // is no honest way to say which of the two the shadow should hold, so we keep it as it
@@ -155,7 +209,7 @@ export class ShadowStore {
         } else {
           entry.deleted = false;
           entry.conflicted = false;
-          await this.writeShadow(projectId, rel, merged);
+          await this.writeShadow(projectId, rel, Buffer.from(merged, 'utf8'));
         }
       }
     }
@@ -169,11 +223,15 @@ export class ShadowStore {
     const index = await this.readIndex(projectId);
     const out: ShadowChange[] = [];
     for (const [rel, entry] of Object.entries(index.entries)) {
+      const binary = entry.binary === true;
+      const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
+      const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
       out.push({
         path: rel,
-        content: entry.deleted ? null : await this.readShadow(projectId, rel),
-        base: entry.baseExists ? await this.readBase(projectId, rel) : null,
+        content: binary ? shadow : (shadow?.toString('utf8') ?? null),
+        base: binary ? base : (base?.toString('utf8') ?? null),
         conflicted: entry.conflicted === true,
+        binary,
       });
     }
     return out.sort((a, b) => a.path.localeCompare(b.path));
@@ -240,10 +298,10 @@ export class ShadowStore {
     for (const [rel, entry] of Object.entries(index.entries)) {
       const head = await this.readHead(projectDir, rel);
       const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
-      if (head === base) continue; // HEAD has not moved under this file
+      if (bytesEqual(head, base)) continue; // HEAD has not moved under this file
 
       const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
-      if (head === shadow || (head === null && entry.deleted)) {
+      if (bytesEqual(head, shadow) || (head === null && entry.deleted)) {
         // Our change is what landed — there is nothing left of it to commit.
         await this.forget(projectId, rel);
         delete index.entries[rel];
@@ -258,13 +316,25 @@ export class ShadowStore {
         continue;
       }
 
-      const { merged, conflicted } = await merge3(head, base ?? '', shadow);
+      if (entry.binary) {
+        // A binary shadow whose HEAD moved to different bytes has no honest merge — there is no
+        // such thing as a merged PNG — so it is reported as a conflict, never merged.
+        entry.conflicted = true;
+        result.conflicted.push(rel);
+        continue;
+      }
+
+      const { merged, conflicted } = await merge3(
+        head.toString('utf8'),
+        base?.toString('utf8') ?? '',
+        shadow.toString('utf8'),
+      );
       if (conflicted) {
         entry.conflicted = true;
         result.conflicted.push(rel);
         continue;
       }
-      await this.writeShadow(projectId, rel, merged);
+      await this.writeShadow(projectId, rel, Buffer.from(merged, 'utf8'));
       await this.writeBase(projectId, rel, head);
       entry.baseExists = true;
       entry.conflicted = false;
@@ -335,19 +405,19 @@ export class ShadowStore {
     await writeAtomic(path.join(dir, 'shadow.json'), JSON.stringify(index, null, 2));
   }
 
-  private readShadow(projectId: string, rel: string): Promise<string | null> {
+  private readShadow(projectId: string, rel: string): Promise<Buffer | null> {
     return readOrNull(this.shadowPath(projectId, rel));
   }
 
-  private readBase(projectId: string, rel: string): Promise<string | null> {
+  private readBase(projectId: string, rel: string): Promise<Buffer | null> {
     return readOrNull(this.basePath(projectId, rel));
   }
 
-  private async writeShadow(projectId: string, rel: string, content: string | null): Promise<void> {
+  private async writeShadow(projectId: string, rel: string, content: Buffer | null): Promise<void> {
     await writeOrRemove(this.shadowPath(projectId, rel), content);
   }
 
-  private async writeBase(projectId: string, rel: string, content: string | null): Promise<void> {
+  private async writeBase(projectId: string, rel: string, content: Buffer | null): Promise<void> {
     await writeOrRemove(this.basePath(projectId, rel), content);
   }
 
@@ -387,19 +457,32 @@ export function latestTouch(entries: PeerShadowEntry[]): string | null {
   return best?.iso ?? null;
 }
 
-async function readOrNull(file: string): Promise<string | null> {
+async function readOrNull(file: string): Promise<Buffer | null> {
   try {
-    return await readFile(file, 'utf8');
+    return await readFile(file);
   } catch {
     return null;
   }
 }
 
-async function writeOrRemove(file: string, content: string | null): Promise<void> {
+async function writeOrRemove(file: string, content: Buffer | null): Promise<void> {
   if (content === null) {
     await rm(file, { force: true });
     return;
   }
   await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, content, 'utf8');
+  await writeFile(file, content);
+}
+
+/** Normalize a mutation's `before`/`after` (or the shadow's own content) to raw bytes. */
+function toBuffer(v: string | Buffer): Buffer {
+  return Buffer.isBuffer(v) ? v : Buffer.from(v, 'utf8');
+}
+
+/** Byte-aware equality for two possibly-absent buffers — `===` is never true for two distinct
+ * Buffer instances even when their bytes match, which is why every HEAD/base/shadow comparison
+ * in this file goes through this helper instead. */
+function bytesEqual(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.equals(b);
 }

@@ -5,7 +5,7 @@ import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
 import { isBibFile } from '../lib/bib.js';
 import { toPosix } from '../lib/paths.js';
-import { execCapture } from '../lib/exec.js';
+import { execCapture, execCaptureBytes } from '../lib/exec.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
@@ -284,13 +284,15 @@ export class GitService {
    * straight into it as blobs, and the commit is made from the index alone — no `add`, no `-a`,
    * and not a single byte of the working tree is touched.
    *
-   * A null `content` stages the file's deletion.
+   * A null `content` stages the file's deletion. A `Buffer` content stages verbatim bytes —
+   * this is how a binary asset (e.g. a PNG figure) reaches a commit without being decoded as
+   * text anywhere along the way.
    */
   async commitContents(
     dir: string,
     opts: {
       message: string;
-      files: Array<{ path: string; content: string | null }>;
+      files: Array<{ path: string; content: string | Buffer | null }>;
       allowEmpty?: boolean;
     },
   ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
@@ -330,13 +332,35 @@ export class GitService {
     return { committed: true, sha, filesChanged: staged.length, files };
   }
 
-  /** Read a path's content at a commit-ish, or null when it does not exist there. */
+  /**
+   * Read a path's content at a commit-ish, or null when it does not exist there. Decodes as
+   * text (via simple-git's `git show`) — for content that may not be valid UTF-8 (a binary
+   * asset), use `readAtRefBytes` instead.
+   */
   async readAtRef(dir: string, ref: string, relPath: string): Promise<string | null> {
     return this.showOrNull(simpleGit(dir), ref, toPosix(relPath));
   }
 
+  /**
+   * Byte-exact analogue of `readAtRef`: read a path's content at a commit-ish as a raw
+   * `Buffer`, or null when it does not exist there. Use this for content that may not be
+   * valid UTF-8 (e.g. a PNG), since `readAtRef`/simple-git's `git show` decode as text and
+   * would corrupt such bytes.
+   */
+  async readAtRefBytes(dir: string, ref: string, relPath: string): Promise<Buffer | null> {
+    const res = await execCaptureBytes('git', ['show', `${ref}:${toPosix(relPath)}`], {
+      cwd: dir,
+    });
+    if (res.code !== 0) return null;
+    return res.stdout;
+  }
+
   /** Write `content` into the object database and return its blob sha. */
-  private async hashObject(dir: string, relPath: string, content: string): Promise<string> {
+  private async hashObject(
+    dir: string,
+    relPath: string,
+    content: string | Buffer,
+  ): Promise<string> {
     const res = await execCapture('git', ['hash-object', '-w', '--stdin', '--path', relPath], {
       cwd: dir,
       input: content,
