@@ -205,6 +205,9 @@ has since exited). That is what separates "wait" from "take over": a write secon
 is a peer mid-paragraph; one hours old, from a session that is merely still open, is a
 judgement the caller can now make with `commit scope: "all"` or `"paths"`. A session
 whose index cannot be read is treated as owning everything, never as owning nothing.
+One gap is deliberate: a write is never failed because its shadow record could not be
+written (a full or unwritable `.sessions/`), so a live peer in that state has edits in
+the tree and no entry naming them — they show up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
 
@@ -240,6 +243,9 @@ so when the others are between edits.
 - **It attributes, it does not lock.** No session is prevented from editing any file.
   Splitting the paper into per-section files remains the real defence — it makes
   collisions rare rather than merely legible.
+- **A peer's `register_project { default: true }` reaches this session at once** — if this
+  session has no default project, its next call that omits `project` resolves to the peer's
+  choice; a session that already has a default keeps it until restart.
 - **A session that dies leaves its edits behind.** They stay in the working tree; once
   its process is gone and its heartbeat is stale it stops counting as live, and its
   files show up as changes no live session owns, committable with `scope: "all"` or

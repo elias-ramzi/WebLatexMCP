@@ -179,6 +179,190 @@ describe('ProjectManager', () => {
     expect(lock.waitedOn).toBeUndefined();
   });
 
+  it('runExclusive reports the in-process mutex wait, and names this session as the holder', async () => {
+    // Two overlapping calls in ONE process contend on the in-process mutex, not the file lock —
+    // withFileLock alone never sees this wait, so before the fix the second call's LockAcquisition
+    // (produced inside withFileLock, whose own clock starts only once the mutex admits it) read
+    // waitedMs: 0 despite genuinely waiting out the whole first call.
+    const pm = new ProjectManager(makeConfig());
+    const first = pm.runExclusive('thesis', async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return 'first';
+    });
+    // Give the first call a moment's head start so the second one is guaranteed to contend on the
+    // mutex rather than possibly racing it for the lock.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = pm.runExclusive('thesis', async (l) => l);
+
+    const [firstResult, secondLock] = await Promise.all([first, second]);
+    expect(firstResult).toBe('first');
+    expect(secondLock.waitedMs).toBeGreaterThanOrEqual(100);
+    expect(secondLock.waitedOn).toBe('test'); // this process's own sessionId (see makeConfig)
+  });
+
+  describe('setDefaultProject', () => {
+    it('loads a project this process has never seen, so projectPath answers for it afterwards', async () => {
+      // A peer registered a LOCAL project; this process holds nothing for that id. The registry
+      // read must fill the in-process gap (as reloadFromRegistry does for a missing id), or the
+      // tool reporting on the result computes the clone path for a project that is local.
+      const store = makeFakeRegistry();
+      const localDir = path.join(workspaceRoot, 'elsewhere');
+      store.entries = [{ id: 'draft', mode: 'local', path: localDir }];
+      const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+
+      const cfg = await pm.setDefaultProject('draft');
+
+      expect(cfg).toEqual({ id: 'draft', mode: 'local', path: localDir });
+      expect(pm.projectPath('draft')).toBe(localDir);
+      expect(pm.defaultProjectId()).toBe('draft');
+    });
+
+    it('persists makeDefault with the FULL existing config, and sets the in-process default', async () => {
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            {
+              id: 'paper',
+              gitUrl: 'https://git.overleaf.com/def',
+              rootFile: 'paper/main.tex',
+              branch: 'main',
+              tokenEnv: 'MY_TOKEN',
+            },
+          ],
+        },
+        store,
+      );
+
+      const cfg = await pm.setDefaultProject('paper');
+
+      expect(cfg).toEqual({
+        id: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'paper/main.tex',
+        branch: 'main',
+        tokenEnv: 'MY_TOKEN',
+      });
+      expect(store.lastUpsertOpts).toEqual({ makeDefault: true });
+      // The config actually handed to the registry store still carries every field — this is the
+      // regression the fix targets: a naive re-registration rebuilt from tool args alone would
+      // have persisted only {id, gitUrl, default: true} and silently dropped the rest.
+      expect(store.entries).toEqual([
+        {
+          id: 'paper',
+          gitUrl: 'https://git.overleaf.com/def',
+          rootFile: 'paper/main.tex',
+          branch: 'main',
+          tokenEnv: 'MY_TOKEN',
+        },
+      ]);
+      expect(pm.defaultProjectId()).toBe('paper');
+    });
+
+    it('persists makeDefault but does not change the in-process default when explicit', async () => {
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+            { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
+          ],
+          defaultProject: 'thesis',
+          defaultProjectExplicit: true,
+        },
+        store,
+      );
+
+      await pm.setDefaultProject('paper');
+
+      expect(store.lastUpsertOpts).toEqual({ makeDefault: true });
+      expect(store.entries).toEqual([{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }]);
+      // The registry write happened, but WEB_LATEX_MCP_DEFAULT_PROJECT still wins in this process.
+      expect(pm.getProjectConfig().id).toBe('thesis');
+    });
+
+    it('throws on an unknown project, naming the known ids', async () => {
+      const pm = new ProjectManager(makeConfig());
+      await expect(pm.setDefaultProject('ghost')).rejects.toThrow(/Unknown project/);
+      await expect(pm.setDefaultProject('ghost')).rejects.toThrow(/thesis, paper/);
+    });
+
+    it('persists the registry’s current entry, not a stale in-process snapshot', async () => {
+      // Session A holds an in-process `paper` from before session B re-registered it with a new
+      // rootFile/branch. A naive setDefaultProject that persists getProjectConfig(id) (the
+      // in-process snapshot) would write A's stale entry over B's and lose the update — the exact
+      // wipe this fix closes. reloadFromRegistry only fills in MISSING ids, so this can't be
+      // relied on to refresh an id already held.
+      const store = makeFakeRegistry();
+      store.entries = [
+        {
+          id: 'paper',
+          gitUrl: 'https://git.overleaf.com/def',
+          rootFile: 'new.tex',
+          branch: 'main',
+        },
+      ];
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def', rootFile: 'old.tex' }],
+        },
+        store,
+      );
+
+      const cfg = await pm.setDefaultProject('paper');
+
+      expect(cfg).toEqual({
+        id: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'new.tex',
+        branch: 'main',
+      });
+      // The config actually handed to the registry's upsert (captured via entries) must be the
+      // fresh registry entry, not the stale in-process one.
+      expect(store.entries).toEqual([
+        {
+          id: 'paper',
+          gitUrl: 'https://git.overleaf.com/def',
+          rootFile: 'new.tex',
+          branch: 'main',
+        },
+      ]);
+    });
+
+    it('falls back to the in-process config when the registry has no entry for the id', async () => {
+      // An env-configured project with no runtime registration: the registry has nothing to name
+      // it, so the in-process config (the only source of truth here) is what gets persisted.
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc', rootFile: 'thesis.tex' },
+          ],
+        },
+        store,
+      );
+
+      const cfg = await pm.setDefaultProject('thesis');
+
+      expect(cfg).toEqual({
+        id: 'thesis',
+        gitUrl: 'https://git.overleaf.com/abc',
+        rootFile: 'thesis.tex',
+      });
+      expect(store.entries).toEqual([
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc', rootFile: 'thesis.tex' },
+      ]);
+    });
+  });
+
   it('falls back to the registry’s persisted default when the config has none', () => {
     const store = makeFakeRegistry();
     store.entries = [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }];

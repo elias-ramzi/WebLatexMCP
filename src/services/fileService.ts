@@ -250,6 +250,12 @@ export class FileService {
    * reported as edited by a human who never touched it. This is the single place every refusal
    * site (`write`, `writeBytes`, `applyEdits`, `delete`) goes through, so the two representations
    * can never again disagree about whether a file is stale.
+   *
+   * What this AND still gives up: an out-of-band edit is missed only when a Buffer baseline
+   * holds a literal U+FFFD (EF BF BD) and the edit swaps those bytes for an invalid UTF-8
+   * sequence, or a string baseline's file has bytes changed only within already-invalid UTF-8
+   * sequences — both decode identically either way. Accepted as contrived; the second case was
+   * already the behaviour back when only strings were compared.
    */
   private isChangedOnDisk(abs: string, bytes: Buffer): boolean {
     return (

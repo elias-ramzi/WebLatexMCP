@@ -68,13 +68,20 @@ project, but only for the current process — use `register_project` to keep it 
 
 With one project registered and no `WEB_LATEX_MCP_DEFAULT_PROJECT` set, every call that omits `project`
 fails, naming the registered ids and how to fix it — including from the chat, without editing config:
-call `register_project` again with `default: true` (works for a project already registered; you don't
-need to give `gitUrl`/`path` again unless something else changed too). That:
+call `register_project` with just `project` and `default: true` — no `gitUrl`/`path` needed for a
+project already registered, and its stored `rootFile`/`branch`/`username`/`tokenEnv` are kept, read
+back from `registry.json` as it stands (for a project configured only through `WEB_LATEX_MCP_PROJECTS`,
+from this process's config). That form takes no other field: passing `rootFile`, `branch`, `username`,
+`tokenEnv` or `clone: false` with it is refused, because updating one needs `gitUrl` or `path` — and giving
+either re-registers the project from those arguments alone, replacing the stored entry, so pass every
+field you want kept. That:
 
 - makes it the default **immediately** in the current session — the very next call that omits `project`
   resolves to it;
 - **persists** the flag (`"default": true` on its `registry.json` entry) so it stays the default across a
-  restart and for every other session reading the same workspace;
+  restart and for every other session reading the same workspace — taking effect at once in a session
+  that has no default of its own, while a session that already has one (from the env, or a persisted
+  flag it started with) keeps it until restart;
 - **replaces** any previous default — only one project is ever the default at a time.
 
 `WEB_LATEX_MCP_DEFAULT_PROJECT` **always wins** when it is set, in every session that sets it, even over a

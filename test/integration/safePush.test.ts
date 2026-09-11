@@ -247,6 +247,87 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       expect(calls).toBe(2);
     });
 
+    it('carries the fresh ahead count and the post-rebase HEAD as pushedSha on a real retry', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed mid-push');
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'one', newString: 'ONE' }]);
+      await git.commit(dir, { message: 'edit line 1' });
+      const preHead = await headSha(dir);
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(res.status).toBe('pushed');
+      // The rebase replays a real (non-empty) commit, so the fresh post-rebase ahead count is
+      // still 1 — and pushedSha is the HEAD *after* that rebase, not the pre-push HEAD.
+      expect(res.pushedCommits).toBe(1);
+      const postRebaseHead = await headSha(dir);
+      expect(postRebaseHead).not.toBe(preHead);
+      expect(res.pushedSha).toBe(postRebaseHead);
+      expect(calls).toBe(2);
+    });
+
+    it('reports nothing-to-push, not a phantom pushed result, when a retry round drops our commit as empty (identical remote change)', async () => {
+      // Regression for the finding: pushWithRetry used to push (attempt 2) without re-reading
+      // ahead/behind after the round-1 rebase. When a collaborator lands a change IDENTICAL to
+      // ours, that rebase drops our replayed commit as empty (already-applied), so there is
+      // nothing left to send — but the stale pre-read `ab.ahead` (from before the retry) still
+      // said "1", and `git push` on an up-to-date branch is a silent no-op success, so the old
+      // code reported `status: "pushed"` with the collaborator's own sha as `pushedSha`.
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              // A collaborator lands the exact same edit we're about to push.
+              await pushCommit(
+                remoteBox.remote!,
+                { 'main.tex': 'one\nTWO\nthree\n' },
+                'identical edit landed',
+              );
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
+      await git.commit(dir, { message: 'edit line 2' });
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      const collaboratorSha = (await simpleGit(remote.bareDir).revparse(['master'])).trim();
+      expect(res.status).toBe('nothing-to-push');
+      expect(res.pushed).toBe(false);
+      // nothing-to-push never carries a pushedSha; in particular it must never be the
+      // collaborator's sha the old buggy code reported it as.
+      expect(res.pushedSha).toBeUndefined();
+      expect(res.pushedSha).not.toBe(collaboratorSha);
+      // The retry round's landing still shows up as something we rebased over.
+      expect(res.rebasedOver?.map((c) => c.message)).toContain('identical edit landed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('one\nTWO\nthree\n');
+      // Only attempt 1's push was ever tried; attempt 2 was skipped once the fresh ahead-count
+      // came back zero, so its beforePush hook never fired.
+      expect(calls).toBe(1);
+      // The generic "already up to date" wording doesn't tell the caller their own just-made
+      // commit was the thing that got replayed empty and dropped — say so explicitly.
+      expect(res.summary).toMatch(/dropped/i);
+      expect(res.summary).toMatch(/already there|identical change/i);
+    });
+
     it('gives up with remote-moved after 3 rounds, clone intact, nothing pushed', async () => {
       const remoteBox: { remote?: FakeRemote } = {};
       let calls = 0;

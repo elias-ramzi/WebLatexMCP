@@ -240,10 +240,65 @@ describe('loadConfig', () => {
   });
 });
 
+describe('loadConfig defaultProject via an injected readRegistryDefault (hermetic)', () => {
+  // Exercises the 5th `readRegistryDefault` parameter directly — no file on disk, so these never
+  // risk picking up a real developer workspace's registry.json (unlike writing one to a temp dir,
+  // which still exercises the *real* production code path end to end; see the "(real file)" test
+  // below for that). Before the fix this parameter didn't exist: `loadConfig` always called the
+  // real `readProjectRegistryDefault` unconditionally, so these calls either failed to typecheck
+  // (an unknown 5th argument) or, if merely ignored at runtime, exercised the wrong (real) reader
+  // — that is the "failed before" this block reports.
+
+  it('uses an injected persisted default when WEB_LATEX_MCP_DEFAULT_PROJECT is unset', () => {
+    const cfg = loadConfig(
+      {},
+      '/some/dir',
+      () => false,
+      () => [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' }],
+      () => 'thesis',
+    );
+    expect(cfg.defaultProject).toBe('thesis');
+    expect(cfg.defaultProjectExplicit).toBe(false);
+  });
+
+  it('an explicit env default wins over an injected persisted default', () => {
+    const cfg = loadConfig(
+      { WEB_LATEX_MCP_DEFAULT_PROJECT: 'paper' },
+      '/some/dir',
+      () => false,
+      () => [
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
+      ],
+      () => 'thesis',
+    );
+    expect(cfg.defaultProject).toBe('paper');
+    expect(cfg.defaultProjectExplicit).toBe(true);
+  });
+
+  it('ignores an injected default naming a project id outside the merged project list, with a stderr warning', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig(
+      {},
+      '/some/dir',
+      () => false,
+      () => [], // merged project list does not include "ghost"
+      () => 'ghost',
+    );
+    expect(cfg.defaultProject).toBeUndefined();
+    expect(cfg.defaultProjectExplicit).toBe(false);
+    expect(spy).toHaveBeenCalled();
+    const message = spy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(message).toContain('ghost');
+  });
+});
+
 describe('loadConfig defaultProject from a persisted registry.json on disk', () => {
-  // These read a REAL registry.json through the real readProjectRegistry/readProjectRegistryDefault
-  // (only `insideRepo` is stubbed), unlike the `persisted` callback fixture above — this is what
-  // exercises the on-disk `"default": true` flag register_project writes.
+  // Unlike the hermetic block above, this one (real file) goes through the REAL
+  // readProjectRegistry/readProjectRegistryDefault (only `insideRepo` is stubbed) against a temp
+  // workspace root — proving the on-disk `"default": true` flag `register_project` writes is
+  // actually read end to end. Kept to exactly one test so the default (real) readers are only
+  // exercised where a test explicitly asks for the real filesystem, never incidentally.
   let workspaceRoot: string;
 
   beforeEach(async () => {
@@ -258,44 +313,11 @@ describe('loadConfig defaultProject from a persisted registry.json on disk', () 
     await writeFile(registryPath(workspaceRoot), JSON.stringify(map), 'utf8');
   }
 
-  it('(a) a registry-persisted default is used when WEB_LATEX_MCP_DEFAULT_PROJECT is unset', async () => {
+  it('(real file) a registry-persisted default is used when WEB_LATEX_MCP_DEFAULT_PROJECT is unset', async () => {
     await writeRegistry({ thesis: { gitUrl: 'https://git.overleaf.com/abc', default: true } });
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: workspaceRoot }, '/some/dir', () => false);
     expect(cfg.defaultProject).toBe('thesis');
     expect(cfg.defaultProjectExplicit).toBe(false);
-  });
-
-  it('(b) an explicit env default wins over a persisted one', async () => {
-    await writeRegistry({
-      thesis: { gitUrl: 'https://git.overleaf.com/abc', default: true },
-      paper: { gitUrl: 'https://git.overleaf.com/def' },
-    });
-    const cfg = loadConfig(
-      { WEB_LATEX_MCP_WORKSPACE: workspaceRoot, WEB_LATEX_MCP_DEFAULT_PROJECT: 'paper' },
-      '/some/dir',
-      () => false,
-    );
-    expect(cfg.defaultProject).toBe('paper');
-    expect(cfg.defaultProjectExplicit).toBe(true);
-  });
-
-  it('(e) a persisted default naming an id outside the merged project list is ignored, not thrown', async () => {
-    // The real registry.json on disk names "ghost" as default, but the injected `readRegistry`
-    // (as a test double would supply) does not surface it into the merged project list — the
-    // mismatch readProjectRegistryDefault must tolerate rather than crash the server over.
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    await writeRegistry({ ghost: { gitUrl: 'https://git.overleaf.com/x', default: true } });
-    const cfg = loadConfig(
-      { WEB_LATEX_MCP_WORKSPACE: workspaceRoot },
-      '/some/dir',
-      () => false,
-      () => [], // merged project list does not include "ghost"
-    );
-    expect(cfg.defaultProject).toBeUndefined();
-    expect(cfg.defaultProjectExplicit).toBe(false);
-    expect(spy).toHaveBeenCalled();
-    const message = spy.mock.calls.map((c) => c.join(' ')).join('\n');
-    expect(message).toContain('ghost');
   });
 });
 

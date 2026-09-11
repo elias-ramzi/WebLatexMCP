@@ -8,6 +8,17 @@ import { gitUrlOf, isLocalProject, requireGitProject } from '../lib/projectMode.
 import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
 
 /**
+ * Below this, a measured mutex wait is treated as scheduling noise rather than genuine
+ * contention — an uncontended `runExclusive` still crosses one or two `Date.now()` ms ticks
+ * between taking `t0` and the mutex callback actually running (promise microtask scheduling,
+ * GC, a loaded CI runner), and reporting THAT as "waited on this session" would be a false
+ * positive on every call, not just a contended one. A real same-process wait (a peer call still
+ * running) is on the order of the work that call is doing — milliseconds to seconds — so a few
+ * ms of headroom cleanly separates the two without needing the contended case to be exact.
+ */
+const MUTEX_WAIT_NOISE_MS = 10;
+
+/**
  * The persisted registry ProjectManager reads to pick up runtime registrations and writes to make
  * them durable. Kept as a narrow interface so the manager stays unit-testable without touching the
  * filesystem (see `src/services/projectRegistry.ts` for the real store).
@@ -70,9 +81,31 @@ export class ProjectManager {
       lock = new Mutex();
       this.locks.set(id, lock);
     }
-    return lock.runExclusive(() =>
-      withFileLock(projectLockPath(this.workspaceRoot, id), fn, { owner: this.sessionId }),
-    );
+    // Measured before the mutex is even requested, so `waitedMs` below covers BOTH layers: a
+    // same-process peer holding the mutex, and a sibling process holding the file lock.
+    // `withFileLock` alone only sees the second — a second concurrent call in this same process
+    // would otherwise wait out the whole first call on the mutex and then report `waitedMs: 0`,
+    // because `withFileLock`'s own clock only starts once the mutex has already let it in.
+    const t0 = Date.now();
+    return lock.runExclusive(() => {
+      // How long this call waited on the mutex alone, before withFileLock has even started its
+      // own (file-lock) wait. Read once, right as the mutex admits us.
+      const mutexWaitMs = Date.now() - t0;
+      return withFileLock(
+        projectLockPath(this.workspaceRoot, id),
+        (fileLock) => {
+          const waitedMs = Date.now() - t0;
+          // The file lock saw no contention of its own (the common case: nobody else is touching
+          // this clone), but the mutex wait was real — so the holder it waited on was this very
+          // session, just a still-running call in this same process.
+          const waitedOn =
+            fileLock.waitedOn ?? (mutexWaitMs > MUTEX_WAIT_NOISE_MS ? this.sessionId : undefined);
+          const combined: LockAcquisition = { waitedMs, ...(waitedOn ? { waitedOn } : {}) };
+          return fn(combined);
+        },
+        { owner: this.sessionId },
+      );
+    });
   }
 
   /** Register (or update) a project at runtime, in memory only. */
@@ -99,10 +132,59 @@ export class ProjectManager {
   ): Promise<ProjectConfig> {
     this.registerProject(cfg);
     await this.registry?.upsert(cfg, opts);
-    if (opts?.makeDefault === true && !this.defaultProjectExplicit) {
-      this.defaultProject = cfg.id;
-    }
+    if (opts?.makeDefault === true) this.applyMakeDefault(cfg.id);
     return cfg;
+  }
+
+  /**
+   * Make an already-registered project the default, without repeating `gitUrl`/`path` — the
+   * documented "make an existing project the default" flow (`register_project { default: true }`
+   * with neither field given).
+   *
+   * Persists the registry's OWN current entry for `id` when it has one — never the in-process
+   * `this.projects` snapshot, which can be stale: session A may be holding `paper` from before
+   * session B re-registered it with a new `rootFile`/`branch`, and `reloadFromRegistry` only fills
+   * in ids `this.projects` is MISSING, never refreshes one it already holds. Persisting A's stale
+   * snapshot would silently overwrite B's update — the exact loss this method exists to prevent.
+   * Only when the registry has no entry for `id` (an env-configured project, or no registry wired
+   * at all) does this fall back to `getProjectConfig(id)`, the in-process config being the only
+   * source of truth in that case. Either way, the whole config is persisted with `makeDefault:
+   * true`: `ProjectRegistry.upsert`'s `toEntry` writes every field of whatever `ProjectConfig` it
+   * is given, so persisting a config rebuilt from scratch out of a caller's partial args would
+   * have silently dropped a previously set `rootFile`/`branch`/`username`/`tokenEnv`.
+   *
+   * This never overwrites `this.projects` with the registry entry — env-configured entries take
+   * precedence over the registry and `ProjectManager` cannot tell which is which, only the
+   * persisted write uses the fresh entry.
+   *
+   * (Re-registering with `gitUrl` alone still replaces the entry — that is `upsert`'s existing,
+   * unrelated replace-the-whole-entry behaviour and is out of scope here.)
+   *
+   * Throws the same "Unknown project" error as `getProjectConfig`, naming the known ids, when `id`
+   * is not registered anywhere.
+   */
+  async setDefaultProject(id: string): Promise<ProjectConfig> {
+    const cfg = this.registry?.read().find((p) => p.id === id) ?? this.getProjectConfig(id);
+    // Fill an in-process gap only — never overwrite an entry this process already holds (it may
+    // be env-configured, which takes precedence over the registry). Same rule as
+    // `reloadFromRegistry`; without it `projectPath`/`isLocal` answer for a project the registry
+    // read above found but this process had never loaded.
+    if (!this.projects.has(cfg.id)) this.registerProject(cfg);
+    await this.registry?.upsert(cfg, { makeDefault: true });
+    this.applyMakeDefault(cfg.id);
+    return cfg;
+  }
+
+  /**
+   * Apply a `makeDefault: true` registration's effect on the in-process default — shared by
+   * `registerAndPersist` and `setDefaultProject` so the "only when not overridden by an explicit
+   * `WEB_LATEX_MCP_DEFAULT_PROJECT`" rule can't drift between the two call sites. See
+   * `defaultProjectExplicit`.
+   */
+  private applyMakeDefault(id: string): void {
+    if (!this.defaultProjectExplicit) {
+      this.defaultProject = id;
+    }
   }
 
   /**

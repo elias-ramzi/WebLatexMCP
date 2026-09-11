@@ -42,7 +42,8 @@ const outputSchema = {
     .array(z.string())
     .describe(
       'Files changed in the working tree but not committed, because they belong to another ' +
-        'session or were edited outside this server. Only meaningful for scope "session".',
+        'session or were edited outside this server. Meaningful for scope "session" and ' +
+        '"paths"; always empty for scope "all".',
     ),
   conflicted: z
     .array(z.string())
@@ -234,21 +235,33 @@ async function commitPaths(
   const normalized = [...new Set(opts.paths.map(toPosix))];
   for (const p of normalized) {
     if (p.startsWith('-')) throw new Error(`Invalid path: "${p}"`);
+    // No symlink-escape check here (unlike FileService reads/writes): this scope never reads or
+    // writes file content through FileService, only stages a pathspec with `git add`. Git stages a
+    // symlink as a link entry (mode 120000) and refuses a pathspec that names a path beyond a
+    // symlink ("is beyond a symbolic link"), so no bytes outside the clone are reachable this way —
+    // exactly as scope "all" (plain `git add`) behaves today.
     resolveInside(dir, p); // throws before git ever sees a path that escapes the clone
   }
 
   const status = await ctx.git.status(dir);
-  // Include staged-only entries too: with `fromHead: true` resetting the index and re-adding from
-  // the working tree, a path that is dirty only in the index (already staged, working tree byte
-  // for byte what HEAD has) is committable — excluding it would refuse it with a false
-  // "not changed in the working tree".
+  // `status.staged` rescues one case `unstaged`/`untracked` cannot: a path that is dirty only in
+  // the index — worktree == index != HEAD, i.e. `git add`ed and not touched since — is still
+  // committable, because `fromHead: true` resets the index to HEAD and then re-`add`s from the
+  // working tree, which is exactly that path's content. A path staged and then reverted in the
+  // working tree (worktree == HEAD again) is *not* committable: the same reset-then-add finds
+  // nothing changed to stage, and git reports "Nothing to commit" when it was the only path
+  // requested; alongside a genuinely dirty path the commit succeeds without it, and it is absent
+  // from `leftUncommitted` too (neither unstaged nor untracked once reset). `status.staged`
+  // including it here does not change either outcome, it only avoids refusing it earlier with a
+  // misleading "not changed in the working tree".
   const dirty = [
     ...new Set([...status.unstaged, ...status.untracked, ...status.staged].map(toPosix)),
   ];
   const uncovered = uncoveredPaths(normalized, dirty);
   if (uncovered.length > 0) {
     throw new Error(
-      `Nothing to commit at: ${uncovered.join(', ')} — not changed in the working tree.`,
+      `Nothing to commit at: ${uncovered.join(', ')} — not changed in the working tree. Paths ` +
+        'are matched literally: no globs, exact case, and no ".." segments.',
     );
   }
 
@@ -256,7 +269,7 @@ async function commitPaths(
   // An unreadable index is treated as owning everything requested, never as owning nothing.
   const peers = await ctx.sessions.livePeers(id);
   const entriesBySession = await collectPeerShadows(ctx.shadows, id, peers);
-  const { owned, unreadable } = peerOwnership(normalized, entriesBySession);
+  const { owned, unreadable } = peerOwnership(normalized, peers, entriesBySession);
   if (unreadable.length > 0) {
     throw new Error(
       `Cannot tell what live session "${unreadable[0]}" owns (its change index is ` +

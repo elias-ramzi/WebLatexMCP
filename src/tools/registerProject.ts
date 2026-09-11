@@ -6,6 +6,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix } from '../lib/paths.js';
+import { isLocalProject } from '../lib/projectMode.js';
 import type { ProjectConfig } from '../types.js';
 
 const inputSchema = {
@@ -202,9 +203,62 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           );
         }
         if (!gitUrl && !localPath) {
-          throw new Error(
-            'Give a gitUrl (a remote to clone) or a path (a directory already on this machine).',
-          );
+          if (makeDefault !== true) {
+            throw new Error(
+              'Give a gitUrl (a remote to clone) or a path (a directory already on this ' +
+                'machine). To make an already-registered project the default without repeating ' +
+                'either, pass `default: true` alone (no gitUrl, no path).',
+            );
+          }
+
+          // The default-only form updates nothing but the default flag: rootFile/branch/username/
+          // tokenEnv are accepted by the schema (they're shared with the gitUrl/path branches
+          // below) but this branch would otherwise silently drop them instead of applying them —
+          // updating them needs gitUrl or path, which re-registers the project from the given
+          // arguments. `clone` defaults to `true` on omission, so only an EXPLICIT `false` is
+          // distinguishable from "not given"; an explicit `true` is indistinguishable from the
+          // default and ignoring it changes nothing, so it is not flagged.
+          const ignoredFields: string[] = [];
+          if (rootFile !== undefined) ignoredFields.push('rootFile');
+          if (branch !== undefined) ignoredFields.push('branch');
+          if (username !== undefined) ignoredFields.push('username');
+          if (tokenEnv !== undefined) ignoredFields.push('tokenEnv');
+          if (clone === false) ignoredFields.push('clone');
+          if (ignoredFields.length > 0) {
+            throw new Error(
+              `default: true with neither gitUrl nor path ignores ${ignoredFields.join(', ')} ` +
+                '(the default-only form only changes which project is the default). To update ' +
+                'those, pass gitUrl or path, which re-registers the project from the given ' +
+                'arguments.',
+            );
+          }
+
+          // The documented "make an existing project the default" flow: neither gitUrl nor path
+          // is needed again, since setDefaultProject re-persists the FULL config already on file
+          // (see ProjectManager.setDefaultProject) rather than rebuilding one from these (absent)
+          // args — which is what would otherwise wipe rootFile/branch/username/tokenEnv.
+          //
+          // No runExclusive here: this branch clones nothing, and ProjectRegistry.upsert takes
+          // its own registry file lock — wrapping it in runExclusive(project) would create
+          // <workspace>/.sessions/<project>/ (the lock dir) even for an unknown project id, before
+          // setDefaultProject gets a chance to reject it.
+          const cfg = await ctx.projectManager.setDefaultProject(project);
+          const local = isLocalProject(cfg);
+          const dir = ctx.projectManager.projectPath(cfg.id);
+          const cloned = await ctx.projectManager.hasClone(cfg.id);
+          const payload = {
+            project: cfg.id,
+            path: local ? toPosix(dir) : dir,
+            mode: local ? ('local' as const) : ('git' as const),
+            persisted: true,
+            cloned,
+            default: ctx.projectManager.defaultProjectId() === cfg.id,
+          };
+          const text = `"${cfg.id}" is already registered.${defaultRegistrationNote(ctx, true)}`;
+          return {
+            content: [{ type: 'text', text }],
+            structuredContent: { ...payload },
+          };
         }
 
         return await ctx.projectManager.runExclusive(project, async () => {

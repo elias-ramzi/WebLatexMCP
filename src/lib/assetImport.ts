@@ -60,18 +60,19 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   }
 
   // Cheap, pre-I/O filter: reject a non-asset extension BEFORE any filesystem access at all.
-  // This is pure string work (isImportableAsset only looks at the path's extension), so it
-  // cannot be used to probe the filesystem — a caller pointing sourcePath at /etc/shadow,
-  // ~/.ssh/id_rsa, or any other non-asset path gets refused without a single syscall, so no
-  // realpath/stat outcome (found vs. not-found vs. permission-denied) ever reaches them. This
+  // This is pure string work (isImportableAsset only looks at the path's extension), so a
+  // non-asset-NAMED path (/etc/shadow, ~/.ssh/id_rsa) is refused without a single syscall. This
   // is NOT the authoritative check: a symlink named `photo.png` that actually resolves to
   // `id_rsa` passes this filter (its own name looks like an asset) and must still be caught —
   // that is what the identical check after realpath below is for, on the resolved target. Do
   // not remove either one: this one closes the oracle for non-asset paths; that one closes the
-  // laundering hole for asset-named symlinks. A sourcePath that is itself named like an asset
-  // (e.g. some-other-real-file.png) can still be probed for existence/type by a caller who
-  // already knows to name it that way — that is the accepted cost of resolving a caller-named
-  // path at all, not something this filter claims to prevent.
+  // laundering hole for asset-named symlinks. For a sourcePath that IS named like an asset
+  // (e.g. some-other-real-file.png, or an attacker-chosen name ending in .png), this filter does
+  // nothing — realpath/stat below are reached, and their outcome (found vs. not-found vs.
+  // unresolvable) is what the error wrapping below collapses to exactly those three shapes, with
+  // no errno text or syscall name in the message. That existence/type oracle for asset-NAMED
+  // paths is the accepted cost of resolving a caller-named path at all, not something this
+  // filter claims to prevent.
   if (!isImportableAsset(expanded)) {
     throw new Error(assetSourceBlockedMessage(expanded));
   }
@@ -89,30 +90,29 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   try {
     real = await realpath(expanded);
   } catch (err) {
+    // Never let the raw errno text (which names the syscall and echoes the path) escape to the
+    // caller — that text is itself an oracle (e.g. ENOTDIR on a path through a regular file
+    // proves the file exists; ELOOP proves a symlink cycle). Every code collapses to one of two
+    // wordings: "was not found" for the family of codes that mean the path plainly doesn't
+    // resolve, "could not be resolved" for anything else (permission denied, or unexpected).
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') {
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
       // Report only the already-expanded absolute path, not the original tilde form: the
       // caller needs to see exactly what was checked against the filesystem.
       throw new Error(`sourcePath "${expanded}" was not found.`, { cause: err });
     }
-    if (code === 'EACCES' || code === 'EPERM') {
-      // Don't let the raw errno text (which includes the syscall name and path) escape to the
-      // caller — wrap it in a message with the same shape as the other refusals here.
-      throw new Error(`sourcePath "${expanded}" could not be resolved (permission denied).`, {
-        cause: err,
-      });
-    }
-    throw err;
+    throw new Error(`sourcePath "${expanded}" could not be resolved.`, { cause: err });
   }
 
   let st;
   try {
     st = await stat(real);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
       throw new Error(`sourcePath "${real}" was not found.`, { cause: err });
     }
-    throw err;
+    throw new Error(`sourcePath "${real}" could not be resolved.`, { cause: err });
   }
   if (!st.isFile()) {
     throw new Error(`sourcePath "${real}" is not a regular file.`);

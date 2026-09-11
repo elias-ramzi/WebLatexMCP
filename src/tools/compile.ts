@@ -179,7 +179,10 @@ const outputSchema = {
   lockHeldBy: z
     .string()
     .optional()
-    .describe('The session that held the lock while this call waited.'),
+    .describe(
+      'The session that held the lock while this call waited — a peer process, or this very ' +
+        'session when a concurrent call in the same process still held it.',
+    ),
   errors: z.array(errorShape),
   warnings: z.array(warningShape),
   missingPackages: z

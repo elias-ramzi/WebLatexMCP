@@ -319,4 +319,36 @@ describe('resolveAssetSource', () => {
       await expect(res).rejects.not.toThrow(/realpath/);
     },
   );
+
+  // --- Finding 1: a raw errno other than ENOENT/EACCES/EPERM must not leak the syscall name or
+  // path back to the caller — that text is itself a file-type oracle (ENOTDIR proves a path
+  // segment exists and is a regular file; ELOOP proves a symlink cycle). ---
+
+  it('treats an asset-shaped path through a regular file (ENOTDIR) as not-found, without leaking realpath/ENOTDIR', async () => {
+    const dir = await tmp();
+    const secret = path.join(dir, 'secret');
+    await writeFile(secret, 'fake-secret\n');
+    // secret is a regular file, not a directory, so treating it as a path segment (secret/x.png)
+    // makes realpath fail with ENOTDIR rather than ENOENT. Pre-fix this rethrew the raw error,
+    // whose message ("ENOTDIR: not a directory, realpath '<path>'") proves /etc/passwd-shaped
+    // paths exist and are regular files.
+    const probe = path.join(secret, 'x.png');
+
+    const res = resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: probe });
+    await expect(res).rejects.toThrow(`sourcePath "${probe}" was not found.`);
+    await expect(res).rejects.not.toThrow(/ENOTDIR|realpath|not a directory/);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'treats a symlink loop (ELOOP) as not-found, without leaking realpath/ELOOP',
+    async () => {
+      const dir = await tmp();
+      const loop = path.join(dir, 'loop.png');
+      await symlink(loop, loop);
+
+      const res = resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: loop });
+      await expect(res).rejects.toThrow(`sourcePath "${loop}" was not found.`);
+      await expect(res).rejects.not.toThrow(/ELOOP/);
+    },
+  );
 });

@@ -30,15 +30,21 @@ export interface OwnedPath {
  *
  * Fails closed: a peer whose entries are `null` (its shadow index could not be read) is reported
  * in `unreadable`, never treated as "owns nothing" — callers must refuse the commit rather than
- * silently proceed, exactly as `ShadowStore.peerEntries`'s own contract requires.
+ * silently proceed, exactly as `ShadowStore.peerEntries`'s own contract requires. Iterating the
+ * live `peers` list (rather than `entriesBySession`'s own keys) is what makes that fail-closed:
+ * a peer that is live but missing from the map — `entries.get(id) ?? null`, mirroring
+ * `attributePeers` in `peerAttribution.ts` — is treated exactly like an explicit `null`, so a
+ * caller that forgot to `set` an entry for every peer cannot silently fail open.
  */
 export function peerOwnership(
   requested: string[],
+  peers: Array<{ sessionId: string }>,
   entriesBySession: Map<string, PeerShadowEntry[] | null>,
 ): { owned: OwnedPath[]; unreadable: string[] } {
   const owned: OwnedPath[] = [];
   const unreadable: string[] = [];
-  for (const [sessionId, entries] of entriesBySession) {
+  for (const { sessionId } of peers) {
+    const entries = entriesBySession.get(sessionId) ?? null;
     if (entries === null) {
       unreadable.push(sessionId);
       continue;

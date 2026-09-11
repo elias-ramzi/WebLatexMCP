@@ -49,35 +49,54 @@ describe('uncoveredPaths', () => {
 
 describe('peerOwnership', () => {
   it('reports the path owned by whichever of two peers has it', () => {
+    const peers = [{ sessionId: 'beta' }, { sessionId: 'gamma' }];
     const entries = new Map<string, PeerShadowEntry[] | null>([
       ['beta', [entry('sections/method.tex')]],
       ['gamma', [entry('sections/results.tex')]],
     ]);
-    const { owned, unreadable } = peerOwnership(['sections/method.tex'], entries);
+    const { owned, unreadable } = peerOwnership(['sections/method.tex'], peers, entries);
     expect(unreadable).toEqual([]);
     expect(owned).toEqual<OwnedPath[]>([{ path: 'sections/method.tex', sessionId: 'beta' }]);
   });
 
   it('lists an unreadable peer in `unreadable`, and never in `owned`', () => {
+    const peers = [{ sessionId: 'beta' }, { sessionId: 'gamma' }];
     const entries = new Map<string, PeerShadowEntry[] | null>([
       ['beta', null],
       ['gamma', [entry('sections/results.tex')]],
     ]);
-    const { owned, unreadable } = peerOwnership(['sections/method.tex'], entries);
+    const { owned, unreadable } = peerOwnership(['sections/method.tex'], peers, entries);
     expect(unreadable).toEqual(['beta']);
     expect(owned.some((o) => o.sessionId === 'beta')).toBe(false);
   });
 
   it('a peer with an empty index owns nothing', () => {
+    const peers = [{ sessionId: 'beta' }];
     const entries = new Map<string, PeerShadowEntry[] | null>([['beta', []]]);
-    const { owned, unreadable } = peerOwnership(['a.tex'], entries);
+    const { owned, unreadable } = peerOwnership(['a.tex'], peers, entries);
     expect(owned).toEqual([]);
     expect(unreadable).toEqual([]);
   });
 
   it('a peer entry under a requested directory counts as owned', () => {
+    const peers = [{ sessionId: 'beta' }];
     const entries = new Map<string, PeerShadowEntry[] | null>([['beta', [entry('figs/plot.png')]]]);
-    const { owned } = peerOwnership(['figs'], entries);
+    const { owned } = peerOwnership(['figs'], peers, entries);
     expect(owned).toEqual<OwnedPath[]>([{ path: 'figs/plot.png', sessionId: 'beta' }]);
+  });
+
+  it('fails closed on a live peer missing from the entries map — treated exactly like null', () => {
+    // A peer the caller knows is live (it is in the `peers` list) but for which
+    // `entriesBySession` happens to carry no entry at all — as opposed to an explicit `null` —
+    // must still land in `unreadable`. Iterating `entriesBySession`'s own keys (the pre-fix
+    // behaviour) would silently skip this peer and report it as owning nothing, failing open.
+    const peers = [{ sessionId: 'beta' }, { sessionId: 'gamma' }];
+    const entries = new Map<string, PeerShadowEntry[] | null>([
+      ['gamma', [entry('sections/results.tex')]],
+      // 'beta' intentionally absent from the map.
+    ]);
+    const { owned, unreadable } = peerOwnership(['sections/method.tex'], peers, entries);
+    expect(unreadable).toEqual(['beta']);
+    expect(owned.some((o) => o.sessionId === 'beta')).toBe(false);
   });
 });

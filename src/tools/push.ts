@@ -121,6 +121,7 @@ const inputSchema = {
     ),
   expectedRemoteHead: z
     .string()
+    .min(1)
     .optional()
     .describe(
       'With `resolutions`: the `remoteHead` from the conflict you merged against. If the remote ' +

@@ -25,7 +25,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   owning everything, so the refusal fails closed. The alternative the report also floated — letting a
   session "claim" external changes into its shadow — was declined: a claim has no `before` of its own,
   so it would adopt whatever a peer had also written into the file, which is the exact leak the
-  change-not-result shadow design exists to prevent.
+  change-not-result shadow design exists to prevent. Review fixes before merge: the ownership check
+  iterates the live peers rather than the indexes it managed to read, so a peer missing from the
+  read set is unreadable (refused), never "owns nothing"; and both commit paths tolerate a clone with
+  no commits yet (an empty remote), where `read-tree --reset HEAD` used to fail.
 - **The `push` refusal for a peer's uncommitted work now says who is mid-edit** (#61). It named the
   live sessions and the files, but not which session owned which file or whether that session was
   between keystrokes or merely still open — so "wait" and "take over" looked the same, and telling
@@ -52,7 +55,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   not used: a stash pop is an automatic merge of somebody's uncommitted lines onto a new base, and a
   pop conflict leaves markers in the working tree. The one case git itself refuses — an incoming commit
   adding a path that already exists untracked locally — is no longer a raw "could not detach HEAD": it
-  is `UntrackedOverwriteError`, naming the colliding file(s), with the clone left at its pre-push state.
+  is `UntrackedOverwriteError`, naming the colliding file(s), with the clone left at its pre-push state
+  — and prescribing `commit scope: "paths"` with exactly those paths, not `scope: "all"`, so following
+  the message does not sweep a peer's in-flight work into the commit.
 - **`push` retries a lost fast-forward race, then reports `status: "remote-moved"`** (#60). With a
   collaborator typing in the Overleaf editor the git bridge lands a commit every few seconds, and a push
   that lost the race between its last fetch and its `git push` returned git's raw stderr
@@ -68,7 +73,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   rebase-then-ff shape is different): it converts the same rejection into `remote-moved`, and because
   local `<base>` is already fast-forwarded onto the feature branch by then, its summary prescribes the
   recovery that actually works — a direct-mode push, which pull-rebases `<base>` and pushes. The `beforePush` hook on `GitService`'s constructor exists only so a test can move the
-  remote in that gap.
+  remote in that gap. A retry round re-reads how far ahead the clone is before pushing: when the
+  rebase dropped our commit because a collaborator landed the identical change, the result is
+  `nothing-to-push` (with what was rebased over), never a `pushed` that names their commit as ours.
 - **Every reported commit lists the files it touched** (#60). `rebasedOver`, `behindCommits`,
   `aheadCommits`, the conflict payload's `remoteCommits` and `reset_to_remote`'s `discardedCommits`
   carried only hash + subject, and an Overleaf commit's subject is always "Update on Overleaf." — so
@@ -78,7 +85,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   with `ref: "<hash>~1..<hash>"` already answers a single commit and the docs now say so where the
   commits are reported; the reporter's "diff compares the working tree to a ref" was the single-ref
   form — the two-dot range compares two commits. A separate `log` tool was declined: the range form
-  plus the per-commit file list covers the case that recurred.
+  plus the per-commit file list covers the case that recurred. The per-commit paths are plain: the
+  log is read with rename detection off and `core.quotePath=false`, so a rename lists its old and new
+  path and a non-ASCII name is not C-quoted.
 - **A project registered from the chat can be the default** (#60). `register_project` gains
   `default: true`, persisted as `"default": true` on the entry in `registry.json` and applied
   immediately in this process, so later calls may omit `project`. `WEB_LATEX_MCP_DEFAULT_PROJECT`, when
@@ -88,7 +97,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   flip a working call into an error mid-session. The no-default error now lists the known ids and both
   ways to set one, and the env-check error no longer claims the id must be in `WEB_LATEX_MCP_PROJECTS`
   (it was already checked against env plus registry; only the message said otherwise, which is what
-  misled the reporter).
+  misled the reporter). Making an already-registered project the default takes `project` and
+  `default: true` alone — no `gitUrl`/`path` — and re-persists the entry as `registry.json` holds it (not this process's snapshot of it), so
+  `rootFile`/`branch`/`tokenEnv` survive; the registry-default read in `loadConfig` is injectable like
+  the registry read, so unit tests never see a developer's real `registry.json`.
 - **`compile` says whether it actually rebuilt, and how long it waited for the lock** (#60). The
   build dir is stable per project path and shared by every session on a clone, so right after a peer
   compiled, latexmk finds nothing to do and `compile` returns `success: true` in 0.08 s with the peer's
@@ -100,6 +112,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `lockHeldBy` — the session that held the lock, which `LockTimeoutError` already named but only after
   the 30 s timeout. The lock reports more and acquires exactly as before; `withFileLock` and
   `runExclusive` hand the acquisition to their callback, which every other caller ignores.
+  `lockWaitSec` covers both layers: a second call in the same process waits on the in-process mutex
+  first, and that wait is counted too, with `lockHeldBy` naming this session.
 
 - **`add_asset`: a figure on your laptop can finally reach the project.** `write_file` takes a
   `content: string` and wrote it as UTF-8, so there was no way to add a PNG that was not already in
@@ -119,7 +133,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   too, on the path a symlink actually resolves to rather than the name it was given, before any file is
   opened. The result reports the resolved source path and a sha256 of what landed; it deliberately
   carries no diff (an added binary tool needing to echo the copied bytes back would be its own way to
-  leak a file that slipped the allowlist).
+  leak a file that slipped the allowlist). Every filesystem outcome on the source collapses to
+  found / not-found / unresolvable with no errno text: a raw `ENOTDIR` on `/etc/passwd/x.png` used to
+  say that `/etc/passwd` exists and is a file.
 
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
