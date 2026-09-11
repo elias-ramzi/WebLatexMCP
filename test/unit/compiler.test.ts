@@ -160,7 +160,7 @@ describe('collectOutcome (rebuilt / pdfMtime)', () => {
 
     const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', before);
     expect(outcome.rebuilt).toBe(false);
-    expect(outcome.pdfMtime).toBe(new Date(before.mtimeMs).toISOString());
+    expect(outcome.pdfMtime).toBe(new Date(Math.round(before.mtimeMs)).toISOString());
   });
 
   it('the PDF was rewritten with different content (mtime and size both change): rebuilt', async () => {

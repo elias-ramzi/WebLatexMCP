@@ -289,7 +289,9 @@ export async function collectOutcome(
     timedOut: res.timedOut,
     logBaseDir: logBase,
     rebuilt,
-    pdfMtime: after !== null ? new Date(after.mtimeMs).toISOString() : undefined,
+    // `mtimeMs` is a float derived from nanoseconds; `new Date(x)` truncates it, so an mtime set
+    // to an exact millisecond can read back one ms early (seen on CI). Round to the nearest ms.
+    pdfMtime: after !== null ? new Date(Math.round(after.mtimeMs)).toISOString() : undefined,
   };
 }
 

@@ -112,7 +112,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `lockHeldBy` — the session that held the lock, which `LockTimeoutError` already named but only after
   the 30 s timeout. The lock reports more and acquires exactly as before; `withFileLock` and
   `runExclusive` hand the acquisition to their callback, which every other caller ignores.
-  `lockWaitSec` covers both layers: a second call in the same process waits on the in-process mutex
+  `pdfMtime` rounds the stat's fractional milliseconds rather than truncating them (an mtime set to
+  an exact millisecond read back one ms early on CI). `lockWaitSec` covers both layers: a second call in the same process waits on the in-process mutex
   first, and that wait is counted too, with `lockHeldBy` naming this session.
 
 - **`add_asset`: a figure on your laptop can finally reach the project.** `write_file` takes a
