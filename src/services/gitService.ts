@@ -151,11 +151,17 @@ export class GitService {
   /** Stage and commit locally. Does not push. */
   async commit(
     dir: string,
-    opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+    opts: { message: string; paths?: string[]; allowEmpty?: boolean; fromHead?: boolean },
   ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
     const git = simpleGit(dir);
+    if (opts.fromHead) {
+      // Start from HEAD so nothing another call left staged (a peer's `commitContents` that threw
+      // mid-way, a hand `git add` in the clone) can leak into this commit. Without `-u` the working
+      // tree is untouched.
+      await git.raw(['read-tree', '--reset', 'HEAD']);
+    }
     if (opts.paths && opts.paths.length > 0) {
-      await git.add(opts.paths);
+      await git.add(['--', ...opts.paths]);
     } else {
       await git.add(['-A']);
     }

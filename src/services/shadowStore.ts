@@ -23,10 +23,27 @@ interface ShadowIndexEntry {
    * from commits until the conflict is dealt with.
    */
   conflicted?: boolean;
+  /**
+   * When this session last wrote the file, ISO 8601. Set on every `record` call — including the
+   * conflicted early return, since the session did write the file even though the shadow could
+   * not fold it in. Never touched by `refresh`: that rewrites shadow files and the index on every
+   * HEAD move regardless of whether this session wrote anything, which is exactly why on-disk
+   * mtimes are not a usable write signal either. Absent on indexes written before this field
+   * existed; such entries parse as `touchedAt: null` via `peerEntries`.
+   */
+  touchedAt?: string;
 }
 
 interface ShadowIndex {
   entries: Record<string, ShadowIndexEntry>;
+}
+
+/** One entry of a session's shadow index, as read by a peer — no lock, no content resolved. */
+export interface PeerShadowEntry {
+  path: string;
+  deleted: boolean;
+  conflicted: boolean;
+  touchedAt: string | null;
 }
 
 /** A file this session has changed, with content resolved. */
@@ -70,6 +87,7 @@ export class ShadowStore {
     private readonly workspaceRoot: string,
     readonly sessionId: string,
     private readonly readHead: HeadReader,
+    private readonly now: () => number = Date.now,
   ) {}
 
   /**
@@ -98,6 +116,11 @@ export class ShadowStore {
       await this.writeBase(projectId, rel, head);
       await this.writeShadow(projectId, rel, head);
     }
+
+    // The session did write the file on every call that reaches here, including the conflicted
+    // branch below where the shadow itself cannot be updated — so this is set unconditionally,
+    // before that branch's early return.
+    entry.touchedAt = new Date(this.now()).toISOString();
 
     if (entry.conflicted) {
       // Once a file is conflicted its shadow is anchored to a base that HEAD has moved past, so
@@ -159,6 +182,47 @@ export class ShadowStore {
   /** Whether this session is tracking any change at all (drives `commit`'s default scope). */
   async hasChanges(projectId: string): Promise<boolean> {
     return Object.keys((await this.readIndex(projectId)).entries).length > 0;
+  }
+
+  /**
+   * Reads another session's shadow index directly — no lock, no file content resolved — for a
+   * peer that needs to know *what* a live session owns without touching it (the push ownership
+   * guard, `status`). Works for the caller's own session id too.
+   *
+   * A session directory that does not exist yet (no edits recorded) is not an error: it returns
+   * `[]`. Anything else that stops the index from being read as intended — a read error other
+   * than "not found", invalid JSON, or a parsed value with no `entries` object — returns `null`.
+   *
+   * **`null` means unreadable, not "owns nothing".** Callers must fail closed: treat a `null`
+   * result the same as if the session owned every file in question, exactly as an unrecoverable
+   * shadow already refuses to let `commit` proceed. Never coerce `null` to `[]`.
+   */
+  async peerEntries(projectId: string, sessionId: string): Promise<PeerShadowEntry[] | null> {
+    const file = path.join(sessionDir(this.workspaceRoot, projectId, sessionId), 'shadow.json');
+    let raw: string;
+    try {
+      raw = await readFile(file, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      return null;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (!isShadowIndexShape(parsed)) return null;
+
+    return Object.entries(parsed.entries)
+      .map(([p, entry]) => ({
+        path: p,
+        deleted: entry.deleted === true,
+        conflicted: entry.conflicted === true,
+        touchedAt: entry.touchedAt ?? null,
+      }))
+      .sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**
@@ -297,6 +361,30 @@ export class ShadowStore {
       rm(this.basePath(projectId, rel), { force: true }),
     ]);
   }
+}
+
+/** Narrows an arbitrary parsed JSON value to something `peerEntries` can safely read entries off. */
+function isShadowIndexShape(value: unknown): value is ShadowIndex {
+  if (typeof value !== 'object' || value === null) return false;
+  const entries = (value as { entries?: unknown }).entries;
+  return typeof entries === 'object' && entries !== null;
+}
+
+/**
+ * The most recent `touchedAt` among a set of peer entries, or `null` when none of them parse as a
+ * date (including an empty list). Compares by `Date.parse`, not string order — ISO timestamps from
+ * different code paths are not guaranteed to share the same fractional-second precision, and
+ * lexicographic comparison only agrees with chronological order when the format matches exactly.
+ */
+export function latestTouch(entries: PeerShadowEntry[]): string | null {
+  let best: { iso: string; ms: number } | null = null;
+  for (const entry of entries) {
+    if (entry.touchedAt === null) continue;
+    const ms = Date.parse(entry.touchedAt);
+    if (Number.isNaN(ms)) continue;
+    if (best === null || ms > best.ms) best = { iso: entry.touchedAt, ms };
+  }
+  return best?.iso ?? null;
 }
 
 async function readOrNull(file: string): Promise<string | null> {

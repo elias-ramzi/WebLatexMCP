@@ -11,6 +11,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`commit scope: "paths"` — commit exactly the files you name, and nothing else** (#61). A session
+  whose work reached the clone without going through `edit_file` / `write_file` — a script's output,
+  the client's own file tools — owns nothing in its shadow, so `scope: "session"` had nothing to commit
+  and the only route was `scope: "all"`, fenced by a caller-maintained `paths` list that widened
+  silently to the whole tree the moment the list was empty. The new scope requires a non-empty `paths`,
+  stages only those (a directory covers what is under it, a path leaving the clone is refused before git
+  sees it) — the index is reset to HEAD first, as a session commit does, so nothing a hand `git add` or
+  an interrupted commit left staged rides along — reports `leftUncommitted` like a session commit does,
+  and **refuses a path a live session's
+  shadow lists** rather than taking that session's in-flight lines — `scope: "all"` remains the
+  deliberate way to do that, unchanged. A live peer whose shadow index cannot be read is treated as
+  owning everything, so the refusal fails closed. The alternative the report also floated — letting a
+  session "claim" external changes into its shadow — was declined: a claim has no `before` of its own,
+  so it would adopt whatever a peer had also written into the file, which is the exact leak the
+  change-not-result shadow design exists to prevent.
+- **The `push` refusal for a peer's uncommitted work now says who is mid-edit** (#61). It named the
+  live sessions and the files, but not which session owned which file or whether that session was
+  between keystrokes or merely still open — so "wait" and "take over" looked the same, and telling
+  them apart meant `stat`-ing mtimes in a shell. Each shadow index entry now records `touchedAt`, the
+  last write that session made through the server (set only when an edit is recorded, never when the
+  shadow is carried onto a new HEAD, which is why file mtimes were never a usable signal), and the
+  refusal attributes each foreign file to the live session whose shadow lists it, with that session's
+  last write age and heartbeat age, and lists apart the files no live session owns. The refusal's
+  _trigger_ is unchanged — any live peer plus any foreign dirt still refuses; making it owner-aware is
+  #60's question and is left there, because dropping the guard without also fixing `safePush`'s
+  `git add -A` fallback would turn "no longer blocked" into "swept into the commit".
+  `status.activeSessions` carries the same per-session `changes` (`null` when that session's index is
+  unreadable) and `lastWriteAt`, so the check is one read-only call.
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
   swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,

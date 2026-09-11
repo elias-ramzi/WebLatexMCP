@@ -283,12 +283,25 @@ process over the same clone. Name each with `WEB_LATEX_MCP_SESSION` (see
   stays uncommitted on disk. The result carries `scope`, `session`, and `leftUncommitted` (what was
   deliberately not taken — a file can appear there even when the commit included part of it). Pass
   `scope: "all"` to commit the whole working tree instead, other sessions' work included.
-- **`status` says who owns what.** `sessionChanges` / `otherChanges` split the uncommitted files,
-  `activeSessions` lists the other sessions and whether they are still live, and `conflictedChanges`
-  names files this session can no longer commit.
-- **`push` waits for live peers.** A push has to rebase, and a rebase needs a clean tree — so it
-  refuses while another live session has uncommitted work, naming who to wait for. Changes nobody owns
-  (edited outside the server, or left by an exited session) do not block it.
+- **`commit scope: "paths"` commits exactly the files you name.** For work that reached the clone
+  without going through `edit_file` / `write_file` — a script's output, the client's own file tools —
+  which no session owns, so a session-scoped commit cannot see it. It requires a non-empty `paths`,
+  stages only those paths (a directory covers what is under it), and refuses a path a live session's
+  shadow lists rather than taking that session's in-flight lines — `scope: "all"` remains the
+  deliberate way to do that. Where `scope: "all"` + `paths` widens silently to the whole tree when the
+  list is empty, `"paths"` cannot.
+- **`status` says who owns what, and how fresh it is.** `sessionChanges` / `otherChanges` split the
+  uncommitted files, `conflictedChanges` names files this session can no longer commit, and
+  `activeSessions` lists the other sessions with whether they are live, the paths their shadow holds
+  (`changes`, `null` when that session's index cannot be read), and their last write through this
+  server (`lastWriteAt`). Edits a session makes outside the server leave no trace here.
+- **`push` waits for live peers, and says who is mid-edit.** A push has to rebase, and a rebase needs
+  a clean tree — so it refuses while another live session exists and the tree holds work that is not
+  this session's. The refusal attributes each such file: which live session's shadow owns it, that
+  session's last write age and heartbeat age, and which files no live session owns (edited outside the
+  server, or left by an exited session). A 30-second-old write means wait; a two-hour-old one is a
+  judgement call, made with `commit scope: "all"` or `"paths"` deliberately. A session whose index
+  cannot be read is treated as owning every listed file.
 - **Same-line collisions are surfaced, never guessed.** If this session and someone else changed the
   same lines, the file is flagged and excluded from commits, and stays flagged. The two ways out are
   `commit scope: "all"` (take the working tree as it stands) or `discard` (give up this session's

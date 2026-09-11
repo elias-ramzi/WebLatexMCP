@@ -170,6 +170,12 @@ Two consequences worth knowing:
   is the two-sessions-one-file case, working as intended.
 - `commit scope: "all"` is the escape hatch: it commits the whole working tree, other
   sessions' work included. Use it deliberately, not as a default.
+- `commit scope: "paths"` is for work that never went through the server — a file a
+  script produced, an edit made with the client's own tools. Nobody's shadow holds it,
+  so a session-scoped commit cannot see it, and `scope: "all"` would take a peer's
+  in-flight work along with it. `"paths"` stages exactly the named files, refuses an
+  empty list, and refuses a path a live session owns — taking that is what `"all"`
+  is for, and it stays a deliberate act.
 
 ### When two sessions edit the same lines
 
@@ -188,10 +194,19 @@ up that session's version.
 ### Pushing with peers around
 
 A push has to rebase, and a rebase needs a clean tree. So `push` refuses while a live
-peer session has uncommitted work, naming who to wait for — the alternative would be
-sweeping their in-flight paragraph into the push or rewriting the tree underneath
-them. Changes nobody owns (edited outside the server, or left by a session that has
-since exited) do not block it.
+peer session exists and the tree holds work that is not this session's — the
+alternative would be sweeping their in-flight paragraph into the push or rewriting
+the tree underneath them.
+
+The refusal says what is known: per live session, the files its shadow owns, how long
+ago it last wrote through the server, and how long ago it was last seen; and, apart,
+the files no live session owns (edited outside the server, or left by a session that
+has since exited). That is what separates "wait" from "take over": a write seconds old
+is a peer mid-paragraph; one hours old, from a session that is merely still open, is a
+judgement the caller can now make with `commit scope: "all"` or `"paths"`. A session
+whose index cannot be read is treated as owning everything, never as owning nothing.
+`status` carries the same per-session `changes` and `lastWriteAt`, for checking
+without attempting a push.
 
 The practical rhythm: sessions commit as they finish a piece, and whoever pushes does
 so when the others are between edits.
@@ -203,9 +218,10 @@ so when the others are between edits.
 - **It attributes, it does not lock.** No session is prevented from editing any file.
   Splitting the paper into per-section files remains the real defence — it makes
   collisions rare rather than merely legible.
-- **A session that dies leaves its edits behind.** They stay in the working tree, but
-  the record of whose they were is eventually collected; they then show up as
-  unattributed changes, committable with `scope: "all"`.
+- **A session that dies leaves its edits behind.** They stay in the working tree; once
+  its process is gone and its heartbeat is stale it stops counting as live, and its
+  files show up as changes no live session owns, committable with `scope: "all"` or
+  `scope: "paths"`.
 
 ## Optional review flow for larger edits
 

@@ -7,6 +7,7 @@ import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
 import { renderConflictText, renderRebasedOver } from '../lib/conflictText.js';
 import { toPosix } from '../lib/paths.js';
+import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
 
 /**
  * Refuse to push while a live sibling session has uncommitted work in the shared clone.
@@ -15,8 +16,12 @@ import { toPosix } from '../lib/paths.js';
  * sweeping that session's half-finished paragraph into our commit or rewriting the tree
  * underneath it. Neither is ours to do, so we stop and name who to wait for.
  *
- * Changes nobody owns (edited outside this server, or left behind by a session that has since
- * exited) are not blocked: they are the single-session behaviour this server has always had.
+ * The refusal attributes each disputed file to whichever live peer's shadow lists it (see
+ * `attributePeers` in `src/lib/peerAttribution.ts`) and dates each peer's last write. A file no
+ * live peer owns — edited outside this server, or left behind by a session that has since exited
+ * — is named as unowned rather than pinned on anyone, but it still blocks the push as long as any
+ * live peer exists: this guard is not owner-aware about *whether* to refuse, only about how it
+ * explains the refusal.
  */
 async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<void> {
   const peers = await ctx.sessions.livePeers(id);
@@ -30,12 +35,12 @@ async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<
   const theirs = dirty.filter((p) => !mine.has(p));
   if (theirs.length === 0) return;
 
-  throw new Error(
-    `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}. ` +
-      `Session(s) ${peers.map((p) => `"${p.sessionId}"`).join(', ')} are active — pushing has to ` +
-      'rebase, which would sweep up or overwrite their in-flight work. Wait for them to commit, ' +
-      'or take ownership deliberately with commit scope "all" and push again.',
+  const attribution = attributePeers(
+    theirs,
+    peers,
+    await collectPeerShadows(ctx.shadows, id, peers),
   );
+  throw new Error(renderPeerRefusal(theirs, attribution, Date.now()));
 }
 
 const conflictHunkSchema = z.object({
