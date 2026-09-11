@@ -42,6 +42,7 @@ function stubCompiler(pdfPath: string | undefined) {
       log: 'Output written on main.pdf',
       timedOut: false,
       logBaseDir: logBaseDir(req.rootFile),
+      rebuilt: true,
     }),
   };
 }

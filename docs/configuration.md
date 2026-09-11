@@ -9,7 +9,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | ---------------------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `WEB_LATEX_MCP_PROJECTS`                                   | no\*     | JSON map of project id → either `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }` (a remote to clone) or `{ mode: "local", path, rootFile?, followSymlinks? }` (a directory used in place; `~` and relative paths are resolved; `followSymlinks: true` lets reads, writes and listings follow a symlink out of that directory — off by default, and only ever set it when the links there are yours). \*Not strictly required — you can also register a project at runtime from the chat (`register_project`); set this to have projects present at boot. See [Registering a project without env config](#registering-a-project-without-env-config). |
 | `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override.                                                                                                                                                                                                                                                                                                                                                                          |
-| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`. **Always wins** over a default persisted via `register_project { default: true }`, even across a restart. See [Setting a default project](#setting-a-default-project).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. Setting it is an **assertion**: that backend is never substituted, and a missing one is an error. Left unset, a missing `latexmk` falls back to an installed `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                               |
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -63,6 +63,32 @@ A project configured through `WEB_LATEX_MCP_PROJECTS` always wins over a persist
 so the env stays the source of truth when you use it. (`project_sync` with a `gitUrl` also registers a
 project, but only for the current process — use `register_project` to keep it across sessions.) See the
 [tool reference](tools.md#registering-a-project-from-the-chat) for the full flow.
+
+### Setting a default project
+
+With one project registered and no `WEB_LATEX_MCP_DEFAULT_PROJECT` set, every call that omits `project`
+fails, naming the registered ids and how to fix it — including from the chat, without editing config:
+call `register_project` with just `project` and `default: true` — no `gitUrl`/`path` needed for a
+project already registered, and its stored `rootFile`/`branch`/`username`/`tokenEnv` are kept, read
+back from `registry.json` as it stands (for a project configured only through `WEB_LATEX_MCP_PROJECTS`,
+from this process's config). That form takes no other field: passing `rootFile`, `branch`, `username`,
+`tokenEnv` or `clone: false` with it is refused, because updating one needs `gitUrl` or `path` — and giving
+either re-registers the project from those arguments alone, replacing the stored entry, so pass every
+field you want kept. That:
+
+- makes it the default **immediately** in the current session — the very next call that omits `project`
+  resolves to it;
+- **persists** the flag (`"default": true` on its `registry.json` entry) so it stays the default across a
+  restart and for every other session reading the same workspace — taking effect at once in a session
+  that has no default of its own, while a session that already has one (from the env, or a persisted
+  flag it started with) keeps it until restart;
+- **replaces** any previous default — only one project is ever the default at a time.
+
+`WEB_LATEX_MCP_DEFAULT_PROJECT` **always wins** when it is set, in every session that sets it, even over a
+persisted `default: true` — the same "a setting is an assertion, an unset one is only a guess" rule as
+[the compile backend](#compile-backend). `register_project` still persists the flag when asked even while
+an env default is set (so a later, env-unset session picks it up), but its result text says the env
+default is the one actually in effect this session.
 
 ## Workspace-local clones
 

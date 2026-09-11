@@ -1,0 +1,157 @@
+import type { PeerShadowEntry, ShadowStore } from '../services/shadowStore.js';
+import { latestTouch } from '../services/shadowStore.js';
+import type { PeerSession } from '../services/sessionRegistry.js';
+
+/** One live peer's claim on the disputed files, as seen for one push refusal or one status call. */
+export interface PeerAttribution {
+  sessionId: string;
+  heartbeatAt: string;
+  /** Dirty paths this peer's shadow lists; every dirty path when its index is unreadable. */
+  owns: string[];
+  lastWriteAt: string | null;
+  /** True when the peer's index could not be read — treated as owning everything, fail closed. */
+  unreadable: boolean;
+}
+
+export interface Attribution {
+  sessions: PeerAttribution[];
+  /** Disputed paths no readable peer's shadow claims. */
+  unowned: string[];
+}
+
+/**
+ * Attributes each of `theirs` (dirty paths this session did not write) to whichever live peer's
+ * shadow lists it.
+ *
+ * A peer whose index could not be read (`entries.get(id) === null`, including a peer missing from
+ * the map entirely) is treated as owning every disputed path — the same fail-closed rule
+ * `peerEntries` documents: `null` means unreadable, never "owns nothing". That peer therefore never
+ * contributes to `unowned`, since it might own anything.
+ */
+export function attributePeers(
+  theirs: string[],
+  peers: Array<{ sessionId: string; heartbeatAt: string }>,
+  entries: Map<string, PeerShadowEntry[] | null>,
+): Attribution {
+  const claimed = new Set<string>();
+
+  const sessions: PeerAttribution[] = peers.map((p) => {
+    const peerEntries = entries.get(p.sessionId) ?? null;
+    if (peerEntries === null) {
+      for (const t of theirs) claimed.add(t);
+      return {
+        sessionId: p.sessionId,
+        heartbeatAt: p.heartbeatAt,
+        owns: [...theirs],
+        lastWriteAt: null,
+        unreadable: true,
+      };
+    }
+
+    const paths = new Set(peerEntries.map((e) => e.path));
+    const owns = theirs.filter((t) => paths.has(t));
+    for (const o of owns) claimed.add(o);
+    return {
+      sessionId: p.sessionId,
+      heartbeatAt: p.heartbeatAt,
+      owns,
+      lastWriteAt: latestTouch(peerEntries),
+      unreadable: false,
+    };
+  });
+
+  const unowned = theirs.filter((t) => !claimed.has(t));
+  return { sessions, unowned };
+}
+
+/**
+ * Reads every peer's shadow index in parallel, keyed by session id — the shared gatherer behind
+ * both the push ownership guard and `status`'s per-session `changes`/`lastWriteAt`. Read-only, no
+ * lock: two callers reading the same peer's index concurrently need nothing serialized.
+ */
+export async function collectPeerShadows(
+  shadows: ShadowStore,
+  projectId: string,
+  peers: PeerSession[],
+): Promise<Map<string, PeerShadowEntry[] | null>> {
+  const out = new Map<string, PeerShadowEntry[] | null>();
+  await Promise.all(
+    peers.map(async (p) => {
+      out.set(p.sessionId, await shadows.peerEntries(projectId, p.sessionId));
+    }),
+  );
+  return out;
+}
+
+/**
+ * Renders an age as a short, human string: seconds under a minute, minutes under an hour, then
+ * hours(+minutes) under a day, then days(+hours). A zero remainder is omitted (`"2h"`, not
+ * `"2h 0m"`). Never negative — a timestamp that is (clock-skew) in the future clamps to `"0s"`.
+ * An unparsable timestamp reads `"unknown"` rather than `"NaNs"`.
+ */
+export function formatAge(fromIso: string, nowMs: number): string {
+  const fromMs = Date.parse(fromIso);
+  if (Number.isNaN(fromMs)) return 'unknown';
+
+  const deltaMs = Math.max(0, nowMs - fromMs);
+  const totalSec = Math.floor(deltaMs / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+
+  const totalMin = Math.floor(totalSec / 60);
+  if (totalMin < 60) return `${totalMin}m`;
+
+  const totalHour = Math.floor(totalMin / 60);
+  const remMin = totalMin % 60;
+  if (totalHour < 24) return remMin ? `${totalHour}h ${remMin}m` : `${totalHour}h`;
+
+  const totalDay = Math.floor(totalHour / 24);
+  const remHour = totalHour % 24;
+  return remHour ? `${totalDay}d ${remHour}h` : `${totalDay}d`;
+}
+
+/**
+ * Renders the push-refusal message: which disputed files belong to which live peer, dated, so the
+ * caller knows whether to wait (a recent last write means the owner is mid-edit) or to take
+ * ownership deliberately. Keep the first line's exact prefix
+ * (`Uncommitted changes in the shared clone are not this session's:`) — existing tests match
+ * `not this session`.
+ */
+export function renderPeerRefusal(theirs: string[], a: Attribution, nowMs: number): string {
+  const lines: string[] = [
+    `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}.`,
+  ];
+
+  for (const s of a.sessions) {
+    const heartbeat = `heartbeat ${formatAge(s.heartbeatAt, nowMs)} ago`;
+    if (s.unreadable) {
+      lines.push(
+        `Live session "${s.sessionId}" — its change index is unreadable, so every file above may ` +
+          `be its; ${heartbeat}.`,
+      );
+    } else if (s.owns.length === 0) {
+      lines.push(`Live session "${s.sessionId}" owns nothing here — ${heartbeat}.`);
+    } else {
+      const lastWrite = s.lastWriteAt
+        ? `last write ${formatAge(s.lastWriteAt, nowMs)} ago`
+        : 'no write on record';
+      lines.push(
+        `Live session "${s.sessionId}" owns ${s.owns.join(', ')} — ${lastWrite}, ${heartbeat}.`,
+      );
+    }
+  }
+
+  if (a.unowned.length > 0) {
+    lines.push(
+      `No live session owns ${a.unowned.join(', ')} — edited outside this server, or left by a ` +
+        'session that has exited.',
+    );
+  }
+
+  lines.push(
+    'Pushing has to rebase, which would sweep up or overwrite in-flight work. A recent last write ' +
+      'means the owner is mid-edit: wait for it to commit. Otherwise take ownership deliberately ' +
+      'with commit scope "all" (or scope "paths" for named files) and push again.',
+  );
+
+  return lines.join('\n');
+}

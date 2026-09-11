@@ -45,6 +45,21 @@ export interface CompileOutcome {
    * it to hand back paths a caller can open.
    */
   logBaseDir: string;
+  /**
+   * Whether the backend actually wrote a fresh PDF during this run. The build dir is stable per
+   * project path and shared by every session on a clone, so when a peer session just compiled the
+   * same clone, latexmk can find nothing to do and finish near-instantly — `success: true` but
+   * `pdfPath` pointing at a previous run's output, not this call's. `false` means exactly that:
+   * derived by comparing the build-dir PDF's mtime and size from just before this run's exec
+   * against just after — never from parsing backend stdout (discarded once a `.log` exists,
+   * worded differently per backend, and tectonic emits none of it) and never from the wall clock.
+   * A filesystem that truncates mtime to whole seconds can only miss a genuine rebuild that lands
+   * in the same second as the previous write AND produces a byte-identical PDF — the narrowest
+   * failure this comparison can have.
+   */
+  rebuilt: boolean;
+  /** ISO 8601 mtime of the build-dir PDF, read before any surfacing copy is made. Absent with no PDF. */
+  pdfMtime?: string;
 }
 
 export interface LatexCompiler {
@@ -204,16 +219,49 @@ export function buildPdfPath(projectDir: string, rootFile: string): string {
 }
 
 /**
+ * A PDF's mtime and size — the two cheap markers `collectOutcome` compares from before a run to
+ * after, to tell "the backend rewrote this file" from "found nothing to do and left it alone"
+ * without any wall-clock assumption.
+ */
+export interface PdfStat {
+  mtimeMs: number;
+  size: number;
+}
+
+/** `stat` a path for its `PdfStat`, or `null` when it does not exist. */
+async function statOrNull(p: string): Promise<PdfStat | null> {
+  try {
+    const info = await stat(p);
+    return { mtimeMs: info.mtimeMs, size: info.size };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the `.log` and `.pdf` a run produced. Both backends write `<jobname>.{log,pdf}`
  * into the build dir, where jobname is the root file's basename. Falls back to captured
  * stdout/stderr when no `.log` was written (e.g. the engine died before opening one).
+ *
+ * `rebuilt` and `pdfMtime` are derived from the PDF's own mtime and size, never parsed out of
+ * backend stdout/log wording (discarded once a `.log` exists, differs per backend, and tectonic
+ * has none) and never from the wall clock: `before` is a stat of the build-dir PDF taken just
+ * before the exec (`null` when it did not exist yet). The PDF changed during this run —
+ * `rebuilt: true` — when it exists now and either its mtime or its size differs from `before`. A
+ * filesystem that truncates mtime to whole seconds can only miss a genuine rebuild that lands in
+ * the same second as the previous write AND produces a byte-identical PDF — the narrowest failure
+ * this comparison can have.
+ *
+ * Exported for unit tests, which drive it directly against a temp build dir and a fake
+ * `ExecResult` rather than a real compile.
  */
-async function collectOutcome(
+export async function collectOutcome(
   buildDir: string,
   rootFile: string,
   res: ExecResult,
   durationSec: number,
   logBase: string,
+  before: PdfStat | null,
 ): Promise<CompileOutcome> {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
   const logPath = path.join(buildDir, `${rootBase}.log`);
@@ -228,15 +276,22 @@ async function collectOutcome(
     log = `${res.stdout}\n${res.stderr}`;
   }
 
-  const pdfExists = await exists(pdfPath);
+  const after = await statOrNull(pdfPath);
+  const rebuilt =
+    after !== null &&
+    (before === null || after.mtimeMs !== before.mtimeMs || after.size !== before.size);
   return {
-    success: res.code === 0 && pdfExists && !res.timedOut,
-    pdfPath: pdfExists ? pdfPath : undefined,
+    success: res.code === 0 && after !== null && !res.timedOut,
+    pdfPath: after !== null ? pdfPath : undefined,
     durationSec,
     log,
     logPath: resolvedLogPath,
     timedOut: res.timedOut,
     logBaseDir: logBase,
+    rebuilt,
+    // `mtimeMs` is a float derived from nanoseconds; `new Date(x)` truncates it, so an mtime set
+    // to an exact millisecond can read back one ms early (seen on CI). Round to the nearest ms.
+    pdfMtime: after !== null ? new Date(Math.round(after.mtimeMs)).toISOString() : undefined,
   };
 }
 
@@ -251,6 +306,7 @@ export class LatexmkCompiler implements LatexCompiler {
     await mirrorSubdirs(req.projectDir, buildDir);
     const args = latexmkArgs(req, buildDir);
 
+    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('latexmk', args, {
       cwd: req.projectDir,
@@ -263,6 +319,7 @@ export class LatexmkCompiler implements LatexCompiler {
       res,
       (Date.now() - start) / 1000,
       logBaseDir(req.rootFile),
+      before,
     );
   }
 }
@@ -292,13 +349,14 @@ export class TectonicCompiler implements LatexCompiler {
     // shell escape here; only an explicit `shellEscape` enables system calls.
     if (req.shellEscape) args.push('-Z', 'shell-escape');
 
+    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('tectonic', args, {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
     // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are.
-    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '');
+    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '', before);
   }
 }
 

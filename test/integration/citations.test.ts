@@ -94,7 +94,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
-        git.readAtRef(d, 'HEAD', rel),
+        git.readAtRefBytes(d, 'HEAD', rel),
       ),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
     };

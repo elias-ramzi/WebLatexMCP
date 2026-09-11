@@ -1,11 +1,11 @@
 import path from 'node:path';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { simpleGit, type SimpleGit } from 'simple-git';
+import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
 import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js';
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
 import { isBibFile } from '../lib/bib.js';
 import { toPosix } from '../lib/paths.js';
-import { execCapture } from '../lib/exec.js';
+import { execCapture, execCaptureBytes } from '../lib/exec.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
@@ -54,7 +54,12 @@ export interface DiffResult {
   files: DiffFile[];
 }
 
-export type PushStatus = 'pushed' | 'conflict' | 'nothing-to-push' | 'awaiting-approval';
+export type PushStatus =
+  | 'pushed'
+  | 'conflict'
+  | 'nothing-to-push'
+  | 'awaiting-approval'
+  | 'remote-moved';
 
 /**
  * A conflicted file, with everything needed for a 3-way merge: the full content of all three
@@ -78,6 +83,8 @@ export interface RemoteCommit {
   hash: string;
   /** Commit subject (first line of the message). */
   message: string;
+  /** Files the commit touched, with added/removed line counts (empty for e.g. a merge commit). */
+  files: DiffFile[];
 }
 
 /** Both sides of a rebase conflict, surfaced for a human (or agent) to adjudicate. */
@@ -112,10 +119,21 @@ export interface SafePushResult {
   pushedCommits?: number;
   /** New local HEAD after a successful push (the tip now on the remote). */
   pushedSha?: string;
-  /** Remote commits our change was rebased over (what landed underneath it), newest first. */
+  /**
+   * Remote commits our change was rebased over (what landed underneath it), newest first. On
+   * `remote-moved`, also the commit(s) that won the last race — which nothing was replayed onto.
+   */
   rebasedOver?: RemoteCommit[];
   /** Present iff `status === 'conflict'`. */
   conflict?: ConflictReport;
+  /**
+   * Present iff `status === 'remote-moved'`: the `origin/<branch>` tip as of the last fetch — the
+   * push lost the race every retry round; nothing was pushed. For `safePush`/`resolvePush` the
+   * clone is intact. Not so for branch-mode landing (`landBranch`): there, the local base branch
+   * has already been fast-forwarded onto the feature branch before the push fails, and the
+   * summary's recovery text says to run push in direct mode to finish syncing it.
+   */
+  remoteHead?: string;
 }
 
 export interface BranchPrepareResult {
@@ -142,20 +160,116 @@ export interface ConflictResolution {
 type RebaseStep = { ok: true } | { ok: false; unmerged: string[] };
 
 /**
+ * A rebase step aborted (or never even started) because the remote has a commit adding a path
+ * that already exists, untracked, in the working tree — git refuses to silently clobber content
+ * it doesn't track. The clone is left at its pre-push state; nothing was pushed. `paths` names
+ * the colliding file(s) when git's own error names them, and is empty when it didn't.
+ */
+export class UntrackedOverwriteError extends Error {
+  readonly paths: string[];
+
+  constructor(paths: string[]) {
+    super(UntrackedOverwriteError.buildMessage(paths));
+    this.name = 'UntrackedOverwriteError';
+    this.paths = paths;
+  }
+
+  private static buildMessage(paths: string[]): string {
+    const nothingPushed =
+      'The rebase a push needs was aborted. Nothing was pushed; the clone is back to its ' +
+      'pre-push state.';
+    if (paths.length === 0) {
+      return (
+        `${nothingPushed} An incoming commit would overwrite an untracked file already in the ` +
+        'working tree, but git did not name it — check `status` for untracked files that might ' +
+        'collide with the remote, then commit just those (`commit` with `scope: "paths"` and ' +
+        '`paths: [...]`) so the next push surfaces a proper conflict instead of this abort — ' +
+        '`scope: "all"` also works but sweeps in every other file in the working tree, including ' +
+        "a peer session's in-flight edits. Or delete/move the colliding file, then read the " +
+        'remote version with read_file(path, ref="origin/<branch>").'
+      );
+    }
+    const pathsJson = JSON.stringify(paths);
+    return (
+      `${nothingPushed} The remote has a commit adding ${paths.join(', ')}, which already ` +
+      `exist${paths.length === 1 ? 's' : ''} untracked in the working tree. Commit ` +
+      `${paths.length === 1 ? 'it' : 'them'} with \`commit\`, \`scope: "paths"\`, ` +
+      `\`paths: ${pathsJson}\` so the next push surfaces a proper conflict instead of this abort ` +
+      '(`scope: "all"` also works but sweeps in every other file in the working tree, including ' +
+      "a peer session's in-flight edits) — or delete/move " +
+      `${paths.length === 1 ? 'it' : 'them'}, then read the remote version with ` +
+      'read_file(path, ref="origin/<branch>").'
+    );
+  }
+}
+
+/**
+ * True when a `git push` failure is a plain non-fast-forward rejection — the remote gained a
+ * commit we don't have (a collaborator's Overleaf edit landing between our last fetch and the
+ * push) — as opposed to an auth failure, a network error, or a server-side hook refusal
+ * (`[remote rejected] ... (pre-receive hook declined)`, which is a different bracket phrase
+ * entirely and must never be retried). Matched case-insensitively against git/simple-git's raw
+ * stderr, which is not a stable API but is the only signal available.
+ */
+export function isNonFastForwardRejection(message: string): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('[rejected]') &&
+    (lower.includes('fetch first') || lower.includes('non-fast-forward'))
+  );
+}
+
+/** How many pull-rebase-then-push rounds `safePush`/`resolvePush` attempt before giving up. */
+const PUSH_RETRY_ROUNDS = 3;
+
+/** Outcome of {@link GitService.pushWithRetry}. */
+type PushRetryOutcome =
+  | {
+      ok: true;
+      rebasedOver: RemoteCommit[];
+      /**
+       * The ahead count re-read immediately before the push that actually ran, for attempt > 1
+       * only (a rebase ran since the caller's own pre-read, which can change it — see
+       * `pushWithRetry`'s doc comment). `undefined` on attempt 1, where no rebase has happened
+       * since the caller read it, so the caller's pre-read count is still accurate. `0` means the
+       * push was skipped entirely: there was nothing left to send.
+       */
+      pushedCommits?: number;
+    }
+  | { ok: false; kind: 'conflict'; report: ConflictReport }
+  | { ok: false; kind: 'remote-moved'; remoteHead: string; rebasedOver: RemoteCommit[] };
+
+/**
  * Wraps git operations via the system `git` CLI (through simple-git). Auth is injected
  * in-memory per network call and never persisted to .git/config.
  */
 export class GitService {
-  constructor(private readonly identity: CommitIdentity = DEFAULT_IDENTITY) {}
+  constructor(
+    private readonly identity: CommitIdentity = DEFAULT_IDENTITY,
+    /**
+     * Test-only seam (mirrors the injectable `run` in `compiler.ts`'s `probeOnPath`): called
+     * immediately before each `git push` attempt, so a test can simulate a collaborator's push
+     * landing in the gap between our fetch and our push.
+     */
+    private readonly hooks: { beforePush?: (attempt: number) => Promise<void> } = {},
+  ) {}
 
   /** Stage and commit locally. Does not push. */
   async commit(
     dir: string,
-    opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+    opts: { message: string; paths?: string[]; allowEmpty?: boolean; fromHead?: boolean },
   ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
     const git = simpleGit(dir);
+    if (opts.fromHead) {
+      // Start from HEAD so nothing another call left staged (a peer's `commitContents` that threw
+      // mid-way, a hand `git add` in the clone) can leak into this commit. Without `-u` the working
+      // tree is untouched. Tolerates an unborn HEAD (a freshly `git init`'d clone with no commits
+      // yet), where `read-tree --reset HEAD` would otherwise fail with "Not a valid object name".
+      await this.resetIndexToHead(dir, git);
+    }
     if (opts.paths && opts.paths.length > 0) {
-      await git.add(opts.paths);
+      await git.add(['--', ...opts.paths]);
     } else {
       await git.add(['-A']);
     }
@@ -190,20 +304,23 @@ export class GitService {
    * straight into it as blobs, and the commit is made from the index alone — no `add`, no `-a`,
    * and not a single byte of the working tree is touched.
    *
-   * A null `content` stages the file's deletion.
+   * A null `content` stages the file's deletion. A `Buffer` content stages verbatim bytes —
+   * this is how a binary asset (e.g. a PNG figure) reaches a commit without being decoded as
+   * text anywhere along the way.
    */
   async commitContents(
     dir: string,
     opts: {
       message: string;
-      files: Array<{ path: string; content: string | null }>;
+      files: Array<{ path: string; content: string | Buffer | null }>;
       allowEmpty?: boolean;
     },
   ): Promise<{ committed: boolean; sha: string; filesChanged: number; files: DiffFile[] }> {
     const git = simpleGit(dir);
     // Start from HEAD so nothing another call left staged can leak into this commit. Without
-    // `-u` the working tree is left exactly as it is.
-    await git.raw(['read-tree', '--reset', 'HEAD']);
+    // `-u` the working tree is left exactly as it is. Tolerates an unborn HEAD the same way
+    // `commit`'s `fromHead` branch does.
+    await this.resetIndexToHead(dir, git);
 
     for (const file of opts.files) {
       const rel = toPosix(file.path);
@@ -236,13 +353,35 @@ export class GitService {
     return { committed: true, sha, filesChanged: staged.length, files };
   }
 
-  /** Read a path's content at a commit-ish, or null when it does not exist there. */
+  /**
+   * Read a path's content at a commit-ish, or null when it does not exist there. Decodes as
+   * text (via simple-git's `git show`) — for content that may not be valid UTF-8 (a binary
+   * asset), use `readAtRefBytes` instead.
+   */
   async readAtRef(dir: string, ref: string, relPath: string): Promise<string | null> {
     return this.showOrNull(simpleGit(dir), ref, toPosix(relPath));
   }
 
+  /**
+   * Byte-exact analogue of `readAtRef`: read a path's content at a commit-ish as a raw
+   * `Buffer`, or null when it does not exist there. Use this for content that may not be
+   * valid UTF-8 (e.g. a PNG), since `readAtRef`/simple-git's `git show` decode as text and
+   * would corrupt such bytes.
+   */
+  async readAtRefBytes(dir: string, ref: string, relPath: string): Promise<Buffer | null> {
+    const res = await execCaptureBytes('git', ['show', `${ref}:${toPosix(relPath)}`], {
+      cwd: dir,
+    });
+    if (res.code !== 0) return null;
+    return res.stdout;
+  }
+
   /** Write `content` into the object database and return its blob sha. */
-  private async hashObject(dir: string, relPath: string, content: string): Promise<string> {
+  private async hashObject(
+    dir: string,
+    relPath: string,
+    content: string | Buffer,
+  ): Promise<string> {
     const res = await execCapture('git', ['hash-object', '-w', '--stdin', '--path', relPath], {
       cwd: dir,
       input: content,
@@ -257,6 +396,25 @@ export class GitService {
   private async indexMode(git: SimpleGit, relPath: string): Promise<string | null> {
     const out = await git.raw(['ls-files', '-s', '--', relPath]);
     return out.trim().split(/\s+/)[0] || null;
+  }
+
+  /**
+   * Reset the index to HEAD, tolerating an unborn HEAD (a freshly `git init`'d clone with no
+   * commits yet) — plain `git read-tree --reset HEAD` fails there with "fatal: Not a valid
+   * object name HEAD". `--verify --quiet` is the cheap, side-effect-free way to ask "does HEAD
+   * resolve to a commit yet", but simple-git's error detection only rejects a `raw()` call when
+   * the process both exits non-zero AND writes to stderr — `--quiet` suppresses exactly the
+   * stderr git would otherwise write on failure, so a rejected `git.raw(...)` never fires and
+   * `born` would always read true. Shell out directly with `execCapture` and check the exit
+   * code instead, the same seam `hashObject` below already uses for this reason. When unborn,
+   * `read-tree --empty` leaves the index empty, the correct "reset to HEAD" for a repo whose
+   * HEAD has no tree at all.
+   */
+  private async resetIndexToHead(dir: string, git: SimpleGit): Promise<void> {
+    const born =
+      (await execCapture('git', ['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: dir }))
+        .code === 0;
+    await git.raw(born ? ['read-tree', '--reset', 'HEAD'] : ['read-tree', '--empty']);
   }
 
   /** Discard uncommitted changes (working tree + untracked), optionally limited to paths. */
@@ -326,18 +484,22 @@ export class GitService {
     const git = simpleGit(dir);
     const branch = await this.currentBranch(git);
 
-    // Rebase needs a clean tree. In the normal flow the work is already committed; if it isn't,
-    // commit it first (a message is required), otherwise refuse rather than rebase a dirty tree.
+    // A rebase's checkout step tolerates untracked dirt in place — it only balks at uncommitted
+    // changes to files it already tracks. In the normal flow the work is already committed; if
+    // it isn't and a message was given, commit it first; if it isn't and tracked files are
+    // modified, refuse rather than rebase over them. Untracked-only dirt rides straight through.
     let committedSha: string | undefined;
-    if (!(await git.status()).isClean()) {
-      if (!opts.commitMessage) {
-        throw new Error(
-          'Working tree has uncommitted changes. Commit them first (or pass a message to ' +
-            'push to commit them), or discard them.',
-        );
+    const preStatus = await git.status();
+    if (!preStatus.isClean()) {
+      if (opts.commitMessage) {
+        committedSha = (await this.commit(dir, { message: opts.commitMessage, paths: opts.paths }))
+          .sha;
+      } else {
+        const modified = trackedModifiedPaths(preStatus);
+        if (modified.length > 0) {
+          throw new Error(uncommittedModificationsMessage(modified, preStatus.not_added));
+        }
       }
-      committedSha = (await this.commit(dir, { message: opts.commitMessage, paths: opts.paths }))
-        .sha;
     }
 
     // Fetch first so we can record what our change will rebase over (surfaced on success).
@@ -359,17 +521,52 @@ export class GitService {
     const ab = await this.aheadBehindOf(git);
     if (ab.ahead === 0) return this.nothingToPush(gitUrl, branch, committedSha);
 
-    await this.withAuth(git, gitUrl, auth, () => git.push(['origin', branch]));
+    const retryRebase = (): Promise<RebaseOutcome> =>
+      this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
+        this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+      );
+    const pushResult = await this.pushWithRetry(
+      git,
+      gitUrl,
+      auth,
+      branch,
+      retryRebase,
+      rebasedOver,
+      PUSH_RETRY_ROUNDS,
+    );
+    if (!pushResult.ok) {
+      return pushResult.kind === 'conflict'
+        ? this.conflictResult(gitUrl, pushResult.report)
+        : this.remoteMovedResult(
+            gitUrl,
+            branch,
+            pushResult.remoteHead,
+            pushResult.rebasedOver,
+            PUSH_RETRY_ROUNDS,
+            'Re-run push.',
+          );
+    }
+    // A retry round's rebase can shrink what's ahead — including to zero, when a collaborator
+    // landed an identical change and our replayed commit became empty and was dropped.
+    // `pushResult.pushedCommits` is the fresh, post-rebase count for that case; `undefined` means
+    // the push succeeded on attempt 1, where `ab.ahead` (read before any rebase since) still holds.
+    if (pushResult.pushedCommits === 0) {
+      return {
+        ...this.nothingToPush(gitUrl, branch, committedSha, GitService.DROPPED_COMMIT_SUMMARY),
+        ...(pushResult.rebasedOver.length ? { rebasedOver: pushResult.rebasedOver } : {}),
+      };
+    }
+    const pushedCommits = pushResult.pushedCommits ?? ab.ahead;
     return {
       status: 'pushed',
       pushed: true,
       remote: gitUrl,
       branch,
-      summary: `Pushed ${ab.ahead} commit(s) to origin/${branch}.`,
+      summary: `Pushed ${pushedCommits} commit(s) to origin/${branch}.`,
       committedSha,
-      pushedCommits: ab.ahead,
+      pushedCommits,
       pushedSha: (await git.revparse(['HEAD'])).trim(),
-      ...(rebasedOver.length ? { rebasedOver } : {}),
+      ...(pushResult.rebasedOver.length ? { rebasedOver: pushResult.rebasedOver } : {}),
     };
   }
 
@@ -421,17 +618,20 @@ export class GitService {
     });
     const branch = await this.currentBranch(git);
 
-    // The work is normally already committed from the earlier (conflicting) push attempt; if the
-    // tree is still dirty, commit it first (a message is required) rather than rebase a dirty tree.
+    // The work is normally already committed from the earlier (conflicting) push attempt. If the
+    // tree is still dirty: untracked-only dirt rides through untouched; a message commits it;
+    // otherwise a tracked modification would block the rebase, so refuse rather than proceed.
     let committedSha: string | undefined;
-    if (!(await git.status()).isClean()) {
-      if (!opts.commitMessage) {
-        throw new Error(
-          'Working tree has uncommitted changes. Commit them first (or pass a message to commit ' +
-            'them) before resolving, or discard them.',
-        );
+    const preStatus = await git.status();
+    if (!preStatus.isClean()) {
+      if (opts.commitMessage) {
+        committedSha = (await this.commit(dir, { message: opts.commitMessage })).sha;
+      } else {
+        const modified = trackedModifiedPaths(preStatus);
+        if (modified.length > 0) {
+          throw new Error(uncommittedModificationsMessage(modified, preStatus.not_added));
+        }
       }
-      committedSha = (await this.commit(dir, { message: opts.commitMessage })).sha;
     }
 
     await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
@@ -520,18 +720,57 @@ export class GitService {
     const ab = await this.aheadBehindOf(git);
     if (ab.ahead === 0) return this.nothingToPush(gitUrl, branch, committedSha);
 
-    await this.withAuth(git, gitUrl, auth, () => git.push(['origin', branch]));
+    // A retry round here is a plain pull-rebase (no resolutions): any conflict it hits is fresh
+    // (against a commit that landed after the one we just resolved), unrelated to `resolutions`,
+    // and is reported — never silently retried again with stale content.
+    const retryRebase = (): Promise<RebaseOutcome> =>
+      this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
+        this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+      );
+    // When the caller pinned `expectedRemoteHead`, they asked to be refused rather than have their
+    // merge silently rebased over a second remote move — one round only, so a lost race here is
+    // reported as `remote-moved` (nothing pushed, clone intact) instead of retried.
+    const rounds = opts.expectedRemoteHead ? 1 : PUSH_RETRY_ROUNDS;
+    const pushResult = await this.pushWithRetry(
+      git,
+      gitUrl,
+      auth,
+      branch,
+      retryRebase,
+      rebasedOver,
+      rounds,
+    );
+    if (!pushResult.ok) {
+      return pushResult.kind === 'conflict'
+        ? this.conflictResult(gitUrl, pushResult.report)
+        : this.remoteMovedResult(
+            gitUrl,
+            branch,
+            pushResult.remoteHead,
+            pushResult.rebasedOver,
+            rounds,
+            'Re-run push.',
+          );
+    }
+    // See safePush's identical handling: a retry round's rebase can drop our commit as empty.
+    if (pushResult.pushedCommits === 0) {
+      return {
+        ...this.nothingToPush(gitUrl, branch, committedSha, GitService.DROPPED_COMMIT_SUMMARY),
+        ...(pushResult.rebasedOver.length ? { rebasedOver: pushResult.rebasedOver } : {}),
+      };
+    }
+    const pushedCommits = pushResult.pushedCommits ?? ab.ahead;
     const pushedSha = (await git.revparse(['HEAD'])).trim();
     return {
       status: 'pushed',
       pushed: true,
       remote: gitUrl,
       branch,
-      summary: `Resolved conflict and pushed ${ab.ahead} commit(s) to origin/${branch} (${pushedSha.slice(0, 8)}).`,
+      summary: `Resolved conflict and pushed ${pushedCommits} commit(s) to origin/${branch} (${pushedSha.slice(0, 8)}).`,
       committedSha,
-      pushedCommits: ab.ahead,
+      pushedCommits,
       pushedSha,
-      ...(rebasedOver.length ? { rebasedOver } : {}),
+      ...(pushResult.rebasedOver.length ? { rebasedOver: pushResult.rebasedOver } : {}),
     };
   }
 
@@ -598,7 +837,29 @@ export class GitService {
     const ab = await this.aheadBehindOf(git);
     if (ab.ahead === 0) return this.nothingToPush(gitUrl, base);
 
-    await this.withAuth(git, gitUrl, auth, () => git.push(['origin', base]));
+    // Unlike safePush/resolvePush, landBranch's rebase (feature branch onto origin/base, then an
+    // ff-only merge of base) doesn't fit the pull-rebase retry thunk cleanly — so a lost race here
+    // is reported as `remote-moved` rather than retried (one attempt, not `PUSH_RETRY_ROUNDS`).
+    await this.hooks.beforePush?.(1);
+    try {
+      await this.withAuth(git, gitUrl, auth, () => git.push(['origin', base]));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!isNonFastForwardRejection(message)) throw err;
+      await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+      const remoteHead = (await this.revParseOrNull(git, `origin/${base}`)) ?? '';
+      const rebasedOver = await this.logCommits(git, `HEAD..origin/${base}`);
+      return this.remoteMovedResult(
+        gitUrl,
+        base,
+        remoteHead,
+        rebasedOver,
+        1,
+        `Local ${base} is already fast-forwarded onto "${opts.branch}" and is now ahead of and ` +
+          `behind the remote; run push in direct mode (no mode/approve) to pull-rebase ${base} ` +
+          `onto the new remote tip and push — the feature branch "${opts.branch}" is intact.`,
+      );
+    }
     return {
       status: 'pushed',
       pushed: true,
@@ -793,7 +1054,7 @@ export class GitService {
       if (unmerged.length === 0) {
         // Not a conflict (e.g. a network/auth failure). Don't leave a rebase half-applied.
         await this.abortRebaseIfInProgress(git);
-        throw err;
+        throw untrackedOverwriteFromError(err) ?? err;
       }
       // Mid-rebase the branch ref still points at our original tip, so the report is read from
       // refs (valid now); the working tree supplies the marker view before we abort.
@@ -816,7 +1077,7 @@ export class GitService {
       const unmerged = await this.unmergedPaths(git);
       if (unmerged.length === 0) {
         await this.abortRebaseIfInProgress(git);
-        throw err;
+        throw untrackedOverwriteFromError(err) ?? err;
       }
       return { ok: false, unmerged };
     }
@@ -897,20 +1158,30 @@ export class GitService {
     }
   }
 
-  /** Commits in a `A..B` range as {hash, subject}, newest first; empty on any error. */
+  /**
+   * Commits in a `A..B` range as {hash, subject, files}, newest first; empty on any error. A
+   * NUL-prefixed header line (`%x00%H%x09%s`) is unambiguous against the `--numstat` lines that
+   * follow it — the subject may itself contain a tab, so only the header's own NUL marks a new
+   * commit.
+   *
+   * `--no-renames` and `-c core.quotePath=false` are load-bearing, not cosmetic: `--numstat`
+   * applies rename detection by default, which collapses a two-file change into one
+   * `old.tex => new.tex` entry a caller can't feed back into e.g. `read_file`; and
+   * `core.quotePath` (on by default) C-quotes any non-ASCII path (`"r\303\251sum\303\251.tex"`)
+   * rather than emitting UTF-8. `-c` must precede the subcommand for `git.raw`.
+   */
   private async logCommits(git: SimpleGit, range: string): Promise<RemoteCommit[]> {
     try {
-      const out = await git.raw(['log', '--format=%H%x09%s', range]);
-      return out
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .map((line) => {
-          const tab = line.indexOf('\t');
-          return tab === -1
-            ? { hash: line, message: '' }
-            : { hash: line.slice(0, tab), message: line.slice(tab + 1) };
-        });
+      const out = await git.raw([
+        '-c',
+        'core.quotePath=false',
+        'log',
+        '--no-renames',
+        '--format=%x00%H%x09%s',
+        '--numstat',
+        range,
+      ]);
+      return parseCommitLog(out);
     } catch {
       return [];
     }
@@ -939,37 +1210,179 @@ export class GitService {
     };
   }
 
-  private nothingToPush(gitUrl: string, branch: string, committedSha?: string): SafePushResult {
+  /**
+   * Push, retrying a lost fast-forward race up to `rounds` times (`PUSH_RETRY_ROUNDS` normally;
+   * callers that pinned `expectedRemoteHead` pass 1, since a second lost race should be reported
+   * rather than silently rebased over). Each round is the same fetch → pull-rebase → push sequence
+   * used elsewhere: on a plain non-fast-forward rejection (a collaborator's commit landing between
+   * our last fetch and this push), fetch again (to capture what just landed, prepended to
+   * `rebasedOver`) and re-run `rebaseAgain`. A conflict during that re-rebase is returned as-is —
+   * never retried again. Any other push error (auth, network, a server-side hook refusal) rethrows
+   * immediately, unretried. Exhausting every round leaves the clone exactly where the last rebase
+   * left it (no rebase in progress, still ahead), fetches once more, and reports `remote-moved`
+   * with the current remote tip — folding that final fetch's commits into `rebasedOver` too, so it
+   * accounts for the exact tip `remoteHead` names.
+   *
+   * A retry round's rebase can also change what's actually ahead of the remote — including to
+   * zero, when a collaborator lands a change identical to ours and the replayed commit becomes
+   * empty and is dropped. So from the second attempt on, the ahead count is re-read immediately
+   * before that attempt's push rather than trusting the caller's pre-round read: if it's now
+   * zero, the push is skipped (there is nothing left to send) and `pushedCommits: 0` is returned;
+   * otherwise the fresh count rides along as `pushedCommits` so the caller never reports a push
+   * that didn't happen, or the wrong commit count for one that did. That re-read uses
+   * {@link aheadBehindStrictOf}, not the lenient `aheadBehindOf`: at this point in the loop no
+   * rebase is in progress (the prior round's `rebaseAgain` already resolved, ok or not, before we
+   * get here) and `ahead` was non-zero moments earlier, so a `rev-list` failure here must propagate
+   * as an error rather than be misread as "the rebase dropped our commit" and silently reported as
+   * `nothing-to-push`.
+   */
+  private async pushWithRetry(
+    git: SimpleGit,
+    gitUrl: string,
+    auth: AuthConfig,
+    branch: string,
+    rebaseAgain: () => Promise<RebaseOutcome>,
+    rebasedOver: RemoteCommit[],
+    rounds: number,
+  ): Promise<PushRetryOutcome> {
+    let over = rebasedOver;
+    for (let attempt = 1; attempt <= rounds; attempt++) {
+      let pushedCommits: number | undefined;
+      if (attempt > 1) {
+        const ab = await this.aheadBehindStrictOf(git);
+        if (ab.ahead === 0) return { ok: true, rebasedOver: over, pushedCommits: 0 };
+        pushedCommits = ab.ahead;
+      }
+      await this.hooks.beforePush?.(attempt);
+      try {
+        await this.withAuth(git, gitUrl, auth, () => git.push(['origin', branch]));
+        return { ok: true, rebasedOver: over, pushedCommits };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!isNonFastForwardRejection(message)) throw err;
+
+        if (attempt < rounds) {
+          await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+          const justLanded = await this.logCommits(git, `HEAD..origin/${branch}`);
+          over = mergeNewestFirst(justLanded, over);
+          const outcome = await rebaseAgain();
+          if (!outcome.ok) return { ok: false, kind: 'conflict', report: outcome.report };
+          continue;
+        }
+
+        // Final attempt: fetch once more and fold the commit that just won the race into
+        // `over` too, so `rebasedOver` accounts for the exact remote tip named by `remoteHead`
+        // — otherwise the landing that caused this very failure would be missing from it.
+        await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+        const justLanded = await this.logCommits(git, `HEAD..origin/${branch}`);
+        over = mergeNewestFirst(justLanded, over);
+        const remoteHead = (await this.revParseOrNull(git, `origin/${branch}`)) ?? '';
+        return { ok: false, kind: 'remote-moved', remoteHead, rebasedOver: over };
+      }
+    }
+    /* istanbul ignore next -- unreachable: the loop always returns within rounds >= 1 */
+    throw new Error('pushWithRetry: exhausted retry rounds without a result.');
+  }
+
+  private remoteMovedResult(
+    gitUrl: string,
+    branch: string,
+    remoteHead: string,
+    rebasedOver: RemoteCommit[],
+    attempts: number,
+    recovery: string,
+  ): SafePushResult {
+    // remoteHead can be '' when origin/<branch> couldn't be resolved (revParseOrNull) — omit the
+    // "(now at …)" clause rather than rendering "now at )".
+    const movedClause = remoteHead ? ` (now at ${remoteHead.slice(0, 8)})` : '';
+    return {
+      status: 'remote-moved',
+      pushed: false,
+      remote: gitUrl,
+      branch,
+      summary:
+        `Remote origin/${branch} moved during the push${movedClause} ` +
+        `after ${attempts} attempt(s); nothing was pushed. ${recovery}`,
+      remoteHead,
+      ...(rebasedOver.length ? { rebasedOver } : {}),
+    };
+  }
+
+  private nothingToPush(
+    gitUrl: string,
+    branch: string,
+    committedSha?: string,
+    summary?: string,
+  ): SafePushResult {
     return {
       status: 'nothing-to-push',
       pushed: false,
       remote: gitUrl,
       branch,
-      summary: 'Nothing to push; already up to date with the remote.',
+      summary: summary ?? 'Nothing to push; already up to date with the remote.',
       committedSha,
     };
   }
 
+  /**
+   * `nothingToPush`'s summary for the "a retry round's rebase dropped our commit as empty" case —
+   * used at both dropped-commit return sites (`safePush` and `resolvePush`). The generic "already up
+   * to date" wording doesn't tell the caller their just-made commit was replayed empty and discarded
+   * because an identical change had already landed upstream.
+   */
+  private static readonly DROPPED_COMMIT_SUMMARY =
+    "Nothing left to push: after rebasing onto the remote, this session's commit was already " +
+    'there (an identical change landed upstream) and was dropped.';
+
   private async aheadBehindOf(
     git: SimpleGit,
   ): Promise<{ branch: string; ahead: number; behind: number }> {
-    const branch = await this.currentBranch(git);
     try {
-      const out = await git.raw([
-        'rev-list',
-        '--left-right',
-        '--count',
-        `${branch}...origin/${branch}`,
-      ]);
-      const [ahead, behind] = out
-        .trim()
-        .split(/\s+/)
-        .map((n) => Number(n));
-      return { branch, ahead: ahead ?? 0, behind: behind ?? 0 };
+      return await this.aheadBehindStrictOf(git);
     } catch {
       // No upstream tracking ref yet (e.g. before first fetch).
-      return { branch, ahead: 0, behind: 0 };
+      return { branch: await this.currentBranch(git), ahead: 0, behind: 0 };
     }
+  }
+
+  /**
+   * Like {@link aheadBehindOf} but does not swallow a `rev-list` failure into a lenient
+   * `{ahead: 0, behind: 0}` — it rethrows instead.
+   *
+   * `aheadBehindOf`'s blanket catch exists for callers that only decide whether to *start* a push
+   * (a `0` there just means "nothing to do yet"). `pushWithRetry`'s mid-round re-read is different:
+   * moments earlier `ahead` was known non-zero, so there a `0` reading is at least as likely to
+   * mean "rev-list errored" (a stray `index.lock`, an unexpected ref state) as "the rebase legitimately
+   * dropped our commit" — and mistaking the former for the latter means silently SKIPPING a push and
+   * reporting `nothing-to-push`, telling the caller their work is upstream when it may not be. Use
+   * this variant there so a genuine git failure propagates as an error instead. Leave every other
+   * (pre-existing) call site on the lenient `aheadBehindOf`.
+   */
+  private async aheadBehindStrictOf(
+    git: SimpleGit,
+  ): Promise<{ branch: string; ahead: number; behind: number }> {
+    const branch = await this.currentBranch(git);
+    const out = await git.raw([
+      'rev-list',
+      '--left-right',
+      '--count',
+      `${branch}...origin/${branch}`,
+    ]);
+    const [ahead, behind] = out
+      .trim()
+      .split(/\s+/)
+      .map((n) => Number(n));
+    return { branch, ahead: ahead ?? 0, behind: behind ?? 0 };
+  }
+
+  /**
+   * Ahead/behind counts vs the upstream for a clone directory, rethrowing a `rev-list` failure
+   * rather than reporting zeros. Exposed alongside {@link aheadBehind} (the lenient equivalent)
+   * purely so the strict/lenient behavior difference can be unit-tested without going through a
+   * full push.
+   */
+  async aheadBehindStrict(dir: string): Promise<{ branch: string; ahead: number; behind: number }> {
+    return this.aheadBehindStrictOf(simpleGit(dir));
   }
 
   /** Run `fn` with origin temporarily pointed at the authenticated URL, then restore. */
@@ -993,18 +1406,138 @@ export class GitService {
   }
 }
 
+/**
+ * Tracked files with staged or unstaged changes (modifications, deletions) — never a file git
+ * doesn't know about yet. `status.files` covers both index and working-dir changes;
+ * `status.not_added` is exactly the untracked set, so excluding it leaves the tracked ones.
+ */
+function trackedModifiedPaths(status: GitStatusSummary): string[] {
+  const notAdded = new Set(status.not_added);
+  return status.files.filter((f) => !notAdded.has(f.path)).map((f) => f.path);
+}
+
+/** Join at most `max` entries, appending `… N more` for whatever didn't fit. */
+function capList(items: string[], max: number): string {
+  if (items.length <= max) return items.join(', ');
+  const shown = items.slice(0, max);
+  return `${shown.join(', ')}, … ${items.length - max} more`;
+}
+
+/**
+ * Shared message for both `safePush` and `resolvePush` refusing a dirty tree: names the tracked
+ * modifications blocking the rebase, and separately reassures that any untracked files present
+ * are not why — they ride through a push untouched. Each list is capped (20 modified, 10
+ * untracked) so a working tree with hundreds of dirty files doesn't blow up the error text.
+ */
+function uncommittedModificationsMessage(modified: string[], untracked: string[]): string {
+  const untrackedNote =
+    untracked.length > 0
+      ? `Untracked file(s) never block a push — ${capList(untracked, 10)} will ride along untouched.`
+      : 'Untracked files never block a push.';
+  return (
+    `Uncommitted changes to tracked file(s): ${capList(modified, 20)}. A push has to rebase onto ` +
+    'the latest remote, and git cannot rebase over uncommitted modifications to files it already ' +
+    "tracks. Commit them first (`commit` takes this session's edits by default, or " +
+    '`scope: "all"` for the whole working tree), pass a `message` to push to commit the WHOLE ' +
+    "working tree instead (peers' work included, so prefer commit first), or `discard` them. " +
+    untrackedNote
+  );
+}
+
+/**
+ * Matches git's refusal to check out (or merge in, mid-rebase) a commit that would overwrite a
+ * path already present, untracked, in the working tree. Git uses "checkout" wording for the
+ * initial detach and "merge" wording for a later commit applied during the rebase — both are the
+ * same underlying refusal, so both are matched. Git also has a sibling wording, "would be
+ * *removed* by", for the case where the incoming commit deletes a tracked file that collides with
+ * an untracked one of the same path — same underlying refusal, matched too.
+ */
+const UNTRACKED_OVERWRITE_RE =
+  /following untracked working tree files would be (?:overwritten|removed) by (?:checkout|merge)/i;
+
+/** Pull the indented file list out of git's "would be overwritten" error text. */
+function parseUntrackedOverwritePaths(message: string): string[] {
+  const lines = message.split('\n');
+  const start = lines.findIndex((line) => UNTRACKED_OVERWRITE_RE.test(line));
+  if (start === -1) return [];
+  const paths: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (!line.startsWith('\t')) break;
+    const trimmed = line.replace(/^\t/, '').trim();
+    if (!trimmed) break;
+    paths.push(toPosix(trimmed));
+  }
+  return paths;
+}
+
+/** Recognise git's "would be overwritten" refusal in a caught error and turn it into our type. */
+function untrackedOverwriteFromError(err: unknown): UntrackedOverwriteError | null {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!UNTRACKED_OVERWRITE_RE.test(message)) return null;
+  return new UntrackedOverwriteError(parseUntrackedOverwritePaths(message));
+}
+
+/** Prepend `justLanded` (newest first) onto `existing`, dropping any hash already present. */
+function mergeNewestFirst(justLanded: RemoteCommit[], existing: RemoteCommit[]): RemoteCommit[] {
+  const seen = new Set(existing.map((c) => c.hash));
+  return [...justLanded.filter((c) => !seen.has(c.hash)), ...existing];
+}
+
+/** Parse one `--numstat` line (`added\tremoved\tpath`) into a {@link DiffFile}, `-` counts as 0. */
+function parseNumstatLine(line: string): DiffFile {
+  const [added, removed, ...rest] = line.split('\t');
+  return {
+    // Rename paths ("old => new", "{a => b}/x") are a single field with no tab in them — keep the
+    // raw string as-is rather than trying to split it into two paths.
+    path: rest.join('\t'),
+    added: added === '-' ? 0 : Number(added),
+    removed: removed === '-' ? 0 : Number(removed),
+  };
+}
+
 /** Parse `git diff --numstat` output into per-file added/removed counts. */
 function parseNumstat(numstat: string): DiffFile[] {
   return numstat
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) => {
-      const [added, removed, ...rest] = line.split('\t');
-      return {
-        path: rest.join('\t'),
-        added: added === '-' ? 0 : Number(added),
-        removed: removed === '-' ? 0 : Number(removed),
-      };
-    });
+    .map(parseNumstatLine);
+}
+
+/**
+ * Parse `git log --format=%x00%H%x09%s --numstat <range>` output into {@link RemoteCommit}s.
+ *
+ * A line starting with NUL begins a new commit: the hash runs up to the first tab, and the
+ * subject is everything after it (which may itself contain tabs — only the header's own leading
+ * NUL is used to detect a new commit, never a tab count). Lines of the form `added\tremoved\tpath`
+ * belong to the current commit's files (`-\t-\t...` — a binary file — counts as 0/0); blank lines
+ * are skipped; anything else (a numstat line with no commit header yet seen, stray output) is
+ * ignored. A commit with no numstat lines under it (e.g. a merge commit) ends up with `files: []`.
+ * Tolerates CRLF input the same way {@link parseNumstat} does: a trailing `\r` is stripped from
+ * every line (header and numstat alike) before parsing, so it never ends up glued onto a subject
+ * or a path. Pure and exported for unit testing without a live git process.
+ */
+export function parseCommitLog(out: string): RemoteCommit[] {
+  const commits: RemoteCommit[] = [];
+  let current: RemoteCommit | null = null;
+  for (const rawLine of out.split('\n')) {
+    const line0 = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line0.length === 0) continue;
+    if (line0[0] === '\u0000') {
+      const line = line0.slice(1);
+      const tab = line.indexOf('\t');
+      current =
+        tab === -1
+          ? { hash: line, message: '', files: [] }
+          : { hash: line.slice(0, tab), message: line.slice(tab + 1), files: [] };
+      commits.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const parts = line0.split('\t');
+    if (parts.length < 3) continue;
+    current.files.push(parseNumstatLine(line0));
+  }
+  return commits;
 }

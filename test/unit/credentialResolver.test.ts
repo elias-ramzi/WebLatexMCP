@@ -121,7 +121,7 @@ describe('CredentialResolver', () => {
 describe('CredentialResolver.storeCredential', () => {
   /** Records `git credential approve` input, and replays it on the next `fill` (a fake keychain). */
   function keychainExec(): {
-    exec: (cmd: string, args: string[], opts?: { input?: string }) => Promise<ExecResult>;
+    exec: (cmd: string, args: string[], opts?: { input?: string | Buffer }) => Promise<ExecResult>;
     approved: string[];
   } {
     let stored: string | undefined;
@@ -130,8 +130,11 @@ describe('CredentialResolver.storeCredential', () => {
       approved,
       async exec(cmd, args, opts) {
         if (cmd === 'git' && args[0] === 'credential' && args[1] === 'approve') {
-          approved.push(opts?.input ?? '');
-          stored = /^password=(.*)$/m.exec(opts?.input ?? '')?.[1];
+          // `ExecOptions.input` also carries Buffers now (binary blobs into `git hash-object`);
+          // a credential payload is always text, so normalize before matching.
+          const input = opts?.input === undefined ? '' : opts.input.toString();
+          approved.push(input);
+          stored = /^password=(.*)$/m.exec(input)?.[1];
           return { code: 0, stdout: '', stderr: '', timedOut: false };
         }
         if (cmd === 'git' && args[0] === 'credential' && args[1] === 'fill') {

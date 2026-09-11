@@ -36,6 +36,7 @@ function stubCompiler(log: string) {
       log,
       timedOut: false,
       logBaseDir: logBaseDir(req.rootFile),
+      rebuilt: true,
     }),
   };
 }

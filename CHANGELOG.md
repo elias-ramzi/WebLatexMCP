@@ -11,6 +11,133 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`commit scope: "paths"` — commit exactly the files you name, and nothing else** (#61). A session
+  whose work reached the clone without going through `edit_file` / `write_file` — a script's output,
+  the client's own file tools — owns nothing in its shadow, so `scope: "session"` had nothing to commit
+  and the only route was `scope: "all"`, fenced by a caller-maintained `paths` list that widened
+  silently to the whole tree the moment the list was empty. The new scope requires a non-empty `paths`,
+  stages only those (a directory covers what is under it, a path leaving the clone is refused before git
+  sees it) — the index is reset to HEAD first, as a session commit does, so nothing a hand `git add` or
+  an interrupted commit left staged rides along — reports `leftUncommitted` like a session commit does,
+  and **refuses a path a live session's
+  shadow lists** rather than taking that session's in-flight lines — `scope: "all"` remains the
+  deliberate way to do that, unchanged. A live peer whose shadow index cannot be read is treated as
+  owning everything, so the refusal fails closed. The alternative the report also floated — letting a
+  session "claim" external changes into its shadow — was declined: a claim has no `before` of its own,
+  so it would adopt whatever a peer had also written into the file, which is the exact leak the
+  change-not-result shadow design exists to prevent. Review fixes before merge: the ownership check
+  iterates the live peers rather than the indexes it managed to read, so a peer missing from the
+  read set is unreadable (refused), never "owns nothing"; and both commit paths tolerate a clone with
+  no commits yet (an empty remote), where `read-tree --reset HEAD` used to fail.
+- **The `push` refusal for a peer's uncommitted work now says who is mid-edit** (#61). It named the
+  live sessions and the files, but not which session owned which file or whether that session was
+  between keystrokes or merely still open — so "wait" and "take over" looked the same, and telling
+  them apart meant `stat`-ing mtimes in a shell. Each shadow index entry now records `touchedAt`, the
+  last write that session made through the server (set only when an edit is recorded, never when the
+  shadow is carried onto a new HEAD, which is why file mtimes were never a usable signal), and the
+  refusal attributes each foreign file to the live session whose shadow lists it, with that session's
+  last write age and heartbeat age, and lists apart the files no live session owns. The refusal's
+  _trigger_ is unchanged — any live peer plus any foreign dirt still refuses; making it owner-aware is
+  #60's question and is left there, because dropping the guard without also fixing `safePush`'s
+  `git add -A` fallback would turn "no longer blocked" into "swept into the commit".
+  `status.activeSessions` carries the same per-session `changes` (`null` when that session's index is
+  unreadable) and `lastWriteAt`, so the check is one read-only call.
+- **`push` no longer refuses on untracked files nobody owns** (#60). `guardPeerWork` already let
+  unowned dirt through when no live peer session existed (or the dirt was this session's own), but `safePush`/`resolvePush` then
+  re-gated on simple-git's `isClean()`, which counts untracked files — so three hand-built `main.pdf`/
+  `main.bbl`/`main.blg` beside the root file, or an exited peer's new figure, refused every push with a
+  generic "uncommitted changes" message that named neither the files nor a session, contradicting what
+  docs/CONCURRENCY.md promised. A rebase's checkout tolerates untracked files in place; it balks only at
+  uncommitted changes to files git already tracks. So the gate now distinguishes the two: untracked
+  files ride through a push untouched, and only modified tracked files refuse — **by name**, saying why
+  (git cannot rebase over them) and offering the three exits (`commit`, a `message` on `push` — which
+  commits the whole working tree, peers' work included — or `discard`). `--autostash` was deliberately
+  not used: a stash pop is an automatic merge of somebody's uncommitted lines onto a new base, and a
+  pop conflict leaves markers in the working tree. The one case git itself refuses — an incoming commit
+  adding a path that already exists untracked locally — is no longer a raw "could not detach HEAD": it
+  is `UntrackedOverwriteError`, naming the colliding file(s), with the clone left at its pre-push state
+  — and prescribing `commit scope: "paths"` with exactly those paths, not `scope: "all"`, so following
+  the message does not sweep a peer's in-flight work into the commit.
+- **`push` retries a lost fast-forward race, then reports `status: "remote-moved"`** (#60). With a
+  collaborator typing in the Overleaf editor the git bridge lands a commit every few seconds, and a push
+  that lost the race between its last fetch and its `git push` returned git's raw stderr
+  (`[rejected] (fetch first)`), neither retried nor explained. `safePush` and `resolvePush` now go through one
+  helper that, on a plain non-fast-forward rejection — and only that: auth, network and hook refusals
+  (`[remote rejected]`) rethrow at once — re-runs the same fetch → `pull --rebase` → push round up to 3
+  times. A conflict on a retry round is reported exactly as before, never retried with stale content;
+  the success result's `rebasedOver` includes the commits picked up by every round. Losing the race
+  three times returns `status: "remote-moved"` with `remoteHead` and the commits that landed, nothing
+  pushed, no rebase in progress, and the local commits still ahead. A `resolutions` push that passed
+  `expectedRemoteHead` does not retry at all — the caller asked to be refused if the remote moved again,
+  so it gets `remote-moved` on the first lost race. Branch-mode landing does not loop either (its
+  rebase-then-ff shape is different): it converts the same rejection into `remote-moved`, and because
+  local `<base>` is already fast-forwarded onto the feature branch by then, its summary prescribes the
+  recovery that actually works — a direct-mode push, which pull-rebases `<base>` and pushes. The `beforePush` hook on `GitService`'s constructor exists only so a test can move the
+  remote in that gap. A retry round re-reads how far ahead the clone is before pushing: when the
+  rebase dropped our commit because a collaborator landed the identical change, the result is
+  `nothing-to-push` (with what was rebased over), never a `pushed` that names their commit as ours.
+- **Every reported commit lists the files it touched** (#60). `rebasedOver`, `behindCommits`,
+  `aheadCommits`, the conflict payload's `remoteCommits` and `reset_to_remote`'s `discardedCommits`
+  carried only hash + subject, and an Overleaf commit's subject is always "Update on Overleaf." — so
+  "what did he change since my last sync" meant ~15 `git show --stat` shell detours per session. Each
+  entry now carries `files` (path, added, removed) from one `git log --numstat`; the result text shows
+  up to 5 files per commit and 20 commits, the rest in `structuredContent`. For the content, `diff`
+  with `ref: "<hash>~1..<hash>"` already answers a single commit and the docs now say so where the
+  commits are reported; the reporter's "diff compares the working tree to a ref" was the single-ref
+  form — the two-dot range compares two commits. A separate `log` tool was declined: the range form
+  plus the per-commit file list covers the case that recurred. The per-commit paths are plain: the
+  log is read with rename detection off and `core.quotePath=false`, so a rename lists its old and new
+  path and a non-ASCII name is not C-quoted.
+- **A project registered from the chat can be the default** (#60). `register_project` gains
+  `default: true`, persisted as `"default": true` on the entry in `registry.json` and applied
+  immediately in this process, so later calls may omit `project`. `WEB_LATEX_MCP_DEFAULT_PROJECT`, when
+  set, always wins — an explicit env value is an assertion, like `compilerExplicit`, and a persisted
+  default is only what fills in when it is unset. Making the sole registered project the default by
+  inference was declined for the same reason, and because a peer registering a second project would
+  flip a working call into an error mid-session. The no-default error now lists the known ids and both
+  ways to set one, and the env-check error no longer claims the id must be in `WEB_LATEX_MCP_PROJECTS`
+  (it was already checked against env plus registry; only the message said otherwise, which is what
+  misled the reporter). Making an already-registered project the default takes `project` and
+  `default: true` alone — no `gitUrl`/`path` — and re-persists the entry as `registry.json` holds it (not this process's snapshot of it), so
+  `rootFile`/`branch`/`tokenEnv` survive; the registry-default read in `loadConfig` is injectable like
+  the registry read, so unit tests never see a developer's real `registry.json`.
+- **`compile` says whether it actually rebuilt, and how long it waited for the lock** (#60). The
+  build dir is stable per project path and shared by every session on a clone, so right after a peer
+  compiled, latexmk finds nothing to do and `compile` returns `success: true` in 0.08 s with the peer's
+  PDF — indistinguishable from a rebuild from your own edits. The result now carries `rebuilt` (the
+  build-dir PDF's mtime or size changed between just before and just after the run — never parsed
+  from backend stdout, which is discarded once a `.log` exists and which tectonic does not emit, and
+  never from the wall clock), `pdfMtime` (read from the build output before the surfacing copy, whose
+  mtime is fresh on every call), `lockWaitSec` (`durationSec` still measures the backend run alone) and
+  `lockHeldBy` — the session that held the lock, which `LockTimeoutError` already named but only after
+  the 30 s timeout. The lock reports more and acquires exactly as before; `withFileLock` and
+  `runExclusive` hand the acquisition to their callback, which every other caller ignores.
+  `pdfMtime` rounds the stat's fractional milliseconds rather than truncating them (an mtime set to
+  an exact millisecond read back one ms early on CI). `lockWaitSec` covers both layers: a second call in the same process waits on the in-process mutex
+  first, and that wait is counted too, with `lockHeldBy` naming this session.
+
+- **`add_asset`: a figure on your laptop can finally reach the project.** `write_file` takes a
+  `content: string` and wrote it as UTF-8, so there was no way to add a PNG that was not already in
+  the project — and the corruption ran deeper than the tool layer: `ShadowStore` stored every shadow
+  as UTF-8 and `GitService.hashObject` piped a string into `git hash-object`, so even bytes that
+  reached disk were destroyed by the default `scope: "session"` commit. (`scope: "all"`/`"paths"`
+  stage through `git add` and were always binary-safe, which is why this only bit the default path.)
+  The write path is now byte-exact end to end: `FileService.readBytes`/`writeBytes`, a `binary` flag
+  on each shadow entry, and `Buffer` support through `commitContents`. A binary shadow is **never**
+  three-way merged — there is no such thing as a merged PNG — so a peer changing the same bytes is
+  reported as a conflict and, as everywhere else, a conflicted entry stays flagged.
+  `add_asset` takes either `sourcePath` (an absolute path on the machine running the server, `~`
+  expanded) or `contentBase64` (for clients with no filesystem access, capped lower since those bytes
+  cross the model's context). Both the destination AND the resolved (realpath'd) source must be an
+  asset type: that two-sided allowlist is the security gate on the one read that leaves every project
+  sandbox — the destination side alone does not constrain what `sourcePath` may name, so it is checked
+  too, on the path a symlink actually resolves to rather than the name it was given, before any file is
+  opened. The result reports the resolved source path and a sha256 of what landed; it deliberately
+  carries no diff (an added binary tool needing to echo the copied bytes back would be its own way to
+  leak a file that slipped the allowlist). Every filesystem outcome on the source collapses to
+  found / not-found / unresolvable with no errno text: a raw `ENOTDIR` on `/etc/passwd/x.png` used to
+  say that `/etc/passwd` exists and is a file.
+
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
   swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,
@@ -168,6 +295,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
+  `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`
+  classification and `read_file`'s binary-file refusal, a `.tif` or `.ico` that previously read as
+  text through `read_file` now returns a path note instead, the same as every other asset type.
+
 - **A regression test that passes before its fix is now a finding, not a footnote.** The `implementer`
   agent already had to watch each new test fail on the pre-fix code and report the result, and it did —
   during the review of #52 it said plainly that two of three new tests passed pre-fix, because the `- `
@@ -207,6 +339,38 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   outside the guard (a win32 `EPERM` with the lock file _present_, which is contention and must not
   retry) and fails if they are split apart again. No behaviour change: `withFileLock`'s signature and
   call site are unchanged, `isLockContentionError` is untouched, and `existsSync` stays uninjected.
+
+### Fixed
+
+- **A missing parent directory now names the flag that creates it.** Writing
+  `sections/new/intro.tex` without `createDirs: true` failed with a raw
+  `ENOENT: no such file or directory, open '/abs/...'` that mentioned neither the missing directory
+  nor the flag, which read as "the server cannot create folders". It now names the parent and points
+  at `createDirs`. A different `ENOENT` still propagates unchanged. (`createDirs` keeps its `false`
+  default on `write_file`; `add_asset`, having no existing callers to surprise, defaults it to true.)
+- **A non-UTF-8 `.tex` is no longer reported as edited-outside-the-server forever.** Comparing raw
+  bytes (above) fixed binaries but broke the other direction: `read`/`readText` record a baseline from
+  the _lossily decoded_ string, so a latin-1 `.tex` — common enough in LaTeX — could never match its
+  own baseline again. A path now counts as externally modified only when it fails to match **both** as
+  bytes and as the decoded string, which is right for binary and latin-1 alike.
+- **Deleting or replacing a figure you just imported no longer claims someone edited it.** The
+  byte-vs-string baseline mismatch above also reached the three _refusal_ sites: `write_file`,
+  `edit_file` and `delete_file` compared a `Buffer` baseline against a UTF-8 rehash of the server's
+  own write, so `add_asset figures/plot.png` followed by `delete_file figures/plot.png` was refused
+  with "changed on disk … it was likely edited directly" — advice the caller could not act on, since
+  `read_file` will not return a binary. All four refusal sites and `status` now share one comparison,
+  so the two halves of the guard cannot disagree again.
+
+- **A text edit to an `.svg`/`.eps` an `add_asset` had touched could silently become an unfixable
+  conflict.** A shadow entry is sticky-binary once bytes land in it, and `write_file`/`edit_file` hand
+  the shadow store a UTF-8-decoded `before`, which can never equal the true bytes — so the entry was
+  flagged conflicted and, correctly, never unflagged, leaving the file uncommittable for the session.
+  The comparison now also accepts a string `before` that the shadow decodes to; a genuine
+  Buffer-vs-Buffer mismatch still conflicts, because that one is real.
+
+- **Binary files no longer show up as permanently edited-outside-the-server.**
+  `FileService.externalModifications` read every file as UTF-8, so a figure's bytes never matched
+  their own recorded baseline and `status` reported it under `externalChanges` forever.
 
 ## [0.6.0] - 2026-08-21
 

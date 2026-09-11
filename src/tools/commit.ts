@@ -2,7 +2,9 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { toPosix } from '../lib/paths.js';
+import { toPosix, resolveInside } from '../lib/paths.js';
+import { uncoveredPaths, peerOwnership } from '../lib/commitPaths.js';
+import { collectPeerShadows } from '../lib/peerAttribution.js';
 import type { ShadowChange } from '../services/shadowStore.js';
 
 const inputSchema = {
@@ -11,15 +13,20 @@ const inputSchema = {
   paths: z
     .array(z.string())
     .optional()
-    .describe('Limit the commit to these paths. Defaults to every change in scope.'),
+    .describe(
+      'Limit the commit to these paths. Defaults to every change in scope; required for scope "paths".',
+    ),
   scope: z
-    .enum(['session', 'all'])
+    .enum(['session', 'all', 'paths'])
     .optional()
     .describe(
       'Which changes to commit. "session" (the default when this session has tracked changes) ' +
         "commits only what this session edited, leaving other sessions' in-flight work " +
         'uncommitted in the working tree. "all" commits every change in the clone, including ' +
-        "other sessions' and any made outside this server.",
+        'other sessions\' and any made outside this server. "paths" commits exactly the files ' +
+        'named in `paths` and nothing else — it refuses an empty list, and refuses a path a live ' +
+        "session owns. Use it for work made outside this server (a script, the client's own " +
+        'file tools) when a peer has in-flight work in the clone.',
     ),
   allowEmpty: z.boolean().optional().describe('Allow a commit with no changes.'),
 };
@@ -29,13 +36,14 @@ const outputSchema = {
   sha: z.string(),
   filesChanged: z.number(),
   files: z.array(z.object({ path: z.string(), added: z.number(), removed: z.number() })),
-  scope: z.enum(['session', 'all']).describe('The scope actually applied.'),
+  scope: z.enum(['session', 'all', 'paths']).describe('The scope actually applied.'),
   session: z.string().describe('Id of the session the commit was attributed to.'),
   leftUncommitted: z
     .array(z.string())
     .describe(
       'Files changed in the working tree but not committed, because they belong to another ' +
-        'session or were edited outside this server. Only meaningful for scope "session".',
+        'session or were edited outside this server. Meaningful for scope "session" and ' +
+        '"paths"; always empty for scope "all".',
     ),
   conflicted: z
     .array(z.string())
@@ -54,7 +62,8 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
         'Stage and commit changes locally. Does NOT push — use the push tool, after reviewing ' +
         "with status/diff, to send commits to Overleaf. By default commits only this session's " +
         'own edits, so parallel sessions working on different parts of the paper do not commit ' +
-        'each other\'s half-finished work; pass scope "all" to commit everything in the clone.',
+        'each other\'s half-finished work; pass scope "all" to commit everything in the clone, ' +
+        'or scope "paths" to commit exactly a named set of files (refusing any a live peer owns).',
       inputSchema,
       outputSchema,
     },
@@ -72,7 +81,9 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           const res =
             effective === 'session'
               ? await commitSession(ctx, id, dir, { message, paths, allowEmpty })
-              : await commitEverything(ctx, dir, { message, paths, allowEmpty });
+              : effective === 'paths'
+                ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
+                : await commitEverything(ctx, dir, { message, paths, allowEmpty });
 
           // The commit moved HEAD: settle what just landed and re-anchor what did not.
           await ctx.shadows.refresh(id, dir);
@@ -83,7 +94,11 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           const headline =
             `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
             `not yet pushed${
-              effective === 'session' ? ` (session "${ctx.shadows.sessionId}")` : ' (whole clone)'
+              effective === 'session'
+                ? ` (session "${ctx.shadows.sessionId}")`
+                : effective === 'paths'
+                  ? ' (named paths)'
+                  : ' (whole clone)'
             }`;
           const text = [
             headline,
@@ -189,4 +204,100 @@ async function commitEverything(
 ): Promise<CommitOutcome> {
   const res = await ctx.git.commit(dir, opts);
   return { ...res, leftUncommitted: [], conflicted: [] };
+}
+
+/**
+ * Commit exactly the named paths, and nothing else — for work made outside this server (a script,
+ * the client's own file tools) when a peer has in-flight edits in the clone. Unlike "session" and
+ * "all", this scope never reads the shadow store to decide what to commit; it stages named paths
+ * from the working tree directly, via `git add` (from an index reset to HEAD first, so nothing a
+ * hand `git add` or an interrupted `commitContents` call left staged rides along — see
+ * `GitService.commit`'s `fromHead` option). What it does borrow from shadows is the ownership
+ * check below: a live peer's shadow index says which files are *its* in-flight edits, and this
+ * scope refuses to sweep those up, failing closed when a peer's index cannot be read.
+ *
+ * The coverage/ownership policy itself is pure and lives in `src/lib/commitPaths.ts` so it is
+ * unit-testable without a git clone; this function stays thin plumbing around it.
+ */
+async function commitPaths(
+  ctx: AppContext,
+  id: string,
+  dir: string,
+  opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+): Promise<CommitOutcome> {
+  if (!opts.paths || opts.paths.length === 0) {
+    throw new Error(
+      'scope "paths" needs a non-empty paths list — name exactly the files to commit. Use scope ' +
+        '"all" to commit everything in the clone.',
+    );
+  }
+
+  const normalized = [...new Set(opts.paths.map(toPosix))];
+  for (const p of normalized) {
+    if (p.startsWith('-')) throw new Error(`Invalid path: "${p}"`);
+    // No symlink-escape check here (unlike FileService reads/writes): this scope never reads or
+    // writes file content through FileService, only stages a pathspec with `git add`. Git stages a
+    // symlink as a link entry (mode 120000) and refuses a pathspec that names a path beyond a
+    // symlink ("is beyond a symbolic link"), so no bytes outside the clone are reachable this way —
+    // exactly as scope "all" (plain `git add`) behaves today.
+    resolveInside(dir, p); // throws before git ever sees a path that escapes the clone
+  }
+
+  const status = await ctx.git.status(dir);
+  // `status.staged` rescues one case `unstaged`/`untracked` cannot: a path that is dirty only in
+  // the index — worktree == index != HEAD, i.e. `git add`ed and not touched since — is still
+  // committable, because `fromHead: true` resets the index to HEAD and then re-`add`s from the
+  // working tree, which is exactly that path's content. A path staged and then reverted in the
+  // working tree (worktree == HEAD again) is *not* committable: the same reset-then-add finds
+  // nothing changed to stage, and git reports "Nothing to commit" when it was the only path
+  // requested; alongside a genuinely dirty path the commit succeeds without it, and it is absent
+  // from `leftUncommitted` too (neither unstaged nor untracked once reset). `status.staged`
+  // including it here does not change either outcome, it only avoids refusing it earlier with a
+  // misleading "not changed in the working tree".
+  const dirty = [
+    ...new Set([...status.unstaged, ...status.untracked, ...status.staged].map(toPosix)),
+  ];
+  const uncovered = uncoveredPaths(normalized, dirty);
+  if (uncovered.length > 0) {
+    throw new Error(
+      `Nothing to commit at: ${uncovered.join(', ')} — not changed in the working tree. Paths ` +
+        'are matched literally: no globs, exact case, and no ".." segments.',
+    );
+  }
+
+  // Fail closed: a live peer's shadow says which of the dirty files are its in-flight edits.
+  // An unreadable index is treated as owning everything requested, never as owning nothing.
+  const peers = await ctx.sessions.livePeers(id);
+  const entriesBySession = await collectPeerShadows(ctx.shadows, id, peers);
+  const { owned, unreadable } = peerOwnership(normalized, peers, entriesBySession);
+  if (unreadable.length > 0) {
+    throw new Error(
+      `Cannot tell what live session "${unreadable[0]}" owns (its change index is ` +
+        'unreadable), so scope "paths" refuses. Wait for it, or take the working tree ' +
+        'deliberately with scope "all".',
+    );
+  }
+  if (owned.length > 0) {
+    const named = owned.map((o) => `${o.path} ("${o.sessionId}")`).join(', ');
+    throw new Error(
+      `Owned by a live session: ${named}. Committing named paths would take that session's ` +
+        'in-flight lines. Wait for it to commit, or take ownership deliberately with scope "all".',
+    );
+  }
+
+  const res = await ctx.git.commit(dir, {
+    message: opts.message,
+    paths: normalized,
+    allowEmpty: opts.allowEmpty,
+    fromHead: true,
+  });
+
+  const statusAfter = await ctx.git.status(dir);
+  const leftUncommitted = [
+    ...new Set([...statusAfter.unstaged, ...statusAfter.untracked].map(toPosix)),
+  ]
+    .sort()
+    .filter(Boolean);
+
+  return { ...res, leftUncommitted, conflicted: [] };
 }

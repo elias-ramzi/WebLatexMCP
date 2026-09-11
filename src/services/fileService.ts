@@ -12,6 +12,7 @@ import {
 import { resolveInside, toPosix } from '../lib/paths.js';
 import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
+import { ASSET_EXT } from '../lib/assets.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
 export class ExternalChangeError extends Error {
@@ -54,19 +55,6 @@ export interface EditOp {
   replaceAll?: boolean;
 }
 
-const ASSET_EXT = new Set([
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.pdf',
-  '.eps',
-  '.gif',
-  '.svg',
-  '.tiff',
-  '.bmp',
-  '.webp',
-]);
-
 /**
  * Prose formats. Their own type because a document is not always LaTeX: a proposal drafted in
  * markdown still has a reference list to verify and citations to cross-check, and it has to be
@@ -80,13 +68,17 @@ const MAX_READ_BYTES = 2 * 1024 * 1024;
  * Notified of every mutation this server makes, with the working-tree content either side of it
  * (null meaning the file was absent). Lets the session's shadow of its own uncommitted work be
  * kept up to date without FileService knowing anything about sessions or git.
+ *
+ * `before`/`after` are `string | Buffer` because a binary file's shadow needs the raw bytes: a
+ * UTF-8 round trip through a string would corrupt it (the same corruption `writeBytes` exists to
+ * avoid on the write side).
  */
 export interface MutationRecorder {
   record(
     projectDir: string,
     relPath: string,
-    before: string | null,
-    after: string | null,
+    before: string | Buffer | null,
+    after: string | Buffer | null,
   ): Promise<void>;
 }
 
@@ -176,6 +168,37 @@ async function resolveThroughLinks(abs: string): Promise<string> {
   return path.join(await resolveThroughLinks(parent), path.basename(abs));
 }
 
+/**
+ * Turn a raw `ENOENT` from `writeFile` into an actionable error when it's caused by a missing
+ * parent directory and the caller didn't pass `createDirs`. A bare `ENOENT: no such file or
+ * directory, open '/abs/path/...'` names neither the missing directory nor the flag that fixes
+ * it. Only fires when the parent really is missing and `createDirs` was not requested — a
+ * different ENOENT (or one under `createDirs: true`, which means something else went wrong) must
+ * propagate unchanged.
+ */
+async function translateMissingParentError(
+  err: unknown,
+  abs: string,
+  projectDir: string,
+  relPath: string,
+  createDirs: boolean | undefined,
+): Promise<never> {
+  if ((err as NodeJS.ErrnoException).code === 'ENOENT' && !createDirs) {
+    const parent = path.dirname(abs);
+    const parentMissing = await stat(parent)
+      .then(() => false)
+      .catch(() => true);
+    if (parentMissing) {
+      const relParent = toPosix(path.relative(projectDir, parent));
+      throw new Error(
+        `cannot write "${relPath}": the parent directory "${relParent}" does not exist. ` +
+          'Pass createDirs: true to create it.',
+      );
+    }
+  }
+  throw err;
+}
+
 /** Sandboxed file access within a project's clone directory. */
 export class FileService {
   /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
@@ -215,6 +238,44 @@ export class FileService {
    */
   setLinkPolicy(followsUserLinks: (projectDir: string) => boolean): void {
     this.followsUserLinks = followsUserLinks;
+  }
+
+  /**
+   * Whether `abs` no longer matches the baseline recorded for it — checked both as raw bytes and
+   * as the UTF-8-decoded string, because the two representations record different baselines:
+   * `writeBytes`/`readBytes` record a `Buffer` (a PNG is never valid UTF-8 both ways), while
+   * `read`/`readText`/`write`/`applyEdits` record the lossily-decoded string. A file is only
+   * stale when BOTH comparisons agree — otherwise a binary the server itself just wrote (compared
+   * against a decoded-string rehash of its own bytes) or a latin-1 `.tex` it merely read would be
+   * reported as edited by a human who never touched it. This is the single place every refusal
+   * site (`write`, `writeBytes`, `applyEdits`, `delete`) goes through, so the two representations
+   * can never again disagree about whether a file is stale.
+   *
+   * What this AND still gives up: an out-of-band edit is missed only when a Buffer baseline
+   * holds a literal U+FFFD (EF BF BD) and the edit swaps those bytes for an invalid UTF-8
+   * sequence, or a string baseline's file has bytes changed only within already-invalid UTF-8
+   * sequences — both decode identically either way. Accepted as contrived; the second case was
+   * already the behaviour back when only strings were compared.
+   */
+  private isChangedOnDisk(abs: string, bytes: Buffer): boolean {
+    return (
+      this.revisions.isStale(abs, bytes) && this.revisions.isStale(abs, bytes.toString('utf8'))
+    );
+  }
+
+  /**
+   * Whether `abs` counts as externally modified — checked both ways, like {@link isChangedOnDisk},
+   * but via `isExternal` rather than `isStale`: `isExternal` treats "no baseline at all" as
+   * changed, `isStale` does not. Keep that distinction — this is deliberately a separate method,
+   * not a flag on `isChangedOnDisk`, so the "no baseline" case is never silently blended into the
+   * refusal-site semantics (a file the server has never seen must never throw `ExternalChangeError`
+   * on its own).
+   */
+  private isExternallyModified(abs: string, bytes: Buffer): boolean {
+    return (
+      this.revisions.isExternal(abs, bytes) &&
+      this.revisions.isExternal(abs, bytes.toString('utf8'))
+    );
   }
 
   /**
@@ -372,28 +433,98 @@ export class FileService {
   ): Promise<WriteResult> {
     const abs = resolveInside(projectDir, opts.path);
     await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
-    let current: string | undefined;
+    let currentBytes: Buffer | undefined;
     try {
-      current = await readFile(abs, 'utf8');
+      currentBytes = await readFile(abs);
+    } catch {
+      currentBytes = undefined; // file does not exist yet
+    }
+    if (
+      !opts.overrideExternalChanges &&
+      currentBytes !== undefined &&
+      this.isChangedOnDisk(abs, currentBytes)
+    ) {
+      throw new ExternalChangeError(opts.path);
+    }
+    const current = currentBytes?.toString('utf8');
+    if (opts.createDirs) {
+      await mkdir(path.dirname(abs), { recursive: true });
+    }
+    try {
+      await writeFile(abs, opts.content, 'utf8');
+    } catch (err) {
+      await translateMissingParentError(err, abs, projectDir, opts.path, opts.createDirs);
+    }
+    this.revisions.record(abs, opts.content);
+    await this.notify(projectDir, opts.path, current ?? null, opts.content);
+    return {
+      path: opts.path,
+      bytesWritten: Buffer.byteLength(opts.content, 'utf8'),
+      created: current === undefined,
+    };
+  }
+
+  /**
+   * Read a file's raw bytes, returning null when it does not exist. The binary counterpart of
+   * {@link readText}. `recordBaseline` carries the same meaning — and the same false default —
+   * as elsewhere: it is a claim that the caller could now base a write on this file.
+   */
+  async readBytes(
+    projectDir: string,
+    opts: { path: string; recordBaseline?: boolean; strictLinks?: boolean },
+  ): Promise<Buffer | null> {
+    const abs = resolveInside(projectDir, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
+    let buf: Buffer;
+    try {
+      buf = await readFile(abs);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
+    }
+    if (opts.recordBaseline) this.revisions.record(abs, buf);
+    return buf;
+  }
+
+  /** Create or overwrite a file with raw bytes. The binary counterpart of {@link write}. */
+  async writeBytes(
+    projectDir: string,
+    opts: {
+      path: string;
+      bytes: Buffer;
+      createDirs?: boolean;
+      overrideExternalChanges?: boolean;
+      strictLinks?: boolean;
+    },
+  ): Promise<WriteResult> {
+    const abs = resolveInside(projectDir, opts.path);
+    await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
+    let current: Buffer | undefined;
+    try {
+      current = await readFile(abs);
     } catch {
       current = undefined; // file does not exist yet
     }
     if (
       !opts.overrideExternalChanges &&
       current !== undefined &&
-      this.revisions.isStale(abs, current)
+      this.isChangedOnDisk(abs, current)
     ) {
       throw new ExternalChangeError(opts.path);
     }
     if (opts.createDirs) {
       await mkdir(path.dirname(abs), { recursive: true });
     }
-    await writeFile(abs, opts.content, 'utf8');
-    this.revisions.record(abs, opts.content);
-    await this.notify(projectDir, opts.path, current ?? null, opts.content);
+    try {
+      await writeFile(abs, opts.bytes);
+    } catch (err) {
+      await translateMissingParentError(err, abs, projectDir, opts.path, opts.createDirs);
+    }
+    this.revisions.record(abs, opts.bytes);
+    await this.notify(projectDir, opts.path, current ?? null, opts.bytes);
     return {
       path: opts.path,
-      bytesWritten: Buffer.byteLength(opts.content, 'utf8'),
+      bytesWritten: opts.bytes.length,
       created: current === undefined,
     };
   }
@@ -414,8 +545,9 @@ export class FileService {
     }
     const abs = resolveInside(projectDir, relPath);
     await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
-    const original = await readFile(abs, 'utf8');
-    if (!opts.overrideExternalChanges && this.revisions.isStale(abs, original)) {
+    const originalBytes = await readFile(abs);
+    const original = originalBytes.toString('utf8');
+    if (!opts.overrideExternalChanges && this.isChangedOnDisk(abs, originalBytes)) {
       throw new ExternalChangeError(relPath);
     }
     let content = original;
@@ -454,12 +586,13 @@ export class FileService {
     if (!info.isFile()) {
       throw new Error(`Not a file: "${relPath}"`);
     }
-    const current = await readFile(abs, 'utf8').catch(() => null);
+    const currentBytes = await readFile(abs).catch(() => null);
     if (!opts.overrideExternalChanges && this.revisions.hasBaseline(abs)) {
-      if (current !== null && this.revisions.isStale(abs, current)) {
+      if (currentBytes !== null && this.isChangedOnDisk(abs, currentBytes)) {
         throw new ExternalChangeError(relPath);
       }
     }
+    const current = currentBytes?.toString('utf8') ?? null;
     await rm(abs);
     this.revisions.forget(abs);
     await this.notify(projectDir, relPath, current, null);
@@ -483,14 +616,19 @@ export class FileService {
     const out: string[] = [];
     for (const rel of relPaths) {
       const abs = resolveInside(projectDir, rel);
-      let content: string;
+      let content: Buffer;
       try {
         await this.guardLinks(projectDir, abs, rel);
-        content = await readFile(abs, 'utf8');
+        // Byte-exact: a text read of a binary file (e.g. a PNG) turns invalid UTF-8 sequences
+        // into U+FFFD, so its hash would never match the Buffer baseline recorded by writeBytes —
+        // every binary file would be reported as externally modified, forever.
+        content = await readFile(abs);
       } catch {
         continue;
       }
-      if (this.revisions.isExternal(abs, content)) out.push(rel);
+      // See isExternallyModified: reported only when neither the byte comparison nor the
+      // UTF-8-decoded-string comparison matches the recorded baseline.
+      if (this.isExternallyModified(abs, content)) out.push(rel);
     }
     return out;
   }
@@ -503,8 +641,8 @@ export class FileService {
   private async notify(
     projectDir: string,
     relPath: string,
-    before: string | null,
-    after: string | null,
+    before: string | Buffer | null,
+    after: string | Buffer | null,
   ): Promise<void> {
     if (!this.recorder) return;
     try {

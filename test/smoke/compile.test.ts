@@ -150,6 +150,51 @@ describe.skipIf(!available)('latexmk compile smoke', () => {
     }
   }, 60_000);
 
+  it('reports rebuilt: false and the same pdfMtime when nothing changed, true again after clean', async () => {
+    // Own fresh directory: `dir` above is shared across this whole describe block and earlier
+    // tests already warmed its build dir, so a compile against it would not be a genuine "first".
+    const own = await mkdtemp(path.join(os.tmpdir(), 'ovl-compile-rebuilt-'));
+    try {
+      await cp(FIXTURE, own, { recursive: true });
+
+      const first = await compiler.compile({ projectDir: own, rootFile: 'main.tex' });
+      expect(first.success).toBe(true);
+      expect(first.rebuilt).toBe(true);
+      expect(first.pdfMtime).toBeDefined();
+
+      // Nothing changed since the first compile: latexmk finds nothing to do. `rebuilt` is
+      // derived from a before/after stat of the build-dir PDF taken around this exec (never from
+      // the wall clock), so back-to-back calls need no delay between them to tell apart.
+      const second = await compiler.compile({ projectDir: own, rootFile: 'main.tex' });
+      expect(second.success).toBe(true);
+      expect(second.rebuilt).toBe(false);
+      expect(second.pdfMtime).toBe(first.pdfMtime);
+
+      const cleaned = await compiler.compile({
+        projectDir: own,
+        rootFile: 'main.tex',
+        clean: true,
+      });
+      expect(cleaned.success).toBe(true);
+      expect(cleaned.rebuilt).toBe(true);
+    } finally {
+      await rm(own, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('reports rebuilt: true for the first compile of a project in a fresh directory', async () => {
+    const fresh = await mkdtemp(path.join(os.tmpdir(), 'ovl-compile-fresh-'));
+    try {
+      await cp(FIXTURE, fresh, { recursive: true });
+      const outcome = await compiler.compile({ projectDir: fresh, rootFile: 'main.tex' });
+      expect(outcome.success).toBe(true);
+      expect(outcome.rebuilt).toBe(true);
+      expect(outcome.pdfMtime).toBeDefined();
+    } finally {
+      await rm(fresh, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('names the package a real TeX installation is missing', async () => {
     const outcome = await compiler.compile({
       projectDir: dir,

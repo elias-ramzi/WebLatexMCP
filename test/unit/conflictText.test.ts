@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { renderConflictText, renderRebasedOver } from '../../src/lib/conflictText.js';
-import type { ConflictReport } from '../../src/services/gitService.js';
+import {
+  renderConflictText,
+  renderRebasedOver,
+  renderCommitLines,
+} from '../../src/lib/conflictText.js';
+import type { ConflictReport, RemoteCommit } from '../../src/services/gitService.js';
 
 const REMOTE_HEAD = 'e782dae2c0ffee1234567890abcdef0011223344';
 const MERGE_BASE = 'ba5eba5e1122334455667788990011223344aabb';
@@ -20,7 +24,13 @@ function report(overrides: Partial<ConflictReport> = {}): ConflictReport {
     rebasedOnto: 'origin/master',
     remoteHead: REMOTE_HEAD,
     mergeBase: MERGE_BASE,
-    remoteCommits: [{ hash: 'abc1234def', message: 'reword scaling section' }],
+    remoteCommits: [
+      {
+        hash: 'abc1234def',
+        message: 'reword scaling section',
+        files: [{ path: 'sections/04.tex', added: 3, removed: 1 }],
+      },
+    ],
     guidance: 'resolve the overlap',
     ...overrides,
   };
@@ -38,6 +48,8 @@ describe('renderConflictText', () => {
     expect(text).toContain(MERGE_BASE); // merge-base sha, so base is fetchable by ref
     expect(text).toContain('expectedRemoteHead');
     expect(text).toContain('reword scaling section');
+    // Landed-upstream commit lists the file it touched, with line counts.
+    expect(text).toContain('+3/-1 sections/04.tex');
     // All three full sides.
     expect(text).toContain('alpha\nbeta\ngamma\n'); // base
     expect(text).toContain('beta-local'); // ours
@@ -72,10 +84,57 @@ describe('renderConflictText', () => {
 
 describe('renderRebasedOver', () => {
   it('summarizes the commits landed underneath a successful push', () => {
-    expect(renderRebasedOver([{ hash: 'deadbeef00', message: 'their edit' }])).toContain(
-      'Rebased over 1 commit(s)',
-    );
+    const text = renderRebasedOver([
+      {
+        hash: 'deadbeef00',
+        message: 'their edit',
+        files: [{ path: 'main.tex', added: 2, removed: 0 }],
+      },
+    ]);
+    expect(text).toContain('Rebased over 1 commit(s)');
+    // The file the commit touched is listed too, not just the hash/subject.
+    expect(text).toContain('+2/-0 main.tex');
     expect(renderRebasedOver([])).toBe('');
     expect(renderRebasedOver(undefined)).toBe('');
+  });
+});
+
+describe('renderCommitLines', () => {
+  function commit(hash: string, message: string, files: RemoteCommit['files'] = []): RemoteCommit {
+    return { hash, message, files };
+  }
+
+  it('prints a file line per file, with added/removed counts', () => {
+    const lines = renderCommitLines([
+      commit('aaaaaaaa1111', 'edit two files', [
+        { path: 'main.tex', added: 3, removed: 1 },
+        { path: 'sections/new.tex', added: 10, removed: 0 },
+      ]),
+    ]);
+    expect(lines[0]).toBe('  aaaaaaaa edit two files');
+    expect(lines).toContain('      +3/-1 main.tex');
+    expect(lines).toContain('      +10/-0 sections/new.tex');
+  });
+
+  it('caps files per commit and adds a "more file(s)" line', () => {
+    const files = Array.from({ length: 8 }, (_, i) => ({
+      path: `f${i}.tex`,
+      added: 1,
+      removed: 0,
+    }));
+    const lines = renderCommitLines([commit('bbbbbbbb2222', 'many files', files)], {
+      maxFiles: 5,
+    });
+    const fileLines = lines.filter((l) => l.startsWith('      +'));
+    expect(fileLines).toHaveLength(5);
+    expect(lines).toContain('      … 3 more file(s)');
+  });
+
+  it('caps commits and adds a "more commit(s)" line', () => {
+    const commits = Array.from({ length: 25 }, (_, i) => commit(`cccc${i}`, `commit ${i}`));
+    const lines = renderCommitLines(commits, { maxCommits: 20 });
+    const commitLines = lines.filter((l) => /^ {2}c{4}\d+ /.test(l));
+    expect(commitLines).toHaveLength(20);
+    expect(lines[lines.length - 1]).toBe('  … 5 more commit(s) (see structuredContent)');
   });
 });

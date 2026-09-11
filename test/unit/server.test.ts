@@ -120,6 +120,13 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 
+  it('registers the add_asset tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('add_asset');
+    await client.close();
+  });
+
   it('registers the reset_to_remote recovery tool', async () => {
     const client = await connect();
     const { tools } = await client.listTools();

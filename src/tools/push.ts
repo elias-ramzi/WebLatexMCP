@@ -5,8 +5,13 @@ import type { AppContext } from '../context.js';
 import type { SafePushResult } from '../services/gitService.js';
 import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
-import { renderConflictText, renderRebasedOver } from '../lib/conflictText.js';
+import {
+  renderConflictText,
+  renderLandedUpstream,
+  renderRebasedOver,
+} from '../lib/conflictText.js';
 import { toPosix } from '../lib/paths.js';
+import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
 
 /**
  * Refuse to push while a live sibling session has uncommitted work in the shared clone.
@@ -15,8 +20,12 @@ import { toPosix } from '../lib/paths.js';
  * sweeping that session's half-finished paragraph into our commit or rewriting the tree
  * underneath it. Neither is ours to do, so we stop and name who to wait for.
  *
- * Changes nobody owns (edited outside this server, or left behind by a session that has since
- * exited) are not blocked: they are the single-session behaviour this server has always had.
+ * The refusal attributes each disputed file to whichever live peer's shadow lists it (see
+ * `attributePeers` in `src/lib/peerAttribution.ts`) and dates each peer's last write. A file no
+ * live peer owns — edited outside this server, or left behind by a session that has since exited
+ * — is named as unowned rather than pinned on anyone, but it still blocks the push as long as any
+ * live peer exists: this guard is not owner-aware about *whether* to refuse, only about how it
+ * explains the refusal.
  */
 async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<void> {
   const peers = await ctx.sessions.livePeers(id);
@@ -30,12 +39,12 @@ async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<
   const theirs = dirty.filter((p) => !mine.has(p));
   if (theirs.length === 0) return;
 
-  throw new Error(
-    `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}. ` +
-      `Session(s) ${peers.map((p) => `"${p.sessionId}"`).join(', ')} are active — pushing has to ` +
-      'rebase, which would sweep up or overwrite their in-flight work. Wait for them to commit, ' +
-      'or take ownership deliberately with commit scope "all" and push again.',
+  const attribution = attributePeers(
+    theirs,
+    peers,
+    await collectPeerShadows(ctx.shadows, id, peers),
   );
+  throw new Error(renderPeerRefusal(theirs, attribution, Date.now()));
 }
 
 const conflictHunkSchema = z.object({
@@ -53,12 +62,22 @@ const conflictFileSchema = z.object({
   hunks: z.array(conflictHunkSchema).describe('Marker view of just the overlapping regions.'),
 });
 
-const remoteCommitSchema = z.object({ hash: z.string(), message: z.string() });
-
 const diffFileSchema = z.object({
   path: z.string(),
   added: z.number(),
   removed: z.number(),
+});
+
+const remoteCommitSchema = z.object({
+  hash: z.string(),
+  message: z.string(),
+  files: z
+    .array(diffFileSchema)
+    .describe(
+      'Files the commit touched, with added/removed line counts — enough to see what a remote ' +
+        '"Update on Overleaf." commit changed without a shell. For the content, use `diff` with ' +
+        'ref: "<hash>~1..<hash>".',
+    ),
 });
 
 const inputSchema = {
@@ -102,10 +121,14 @@ const inputSchema = {
     ),
   expectedRemoteHead: z
     .string()
+    .min(1)
     .optional()
     .describe(
       'With `resolutions`: the `remoteHead` from the conflict you merged against. If the remote ' +
-        'has advanced past it, the push is refused instead of merging over what just landed.',
+        'has advanced past it, the push is refused instead of merging over what just landed. ' +
+        'Setting this also disables the automatic lost-race retry: a second remote move during ' +
+        'this push is reported as "remote-moved" (nothing pushed) after one attempt, rather than ' +
+        'retried up to 3 times.',
     ),
   confirm: z
     .literal(true)
@@ -113,7 +136,7 @@ const inputSchema = {
 };
 
 const outputSchema = {
-  status: z.enum(['pushed', 'conflict', 'nothing-to-push', 'awaiting-approval']),
+  status: z.enum(['pushed', 'conflict', 'nothing-to-push', 'awaiting-approval', 'remote-moved']),
   pushed: z.boolean(),
   remote: z.string(),
   branch: z.string(),
@@ -151,6 +174,7 @@ function safePushToolResult(
   if (res.pushedCommits !== undefined) structured.pushedCommits = res.pushedCommits;
   if (res.pushedSha) structured.pushedSha = res.pushedSha;
   if (res.rebasedOver) structured.rebasedOver = res.rebasedOver;
+  if (res.remoteHead && !res.conflict) structured.remoteHead = res.remoteHead;
   if (res.conflict) {
     structured.conflictFiles = res.conflict.files;
     structured.conflictPaths = res.conflict.conflictPaths;
@@ -163,7 +187,9 @@ function safePushToolResult(
   // client may drop): per-file sides, the remote head to echo back, and what landed upstream.
   const text = res.conflict
     ? renderConflictText(res.summary, res.conflict)
-    : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
+    : res.status === 'remote-moved'
+      ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
+      : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
   return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
@@ -184,8 +210,18 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         'is validated and missing/extra files are named), optionally passing expectedRemoteHead ' +
         '(the reported remoteHead) so the push is refused if the remote moved again. `.bib` files ' +
         'need confirmBibEdit. Read any side directly with read_file(path, ref) using remoteHead/' +
-        'mergeBase. Branch mode commits to a local review branch and lands it only on approve=true. ' +
-        'Requires confirm=true. See docs/CONCURRENCY.md.',
+        'mergeBase. Each reported commit (rebasedOver, remoteCommits) lists the files it touched ' +
+        'with added/removed line counts; for the content, diff with ref: "<hash>~1..<hash>". ' +
+        'If the remote moves during the push, the pull-rebase is retried up to 3 times; ' +
+        'if it still loses the race the result is status "remote-moved" (nothing pushed, clone ' +
+        'intact) — re-run push. That retry does not apply when expectedRemoteHead was given: it is ' +
+        'one attempt only, refused as "remote-moved" on a second lost race. Branch mode commits to ' +
+        'a local review branch and lands it only on ' +
+        'approve=true. Once past the live-peer guard, untracked files never block a push; uncommitted ' +
+        'modifications to files git already ' +
+        'tracks do, since git cannot rebase over them — commit first (or discard them); a ' +
+        "`message` here commits the WHOLE working tree, including any peers' in-flight work, so " +
+        'prefer committing your own edits first. Requires confirm=true. See docs/CONCURRENCY.md.',
       inputSchema,
       outputSchema,
     },

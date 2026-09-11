@@ -151,7 +151,38 @@ const outputSchema = {
         'counting need the optional native canvas backend — run doctor). Use render_pages to ' +
         'actually look at those pages.',
     ),
-  durationSec: z.number(),
+  durationSec: z
+    .number()
+    .describe(
+      'Seconds the backend run itself took — the compile only, not any wait for the project ' +
+        'lock beforehand (see lockWaitSec).',
+    ),
+  rebuilt: z
+    .boolean()
+    .describe(
+      'Whether this run wrote a fresh PDF. false means the backend found nothing to do — the ' +
+        "PDF is a previous run's, often a peer session's that just compiled the same clone — " +
+        'not a rebuild from your edits; pass clean: true to force one.',
+    ),
+  pdfMtime: z
+    .string()
+    .optional()
+    .describe(
+      'ISO time the PDF was last written, read from the build output — not from the surfaced copy.',
+    ),
+  lockWaitSec: z
+    .number()
+    .describe(
+      'Seconds this call waited for the project lock before compiling; 0 when uncontended. Not ' +
+        'included in durationSec.',
+    ),
+  lockHeldBy: z
+    .string()
+    .optional()
+    .describe(
+      'The session that held the lock while this call waited — a peer process, or this very ' +
+        'session when a concurrent call in the same process still held it.',
+    ),
   errors: z.array(errorShape),
   warnings: z.array(warningShape),
   missingPackages: z
@@ -241,7 +272,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'run ARBITRARY shell commands, so only enable it for a trusted project. Shell escape is ' +
         'never enabled automatically; when a compile fails for lack of it, the result carries a hint. ' +
         'A failure caused by a package the local TeX installation does not have names it in ' +
-        'missingPackages, so you can act on it without parsing the log.',
+        'missingPackages, so you can act on it without parsing the log. Also reports whether the ' +
+        'backend actually wrote a fresh PDF (`rebuilt` — false means a peer session already ' +
+        'compiled this shared clone and there was nothing to do) and how long this call waited ' +
+        'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended).',
       inputSchema,
       outputSchema,
     },
@@ -262,7 +296,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         // project file, and throwing here costs nothing. Without it a missing backend surfaced as a
         // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
         const backend = await ctx.compiler.select(compiler);
-        return await ctx.projectManager.runExclusive(id, async () => {
+        return await ctx.projectManager.runExclusive(id, async (lock) => {
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
           const outcome = await backend.compiler.compile({
             projectDir: dir,
@@ -333,6 +367,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               pageCount = undefined;
             }
           }
+          const lockWaitSec = Math.round(lock.waitedMs / 100) / 10;
+          const lockHeldBy = lock.waitedOn;
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
@@ -341,6 +377,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             pdfUrl,
             pageCount,
             durationSec: outcome.durationSec,
+            rebuilt: outcome.rebuilt,
+            pdfMtime: outcome.pdfMtime,
+            lockWaitSec,
+            lockHeldBy,
             errors,
             warnings: shownWarnings,
             missingPackages,
@@ -352,11 +392,19 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Name the backend in the text too, not only structuredContent: which engine spoke
           // decides how to read what follows (tectonic attaches no snippets to anything), and the
           // client this rendering exists for is the one that cannot read structuredContent at all.
-          const headline = outcome.timedOut
+          let headline = outcome.timedOut
             ? `compile timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
             : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
               `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
               `${errors.length} error(s), ${warnings.length} warning(s)`;
+          // A fast "success" right after a peer session compiled the same clone is easy to
+          // mistake for a rebuild from this call's own edits — say plainly when it wasn't one.
+          if (outcome.success && !outcome.rebuilt) headline += ' (up to date — not rebuilt)';
+          if (lockWaitSec >= 0.5) {
+            headline +=
+              `; waited ${lockWaitSec.toFixed(1)}s for the lock` +
+              (lockHeldBy ? ` held by "${lockHeldBy}"` : '');
+          }
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
           // Errors sharing a location print the snippet once.

@@ -97,7 +97,7 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   recorder in `context.ts` skips them too (no HEAD of ours to three-way merge against). Compiled PDFs
   are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
   read and edit in place, not litter in place.
-- **Mutating tools** (write/edit/delete/commit/push/discard/clone/add_citation) must run inside
+- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/clone/add_citation) must run inside
   `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
   `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`), because
   sibling agent sessions are separate server processes over the same clone.
@@ -111,7 +111,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   After HEAD moves, `shadows.refresh(id, dir)` carries shadows forward (lazily, per session); tools that
   rewrite the whole tree (`discard`, `reset_to_remote`) call `shadows.clearAll(id)` instead. A same-line
   collision flags the entry `conflicted` and it **stays** flagged — never clear it on a later edit, since
-  its base is stale and committing it would revert what landed. State lives in
+  its base is stale and committing it would revert what landed. Shadows are stored as **bytes**, and an
+  entry that has ever carried non-text bytes (`add_asset`, `writeBytes`) is flagged `binary` — stickily
+  — and is **never three-way merged**: there is no such thing as a merged PNG, so a peer changing the
+  same bytes is a `conflicted` entry, not a merge. `commit scope: "paths"` is the one deliberate
+  widening: it stages named working-tree paths via `git add` (index reset to HEAD first), so it may
+  carry a peer's lines — which is why it refuses any path a **live** peer's shadow index lists, and
+  refuses outright when a live peer's index cannot be read (`null` from `peerEntries` means unreadable,
+  never "owns nothing"). State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`), outside the clones. Keep this: the
   guarantee is that a commit contains one session's lines and nobody else's.
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
@@ -166,6 +173,18 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   schema-level `z.literal(true)`), mirroring `confirmBibEdit`'s shape exactly; `appendWritingConvention`
   itself stays unchanged and keeps writing only to `ctx.config.extraWritingGuidePath`, never a
   caller-named path.
+- **`add_asset` is the one _read_ from outside every project sandbox, and it is gated on both ends.**
+  `sourcePath` names a file on the machine running the server, by design outside every sandbox, so
+  `resolveInside` cannot apply; what makes the read accountable is the asset-extension allowlist
+  (`src/lib/assets.ts`) checked on **both** sides: the destination first (before anything is read), the
+  source's own name before any syscall, and the source again on its **realpath'd** target, so a symlink
+  named `photo.png` pointing at an extensionless secret is judged on where it lands. The first
+  implementation gated only the destination and was an arbitrary-file-read primitive
+  (`sourcePath: "/etc/passwd"` → `figures/innocent.png`, echoed back by the confirmation diff), which is
+  why `add_asset` deliberately returns **no diff** and why every syscall outcome on the source collapses
+  to found / not-found / unresolvable with no errno text. Widen `ASSET_EXT` only for a genuine figure
+  format — it is a security gate, not a convenience — and keep the source-side check: the destination
+  check alone constrains nothing about what is read.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)

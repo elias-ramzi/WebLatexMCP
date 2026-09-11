@@ -1,13 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'node:fs/promises';
 import {
   latexmkArgs,
   mirrorSubdirs,
   isNotFound,
   probeOnPath,
+  collectOutcome,
 } from '../../src/services/compiler.js';
+import type { PdfStat } from '../../src/services/compiler.js';
+import type { ExecResult } from '../../src/lib/exec.js';
 
 const BUILD = '/tmp/build';
 
@@ -118,6 +121,79 @@ describe('isNotFound — which spawn errors mean "the binary is not there"', () 
     expect(isNotFound(undefined)).toBe(false);
     expect(isNotFound(null)).toBe(false);
     expect(isNotFound('ENOENT')).toBe(false);
+  });
+});
+
+describe('collectOutcome (rebuilt / pdfMtime)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-collect-outcome-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function fakeExec(overrides: Partial<ExecResult> = {}): ExecResult {
+    return { code: 0, stdout: '', stderr: '', timedOut: false, ...overrides };
+  }
+
+  async function statPdf(pdfPath: string): Promise<PdfStat> {
+    const info = await stat(pdfPath);
+    return { mtimeMs: info.mtimeMs, size: info.size };
+  }
+
+  it('no PDF existed before the run (before: null): a PDF present after is a rebuild', async () => {
+    const pdfPath = path.join(dir, 'main.pdf');
+    await writeFile(pdfPath, 'fresh output');
+
+    const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', null);
+    expect(outcome.rebuilt).toBe(true);
+    expect(outcome.pdfMtime).toBeDefined();
+  });
+
+  it('the PDF is byte-identical to `before`: not a rebuild', async () => {
+    const pdfPath = path.join(dir, 'main.pdf');
+    await writeFile(pdfPath, 'unchanged output');
+    const before = await statPdf(pdfPath);
+
+    const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', before);
+    expect(outcome.rebuilt).toBe(false);
+    expect(outcome.pdfMtime).toBe(new Date(Math.round(before.mtimeMs)).toISOString());
+  });
+
+  it('the PDF was rewritten with different content (mtime and size both change): rebuilt', async () => {
+    const pdfPath = path.join(dir, 'main.pdf');
+    await writeFile(pdfPath, 'v1');
+    const before = await statPdf(pdfPath);
+    // A short pause guards against filesystem mtime resolution coarser than the write gap.
+    await new Promise((r) => setTimeout(r, 20));
+    await writeFile(pdfPath, 'v2 with different, longer content');
+
+    const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', before);
+    expect(outcome.rebuilt).toBe(true);
+  });
+
+  it('only the mtime changed, same size: still rebuilt', async () => {
+    const pdfPath = path.join(dir, 'main.pdf');
+    await writeFile(pdfPath, 'same size');
+    const before = await statPdf(pdfPath);
+    const differentMtime = new Date(before.mtimeMs + 5_000);
+    await utimes(pdfPath, differentMtime, differentMtime);
+
+    const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', before);
+    expect(outcome.rebuilt).toBe(true);
+    expect(outcome.pdfMtime).toBe(differentMtime.toISOString());
+  });
+
+  it('no PDF in the build dir at all: not rebuilt, not successful, no path or mtime', async () => {
+    // Nothing named main.pdf is ever written to `dir` in this case.
+    const outcome = await collectOutcome(dir, 'main.tex', fakeExec(), 0.1, '', null);
+    expect(outcome.rebuilt).toBe(false);
+    expect(outcome.pdfMtime).toBeUndefined();
+    expect(outcome.success).toBe(false);
+    expect(outcome.pdfPath).toBeUndefined();
   });
 });
 

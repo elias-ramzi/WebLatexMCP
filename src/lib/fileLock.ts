@@ -32,6 +32,18 @@ interface LockFileContents {
   acquiredAt: string;
 }
 
+/**
+ * How long a caller waited for the lock, and (when it had to wait) who it was waiting on. Passed
+ * to `withFileLock`'s `fn` so a caller can report a suspiciously fast result as "actually waited
+ * on a peer" rather than silently looking instant. `waitedOn` is the `owner` recorded in the lock
+ * file that was waited on — or, when a holder wrote no owner, its pid as a string — and is absent
+ * whenever there was no wait at all.
+ */
+export interface LockAcquisition {
+  waitedMs: number;
+  waitedOn?: string;
+}
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_MS = 60_000;
 const HEARTBEAT_MS = 5_000;
@@ -211,26 +223,43 @@ async function olderThan(lockPath: string, ms: number): Promise<boolean> {
 }
 
 /**
- * Run `fn` while holding an exclusive lock at `lockPath`, releasing it however `fn` ends.
+ * Run `fn` while holding an exclusive lock at `lockPath`, releasing it however `fn` ends. `fn`
+ * receives how long this call waited to acquire the lock, and who it waited on — purely
+ * informational, reported by callers such as `compile`; it changes nothing about *when* the lock
+ * is acquired (same poll interval, same stale reclaim, same timeout).
+ *
  * Concurrent callers in this process are expected to be serialised by a mutex first; this is the
  * guard against *other* processes.
  */
 export async function withFileLock<T>(
   lockPath: string,
-  fn: () => Promise<T>,
+  fn: (lock: LockAcquisition) => Promise<T>,
   opts: FileLockOptions = {},
 ): Promise<T> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   await mkdir(path.dirname(lockPath), { recursive: true });
 
-  const deadline = Date.now() + timeoutMs;
+  const t0 = Date.now();
+  // Recorded only once we are actually about to sleep on a live holder — never on the
+  // uncontended path (no extra disk read on the fast path) and never for a holder that turned
+  // out to be reclaimable (dead pid or stale heartbeat): that one was never waited on, it was
+  // cleared on the spot and the next `tryAcquire` may well succeed immediately. Once set, later
+  // polls don't re-read the holder; it is re-read only on a poll where it is still undefined.
+  let waitedOn: string | undefined;
+
+  const deadline = t0 + timeoutMs;
   for (;;) {
     if (await tryAcquire(lockPath, opts.owner)) break;
     if (await reclaimIfStale(lockPath, staleMs)) continue;
+    if (waitedOn === undefined) {
+      const holder = await readHolder(lockPath);
+      if (holder) waitedOn = holder.owner ?? String(holder.pid);
+    }
     if (Date.now() >= deadline) throw new LockTimeoutError(lockPath, await readHolder(lockPath));
     await sleep(POLL_MS);
   }
+  const lock: LockAcquisition = { waitedMs: Date.now() - t0, ...(waitedOn ? { waitedOn } : {}) };
 
   // Keep the lock looking alive for as long as we hold it, so a slow clone or push is never
   // mistaken for an abandoned lock. Unref'd so it can't hold the process open.
@@ -241,7 +270,7 @@ export async function withFileLock<T>(
   heartbeat.unref?.();
 
   try {
-    return await fn();
+    return await fn(lock);
   } finally {
     clearInterval(heartbeat);
     await rm(lockPath, RM_OPTS);
