@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile, realpath } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -30,10 +30,11 @@ function textOf(res: unknown): string {
   return JSON.stringify((res as { content?: unknown }).content ?? '');
 }
 
+/** Canonicalized — see the note on the unit test's `tmp`: the reported source is the realpath. */
 async function tmp(prefix: string): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
   cleanups.push(() => rm(dir, { recursive: true, force: true }));
-  return dir;
+  return realpath(dir);
 }
 
 async function setupGitProject(): Promise<{

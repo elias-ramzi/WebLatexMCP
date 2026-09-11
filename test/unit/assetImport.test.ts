@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { mkdtemp, writeFile, rm, symlink, chmod, mkdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, symlink, chmod, mkdir, realpath } from 'node:fs/promises';
 import { resolveAssetSource } from '../../src/lib/assetImport.js';
 import { MAX_ASSET_BYTES, MAX_INLINE_ASSET_BYTES } from '../../src/lib/assets.js';
 import { assetSourceBlockedMessage } from '../../src/lib/assets.js';
@@ -16,10 +16,16 @@ describe('resolveAssetSource', () => {
     for (const c of cleanups.splice(0)) await c();
   });
 
+  /**
+   * A temp dir, **canonicalized**. `resolveAssetSource` reports the realpath'd source — that is the
+   * security property, not a detail — so a test comparing against an unresolved path fails wherever
+   * the temp root is itself a link: macOS (`/var` -> `/private/var`) and Windows (the `RUNNER~1`
+   * 8.3 alias). Resolving at creation keeps every path derived from it canonical on every platform.
+   */
   async function tmp(): Promise<string> {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-asset-'));
     cleanups.push(() => rm(dir, { recursive: true, force: true }));
-    return dir;
+    return realpath(dir);
   }
 
   it('reads a real file from an absolute sourcePath, byte-identically', async () => {
