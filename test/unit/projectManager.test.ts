@@ -3,8 +3,37 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { ProjectManager } from '../../src/services/projectManager.js';
+import type { ProjectRegistryStore } from '../../src/services/projectManager.js';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import type { ProjectConfig, ServerConfig } from '../../src/types.js';
+
+/**
+ * A fake `ProjectRegistryStore` that mimics the real one's default-tracking: `upsert` with
+ * `makeDefault: true` sets `defaultId` (and only one project may hold it), and records the opts
+ * it was last called with so a test can check what `registerAndPersist` passed through.
+ */
+function makeFakeRegistry(): ProjectRegistryStore & {
+  entries: ProjectConfig[];
+  defaultId?: string;
+  lastUpsertOpts?: { makeDefault?: boolean };
+} {
+  return {
+    entries: [],
+    defaultId: undefined,
+    lastUpsertOpts: undefined,
+    read() {
+      return this.entries;
+    },
+    readDefault() {
+      return this.defaultId;
+    },
+    async upsert(cfg: ProjectConfig, opts?: { makeDefault?: boolean }) {
+      this.entries = [...this.entries.filter((e) => e.id !== cfg.id), cfg];
+      this.lastUpsertOpts = opts;
+      if (opts?.makeDefault) this.defaultId = cfg.id;
+    },
+  };
+}
 
 describe('ProjectManager', () => {
   let workspaceRoot: string;
@@ -44,9 +73,27 @@ describe('ProjectManager', () => {
     expect(() => pm.getProjectConfig('ghost')).toThrow(/Unknown project/);
   });
 
-  it('throws when no id and no default are available', () => {
+  it('throws when no id and no default are available, and points at register_project', () => {
     const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] });
     expect(() => pm.getProjectConfig()).toThrow(/No project specified/);
+    expect(() => pm.getProjectConfig()).toThrow(/register_project/);
+  });
+
+  it('names the known projects and mentions register_project when no default is configured', () => {
+    const pm = new ProjectManager(makeConfig() /* has defaultProject */);
+    // Same projects, but no configured default this time.
+    const noDefault = new ProjectManager({
+      workspaceRoot,
+      sessionId: 'test',
+      projects: [
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
+      ],
+    });
+    expect(pm.getProjectConfig().id).toBe('thesis'); // sanity: the fixture itself still resolves
+    expect(() => noDefault.getProjectConfig()).toThrow(/Known projects: thesis, paper/);
+    expect(() => noDefault.getProjectConfig()).toThrow(/WEB_LATEX_MCP_DEFAULT_PROJECT/);
+    expect(() => noDefault.getProjectConfig()).toThrow(/register_project/);
   });
 
   it('reports clone status based on the presence of a .git directory', async () => {
@@ -66,15 +113,7 @@ describe('ProjectManager', () => {
   });
 
   it('persists a registration through the registry store', async () => {
-    const store = {
-      entries: [] as ProjectConfig[],
-      read() {
-        return this.entries;
-      },
-      async upsert(cfg: ProjectConfig) {
-        this.entries = [...this.entries.filter((e) => e.id !== cfg.id), cfg];
-      },
-    };
+    const store = makeFakeRegistry();
     const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
     await pm.registerAndPersist({
       id: 'new',
@@ -87,19 +126,66 @@ describe('ProjectManager', () => {
   });
 
   it('picks up a peer registration from the registry on an unknown-id miss', () => {
-    const store = {
-      entries: [] as ProjectConfig[],
-      read() {
-        return this.entries;
-      },
-      async upsert() {},
-    };
+    const store = makeFakeRegistry();
     const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
     expect(() => pm.getProjectConfig('peer')).toThrow(/Unknown project/);
     // A peer session persists it after startup...
     store.entries = [{ id: 'peer', gitUrl: 'https://git.overleaf.com/peer' }];
     // ...and this session resolves it without a restart.
     expect(gitUrlOf(pm.getProjectConfig('peer'))).toBe('https://git.overleaf.com/peer');
+  });
+
+  it('registerAndPersist with makeDefault sets the in-process default and tells the registry', async () => {
+    const store = makeFakeRegistry();
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+    await pm.registerAndPersist(
+      { id: 'new', gitUrl: 'https://git.overleaf.com/zzz' },
+      { makeDefault: true },
+    );
+    expect(pm.getProjectConfig().id).toBe('new');
+    expect(store.lastUpsertOpts).toEqual({ makeDefault: true });
+    expect(pm.defaultProjectId()).toBe('new');
+  });
+
+  it('does not let makeDefault override an explicit WEB_LATEX_MCP_DEFAULT_PROJECT', async () => {
+    const store = makeFakeRegistry();
+    const pm = new ProjectManager(
+      {
+        workspaceRoot,
+        sessionId: 'test',
+        projects: [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' }],
+        defaultProject: 'thesis',
+        defaultProjectExplicit: true,
+      },
+      store,
+    );
+    await pm.registerAndPersist(
+      { id: 'new', gitUrl: 'https://git.overleaf.com/zzz' },
+      { makeDefault: true },
+    );
+    // The registry still records the request — only the in-process default is protected.
+    expect(store.lastUpsertOpts).toEqual({ makeDefault: true });
+    expect(pm.getProjectConfig().id).toBe('thesis');
+  });
+
+  it('runExclusive forwards a LockAcquisition to fn, waitedMs ~0 and no waitedOn when uncontended', async () => {
+    const pm = new ProjectManager(makeConfig());
+    const lock = await pm.runExclusive('thesis', async (l) => l);
+    // The claim under test is "did not wait for a holder", not a timing budget — a loaded CI
+    // runner can pay far more than a couple of milliseconds for the real filesystem write, and
+    // that is not a regression. `waitedOn` is what actually proves no wait happened.
+    expect(lock.waitedMs).toBeGreaterThanOrEqual(0);
+    expect(lock.waitedMs).toBeLessThan(1000);
+    expect(lock.waitedOn).toBeUndefined();
+  });
+
+  it('falls back to the registry’s persisted default when the config has none', () => {
+    const store = makeFakeRegistry();
+    store.entries = [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }];
+    store.defaultId = 'paper';
+    const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+    expect(pm.getProjectConfig().id).toBe('paper');
+    expect(pm.defaultProjectId()).toBe('paper');
   });
 
   describe('local projects', () => {

@@ -39,6 +39,67 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `git add -A` fallback would turn "no longer blocked" into "swept into the commit".
   `status.activeSessions` carries the same per-session `changes` (`null` when that session's index is
   unreadable) and `lastWriteAt`, so the check is one read-only call.
+- **`push` no longer refuses on untracked files nobody owns** (#60). `guardPeerWork` already let
+  unowned dirt through when no live peer session existed (or the dirt was this session's own), but `safePush`/`resolvePush` then
+  re-gated on simple-git's `isClean()`, which counts untracked files — so three hand-built `main.pdf`/
+  `main.bbl`/`main.blg` beside the root file, or an exited peer's new figure, refused every push with a
+  generic "uncommitted changes" message that named neither the files nor a session, contradicting what
+  docs/CONCURRENCY.md promised. A rebase's checkout tolerates untracked files in place; it balks only at
+  uncommitted changes to files git already tracks. So the gate now distinguishes the two: untracked
+  files ride through a push untouched, and only modified tracked files refuse — **by name**, saying why
+  (git cannot rebase over them) and offering the three exits (`commit`, a `message` on `push` — which
+  commits the whole working tree, peers' work included — or `discard`). `--autostash` was deliberately
+  not used: a stash pop is an automatic merge of somebody's uncommitted lines onto a new base, and a
+  pop conflict leaves markers in the working tree. The one case git itself refuses — an incoming commit
+  adding a path that already exists untracked locally — is no longer a raw "could not detach HEAD": it
+  is `UntrackedOverwriteError`, naming the colliding file(s), with the clone left at its pre-push state.
+- **`push` retries a lost fast-forward race, then reports `status: "remote-moved"`** (#60). With a
+  collaborator typing in the Overleaf editor the git bridge lands a commit every few seconds, and a push
+  that lost the race between its last fetch and its `git push` returned git's raw stderr
+  (`[rejected] (fetch first)`), neither retried nor explained. `safePush` and `resolvePush` now go through one
+  helper that, on a plain non-fast-forward rejection — and only that: auth, network and hook refusals
+  (`[remote rejected]`) rethrow at once — re-runs the same fetch → `pull --rebase` → push round up to 3
+  times. A conflict on a retry round is reported exactly as before, never retried with stale content;
+  the success result's `rebasedOver` includes the commits picked up by every round. Losing the race
+  three times returns `status: "remote-moved"` with `remoteHead` and the commits that landed, nothing
+  pushed, no rebase in progress, and the local commits still ahead. A `resolutions` push that passed
+  `expectedRemoteHead` does not retry at all — the caller asked to be refused if the remote moved again,
+  so it gets `remote-moved` on the first lost race. Branch-mode landing does not loop either (its
+  rebase-then-ff shape is different): it converts the same rejection into `remote-moved`, and because
+  local `<base>` is already fast-forwarded onto the feature branch by then, its summary prescribes the
+  recovery that actually works — a direct-mode push, which pull-rebases `<base>` and pushes. The `beforePush` hook on `GitService`'s constructor exists only so a test can move the
+  remote in that gap.
+- **Every reported commit lists the files it touched** (#60). `rebasedOver`, `behindCommits`,
+  `aheadCommits`, the conflict payload's `remoteCommits` and `reset_to_remote`'s `discardedCommits`
+  carried only hash + subject, and an Overleaf commit's subject is always "Update on Overleaf." — so
+  "what did he change since my last sync" meant ~15 `git show --stat` shell detours per session. Each
+  entry now carries `files` (path, added, removed) from one `git log --numstat`; the result text shows
+  up to 5 files per commit and 20 commits, the rest in `structuredContent`. For the content, `diff`
+  with `ref: "<hash>~1..<hash>"` already answers a single commit and the docs now say so where the
+  commits are reported; the reporter's "diff compares the working tree to a ref" was the single-ref
+  form — the two-dot range compares two commits. A separate `log` tool was declined: the range form
+  plus the per-commit file list covers the case that recurred.
+- **A project registered from the chat can be the default** (#60). `register_project` gains
+  `default: true`, persisted as `"default": true` on the entry in `registry.json` and applied
+  immediately in this process, so later calls may omit `project`. `WEB_LATEX_MCP_DEFAULT_PROJECT`, when
+  set, always wins — an explicit env value is an assertion, like `compilerExplicit`, and a persisted
+  default is only what fills in when it is unset. Making the sole registered project the default by
+  inference was declined for the same reason, and because a peer registering a second project would
+  flip a working call into an error mid-session. The no-default error now lists the known ids and both
+  ways to set one, and the env-check error no longer claims the id must be in `WEB_LATEX_MCP_PROJECTS`
+  (it was already checked against env plus registry; only the message said otherwise, which is what
+  misled the reporter).
+- **`compile` says whether it actually rebuilt, and how long it waited for the lock** (#60). The
+  build dir is stable per project path and shared by every session on a clone, so right after a peer
+  compiled, latexmk finds nothing to do and `compile` returns `success: true` in 0.08 s with the peer's
+  PDF — indistinguishable from a rebuild from your own edits. The result now carries `rebuilt` (the
+  build-dir PDF's mtime or size changed between just before and just after the run — never parsed
+  from backend stdout, which is discarded once a `.log` exists and which tectonic does not emit, and
+  never from the wall clock), `pdfMtime` (read from the build output before the surfacing copy, whose
+  mtime is fresh on every call), `lockWaitSec` (`durationSec` still measures the backend run alone) and
+  `lockHeldBy` — the session that held the lock, which `LockTimeoutError` already named but only after
+  the 30 s timeout. The lock reports more and acquires exactly as before; `withFileLock` and
+  `runExclusive` hand the acquisition to their callback, which every other caller ignores.
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
   swapping in a house style wholesale, but it meant a single per-paper preference ("always write lidar,

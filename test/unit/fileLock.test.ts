@@ -10,7 +10,7 @@ import {
   isLockContentionError,
   tryAcquire,
 } from '../../src/lib/fileLock.js';
-import type { LockAttemptDeps } from '../../src/lib/fileLock.js';
+import type { LockAttemptDeps, LockAcquisition } from '../../src/lib/fileLock.js';
 
 describe('withFileLock', () => {
   let dir: string;
@@ -95,6 +95,20 @@ describe('withFileLock', () => {
     ).resolves.toBe('taken');
   });
 
+  it('does not report a reclaimed dead holder as something we waited on', async () => {
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(path.dirname(lock), { recursive: true });
+    // A pid far above any platform's pid_max cannot be a live process — it is reclaimed on the
+    // very first loop iteration, before ever checking who to report as `waitedOn`. Reporting
+    // "ghost" here would be a lie: we never actually waited on it, we cleared it and moved on.
+    await writeFile(
+      lock,
+      JSON.stringify({ pid: 999_999_999, owner: 'ghost', acquiredAt: new Date().toISOString() }),
+    );
+    const captured = await withFileLock(lock, (l) => Promise.resolve(l), { timeoutMs: 500 });
+    expect(captured.waitedOn).toBeUndefined();
+  });
+
   it('reclaims an unparseable lock once it has gone stale', async () => {
     const { mkdir } = await import('node:fs/promises');
     await mkdir(path.dirname(lock), { recursive: true });
@@ -143,6 +157,46 @@ describe('withFileLock', () => {
       `Timed out waiting for the lock on nested — held by pid 4242 ` +
         `since 2024-01-01T00:00:00.000Z. Another session is mid-operation; retry shortly.`,
     );
+  });
+
+  it('reports no wait and no holder when the lock is free (uncontended fast path)', async () => {
+    const captured = await withFileLock(lock, (l) => Promise.resolve(l), { owner: 'writer' });
+    // The claim under test is "did not wait for a holder", not a timing budget — a loaded CI
+    // runner can pay far more than a couple of milliseconds for the real filesystem write, and
+    // that is not a regression. `waitedOn` is what actually proves no wait happened.
+    expect(captured.waitedMs).toBeGreaterThanOrEqual(0);
+    expect(captured.waitedMs).toBeLessThan(1000);
+    expect(captured.waitedOn).toBeUndefined();
+  });
+
+  it('reports how long a contended caller waited and who it waited on', async () => {
+    const captured: LockAcquisition[] = [];
+    const first = withFileLock(
+      lock,
+      async (l) => {
+        captured[0] = l;
+        await new Promise((r) => setTimeout(r, 150));
+        return 'first';
+      },
+      { owner: 'writer' },
+    );
+    // Give the first call a moment to actually acquire before the second one starts polling.
+    await new Promise((r) => setTimeout(r, 20));
+    const second = withFileLock(
+      lock,
+      async (l) => {
+        captured[1] = l;
+        return 'second';
+      },
+      { owner: 'reader' },
+    );
+    await Promise.all([first, second]);
+
+    expect(captured[0]?.waitedMs).toBeGreaterThanOrEqual(0);
+    expect(captured[0]?.waitedMs).toBeLessThan(1000);
+    expect(captured[0]?.waitedOn).toBeUndefined();
+    expect(captured[1]?.waitedMs).toBeGreaterThanOrEqual(100);
+    expect(captured[1]?.waitedOn).toBe('writer');
   });
 });
 

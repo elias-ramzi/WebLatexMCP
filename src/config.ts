@@ -4,7 +4,11 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { readProjectRegistry } from './services/projectRegistry.js';
+import {
+  readProjectRegistry,
+  readProjectRegistryDefault,
+  registryPath,
+} from './services/projectRegistry.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
 import { COMPILER_KINDS } from './services/compilerResolver.js';
@@ -241,13 +245,34 @@ export function loadConfig(
   for (const p of envProjects) byId.set(p.id, p);
   const projects = [...byId.values()];
 
-  const defaultProject = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
+  const envDefault = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
+  const knownProjectIds = () => (projects.length ? projects.map((p) => p.id).join(', ') : '(none)');
 
-  if (defaultProject && !projects.some((p) => p.id === defaultProject)) {
+  if (envDefault && !projects.some((p) => p.id === envDefault)) {
     throw new Error(
-      `WEB_LATEX_MCP_DEFAULT_PROJECT "${defaultProject}" is not present in WEB_LATEX_MCP_PROJECTS.`,
+      `WEB_LATEX_MCP_DEFAULT_PROJECT "${envDefault}" is not a known project. Known (from ` +
+        `WEB_LATEX_MCP_PROJECTS and the workspace registry at ${registryPath(workspaceRoot)}): ` +
+        `${knownProjectIds()}.`,
     );
   }
+
+  // A registry.json default (register_project { default: true }) fills in only when the env var
+  // above did not — an explicit env default always wins, never merely overridden in memory here.
+  // Still resolved unconditionally so a stale/unknown persisted default is reported either way.
+  const persistedDefaultCandidate = readProjectRegistryDefault(workspaceRoot);
+  let persistedDefault: string | undefined;
+  if (persistedDefaultCandidate && projects.some((p) => p.id === persistedDefaultCandidate)) {
+    persistedDefault = persistedDefaultCandidate;
+  } else if (persistedDefaultCandidate) {
+    console.error(
+      `[web-latex-mcp] ignoring persisted default project "${persistedDefaultCandidate}" ` +
+        `(registry.json at ${registryPath(workspaceRoot)}): not a known project (from ` +
+        `WEB_LATEX_MCP_PROJECTS and the workspace registry): ${knownProjectIds()}.`,
+    );
+  }
+
+  const defaultProject = envDefault ?? persistedDefault;
+  const defaultProjectExplicit = envDefault !== undefined;
 
   const { kind: compiler, explicit: compilerExplicit } = parseCompilerChoice(
     env.WEB_LATEX_MCP_COMPILER,
@@ -265,6 +290,7 @@ export function loadConfig(
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
     defaultProject,
+    defaultProjectExplicit,
     compiler,
     compilerExplicit,
     viewerPort,

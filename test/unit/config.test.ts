@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import { loadConfig, parseExtraWritingGuide } from '../../src/config.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
+import { registryPath } from '../../src/services/projectRegistry.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -75,8 +77,14 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ WEB_LATEX_MCP_PROJECTS: '{not json' })).toThrow(/not valid JSON/);
   });
 
-  it('throws when the default project is not in the registry', () => {
-    expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/not present/);
+  it('throws when the default project is not a known project, naming both sources', () => {
+    expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(
+      /WEB_LATEX_MCP_DEFAULT_PROJECT "ghost" is not a known project/,
+    );
+    expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(
+      /WEB_LATEX_MCP_PROJECTS and the workspace registry/,
+    );
+    expect(() => loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'ghost' })).toThrow(/\(none\)/);
   });
 
   it('merges persisted projects, with env projects winning on a shared id', () => {
@@ -102,6 +110,9 @@ describe('loadConfig', () => {
   });
 
   it('accepts a default project that only exists in the persisted registry', () => {
+    // (d) from the issue-60 task: an env default naming a registry-only project — this passed
+    // before the fix too (loadConfig already validated against the env+registry merge), so it's
+    // kept here as a regression guard rather than reported as new coverage.
     const persisted = () => [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/persisted' }];
     const cfg = loadConfig(
       { WEB_LATEX_MCP_DEFAULT_PROJECT: 'thesis' },
@@ -226,6 +237,65 @@ describe('loadConfig', () => {
     expect(() =>
       loadConfig({ WEB_LATEX_MCP_PROJECTS: JSON.stringify({ cv: { rootFile: 'cv.tex' } }) }),
     ).toThrow(/invalid/);
+  });
+});
+
+describe('loadConfig defaultProject from a persisted registry.json on disk', () => {
+  // These read a REAL registry.json through the real readProjectRegistry/readProjectRegistryDefault
+  // (only `insideRepo` is stubbed), unlike the `persisted` callback fixture above — this is what
+  // exercises the on-disk `"default": true` flag register_project writes.
+  let workspaceRoot: string;
+
+  beforeEach(async () => {
+    workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'ovl-cfg-default-'));
+  });
+
+  afterEach(async () => {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  });
+
+  async function writeRegistry(map: Record<string, unknown>): Promise<void> {
+    await writeFile(registryPath(workspaceRoot), JSON.stringify(map), 'utf8');
+  }
+
+  it('(a) a registry-persisted default is used when WEB_LATEX_MCP_DEFAULT_PROJECT is unset', async () => {
+    await writeRegistry({ thesis: { gitUrl: 'https://git.overleaf.com/abc', default: true } });
+    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: workspaceRoot }, '/some/dir', () => false);
+    expect(cfg.defaultProject).toBe('thesis');
+    expect(cfg.defaultProjectExplicit).toBe(false);
+  });
+
+  it('(b) an explicit env default wins over a persisted one', async () => {
+    await writeRegistry({
+      thesis: { gitUrl: 'https://git.overleaf.com/abc', default: true },
+      paper: { gitUrl: 'https://git.overleaf.com/def' },
+    });
+    const cfg = loadConfig(
+      { WEB_LATEX_MCP_WORKSPACE: workspaceRoot, WEB_LATEX_MCP_DEFAULT_PROJECT: 'paper' },
+      '/some/dir',
+      () => false,
+    );
+    expect(cfg.defaultProject).toBe('paper');
+    expect(cfg.defaultProjectExplicit).toBe(true);
+  });
+
+  it('(e) a persisted default naming an id outside the merged project list is ignored, not thrown', async () => {
+    // The real registry.json on disk names "ghost" as default, but the injected `readRegistry`
+    // (as a test double would supply) does not surface it into the merged project list — the
+    // mismatch readProjectRegistryDefault must tolerate rather than crash the server over.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await writeRegistry({ ghost: { gitUrl: 'https://git.overleaf.com/x', default: true } });
+    const cfg = loadConfig(
+      { WEB_LATEX_MCP_WORKSPACE: workspaceRoot },
+      '/some/dir',
+      () => false,
+      () => [], // merged project list does not include "ghost"
+    );
+    expect(cfg.defaultProject).toBeUndefined();
+    expect(cfg.defaultProjectExplicit).toBe(false);
+    expect(spy).toHaveBeenCalled();
+    const message = spy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(message).toContain('ghost');
   });
 });
 

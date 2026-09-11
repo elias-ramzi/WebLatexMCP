@@ -107,6 +107,13 @@ export interface ServerConfig {
   projects: ProjectConfig[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
+  /**
+   * True when `defaultProject` came from `WEB_LATEX_MCP_DEFAULT_PROJECT` rather than a persisted
+   * registry default. An explicit env default is an assertion — like `compilerExplicit` — and a
+   * `register_project { default: true }` call never overrides it in this process. Optional so the
+   * many test fixtures constructing `ServerConfig` need no change; undefined means false.
+   */
+  defaultProjectExplicit?: boolean;
   /** Local compile backend. `loadConfig` always resolves this; omit to default to `latexmk`. */
   compiler?: CompilerKind;
   /**

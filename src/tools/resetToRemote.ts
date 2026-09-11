@@ -13,7 +13,23 @@ const inputSchema = {
     ),
 };
 
-const commitSchema = z.object({ hash: z.string(), message: z.string() });
+const diffFileSchema = z.object({
+  path: z.string(),
+  added: z.number(),
+  removed: z.number(),
+});
+
+const commitSchema = z.object({
+  hash: z.string(),
+  message: z.string(),
+  files: z
+    .array(diffFileSchema)
+    .describe(
+      'Files the commit touched, with added/removed line counts — enough to see what a remote ' +
+        '"Update on Overleaf." commit changed without a shell. For the content, use `diff` with ' +
+        'ref: "<hash>~1..<hash>".',
+    ),
+});
 
 const outputSchema = {
   branch: z.string(),

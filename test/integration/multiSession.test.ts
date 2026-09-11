@@ -453,6 +453,53 @@ describe('two sessions sharing one clone', () => {
     expect(err).toContain('beta');
   });
 
+  it('pushes over untracked files left by a peer that has exited', async () => {
+    const { remote, dir, workspace, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+
+    // Beta registers itself (a heartbeat) and writes a new file, but never commits it.
+    await call(b, 'status', {});
+    await call(b, 'write_file', {
+      path: 'sections/extra.tex',
+      content: 'A stray section beta never committed.\n',
+    });
+
+    // Simulate beta's process having exited: an unreachable pid and a heartbeat well past stale.
+    const recordPath = path.join(sessionDir(workspace, 'demo', 'beta'), 'session.json');
+    const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(
+      recordPath,
+      JSON.stringify(
+        {
+          ...record,
+          pid: 999999999,
+          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    // Alpha edits and commits only its own paragraph; beta's untracked file stays in the clone,
+    // owned by nobody live.
+    await editA(a);
+    await call(a, 'commit', { message: 'A: revise the assumption' });
+
+    const pushed = await call<{ status: string }>(a, 'push', { confirm: true });
+    expect(pushed.status).toBe('pushed');
+
+    // Beta's file rides through untouched and was never pushed.
+    expect(await readFile(path.join(dir, 'sections', 'extra.tex'), 'utf8')).toBe(
+      'A stray section beta never committed.\n',
+    );
+    const verify = await mkdtemp(path.join(os.tmpdir(), 'wlm-verify-'));
+    cleanups.push(() => rm(verify, { recursive: true, force: true }));
+    await simpleGit().clone(remote.url, verify);
+    await expect(readFile(path.join(verify, 'sections', 'extra.tex'), 'utf8')).rejects.toThrow();
+  });
+
   it('pushes once the peer has committed', async () => {
     const { remote, dir, session } = await setup();
     const a = await session('alpha');

@@ -208,6 +208,28 @@ whose index cannot be read is treated as owning everything, never as owning noth
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
 
+Once past that peer guard — no live peer, or every live peer's work is already
+committed — the push still has to rebase, and git itself draws a further line:
+**untracked files never block it.** They ride through the rebase untouched, whoever
+left them (a build artifact, a peer's new file after it has exited). What does block
+it is an **uncommitted modification to a file git already tracks**, because git cannot
+rebase over one; `push` refuses and names every such file, and offers the ways out —
+`commit` (this session's edits by default, `scope: "all"` for the whole tree), a
+`message` on push (which commits the _whole_ working tree, any peers' work included),
+or `discard`. Separately, if the incoming remote commit would **add** a path that
+already exists, untracked, in the local tree, git refuses that specific rebase step
+too; `push` reports it by name and leaves the clone exactly as it was — nothing
+pushed, no rebase left in progress. Either way, the fix is the same: commit the
+colliding file (so the next push surfaces a proper conflict instead of this abort) or
+delete/move it, then read the remote version with `read_file(path, ref="origin/<branch>")`.
+
+If a collaborator's push lands in the gap between our fetch and our push, `push` retries the same
+pull-rebase-then-push sequence up to 3 rounds before giving up as `status: "remote-moved"` (nothing
+pushed, clone intact) — a genuine rebase conflict on any round is reported immediately, not retried.
+Two cases take one attempt only and report `remote-moved` on the first lost race: a `resolutions`
+push that passed `expectedRemoteHead` (the caller asked to be refused if the remote moved again), and
+branch-mode landing, whose summary then prescribes the direct-mode push that recovers from it.
+
 The practical rhythm: sessions commit as they finish a piece, and whoever pushes does
 so when the others are between edits.
 

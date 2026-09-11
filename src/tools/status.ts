@@ -6,12 +6,29 @@ import { syncState, syncSummary } from '../lib/syncState.js';
 import { toPosix } from '../lib/paths.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
 import { latestTouch } from '../services/shadowStore.js';
+import { renderCommitLines } from '../lib/conflictText.js';
 
 const inputSchema = {
   project: z.string().optional(),
 };
 
-const commitSchema = z.object({ hash: z.string(), message: z.string() });
+const diffFileSchema = z.object({
+  path: z.string(),
+  added: z.number(),
+  removed: z.number(),
+});
+
+const commitSchema = z.object({
+  hash: z.string(),
+  message: z.string(),
+  files: z
+    .array(diffFileSchema)
+    .describe(
+      'Files the commit touched, with added/removed line counts — enough to see what a remote ' +
+        '"Update on Overleaf." commit changed without a shell. For the content, use `diff` with ' +
+        'ref: "<hash>~1..<hash>".',
+    ),
+});
 
 const outputSchema = {
   branch: z.string(),
@@ -89,7 +106,9 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
       description:
         'Show branch, sync state (ahead/behind vs the tracked remote — a non-zero "behind" means ' +
         'origin moved since the last sync and a push may conflict), and staged/unstaged/untracked ' +
-        'files. Counts reflect the last fetch; run project_sync to refresh them. Also splits the ' +
+        'files. Counts reflect the last fetch; run project_sync to refresh them. Each reported ' +
+        'commit (aheadCommits, behindCommits) lists the files it touched with added/removed line ' +
+        'counts; for the content, diff with ref: "<hash>~1..<hash>". Also splits the ' +
         "uncommitted changes into this session's and other sessions', and lists the other agent " +
         'sessions currently working on the project.',
       inputSchema,
@@ -120,8 +139,6 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           ...status.unstaged,
           ...status.untracked,
         ]);
-        const commitLine = (c: { hash: string; message: string }): string =>
-          `  ${c.hash.slice(0, 8)} ${c.message}`;
         const peerDetail = (p: (typeof peers)[number]): string => {
           const entries = peerShadows.get(p.sessionId) ?? null;
           const segments: string[] = [];
@@ -155,10 +172,10 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           status.unstaged.length ? `unstaged: ${status.unstaged.join(', ')}` : '',
           status.untracked.length ? `untracked: ${status.untracked.join(', ')}` : '',
           status.behindCommits.length
-            ? `landed upstream:\n${status.behindCommits.map(commitLine).join('\n')}`
+            ? `landed upstream:\n${renderCommitLines(status.behindCommits).join('\n')}`
             : '',
           status.aheadCommits.length
-            ? `to push:\n${status.aheadCommits.map(commitLine).join('\n')}`
+            ? `to push:\n${renderCommitLines(status.aheadCommits).join('\n')}`
             : '',
           externalChanges.length
             ? `⚠ changed directly (not via tools): ${externalChanges.join(', ')}`

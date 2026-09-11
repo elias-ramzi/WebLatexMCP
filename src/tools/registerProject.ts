@@ -65,6 +65,14 @@ const inputSchema = {
     .boolean()
     .optional()
     .describe('Clone the project right away if it is not present locally (default true).'),
+  default: z
+    .boolean()
+    .optional()
+    .describe(
+      'Make this the project used when a call omits `project`: takes effect now and is ' +
+        'persisted for later sessions. Only one project is the default; setting it here ' +
+        'replaces the previous one. WEB_LATEX_MCP_DEFAULT_PROJECT, when set, always wins.',
+    ),
 };
 
 const outputSchema = {
@@ -77,7 +85,26 @@ const outputSchema = {
   cloned: z
     .boolean()
     .describe('Git: whether the clone is present. Local: whether the directory is there.'),
+  default: z
+    .boolean()
+    .describe('Whether this project is now the default in this process (may reflect a peer’s).'),
 };
+
+/**
+ * The one-clause addendum to the result text when `default: true` was asked for: says whether it
+ * took effect in this process, or only got persisted because an explicit
+ * `WEB_LATEX_MCP_DEFAULT_PROJECT` outranks it (see `ProjectManager.registerAndPersist`).
+ */
+function defaultRegistrationNote(ctx: AppContext, makeDefault: boolean | undefined): string {
+  if (!makeDefault) return '';
+  if (ctx.config.defaultProjectExplicit) {
+    return (
+      ` Persisted as the default for later sessions, but WEB_LATEX_MCP_DEFAULT_PROJECT ` +
+      `("${ctx.config.defaultProject}") wins in every session that sets it.`
+    );
+  }
+  return ' It is now the default project — calls may omit `project`.';
+}
 
 /** Expand a leading `~`, then resolve against the server's launch dir, so any input form works. */
 function resolveLocalPath(input: string): string {
@@ -144,8 +171,9 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
         'editing env config is awkward: just paste the git URL in the chat. Or pass `path` for a ' +
         'directory already on this machine, compiled and edited IN PLACE — the right choice for a ' +
         '.tex that lives in a repo of your own, since cloning that repo to reach one file leaves ' +
-        'two copies of the document to drift apart. Exactly one of the two. Tokens are never ' +
-        'stored; they are resolved per host at git time (see the auth docs).',
+        'two copies of the document to drift apart. Exactly one of the two. Pass `default: true` ' +
+        'to make this the project used when a call omits `project`. Tokens are never stored; ' +
+        'they are resolved per host at git time (see the auth docs).',
       inputSchema,
       outputSchema,
     },
@@ -159,6 +187,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
       username,
       tokenEnv,
       clone = true,
+      default: makeDefault,
     }) => {
       try {
         if (followSymlinks !== undefined && !localPath) {
@@ -191,13 +220,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               rootFile: resolvedRoot,
               followSymlinks,
             };
-            await ctx.projectManager.registerAndPersist(cfg);
+            await ctx.projectManager.registerAndPersist(cfg, { makeDefault });
             const payload = {
               project,
               path: toPosix(dir),
               mode: 'local' as const,
               persisted: true,
               cloned: true,
+              default: ctx.projectManager.defaultProjectId() === project,
             };
             // Say which directory was registered when they named a file: the project is the whole
             // folder, so that is what is readable and editable — not just the file they pointed at.
@@ -217,22 +247,26 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
-              `workspace, not into that directory.${links}`;
+              `workspace, not into that directory.${links}` +
+              defaultRegistrationNote(ctx, makeDefault);
             return {
               content: [{ type: 'text', text }],
               structuredContent: { ...payload },
             };
           }
 
-          const cfg = await ctx.projectManager.registerAndPersist({
-            id: project,
-            // Narrowed by the guards above; `localPath` is undefined here.
-            gitUrl: gitUrl as string,
-            rootFile,
-            branch,
-            username,
-            tokenEnv,
-          });
+          const cfg = await ctx.projectManager.registerAndPersist(
+            {
+              id: project,
+              // Narrowed by the guards above; `localPath` is undefined here.
+              gitUrl: gitUrl as string,
+              rootFile,
+              branch,
+              username,
+              tokenEnv,
+            },
+            { makeDefault },
+          );
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
@@ -250,6 +284,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             mode: 'git' as const,
             persisted: true,
             cloned,
+            default: ctx.projectManager.defaultProjectId() === cfg.id,
           };
           // The clone dir sits inside the user's own repo in workspace-local mode. The server
           // already excluded it at startup; say so, or the caller cannot tell and adds a
@@ -264,7 +299,8 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             (cloned
               ? `Cloned at ${dir}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
-            excludeNote;
+            excludeNote +
+            defaultRegistrationNote(ctx, makeDefault);
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },

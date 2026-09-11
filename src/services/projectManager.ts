@@ -2,6 +2,7 @@ import path from 'node:path';
 import { access } from 'node:fs/promises';
 import { Mutex } from 'async-mutex';
 import { withFileLock } from '../lib/fileLock.js';
+import type { LockAcquisition } from '../lib/fileLock.js';
 import { projectLockPath } from '../lib/sessionPaths.js';
 import { gitUrlOf, isLocalProject, requireGitProject } from '../lib/projectMode.js';
 import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
@@ -13,7 +14,9 @@ import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } fro
  */
 export interface ProjectRegistryStore {
   read(): ProjectConfig[];
-  upsert(cfg: ProjectConfig): Promise<void>;
+  /** Id of the persisted default project, or `undefined`. */
+  readDefault(): string | undefined;
+  upsert(cfg: ProjectConfig, opts?: { makeDefault?: boolean }): Promise<void>;
 }
 
 /**
@@ -25,7 +28,17 @@ export interface ProjectRegistryStore {
 export class ProjectManager {
   private readonly projects: Map<string, ProjectConfig>;
   private readonly workspaceRoot: string;
-  private readonly defaultProject?: string;
+  /**
+   * The in-process default project id. Mutable: `registerAndPersist({ makeDefault: true })` may
+   * set it (see there for when it is and is not allowed to).
+   */
+  private defaultProject?: string;
+  /**
+   * True when `defaultProject` came from `WEB_LATEX_MCP_DEFAULT_PROJECT` — an assertion, like
+   * `compilerExplicit` (see CLAUDE.md). It licenses nothing to override it, including a later
+   * `register_project { default: true }` in this same process.
+   */
+  private readonly defaultProjectExplicit: boolean;
   private readonly sessionId: string;
   private readonly registry?: ProjectRegistryStore;
 
@@ -36,19 +49,22 @@ export class ProjectManager {
     this.projects = new Map(config.projects.map((p) => [p.id, p]));
     this.workspaceRoot = config.workspaceRoot;
     this.defaultProject = config.defaultProject;
+    this.defaultProjectExplicit = config.defaultProjectExplicit === true;
     this.sessionId = config.sessionId;
     this.registry = registry;
   }
 
   /**
-   * Run `fn` holding the project's lock — serializes writes/commits/pushes per project.
+   * Run `fn` holding the project's lock — serializes writes/commits/pushes per project. `fn`
+   * receives the `LockAcquisition` (how long this call waited for the lock, and who it waited
+   * on) so a caller like `compile` can report it; most callers ignore the argument.
    *
    * Two layers, because sibling agent sessions run separate server processes over the same
    * clone: the mutex serialises this process's own calls, and the lock file serialises us
    * against every other process. Both are needed — git will happily corrupt an index that two
    * processes rewrite at once.
    */
-  async runExclusive<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  async runExclusive<T>(id: string, fn: (lock: LockAcquisition) => Promise<T>): Promise<T> {
     let lock = this.locks.get(id);
     if (!lock) {
       lock = new Mutex();
@@ -68,10 +84,24 @@ export class ProjectManager {
   /**
    * Register a project and persist it to the workspace registry, so it survives a restart and is
    * seen by other sessions. Falls back to an in-memory registration when no registry is wired.
+   *
+   * `opts.makeDefault: true` persists this project as the registry's default (see
+   * `ProjectRegistryStore.upsert`) and, only when `WEB_LATEX_MCP_DEFAULT_PROJECT` was NOT set for
+   * this process, also makes it the in-process default immediately — so the very next call that
+   * omits `project` in this session resolves to it without waiting on a re-read. An explicit env
+   * default is an assertion (see `defaultProjectExplicit`) and is never overridden by this, even
+   * though the registry write still happens — a later, env-unset session picks it up via
+   * `readDefault()`.
    */
-  async registerAndPersist(cfg: ProjectConfig): Promise<ProjectConfig> {
+  async registerAndPersist(
+    cfg: ProjectConfig,
+    opts?: { makeDefault?: boolean },
+  ): Promise<ProjectConfig> {
     this.registerProject(cfg);
-    await this.registry?.upsert(cfg);
+    await this.registry?.upsert(cfg, opts);
+    if (opts?.makeDefault === true && !this.defaultProjectExplicit) {
+      this.defaultProject = cfg.id;
+    }
     return cfg;
   }
 
@@ -87,11 +117,31 @@ export class ProjectManager {
     }
   }
 
+  /**
+   * Id of the default project used when a call omits `project`: the in-process one
+   * (`WEB_LATEX_MCP_DEFAULT_PROJECT`, or a `makeDefault` registration this process made) if set,
+   * else the persisted registry default — a peer session may have set one since this process
+   * started. `undefined` when nothing names a default anywhere.
+   */
+  defaultProjectId(): string | undefined {
+    return this.defaultProject ?? this.registry?.readDefault();
+  }
+
   /** Resolve a project id (or the configured default) to its config, or throw. */
   getProjectConfig(id?: string): ProjectConfig {
-    const resolvedId = id ?? this.defaultProject;
+    // A peer may have persisted a default since this process started — readDefault() picks it up
+    // without waiting for a restart, the same way reloadFromRegistry does for an unknown id below.
+    const resolvedId = id ?? this.defaultProjectId();
     if (!resolvedId) {
-      throw new Error('No project specified and no default project is configured.');
+      const known = this.knownIds();
+      throw new Error(
+        known.length === 0
+          ? 'No project specified and no default project is configured. No projects are ' +
+              'registered yet — use register_project (or WEB_LATEX_MCP_PROJECTS) first.'
+          : 'No project specified and no default project is configured. Known projects: ' +
+              `${known.join(', ')}. Pass "project", set WEB_LATEX_MCP_DEFAULT_PROJECT, or ` +
+              're-run register_project with default: true.',
+      );
     }
     let project = this.projects.get(resolvedId);
     if (!project) {

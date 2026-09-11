@@ -52,6 +52,7 @@ function stubBackend(
         log,
         timedOut: false,
         logBaseDir: '',
+        rebuilt: true,
       };
     },
   };
