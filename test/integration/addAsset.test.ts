@@ -30,6 +30,16 @@ function textOf(res: unknown): string {
   return JSON.stringify((res as { content?: unknown }).content ?? '');
 }
 
+/**
+ * The result's text exactly as a client renders it. `textOf` JSON-encodes, which doubles every
+ * backslash — so a Windows path (`C:\\Users\\...`) never matches a `toContain` against the path
+ * as the OS spells it. Assert path-bearing text through this instead.
+ */
+function plainText(res: unknown): string {
+  const content = (res as { content?: Array<{ text?: string }> }).content ?? [];
+  return content.map((c) => c.text ?? '').join('\n');
+}
+
 /** Canonicalized — see the note on the unit test's `tmp`: the reported source is the realpath. */
 async function tmp(prefix: string): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -212,8 +222,9 @@ describe('add_asset result shape', () => {
     expect(typeof sc.sha256).toBe('string');
     expect((sc.sha256 as string).length).toBe(64);
 
-    const text = textOf(res);
-    expect(text).not.toContain('"diff"');
+    // The absence of a diff is asserted structurally above; here, on the rendered text.
+    expect(textOf(res)).not.toContain('"diff"');
+    const text = plainText(res);
     expect(text).toContain(srcFile);
     expect(text).toContain(String(PNG.length));
     expect(text).toContain((sc.sha256 as string).slice(0, 12));
