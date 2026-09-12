@@ -292,6 +292,30 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   costs the log more than the missing rule does. And what is compared is the `[Unreleased]` section
   itself, base-vs-head, not whether the file appears in the diff — the mistake actually made is
   appending to the last released section out of habit, which touching the file does not catch.
+- **A guide for running the server from an iPad, an iPhone, or a browser**
+  ([`docs/install/claude-code-web.md`](docs/install/claude-code-web.md)). The recurring question is
+  whether the Claude mobile and web apps can use this server, and the honest answer has two halves.
+  They cannot add it as a **custom connector**: those reach only remote servers over HTTPS, and this
+  one is a stdio process that needs a filesystem, a git credential and a TeX install — hosting it to
+  close that gap means a public URL in front of something that writes your working tree and pushes to
+  your remotes, which is the same trade this repo already declines for Le Chat. But **Claude Code on
+  the web** runs it unmodified: a cloud session clones the repo, loads its `.mcp.json`, and is
+  steerable from the Claude app on a phone. So the guide documents that path end to end — which repo
+  to start from when the paper lives on Overleaf and has no GitHub remote, a setup script that
+  installs TeX inside the ~5-minute budget the environment cache needs (measured in an Anthropic cloud
+  VM: ~34 s for a minimal `latexmk` + `texlive-latex-recommended` base, ~2.5 min and 2.3 GB with
+  `texlive-latex-extra`/`-science`/`-fonts-extra` and `biber`, against a 30 GB disk — so the answer to
+  a missing package is `compile`'s `missingPackages` and one more line in the script, never
+  `texlive-full`), the two hosts that need adding to the network allowlist (`git.overleaf.com`,
+  `dblp.org`; npm and the Ubuntu archives are already on the Trusted list), and why the token goes in
+  the environment rather than the committed `.mcp.json`. It is also explicit about what does **not**
+  survive the move: `viewer` and `credential_portal` bind loopback inside a VM nobody can route to, so
+  the PDF is read through `render_pages` (whose canvas backend has a prebuilt linux-x64 binary and
+  works there) and the token through an environment variable; the clone dies with the sandbox, so
+  unpushed work is lost; and two cloud sessions are two VMs, so the lock file and session shadows —
+  which coordinate processes sharing a filesystem — do not apply, and the sessions meet at the git
+  remote like two people would. Verified rather than asserted: this repo's TeX smoke suite, real
+  `latexmk` compiles and `render_pages` rasterization included, passes unmodified in that VM.
 
 ### Changed
 
