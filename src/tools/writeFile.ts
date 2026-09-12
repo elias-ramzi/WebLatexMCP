@@ -1,10 +1,9 @@
-import path from 'node:path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
-import { changeDiff } from '../lib/changeDiff.js';
+import { changeDiff, changedPath } from '../lib/changeDiff.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -73,10 +72,14 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
             createDirs,
             overrideExternalChanges,
           });
-          // A write through an in-project link changed the target, so that is the path to diff
-          // (`target` is project-relative when it stays inside the project, absolute otherwise).
-          const diffPath = target !== null && !path.isAbsolute(target) ? target : relPath;
-          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, diffPath);
+          // A write through an in-project link changed the target, so that is the path to diff.
+          const diff = await changeDiff(
+            ctx.projectManager,
+            ctx.git,
+            id,
+            dir,
+            changedPath(target, relPath),
+          );
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           return {
             content: [{ type: 'text', text: diff ? `${headline}\n\n${diff}` : headline }],

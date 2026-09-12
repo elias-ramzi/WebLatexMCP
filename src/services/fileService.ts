@@ -13,6 +13,7 @@ import { resolveInside, samePath, toPosix } from '../lib/paths.js';
 import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 import { ASSET_EXT } from '../lib/assets.js';
+import { changedPath } from '../lib/changeDiff.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
 export class ExternalChangeError extends Error {
@@ -416,7 +417,7 @@ export class FileService {
       );
       target = null;
     }
-    return target !== null && !path.isAbsolute(target) ? target : toPosix(relPath);
+    return changedPath(target, relPath);
   }
 
   async list(

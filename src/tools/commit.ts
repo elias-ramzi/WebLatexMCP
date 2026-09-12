@@ -205,6 +205,9 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           const collided = conflicted.filter((p) => !unrecordedSet.has(p));
           const added = res.files.reduce((sum, f) => sum + f.added, 0);
           const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
+          // `headSha` reports a clone with no commits as the sentinel "unborn" — say so rather than
+          // presenting the sentinel as if it were a commit id.
+          const headAt = res.sha === 'unborn' ? 'no commits yet' : `HEAD ${res.sha.slice(0, 8)}`;
           const headline = res.committed
             ? `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
               `not yet pushed${
@@ -217,10 +220,10 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
             : res.ignored.length
               ? `nothing to commit — every requested path is ignored by git (never committed by ` +
                 `any scope): ${res.ignored.join(', ')}; settled this session's stale record of: ` +
-                `${settled.join(', ')} (HEAD ${res.sha.slice(0, 8)})`
+                `${settled.join(', ')} (${headAt})`
               : 'nothing to commit — the working tree already matches HEAD for the requested paths; ' +
                 `settled this session's stale record of: ${settled.join(', ')} ` +
-                `(not yet pushed: HEAD ${res.sha.slice(0, 8)})`;
+                `(not yet pushed: ${headAt})`;
           const text = [
             headline,
             ...res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
@@ -358,6 +361,8 @@ async function commitSession(
       ? await ctx.git.ignoredPaths(
           dir,
           committableAll.map((c) => c.path),
+          // `commitContents` resets the index to HEAD before staging, so "tracked" means HEAD.
+          { tracked: 'head' },
         )
       : [];
   if (ignored.length > 0) {
@@ -429,9 +434,10 @@ async function withoutIgnored(
   ctx: AppContext,
   dir: string,
   paths: string[],
+  tracked: 'head' | 'index',
 ): Promise<{ paths: string[]; ignored: string[] }> {
   if (paths.length === 0) return { paths, ignored: [] };
-  const ignored = await ctx.git.ignoredPaths(dir, paths);
+  const ignored = await ctx.git.ignoredPaths(dir, paths, { tracked });
   if (ignored.length === 0) return { paths, ignored };
   const ignoredSet = new Set(ignored);
   return { paths: paths.filter((p) => !ignoredSet.has(toPosix(p))), ignored };
@@ -446,7 +452,9 @@ async function commitEverything(
   let paths = opts.paths;
   let ignored: string[] = [];
   if (paths && paths.length > 0) {
-    const filtered = await withoutIgnored(ctx, dir, paths);
+    // `git add` here runs over the live index (no `fromHead` — scope "all" commits the clone as it
+    // stands, staged state included), so judge "tracked" the way that `git add` will.
+    const filtered = await withoutIgnored(ctx, dir, paths, 'index');
     ignored = filtered.ignored;
     if (filtered.paths.length === 0) {
       throw new NothingToCommitError(
@@ -559,7 +567,7 @@ async function commitPaths(
   // shadow entry for one past the uncovered-paths refusal) never reaches `git add` as a raw error.
   // After the ownership check on purpose: a path a live peer owns is refused as owned, whatever
   // git thinks of it — the more informative answer, and one that settles nothing of ours.
-  const { paths: stageable, ignored } = await withoutIgnored(ctx, dir, normalized);
+  const { paths: stageable, ignored } = await withoutIgnored(ctx, dir, normalized, 'head');
   if (stageable.length === 0) {
     throw new NothingToCommitError(
       `Nothing to commit: ${ignored.join(', ')} ignored by git (.gitignore / .git/info/exclude) ` +

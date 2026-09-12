@@ -259,6 +259,25 @@ export class NothingToCommitError extends Error {
 }
 
 /**
+ * Whether `git ls-files -s` output for one conflicted path shows a symlink (mode 120000) on OUR
+ * (stage 2) or THEIR (stage 3) side. During a conflict the index lists one line per stage,
+ * `<mode> <object> <stage>\t<name>`. The BASE stage (1) is deliberately not a side: when both
+ * sides already replaced a tracked link with a regular file, the conflict is an ordinary content
+ * conflict with nothing a file-content resolution could wrongly land on, and refusing it would
+ * leave the caller no way to resolve it. A merged entry (stage 0) is not a conflict at all.
+ */
+export function hasLinkOnConflictSide(lsFilesOutput: string): boolean {
+  return lsFilesOutput
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => {
+      const [mode, , stage] = line.split(/\s+/);
+      return mode === '120000' && (stage === '2' || stage === '3');
+    });
+}
+
+/**
  * Wraps git operations via the system `git` CLI (through simple-git). Auth is injected
  * in-memory per network call and never persisted to .git/config.
  */
@@ -389,34 +408,78 @@ export class GitService {
   }
 
   /**
-   * Which of `paths` git ignores (`.gitignore`, `.git/info/exclude`, etc), as POSIX paths
-   * relative to `dir`. Exists because `commitContents` stages via `hash-object` +
+   * Which of `paths` git ignores (`.gitignore`, `.git/info/exclude`, etc) and would not stage, as
+   * POSIX paths relative to `dir`. Exists because `commitContents` stages via `hash-object` +
    * `update-index --add --cacheinfo`, which — unlike `git add` — consults no ignore rules at
    * all; a scope-"session" commit must skip what a plain `git add` (scope "all"/"paths") would
    * already have skipped, or an excluded file (e.g. a skill's local-only note kept out of git via
    * `.git/info/exclude`) gets committed and pushed anyway.
    *
-   * Deliberately WITHOUT `--no-index`: `check-ignore` then still consults the index, so a
-   * *tracked* file that happens to match an ignore pattern is correctly reported as not ignored
-   * (git itself never re-ignores a tracked path) — a deletion of, or edit to, such a file must
-   * still commit, exactly as `git add` would stage it.
+   * Git never re-ignores a *tracked* path, so a tracked file matching a pattern is not ignored —
+   * a deletion of, or edit to, it must still commit. `tracked` says where the caller's staging
+   * step will look for "tracked", and must match it:
+   * - `'head'` for the routes that reset the index to HEAD before staging (`commitContents`,
+   *   `commit` with `fromHead`): whatever a hand `git rm --cached` or `git add -f` left in the
+   *   index is gone by then. `check-ignore` on its own judges by the index, so after a hand
+   *   `git rm --cached` it called a file ignored that the reset was about to put straight back —
+   *   the session's edit was dropped from its record while the file stayed tracked at HEAD's
+   *   content. So: `check-ignore --no-index` for every path the rules match, minus what
+   *   `ls-tree HEAD` lists.
+   * - `'index'` for a plain `git add` over the live index (`commit` without `fromHead`, i.e.
+   *   scope "all" with `paths`): plain `check-ignore`, which hides index-tracked paths exactly as
+   *   `git add` accepts them, so a force-added file stays committable there and a hand
+   *   `git rm --cached` one is reported ignored rather than surfacing git's raw "Use -f" hint.
    */
-  async ignoredPaths(dir: string, paths: string[]): Promise<string[]> {
+  async ignoredPaths(
+    dir: string,
+    paths: string[],
+    opts: { tracked: 'head' | 'index' },
+  ): Promise<string[]> {
     if (paths.length === 0) return [];
     const rels = paths.map((p) => toPosix(p));
-    const res = await execCapture('git', ['check-ignore', '-z', '--stdin'], {
-      cwd: dir,
-      input: rels.join('\0') + '\0',
-    });
+    const args = [
+      'check-ignore',
+      '-z',
+      '--stdin',
+      ...(opts.tracked === 'head' ? ['--no-index'] : []),
+    ];
+    const res = await execCapture('git', args, { cwd: dir, input: rels.join('\0') + '\0' });
     // Exit code 1 means "none of the given paths are ignored" — not an error. Anything other
     // than 0/1 (typically 128) is a real failure.
     if (res.code !== 0 && res.code !== 1) {
       throw new Error(`git check-ignore failed: ${res.stderr.trim()}`);
     }
-    return res.stdout
+    const matched = res.stdout
       .split('\0')
       .filter(Boolean)
       .map((p) => toPosix(p));
+    if (matched.length === 0 || opts.tracked === 'index') return matched;
+    const tracked = await this.trackedAtHead(simpleGit(dir), matched);
+    return matched.filter((p) => !tracked.has(p));
+  }
+
+  /**
+   * Which of `rels` (POSIX, relative to the clone) HEAD tracks — exact names only, so a directory
+   * pathspec's recursive matches never count for a file of the same name. Empty for an unborn
+   * HEAD (nothing is tracked yet). Two spawns (`rev-parse`, `ls-tree`), run only when
+   * `check-ignore` matched something.
+   */
+  private async trackedAtHead(git: SimpleGit, rels: string[]): Promise<Set<string>> {
+    if ((await this.revParseOrNull(git, 'HEAD')) === null) return new Set();
+    // `-z` so a name with a newline or non-ASCII byte comes back verbatim, not C-quoted;
+    // `--literal-pathspecs` because `a[1].tex` is a glob to git otherwise.
+    const out = await git.raw([
+      '--literal-pathspecs',
+      'ls-tree',
+      '-r',
+      '-z',
+      '--name-only',
+      'HEAD',
+      '--',
+      ...rels,
+    ]);
+    const wanted = new Set(rels);
+    return new Set(out.split('\0').filter((name) => wanted.has(name)));
   }
 
   /**
@@ -513,11 +576,11 @@ export class GitService {
   }
 
   /**
-   * Whether `relPath` is a symlink on either side of a paused rebase conflict: the working tree
-   * (`lstat`, mode 120000 never survives a checkout as a real file) or any conflict stage in the
-   * index (`git ls-files -s`, which during a conflict lists one line per stage — 1 = base, 2 =
-   * ours, 3 = theirs — each starting with its own mode). Either alone would miss a link the other
-   * side introduced, so both are checked. A missing working-tree file (`ENOENT`, e.g. a
+   * Whether `relPath` is a symlink on OUR or THEIR side of a paused rebase conflict: the working
+   * tree (`lstat` — for an ours-vs-theirs type change git checks the link itself out at the
+   * path) or conflict stage 2/3 in the index ({@link hasLinkOnConflictSide} over `git ls-files
+   * -s`). The index arm is belt and braces for a checkout layout that leaves a regular file at
+   * the path while a side is still a link. A missing working-tree file (`ENOENT`, e.g. a
    * delete/modify conflict) is not a link — only an actual link is refused.
    */
   private async hasSymlinkMode(dir: string, git: SimpleGit, relPath: string): Promise<boolean> {
@@ -529,12 +592,9 @@ export class GitService {
     }
     // `--literal-pathspecs`: a pathspec is a glob by default, so `a[1].tex` would also match `a1.tex`
     // and a backslash in a name escapes instead of matching. The path here is a literal name.
-    const out = await git.raw(['--literal-pathspecs', 'ls-files', '-s', '--', relPath]);
-    return out
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .some((line) => line.split(/\s+/)[0] === '120000');
+    return hasLinkOnConflictSide(
+      await git.raw(['--literal-pathspecs', 'ls-files', '-s', '--', relPath]),
+    );
   }
 
   /**
@@ -828,8 +888,9 @@ export class GitService {
       // not a spurious "missing resolution". `writeFile` follows a link (in-project or pointing
       // outside the clone entirely), so a resolved "notes.tex" would silently land wherever the
       // link points, and `git add` would then stage the untouched link as if it had been resolved.
-      // Check the paused rebase's working tree (`lstat`) and every conflict stage in the index
-      // (`git ls-files -s`, mode 120000) — either side can carry the link.
+      // Check the paused rebase's working tree (`lstat`) and the ours/theirs conflict stages in
+      // the index (`git ls-files -s`, mode 120000) — either side can carry the link; a link only
+      // in the base stage is one both sides already replaced, and is not refused.
       const linked: string[] = [];
       for (const rel of step.unmerged) {
         try {
@@ -1182,8 +1243,18 @@ export class GitService {
     return ref;
   }
 
+  /**
+   * The checked-out branch name. `symbolic-ref` first: it answers on an unborn branch (a clone of
+   * an empty remote), where `rev-parse --abbrev-ref HEAD` fails with "ambiguous argument 'HEAD'"
+   * and took `status` (and every tool that starts from it) down with it. `symbolic-ref` in turn
+   * fails on a detached HEAD, where `rev-parse` still answers `HEAD` — so fall back to it.
+   */
   private async currentBranch(git: SimpleGit): Promise<string> {
-    return (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+    try {
+      return (await git.raw(['symbolic-ref', '--short', 'HEAD'])).trim();
+    } catch {
+      return (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+    }
   }
 
   /** Resolve the clone's default branch from `origin/HEAD`, falling back to `master`. */

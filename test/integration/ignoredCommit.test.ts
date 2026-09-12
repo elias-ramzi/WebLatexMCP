@@ -1,7 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, appendFile } from 'node:fs/promises';
+import { mkdtemp, rm, appendFile, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -171,6 +173,132 @@ describe('commit skips files git ignores', () => {
     expect(sc.committed).toBe(true);
     expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['notes.txt']);
     expect(sc.ignored).toEqual([]);
+  });
+
+  it('a file tracked in HEAD but hand-removed from the index (`git rm --cached`) still commits', async () => {
+    // `git check-ignore` decides "tracked" by the INDEX, but `commitContents` resets the index to
+    // HEAD before staging — so what matters is whether HEAD tracks the file. A hand
+    // `git rm --cached` on a file matching an ignore pattern left the two disagreeing: the file
+    // was reported ignored (and the session's edit dropped from its record), while the reset
+    // put it straight back into the index and it stayed tracked at HEAD's content.
+    const { client, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      'notes.txt': 'original\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes.txt\n');
+    await simpleGit(dir).raw(['rm', '--cached', '--', 'notes.txt']);
+
+    const wroteNotes = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'notes.txt', content: 'edited\n' },
+    });
+    expect(isError(wroteNotes), textOf(wroteNotes)).toBe(false);
+
+    const committed = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'still tracked at HEAD' },
+    });
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const sc = structured(committed);
+    expect(sc.committed).toBe(true);
+    expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['notes.txt']);
+    expect(sc.ignored).toEqual([]);
+    expect(await simpleGit(dir).show(['HEAD:notes.txt'])).toBe('edited\n');
+  });
+
+  it('scope "all" with paths judges "tracked" by the index, as its `git add` does: a `git rm --cached` file is reported ignored, never as git\'s raw "Use -f"', async () => {
+    const { client, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      'notes.txt': 'original\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes.txt\n');
+    await simpleGit(dir).raw(['rm', '--cached', '--', 'notes.txt']);
+    await writeFile(path.join(dir, 'notes.txt'), 'edited by hand\n', 'utf8');
+
+    const res = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'x', scope: 'all', paths: ['notes.txt'] },
+    });
+    expect(isError(res), textOf(res)).toBe(true);
+    expect(textOf(res)).toMatch(/notes\.txt/);
+    expect(textOf(res)).toMatch(/ignored by git/);
+    expect(textOf(res)).not.toMatch(/Use -f/);
+  });
+
+  it('scope "all" with paths still commits a file force-added to the index (`git add -f`)', async () => {
+    const { client, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes.txt\n');
+    await writeFile(path.join(dir, 'notes.txt'), 'forced\n', 'utf8');
+    await simpleGit(dir).raw(['add', '-f', '--', 'notes.txt']);
+
+    const res = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'x', scope: 'all', paths: ['notes.txt'] },
+    });
+    expect(isError(res), textOf(res)).toBe(false);
+    const sc = structured(res);
+    expect(sc.committed).toBe(true);
+    expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['notes.txt']);
+    expect(sc.ignored).toEqual([]);
+  });
+
+  it('a clone with no commits yet says so, rather than printing "HEAD unborn"', async () => {
+    // An empty remote (a GitHub repository created without a README) clones to an unborn HEAD.
+    // `GitService.headSha` reports that as the sentinel "unborn"; the tool's text must not
+    // present the sentinel as if it were a commit id.
+    const remoteTmp = await tmp('ovl-ignored-empty-');
+    const bareDir = path.join(remoteTmp, 'empty.git');
+    await simpleGit().raw(['init', '--bare', '-b', 'master', bareDir]);
+    const workspace = await tmp('ovl-ignored-ws-');
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: 'test',
+      projects: [{ id: 'demo', gitUrl: pathToFileURL(bareDir).href }],
+      defaultProject: 'demo',
+    };
+    const ctx = createContext(
+      config,
+      new CredentialResolver({}),
+      { name: 'Test', email: 'test@example.com' },
+      new ProjectRegistry(workspace),
+    );
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+    const synced = await client.callTool({
+      name: 'project_sync',
+      arguments: { project: 'demo', mode: 'clone' },
+    });
+    expect(isError(synced), textOf(synced)).toBe(false);
+    const { dir } = await ctx.projectManager.requireProjectDir('demo');
+    // `status` used to fail outright here: `rev-parse --abbrev-ref HEAD` cannot name an unborn
+    // branch, and every tool that starts from `git.status` failed with the raw git message.
+    const status = await client.callTool({ name: 'status', arguments: { project: 'demo' } });
+    expect(isError(status), textOf(status)).toBe(false);
+    expect(structured(status).branch).toBe('master');
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'PAPER-SUMMARY.md\n');
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'PAPER-SUMMARY.md', content: '# summary\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+
+    const res = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'x', scope: 'paths', paths: ['PAPER-SUMMARY.md'] },
+    });
+    expect(isError(res), textOf(res)).toBe(false);
+    const sc = structured(res);
+    expect(sc.committed).toBe(false);
+    expect(sc.ignored).toEqual(['PAPER-SUMMARY.md']);
+    expect(sc.sha).toBe('unborn');
+    expect(textOf(res)).toMatch(/no commits yet/);
+    expect(textOf(res)).not.toMatch(/HEAD unborn/);
   });
 
   it('names both the ignore and the conflict when a default-scope commit is left with only those', async () => {

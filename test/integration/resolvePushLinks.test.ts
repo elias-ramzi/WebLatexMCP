@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile, writeFile, stat, symlink } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, stat, symlink, lstat } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
 import { GitService } from '../../src/services/gitService.js';
@@ -213,6 +213,61 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
       expect((await git.status(dir)).clean).toBe(true);
     });
   });
+
+  describe.skipIf(process.platform === 'win32')(
+    'a link only in the BASE stage is not a link (posix only)',
+    () => {
+      it('accepts a resolution when both sides replaced a tracked link with a regular file', async () => {
+        // Base has `notes.tex -> main.tex`; upstream and we each replace the link with a regular
+        // file carrying different text. Every side a resolution could land on is now a file, so the
+        // conflict is an ordinary content conflict — only the BASE stage (1) still shows mode
+        // 120000. Judging "is a link" on any stage refused this with "symbolic link", leaving a
+        // caller no way to resolve a conflict that has no link left in it.
+        const { remote, git, dir } = await setup({ 'main.tex': 'root\n' });
+
+        const cloneB = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-b-'));
+        cleanups.push(() => rm(cloneB, { recursive: true, force: true }));
+        const gitB = simpleGit(cloneB);
+        await gitB.clone(remote.url, cloneB);
+        await gitB.addConfig('user.email', 'other@example.com');
+        await gitB.addConfig('user.name', 'Other');
+        await gitB.addConfig('core.autocrlf', 'false');
+        await symlink('main.tex', path.join(cloneB, 'notes.tex'));
+        await gitB.add(['notes.tex']);
+        await gitB.commit('seed link');
+        await gitB.push('origin', remote.branch);
+        await git.syncPull(remote.url, dir, { username: 'git' });
+
+        // Upstream: the link becomes a regular file.
+        await rm(path.join(cloneB, 'notes.tex'));
+        await writeFile(path.join(cloneB, 'notes.tex'), 'remote text\n', 'utf8');
+        await gitB.add(['notes.tex']);
+        await gitB.commit('unlink upstream');
+        await gitB.push('origin', remote.branch);
+
+        // Ours: the same link becomes a different regular file.
+        await rm(path.join(dir, 'notes.tex'));
+        await writeFile(path.join(dir, 'notes.tex'), 'our text\n', 'utf8');
+        await git.commit(dir, { message: 'unlink locally' });
+
+        const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+        expect(conflict.status).toBe('conflict');
+        expect(conflict.conflict?.conflictPaths).toEqual(['notes.tex']);
+
+        const res = await git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          { resolutions: [{ path: 'notes.tex', content: 'merged text\n' }] },
+        );
+        expect(res.status).toBe('pushed');
+        expect(await readFromRemote(remote, 'notes.tex')).toBe('merged text\n');
+        expect((await lstat(path.join(dir, 'notes.tex'))).isSymbolicLink()).toBe(false);
+        expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('root\n');
+        expect(await noRebaseInProgress(dir)).toBe(true);
+      });
+    },
+  );
 
   it('resolves a non-ASCII conflicted path without C-quoting it', async () => {
     const { remote, git, files, dir } = await setup({ 'é.tex': 'alpha\nbeta\ngamma\n' });

@@ -383,9 +383,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the session's files, or the named `paths` under `"paths"`/`"all"` (where `git add` would have
   failed with a raw "use -f") — skips the matches, reports them under a new `ignored` field and
   drops them from the session's record; a tracked file that matches a pattern is not ignored (as
-  under `git add`) and still commits. A request whose every path is ignored is refused by name, not
-  with "no changes". Pathspecs handed to `git add` and `ls-files` are now literal, never globs:
-  naming `a[1].tex` used to stage a peer's dirty `a1.tex` past the ownership check.
+  under `git add`) and still commits. "Tracked" is judged where the staging step will look: against
+  HEAD for the session scope and `scope: "paths"`, which reset the index to HEAD first — so a hand
+  `git rm --cached` no longer gets the file reported ignored (and the session's edit dropped) while
+  the reset put it straight back — and against the live index for `scope: "all"` with `paths`,
+  whose `git add` runs over the index as it stands. A request whose every path is ignored is
+  refused by name, not with "no changes". Pathspecs handed to `git add` and `ls-files` are now
+  literal, never globs: naming `a[1].tex` used to stage a peer's dirty `a1.tex` past the ownership
+  check.
+- **`status` (and every tool that starts from it) works on a clone of an empty remote.** The branch
+  name came from `rev-parse --abbrev-ref HEAD`, which cannot name an unborn branch, so a repository
+  created without a first commit failed every `status`/`commit` with git's raw "ambiguous argument
+  'HEAD'"; it now asks `symbolic-ref` first (falling back to `rev-parse` on a detached HEAD). A
+  `commit` that settles a session record on such a clone says "no commits yet" rather than printing
+  the `sha: "unborn"` sentinel as if it were a commit id.
 - **A wedged `unrecorded`/`conflicted` entry whose file already matches HEAD can be settled without an
   empty commit** (#66, item 2). After a `push` with `message` had committed the working tree, or a hand
   revert, the remedy every message named — `scope: "all"` — refused with "Nothing to commit", `scope:
@@ -400,10 +411,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   clone, the resolution's content landed in the outside file, `git add` staged the link unchanged, and
   the tool reported nothing-to-push; a link to `refs.bib` reached the bibliography past the
   literal-name `confirmBibEdit` gate. A path that is a symlink on either side of the conflict (the
-  paused rebase's working tree, or any index stage at mode 120000) is now refused by name, the rebase
-  aborted and the clone left where it was before the rebase started. The index-side check (and
-  `commitContents`' mode lookup) passes the path as a literal pathspec, not a glob, so `a[1].tex`
-  is never judged by `a1.tex`'s entry. Separately, the unmerged-path listing lacked
+  paused rebase's working tree, or the ours/theirs index stage at mode 120000) is now refused by
+  name, the rebase aborted and the clone left where it was before the rebase started. A link only in
+  the _base_ stage — one both sides already replaced with a regular file — is an ordinary content
+  conflict and is not refused, since nothing a resolution could land on is a link any more. The
+  index-side check (and `commitContents`' mode lookup) passes the path as a literal pathspec, not a
+  glob, so `a[1].tex` is never judged by `a1.tex`'s entry. Separately, the unmerged-path listing lacked
   `core.quotePath=false`, so a conflict on `é.tex` came back as `"\303\251.tex"`, with an empty
   per-file report and a resolution for `é.tex` rejected as "not supplied"; it now matches every other
   path-returning call. (The issue's item 10 — a literal newline in a path mis-splitting `--numstat` —

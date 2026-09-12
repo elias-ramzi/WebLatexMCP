@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, lstat } from 'node:fs/promises';
@@ -122,6 +122,33 @@ describe.skipIf(process.platform === 'win32')('FileService attributes writes thr
       expect(await readFile(path.join(outside, 'real.tex'), 'utf8')).toBe('B\n');
     } finally {
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the given name, and logs to stderr, when the link cannot be resolved after the write', async () => {
+    // Coverage of the fallback, not a regression: resolution failing after the bytes are on disk
+    // must neither fail the write nor skip the recorder — the change is attributed to the name
+    // the caller gave.
+    await writeFile(path.join(dir, 'main.tex'), 'A\n', 'utf8');
+    await symlink('main.tex', path.join(dir, 'link.tex'));
+    const resolver = vi
+      .spyOn(
+        files as unknown as { resolveLinkTarget: () => Promise<string | null> },
+        'resolveLinkTarget',
+      )
+      .mockRejectedValueOnce(new Error('ELOOP: simulated'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await files.write(dir, { path: 'link.tex', content: 'B\n' });
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('B\n');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.relPath).toBe('link.tex');
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0]![0])).toMatch(/could not resolve where "link.tex" lands/);
+    } finally {
+      resolver.mockRestore();
+      stderr.mockRestore();
     }
   });
 

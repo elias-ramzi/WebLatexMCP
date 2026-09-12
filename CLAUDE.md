@@ -137,12 +137,18 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   a `push` with `message` committed it, or a hand revert), `commit` settles those entries and returns
   `committed: false` with them under `settled`, rather than refusing and leaving the only way out an
   empty commit or a discard; a request covering nothing this session tracks still refuses as before.
-  **A session commit skips what git ignores** (`GitService.ignoredPaths`, `git check-ignore --stdin`
-  without `--no-index`, run once per commit): `commitContents` stages by `update-index`, which never
-  consults `.gitignore`/`.git/info/exclude`, so the `summarize-paper` note that relies on the exclude
-  was committed and pushed by the default scope while `"all"` (`git add -A`) left it alone. Ignored
-  entries are settled and reported under `ignored`; a tracked file matching a pattern is not ignored
-  (as for `git add`) and still commits. The flag is never cleared on an edit, and
+  **A session commit skips what git ignores** (`GitService.ignoredPaths`, run once per commit):
+  `commitContents` stages by `update-index`, which never consults `.gitignore`/`.git/info/exclude`,
+  so the `summarize-paper` note that relies on the exclude was committed and pushed by the default
+  scope while `"all"` (`git add -A`) left it alone. Ignored entries are settled and reported under
+  `ignored`. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
+  and "tracked" is judged **where the staging step that follows will look** (`ignoredPaths`'
+  `tracked` option): against HEAD for `commitContents` and `scope: "paths"`, which reset the index
+  to HEAD first (`check-ignore --no-index` minus what `ls-tree HEAD` lists — a hand `git rm --cached`
+  used to get the file reported ignored, and the session's edit dropped, while the reset put it
+  straight back); against the live index for `scope: "all"` with `paths`, whose `git add` runs over
+  the index as it stands. Keep the two paired, or the filter passes a path `git add` then refuses
+  with its raw "Use -f" hint. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
   deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
   its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call
@@ -337,25 +343,27 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   credential helpers (e.g. `gh auth setup-git`).
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
-- **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict `push`
-  aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way payload per
-  file (`base`/`ours`/`theirs` + marker `hunks`) plus `conflictPaths`/`remoteHead`/`remoteCommits`. This
-  payload is rendered into the result **text** (`src/lib/conflictText.ts`), not only `structuredContent`,
-  so an MCP-only client can resolve without a shell. The caller resolves by retrying `push` with
-  `resolutions` (full merged content per file — used verbatim, applied _inside_ the rebase via add +
-  `rebase --continue`); the set is validated (missing/extra files named), `expectedRemoteHead` guards
-  against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
-  gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
-  directly. Keep the merged text originating from the caller. **A resolution is file content, so a
-  path that is a symlink on _either_ side of the conflict is refused** (rebase aborted, clone back to
-  its pre-push state) — `resolvePush` checks `lstat` in the paused rebase _and_ every index stage for
-  mode 120000, inside `GitService`, because the link that matters is upstream's, materialised only by
-  the paused rebase, which a pre-check in the tool against our HEAD cannot see. Before this, a
-  collaborator's `notes.tex -> /outside` made a resolution write through the link into the outside
-  file and then report nothing-to-push, and `notes.tex -> refs.bib` reached a `.bib` past the
-  literal-name `confirmBibEdit` gate. `unmergedPaths` passes `-c core.quotePath=false` like every
-  other path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never
-  be resolved by name.
+- **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict
+  `push` aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way
+  payload per file (`base`/`ours`/`theirs` + marker `hunks`) plus
+  `conflictPaths`/`remoteHead`/`remoteCommits`. This payload is rendered into the result **text**
+  (`src/lib/conflictText.ts`), not only `structuredContent`, so an MCP-only client can resolve
+  without a shell. The caller resolves by retrying `push` with `resolutions` (full merged content
+  per file — used verbatim, applied _inside_ the rebase via add + `rebase --continue`); the set is
+  validated (missing/extra files named), `expectedRemoteHead` guards against a moved remote (compare
+  full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays gated behind
+  `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs` directly.
+  Keep the merged text originating from the caller. **A resolution is file content, so a path that
+  is a symlink on _either_ side of the conflict is refused** (rebase aborted, clone back to its
+  pre-push state) — `resolvePush` checks `lstat` in the paused rebase _and_ the ours/theirs index
+  stages (2/3) for mode 120000 (`hasLinkOnConflictSide`; a link only in the _base_ stage is one both
+  sides already replaced with a file, an ordinary content conflict), inside `GitService`, because
+  the link that matters is upstream's, materialised only by the paused rebase, which a pre-check in
+  the tool against our HEAD cannot see. Before this, a collaborator's `notes.tex -> /outside` made a
+  resolution write through the link into the outside file and then report nothing-to-push, and
+  `notes.tex -> refs.bib` reached a `.bib` past the literal-name `confirmBibEdit` gate.
+  `unmergedPaths` passes `-c core.quotePath=false` like every other path-returning git call: without
+  it a conflict on `é.tex` came back C-quoted and could never be resolved by name.
 - **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
   range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
   rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,

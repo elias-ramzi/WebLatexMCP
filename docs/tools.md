@@ -371,8 +371,11 @@ process over the same clone. Name each with `WEB_LATEX_MCP_SESSION` (see
   shadow rather than through `git add`, which used to let a file git ignores (`.gitignore`,
   `.git/info/exclude` — the local note `summarize-paper` keeps out of git that way) into a commit and
   a push. `commit` now asks git which of the session's files are ignored, skips them, lists them under
-  `ignored`, and drops them from the session's record; a tracked file that happens to match an ignore
-  pattern still commits, as it would under `git add`.
+  `ignored`, and drops them from the session's record; a tracked file that happens to match an
+  ignore pattern still commits, as it would under `git add`. "Tracked" follows the scope: the
+  session scope and `scope: "paths"` reset the index to HEAD before staging, so there it means
+  tracked at HEAD (a hand `git rm --cached` changes nothing); `scope: "all"` with `paths` stages
+  over the index as it stands, so there it means tracked in the index.
 
 Mutating operations are serialised across processes with a lock file, so two servers never rewrite the
 clone's index at once. The model, and what it deliberately does not do, is in [Parallel sessions on one
@@ -415,8 +418,9 @@ pushing) and **never force-pushes**. A rebase conflict means the agent and a hum
 — `ref` takes `remoteHead`/`mergeBase` or any commit sha.) It
 never auto-merges. To resolve, retry `push` with a `resolutions` array — the full merged content for each
 conflicted file (`.bib` files need `confirmBibEdit: true`); the set is validated (missing/extra files are
-named; a path that is a symlink on either side of the conflict is refused outright, since content cannot
-resolve a link — resolve that one by hand and push again), an optional `expectedRemoteHead` refuses the push if the remote moved again (abbreviated SHAs are
+named; a path that is a symlink on our or their side of the conflict is refused outright, since content
+cannot resolve a link — resolve that one by hand and push again; a link both sides already replaced with
+a file is an ordinary content conflict and resolves normally), an optional `expectedRemoteHead` refuses the push if the remote moved again (abbreviated SHAs are
 accepted), and success returns `pushedSha`. If the remote instead just keeps moving — a collaborator's
 push landing in the gap between fetch and push — the pull-rebase is retried automatically (up to 3
 rounds); losing every round returns `status: "remote-moved"` with nothing pushed and the clone intact —
