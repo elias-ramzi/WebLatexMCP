@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
-import { FileService } from '../../src/services/fileService.js';
+import { FileService, MAX_READ_BYTES } from '../../src/services/fileService.js';
 
 describe('FileService', () => {
   let dir: string;
@@ -378,5 +378,48 @@ describe('FileService out-of-band guard: byte vs string baseline agreement', () 
     await expect(files.delete(dir, 'figures/never-seen.png')).resolves.toMatchObject({
       path: 'figures/never-seen.png',
     });
+  });
+});
+
+describe('FileService readBytes size cap', () => {
+  // readBytes had no size cap at all — unlike read(), which refuses over MAX_READ_BYTES and
+  // returns a note instead of the content. Nothing in src/ calls readBytes yet, but the missing
+  // cap means a future caller (or MCP argument) could slurp an arbitrarily large file into memory.
+  let dir: string;
+  let files: FileService;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-fs-readcap-'));
+    await mkdir(path.join(dir, '.git'), { recursive: true });
+    files = new FileService();
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('reads a file of exactly MAX_READ_BYTES fine', async () => {
+    const bytes = Buffer.alloc(MAX_READ_BYTES, 0x41);
+    await writeFile(path.join(dir, 'at-cap.bin'), bytes);
+
+    const read = await files.readBytes(dir, { path: 'at-cap.bin' });
+    expect(read).not.toBeNull();
+    expect((read as Buffer).length).toBe(MAX_READ_BYTES);
+  });
+
+  it('throws over the cap by one byte, naming the read cap', async () => {
+    const bytes = Buffer.alloc(MAX_READ_BYTES + 1, 0x41);
+    await writeFile(path.join(dir, 'over-cap.bin'), bytes);
+
+    await expect(files.readBytes(dir, { path: 'over-cap.bin' })).rejects.toThrow(/read cap/);
+  });
+
+  it('still returns null for a missing file', async () => {
+    expect(await files.readBytes(dir, { path: 'nope.bin' })).toBeNull();
+  });
+
+  it('still refuses a directory the same way read() does', async () => {
+    await mkdir(path.join(dir, 'adir'), { recursive: true });
+    await expect(files.readBytes(dir, { path: 'adir' })).rejects.toThrow(/Not a file/);
   });
 });

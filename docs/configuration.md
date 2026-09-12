@@ -74,14 +74,13 @@ back from `registry.json` as it stands (for a project configured only through `W
 from this process's config). That form takes no other field: passing `rootFile`, `branch`, `username`,
 `tokenEnv` or `clone: false` with it is refused, because updating one needs `gitUrl` or `path` — and giving
 either re-registers the project from those arguments alone, replacing the stored entry, so pass every
-field you want kept. That:
+field you want kept — the result names any field of the previous configuration (persisted or in-process) the new registration dropped. That:
 
 - makes it the default **immediately** in the current session — the very next call that omits `project`
   resolves to it;
 - **persists** the flag (`"default": true` on its `registry.json` entry) so it stays the default across a
-  restart and for every other session reading the same workspace — taking effect at once in a session
-  that has no default of its own, while a session that already has one (from the env, or a persisted
-  flag it started with) keeps it until restart;
+  restart and for every other session reading the same workspace — taking effect at once in every
+  session that did not assert a default through the env var, whether or not it had one before;
 - **replaces** any previous default — only one project is ever the default at a time.
 
 `WEB_LATEX_MCP_DEFAULT_PROJECT` **always wins** when it is set, in every session that sets it, even over a

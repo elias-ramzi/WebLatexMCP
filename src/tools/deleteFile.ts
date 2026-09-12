@@ -40,6 +40,12 @@ export function registerDeleteFile(server: McpServer, ctx: AppContext): void {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
+        // No linkTarget check here (unlike write_file/edit_file/add_asset): FileService.delete
+        // ends in rm(abs), which unlinks the symlink itself — the .bib at the far end is never
+        // touched, so refusing "figures/x.png -> ../refs.bib" would only block removing a stale
+        // link a collaborator committed, while confirmBibEdit: true would "approve" a bibliography
+        // change that never actually happens. The literal isBibFile(relPath) check above is the
+        // whole guard for delete_file.
         return await ctx.projectManager.runExclusive(id, async () => {
           const res = await ctx.files.delete(dir, relPath, { overrideExternalChanges });
           return {

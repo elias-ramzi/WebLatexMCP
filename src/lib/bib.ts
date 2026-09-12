@@ -54,10 +54,19 @@ export function mergeBibEntry(existing: string, entry: string): BibMergeResult {
 /**
  * Why direct .bib mutation is refused, and the two sanctioned ways forward. Returned
  * from write/edit/delete when the target is a .bib file and `confirmBibEdit` is unset.
+ *
+ * `target`, when given, means `relPath` is not itself named `.bib` — it is a symlink (possibly
+ * through a linked directory) that lands on one, per `FileService.linkTarget`. The opening
+ * sentence then names both: the path the caller gave, and the .bib it actually resolves to,
+ * so the refusal is not mistaken for a false positive on a `.png`-named path.
  */
-export function bibEditBlockedMessage(relPath: string): string {
+export function bibEditBlockedMessage(relPath: string, target?: string): string {
+  const subject =
+    target === undefined
+      ? `"${relPath}" is a .bib bibliography file and is protected from direct changes.`
+      : `"${relPath}" is a link to "${target}", a .bib bibliography file, and is protected from direct changes.`;
   return (
-    `"${relPath}" is a .bib bibliography file and is protected from direct changes. ` +
+    `${subject} ` +
     'To add a reference, use search_references then add_citation, which fetch verified ' +
     'BibTeX from DBLP. To change the .bib another way (e.g. remove or fix an entry), ' +
     'first ask the user to approve the change, then retry with confirmBibEdit: true.'

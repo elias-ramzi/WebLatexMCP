@@ -120,7 +120,21 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   refuses outright when a live peer's index cannot be read (`null` from `peerEntries` means unreadable,
   never "owns nothing"). State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`), outside the clones. Keep this: the
-  guarantee is that a commit contains one session's lines and nobody else's.
+  guarantee is that a commit contains one session's lines and nobody else's. Two refinements keep
+  that honest: **equality between HEAD, a shadow and the working tree is judged through the path's
+  gitattributes clean filter** (`GitService.cleanBlobId`, wired into `ShadowStore` as its
+  `cleanHash`), because `commitContents` writes _filtered_ blobs — under `* text=auto` a CRLF `.svg`
+  lands as LF, and raw comparison flagged a file nobody else touched as `conflicted` forever (#63);
+  a genuine collision still conflicts. And **a recorder failure marks the path** (`markUnrecorded`,
+  via `src/lib/mutationRecorder.ts`): the write is still never failed, but the entry is written
+  `conflicted` + `unrecorded`, so a peer's `scope: "paths"` refuses it and this session's own commit
+  excludes it, instead of a live session's edit showing up as owned by nobody. And **taking the tree
+  deliberately settles what it took**: after a `scope: "all"`/`"paths"` commit, `commit` drops this
+  session's entries _under the paths the commit was given_ (`ShadowStore.settle`/`clear`, by
+  `coversPath`), whether or not git staged each one — deliberately, since an entry whose working tree
+  already equals HEAD stages nothing yet must still un-wedge. The flag is never cleared on an edit, and
+  `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
+  deliberate take or a discard ends that state.
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
@@ -156,7 +170,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
-  not blocked.
+  not blocked. It judges the **link-resolved** name too (`FileService.linkTarget` — symlinks only: a hard
+  link is invisible to `realpath`, and git cannot commit one): an in-project
+  `figures/x.png -> refs.bib` passes the escape check (it stays inside) and used to let `write_file`,
+  `edit_file` and `add_asset` change the bibliography with no confirmation. `linkTarget` decides
+  nothing about whether a path may be used — that stays `assertNoSymlinkEscape` — it only tells the
+  tool layer what the path is called at the far end, so every name-based gate can judge that too; it
+  runs inside `runExclusive`, so a peer cannot plant the link between the check and the write.
+  `delete_file` judges only the literal name: removing a link removes the link, not what it points at.
 - **`add_writing_convention` is guarded too, for the opposite reason.** When no extra writing guide is
   configured (`ctx.config.extraWritingGuidePath` unset), the unconfigured-guide error wins outright —
   there is nothing to confirm writing to a destination that doesn't exist, so the tool goes straight to
@@ -184,7 +205,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   why `add_asset` deliberately returns **no diff** and why every syscall outcome on the source collapses
   to found / not-found / unresolvable with no errno text. Widen `ASSET_EXT` only for a genuine figure
   format — it is a security gate, not a convenience — and keep the source-side check: the destination
-  check alone constrains nothing about what is read.
+  check alone constrains nothing about what is read. The destination is judged on its link-resolved name as well
+  (`linkTarget`, above): a link named `figures/x.png` whose target is not an asset type is refused.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
   "what the server last saw". `write_file`/`edit_file`/`delete_file` refuse (throw `ExternalChangeError`)

@@ -363,6 +363,66 @@ describe('ProjectManager', () => {
     });
   });
 
+  describe('previousRegistration', () => {
+    it('falls back to the in-process config when the id has no registry entry', () => {
+      // The case PR #64 missed: a project configured through WEB_LATEX_MCP_PROJECTS (or
+      // registered in-session via project_sync { gitUrl }) is held only in `this.projects` and
+      // was never written to the registry — `registryEntry`-style "registry only" lookup finds
+      // nothing here, which is exactly the silent-loss gap this method exists to close.
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            {
+              id: 'thesis',
+              gitUrl: 'https://git.overleaf.com/abc',
+              rootFile: 'thesis.tex',
+              branch: 'main',
+            },
+          ],
+        },
+        store,
+      );
+
+      expect(pm.previousRegistration('thesis')).toEqual({
+        id: 'thesis',
+        gitUrl: 'https://git.overleaf.com/abc',
+        rootFile: 'thesis.tex',
+        branch: 'main',
+      });
+    });
+
+    it('prefers the registry’s own entry over a stale in-process config', () => {
+      // Same reasoning as setDefaultProject's "not a stale in-process snapshot" case: a peer
+      // session may have re-registered the id since this process last loaded it.
+      const store = makeFakeRegistry();
+      store.entries = [
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/def', rootFile: 'new.tex' },
+      ];
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def', rootFile: 'old.tex' }],
+        },
+        store,
+      );
+
+      expect(pm.previousRegistration('paper')).toEqual({
+        id: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'new.tex',
+      });
+    });
+
+    it('returns undefined when neither the registry nor the in-process config knows the id', () => {
+      const pm = new ProjectManager(makeConfig(), makeFakeRegistry());
+      expect(pm.previousRegistration('ghost')).toBeUndefined();
+    });
+  });
+
   it('falls back to the registry’s persisted default when the config has none', () => {
     const store = makeFakeRegistry();
     store.entries = [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }];
@@ -451,6 +511,88 @@ describe('ProjectManager', () => {
     it('attributes a directory back to its local project', () => {
       const pm = new ProjectManager(localConfig());
       expect(pm.idForDir(localDir)).toBe('cv');
+    });
+  });
+
+  describe('defaultProjectId precedence between the registry and the in-process value', () => {
+    // Regression for the gap documented in docs/CONCURRENCY.md: a peer session's
+    // `register_project { default: true }` must reach every env-unset session consistently,
+    // not only one that started with NO default. Before the fix, `defaultProjectId()` was
+    // `this.defaultProject ?? this.registry?.readDefault()` — so a process that started with
+    // `defaultProject: 'a'` (taken from the registry's default AT STARTUP, not asserted via
+    // WEB_LATEX_MCP_DEFAULT_PROJECT) never saw a later peer update, because the truthy
+    // in-process snapshot shadowed the `??` fallback to `readDefault()` forever.
+    it('a live, non-explicit registry default wins over the in-process value taken at startup', () => {
+      const store = makeFakeRegistry();
+      store.defaultId = 'b';
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            { id: 'a', gitUrl: 'https://git.overleaf.com/a' },
+            { id: 'b', gitUrl: 'https://git.overleaf.com/b' },
+          ],
+          defaultProject: 'a',
+          defaultProjectExplicit: false,
+        },
+        store,
+      );
+      expect(pm.defaultProjectId()).toBe('b');
+    });
+
+    it('an explicit WEB_LATEX_MCP_DEFAULT_PROJECT always wins over the registry default', () => {
+      const store = makeFakeRegistry();
+      store.defaultId = 'b';
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            { id: 'a', gitUrl: 'https://git.overleaf.com/a' },
+            { id: 'b', gitUrl: 'https://git.overleaf.com/b' },
+          ],
+          defaultProject: 'a',
+          defaultProjectExplicit: true,
+        },
+        store,
+      );
+      expect(pm.defaultProjectId()).toBe('a');
+    });
+
+    it('falls back to the in-process value when no registry is wired', () => {
+      const pm = new ProjectManager({
+        workspaceRoot,
+        sessionId: 'test',
+        projects: [{ id: 'a', gitUrl: 'https://git.overleaf.com/a' }],
+        defaultProject: 'a',
+      });
+      expect(pm.defaultProjectId()).toBe('a');
+    });
+
+    it('falls back to the in-process value when the registry is wired but names no default', () => {
+      const store = makeFakeRegistry();
+      store.defaultId = undefined;
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [{ id: 'a', gitUrl: 'https://git.overleaf.com/a' }],
+          defaultProject: 'a',
+        },
+        store,
+      );
+      expect(pm.defaultProjectId()).toBe('a');
+    });
+
+    it('picks up a registerAndPersist({ makeDefault: true }) default through the registry', async () => {
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+      await pm.registerAndPersist(
+        { id: 'fresh', gitUrl: 'https://git.overleaf.com/fresh' },
+        { makeDefault: true },
+      );
+      expect(pm.defaultProjectId()).toBe('fresh');
     });
   });
 });

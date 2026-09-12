@@ -86,6 +86,29 @@ export function assetSourceBlockedMessage(sourcePath: string): string {
   );
 }
 
+/**
+ * Why a destination was refused because it is a symlink landing somewhere add_asset must not
+ * write: `relPath` names an asset-typed path — it cleared `assetTypeBlockedMessage`'s check on
+ * its own name — but it is a link (possibly through a linked directory) to `target`, which is not
+ * itself a recognized asset type. This message fires from the link check, which the tool layer
+ * runs *before* `resolveAssetSource` (so `sourcePath`/`contentBase64` are never even looked at
+ * for a destination that resolves to something add_asset must not overwrite); it is not, and does
+ * not depend on, `assetSourceBlockedMessage`'s check on the source side. Mirrors
+ * `assetTypeBlockedMessage`'s wording (same allowlist, same "use write_file / add_citation
+ * instead" guidance) so a `.tex` or `.bib` at the far end is refused with the same actionable
+ * message whether the caller named it directly or through a link. Modeled on
+ * `bibEditBlockedMessage`'s target-naming form.
+ */
+export function assetLinkBlockedMessage(relPath: string, target: string): string {
+  const allowed = [...ASSET_EXT].sort().join(', ');
+  return (
+    `"${relPath}" is a link to "${target}", which is not a recognized asset type. ` +
+    `add_asset only writes binary figures with one of these extensions: ${allowed}. ` +
+    'For a text or .tex file at the far end, use write_file. For a .bib bibliography entry, ' +
+    'use add_citation.'
+  );
+}
+
 /** Why an asset was refused for being too large, naming both the actual size and the cap. */
 export function assetTooLargeMessage(relPath: string, bytes: number, cap: number): string {
   const mib = (n: number) => (n / (1024 * 1024)).toFixed(1);

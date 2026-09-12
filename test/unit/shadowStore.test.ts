@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
 import {
   ShadowStore,
   latestTouch,
   type ShadowChange,
   type PeerShadowEntry,
+  type CleanHasher,
 } from '../../src/services/shadowStore.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
 
@@ -47,6 +48,25 @@ describe('ShadowStore', () => {
       sessionId,
       (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
       now,
+    );
+
+  /**
+   * A fake `CleanHasher` standing in for `GitService.cleanBlobId`: it normalises CRLF to LF
+   * (decoding as UTF-8, which is fine for the ASCII fixtures these tests use) so two byte strings
+   * that only differ in line endings hash equal — exactly what a `* text=auto` clean filter does
+   * for git's real `hash-object`, without spawning git.
+   */
+  const crlfNormalizingHasher: CleanHasher = (_dir, _rel, bytes) =>
+    Promise.resolve(bytes.toString('utf8').replace(/\r\n/g, '\n'));
+
+  /** Same as `makeStore`, but with the fake clean hasher wired in. */
+  const makeHashingStore = (sessionId: string): ShadowStore =>
+    new ShadowStore(
+      workspace,
+      sessionId,
+      (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
+      undefined,
+      crlfNormalizingHasher,
     );
 
   beforeEach(async () => {
@@ -197,6 +217,86 @@ describe('ShadowStore', () => {
     expect(only(await store.changes(PROJECT)).path).toBe('sections/new.tex');
   });
 
+  describe('clear', () => {
+    it('drops the shadow state but leaves the session record (heartbeat) in place', async () => {
+      // `commit scope: "all"` calls this after every commit; wiping the whole session directory
+      // would delete `session.json` and make the session look dead to peers until the next
+      // throttled heartbeat.
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, REL, BASE, `${BASE}edited\n`);
+      const dir = sessionDir(workspace, PROJECT, 'a');
+      await writeFile(path.join(dir, 'session.json'), '{"heartbeatAt":"now"}');
+
+      await store.clear(PROJECT);
+
+      expect(await store.hasChanges(PROJECT)).toBe(false);
+      expect(await readFile(path.join(dir, 'session.json'), 'utf8')).toBe('{"heartbeatAt":"now"}');
+      await expect(readFile(path.join(dir, 'shadow.json'))).rejects.toThrow();
+    });
+  });
+
+  describe('settle', () => {
+    it('drops an entry named exactly, leaving others untouched', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, REL, BASE, `${BASE}edited\n`);
+      await store.record(PROJECT, DIR, 'notes.tex', null, 'fresh\n');
+
+      const dropped = await store.settle(PROJECT, [REL]);
+      expect(dropped).toEqual([REL]);
+
+      const remaining = await store.changes(PROJECT);
+      expect(remaining.map((c) => c.path)).toEqual(['notes.tex']);
+    });
+
+    it('drops every entry under a covering directory', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, 'figures/a.tex', null, 'a\n');
+      await store.record(PROJECT, DIR, 'figures/sub/b.tex', null, 'b\n');
+      await store.record(PROJECT, DIR, 'notes.tex', null, 'fresh\n');
+
+      const dropped = await store.settle(PROJECT, ['figures']);
+      expect(dropped.sort()).toEqual(['figures/a.tex', 'figures/sub/b.tex']);
+
+      const remaining = await store.changes(PROJECT);
+      expect(remaining.map((c) => c.path)).toEqual(['notes.tex']);
+    });
+
+    it('drops a conflicted/unrecorded entry too — settling does not check the flag', async () => {
+      const store = makeStore('a');
+      await store.markUnrecorded(PROJECT, REL);
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+
+      const dropped = await store.settle(PROJECT, [REL]);
+      expect(dropped).toEqual([REL]);
+      expect(await store.changes(PROJECT)).toEqual([]);
+      expect(await store.hasChanges(PROJECT)).toBe(false);
+    });
+
+    it('returns [] and touches nothing when no path covers any entry', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, REL, BASE, `${BASE}edited\n`);
+
+      const dropped = await store.settle(PROJECT, ['figures']);
+      expect(dropped).toEqual([]);
+      expect(only(await store.changes(PROJECT)).path).toBe(REL);
+    });
+
+    it('removes the shadow/base files on disk, not just the index entry', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, REL, BASE, `${BASE}edited\n`);
+
+      const shadowPath = path.join(sessionDir(workspace, PROJECT, 'a'), 'shadow', REL);
+      const basePath = path.join(sessionDir(workspace, PROJECT, 'a'), 'base', REL);
+      await expect(readFile(shadowPath)).resolves.toBeDefined();
+      await expect(readFile(basePath)).resolves.toBeDefined();
+
+      await store.settle(PROJECT, [REL]);
+
+      await expect(readFile(shadowPath)).rejects.toThrow();
+      await expect(readFile(basePath)).rejects.toThrow();
+    });
+  });
+
   it('clearAll drops every session, not just this one', async () => {
     const a = makeStore('a');
     const b = makeStore('b');
@@ -306,6 +406,162 @@ describe('ShadowStore', () => {
         touchedAt: new Date(clock).toISOString(),
       },
     ]);
+  });
+
+  describe('markUnrecorded', () => {
+    it('flags a fresh path conflicted + unrecorded, with no shadow content', async () => {
+      const store = makeStore('a');
+      await store.markUnrecorded(PROJECT, REL);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      expect(change.content).toBeNull();
+    });
+
+    it("peerEntries lists it conflicted, with a touchedAt, for the session's own id", async () => {
+      const clock = 1_700_000_000_000;
+      const store = makeClockedStore('a', () => clock);
+      await store.markUnrecorded(PROJECT, REL);
+
+      const entries = await store.peerEntries(PROJECT, 'a');
+      expect(entries).toEqual([
+        { path: REL, deleted: false, conflicted: true, touchedAt: new Date(clock).toISOString() },
+      ]);
+    });
+
+    it('a later record() leaves it conflicted (sticky)', async () => {
+      const store = makeStore('a');
+      await store.markUnrecorded(PROJECT, REL);
+
+      await store.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha, later.'));
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      expect(change.content).toBeNull(); // never folded in — record's conflicted early return
+    });
+
+    it('refresh reports it conflicted and does not throw when HEAD has no file for it', async () => {
+      const store = makeStore('a');
+      await store.markUnrecorded(PROJECT, 'sections/never-existed.tex');
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      // An unrecorded entry is reported conflicted on every refresh, unconditionally — refresh
+      // never even reaches the "has HEAD moved" check for it (see the #64 fix): that check says
+      // nothing about a shadow that is known to be missing this session's latest write.
+      expect(refreshed.conflicted).toEqual(['sections/never-existed.tex']);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.advanced).toEqual([]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+    });
+
+    it('refresh leaves it conflicted and does not throw when HEAD does have the file', async () => {
+      const store = makeStore('a');
+      await store.markUnrecorded(PROJECT, REL); // HEAD already holds REL (set in beforeEach)
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.conflicted).toEqual([REL]);
+      expect(refreshed.settled).toEqual([]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+    });
+
+    it('refresh does not advance an unrecorded entry even when a non-overlapping HEAD change merges cleanly (#64 regression)', async () => {
+      // Reproduces the reviewer's probe: a write reached the working tree and was folded into the
+      // shadow, but a LATER write on the same path failed to record (`markUnrecorded`) — so the
+      // shadow is missing that latest edit. A peer's unrelated commit then lands, and a bare
+      // three-way merge of the (stale) shadow onto the new HEAD succeeds cleanly, which must NOT
+      // be allowed to clear `conflicted`/`unrecorded`: the shadow still lacks the write that failed
+      // to record, so staging it would silently drop that edit (and, via `commitContents`, revert
+      // it if it happened to already be in the working tree).
+      const store = makeStore('a');
+      const mine = BASE.replace('Beta line.', 'Beta, MINE.');
+      await store.record(PROJECT, DIR, REL, BASE, mine); // shadow now holds "Beta, MINE."
+      await store.markUnrecorded(PROJECT, REL); // a later write failed to fold in
+
+      // A peer's commit changes a different line — a change that would merge cleanly onto the
+      // stale shadow if `refresh` didn't special-case `unrecorded`.
+      const peerLanded = BASE.replace('Alpha line.', 'Alpha, PEER.');
+      setHead(REL, peerLanded);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.advanced).toEqual([]);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      // The shadow is untouched — not merged with the peer's line.
+      expect(change.content).toBe(mine);
+    });
+
+    it('refresh does not settle/forget an unrecorded entry even when HEAD lands on bytes equal to the shadow (#64 regression)', async () => {
+      const store = makeStore('a');
+      const mine = BASE.replace('Beta line.', 'Beta, MINE.');
+      await store.record(PROJECT, DIR, REL, BASE, mine);
+      await store.markUnrecorded(PROJECT, REL);
+
+      // HEAD happens to land on exactly the shadow's bytes (e.g. a peer independently made the
+      // same edit) — this must not be read as "our change is what landed", because the shadow is
+      // known to be missing this session's latest write.
+      setHead(REL, mine);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.advanced).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      expect(change.content).toBe(mine);
+    });
+
+    it('peerEntries reports conflicted:true for an unrecorded entry even when the raw index has no conflicted field', async () => {
+      // Belt-and-braces derivation: write an index by hand with `unrecorded: true` and no
+      // `conflicted` field at all, proving peerEntries does not rely solely on the raw flag.
+      const dir = sessionDir(workspace, PROJECT, 'raw');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        path.join(dir, 'shadow.json'),
+        JSON.stringify({
+          entries: {
+            [REL]: { deleted: false, baseExists: true, unrecorded: true },
+          },
+        }),
+        'utf8',
+      );
+
+      const store = makeStore('a');
+      const entries = await store.peerEntries(PROJECT, 'raw');
+      expect(entries).toEqual([{ path: REL, deleted: false, conflicted: true, touchedAt: null }]);
+    });
+
+    it('on an existing entry, keeps its binary/deleted fields and just flags it', async () => {
+      const store = makeStore('a');
+      const rel = 'figs/photo.png';
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]);
+      await store.record(PROJECT, DIR, rel, null, png);
+      const before = only(await store.changes(PROJECT));
+      expect(before.binary).toBe(true);
+      expect(before.conflicted).toBe(false);
+
+      await store.markUnrecorded(PROJECT, rel);
+
+      const after = only(await store.changes(PROJECT));
+      expect(after.binary).toBe(true); // preserved
+      expect(after.conflicted).toBe(true);
+      expect(after.unrecorded).toBe(true);
+      // The shadow bytes this session already recorded are untouched — only the flag changed.
+      expect(Buffer.isBuffer(after.content) && Buffer.compare(after.content, png) === 0).toBe(true);
+    });
   });
 
   it('parses a hand-written index missing touchedAt as touchedAt: null', async () => {
@@ -493,6 +749,133 @@ describe('ShadowStore', () => {
       // And conflicted stays flagged through a further write, exactly as elsewhere in this file.
       await store.record(PROJECT, DIR, svgRel, svgBytes, Buffer.from([0x07, 0x08, 0x09]));
       expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+    });
+  });
+
+  describe('clean-filter equality (#63)', () => {
+    const CRLF_REL = 'figures/diagram.svg';
+    const crlf = (s: string): Buffer => Buffer.from(s.replace(/\n/g, '\r\n'), 'utf8');
+    const lf = (s: string): Buffer => Buffer.from(s, 'utf8');
+    const SVG = '<svg>\n<rect/>\n</svg>\n';
+
+    it('refresh settles a binary entry whose shadow is CRLF when HEAD is the LF-normalised version', async () => {
+      const store = makeHashingStore('a');
+      await store.record(PROJECT, DIR, CRLF_REL, null, crlf(SVG));
+      expect(only(await store.changes(PROJECT)).binary).toBe(true);
+
+      // Simulate `commitContents` having clean-filtered the CRLF bytes to LF when writing HEAD.
+      setHead(CRLF_REL, lf(SVG));
+      const refreshed = await store.refresh(PROJECT, DIR);
+
+      expect(refreshed.settled).toEqual([CRLF_REL]);
+      expect(refreshed.conflicted).toEqual([]);
+      expect(await store.changes(PROJECT)).toEqual([]);
+    });
+
+    it('refresh settles a text entry whose shadow is CRLF when HEAD is the LF-normalised version', async () => {
+      const store = makeHashingStore('a');
+      const rel = 'notes.tex';
+      await store.record(PROJECT, DIR, rel, null, crlf(SVG).toString('utf8'));
+      expect(only(await store.changes(PROJECT)).binary).toBe(false);
+
+      setHead(rel, lf(SVG));
+      const refreshed = await store.refresh(PROJECT, DIR);
+
+      expect(refreshed.settled).toEqual([rel]);
+      expect(refreshed.conflicted).toEqual([]);
+      expect(await store.changes(PROJECT)).toEqual([]);
+    });
+
+    it('record on a binary entry accepts a before that differs raw but hashes equal to the shadow', async () => {
+      const store = makeHashingStore('a');
+      await store.record(PROJECT, DIR, CRLF_REL, null, crlf(SVG));
+
+      // The working tree now (as far as this call is told) holds the LF-normalised bytes — as it
+      // would if `commitContents` had just written HEAD and the caller re-read the file off disk
+      // before writing again — even though the shadow still holds the original CRLF bytes.
+      const after = crlf('<svg>\n<rect fill="red"/>\n</svg>\n');
+      await store.record(PROJECT, DIR, CRLF_REL, lf(SVG), after);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(false);
+      expect(Buffer.compare(change.content as Buffer, after)).toBe(0);
+    });
+
+    it('a before whose normalised content differs still conflicts, even with the hasher present', async () => {
+      const store = makeHashingStore('a');
+      await store.record(PROJECT, DIR, CRLF_REL, null, crlf(SVG));
+
+      // Genuinely different content (not just line endings) — normalising CRLF->LF does not make
+      // this equal to the shadow, so it must still conflict.
+      const peerContent = lf('<svg>\n<rect fill="blue"/>\n</svg>\n');
+      await store.record(
+        PROJECT,
+        DIR,
+        CRLF_REL,
+        peerContent,
+        crlf('<svg>\n<rect/>\n<x/>\n</svg>\n'),
+      );
+
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+    });
+
+    it('without a hasher, refresh stays byte-exact and still conflicts on a CRLF/LF mismatch', async () => {
+      const store = makeStore('a'); // no CleanHasher wired
+      await store.record(PROJECT, DIR, CRLF_REL, null, crlf(SVG));
+
+      setHead(CRLF_REL, lf(SVG));
+      const refreshed = await store.refresh(PROJECT, DIR);
+
+      expect(refreshed.conflicted).toEqual([CRLF_REL]);
+      expect(refreshed.settled).toEqual([]);
+    });
+
+    it('a hasher that throws (e.g. an uninstalled filter= driver) fails safe: refresh conflicts rather than rejecting', async () => {
+      const throwingHasher: CleanHasher = () =>
+        Promise.reject(new Error('git hash-object failed (simulated): unknown filter driver'));
+      const store = new ShadowStore(
+        workspace,
+        'a',
+        (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
+        undefined,
+        throwingHasher,
+      );
+      const rel = 'notes.tex';
+      await store.record(PROJECT, DIR, rel, null, crlf(SVG).toString('utf8'));
+
+      setHead(rel, lf(SVG));
+      // Byte-exact comparison already fails (CRLF vs LF), so refresh falls back to the hasher,
+      // which throws — this must not reject the call, and must not silently treat the two as
+      // equal (settled) either: the honest answer when we cannot vouch for equality is the same
+      // as when no hasher was wired at all.
+      await expect(store.refresh(PROJECT, DIR)).resolves.toEqual({
+        advanced: [],
+        conflicted: [rel],
+        settled: [],
+      });
+    });
+
+    it('a hasher that throws makes record() on a binary entry conflict rather than reject', async () => {
+      const throwingHasher: CleanHasher = () =>
+        Promise.reject(new Error('git hash-object failed (simulated)'));
+      const store = new ShadowStore(
+        workspace,
+        'a',
+        (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
+        undefined,
+        throwingHasher,
+      );
+      await store.record(PROJECT, DIR, CRLF_REL, null, crlf(SVG));
+
+      // Working tree now holds bytes that differ raw from the shadow (the LF-normalised form) —
+      // exactly the case that would consult the hasher. It throws, so this must resolve (not
+      // reject) with the entry flagged conflicted, never silently accepted as a match.
+      await expect(
+        store.record(PROJECT, DIR, CRLF_REL, lf(SVG), crlf('<svg>\n<rect fill="red"/>\n</svg>\n')),
+      ).resolves.toBeUndefined();
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
     });
   });
 });

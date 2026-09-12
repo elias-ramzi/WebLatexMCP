@@ -59,6 +59,13 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
+          // Inside the lock: a peer session's own mutations take this same per-project lock, so
+          // checking here (rather than before runExclusive) closes the window where a peer could
+          // land a symlink onto refs.bib between the check and the write.
+          const target = await ctx.files.linkTarget(dir, relPath);
+          if (target !== null && isBibFile(target) && !confirmBibEdit) {
+            throw new Error(bibEditBlockedMessage(relPath, target));
+          }
           const res = await ctx.files.write(dir, {
             path: relPath,
             content,

@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile, rm, readdir } from 'node:fs/promises';
 import { merge3 } from '../lib/merge3.js';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
 import { toPosix } from '../lib/paths.js';
+import { coversPath } from '../lib/commitPaths.js';
 import { writeAtomic } from './sessionRegistry.js';
 
 /**
@@ -12,6 +13,15 @@ import { writeAtomic } from './sessionRegistry.js';
  * (e.g. a PNG) byte-identically instead of mangling it through a UTF-8 round trip.
  */
 export type HeadReader = (projectDir: string, relPath: string) => Promise<Buffer | null>;
+
+/**
+ * The blob id `bytes` would get if committed at `relPath` in `projectDir` — clean filter applied,
+ * nothing written. Injected (rather than importing `GitService` directly) for the same reason
+ * `HeadReader` is: this store stays independent of git, and tests can drive it without a
+ * repository. See `GitService.cleanBlobId`, and the class doc comment below, for why the store
+ * needs this at all.
+ */
+export type CleanHasher = (projectDir: string, relPath: string, bytes: Buffer) => Promise<string>;
 
 /** One file this session has changed, as tracked on disk. */
 interface ShadowIndexEntry {
@@ -41,6 +51,15 @@ interface ShadowIndexEntry {
    * text, matching how those entries were actually stored.
    */
   binary?: boolean;
+  /**
+   * Set when a write reached the working tree but its shadow record failed (`touch`/`record`
+   * threw — an unreadable HEAD, an unwritable `.sessions/` dir, …), so the shadow does not hold
+   * this session's latest change to the file. Always paired with `conflicted`, which is what
+   * actually keeps the entry sticky and excluded from commits — this flag only distinguishes the
+   * two causes ("a peer's commit landed on the same lines" vs. "this session's own record
+   * failed") in messages shown to the caller.
+   */
+  unrecorded?: boolean;
 }
 
 interface ShadowIndex {
@@ -69,12 +88,17 @@ export interface ShadowChange {
   conflicted: boolean;
   /** True when this file's shadow holds raw bytes rather than text — see `ShadowIndexEntry.binary`. */
   binary: boolean;
+  /** True when this session's latest change to the file could not be recorded — see `markUnrecorded`. */
+  unrecorded: boolean;
 }
 
 export interface RefreshResult {
   /** Files whose shadow was successfully carried onto the new HEAD. */
   advanced: string[];
-  /** Files where this session's edits and a commit touched the same lines. */
+  /**
+   * Files left flagged: where this session's edits and a commit touched the same lines, plus every
+   * `unrecorded` entry, which `refresh` skips without reading HEAD (see the loop in `refresh`).
+   */
   conflicted: string[];
   /** Files dropped because the session's change is now part of HEAD (typically its own commit). */
   settled: string[];
@@ -96,6 +120,25 @@ export interface RefreshResult {
  *
  * `record` maintains it as edits land, `refresh` restores it after HEAD moves (a peer's commit, a
  * pull, a rebase). Both do so by three-way merge, never by guessing which hunk belongs to whom.
+ *
+ * Equality between HEAD/shadow/working-tree bytes is judged *through the path's clean filter*,
+ * not just raw byte comparison, because `commit`'s session scope stages via
+ * `GitService.commitContents`, which writes each blob with `git hash-object --path` — so a clone
+ * whose `.gitattributes` normalises a path (e.g. `* text=auto` turning a CRLF `.svg` into LF)
+ * ends up with a HEAD blob that differs, byte-for-byte, from what this session's shadow holds,
+ * even though nobody else touched the file. Raw comparison then read that as a peer's change and
+ * flagged the entry `conflicted` — sticky, so it never cleared (#63). `sameAsGitSees` (below) asks
+ * git what blob id the bytes would get at that path; two byte strings with the same id are the
+ * same content *as git will store it*. This is consulted only as a fallback after raw equality
+ * already failed, and only when a `CleanHasher` is wired — see `sameAsGitSees`. The invariant
+ * itself is unchanged, and nothing here weakens it: a genuine collision (different content even
+ * after normalisation) still conflicts, a binary shadow is still never three-way merged, and
+ * `conflicted` still stays sticky once set.
+ *
+ * The fallback trusts whatever clean filter the path actually has, not only a `text`/`eol`
+ * normaliser: a lossy custom `filter=` driver (e.g. one that strips a generated section before
+ * hashing) makes two contents equal here exactly when it would make them equal in the commit —
+ * which is the honest answer, since nothing else could ever be committed for that path either.
  */
 export class ShadowStore {
   constructor(
@@ -103,7 +146,41 @@ export class ShadowStore {
     readonly sessionId: string,
     private readonly readHead: HeadReader,
     private readonly now: () => number = Date.now,
+    private readonly cleanHash?: CleanHasher,
   ) {}
+
+  /**
+   * Whether `a` and `b` are the same content *as git would store it* at `rel` — i.e. they clean-
+   * filter to the same blob id — used only as a fallback once a raw byte/string comparison has
+   * already failed. Returns `false` outright when no `CleanHasher` was wired (byte-exact behaviour
+   * is preserved for every caller that does not supply one, including every existing test). Spawns
+   * git twice, so callers must only reach this after the cheap raw comparison has already missed.
+   */
+  private async sameAsGitSees(
+    projectDir: string,
+    rel: string,
+    a: Buffer,
+    b: Buffer,
+  ): Promise<boolean> {
+    if (!this.cleanHash) return false;
+    try {
+      const [idA, idB] = await Promise.all([
+        this.cleanHash(projectDir, rel, a),
+        this.cleanHash(projectDir, rel, b),
+      ]);
+      return idA === idB;
+    } catch (err) {
+      // A git hiccup here (e.g. a `.gitattributes` naming an uninstalled `filter=` driver) must
+      // not turn into a sticky conflict, nor fail whatever caller asked (`refresh`/`record`, and
+      // transitively `status`/`commit`) — it means only "we cannot vouch these are the same", the
+      // same byte-exact answer as when no hasher is wired at all.
+      console.error(
+        `[web-latex-mcp] could not clean-filter "${rel}" to compare shadow content — treating ` +
+          `as changed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
 
   /**
    * Fold a mutation this session just made into its shadow.
@@ -176,11 +253,18 @@ export class ShadowStore {
       // `after` is a string too, and `toBuffer(after)` below re-encodes exactly what the text tool
       // wrote — only the comparison was lossy, never the write. A Buffer `before` never takes this
       // branch, so a genuine byte-level collision between two binary writers still conflicts.
-      const beforeMatchesShadow =
+      let beforeMatchesShadow =
         shadowBuf === null ||
         beforeBuf === null ||
         shadowBuf.equals(beforeBuf) ||
         (typeof before === 'string' && shadowBuf.toString('utf8') === before);
+      // Raw comparison failed: as a fallback, ask git whether the two sides would clean-filter to
+      // the same blob (e.g. a clone-wide `* text=auto` normalising CRLF to LF) — see the class doc
+      // comment and `sameAsGitSees`. Only reached with both sides present, so this never fires on
+      // the common (equal, or plainly new-file) path.
+      if (!beforeMatchesShadow && shadowBuf !== null && beforeBuf !== null) {
+        beforeMatchesShadow = await this.sameAsGitSees(projectDir, rel, shadowBuf, beforeBuf);
+      }
       if (beforeMatchesShadow) {
         entry.deleted = false;
         entry.conflicted = false;
@@ -193,13 +277,23 @@ export class ShadowStore {
       const shadowStr = shadow === null ? null : shadow.toString('utf8');
       const beforeStr = before === null ? null : before.toString('utf8');
       const afterStr = after.toString('utf8');
-      if (shadowStr === null || beforeStr === null || shadowStr === beforeStr) {
-        // Nothing to reconcile: a new file, one we are re-creating, or a working tree that has
-        // not diverged from our shadow — the edit applies to the shadow directly.
+      let directApply = shadowStr === null || beforeStr === null || shadowStr === beforeStr;
+      // Raw string comparison failed: fall back to clean-filtered equality, exactly as the binary
+      // branch does — a CRLF `.tex` on a clone with `* text=auto` normalises to the same LF blob,
+      // which means the working tree held no peer lines, so applying `after` directly is honest.
+      if (!directApply && shadow !== null && before !== null) {
+        directApply = await this.sameAsGitSees(projectDir, rel, shadow, toBuffer(before));
+      }
+      if (directApply) {
+        // Nothing to reconcile: a new file, one we are re-creating, a working tree that has not
+        // diverged from our shadow, or one that has diverged only in a way git's clean filter
+        // erases — the edit applies to the shadow directly.
         entry.deleted = false;
         entry.conflicted = false;
         await this.writeShadow(projectId, rel, Buffer.from(afterStr, 'utf8'));
-      } else {
+      } else if (shadowStr !== null && beforeStr !== null) {
+        // Re-checked (rather than asserted) so the compiler can narrow these to `string`:
+        // `directApply` is false here only when both were already non-null and unequal.
         const { merged, conflicted } = await merge3(shadowStr, beforeStr, afterStr);
         if (conflicted) {
           // This session just edited lines a peer had already changed in the working tree. There
@@ -218,6 +312,29 @@ export class ShadowStore {
     await this.writeIndex(projectId, index);
   }
 
+  /**
+   * Flag a path as having a write that reached the working tree but could not be folded into the
+   * shadow (`touch` or `record` threw). Called by the mutation recorder's own failure path
+   * (`src/lib/mutationRecorder.ts`), never by `record` itself.
+   *
+   * Takes whatever entry already exists — preserving its `binary`/`deleted`/`baseExists` — or
+   * creates a bare one (`baseExists: false`) for a path this session had not touched before, since
+   * a write can fail to record on its very first touch. Either way the entry ends up `conflicted`
+   * (the flag that actually excludes it from commits and keeps it sticky — see the class doc
+   * comment) and `unrecorded` (which only distinguishes *why*, in messages). `touchedAt` is
+   * stamped too, since the session did write the file.
+   */
+  async markUnrecorded(projectId: string, relPath: string): Promise<void> {
+    const rel = toPosix(relPath);
+    const index = await this.readIndex(projectId);
+    const entry: ShadowIndexEntry = index.entries[rel] ?? { deleted: false, baseExists: false };
+    entry.conflicted = true;
+    entry.unrecorded = true;
+    entry.touchedAt = new Date(this.now()).toISOString();
+    index.entries[rel] = entry;
+    await this.writeIndex(projectId, index);
+  }
+
   /** Every change this session currently owns, resolved to content. */
   async changes(projectId: string): Promise<ShadowChange[]> {
     const index = await this.readIndex(projectId);
@@ -230,8 +347,11 @@ export class ShadowStore {
         path: rel,
         content: binary ? shadow : (shadow?.toString('utf8') ?? null),
         base: binary ? base : (base?.toString('utf8') ?? null),
-        conflicted: entry.conflicted === true,
+        // Belt and braces: an unrecorded entry is reported conflicted regardless of the raw flag,
+        // so no future code path that clears `conflicted` can make it look committable.
+        conflicted: entry.conflicted === true || entry.unrecorded === true,
         binary,
+        unrecorded: entry.unrecorded === true,
       });
     }
     return out.sort((a, b) => a.path.localeCompare(b.path));
@@ -277,7 +397,10 @@ export class ShadowStore {
       .map(([p, entry]) => ({
         path: p,
         deleted: entry.deleted === true,
-        conflicted: entry.conflicted === true,
+        // Belt and braces, matching `changes()`: an unrecorded entry is reported conflicted
+        // regardless of the raw flag, so no future code path that clears `conflicted` can make a
+        // peer treat it as safe to route around.
+        conflicted: entry.conflicted === true || entry.unrecorded === true,
         touchedAt: entry.touchedAt ?? null,
       }))
       .sort((a, b) => a.path.localeCompare(b.path));
@@ -289,19 +412,43 @@ export class ShadowStore {
    * Call after anything that moves HEAD or rewrites the tree — this session committing, a peer
    * committing, a pull, a rebase. Files whose change is now in HEAD stop being tracked; files
    * where HEAD and this session changed the same lines are marked conflicted and left alone,
-   * so nothing is resolved on the session's behalf.
+   * so nothing is resolved on the session's behalf. An `unrecorded` entry is skipped entirely —
+   * its shadow is known-incomplete, so neither a clean merge nor "HEAD equals the shadow" says
+   * anything about it — and reported under `conflicted` as it was.
    */
   async refresh(projectId: string, projectDir: string): Promise<RefreshResult> {
     const index = await this.readIndex(projectId);
     const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
 
     for (const [rel, entry] of Object.entries(index.entries)) {
+      if (entry.unrecorded === true) {
+        // This session's latest write to the file never made it into the shadow (`markUnrecorded`).
+        // A three-way merge onto a new HEAD only tells us the *shadow* reconciles cleanly — it says
+        // nothing about the write that is missing from it — and "HEAD equals the shadow" would be
+        // true only by ignoring that same gap. Either way, resolving anything here risks either
+        // reverting the session's own edit (advanced) or silently dropping its claim on an
+        // uncommitted change (settled/forgotten) — the exact gap `markUnrecorded` exists to close.
+        // So: touch nothing, leave the entry exactly as it is, and keep it flagged. Only a
+        // deliberate take (`settle`/`clear`, i.e. commit scope "all"/"paths") or a discard ends
+        // this state.
+        result.conflicted.push(rel);
+        continue;
+      }
+
       const head = await this.readHead(projectDir, rel);
       const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
       if (bytesEqual(head, base)) continue; // HEAD has not moved under this file
 
       const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
-      if (bytesEqual(head, shadow) || (head === null && entry.deleted)) {
+      const settled =
+        bytesEqual(head, shadow) ||
+        (head === null && entry.deleted) ||
+        // Raw bytes differ but both sides are present: ask git whether they'd clean-filter to the
+        // same blob (see the class doc comment) before concluding a peer changed this file.
+        (head !== null &&
+          shadow !== null &&
+          (await this.sameAsGitSees(projectDir, rel, head, shadow)));
+      if (settled) {
         // Our change is what landed — there is nothing left of it to commit.
         await this.forget(projectId, rel);
         delete index.entries[rel];
@@ -345,9 +492,48 @@ export class ShadowStore {
     return result;
   }
 
-  /** Drop this session's tracked changes for a project (after its work is committed or discarded). */
+  /**
+   * Drop every entry this session tracks whose path is covered by one of `paths` (`coversPath` —
+   * a directory covers everything under it), regardless of `conflicted`/`unrecorded`. Returns the
+   * dropped paths.
+   *
+   * Called by `commit` after a `scope: "all"`/`"paths"` commit, and only after that commit has
+   * actually landed. It drops every entry *under the paths the commit was given* (`coversPath` —
+   * a directory covers everything under it), whether or not git actually staged that particular
+   * entry — those scopes stage the working tree as it stands (via `git add`), and git stages
+   * nothing for a path whose working-tree content already equals HEAD, so checking "did git stage
+   * this" would leave exactly the already-reconciled entries wedged. Dropping by coverage instead
+   * is deliberate: whatever this session's shadow said about a covered path — including a sticky
+   * `conflicted`/`unrecorded` flag — is now either exactly what is in HEAD, or was deliberately
+   * overridden by the caller's choice of scope. This is not a weakening of "conflicted stays
+   * flagged": nothing here clears the flag on an *edit* (`record` never calls this), and `refresh`
+   * still refuses to resolve one on its own. The entry disappears because the session took the
+   * tree deliberately — the exact remedy every conflicted/unrecorded message names.
+   */
+  async settle(projectId: string, paths: string[]): Promise<string[]> {
+    const wanted = paths.map(toPosix);
+    const index = await this.readIndex(projectId);
+    const dropped: string[] = [];
+    for (const rel of Object.keys(index.entries)) {
+      if (wanted.some((p) => coversPath(p, rel))) {
+        await this.forget(projectId, rel);
+        delete index.entries[rel];
+        dropped.push(rel);
+      }
+    }
+    await this.writeIndex(projectId, index);
+    return dropped;
+  }
+
+  /**
+   * Drop this session's tracked changes for a project (after its work is committed or discarded).
+   * Removes only the shadow state — `shadow/`, `base/`, `shadow.json` — never the session
+   * directory itself: `session.json` (the heartbeat record `SessionRegistry` writes there) must
+   * survive, or a `commit scope: "all"` would make this session look dead to its peers until the
+   * next throttled heartbeat.
+   */
   async clear(projectId: string): Promise<void> {
-    await rm(this.dir(projectId), { recursive: true, force: true });
+    await this.clearShadowState(this.dir(projectId));
   }
 
   /**
@@ -365,16 +551,16 @@ export class ShadowStore {
     } catch {
       return;
     }
-    await Promise.all(
-      sessions.map((id) =>
-        rm(path.join(root, id, 'shadow'), { recursive: true, force: true }).then(() =>
-          Promise.all([
-            rm(path.join(root, id, 'base'), { recursive: true, force: true }),
-            rm(path.join(root, id, 'shadow.json'), { force: true }),
-          ]),
-        ),
-      ),
-    );
+    await Promise.all(sessions.map((id) => this.clearShadowState(path.join(root, id))));
+  }
+
+  /** The shadow files under one session directory, leaving everything else there alone. */
+  private async clearShadowState(dir: string): Promise<void> {
+    await rm(path.join(dir, 'shadow'), { recursive: true, force: true });
+    await Promise.all([
+      rm(path.join(dir, 'base'), { recursive: true, force: true }),
+      rm(path.join(dir, 'shadow.json'), { force: true }),
+    ]);
   }
 
   private dir(projectId: string): string {

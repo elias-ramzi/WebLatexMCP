@@ -9,7 +9,7 @@ import {
   realpath,
   readlink,
 } from 'node:fs/promises';
-import { resolveInside, toPosix } from '../lib/paths.js';
+import { resolveInside, samePath, toPosix } from '../lib/paths.js';
 import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 import { ASSET_EXT } from '../lib/assets.js';
@@ -62,7 +62,7 @@ export interface EditOp {
  */
 const DOC_EXT = new Set(['.md', '.markdown', '.txt', '.rst', '.org']);
 
-const MAX_READ_BYTES = 2 * 1024 * 1024;
+export const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 /**
  * Notified of every mutation this server makes, with the working-tree content either side of it
@@ -321,6 +321,50 @@ export class FileService {
     }
   }
 
+  /**
+   * Where a project-relative path is really called at the far end, once symlinks are followed —
+   * `null` when the path lands exactly where its name says (the common case, no link involved).
+   *
+   * A name-based gate (`isBibFile`, the asset destination allowlist) only ever sees the name the
+   * caller supplied. That is fine for a plain file, but a symlink committed *inside* the project
+   * — `figures/x.png -> refs.bib` (git stores a symlink as mode 120000, so a collaborator can
+   * commit one) — passes `assertNoSymlinkEscape` (it never leaves the project) while landing on a
+   * file the gate would have refused had it seen that name. This tells the tool layer what to
+   * judge instead: the resolved target, project-relative when it stays inside the project, or
+   * absolute when it doesn't (reachable only under a local project's `followSymlinks`, since
+   * `guardLinks` below refuses an escaping link outright otherwise).
+   *
+   * Decides nothing about *whether* the path may be used — `guardLinks` runs first, so an
+   * escaping link is refused with the exact error a write would raise. And it does not change the
+   * path's one identity for the revision tracker: the `resolveInside` string stays what every
+   * read/write keys its baseline on (see `assertNoSymlinkEscape`'s doc comment) — this only
+   * reports what the tool layer should additionally judge by name.
+   */
+  async linkTarget(
+    projectDir: string,
+    relPath: string,
+    strictLinks = false,
+  ): Promise<string | null> {
+    const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, strictLinks);
+    const target = await resolveThroughLinks(abs);
+    const realRoot = await realpath(projectDir);
+    // `target` comes back from `realpath` (on-disk casing); the expected side is built from the
+    // caller's own spelling of `relPath`. A bare string compare mistakes a mere case mismatch
+    // (macOS/Windows) for a link pointing somewhere else — samePath judges by where each side
+    // actually lands.
+    if (samePath(target, path.join(realRoot, relPath))) {
+      return null;
+    }
+    const rel = path.relative(realRoot, target);
+    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return toPosix(rel);
+    }
+    // Outside the project (only reachable under a local project's followSymlinks) — POSIX-ify so
+    // it lands verbatim in tool text the same way every other path does.
+    return toPosix(target);
+  }
+
   async list(
     projectDir: string,
     opts: { filter?: FileFilter; subdir?: string } = {},
@@ -475,13 +519,22 @@ export class FileService {
   ): Promise<Buffer | null> {
     const abs = resolveInside(projectDir, opts.path);
     await this.guardLinks(projectDir, abs, opts.path, opts.strictLinks);
-    let buf: Buffer;
+    let info;
     try {
-      buf = await readFile(abs);
+      info = await stat(abs);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw err;
     }
+    if (!info.isFile()) {
+      throw new Error(`Not a file: "${opts.path}"`);
+    }
+    if (info.size > MAX_READ_BYTES) {
+      throw new Error(
+        `"${opts.path}" is ${info.size} bytes, over the ${MAX_READ_BYTES}-byte read cap.`,
+      );
+    }
+    const buf = await readFile(abs);
     if (opts.recordBaseline) this.revisions.record(abs, buf);
     return buf;
   }

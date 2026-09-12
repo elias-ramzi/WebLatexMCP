@@ -40,8 +40,16 @@ export class ProjectManager {
   private readonly projects: Map<string, ProjectConfig>;
   private readonly workspaceRoot: string;
   /**
-   * The in-process default project id. Mutable: `registerAndPersist({ makeDefault: true })` may
-   * set it (see there for when it is and is not allowed to).
+   * The in-process default project id. When `defaultProjectExplicit` is true (the
+   * `WEB_LATEX_MCP_DEFAULT_PROJECT` env assertion), `defaultProjectId()` returns exactly this —
+   * the env assertion always wins. Otherwise this value is only the FALLBACK `defaultProjectId()`
+   * uses when no registry is wired at all, or the registry currently names no default: the
+   * registry's own `readDefault()` is the live source of truth for every session that did not
+   * assert a default through the env var, so a peer session's `register_project { default: true
+   * }` reaches this session's very next call, whether or not this process started with a default
+   * of its own. Still mutable: `registerAndPersist`/`setDefaultProject` with `makeDefault: true`
+   * set it too (via `applyMakeDefault`), so it stays a correct fallback and remains meaningful
+   * when no registry is wired (the unit-test / no-registry configuration).
    */
   private defaultProject?: string;
   /**
@@ -176,6 +184,29 @@ export class ProjectManager {
   }
 
   /**
+   * What a re-registration of `id` is about to replace, so `register_project` can report which
+   * stored fields it would silently drop (`upsert` replaces the whole entry — see
+   * `droppedRegistrationFields` in `src/tools/registerProject.ts`).
+   *
+   * Prefers the registry's OWN current entry when it has one — a peer session may have
+   * re-registered `id` since this process last looked, the same reasoning `setDefaultProject`
+   * uses for its own registry read. Falls back to the in-process `this.projects` config for a
+   * project that has never been written to the registry at all: one configured through
+   * `WEB_LATEX_MCP_PROJECTS`, or registered in-session via `project_sync { gitUrl }`
+   * (`registerProject` only ever does `this.projects.set`, never a registry write). Without this
+   * fallback, re-registering such a project reports nothing dropped while silently replacing its
+   * in-process config — exactly the loss this report exists to name, in the one case the user has
+   * no registry entry to inspect.
+   *
+   * Deliberately not `getProjectConfig(id)`: that throws on an unknown id and can reload from the
+   * registry as a side effect, neither of which is wanted for a plain "what do we have on file"
+   * lookup. `undefined` when neither source has anything for `id` (first-time registration).
+   */
+  previousRegistration(id: string): ProjectConfig | undefined {
+    return this.registry?.read().find((p) => p.id === id) ?? this.projects.get(id);
+  }
+
+  /**
    * Apply a `makeDefault: true` registration's effect on the in-process default — shared by
    * `registerAndPersist` and `setDefaultProject` so the "only when not overridden by an explicit
    * `WEB_LATEX_MCP_DEFAULT_PROJECT`" rule can't drift between the two call sites. See
@@ -200,13 +231,26 @@ export class ProjectManager {
   }
 
   /**
-   * Id of the default project used when a call omits `project`: the in-process one
-   * (`WEB_LATEX_MCP_DEFAULT_PROJECT`, or a `makeDefault` registration this process made) if set,
-   * else the persisted registry default — a peer session may have set one since this process
-   * started. `undefined` when nothing names a default anywhere.
+   * Id of the default project used when a call omits `project`.
+   *
+   * When `defaultProjectExplicit` is true (`WEB_LATEX_MCP_DEFAULT_PROJECT` was set for this
+   * process), that env assertion always wins, full stop — return `this.defaultProject` and never
+   * consult the registry.
+   *
+   * Otherwise the registry's CURRENT default is the live source of truth: a peer session's
+   * `register_project { default: true }` must reach every env-unset session's very next call,
+   * not only a session that happened to start with no default of its own. (Before this, the
+   * in-process value — which for a non-explicit default is only a snapshot of whatever the
+   * registry said AT STARTUP — permanently shadowed a later registry update once it was truthy,
+   * so a session that started with a registry default never saw a peer retarget it; a session
+   * that started with none did, which was the inconsistency.) `this.defaultProject` is consulted
+   * only as the fallback: no registry wired at all, or the registry currently names no default.
+   *
+   * `undefined` when nothing names a default anywhere.
    */
   defaultProjectId(): string | undefined {
-    return this.defaultProject ?? this.registry?.readDefault();
+    if (this.defaultProjectExplicit) return this.defaultProject;
+    return this.registry?.readDefault() ?? this.defaultProject;
   }
 
   /** Resolve a project id (or the configured default) to its config, or throw. */
