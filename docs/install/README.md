@@ -17,6 +17,14 @@ All three end at the same place: the server registered over stdio, with a token 
 var, the GitHub CLI, or your OS git credential helper. See the main [README](../../README.md) for the
 full configuration reference and tool list.
 
+## No machine of your own — an iPad, an iPhone, or a browser
+
+- 📱 [**Claude Code on the web**](claude-code-web.md) — a cloud session reads your repo's `.mcp.json`
+  and runs the server in its own VM, so the whole workflow (compile included, once the environment's
+  setup script installs TeX) works from claude.ai/code or the Claude mobile app. The guide also says why
+  a **custom connector** is not the answer: the Claude apps reach only remote servers over HTTPS, and
+  this one holds your git token, writes your working tree, and pushes.
+
 ## Other MCP clients — pending verification
 
 The server speaks standard MCP over stdio, so any MCP-capable client should work. These guides are
