@@ -127,6 +127,13 @@ Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler)
 [macOS](docs/install/macos.md) / [Linux](docs/install/linux.md) / [Windows](docs/install/windows.md) ·
 [Gemini](docs/install/gemini.md) · [Copilot](docs/install/copilot.md).
 
+### No machine of your own — iPad, iPhone, browser
+
+The Claude apps connect only to _remote_ MCP servers, so this one isn't a connector. It does run in
+**[Claude Code on the web](docs/install/claude-code-web.md)**: a cloud session loads your repo's
+`.mcp.json`, a setup script installs TeX, and `render_pages` shows you the compiled page — steerable
+from the Claude app on a phone or tablet.
+
 ### Project-specific writing conventions
 
 The bundled [writing guide](docs/writing-guide.md) is general — for a per-paper rule ("always write
