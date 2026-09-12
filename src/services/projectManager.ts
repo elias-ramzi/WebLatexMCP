@@ -246,6 +246,13 @@ export class ProjectManager {
    * that started with none did, which was the inconsistency.) `this.defaultProject` is consulted
    * only as the fallback: no registry wired at all, or the registry currently names no default.
    *
+   * Cost: `readDefault` is a synchronous read of the registry file (`readFileSync`), on the stdio
+   * event loop, on every call that omits `project` — and a tool call typically resolves twice
+   * (`requireGitProject` then `requireProjectDir` each go through `getProjectConfig`). Accepted
+   * deliberately: the file is a few hundred bytes, and a peer-visible default that is actually
+   * current outranks a cached one (the inconsistency above). Cache it only if it ever shows up in
+   * a profile — and then keyed on the file's mtime, never on process lifetime.
+   *
    * `undefined` when nothing names a default anywhere.
    */
   defaultProjectId(): string | undefined {

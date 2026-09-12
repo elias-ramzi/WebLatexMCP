@@ -1,10 +1,10 @@
 import path from 'node:path';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
 import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js';
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
 import { isBibFile } from '../lib/bib.js';
-import { toPosix } from '../lib/paths.js';
+import { resolveInside, toPosix } from '../lib/paths.js';
 import { execCapture, execCaptureBytes } from '../lib/exec.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
@@ -241,6 +241,24 @@ type PushRetryOutcome =
   | { ok: false; kind: 'remote-moved'; remoteHead: string; rebasedOver: RemoteCommit[] };
 
 /**
+ * Thrown by `commit`/`commitContents` when nothing is staged for the paths in scope and
+ * `allowEmpty` was not set. A class, not a message: the `commit` tool decides whether to settle a
+ * session's stale shadow record on this outcome, and that decision must hang on the error's type,
+ * never on its prose. `ignored` names the requested paths that were dropped because git ignores
+ * them (the tool's own throw sites), so the caller can report *why* nothing was staged without
+ * matching on the text either.
+ */
+export class NothingToCommitError extends Error {
+  constructor(
+    message = 'Nothing to commit (no staged changes).',
+    readonly ignored: string[] = [],
+  ) {
+    super(message);
+    this.name = 'NothingToCommitError';
+  }
+}
+
+/**
  * Wraps git operations via the system `git` CLI (through simple-git). Auth is injected
  * in-memory per network call and never persisted to .git/config.
  */
@@ -269,7 +287,9 @@ export class GitService {
       await this.resetIndexToHead(dir, git);
     }
     if (opts.paths && opts.paths.length > 0) {
-      await git.add(['--', ...opts.paths]);
+      // `--literal-pathspecs`: a pathspec is a glob by default, so naming `a[1].tex` would also
+      // stage a peer's dirty `a1.tex` — past the ownership check, which compared literal names.
+      await git.raw(['--literal-pathspecs', 'add', '--', ...opts.paths]);
     } else {
       await git.add(['-A']);
     }
@@ -277,7 +297,7 @@ export class GitService {
       .split('\n')
       .filter(Boolean);
     if (staged.length === 0 && !opts.allowEmpty) {
-      throw new Error('Nothing to commit (no staged changes).');
+      throw new NothingToCommitError();
     }
     // Capture the staged per-file line counts before committing — once committed, the
     // `--cached` diff is empty. Drives the diffstat surfaced by the commit tool.
@@ -331,6 +351,17 @@ export class GitService {
         continue;
       }
       const mode = (await this.indexMode(git, rel)) ?? '100644';
+      // A shadow entry can only name a link when it predates the write-through-a-link fix (a
+      // stale record filed under the link's own name): staging text under a 120000 mode would
+      // produce a symlink whose target is that text, not a real file. A `null` content
+      // (deletion) of a link stays allowed — that's the link itself going away.
+      if (mode === '120000') {
+        throw new Error(
+          `"${rel}" is a symbolic link in the index; a content commit cannot replace a link with ` +
+            `file content. Delete the link first (delete_file), or commit the working tree with ` +
+            `scope "all".`,
+        );
+      }
       const sha = await this.hashObject(dir, rel, file.content);
       await git.raw(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`]);
     }
@@ -339,7 +370,7 @@ export class GitService {
       .split('\n')
       .filter(Boolean);
     if (staged.length === 0 && !opts.allowEmpty) {
-      throw new Error('Nothing to commit (no staged changes).');
+      throw new NothingToCommitError();
     }
     const files = await this.numstat(git, ['--cached']);
     const args = [
@@ -358,6 +389,37 @@ export class GitService {
   }
 
   /**
+   * Which of `paths` git ignores (`.gitignore`, `.git/info/exclude`, etc), as POSIX paths
+   * relative to `dir`. Exists because `commitContents` stages via `hash-object` +
+   * `update-index --add --cacheinfo`, which — unlike `git add` — consults no ignore rules at
+   * all; a scope-"session" commit must skip what a plain `git add` (scope "all"/"paths") would
+   * already have skipped, or an excluded file (e.g. a skill's local-only note kept out of git via
+   * `.git/info/exclude`) gets committed and pushed anyway.
+   *
+   * Deliberately WITHOUT `--no-index`: `check-ignore` then still consults the index, so a
+   * *tracked* file that happens to match an ignore pattern is correctly reported as not ignored
+   * (git itself never re-ignores a tracked path) — a deletion of, or edit to, such a file must
+   * still commit, exactly as `git add` would stage it.
+   */
+  async ignoredPaths(dir: string, paths: string[]): Promise<string[]> {
+    if (paths.length === 0) return [];
+    const rels = paths.map((p) => toPosix(p));
+    const res = await execCapture('git', ['check-ignore', '-z', '--stdin'], {
+      cwd: dir,
+      input: rels.join('\0') + '\0',
+    });
+    // Exit code 1 means "none of the given paths are ignored" — not an error. Anything other
+    // than 0/1 (typically 128) is a real failure.
+    if (res.code !== 0 && res.code !== 1) {
+      throw new Error(`git check-ignore failed: ${res.stderr.trim()}`);
+    }
+    return res.stdout
+      .split('\0')
+      .filter(Boolean)
+      .map((p) => toPosix(p));
+  }
+
+  /**
    * Read a path's content at a commit-ish, or null when it does not exist there. Decodes as
    * text (via simple-git's `git show`) — for content that may not be valid UTF-8 (a binary
    * asset), use `readAtRefBytes` instead.
@@ -372,6 +434,16 @@ export class GitService {
    * valid UTF-8 (e.g. a PNG), since `readAtRef`/simple-git's `git show` decode as text and
    * would corrupt such bytes.
    */
+  /**
+   * The commit HEAD points at, or `'unborn'` for a repository with no commits yet. Never throws:
+   * `ShadowStore.refresh` calls this once per call to decide whether a conflicted entry's verdict
+   * can have changed (it cannot while HEAD is the same commit), and an unanswerable HEAD must
+   * degrade to "re-evaluate everything", never to a failed `status`/`commit`.
+   */
+  async headSha(dir: string): Promise<string> {
+    return (await this.revParseOrNull(simpleGit(dir), 'HEAD')) ?? 'unborn';
+  }
+
   async readAtRefBytes(dir: string, ref: string, relPath: string): Promise<Buffer | null> {
     const res = await execCaptureBytes('git', ['show', `${ref}:${toPosix(relPath)}`], {
       cwd: dir,
@@ -434,8 +506,35 @@ export class GitService {
 
   /** A tracked path's index mode, so staging preserves it (e.g. an executable). */
   private async indexMode(git: SimpleGit, relPath: string): Promise<string | null> {
-    const out = await git.raw(['ls-files', '-s', '--', relPath]);
+    // `--literal-pathspecs`: a pathspec is a glob by default, so `a[1].tex` would also match `a1.tex`
+    // and a backslash in a name escapes instead of matching. The path here is a literal name.
+    const out = await git.raw(['--literal-pathspecs', 'ls-files', '-s', '--', relPath]);
     return out.trim().split(/\s+/)[0] || null;
+  }
+
+  /**
+   * Whether `relPath` is a symlink on either side of a paused rebase conflict: the working tree
+   * (`lstat`, mode 120000 never survives a checkout as a real file) or any conflict stage in the
+   * index (`git ls-files -s`, which during a conflict lists one line per stage — 1 = base, 2 =
+   * ours, 3 = theirs — each starting with its own mode). Either alone would miss a link the other
+   * side introduced, so both are checked. A missing working-tree file (`ENOENT`, e.g. a
+   * delete/modify conflict) is not a link — only an actual link is refused.
+   */
+  private async hasSymlinkMode(dir: string, git: SimpleGit, relPath: string): Promise<boolean> {
+    try {
+      const st = await lstat(path.join(dir, relPath));
+      if (st.isSymbolicLink()) return true;
+    } catch {
+      // Absent from the working tree (e.g. a delete/modify conflict) — not a link.
+    }
+    // `--literal-pathspecs`: a pathspec is a glob by default, so `a[1].tex` would also match `a1.tex`
+    // and a backslash in a name escapes instead of matching. The path here is a literal name.
+    const out = await git.raw(['--literal-pathspecs', 'ls-files', '-s', '--', relPath]);
+    return out
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .some((line) => line.split(/\s+/)[0] === '120000');
   }
 
   /**
@@ -623,7 +722,10 @@ export class GitService {
    * full conflict report (naming what was omitted); an extra (non-conflicted) file is rejected by
    * name. A `.bib` file may only be resolved when `confirmBibEdit` is set. If `expectedRemoteHead`
    * is given and the remote advanced past it since the conflict was computed, the push is refused
-   * rather than applying a merge against a stale `theirs`. Never force-pushes.
+   * rather than applying a merge against a stale `theirs`. A path that is a symlink on either side
+   * of the conflict (upstream retargeted it, or we did) is refused too — a resolution carries file
+   * content, never a link target, so writing one through a link would land in whatever it points
+   * at instead of resolving it. Never force-pushes.
    */
   async resolvePush(
     dir: string,
@@ -718,6 +820,40 @@ export class GitService {
             'pushing. Re-pull and try the resolution again.',
         );
       }
+      // A resolution carries file content, never a link target. Refuse to write through a symlink
+      // on either side of the conflict before anything else for this step — including before the
+      // "every conflicted path needs a resolution" check below, since a type-change conflict
+      // (symlink vs. regular file) can add a synthetic path git itself invents (`notes.tex~HEAD`)
+      // that no caller would think to supply a resolution for; the link is what must be refused,
+      // not a spurious "missing resolution". `writeFile` follows a link (in-project or pointing
+      // outside the clone entirely), so a resolved "notes.tex" would silently land wherever the
+      // link points, and `git add` would then stage the untouched link as if it had been resolved.
+      // Check the paused rebase's working tree (`lstat`) and every conflict stage in the index
+      // (`git ls-files -s`, mode 120000) — either side can carry the link.
+      const linked: string[] = [];
+      for (const rel of step.unmerged) {
+        try {
+          resolveInside(dir, rel);
+        } catch (err) {
+          await this.abortRebaseIfInProgress(git);
+          throw err;
+        }
+        if (await this.hasSymlinkMode(dir, git, rel)) linked.push(rel);
+      }
+      if (linked.length > 0) {
+        await this.abortRebaseIfInProgress(git);
+        throw new Error(
+          linked
+            .map(
+              (rel) =>
+                `"${rel}" is a symbolic link on at least one side of this conflict; a resolution ` +
+                'carries file content and cannot resolve a link.',
+            )
+            .join(' ') +
+            ' Nothing was pushed and the rebase was aborted, so the clone is back to where it was ' +
+            'before it started — resolve that path by hand and push again.',
+        );
+      }
       const missing = step.unmerged.filter((rel) => !byPath.has(rel));
       if (missing.length > 0) {
         // Can't resolve without content for every conflicted file — fail safe: build the full
@@ -738,7 +874,7 @@ export class GitService {
       }
       for (const rel of step.unmerged) {
         await writeFile(path.join(dir, rel), byPath.get(rel) as string, 'utf8');
-        await git.add(['--', rel]);
+        await git.raw(['--literal-pathspecs', 'add', '--', rel]);
         used.add(rel);
       }
       step = await this.runRebaseStep(git, () => git.raw(['rebase', '--continue']));
@@ -1126,7 +1262,7 @@ export class GitService {
   }
 
   private async unmergedPaths(git: SimpleGit): Promise<string[]> {
-    return (await git.raw(['diff', '--name-only', '--diff-filter=U']))
+    return (await git.raw(['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U']))
       .split('\n')
       .map((s) => s.trim())
       .filter(Boolean);

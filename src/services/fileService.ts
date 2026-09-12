@@ -337,8 +337,9 @@ export class FileService {
    * Decides nothing about *whether* the path may be used — `guardLinks` runs first, so an
    * escaping link is refused with the exact error a write would raise. And it does not change the
    * path's one identity for the revision tracker: the `resolveInside` string stays what every
-   * read/write keys its baseline on (see `assertNoSymlinkEscape`'s doc comment) — this only
-   * reports what the tool layer should additionally judge by name.
+   * read/write keys its baseline on (see `assertNoSymlinkEscape`'s doc comment). What it *does*
+   * change is what name the mutation recorder is told — see {@link attributedPath} — so a write
+   * through a tracked link is attributed to the file it actually changed, not the link's name.
    */
   async linkTarget(
     projectDir: string,
@@ -347,6 +348,19 @@ export class FileService {
   ): Promise<string | null> {
     const abs = resolveInside(projectDir, relPath);
     await this.guardLinks(projectDir, abs, relPath, strictLinks);
+    return this.resolveLinkTarget(projectDir, abs, relPath);
+  }
+
+  /**
+   * Shared by {@link linkTarget} (name-based gates judge the far end) and {@link attributedPath}
+   * (the mutation recorder is told the far end): where `abs` really lands, `null` when it lands
+   * exactly where `relPath` says (no link involved).
+   */
+  private async resolveLinkTarget(
+    projectDir: string,
+    abs: string,
+    relPath: string,
+  ): Promise<string | null> {
     const target = await resolveThroughLinks(abs);
     const realRoot = await realpath(projectDir);
     // `target` comes back from `realpath` (on-disk casing); the expected side is built from the
@@ -363,6 +377,46 @@ export class FileService {
     // Outside the project (only reachable under a local project's followSymlinks) — POSIX-ify so
     // it lands verbatim in tool text the same way every other path does.
     return toPosix(target);
+  }
+
+  /**
+   * The name the mutation recorder should be told for a write that just happened through `abs`:
+   * the in-project link target's project-relative name when `abs` is a link landing somewhere
+   * other than `relPath`, else `relPath` itself (POSIX-ified) — the common case, no link
+   * involved.
+   *
+   * `write`/`writeBytes`/`applyEdits` read and write through `abs`, which already followed any
+   * link `guardLinks` allowed; without this they told the recorder the *link's* name, so the
+   * shadow store three-way-merged the link's own target string (its blob content) against the
+   * caller's text — a bogus conflict on every tracked link, and the real edit landing on nobody's
+   * shadow at all (issue #66 item 4).
+   *
+   * When the target lands OUTSIDE the project (reachable only under a local project's
+   * `followSymlinks`), this returns `relPath` unchanged: there is no shadow store for a local
+   * project anyway (see CLAUDE.md's "Local projects never see git" bullet), and an absolute path
+   * must never reach the recorder.
+   *
+   * `delete` does NOT go through this — see the comment at its call site: `rm(abs)` removes the
+   * link itself, never the target, so attributing the deletion to the link's own name is already
+   * correct.
+   */
+  private async attributedPath(projectDir: string, abs: string, relPath: string): Promise<string> {
+    // Called after the bytes are on disk, so it must not fail the write: for a git project
+    // `guardLinks` resolved this same path before the write, but a local `followSymlinks` project
+    // skips that, and an ELOOP/EACCES here would be the first resolution attempt — falling back to
+    // the given name keeps the recorder call (and, on its failure, `markUnrecorded`) happening.
+    let target: string | null;
+    try {
+      target = await this.resolveLinkTarget(projectDir, abs, relPath);
+    } catch (err) {
+      console.error(
+        `[web-latex-mcp] could not resolve where "${relPath}" lands; attributing the change to ` +
+          'that name as given:',
+        err instanceof Error ? err.message : err,
+      );
+      target = null;
+    }
+    return target !== null && !path.isAbsolute(target) ? target : toPosix(relPath);
   }
 
   async list(
@@ -500,7 +554,12 @@ export class FileService {
       await translateMissingParentError(err, abs, projectDir, opts.path, opts.createDirs);
     }
     this.revisions.record(abs, opts.content);
-    await this.notify(projectDir, opts.path, current ?? null, opts.content);
+    await this.notify(
+      projectDir,
+      await this.attributedPath(projectDir, abs, opts.path),
+      current ?? null,
+      opts.content,
+    );
     return {
       path: opts.path,
       bytesWritten: Buffer.byteLength(opts.content, 'utf8'),
@@ -574,7 +633,12 @@ export class FileService {
       await translateMissingParentError(err, abs, projectDir, opts.path, opts.createDirs);
     }
     this.revisions.record(abs, opts.bytes);
-    await this.notify(projectDir, opts.path, current ?? null, opts.bytes);
+    await this.notify(
+      projectDir,
+      await this.attributedPath(projectDir, abs, opts.path),
+      current ?? null,
+      opts.bytes,
+    );
     return {
       path: opts.path,
       bytesWritten: opts.bytes.length,
@@ -623,7 +687,12 @@ export class FileService {
     });
     await writeFile(abs, content, 'utf8');
     this.revisions.record(abs, content);
-    await this.notify(projectDir, relPath, original, content);
+    await this.notify(
+      projectDir,
+      await this.attributedPath(projectDir, abs, relPath),
+      original,
+      content,
+    );
     return { path: relPath, appliedEdits: edits.length };
   }
 
@@ -646,6 +715,9 @@ export class FileService {
       }
     }
     const current = currentBytes?.toString('utf8') ?? null;
+    // Deliberately NOT run through attributedPath: rm(abs) removes the link itself (mode 120000
+    // in the index), never the target it points to, so the deletion is already correctly
+    // attributed to the link's own name.
     await rm(abs);
     this.revisions.forget(abs);
     await this.notify(projectDir, relPath, current, null);

@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -11,6 +12,23 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { GitService } from '../../src/services/gitService.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import type { ServerConfig } from '../../src/types.js';
+
+/** Commit the working tree by hand, the way an external `push`/user edit would — never through
+ * the server's own commit machinery, so these tests exercise a real out-of-band commit. */
+async function handCommit(dir: string, message: string): Promise<string> {
+  const git = simpleGit(dir);
+  await git.add(['-A']);
+  await git.raw([
+    '-c',
+    'user.name=Hand',
+    '-c',
+    'user.email=hand@example.com',
+    'commit',
+    '-m',
+    message,
+  ]);
+  return (await git.revparse(['HEAD'])).trim();
+}
 
 /**
  * Regression test for the "an unrecorded entry never settles" finding: `ShadowStore.markUnrecorded`
@@ -378,5 +396,255 @@ describe('an unrecorded shadow entry settles once deliberately taken', () => {
     // Each file is named under its own clause, not lumped together under the wrong one.
     expect(text).toMatch(/notes\.tex could not be recorded/);
     expect(text).toMatch(new RegExp(`changed the same lines of.*${REL_COLLIDE}`));
+  });
+});
+
+/**
+ * Regression tests for issue #66 item 2: an `unrecorded`/`conflicted` shadow entry whose working
+ * tree already equals HEAD (a `push` with `message` committed it, or a hand revert) has no exit
+ * before this fix. `scope: "session"` refuses ("could not be recorded", naming scope "all" as the
+ * remedy); `scope: "all"` and `scope: "paths"` both refuse too, because `GitService.commit`
+ * throws "Nothing to commit (no staged changes)" (or, for "paths", `commitPaths` refuses even
+ * earlier with "Nothing to commit at: ... not changed in the working tree") before the handler
+ * ever reaches its post-commit `settle`/`clear` step — leaving only `discard` or an empty junk
+ * commit (`scope: "all", allowEmpty: true`) as a way out. Each test below asserts the *pre-fix*
+ * failure in a comment, and was run against the pre-fix `commit.ts` to confirm it actually failed
+ * there for the stated reason before the fix landed.
+ */
+describe('a wedged entry settles when the working tree already matches HEAD (issue #66 item 2)', () => {
+  it('scope "all" settles the record without a commit when a hand commit already landed the content', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    const dir = ctx.projectManager.projectPath('demo');
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+
+    // A hand commit takes the current working tree (mirrors a `push` with `message` landing it,
+    // or an out-of-band commit made outside this server) — HEAD now equals the working tree.
+    const handSha = await handCommit(dir, 'hand-committed while wedged');
+
+    // Pre-fix: this call throws "Nothing to commit (no staged changes)." — `git add -A` stages
+    // nothing because the working tree already equals HEAD, and the handler never reaches its
+    // settle/clear step because the error is thrown before that point.
+    const taken = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'settle it', scope: 'all' },
+    });
+    expect(isError(taken), textOf(taken)).toBe(false);
+    const sc = structured(taken);
+    expect(sc.committed).toBe(false);
+    expect(sc.settled).toEqual(['main.tex']);
+    expect(sc.sha).toBe(handSha);
+    expect(sc.filesChanged).toBe(0);
+    expect(await ctx.shadows.hasChanges('demo')).toBe(false);
+
+    // A further default-scope commit, with nothing left to settle and nothing dirty, errors with
+    // the plain git wording — not "could not be recorded" (the entry is gone), and not a
+    // settlement (there is nothing left this session tracks).
+    const again = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'try default again' },
+    });
+    expect(isError(again), textOf(again)).toBe(true);
+    expect(textOf(again)).toMatch(/Nothing to commit \(no staged changes\)/);
+    expect(textOf(again)).not.toMatch(/could not be recorded/);
+    expect(await ctx.shadows.changes('demo')).toEqual([]);
+  });
+
+  it('scope "paths" naming the wedged file settles it the same way', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    const dir = ctx.projectManager.projectPath('demo');
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+    const handSha = await handCommit(dir, 'hand-committed while wedged');
+
+    // Pre-fix: `commitPaths` refuses even before reaching git, with "Nothing to commit at:
+    // main.tex — not changed in the working tree" — the working tree has nothing dirty at that
+    // path once the hand commit landed it, and pre-fix nothing consulted the shadow store to see
+    // that this session still (stale-)tracks exactly that path.
+    const taken = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'settle it', scope: 'paths', paths: ['main.tex'] },
+    });
+    expect(isError(taken), textOf(taken)).toBe(false);
+    const sc = structured(taken);
+    expect(sc.committed).toBe(false);
+    expect(sc.settled).toEqual(['main.tex']);
+    expect(sc.sha).toBe(handSha);
+    expect(await ctx.shadows.hasChanges('demo')).toBe(false);
+  });
+
+  it('a hand revert (no new commit) settles the same way under scope "paths"', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    const dir = ctx.projectManager.projectPath('demo');
+    const headBefore = (await simpleGit(dir).revparse(['HEAD'])).trim();
+    const original = await ctx.git.showAtRef(dir, 'HEAD', 'main.tex');
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+
+    // Revert the working tree by hand to HEAD's content — no new commit, HEAD is unchanged.
+    const overwritten = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'main.tex',
+        content: original,
+        overrideExternalChanges: true,
+      },
+    });
+    expect(isError(overwritten), textOf(overwritten)).toBe(false);
+
+    const taken = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'settle it', scope: 'paths', paths: ['main.tex'] },
+    });
+    expect(isError(taken), textOf(taken)).toBe(false);
+    const sc = structured(taken);
+    expect(sc.committed).toBe(false);
+    expect(sc.settled).toEqual(['main.tex']);
+    expect(sc.sha).toBe(headBefore);
+    expect(await ctx.shadows.hasChanges('demo')).toBe(false);
+  });
+
+  it('a landed commit reports `settled` too, alongside `committed: true`', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+
+    const taken = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'take it', scope: 'all' },
+    });
+    expect(isError(taken), textOf(taken)).toBe(false);
+    const sc = structured(taken);
+    expect(sc.committed).toBe(true);
+    expect(sc.settled).toEqual(['main.tex']);
+  });
+
+  it('never claims a settlement just outside the guard', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      'other.tex': 'untouched\n',
+    });
+    const dir = ctx.projectManager.projectPath('demo');
+
+    // (a) scope "all" on a clean tree with no shadow entries at all: still a plain refusal.
+    const cleanAll = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'nothing here', scope: 'all' },
+    });
+    expect(isError(cleanAll), textOf(cleanAll)).toBe(true);
+    expect(textOf(cleanAll)).toMatch(/Nothing to commit \(no staged changes\)/);
+
+    // (b) scope "paths" naming a clean path this session never tracked: still refused by name.
+    const cleanPaths = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'nothing here', scope: 'paths', paths: ['other.tex'] },
+    });
+    expect(isError(cleanPaths), textOf(cleanPaths)).toBe(true);
+    expect(textOf(cleanPaths)).toMatch(/Nothing to commit at:/);
+
+    // (c) wedge main.tex, then request only the untouched other.tex under scope "paths": still
+    // refused by name, and main.tex's entry is left exactly as it was — a request that never
+    // covered it settles nothing.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+    await handCommit(dir, 'hand-committed while wedged');
+
+    const namedElsewhere = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'nothing here', scope: 'paths', paths: ['other.tex'] },
+    });
+    expect(isError(namedElsewhere), textOf(namedElsewhere)).toBe(true);
+    expect(textOf(namedElsewhere)).toMatch(/Nothing to commit at: other\.tex/);
+    expect(await ctx.shadows.hasChanges('demo')).toBe(true);
+    const remaining = await ctx.shadows.changes('demo');
+    expect(remaining.map((c) => c.path)).toEqual(['main.tex']);
+  });
+
+  it('scope "all" with a paths list that covers nothing this session tracks rethrows plainly', async () => {
+    // Regression test for the `dropped.length === 0` rethrow branch in the handler's catch (the
+    // `settle(taken)` arm): a request whose `paths` never covers what this session tracks must
+    // not claim a settlement it didn't make, and must leave the untouched wedge exactly as it was.
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      'other.tex': 'untouched\n',
+    });
+
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+
+    const result = await client.callTool({
+      name: 'commit',
+      arguments: {
+        project: 'demo',
+        message: 'try all with unrelated paths',
+        scope: 'all',
+        paths: ['other.tex'],
+      },
+    });
+    expect(isError(result), textOf(result)).toBe(true);
+    expect(textOf(result)).toMatch(/Nothing to commit \(no staged changes\)/);
+
+    const remaining = await ctx.shadows.changes('demo');
+    expect(remaining.map((c) => c.path)).toEqual(['main.tex']);
+  });
+
+  it('the "could not be recorded" refusal names the exact discard remedy', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wrote), textOf(wrote)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'main.tex');
+    const wroteAgain = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited again.\n' },
+    });
+    expect(isError(wroteAgain), textOf(wroteAgain)).toBe(false);
+
+    const blocked = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'try default' },
+    });
+    expect(isError(blocked), textOf(blocked)).toBe(true);
+    const text = textOf(blocked);
+    expect(text).toMatch(/could not be recorded/);
+    expect(text).toMatch(/discard/);
+    expect(text).toMatch(/confirm: true/);
   });
 });

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
@@ -68,7 +69,10 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
             throw new Error(bibEditBlockedMessage(relPath, target));
           }
           const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
-          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
+          // A write through an in-project link changed the target, so that is the path to diff
+          // (`target` is project-relative when it stays inside the project, absolute otherwise).
+          const diffPath = target !== null && !path.isAbsolute(target) ? target : relPath;
+          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, diffPath);
           const headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
           return {
             content: [

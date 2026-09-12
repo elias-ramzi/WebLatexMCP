@@ -3,8 +3,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, resolveInside } from '../lib/paths.js';
-import { uncoveredPaths, peerOwnership } from '../lib/commitPaths.js';
+import { uncoveredPaths, peerOwnership, coversPath } from '../lib/commitPaths.js';
 import { collectPeerShadows } from '../lib/peerAttribution.js';
+import { NothingToCommitError } from '../services/gitService.js';
 import type { ShadowChange } from '../services/shadowStore.js';
 
 const inputSchema = {
@@ -60,6 +61,21 @@ const outputSchema = {
       "Subset of `conflicted`: files excluded because this session's own record of its change " +
         'failed, not because of a collision. Take them with scope "all" or discard them.',
     ),
+  ignored: z
+    .array(z.string())
+    .describe(
+      'Files git ignores (.gitignore / .git/info/exclude) that this call skipped — they are ' +
+        'never committed by any scope and stay in the working tree. Empty for scope "all" ' +
+        'without `paths` (git add -A skips them itself).',
+    ),
+  settled: z
+    .array(z.string())
+    .describe(
+      'Files this session stopped tracking because this call took their paths deliberately ' +
+        '(scope "all" or "paths"): after a commit that landed, or — when `committed` is false — ' +
+        'because the working tree already matched HEAD for them, so there was nothing to commit ' +
+        'and the stale record was dropped. Always empty for scope "session".',
+    ),
 };
 
 export function registerCommit(server: McpServer, ctx: AppContext): void {
@@ -87,18 +103,79 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           await ctx.shadows.refresh(id, dir);
           const effective = scope ?? ((await ctx.shadows.hasChanges(id)) ? 'session' : 'all');
 
-          const res =
-            effective === 'session'
-              ? await commitSession(ctx, id, dir, { message, paths, allowEmpty })
-              : effective === 'paths'
-                ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
-                : await commitEverything(ctx, dir, { message, paths, allowEmpty });
+          let res: CommitOutcome;
+          // Files this call settled by taking their paths deliberately (scope "all"/"paths"),
+          // either because a commit landed (populated below, after it does) or — the case issue
+          // #66 item 2 exists for — because the working tree for those paths already equalled what
+          // would have been staged, so GitService itself found nothing to commit. Always empty for
+          // scope "session".
+          let settled: string[] = [];
+          if (effective === 'session') {
+            res = await commitSession(ctx, id, dir, { message, paths, allowEmpty });
+          } else {
+            try {
+              res =
+                effective === 'paths'
+                  ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
+                  : await commitEverything(ctx, dir, { message, paths, allowEmpty });
+            } catch (err) {
+              // `GitService.commit`/`commitContents` throw `NothingToCommitError` (a type, not a
+              // message to match on) when there was nothing to stage for the paths in scope,
+              // including when the working tree already equals HEAD — e.g. a `push` with
+              // `message` already committed the content, or a hand revert. A caller reaching for
+              // scope "all"/"paths" still means what those scopes mean: take the paths in scope
+              // deliberately. With nothing to commit, "take" means dropping this session's stale
+              // shadow record of them rather than leaving an `unrecorded`/`conflicted` entry
+              // permanently wedged (issue #66 item 2) — never reachable any other way once the
+              // content is already at HEAD. Anything else rethrows unchanged.
+              if (!(err instanceof NothingToCommitError)) {
+                throw err;
+              }
+              const taken = settlePaths(paths);
+              if (taken === 'everything') {
+                // Only reachable for scope "all" (commitPaths always requires a non-empty list).
+                // Settle only if this session actually tracks something — an empty-tree "all" with
+                // no shadow entries at all is a plain "nothing to commit", not a wedge to clear.
+                if (!(await ctx.shadows.hasChanges(id))) throw err;
+                const before = await ctx.shadows.changes(id);
+                await ctx.shadows.clear(id);
+                settled = before.map((c) => c.path);
+              } else {
+                const dropped = await ctx.shadows.settle(id, taken);
+                // Named paths this session never tracked and that were not dirty either: a genuine
+                // "nothing to commit", not a wedge — rethrow rather than claim a settlement.
+                if (dropped.length === 0) throw err;
+                settled = dropped;
+              }
+              const status = await ctx.git.status(dir);
+              const leftUncommitted =
+                effective === 'paths'
+                  ? [...new Set([...status.unstaged, ...status.untracked].map(toPosix))]
+                      .sort()
+                      .filter(Boolean)
+                  : [];
+              res = {
+                committed: false,
+                sha: await ctx.git.headSha(dir),
+                filesChanged: 0,
+                files: [],
+                leftUncommitted,
+                conflicted: [],
+                // Carried on the error by the tool's own throw sites (`withoutIgnored`): the paths
+                // git ignores are why nothing was staged, and the result must say so structurally.
+                ignored: err.ignored,
+              };
+            }
+          }
 
           // "all"/"paths" commit the working tree as it stands, taken deliberately — so whatever
           // this session's shadow said about a path just committed (including a sticky
           // conflicted/unrecorded flag) is settled by that act, not by a merge. "session" needs
-          // nothing extra: the refresh below settles what landed the normal way.
-          if (effective === 'all' || effective === 'paths') {
+          // nothing extra: the refresh below settles what landed the normal way. Skipped when
+          // `res.committed` is false: the catch above already settled directly (or deliberately
+          // left nothing settled and rethrew) — running this again would be harmless (nothing left
+          // to settle) but wasteful.
+          if (res.committed && (effective === 'all' || effective === 'paths')) {
             const taken = settlePaths(paths);
             if (taken === 'everything') {
               // "all" with no paths: the whole tree was taken. Unreachable for "paths" (commitPaths
@@ -106,9 +183,13 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               // never widened to `clear`: a "paths" commit must not settle what it did not name,
               // and the commit has already landed, so throwing here would report an error for a
               // commit that happened.
-              if (effective === 'all') await ctx.shadows.clear(id);
+              if (effective === 'all') {
+                const before = await ctx.shadows.changes(id);
+                await ctx.shadows.clear(id);
+                settled = before.map((c) => c.path);
+              }
             } else {
-              await ctx.shadows.settle(id, taken);
+              settled = await ctx.shadows.settle(id, taken);
             }
           }
 
@@ -124,15 +205,22 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           const collided = conflicted.filter((p) => !unrecordedSet.has(p));
           const added = res.files.reduce((sum, f) => sum + f.added, 0);
           const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
-          const headline =
-            `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
-            `not yet pushed${
-              effective === 'session'
-                ? ` (session "${ctx.shadows.sessionId}")`
-                : effective === 'paths'
-                  ? ' (named paths)'
-                  : ' (whole clone)'
-            }`;
+          const headline = res.committed
+            ? `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
+              `not yet pushed${
+                effective === 'session'
+                  ? ` (session "${ctx.shadows.sessionId}")`
+                  : effective === 'paths'
+                    ? ' (named paths)'
+                    : ' (whole clone)'
+              }`
+            : res.ignored.length
+              ? `nothing to commit — every requested path is ignored by git (never committed by ` +
+                `any scope): ${res.ignored.join(', ')}; settled this session's stale record of: ` +
+                `${settled.join(', ')} (HEAD ${res.sha.slice(0, 8)})`
+              : 'nothing to commit — the working tree already matches HEAD for the requested paths; ' +
+                `settled this session's stale record of: ${settled.join(', ')} ` +
+                `(not yet pushed: HEAD ${res.sha.slice(0, 8)})`;
           const text = [
             headline,
             ...res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
@@ -142,12 +230,15 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
             unrecorded.length
               ? `⚠ excluded — this session's change to ${unrecorded.join(', ')} could not be ` +
                 'recorded (see the server log), so its shadow does not hold it. Commit with scope ' +
-                '"all" to take the working tree as it stands, or discard those files.'
+                `"all" to take the working tree as it stands,${discardHint(unrecorded)}`
               : '',
             collided.length
               ? `⚠ excluded — this session and someone else changed the same lines of ` +
                 `${collided.join(', ')}. Commit with scope "all" to take the working tree as ` +
-                "it stands, or discard those files to drop this session's version."
+                `it stands,${discardHint(collided)}`
+              : '',
+            res.ignored.length
+              ? `skipped — ignored by git (never committed by any scope): ${res.ignored.join(', ')}`
               : '',
           ]
             .filter(Boolean)
@@ -165,6 +256,8 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               leftUncommitted: res.leftUncommitted,
               conflicted,
               unrecorded,
+              ignored: res.ignored,
+              settled,
             },
           };
         });
@@ -189,6 +282,21 @@ export function settlePaths(paths: string[] | undefined): string[] | 'everything
   return normalized;
 }
 
+/**
+ * The precise remedy named by every `conflicted`/`unrecorded` refusal: the exact `discard` call
+ * that gives up this session's version of the named paths, plus the reminder that a file already
+ * matching HEAD does not even need that — scope "all"/"paths" alone settles the stale record (the
+ * issue #66 item 2 fix, in the handler above). Named paths rather than "those files" so the
+ * caller can act on the message without cross-referencing `conflicted`/`unrecorded` themselves.
+ */
+function discardHint(paths: string[]): string {
+  return (
+    ` or discard them (discard { paths: ${JSON.stringify(paths)}, confirm: true }) to give up ` +
+    "this session's version. If the working tree already matches HEAD for a file, scope " +
+    '"all" or scope "paths" naming it settles the record without a commit.'
+  );
+}
+
 interface CommitOutcome {
   committed: boolean;
   sha: string;
@@ -203,6 +311,16 @@ interface CommitOutcome {
    * took), since a path this call excluded may no longer be tracked at all by then.
    */
   conflicted: string[];
+  /**
+   * Files git ignores (`.gitignore`/`.git/info/exclude`) that this commit skipped.
+   * `commitSession` finds these among its shadow entries directly. `commitPaths`/
+   * `commitEverything` (only when `paths` was given) stage via `git add`, which refuses outright
+   * to add an ignored pathspec rather than silently skipping it — `withoutIgnored` filters those
+   * out before `git add` ever sees them, so they land here instead of surfacing as a raw git
+   * error. `commitEverything` with no `paths` (`git add -A`) always reports `[]`: `git add -A`
+   * already skips ignored paths itself.
+   */
+  ignored: string[];
 }
 
 /** Commit only the changes this session made, from its shadow — peers' edits stay on disk. */
@@ -228,26 +346,57 @@ async function commitSession(
   const unrecorded = selected.filter((c) => c.unrecorded).map((c) => c.path);
   const unrecordedSet = new Set(unrecorded);
   const collided = conflicted.filter((p) => !unrecordedSet.has(p));
-  const committable = selected.filter((c) => !c.conflicted);
+  const committableAll = selected.filter((c) => !c.conflicted);
+
+  // `commitContents` stages via `hash-object` + `update-index --add`, which — unlike `git add`
+  // — consults no ignore rules at all. A file this session wrote that git ignores (e.g. a
+  // skill's local-only note kept out of git via `.git/info/exclude`) must never ride along in
+  // the default scope, so it is filtered out here, the same way `git add` would already have
+  // skipped it under scope "all"/"paths".
+  const ignored =
+    committableAll.length > 0
+      ? await ctx.git.ignoredPaths(
+          dir,
+          committableAll.map((c) => c.path),
+        )
+      : [];
+  if (ignored.length > 0) {
+    // Settle immediately, before any refusal below: an ignored path is never committed by any
+    // scope, so it must stop wedging the default scope the same way a deliberate "all"/"paths"
+    // take settles what it commits.
+    await ctx.shadows.settle(id, ignored);
+  }
+  const ignoredSet = new Set(ignored);
+  const committable = committableAll.filter((c) => !ignoredSet.has(c.path));
+
   if (committable.length === 0 && !opts.allowEmpty) {
-    throw new Error(
+    const ignoredSentence =
+      `Nothing to commit: every change this session made is to a file git ignores ` +
+      `(${ignored.join(', ')}) — ignored files are never committed by any scope. Use scope ` +
+      '"all" to commit changes made by other sessions or outside this server.';
+
+    if (ignored.length > 0 && conflicted.length === 0) {
+      throw new Error(ignoredSentence);
+    }
+
+    const baseMessage =
       conflicted.length === 0
         ? 'Nothing to commit (this session has made no changes). Use scope "all" to commit ' +
-            'changes made by other sessions or outside this server.'
+          'changes made by other sessions or outside this server.'
         : unrecorded.length > 0 && collided.length > 0
           ? `Nothing to commit: every change is excluded — ${unrecorded.join(', ')} could not be ` +
             'recorded (see the server log for why), and this session and someone else changed ' +
             `the same lines of ${collided.join(', ')}. Commit with scope "all" to take the ` +
-            "working tree as it stands, or discard those files to give up this session's version."
+            `working tree as it stands,${discardHint([...unrecorded, ...collided])}`
           : unrecorded.length > 0
             ? `Nothing to commit: every change could not be recorded (${unrecorded.join(', ')}) — ` +
-              'see the server log for why. Commit with scope "all" to take the working tree as it ' +
-              "stands, or discard those files to give up this session's version."
+              `see the server log for why. Commit with scope "all" to take the working tree as it ` +
+              `stands,${discardHint(unrecorded)}`
             : `Nothing to commit: every change is conflicted (${collided.join(', ')}) — this ` +
               'session and someone else changed the same lines, so which edit is whose cannot be ' +
-              'decided here. Commit with scope "all" to take the working tree as it stands, or ' +
-              "discard those files to give up this session's version.",
-    );
+              `decided here. Commit with scope "all" to take the working tree as it stands,${discardHint(collided)}`;
+
+    throw new Error(ignored.length > 0 ? `${ignoredSentence} ${baseMessage}` : baseMessage);
   }
 
   const res = await ctx.git.commitContents(dir, {
@@ -265,7 +414,27 @@ async function commitSession(
     .sort()
     .filter(Boolean);
 
-  return { ...res, leftUncommitted, conflicted };
+  return { ...res, leftUncommitted, conflicted, ignored };
+}
+
+/**
+ * Removes any of `paths` that git ignores, since `git add` — used by `commitEverything` and
+ * `commitPaths` alike — refuses an ignored pathspec outright ("The following paths are
+ * ignored… Use -f") rather than silently skipping it the way `git add -A` (no paths) does.
+ * Returns the paths still safe to hand to `git add`, plus which of the requested ones were
+ * dropped (`ignoredPaths` itself returns POSIX-normalised paths, so membership is checked on the
+ * normalised form).
+ */
+async function withoutIgnored(
+  ctx: AppContext,
+  dir: string,
+  paths: string[],
+): Promise<{ paths: string[]; ignored: string[] }> {
+  if (paths.length === 0) return { paths, ignored: [] };
+  const ignored = await ctx.git.ignoredPaths(dir, paths);
+  if (ignored.length === 0) return { paths, ignored };
+  const ignoredSet = new Set(ignored);
+  return { paths: paths.filter((p) => !ignoredSet.has(toPosix(p))), ignored };
 }
 
 /** Commit every change in the clone — the pre-session behaviour, now opt-in. */
@@ -274,8 +443,24 @@ async function commitEverything(
   dir: string,
   opts: { message: string; paths?: string[]; allowEmpty?: boolean },
 ): Promise<CommitOutcome> {
-  const res = await ctx.git.commit(dir, opts);
-  return { ...res, leftUncommitted: [], conflicted: [] };
+  let paths = opts.paths;
+  let ignored: string[] = [];
+  if (paths && paths.length > 0) {
+    const filtered = await withoutIgnored(ctx, dir, paths);
+    ignored = filtered.ignored;
+    if (filtered.paths.length === 0) {
+      throw new NothingToCommitError(
+        `Nothing to commit: ${ignored.join(', ')} ignored by git (.gitignore / ` +
+          '.git/info/exclude) — an ignored file is never committed by any scope.',
+        ignored,
+      );
+    }
+    paths = filtered.paths;
+  }
+  // Without `paths` this is a plain `git add -A`, which already honours .gitignore/
+  // .git/info/exclude on its own — nothing is ever taken here that `ignoredPaths` would flag.
+  const res = await ctx.git.commit(dir, { ...opts, paths });
+  return { ...res, leftUncommitted: [], conflicted: [], ignored };
 }
 
 /**
@@ -329,7 +514,18 @@ async function commitPaths(
   const dirty = [
     ...new Set([...status.unstaged, ...status.untracked, ...status.staged].map(toPosix)),
   ];
-  const uncovered = uncoveredPaths(normalized, dirty);
+  let uncovered = uncoveredPaths(normalized, dirty);
+  if (uncovered.length > 0) {
+    // A path with nothing dirty in the working tree can still be this session's own tracked
+    // change — e.g. an `unrecorded`/`conflicted` entry whose content already equals HEAD (a hand
+    // commit or revert settled it before this call ever ran `git status`). That is not "nothing to
+    // commit at this path": it is a stale shadow record this deliberate scope should be able to
+    // settle (issue #66 item 2), so `git.commit` below gets the chance to say "nothing staged"
+    // itself — which the handler turns into a settlement — rather than refusing here first with a
+    // misleading "not changed in the working tree" for a path this session plainly did track.
+    const tracked = (await ctx.shadows.changes(id)).map((c) => c.path);
+    uncovered = uncovered.filter((p) => !tracked.some((t) => coversPath(p, t)));
+  }
   if (uncovered.length > 0) {
     throw new Error(
       `Nothing to commit at: ${uncovered.join(', ')} — not changed in the working tree. Paths ` +
@@ -357,9 +553,24 @@ async function commitPaths(
     );
   }
 
+  // `git add` refuses outright (exit 1, "The following paths are ignored… Use -f") if any named
+  // pathspec is ignored — unlike `git add -A`, which silently skips ignored paths. Drop them here
+  // so an ignored-but-tracked-by-this-session path (the `coversPath` filter above lets a stale
+  // shadow entry for one past the uncovered-paths refusal) never reaches `git add` as a raw error.
+  // After the ownership check on purpose: a path a live peer owns is refused as owned, whatever
+  // git thinks of it — the more informative answer, and one that settles nothing of ours.
+  const { paths: stageable, ignored } = await withoutIgnored(ctx, dir, normalized);
+  if (stageable.length === 0) {
+    throw new NothingToCommitError(
+      `Nothing to commit: ${ignored.join(', ')} ignored by git (.gitignore / .git/info/exclude) ` +
+        '— an ignored file is never committed by any scope.',
+      ignored,
+    );
+  }
+
   const res = await ctx.git.commit(dir, {
     message: opts.message,
-    paths: normalized,
+    paths: stageable,
     allowEmpty: opts.allowEmpty,
     fromHead: true,
   });
@@ -371,5 +582,5 @@ async function commitPaths(
     .sort()
     .filter(Boolean);
 
-  return { ...res, leftUncommitted, conflicted: [] };
+  return { ...res, leftUncommitted, conflicted: [], ignored };
 }

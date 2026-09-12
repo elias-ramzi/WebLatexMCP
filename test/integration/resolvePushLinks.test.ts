@@ -1,0 +1,244 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm, readFile, writeFile, stat, symlink } from 'node:fs/promises';
+import { simpleGit } from 'simple-git';
+import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
+import { GitService } from '../../src/services/gitService.js';
+import { FileService } from '../../src/services/fileService.js';
+import { ProjectManager } from '../../src/services/projectManager.js';
+import type { ServerConfig } from '../../src/types.js';
+
+describe('resolvePush refuses to write a resolution through a symlink', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  async function setup(
+    files: Record<string, string>,
+  ): Promise<{ remote: FakeRemote; git: GitService; files: FileService; dir: string }> {
+    const remote = await createFakeRemote(files);
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-'));
+    cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: 'test',
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const pm = new ProjectManager(config);
+    const git = new GitService();
+    const dir = pm.projectPath('demo');
+    await git.clone(remote.url, dir, { username: 'git' });
+    return { remote, git, files: new FileService(), dir };
+  }
+
+  async function readFromRemote(remote: FakeRemote, rel: string): Promise<string> {
+    const verify = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-verify-'));
+    cleanups.push(() => rm(verify, { recursive: true, force: true }));
+    await simpleGit(verify).clone(remote.url, verify);
+    return readFile(path.join(verify, rel), 'utf8');
+  }
+
+  const headSha = (dir: string): Promise<string> =>
+    simpleGit(dir)
+      .revparse(['HEAD'])
+      .then((s) => s.trim());
+
+  async function noRebaseInProgress(dir: string): Promise<boolean> {
+    for (const d of ['rebase-merge', 'rebase-apply']) {
+      try {
+        await stat(path.join(dir, '.git', d));
+        return false;
+      } catch {
+        // absent — good
+      }
+    }
+    return true;
+  }
+
+  describe.skipIf(process.platform === 'win32')('symlinked conflicts (posix only)', () => {
+    it('refuses when upstream retargeted the conflicted path to a symlink outside the clone', async () => {
+      const { remote, git, files, dir } = await setup({
+        'main.tex': 'root\n',
+        'notes.tex': 'alpha\n',
+      });
+
+      // Outside secret the link will point at — outside both clones entirely.
+      const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-outside-'));
+      cleanups.push(() => rm(outsideDir, { recursive: true, force: true }));
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      await writeFile(outsideFile, 'SECRET', 'utf8');
+
+      // Clone B: replace notes.tex with a symlink to the outside file, commit, push.
+      const cloneB = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-b-'));
+      cleanups.push(() => rm(cloneB, { recursive: true, force: true }));
+      const gitB = simpleGit(cloneB);
+      await gitB.clone(remote.url, cloneB);
+      await gitB.addConfig('user.email', 'other@example.com');
+      await gitB.addConfig('user.name', 'Other');
+      await gitB.addConfig('core.autocrlf', 'false');
+      await rm(path.join(cloneB, 'notes.tex'));
+      await symlink(outsideFile, path.join(cloneB, 'notes.tex'));
+      await gitB.add(['notes.tex']);
+      await gitB.commit('retarget notes.tex to an outside symlink');
+      await gitB.push('origin', remote.branch);
+
+      // Our clone A: change notes.tex as a regular file, commit.
+      await files.applyEdits(dir, 'notes.tex', [{ oldString: 'alpha', newString: 'alpha-local' }]);
+      await git.commit(dir, { message: 'local edits to notes' });
+
+      const before = await headSha(dir);
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toContain('notes.tex');
+
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          { resolutions: [{ path: 'notes.tex', content: 'RESOLVED' }] },
+        ),
+      ).rejects.toThrow(/symbolic link/);
+
+      // The outside file was never touched.
+      expect(await readFile(outsideFile, 'utf8')).toBe('SECRET');
+      // Clone fully restored: same HEAD, no rebase in progress, nothing pushed.
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      const remoteHeadAfter = await simpleGit(cloneB).revparse(['origin/master']);
+      const oursRemoteHead = await gitB.revparse(['origin/master']);
+      expect(remoteHeadAfter.trim()).toBe(oursRemoteHead.trim());
+    });
+
+    it('refuses when OUR side has the symlink, in-project target', async () => {
+      const { remote, git, files, dir } = await setup({
+        'main.tex': 'root\n',
+        'refs.bib': '@article{a,\n title={original}\n}\n',
+        'notes.tex': 'alpha\n',
+      });
+
+      // Our clone: replace notes.tex with a symlink to refs.bib, commit.
+      await rm(path.join(dir, 'notes.tex'));
+      await symlink(path.join(dir, 'refs.bib'), path.join(dir, 'notes.tex'));
+      await git.commit(dir, { message: 'link notes.tex to refs.bib' });
+
+      // Upstream: edit notes.tex as a regular file.
+      await pushCommit(remote, { 'notes.tex': 'alpha-remote\n' }, 'remote edits notes.tex');
+
+      const before = await headSha(dir);
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toContain('notes.tex');
+
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          { resolutions: [{ path: 'notes.tex', content: 'merged content' }] },
+        ),
+      ).rejects.toThrow(/symbolic link/);
+
+      expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(
+        '@article{a,\n title={original}\n}\n',
+      );
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      void files;
+    });
+
+    it('refuses a link-vs-link retarget — the case with no synthetic ~HEAD path', async () => {
+      // Both sides of the conflict are symlinks: base has a tracked `notes.tex -> main.tex`,
+      // upstream retargets it to a file outside the clone, we retarget it to another in-project
+      // file. Unlike a regular-file-vs-link type change, git invents no `notes.tex~HEAD` second
+      // unmerged path here, so `conflictPaths` is exactly ["notes.tex"] and the missing-resolution
+      // check passes — pre-fix the resolution was written straight through the link into the
+      // outside file and the call returned `status: "nothing-to-push"`.
+      const { remote, git, dir } = await setup({ 'main.tex': 'root\n', 'other.tex': 'o\n' });
+
+      const cloneB = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-b-'));
+      cleanups.push(() => rm(cloneB, { recursive: true, force: true }));
+      const gitB = simpleGit(cloneB);
+      await gitB.clone(remote.url, cloneB);
+      await gitB.addConfig('user.email', 'other@example.com');
+      await gitB.addConfig('user.name', 'Other');
+      await gitB.addConfig('core.autocrlf', 'false');
+      // Seed the tracked link through clone B, then bring it into ours.
+      await symlink('main.tex', path.join(cloneB, 'notes.tex'));
+      await gitB.add(['notes.tex']);
+      await gitB.commit('seed link');
+      await gitB.push('origin', remote.branch);
+      await git.syncPull(remote.url, dir, { username: 'git' });
+
+      const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-outside-'));
+      cleanups.push(() => rm(outsideDir, { recursive: true, force: true }));
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      await writeFile(outsideFile, 'SECRET', 'utf8');
+
+      // Upstream retargets the link to the outside file.
+      await rm(path.join(cloneB, 'notes.tex'));
+      await symlink(outsideFile, path.join(cloneB, 'notes.tex'));
+      await gitB.add(['notes.tex']);
+      await gitB.commit('retarget outward');
+      await gitB.push('origin', remote.branch);
+
+      // We retarget the same link to other.tex.
+      await rm(path.join(dir, 'notes.tex'));
+      await symlink('other.tex', path.join(dir, 'notes.tex'));
+      await git.commit(dir, { message: 'retarget inward' });
+
+      const before = await headSha(dir);
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toEqual(['notes.tex']);
+
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          { resolutions: [{ path: 'notes.tex', content: 'PWNED\n' }] },
+        ),
+      ).rejects.toThrow(/symbolic link/);
+
+      expect(await readFile(outsideFile, 'utf8')).toBe('SECRET');
+      expect(await headSha(dir)).toBe(before);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+    });
+  });
+
+  it('resolves a non-ASCII conflicted path without C-quoting it', async () => {
+    const { remote, git, files, dir } = await setup({ 'é.tex': 'alpha\nbeta\ngamma\n' });
+    await files.applyEdits(dir, 'é.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+    await git.commit(dir, { message: 'local edit to é.tex' });
+    await pushCommit(remote, { 'é.tex': 'alpha\nbeta-remote\ngamma\n' }, 'remote edit to é.tex');
+
+    const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(conflict.status).toBe('conflict');
+    expect(conflict.conflict?.conflictPaths).toEqual(['é.tex']);
+    const detail = conflict.conflict?.files.find((f) => f.path === 'é.tex');
+    expect(detail).toBeDefined();
+    expect(detail?.ours).toContain('beta-local');
+    expect(detail?.theirs).toContain('beta-remote');
+
+    const res = await git.resolvePush(
+      dir,
+      remote.url,
+      { username: 'git' },
+      { resolutions: [{ path: 'é.tex', content: 'merged\n' }] },
+    );
+    expect(res.status).toBe('pushed');
+    expect(await readFromRemote(remote, 'é.tex')).toBe('merged\n');
+  });
+
+  // A plain regular-file conflict resolving and pushing through `resolvePush` is already covered
+  // by "applies merged content, continues the rebase, and pushes" in test/integration/safePush.test.ts —
+  // not duplicated here.
+});

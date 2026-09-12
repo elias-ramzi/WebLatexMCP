@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
@@ -72,7 +73,10 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
             createDirs,
             overrideExternalChanges,
           });
-          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
+          // A write through an in-project link changed the target, so that is the path to diff
+          // (`target` is project-relative when it stays inside the project, absolute otherwise).
+          const diffPath = target !== null && !path.isAbsolute(target) ? target : relPath;
+          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, diffPath);
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           return {
             content: [{ type: 'text', text: diff ? `${headline}\n\n${diff}` : headline }],

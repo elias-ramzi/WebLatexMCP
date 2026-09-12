@@ -8,6 +8,7 @@ import {
   type ShadowChange,
   type PeerShadowEntry,
   type CleanHasher,
+  type HeadShaReader,
 } from '../../src/services/shadowStore.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
 
@@ -69,10 +70,44 @@ describe('ShadowStore', () => {
       crlfNormalizingHasher,
     );
 
+  /**
+   * Fake HEAD *commit sha*, kept separate from the fake HEAD *content* map (`head`) above: real
+   * git only moves the sha when a commit lands, so a test can change `head`'s bytes (simulating a
+   * peer landing new content) independently of whether it also "commits" (bumps this). The
+   * conflictHead memo (issue #66 item 6) keys off exactly this sha, not off the content.
+   */
+  let headCommit: string;
+
+  /** Wraps a `CleanHasher` to count how many times it is actually invoked (i.e. spawned). */
+  const countingHasher = (base: CleanHasher): { hasher: CleanHasher; count: () => number } => {
+    let calls = 0;
+    const hasher: CleanHasher = async (dir, rel, bytes) => {
+      calls += 1;
+      return base(dir, rel, bytes);
+    };
+    return { hasher, count: () => calls };
+  };
+
+  const identityHasher: CleanHasher = (_dir, _rel, bytes) =>
+    Promise.resolve(bytes.toString('utf8'));
+
+  /** Same as `makeStore`, but with a `CleanHasher` and a `HeadShaReader` wired in, for exercising
+   * the conflictHead memo. */
+  const makeMemoStore = (sessionId: string, hasher: CleanHasher): ShadowStore =>
+    new ShadowStore(
+      workspace,
+      sessionId,
+      (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
+      undefined,
+      hasher,
+      ((_dir: string) => Promise.resolve(headCommit)) as HeadShaReader,
+    );
+
   beforeEach(async () => {
     workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-shadow-'));
     head = new Map();
     setHead(REL, BASE);
+    headCommit = 'c0';
   });
 
   afterEach(async () => {
@@ -876,6 +911,176 @@ describe('ShadowStore', () => {
 
       const change = only(await store.changes(PROJECT));
       expect(change.conflicted).toBe(true);
+    });
+  });
+
+  describe('conflictHead memo (issue #66 item 6)', () => {
+    it('does not re-hash a conflicted entry while HEAD stays put', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const a = makeMemoStore('a', hasher);
+      const b = makeMemoStore('b', hasher);
+
+      await a.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per B.'));
+
+      // A's commit lands: HEAD moves to different bytes on the same line B touched.
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+
+      expect(count()).toBe(0);
+      const first = await b.refresh(PROJECT, DIR);
+      expect(first.conflicted).toEqual([REL]);
+      // The settled check's sameAsGitSees fallback spawns the hasher twice (idA/idB) before
+      // falling through to the merge3 conflict — this is the pre-fix baseline cost per call.
+      expect(count()).toBe(2);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      // Three more refreshes with HEAD unchanged must not grow the hasher call count at all —
+      // pre-fix, each of these would add 2 more (6 total).
+      for (let i = 0; i < 3; i++) {
+        const refreshed = await b.refresh(PROJECT, DIR);
+        expect(refreshed.conflicted).toEqual([REL]);
+        expect(count()).toBe(2);
+        expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+      }
+    });
+
+    it('re-evaluates once HEAD moves again, and can settle', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const a = makeMemoStore('a', hasher);
+      const b = makeMemoStore('b', hasher);
+
+      await a.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per B.'));
+
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.refresh(PROJECT, DIR);
+      expect(count()).toBe(2);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      // HEAD moves to exactly what B's own shadow already holds (e.g. someone applied B's fix) —
+      // the memo must not freeze the stale verdict past this move: it settles.
+      headCommit = 'c2';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per B.'));
+      const settled = await b.refresh(PROJECT, DIR);
+      expect(settled.settled).toEqual([REL]);
+      expect(settled.conflicted).toEqual([]);
+      expect(await b.changes(PROJECT)).toEqual([]);
+      // bytesEqual(head, shadow) matched directly — no hasher spawn needed for this move.
+      expect(count()).toBe(2);
+
+      // A fresh conflict, then HEAD moves to a THIRD, still-conflicting commit: the evaluation
+      // must re-run (hasher spawns again) and the new conflictHead must be the new sha, not stuck
+      // on the first one. `before` matches the entry's re-anchored base (the settled HEAD content)
+      // exactly, so this record() applies cleanly (no hasher spawn) and leaves a fresh shadow to
+      // conflict against.
+      await b.record(
+        PROJECT,
+        DIR,
+        REL,
+        BASE.replace('Alpha line.', 'Alpha per B.'),
+        BASE.replace('Alpha line.', 'Alpha per B, again.'),
+      );
+      expect(count()).toBe(2); // unchanged — that record() applied directly
+      headCommit = 'c3';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A, again.'));
+      const reconflicted = await b.refresh(PROJECT, DIR);
+      expect(reconflicted.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // settled-check fallback spawned again for this new HEAD
+
+      headCommit = 'c4';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A, yet again.'));
+      const reconflictedAgain = await b.refresh(PROJECT, DIR);
+      expect(reconflictedAgain.conflicted).toEqual([REL]);
+      expect(count()).toBe(6); // re-evaluated again — a new HEAD sha each time, no memo hit
+    });
+
+    it('a record-time collision (no conflictHead yet) is fully evaluated once by the next refresh, then memoised', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const store = makeMemoStore('a', hasher);
+
+      // First edit lands in the shadow.
+      await store.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      // A second record() call whose "before" no longer matches the shadow (a peer wrote to the
+      // same line in the working tree between the two calls) and whose "after" changes it a third
+      // way: shadow/before/after all differ on the same line, so record()'s own merge3 conflicts.
+      // This branch (record, not refresh) never sets conflictHead — see the class doc comment.
+      await store.record(
+        PROJECT,
+        DIR,
+        REL,
+        BASE.replace('Alpha line.', 'Alpha per B.'),
+        BASE.replace('Alpha line.', 'Alpha per C.'),
+      );
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+      // record()'s own raw-comparison-failed fallback (before the merge3 that finds the conflict)
+      // already spawns the hasher twice — this is what "no conflictHead yet" costs on its own,
+      // separate from what the next refresh costs.
+      expect(count()).toBe(2);
+
+      // Move HEAD to yet another value on the same line, so refresh has real work to do.
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per HEAD.'));
+
+      const first = await store.refresh(PROJECT, DIR);
+      expect(first.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // fully evaluated exactly once (settled-check fallback: +2)
+
+      const second = await store.refresh(PROJECT, DIR);
+      expect(second.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // memoised — the second call spawns nothing more
+    });
+
+    it('an old index entry with conflicted:true but no conflictHead is re-evaluated, not skipped', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const dir = sessionDir(workspace, PROJECT, 'legacy-conflict');
+      await mkdir(path.join(dir, 'shadow', 'sections'), { recursive: true });
+      await mkdir(path.join(dir, 'base', 'sections'), { recursive: true });
+      await writeFile(
+        path.join(dir, 'shadow', REL),
+        BASE.replace('Alpha line.', 'Alpha SHADOW.'),
+        'utf8',
+      );
+      await writeFile(path.join(dir, 'base', REL), BASE, 'utf8');
+      await writeFile(
+        path.join(dir, 'shadow.json'),
+        JSON.stringify({
+          entries: { [REL]: { deleted: false, baseExists: true, conflicted: true } },
+        }),
+        'utf8',
+      );
+
+      const store = makeMemoStore('legacy-conflict', hasher);
+      headCommit = 'cX';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha HEAD.'));
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.conflicted).toEqual([REL]);
+      expect(count()).toBe(2); // the missing field forced a full evaluation
+
+      const raw = JSON.parse(await readFile(path.join(dir, 'shadow.json'), 'utf8')) as {
+        entries: Record<string, { conflictHead?: string }>;
+      };
+      expect(raw.entries[REL]?.conflictHead).toBe('cX');
+
+      // Now that conflictHead is set, a further refresh with the same HEAD is memoised.
+      const again = await store.refresh(PROJECT, DIR);
+      expect(again.conflicted).toEqual([REL]);
+      expect(count()).toBe(2);
+    });
+
+    it('leaves conflictHead unset on an unrecorded entry — it is skipped before the memo check', async () => {
+      const store = makeMemoStore('a', identityHasher);
+      await store.markUnrecorded(PROJECT, REL);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const raw = JSON.parse(
+        await readFile(path.join(sessionDir(workspace, PROJECT, 'a'), 'shadow.json'), 'utf8'),
+      ) as { entries: Record<string, { conflictHead?: string }> };
+      expect(raw.entries[REL]?.conflictHead).toBeUndefined();
     });
   });
 });

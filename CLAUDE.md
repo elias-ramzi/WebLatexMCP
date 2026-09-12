@@ -132,9 +132,27 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   deliberately settles what it took**: after a `scope: "all"`/`"paths"` commit, `commit` drops this
   session's entries _under the paths the commit was given_ (`ShadowStore.settle`/`clear`, by
   `coversPath`), whether or not git staged each one — deliberately, since an entry whose working tree
-  already equals HEAD stages nothing yet must still un-wedge. The flag is never cleared on an edit, and
+  already equals HEAD stages nothing yet must still un-wedge — and when git reports nothing to stage
+  at all for an `"all"`/`"paths"` request that covers a tracked entry (the content is already at HEAD:
+  a `push` with `message` committed it, or a hand revert), `commit` settles those entries and returns
+  `committed: false` with them under `settled`, rather than refusing and leaving the only way out an
+  empty commit or a discard; a request covering nothing this session tracks still refuses as before.
+  **A session commit skips what git ignores** (`GitService.ignoredPaths`, `git check-ignore --stdin`
+  without `--no-index`, run once per commit): `commitContents` stages by `update-index`, which never
+  consults `.gitignore`/`.git/info/exclude`, so the `summarize-paper` note that relies on the exclude
+  was committed and pushed by the default scope while `"all"` (`git add -A`) left it alone. Ignored
+  entries are settled and reported under `ignored`; a tracked file matching a pattern is not ignored
+  (as for `git add`) and still commits. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
-  deliberate take or a discard ends that state.
+  deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
+  its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call
+  (`GitService.headSha`, wired as the store's `HeadShaReader`) and **skips a conflicted entry whose
+  `conflictHead` is that commit** — otherwise every `status`/`commit`/`push` re-merged and re-hashed
+  (two `git hash-object` spawns) each permanently conflicted asset, forever. The memo never clears a
+  flag; a HEAD move re-evaluates in full, and an entry without the field (older index, or a
+  `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
+  reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
+  never clear one.
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
@@ -251,7 +269,16 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   was resolved and found to leave; a path past `MAX_REPORTED_PATH_CHECKS` was never resolved at all.
   Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
   stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
-  land outside.
+  land outside. **A write through an in-project link is attributed to the link's target**
+  (`attributedPath` in `FileService`, fed to the mutation recorder by `write`/`writeBytes`/
+  `applyEdits`): the bytes land in the target, so the session's shadow must name the target, or the
+  entry carries the link's HEAD blob (its target string) as base and three-way merges text against
+  `"main.tex"` — a bogus `conflicted` on the link while the real edit is owned by nobody — and a
+  dangling tracked link committed as a mode-120000 blob whose target string _was_ the new text.
+  `delete` stays attributed to the link: `rm` removes the link, not the target. The baseline key is
+  untouched by this — identity for the revision tracker is still the `resolveInside` string; only the
+  name the recorder is told changes. And `commitContents` refuses content for a path whose index mode
+  is 120000, so no stale entry can produce that link-with-text blob again.
 - **The compile backend is preflighted, and only an _unchosen_ default is ever substituted.**
   `CompilerResolver` (`src/services/compilerResolver.ts`) calls `isAvailable()` before compiling —
   which nothing did until a user on a tectonic-only machine got a raw `spawn latexmk ENOENT` naming
@@ -319,7 +346,16 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `rebase --continue`); the set is validated (missing/extra files named), `expectedRemoteHead` guards
   against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
   gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
-  directly. Keep the merged text originating from the caller.
+  directly. Keep the merged text originating from the caller. **A resolution is file content, so a
+  path that is a symlink on _either_ side of the conflict is refused** (rebase aborted, clone back to
+  its pre-push state) — `resolvePush` checks `lstat` in the paused rebase _and_ every index stage for
+  mode 120000, inside `GitService`, because the link that matters is upstream's, materialised only by
+  the paused rebase, which a pre-check in the tool against our HEAD cannot see. Before this, a
+  collaborator's `notes.tex -> /outside` made a resolution write through the link into the outside
+  file and then report nothing-to-push, and `notes.tex -> refs.bib` reached a `.bib` past the
+  literal-name `confirmBibEdit` gate. `unmergedPaths` passes `-c core.quotePath=false` like every
+  other path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never
+  be resolved by name.
 - **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
   range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
   rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,

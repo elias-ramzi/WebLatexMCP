@@ -77,6 +77,9 @@ export function createContext(
     (dir, rel) => git.readAtRefBytes(dir, 'HEAD', rel),
     undefined,
     (dir, rel, bytes) => git.cleanBlobId(dir, rel, bytes),
+    // HEAD's commit sha, once per `refresh`, so a permanently conflicted entry is not re-merged and
+    // re-hashed (two `git hash-object` spawns) on every status/commit/push while HEAD stands still.
+    (dir) => git.headSha(dir),
   );
   // Every mutation this server makes is folded into this session's shadow, so `commit` can later
   // stage this session's lines alone. FileService is handed the hook rather than the store so it

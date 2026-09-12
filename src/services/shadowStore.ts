@@ -23,6 +23,14 @@ export type HeadReader = (projectDir: string, relPath: string) => Promise<Buffer
  */
 export type CleanHasher = (projectDir: string, relPath: string, bytes: Buffer) => Promise<string>;
 
+/**
+ * The commit sha HEAD currently points at, or the literal `'unborn'` when the project has no
+ * commit yet — never throws. Injected for the same reason `HeadReader`/`CleanHasher` are: the
+ * store stays independent of `GitService`, and tests can drive it without a repository. This is
+ * what lets `refresh` memoise a conflicted verdict: see the class doc comment and `refresh`.
+ */
+export type HeadShaReader = (projectDir: string) => Promise<string>;
+
 /** One file this session has changed, as tracked on disk. */
 interface ShadowIndexEntry {
   /** True when this session's change to the file is its deletion. */
@@ -35,6 +43,17 @@ interface ShadowIndexEntry {
    * from commits until the conflict is dealt with.
    */
   conflicted?: boolean;
+  /**
+   * The commit sha HEAD had when `refresh` last judged this entry conflicted. While HEAD is still
+   * that commit, the verdict cannot have changed — `record` early-returns on `conflicted`
+   * (leaving the shadow and base exactly as they were) and `refresh` writes nothing on either
+   * conflicting branch — so `refresh` skips recomputing it: no HEAD blob read, no shadow read, no
+   * merge, no `sameAsGitSees` spawn. Absent on entries written before this field existed (simply
+   * re-evaluated once, which then sets it) and on a `record`-time collision (set only by
+   * `refresh`, so the *next* `refresh` still evaluates that one fully, once). Cleared wherever
+   * `conflicted` is cleared.
+   */
+  conflictHead?: string;
   /**
    * When this session last wrote the file, ISO 8601. Set on every `record` call — including the
    * conflicted early return, since the session did write the file even though the shadow could
@@ -147,6 +166,7 @@ export class ShadowStore {
     private readonly readHead: HeadReader,
     private readonly now: () => number = Date.now,
     private readonly cleanHash?: CleanHasher,
+    private readonly resolveHeadSha?: HeadShaReader,
   ) {}
 
   /**
@@ -234,6 +254,7 @@ export class ShadowStore {
       // A deletion is not mergeable — record it as this session's change outright.
       entry.deleted = true;
       entry.conflicted = false;
+      delete entry.conflictHead;
       await this.removeShadow(projectId, rel);
     } else if (entry.binary) {
       // Binary content has no honest merge — there is no such thing as a merged PNG. A peer
@@ -268,6 +289,7 @@ export class ShadowStore {
       if (beforeMatchesShadow) {
         entry.deleted = false;
         entry.conflicted = false;
+        delete entry.conflictHead;
         await this.writeShadow(projectId, rel, toBuffer(after));
       } else {
         entry.conflicted = true;
@@ -290,6 +312,7 @@ export class ShadowStore {
         // erases — the edit applies to the shadow directly.
         entry.deleted = false;
         entry.conflicted = false;
+        delete entry.conflictHead;
         await this.writeShadow(projectId, rel, Buffer.from(afterStr, 'utf8'));
       } else if (shadowStr !== null && beforeStr !== null) {
         // Re-checked (rather than asserted) so the compiler can narrow these to `string`:
@@ -303,6 +326,7 @@ export class ShadowStore {
         } else {
           entry.deleted = false;
           entry.conflicted = false;
+          delete entry.conflictHead;
           await this.writeShadow(projectId, rel, Buffer.from(merged, 'utf8'));
         }
       }
@@ -415,10 +439,18 @@ export class ShadowStore {
    * so nothing is resolved on the session's behalf. An `unrecorded` entry is skipped entirely —
    * its shadow is known-incomplete, so neither a clean merge nor "HEAD equals the shadow" says
    * anything about it — and reported under `conflicted` as it was.
+   *
+   * A conflicted entry whose `conflictHead` still matches the current HEAD is reported without
+   * re-reading HEAD's blob, re-reading the shadow, re-running `merge3`, or spawning
+   * `sameAsGitSees` — that verdict cannot have changed since HEAD has not moved and neither
+   * `record` nor `refresh` touch a conflicted entry's shadow/base (see `ShadowIndexEntry.conflictHead`).
+   * HEAD's sha is resolved at most once per call, before the loop, when a `HeadShaReader` is
+   * wired.
    */
   async refresh(projectId: string, projectDir: string): Promise<RefreshResult> {
     const index = await this.readIndex(projectId);
     const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
+    const headSha = this.resolveHeadSha ? await this.resolveHeadSha(projectDir) : undefined;
 
     for (const [rel, entry] of Object.entries(index.entries)) {
       if (entry.unrecorded === true) {
@@ -431,6 +463,15 @@ export class ShadowStore {
         // So: touch nothing, leave the entry exactly as it is, and keep it flagged. Only a
         // deliberate take (`settle`/`clear`, i.e. commit scope "all"/"paths") or a discard ends
         // this state.
+        result.conflicted.push(rel);
+        continue;
+      }
+
+      if (entry.conflicted === true && headSha !== undefined && entry.conflictHead === headSha) {
+        // HEAD has not moved since this entry was last judged conflicted, and a conflicted
+        // entry's shadow/base are frozen (`record` early-returns on it; `refresh` writes nothing
+        // on either conflicting branch below) — so the verdict is unchanged. Skip the HEAD read,
+        // the shadow read, the merge, and the `sameAsGitSees` spawns entirely.
         result.conflicted.push(rel);
         continue;
       }
@@ -459,6 +500,7 @@ export class ShadowStore {
       if (head === null || shadow === null) {
         // One side is a delete: no text to merge, and picking a winner would be a guess.
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -467,6 +509,7 @@ export class ShadowStore {
         // A binary shadow whose HEAD moved to different bytes has no honest merge — there is no
         // such thing as a merged PNG — so it is reported as a conflict, never merged.
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -478,6 +521,7 @@ export class ShadowStore {
       );
       if (conflicted) {
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -485,6 +529,7 @@ export class ShadowStore {
       await this.writeBase(projectId, rel, head);
       entry.baseExists = true;
       entry.conflicted = false;
+      delete entry.conflictHead;
       result.advanced.push(rel);
     }
 

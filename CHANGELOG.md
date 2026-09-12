@@ -375,6 +375,60 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **A session commit no longer takes files git ignores** (#66, item 1). `scope: "session"` stages
+  from the session's shadow with `update-index`, which never consults `.gitignore` or
+  `.git/info/exclude` — so a file this server wrote that git would never stage (the `summarize-paper`
+  note relies on the exclude to stay local) was committed and pushed by the default scope while
+  `scope: "all"` left it alone. `commit` now runs one `git check-ignore` over the paths in scope —
+  the session's files, or the named `paths` under `"paths"`/`"all"` (where `git add` would have
+  failed with a raw "use -f") — skips the matches, reports them under a new `ignored` field and
+  drops them from the session's record; a tracked file that matches a pattern is not ignored (as
+  under `git add`) and still commits. A request whose every path is ignored is refused by name, not
+  with "no changes". Pathspecs handed to `git add` and `ls-files` are now literal, never globs:
+  naming `a[1].tex` used to stage a peer's dirty `a1.tex` past the ownership check.
+- **A wedged `unrecorded`/`conflicted` entry whose file already matches HEAD can be settled without an
+  empty commit** (#66, item 2). After a `push` with `message` had committed the working tree, or a hand
+  revert, the remedy every message named — `scope: "all"` — refused with "Nothing to commit", `scope:
+"paths"` refused the path as unchanged, and only `discard` or `allowEmpty` (a junk empty commit,
+  later pushed) worked. Now a `scope: "all"`/`"paths"` request that covers a tracked entry and finds
+  nothing to stage settles those entries and returns `committed: false` with them under the new
+  `settled` field (also populated after a landed commit); a request covering nothing the session tracks
+  still refuses as before. The refusal texts name the exact `discard` call and this route.
+- **A push `resolution` can no longer write through a symlink, and a non-ASCII conflicted path can be
+  resolved** (#66, items 3 and 10). `resolvePush` applied each resolution with a raw `writeFile` by the
+  path git reported: when a collaborator's commit turned `notes.tex` into a link pointing outside the
+  clone, the resolution's content landed in the outside file, `git add` staged the link unchanged, and
+  the tool reported nothing-to-push; a link to `refs.bib` reached the bibliography past the
+  literal-name `confirmBibEdit` gate. A path that is a symlink on either side of the conflict (the
+  paused rebase's working tree, or any index stage at mode 120000) is now refused by name, the rebase
+  aborted and the clone left where it was before the rebase started. The index-side check (and
+  `commitContents`' mode lookup) passes the path as a literal pathspec, not a glob, so `a[1].tex`
+  is never judged by `a1.tex`'s entry. Separately, the unmerged-path listing lacked
+  `core.quotePath=false`, so a conflict on `é.tex` came back as `"\303\251.tex"`, with an empty
+  per-file report and a resolution for `é.tex` rejected as "not supplied"; it now matches every other
+  path-returning call. (The issue's item 10 — a literal newline in a path mis-splitting `--numstat` —
+  turned out not to be a defect: git C-quotes control characters whatever `core.quotePath` says, so the
+  row count stays right; the quoting bug that _was_ real is this one.)
+- **A write through an in-project symlink is attributed to the link's target** (#66, item 4). A
+  confirmed `write_file`/`edit_file`/`add_asset` through a tracked `link.tex -> main.tex` changed
+  `main.tex` on disk but recorded the change under `link.tex`, whose HEAD content is the target string:
+  the session's commit then refused with a bogus "same lines of link.tex" collision while the real
+  edit to `main.tex` was owned by nobody; through a dangling tracked link, the commit landed a
+  mode-120000 entry whose blob was the new text — a symlink pointing at the paragraph. The mutation
+  recorder is now told where the bytes landed (the target's project-relative name, when the link stays
+  inside the project); `delete_file` stays attributed to the link itself, which is what it removes; the
+  revision-tracker baseline key is unchanged, and the confirmation diff `write_file`/`edit_file`
+  return now shows the target's change rather than an unchanged link. `commitContents` additionally
+  refuses to stage content over a mode-120000 index entry, so no stale record can produce a
+  link-with-text again.
+- **`refresh` no longer re-merges and re-hashes a permanently conflicted entry on every call** (#66,
+  item 6). A conflicted entry's shadow and base are frozen by design, so after a collision every
+  `status`/`commit`/`push`/`project_sync` re-read HEAD, re-ran the three-way merge and spawned
+  `git hash-object` twice per entry — three conflicted 2 MiB assets meant six spawns and ~12 MiB of pipe
+  per `status`, forever. The entry now remembers the HEAD commit it was judged against
+  (`conflictHead`) and is skipped while HEAD is still that commit; a HEAD move re-evaluates it in full,
+  the flag is never cleared by the memo, and entries written before the field existed are evaluated
+  once and then memoised.
 - **An imported `.svg`/`.eps` (or a CRLF `.tex`) no longer stays `conflicted` forever on a clone with
   `* text=auto`** (#63). A session commit stages through `git hash-object --path`, which applies the
   path's gitattributes clean filter, so HEAD held the LF-normalised blob while the session's shadow held
