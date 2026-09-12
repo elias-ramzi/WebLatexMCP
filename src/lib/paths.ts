@@ -16,6 +16,23 @@ export function toFileUrl(absPath: string): string {
 }
 
 /**
+ * Whether two paths name the same location, after `path.resolve`. Exact (case-sensitive) on
+ * Linux; case-insensitive on `win32` and `darwin`, whose default filesystems (NTFS, APFS/HFS+ in
+ * their default configuration) treat differently-cased paths as the same file — so a caller
+ * spelling `Figures/x.png` for an on-disk `figures/x.png` names the same entry there, and a
+ * case-sensitive string compare would wrongly call that a different target (e.g.
+ * `FileService.linkTarget` mistaking a mere case mismatch for a symlink pointing elsewhere).
+ */
+export function samePath(a: string, b: string): boolean {
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    return ra.toLowerCase() === rb.toLowerCase();
+  }
+  return ra === rb;
+}
+
+/**
  * Resolve a user-supplied relative path against a project root, rejecting anything
  * that escapes the root (`..`, absolute paths, symlink-style traversal in the string).
  * Returns the absolute resolved path. Allows the root itself (empty/`.` relative path).

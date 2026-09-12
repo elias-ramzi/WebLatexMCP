@@ -61,6 +61,12 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
+          // Inside the lock, same reasoning as write_file: closes the peer window at no extra cost
+          // since every mutator already takes this lock.
+          const target = await ctx.files.linkTarget(dir, relPath);
+          if (target !== null && isBibFile(target) && !confirmBibEdit) {
+            throw new Error(bibEditBlockedMessage(relPath, target));
+          }
           const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
           const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
           const headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;

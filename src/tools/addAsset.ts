@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { resolveAssetSource } from '../lib/assetImport.js';
+import { isImportableAsset, assetLinkBlockedMessage } from '../lib/assets.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -78,6 +79,12 @@ export function registerAddAsset(server: McpServer, ctx: AppContext): void {
         // an asset too, exactly as write_file writes into one.
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
+          // Inside the lock, same reasoning as write_file/edit_file: closes the peer window at no
+          // extra cost since every mutator already takes this lock.
+          const target = await ctx.files.linkTarget(dir, relPath);
+          if (target !== null && !isImportableAsset(target)) {
+            throw new Error(assetLinkBlockedMessage(relPath, target));
+          }
           const { bytes, origin, sha256 } = await resolveAssetSource({
             destPath: relPath,
             sourcePath,

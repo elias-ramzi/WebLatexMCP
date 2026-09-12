@@ -295,6 +295,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **Re-registering a project says which stored fields it dropped.** `register_project` with `gitUrl`
+  or `path` on an id already in the registry replaces the stored entry from the arguments given — that
+  is unchanged and documented — but a `rootFile`, `branch`, `username`, `tokenEnv` or `followSymlinks`
+  set earlier and not repeated vanished without a word. The result text now lists them with their old
+  values so they can be re-registered on purpose. Internal clean-ups from the same review:
+  `execCapture` is defined in terms of `execCaptureBytes` (one spawn body, and a multi-byte character
+  split across two output chunks now decodes correctly), and `FileService.readBytes` refuses a file over
+  the 2 MiB read cap instead of loading it whole.
 - **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
   `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`
   classification and `read_file`'s binary-file refusal, a `.tif` or `.ico` that previously read as
@@ -342,6 +350,44 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **An imported `.svg`/`.eps` (or a CRLF `.tex`) no longer stays `conflicted` forever on a clone with
+  `* text=auto`** (#63). A session commit stages through `git hash-object --path`, which applies the
+  path's gitattributes clean filter, so HEAD held the LF-normalised blob while the session's shadow held
+  the CRLF bytes it wrote; the next refresh saw HEAD and shadow differ, a binary shadow has no merge, and
+  the path was flagged `conflicted` — sticky by design — for a file nobody else touched, and every later
+  `add_asset` or `commit` on it was refused. Equality between HEAD, a shadow and the working tree is
+  now judged through the same clean filter (`GitService.cleanBlobId`, the blob id the bytes _would_
+  get), so "our change is what landed" is recognised across a normalisation, the second import to the
+  same path is accepted, and a CRLF `.tex` commits without a phantom every-line conflict. A genuine
+  collision still conflicts, a binary shadow is still never merged, and the flag still sticks.
+- **A shadow record that fails no longer leaves a live session's edit owned by nobody.** The write was
+  (and is) never failed for it, but the file then had no index entry, so a peer's `commit scope: "paths"`
+  could take the session's in-flight lines and the session's own commit silently omitted them. The path
+  is now marked `conflicted` + `unrecorded` in the session's index: peers refuse it as owned, the
+  session's `commit` excludes it and says why, and it stays that way until taken with `scope: "all"` or
+  discarded. Taking it now actually settles it: a `scope: "all"`/`"paths"` commit drops this session's
+  entries for the paths it committed (`ShadowStore.settle`), so a conflicted or unrecorded entry no
+  longer lingers and keeps the default scope refusing after the tree was taken deliberately. A
+  heartbeat (`touch`) failure alone marks nothing — only a failed shadow record does. What remains is
+  an index that cannot be written at all (documented in CONCURRENCY.md).
+- **A peer's `register_project { default: true }` now reaches every env-unset session the same way.**
+  It retargeted a session that had no default at startup at once, but never one that had started with
+  a persisted default, because the in-process value shadowed the registry's. The registry's current
+  default is now the live answer for every session that did not assert one through
+  `WEB_LATEX_MCP_DEFAULT_PROJECT`; the env assertion still wins outright.
+- **The `.bib` guard and the `add_asset` destination gate look through symlinks.** An in-project link
+  `figures/x.png -> refs.bib` stays inside the sandbox, so it passed the escape check, and every
+  name-based gate judged only `figures/x.png`: `write_file` and `edit_file` changed the bibliography
+  with no `confirmBibEdit`, and `add_asset` overwrote it with a PNG. Each now also judges the name the
+  path resolves to (`FileService.linkTarget`, inside the project lock) and refuses with a message
+  naming the far end. `delete_file` is deliberately not gated on the target: deleting a link removes
+  the link, never the bibliography behind it. The escape check itself is unchanged and still runs
+  first.
+- **`diff` returns literal paths in `files[].path`.** A non-ASCII path came back C-quoted
+  (`"r\303\251sum\303\251.tex"`) and a rename as `{a => b}.tex`, neither of which `read_file`
+  accepts. Every `--numstat` the server runs (`diff`, `commit`, the branch-review landing) now shares
+  one helper with `core.quotePath=false` and `--no-renames`, the same fix `logCommits` received; the
+  patch text alongside still renders a rename as a rename.
 - **A missing parent directory now names the flag that creates it.** Writing
   `sections/new/intro.tex` without `createDirs: true` failed with a raw
   `ENOENT: no such file or directory, open '/abs/...'` that mentioned neither the missing directory

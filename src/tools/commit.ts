@@ -48,8 +48,11 @@ const outputSchema = {
   conflicted: z
     .array(z.string())
     .describe(
-      'Files excluded because this session and a commit changed the same lines. Re-read them, ' +
-        'redo the edit on the current content, then commit again.',
+      'Files this session still holds as excluded after the commit — whether or not `paths` ' +
+        'named them — because this session and a commit changed the same lines, or because ' +
+        "this session's own record of its change failed (see the result text for which). " +
+        'Re-read them, redo the edit on the current content, then commit again — or take them ' +
+        'deliberately with scope "all".',
     ),
 };
 
@@ -75,7 +78,7 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           await ctx.sessions.touch(id);
           // HEAD may have moved since this session last wrote (a peer committed, or a pull
           // landed), so carry its shadow forward before deciding what to commit.
-          const refreshed = await ctx.shadows.refresh(id, dir);
+          await ctx.shadows.refresh(id, dir);
           const effective = scope ?? ((await ctx.shadows.hasChanges(id)) ? 'session' : 'all');
 
           const res =
@@ -85,10 +88,28 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
                 ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
                 : await commitEverything(ctx, dir, { message, paths, allowEmpty });
 
-          // The commit moved HEAD: settle what just landed and re-anchor what did not.
-          await ctx.shadows.refresh(id, dir);
+          // "all"/"paths" commit the working tree as it stands, taken deliberately — so whatever
+          // this session's shadow said about a path just committed (including a sticky
+          // conflicted/unrecorded flag) is settled by that act, not by a merge. "session" needs
+          // nothing extra: the refresh below settles what landed the normal way.
+          if (effective === 'all') {
+            const taken = settlePaths(paths);
+            if (taken === 'everything') await ctx.shadows.clear(id);
+            else await ctx.shadows.settle(id, taken);
+          } else if (effective === 'paths') {
+            await ctx.shadows.settle(id, (paths ?? []).map(toPosix));
+          }
 
-          const conflicted = [...new Set([...refreshed.conflicted, ...res.conflicted])];
+          // The commit moved HEAD (or the store was settled directly above): carry forward
+          // whatever this session still tracks, then report what is left, not what was true
+          // before the commit — under scope "all"/"paths" a path just taken must never be
+          // reported as excluded.
+          await ctx.shadows.refresh(id, dir);
+          const remaining = await ctx.shadows.changes(id);
+          const conflicted = remaining.filter((c) => c.conflicted).map((c) => c.path);
+          const unrecorded = remaining.filter((c) => c.unrecorded).map((c) => c.path);
+          const unrecordedSet = new Set(unrecorded);
+          const collided = conflicted.filter((p) => !unrecordedSet.has(p));
           const added = res.files.reduce((sum, f) => sum + f.added, 0);
           const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
           const headline =
@@ -106,9 +127,14 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
             res.leftUncommitted.length
               ? `left uncommitted (not this session's): ${res.leftUncommitted.join(', ')}`
               : '',
-            conflicted.length
+            unrecorded.length
+              ? `⚠ excluded — this session's change to ${unrecorded.join(', ')} could not be ` +
+                'recorded (see the server log), so its shadow does not hold it. Commit with scope ' +
+                '"all" to take the working tree as it stands, or discard those files.'
+              : '',
+            collided.length
               ? `⚠ excluded — this session and someone else changed the same lines of ` +
-                `${conflicted.join(', ')}. Commit with scope "all" to take the working tree as ` +
+                `${collided.join(', ')}. Commit with scope "all" to take the working tree as ` +
                 "it stands, or discard those files to drop this session's version."
               : '',
           ]
@@ -136,12 +162,33 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
   );
 }
 
+/**
+ * What a `scope: "all"` commit took, in the spelling `ShadowStore.settle` matches on. `git add`
+ * accepts `"."`, `""` and a leading `"./"` as "the whole tree" / "this directory", but
+ * `coversPath` deliberately covers nothing for `"."`/`""`, so those spellings must map to
+ * `clear` — otherwise an entry the caller just committed as it stands would linger and keep the
+ * default scope refusing (the wedge `settle` exists to end). Exported for the unit test.
+ */
+export function settlePaths(paths: string[] | undefined): string[] | 'everything' {
+  if (!paths || paths.length === 0) return 'everything';
+  const normalized = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
+  if (normalized.some((p) => p === '' || p === '.')) return 'everything';
+  return normalized;
+}
+
 interface CommitOutcome {
   committed: boolean;
   sha: string;
   filesChanged: number;
   files: Array<{ path: string; added: number; removed: number }>;
   leftUncommitted: string[];
+  /**
+   * Files this call itself excluded from the commit (populated only by `commitSession`, always
+   * `[]` for `commitPaths`/`commitEverything`, which never consult the shadow store to decide
+   * what to commit). Not what the tool reports: the handler re-derives `conflicted`/`unrecorded`
+   * from `ctx.shadows` *after* the commit (and, for "all"/"paths", after settling what it just
+   * took), since a path this call excluded may no longer be tracked at all by then.
+   */
   conflicted: string[];
 }
 
@@ -165,11 +212,16 @@ async function commitSession(
   }
 
   const conflicted = selected.filter((c) => c.conflicted).map((c) => c.path);
+  const unrecorded = selected.filter((c) => c.unrecorded).map((c) => c.path);
   const committable = selected.filter((c) => !c.conflicted);
   if (committable.length === 0 && !opts.allowEmpty) {
     throw new Error(
       conflicted.length > 0
-        ? `Nothing to commit: every change is conflicted (${conflicted.join(', ')}) — this ` +
+        ? conflicted.length === unrecorded.length
+          ? `Nothing to commit: every change could not be recorded (${conflicted.join(', ')}) — ` +
+            'see the server log for why. Commit with scope "all" to take the working tree as it ' +
+            "stands, or discard those files to give up this session's version."
+          : `Nothing to commit: every change is conflicted (${conflicted.join(', ')}) — this ` +
             'session and someone else changed the same lines, so which edit is whose cannot be ' +
             'decided here. Commit with scope "all" to take the working tree as it stands, or ' +
             "discard those files to give up this session's version."

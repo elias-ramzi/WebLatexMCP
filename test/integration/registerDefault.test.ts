@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, stat } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -167,5 +167,103 @@ describe('register_project { default: true } on an already-registered project', 
     expect(res.isError).toBe(true);
 
     await expect(stat(sessionStateDir(workspace, 'ghost'))).rejects.toThrow();
+  });
+});
+
+/**
+ * Regression coverage for the silent-replace gap: `register_project` with `gitUrl`/`path` on an
+ * id that already exists in the registry replaces the whole stored entry (`ProjectRegistry.upsert`
+ * — "pass every field you want kept", per docs/configuration.md). That replace semantics is kept
+ * on purpose, but before this fix nothing told the caller a re-registration had silently dropped
+ * previously-stored optional fields.
+ */
+describe('register_project reports dropped fields on a silent re-registration', () => {
+  it('names the dropped fields when a re-registration omits them', async () => {
+    const { client } = await setup();
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: {
+        project: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'main.tex',
+        branch: 'master',
+        clone: false,
+      },
+    });
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', gitUrl: 'https://git.overleaf.com/def', clone: false },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('dropping its stored rootFile=main.tex, branch=master');
+  });
+
+  it('says nothing about dropped fields when the re-registration repeats them', async () => {
+    const { client } = await setup();
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: {
+        project: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'main.tex',
+        branch: 'master',
+        clone: false,
+      },
+    });
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: {
+        project: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'main.tex',
+        branch: 'master',
+        clone: false,
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).not.toContain('dropping');
+  });
+
+  it('says nothing about dropped fields on a first-time registration', async () => {
+    const { client } = await setup();
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: {
+        project: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'main.tex',
+        branch: 'master',
+        clone: false,
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).not.toContain('dropping');
+  });
+
+  it('names dropped fields for a local re-registration too', async () => {
+    const { client, workspace } = await setup();
+    const localDir = path.join(workspace, 'draft-source');
+    await mkdir(localDir, { recursive: true });
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'draft', path: localDir, followSymlinks: true },
+    });
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'draft', path: localDir },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('dropping its stored followSymlinks=true');
   });
 });

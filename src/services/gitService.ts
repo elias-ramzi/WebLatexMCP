@@ -273,13 +273,15 @@ export class GitService {
     } else {
       await git.add(['-A']);
     }
-    const staged = (await git.diff(['--cached', '--name-only'])).split('\n').filter(Boolean);
+    const staged = (await git.diff(['--cached', '--no-renames', '--name-only']))
+      .split('\n')
+      .filter(Boolean);
     if (staged.length === 0 && !opts.allowEmpty) {
       throw new Error('Nothing to commit (no staged changes).');
     }
     // Capture the staged per-file line counts before committing — once committed, the
     // `--cached` diff is empty. Drives the diffstat surfaced by the commit tool.
-    const files = parseNumstat(await git.diff(['--cached', '--numstat']));
+    const files = await this.numstat(git, ['--cached']);
     // Identity is supplied per-invocation with -c, so we never mutate the repo config.
     const args = [
       '-c',
@@ -333,11 +335,13 @@ export class GitService {
       await git.raw(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`]);
     }
 
-    const staged = (await git.diff(['--cached', '--name-only'])).split('\n').filter(Boolean);
+    const staged = (await git.diff(['--cached', '--no-renames', '--name-only']))
+      .split('\n')
+      .filter(Boolean);
     if (staged.length === 0 && !opts.allowEmpty) {
       throw new Error('Nothing to commit (no staged changes).');
     }
-    const files = parseNumstat(await git.diff(['--cached', '--numstat']));
+    const files = await this.numstat(git, ['--cached']);
     const args = [
       '-c',
       `user.name=${this.identity.name}`,
@@ -376,13 +380,49 @@ export class GitService {
     return res.stdout;
   }
 
-  /** Write `content` into the object database and return its blob sha. */
+  /**
+   * Per-file added/removed counts for `git diff <args>`, with every `path` a literal working-tree
+   * path. Same two flags `logCommits` needs, for the same reason: every `files[].path` a tool
+   * returns is one the caller may pass to `read_file`, so `core.quotePath` (which C-quotes any
+   * non-ASCII path — `"r\303\251sum\303\251.tex"`) is turned off, and `--no-renames` keeps a
+   * moved file as a delete plus an add rather than one `a/{x => y}.tex` entry that names no file.
+   * `commit`/`commitContents` count staged files with `--no-renames` too, so `filesChanged` agrees
+   * with `files.length`. Only these per-file lists are affected: the patch text callers show
+   * alongside is produced separately and still renders a rename as a rename.
+   */
+  private async numstat(git: SimpleGit, args: string[]): Promise<DiffFile[]> {
+    const out = await git.raw([
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--no-renames',
+      '--numstat',
+      ...args,
+    ]);
+    return parseNumstat(out);
+  }
+
+  /**
+   * The blob id `content` would get if committed at `relPath` — `git hash-object --stdin --path`
+   * WITHOUT `-w`, so nothing is written. `--path` applies the path's gitattributes clean filter
+   * (`* text=auto` turns CRLF into LF), which is exactly the point: two byte strings with the same
+   * id here are the same content *as git will store it*, even when their raw bytes differ. That is
+   * the equality `ShadowStore` needs to tell "our change landed" from "a peer changed this file"
+   * on a clone whose attributes normalise what `commitContents` writes.
+   */
+  async cleanBlobId(dir: string, relPath: string, content: Buffer): Promise<string> {
+    return this.hashObject(dir, toPosix(relPath), content, { write: false });
+  }
+
+  /** Write `content` into the object database (unless `write: false`) and return its blob sha. */
   private async hashObject(
     dir: string,
     relPath: string,
     content: string | Buffer,
+    opts: { write: boolean } = { write: true },
   ): Promise<string> {
-    const res = await execCapture('git', ['hash-object', '-w', '--stdin', '--path', relPath], {
+    const args = ['hash-object', ...(opts.write ? ['-w'] : []), '--stdin', '--path', relPath];
+    const res = await execCapture('git', args, {
       cwd: dir,
       input: content,
     });
@@ -791,7 +831,7 @@ export class GitService {
     const committed = await this.commit(dir, { message: opts.message, paths: opts.paths });
 
     const range = `${base}...${opts.branch}`;
-    const [diff, numstat] = await Promise.all([git.diff([range]), git.diff([range, '--numstat'])]);
+    const [diff, files] = await Promise.all([git.diff([range]), this.numstat(git, [range])]);
 
     return {
       status: 'awaiting-approval',
@@ -799,7 +839,7 @@ export class GitService {
       base,
       committedSha: committed.sha,
       diff,
-      files: parseNumstat(numstat),
+      files,
       summary:
         `Committed ${committed.sha.slice(0, 8)} to local branch "${opts.branch}" ` +
         `(${committed.filesChanged} file(s)). Review the diff vs ${base}, then approve to land it.`,
@@ -978,9 +1018,11 @@ export class GitService {
     // ("main.tex" as a branch) is not an ambiguous argument.
     const tail = opts.path ? ['--', opts.path] : opts.ref !== undefined ? ['--'] : [];
     const patchArgs = [...base, ...tail];
-    const numstatArgs = [...base, '--numstat', ...tail];
-    const [diff, numstat] = await Promise.all([git.diff(patchArgs), git.diff(numstatArgs)]);
-    return { diff, files: parseNumstat(numstat) };
+    const [diff, files] = await Promise.all([
+      git.diff(patchArgs),
+      this.numstat(git, [...base, ...tail]),
+    ]);
+    return { diff, files };
   }
 
   /**
@@ -1488,8 +1530,8 @@ function mergeNewestFirst(justLanded: RemoteCommit[], existing: RemoteCommit[]):
 function parseNumstatLine(line: string): DiffFile {
   const [added, removed, ...rest] = line.split('\t');
   return {
-    // Rename paths ("old => new", "{a => b}/x") are a single field with no tab in them — keep the
-    // raw string as-is rather than trying to split it into two paths.
+    // Every in-repo caller passes `--no-renames` (see `numstat`/`logCommits`), so this is a plain
+    // path; a rename expression ("{a => b}/x") from any other input is kept verbatim, not split.
     path: rest.join('\t'),
     added: added === '-' ? 0 : Number(added),
     removed: removed === '-' ? 0 : Number(removed),

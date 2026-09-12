@@ -107,6 +107,82 @@ function defaultRegistrationNote(ctx: AppContext, makeDefault: boolean | undefin
   return ' It is now the default project — calls may omit `project`.';
 }
 
+/**
+ * Which optional fields a re-registration is about to drop relative to what was already stored,
+ * so `register_project` can say so instead of silently losing them. `ProjectRegistry.upsert`
+ * replaces the whole stored entry on a re-registration with `gitUrl`/`path` (documented,
+ * intentional — docs/configuration.md: "pass every field you want kept") — this helper computes
+ * the loss, it never changes what gets persisted.
+ *
+ * Compares only the fields the STORED (`previous`) entry actually had: a field the new
+ * registration also sets is never reported, even when its value changed — this is a loss check,
+ * not a diff. `previous` undefined (first-time registration) drops nothing, of course.
+ *
+ * One rule for every field, kind change or not: it is dropped only when `previous` had it AND
+ * `next` does not carry the same value forward. `rootFile` exists on both kinds, so it survives a
+ * kind change too, when repeated. `branch`/`username`/`tokenEnv` (git-only) and `followSymlinks`
+ * (local-only) cannot be *set* on the other kind at all, so a kind change drops every one of them
+ * `previous` had — not because kind changes are special-cased, but because `next` can never carry
+ * a git-only field forward onto a local config or vice versa. `followSymlinks: false` is never
+ * reported even when omitted next: the effective value is false either way, so nothing was lost.
+ *
+ * Exported so it is unit-testable without going through the MCP client.
+ */
+export function droppedRegistrationFields(
+  previous: ProjectConfig | undefined,
+  next: ProjectConfig,
+): string[] {
+  if (!previous) return [];
+
+  const dropped: string[] = [];
+  const note = (name: string, value: string | boolean): void => {
+    dropped.push(`${name}=${String(value)}`);
+  };
+
+  // Shared by both kinds: dropped whenever `next` doesn't set it too, kind change or not.
+  if (previous.rootFile !== undefined && next.rootFile === undefined) {
+    note('rootFile', previous.rootFile);
+  }
+
+  if (isLocalProject(previous)) {
+    // Local-only. `next` can carry it forward only if it is itself a local config that sets it —
+    // a git `next` never has the field at all, so this is also how a kind change drops it.
+    if (previous.followSymlinks === true && !(isLocalProject(next) && next.followSymlinks)) {
+      note('followSymlinks', previous.followSymlinks);
+    }
+  } else {
+    // Git-only. Same shape: `next` carries a field forward only as a git config that sets it.
+    if (previous.branch !== undefined && !(!isLocalProject(next) && next.branch !== undefined)) {
+      note('branch', previous.branch);
+    }
+    if (
+      previous.username !== undefined &&
+      !(!isLocalProject(next) && next.username !== undefined)
+    ) {
+      note('username', previous.username);
+    }
+    if (
+      previous.tokenEnv !== undefined &&
+      !(!isLocalProject(next) && next.tokenEnv !== undefined)
+    ) {
+      note('tokenEnv', previous.tokenEnv);
+    }
+  }
+  return dropped;
+}
+
+/**
+ * The result-text addendum for a re-registration that silently dropped stored fields — empty
+ * string when nothing was dropped (a first registration, or one that repeated every field).
+ */
+function droppedFieldsNote(id: string, dropped: string[]): string {
+  if (dropped.length === 0) return '';
+  return (
+    ` Replaced the previous registration of "${id}", dropping its stored ${dropped.join(', ')} ` +
+    '— re-register with them to keep them.'
+  );
+}
+
 /** Expand a leading `~`, then resolve against the server's launch dir, so any input form works. */
 function resolveLocalPath(input: string): string {
   const expanded =
@@ -263,6 +339,10 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
 
         return await ctx.projectManager.runExclusive(project, async () => {
           if (localPath !== undefined) {
+            // Read before persisting: the previous stored entry, so a silent re-registration can
+            // be reported. Reads the registry's own entry (a peer may have updated it), never the
+            // in-process map — see `ProjectManager.registryEntry`.
+            const previous = ctx.projectManager.registryEntry(project);
             const target = await resolveLocalTarget(localPath);
             const dir = target.dir;
             // An explicit rootFile always wins over the one inferred from the file pointed at.
@@ -274,6 +354,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               rootFile: resolvedRoot,
               followSymlinks,
             };
+            const dropped = droppedRegistrationFields(previous, cfg);
             await ctx.projectManager.registerAndPersist(cfg, { makeDefault });
             const payload = {
               project,
@@ -302,13 +383,16 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
               `workspace, not into that directory.${links}` +
-              defaultRegistrationNote(ctx, makeDefault);
+              defaultRegistrationNote(ctx, makeDefault) +
+              droppedFieldsNote(project, dropped);
             return {
               content: [{ type: 'text', text }],
               structuredContent: { ...payload },
             };
           }
 
+          // Read before persisting, same reasoning as the local branch above.
+          const previous = ctx.projectManager.registryEntry(project);
           const cfg = await ctx.projectManager.registerAndPersist(
             {
               id: project,
@@ -321,6 +405,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             },
             { makeDefault },
           );
+          const dropped = droppedRegistrationFields(previous, cfg);
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
@@ -354,7 +439,8 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               ? `Cloned at ${dir}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
-            defaultRegistrationNote(ctx, makeDefault);
+            defaultRegistrationNote(ctx, makeDefault) +
+            droppedFieldsNote(cfg.id, dropped);
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },

@@ -32,6 +32,48 @@ describe('execCapture', () => {
   it('rejects when the binary cannot be spawned', async () => {
     await expect(execCapture('definitely-not-a-real-binary-xyz', [])).rejects.toBeTruthy();
   });
+
+  it('agrees with execCaptureBytes on code, stderr, and decoded stdout for the same child', async () => {
+    const script =
+      'process.stdout.write("out-line\\n"); process.stderr.write("err-line\\n"); process.exit(7)';
+    const [viaCapture, viaBytes] = await Promise.all([
+      execCapture(process.execPath, ['-e', script]),
+      execCaptureBytes(process.execPath, ['-e', script]),
+    ]);
+    expect(viaCapture.code).toBe(viaBytes.code);
+    expect(viaCapture.stderr).toBe(viaBytes.stderr);
+    expect(viaCapture.stdout).toBe(viaBytes.stdout.toString('utf8'));
+    expect(viaCapture.stdout).toBe('out-line\n');
+  });
+
+  it('decodes a multi-byte UTF-8 character split across two stdout chunks', async () => {
+    // 'é' (U+00E9) as UTF-8 is the two bytes 0xC3 0xA9. Write them in two separate
+    // process.stdout.write calls with a delay between them, so the OS pipe delivers them as
+    // two distinct `data` chunks instead of coalescing them into one. Decoding each chunk on
+    // its own (the old `stdout += d.toString()` accumulation) turns each lone byte into a
+    // replacement character (U+FFFD) since neither half is valid UTF-8 by itself; decoding
+    // the concatenated bytes once, as execCaptureBytes does, recovers 'é'.
+    const script = [
+      'process.stdout.write(Buffer.from([0xc3]));',
+      'setTimeout(() => {',
+      '  process.stdout.write(Buffer.from([0xa9]));',
+      '  process.exit(0);',
+      '}, 20);',
+    ].join(' ');
+    const res = await execCapture(process.execPath, ['-e', script]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('é');
+  });
+
+  it('kills the child and sets timedOut on timeout', async () => {
+    const res = await execCapture(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'], // never exits on its own
+      { timeoutMs: 50 },
+    );
+    expect(res.timedOut).toBe(true);
+    expect(res.code).not.toBe(0);
+  });
 });
 
 describe('execCaptureBytes', () => {

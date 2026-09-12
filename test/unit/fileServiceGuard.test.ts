@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, realpath } from 'node:fs/promises';
 import { FileService } from '../../src/services/fileService.js';
+import { toPosix } from '../../src/lib/paths.js';
 
 /** Simulate a user editing the clone directly, outside the server's tools. */
 async function editOnDisk(dir: string, rel: string, content: string): Promise<void> {
@@ -307,6 +308,111 @@ describe('FileService out-of-band edit guard', () => {
     await expect(
       files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
     ).resolves.toMatchObject({ path: 'main.tex' });
+  });
+
+  describe('linkTarget', () => {
+    it('returns null for a plain file (no link involved)', async () => {
+      expect(await files.linkTarget(dir, 'main.tex')).toBeNull();
+    });
+
+    it('names the real target of a link to a file inside the project', async () => {
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+      await symlink(path.join('..', 'refs.bib'), path.join(dir, 'figures', 'x.png'));
+
+      expect(await files.linkTarget(dir, 'figures/x.png')).toBe('refs.bib');
+    });
+
+    it('resolves the project-relative path through a linked directory', async () => {
+      await mkdir(path.join(dir, 'realfigs'), { recursive: true });
+      await writeFile(path.join(dir, 'realfigs', 'a.png'), 'not really png', 'utf8');
+      await symlink('realfigs', path.join(dir, 'figs'), 'dir');
+
+      expect(await files.linkTarget(dir, 'figs/a.png')).toBe('realfigs/a.png');
+    });
+
+    it('throws the same symlink error a write would raise for a link that leaves the project', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+
+        await expect(files.linkTarget(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('under a local project with followSymlinks, returns the absolute outside target', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-outside2-'));
+      try {
+        await writeFile(path.join(outside, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+        await symlink(path.join(outside, 'refs.bib'), path.join(dir, 'shared.bib'));
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+
+        const target = await local.linkTarget(dir, 'shared.bib');
+        // toPosix'd so an outside target lands verbatim in tool text the same way as every other
+        // path — the raw realpath is native (backslashes on Windows), and comparing against it
+        // directly would only happen to match on POSIX platforms.
+        expect(target).toBe(toPosix(await realpath(path.join(outside, 'refs.bib'))));
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('returns null for a case-mismatched path to a plain file (no link involved), on any platform', async () => {
+      // On a case-insensitive filesystem (win32/darwin), "Figures/x.png" resolves via realpath to
+      // the real "figures/x.png" — a bare string compare would wrongly report that as a target
+      // pointing somewhere else; this is the scenario samePath's case-insensitive branch exists
+      // for. On a case-sensitive filesystem (linux), "Figures" does not exist at all, so
+      // resolveThroughLinks's ENOENT fallback (real parent + literal re-attached basename) joins
+      // right back onto the exact same string the "expected" side computes — still null, because
+      // no path component was ever actually a symlink. Assert null either way; don't skip.
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'figures', 'x.png'), 'png', 'utf8');
+
+      expect(await files.linkTarget(dir, 'Figures/x.png')).toBeNull();
+    });
+
+    it('reports a dangling link to a not-yet-existing .bib as its target', async () => {
+      // A write through this link would CREATE refs.bib at the far end — the tool layer needs the
+      // target even though nothing is there yet to gate that write behind confirmBibEdit.
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await symlink(path.join('..', 'refs.bib'), path.join(dir, 'figures', 'x.png'));
+
+      expect(await files.linkTarget(dir, 'figures/x.png')).toBe('refs.bib');
+    });
+
+    it('resolves through a linked directory to a .bib one level further in', async () => {
+      // aliased -> real (a linked directory), and figures/chain.png -> ../aliased/refs.bib: the
+      // resolved target has to walk through the linked directory component too, landing on
+      // real/refs.bib rather than stopping at the literal (aliased-relative) spelling.
+      await mkdir(path.join(dir, 'real'), { recursive: true });
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'real', 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+      await symlink('real', path.join(dir, 'aliased'), 'dir');
+      await symlink(path.join('..', 'aliased', 'refs.bib'), path.join(dir, 'figures', 'chain.png'));
+
+      expect(await files.linkTarget(dir, 'figures/chain.png')).toBe('real/refs.bib');
+    });
+
+    it('still returns null for a plain file when the project is reached through a symlinked parent', async () => {
+      // Same macOS-/var-vs-/private/var scenario as "keeps one identity" above.
+      const real = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-real-'));
+      const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-link-'));
+      const link = path.join(parent, 'project');
+      try {
+        await writeFile(path.join(real, 'main.tex'), 'original\n', 'utf8');
+        await symlink(real, link, 'dir');
+
+        expect(await files.linkTarget(link, 'main.tex')).toBeNull();
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+        await rm(real, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('externalModifications', () => {

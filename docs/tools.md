@@ -114,7 +114,9 @@ file from outside every project sandbox, and the allowlist gates that read on BO
 refused destination is what stops a project from ending up with a stray credential, and a refused
 `sourcePath` is what stops the server from reading a credential file — `~/.ssh/id_rsa`, `.env`,
 both non-asset — off disk in the first place. The source check runs on the realpath'd file, so a
-symlink named like a figure cannot launder a non-asset target past it. A `.tex` destination is
+symlink named like a figure cannot launder a non-asset target past it, and the destination is judged
+on where it lands too — a link named `figures/x.png` whose target is not an asset type (a `.bib`, a
+`.tex`) is refused. A `.tex` destination is
 refused and points you at `write_file`; a `.bib` destination is refused and points you at
 `add_citation`; a non-asset `sourcePath` is refused and points you at `contentBase64`.
 
@@ -172,7 +174,8 @@ Two tools register a project; they differ in whether the registration is remembe
 - **`register_project`** — persists the project to a `registry.json` in the workspace, so it is still
   there after you restart the client and is visible to any other session on the same machine. This is
   the recommended path, and the natural fit for **Claude Desktop**, where hand-editing the env config is
-  awkward. It clones right away unless you pass `clone: false`. Re-registering the same id updates it.
+  awkward. It clones right away unless you pass `clone: false`. Re-registering the same id replaces its
+  stored entry from the arguments given, and the result names any stored field that dropped.
 - **`project_sync` with `gitUrl`** — a lightweight, **session-only** registration: it lives in this one
   server process and is gone on restart. Handy for a one-off; use `register_project` when you want it to
   stick.
@@ -186,7 +189,9 @@ The registry file stores only the id, git URL, and options (`rootFile` / `branch
 
 References are added through a verified path, never hand-written. `.bib` files are **protected**:
 `write_file`, `edit_file`, and `delete_file` refuse a `.bib` target unless you pass `confirmBibEdit: true`
-— a guard so an agent can't quietly rewrite the bibliography. The tool tells the agent to ask you first;
+— a guard so an agent can't quietly rewrite the bibliography. For writes and edits the guard looks
+through symlinks: a `figures/x.png` that is a link to `refs.bib` is refused the same way (deleting
+such a link only removes the link, so `delete_file` judges the name alone). The tool tells the agent to ask you first;
 set the flag only after you approve a manual change (removing or fixing an entry).
 
 To add a reference, use the two-step DBLP flow:

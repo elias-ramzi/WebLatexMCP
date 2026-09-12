@@ -14,6 +14,7 @@ import { DoctorService } from './services/doctor.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
+import { createSessionRecorder } from './lib/mutationRecorder.js';
 import { detectRootFile } from './lib/rootFile.js';
 import { locateProjectPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
@@ -66,8 +67,16 @@ export function createContext(
   const git = new GitService(identity);
 
   const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
-  const shadows = new ShadowStore(config.workspaceRoot, config.sessionId, (dir, rel) =>
-    git.readAtRefBytes(dir, 'HEAD', rel),
+  // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
+  // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
+  // `* text=auto` normalising a binary asset's line endings looks like a peer's change and sticks
+  // the entry `conflicted` forever (#63).
+  const shadows = new ShadowStore(
+    config.workspaceRoot,
+    config.sessionId,
+    (dir, rel) => git.readAtRefBytes(dir, 'HEAD', rel),
+    undefined,
+    (dir, rel, bytes) => git.cleanBlobId(dir, rel, bytes),
   );
   // Every mutation this server makes is folded into this session's shadow, so `commit` can later
   // stage this session's lines alone. FileService is handed the hook rather than the store so it
@@ -76,20 +85,15 @@ export function createContext(
   // theirs (`followSymlinks` on a local project). See setLinkPolicy.
   files.setLinkPolicy((dir) => projectManager.followsUserLinks(dir));
 
-  files.setMutationRecorder({
-    record: async (projectDir, relPath, before, after) => {
-      const id = projectManager.idForDir(projectDir);
-      if (!id) return; // not one of our clones — nothing to attribute it to
-      // Shadows exist so a commit carries one session's lines and nobody else's. A local project
-      // is never committed by this server, and reading `HEAD` there would mean reading whatever
-      // repository happens to contain the user's directory — so it is left out entirely.
-      if (projectManager.isLocal(id)) return;
-      // Editing is what makes a session worth knowing about, so this doubles as its heartbeat —
-      // otherwise a session that only writes would stay invisible to its peers until it committed.
-      await sessions.touch(id);
-      await shadows.record(id, projectDir, relPath, before, after);
-    },
-  });
+  files.setMutationRecorder(
+    createSessionRecorder({
+      idForDir: (dir) => projectManager.idForDir(dir),
+      isLocal: (id) => projectManager.isLocal(id),
+      touch: (id) => sessions.touch(id),
+      record: (id, dir, rel, before, after) => shadows.record(id, dir, rel, before, after),
+      markUnrecorded: (id, rel) => shadows.markUnrecorded(id, rel),
+    }),
+  );
 
   // The viewer resolves a project's current PDF the same way `compile` surfaces it, and (for
   // comments) resolves a clicked PDF point to source via synctex against the build-dir PDF, which
