@@ -174,11 +174,15 @@ export function droppedRegistrationFields(
 /**
  * The result-text addendum for a re-registration that silently dropped stored fields — empty
  * string when nothing was dropped (a first registration, or one that repeated every field).
+ *
+ * Worded around "configuration", not "registry entry": `previous` may come from either — a
+ * registry entry, or a project this process only ever held in memory (env-configured, or
+ * registered in-session via `project_sync { gitUrl }`) — and the loss reads the same either way.
  */
 function droppedFieldsNote(id: string, dropped: string[]): string {
   if (dropped.length === 0) return '';
   return (
-    ` Replaced the previous registration of "${id}", dropping its stored ${dropped.join(', ')} ` +
+    ` Replaced the previous configuration of "${id}", dropping its ${dropped.join(', ')} ` +
     '— re-register with them to keep them.'
   );
 }
@@ -339,10 +343,11 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
 
         return await ctx.projectManager.runExclusive(project, async () => {
           if (localPath !== undefined) {
-            // Read before persisting: the previous stored entry, so a silent re-registration can
-            // be reported. Reads the registry's own entry (a peer may have updated it), never the
-            // in-process map — see `ProjectManager.registryEntry`.
-            const previous = ctx.projectManager.registryEntry(project);
+            // Read before persisting: what is already on file, so a silent re-registration can be
+            // reported — the registry's own entry when there is one (a peer may have updated it),
+            // else this process's in-memory config for an env-configured or session-registered
+            // project with no registry entry at all. See `ProjectManager.previousRegistration`.
+            const previous = ctx.projectManager.previousRegistration(project);
             const target = await resolveLocalTarget(localPath);
             const dir = target.dir;
             // An explicit rootFile always wins over the one inferred from the file pointed at.
@@ -392,7 +397,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           }
 
           // Read before persisting, same reasoning as the local branch above.
-          const previous = ctx.projectManager.registryEntry(project);
+          const previous = ctx.projectManager.previousRegistration(project);
           const cfg = await ctx.projectManager.registerAndPersist(
             {
               id: project,

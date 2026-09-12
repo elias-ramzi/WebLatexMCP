@@ -184,15 +184,26 @@ export class ProjectManager {
   }
 
   /**
-   * The registry's OWN current entry for `id`, or `undefined` (no registry wired, or nothing
-   * registered under that id yet). Reads the persisted registry, never the in-process `projects`
-   * map — a peer session may have re-registered `id` since this process last looked, the same
-   * reasoning `setDefaultProject` uses for its own registry read above. Used by `register_project`
-   * to report which stored fields a re-registration is about to drop (`upsert` replaces the whole
-   * entry — see `droppedRegistrationFields` in `src/tools/registerProject.ts`).
+   * What a re-registration of `id` is about to replace, so `register_project` can report which
+   * stored fields it would silently drop (`upsert` replaces the whole entry — see
+   * `droppedRegistrationFields` in `src/tools/registerProject.ts`).
+   *
+   * Prefers the registry's OWN current entry when it has one — a peer session may have
+   * re-registered `id` since this process last looked, the same reasoning `setDefaultProject`
+   * uses for its own registry read. Falls back to the in-process `this.projects` config for a
+   * project that has never been written to the registry at all: one configured through
+   * `WEB_LATEX_MCP_PROJECTS`, or registered in-session via `project_sync { gitUrl }`
+   * (`registerProject` only ever does `this.projects.set`, never a registry write). Without this
+   * fallback, re-registering such a project reports nothing dropped while silently replacing its
+   * in-process config — exactly the loss this report exists to name, in the one case the user has
+   * no registry entry to inspect.
+   *
+   * Deliberately not `getProjectConfig(id)`: that throws on an unknown id and can reload from the
+   * registry as a side effect, neither of which is wanted for a plain "what do we have on file"
+   * lookup. `undefined` when neither source has anything for `id` (first-time registration).
    */
-  registryEntry(id: string): ProjectConfig | undefined {
-    return this.registry?.read().find((p) => p.id === id);
+  previousRegistration(id: string): ProjectConfig | undefined {
+    return this.registry?.read().find((p) => p.id === id) ?? this.projects.get(id);
   }
 
   /**

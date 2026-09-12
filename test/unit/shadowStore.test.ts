@@ -442,13 +442,17 @@ describe('ShadowStore', () => {
       expect(change.content).toBeNull(); // never folded in — record's conflicted early return
     });
 
-    it('refresh leaves it conflicted and does not throw when HEAD has no file for it', async () => {
+    it('refresh reports it conflicted and does not throw when HEAD has no file for it', async () => {
       const store = makeStore('a');
       await store.markUnrecorded(PROJECT, 'sections/never-existed.tex');
 
       const refreshed = await store.refresh(PROJECT, DIR);
-      expect(refreshed.conflicted).toEqual([]); // "HEAD has not moved" — head and base both null
+      // An unrecorded entry is reported conflicted on every refresh, unconditionally — refresh
+      // never even reaches the "has HEAD moved" check for it (see the #64 fix): that check says
+      // nothing about a shadow that is known to be missing this session's latest write.
+      expect(refreshed.conflicted).toEqual(['sections/never-existed.tex']);
       expect(refreshed.settled).toEqual([]);
+      expect(refreshed.advanced).toEqual([]);
 
       const change = only(await store.changes(PROJECT));
       expect(change.conflicted).toBe(true);
@@ -466,6 +470,78 @@ describe('ShadowStore', () => {
       const change = only(await store.changes(PROJECT));
       expect(change.conflicted).toBe(true);
       expect(change.unrecorded).toBe(true);
+    });
+
+    it('refresh does not advance an unrecorded entry even when a non-overlapping HEAD change merges cleanly (#64 regression)', async () => {
+      // Reproduces the reviewer's probe: a write reached the working tree and was folded into the
+      // shadow, but a LATER write on the same path failed to record (`markUnrecorded`) — so the
+      // shadow is missing that latest edit. A peer's unrelated commit then lands, and a bare
+      // three-way merge of the (stale) shadow onto the new HEAD succeeds cleanly, which must NOT
+      // be allowed to clear `conflicted`/`unrecorded`: the shadow still lacks the write that failed
+      // to record, so staging it would silently drop that edit (and, via `commitContents`, revert
+      // it if it happened to already be in the working tree).
+      const store = makeStore('a');
+      const mine = BASE.replace('Beta line.', 'Beta, MINE.');
+      await store.record(PROJECT, DIR, REL, BASE, mine); // shadow now holds "Beta, MINE."
+      await store.markUnrecorded(PROJECT, REL); // a later write failed to fold in
+
+      // A peer's commit changes a different line — a change that would merge cleanly onto the
+      // stale shadow if `refresh` didn't special-case `unrecorded`.
+      const peerLanded = BASE.replace('Alpha line.', 'Alpha, PEER.');
+      setHead(REL, peerLanded);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.advanced).toEqual([]);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      // The shadow is untouched — not merged with the peer's line.
+      expect(change.content).toBe(mine);
+    });
+
+    it('refresh does not settle/forget an unrecorded entry even when HEAD lands on bytes equal to the shadow (#64 regression)', async () => {
+      const store = makeStore('a');
+      const mine = BASE.replace('Beta line.', 'Beta, MINE.');
+      await store.record(PROJECT, DIR, REL, BASE, mine);
+      await store.markUnrecorded(PROJECT, REL);
+
+      // HEAD happens to land on exactly the shadow's bytes (e.g. a peer independently made the
+      // same edit) — this must not be read as "our change is what landed", because the shadow is
+      // known to be missing this session's latest write.
+      setHead(REL, mine);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.advanced).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.unrecorded).toBe(true);
+      expect(change.content).toBe(mine);
+    });
+
+    it('peerEntries reports conflicted:true for an unrecorded entry even when the raw index has no conflicted field', async () => {
+      // Belt-and-braces derivation: write an index by hand with `unrecorded: true` and no
+      // `conflicted` field at all, proving peerEntries does not rely solely on the raw flag.
+      const dir = sessionDir(workspace, PROJECT, 'raw');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        path.join(dir, 'shadow.json'),
+        JSON.stringify({
+          entries: {
+            [REL]: { deleted: false, baseExists: true, unrecorded: true },
+          },
+        }),
+        'utf8',
+      );
+
+      const store = makeStore('a');
+      const entries = await store.peerEntries(PROJECT, 'raw');
+      expect(entries).toEqual([{ path: REL, deleted: false, conflicted: true, touchedAt: null }]);
     });
 
     it('on an existing entry, keeps its binary/deleted fields and just flags it', async () => {

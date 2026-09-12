@@ -95,7 +95,10 @@ export interface ShadowChange {
 export interface RefreshResult {
   /** Files whose shadow was successfully carried onto the new HEAD. */
   advanced: string[];
-  /** Files where this session's edits and a commit touched the same lines. */
+  /**
+   * Files left flagged: where this session's edits and a commit touched the same lines, plus every
+   * `unrecorded` entry, which `refresh` skips without reading HEAD (see the loop in `refresh`).
+   */
   conflicted: string[];
   /** Files dropped because the session's change is now part of HEAD (typically its own commit). */
   settled: string[];
@@ -344,7 +347,9 @@ export class ShadowStore {
         path: rel,
         content: binary ? shadow : (shadow?.toString('utf8') ?? null),
         base: binary ? base : (base?.toString('utf8') ?? null),
-        conflicted: entry.conflicted === true,
+        // Belt and braces: an unrecorded entry is reported conflicted regardless of the raw flag,
+        // so no future code path that clears `conflicted` can make it look committable.
+        conflicted: entry.conflicted === true || entry.unrecorded === true,
         binary,
         unrecorded: entry.unrecorded === true,
       });
@@ -392,7 +397,10 @@ export class ShadowStore {
       .map(([p, entry]) => ({
         path: p,
         deleted: entry.deleted === true,
-        conflicted: entry.conflicted === true,
+        // Belt and braces, matching `changes()`: an unrecorded entry is reported conflicted
+        // regardless of the raw flag, so no future code path that clears `conflicted` can make a
+        // peer treat it as safe to route around.
+        conflicted: entry.conflicted === true || entry.unrecorded === true,
         touchedAt: entry.touchedAt ?? null,
       }))
       .sort((a, b) => a.path.localeCompare(b.path));
@@ -404,13 +412,29 @@ export class ShadowStore {
    * Call after anything that moves HEAD or rewrites the tree — this session committing, a peer
    * committing, a pull, a rebase. Files whose change is now in HEAD stop being tracked; files
    * where HEAD and this session changed the same lines are marked conflicted and left alone,
-   * so nothing is resolved on the session's behalf.
+   * so nothing is resolved on the session's behalf. An `unrecorded` entry is skipped entirely —
+   * its shadow is known-incomplete, so neither a clean merge nor "HEAD equals the shadow" says
+   * anything about it — and reported under `conflicted` as it was.
    */
   async refresh(projectId: string, projectDir: string): Promise<RefreshResult> {
     const index = await this.readIndex(projectId);
     const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
 
     for (const [rel, entry] of Object.entries(index.entries)) {
+      if (entry.unrecorded === true) {
+        // This session's latest write to the file never made it into the shadow (`markUnrecorded`).
+        // A three-way merge onto a new HEAD only tells us the *shadow* reconciles cleanly — it says
+        // nothing about the write that is missing from it — and "HEAD equals the shadow" would be
+        // true only by ignoring that same gap. Either way, resolving anything here risks either
+        // reverting the session's own edit (advanced) or silently dropping its claim on an
+        // uncommitted change (settled/forgotten) — the exact gap `markUnrecorded` exists to close.
+        // So: touch nothing, leave the entry exactly as it is, and keep it flagged. Only a
+        // deliberate take (`settle`/`clear`, i.e. commit scope "all"/"paths") or a discard ends
+        // this state.
+        result.conflicted.push(rel);
+        continue;
+      }
+
       const head = await this.readHead(projectDir, rel);
       const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
       if (bytesEqual(head, base)) continue; // HEAD has not moved under this file
@@ -474,8 +498,12 @@ export class ShadowStore {
    * dropped paths.
    *
    * Called by `commit` after a `scope: "all"`/`"paths"` commit, and only after that commit has
-   * actually landed: those scopes stage the working tree as it stands (via `git add`, not the
-   * shadow), so whatever this session's shadow said about a taken path — including a sticky
+   * actually landed. It drops every entry *under the paths the commit was given* (`coversPath` —
+   * a directory covers everything under it), whether or not git actually staged that particular
+   * entry — those scopes stage the working tree as it stands (via `git add`), and git stages
+   * nothing for a path whose working-tree content already equals HEAD, so checking "did git stage
+   * this" would leave exactly the already-reconciled entries wedged. Dropping by coverage instead
+   * is deliberate: whatever this session's shadow said about a covered path — including a sticky
    * `conflicted`/`unrecorded` flag — is now either exactly what is in HEAD, or was deliberately
    * overridden by the caller's choice of scope. This is not a weakening of "conflicted stays
    * flagged": nothing here clears the flag on an *edit* (`record` never calls this), and `refresh`

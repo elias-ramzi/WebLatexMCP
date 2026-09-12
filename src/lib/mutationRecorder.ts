@@ -41,9 +41,11 @@ export interface SessionRecorderDeps {
  * before it commits) — it says nothing about whether *this* change made it into the shadow, so
  * its failure alone must never mark the path. It runs in its own try/catch, and `record` still
  * runs whether or not `touch` succeeded; only `record` throwing (with or without a prior touch
- * failure) marks the path unrecorded. A touch failure that did not stop `record` is still real
- * and still worth logging, so it is rethrown afterwards — once `record` has succeeded — purely so
- * `FileService.notify` logs it too.
+ * failure) marks the path unrecorded. A touch failure that did not stop a successful `record` is
+ * still real and still worth logging — but not by rethrowing it: `FileService.notify` logs every
+ * throw from this function as "could not attribute the change ... to this session", which would
+ * be false here (the change *was* attributed; only the heartbeat failed) and would send a future
+ * reader after the wrong bug. So it is logged directly, via `warn`, instead.
  */
 export function createSessionRecorder(deps: SessionRecorderDeps): MutationRecorder {
   const warn = deps.warn ?? ((msg: string) => console.error(`[web-latex-mcp] ${msg}`));
@@ -85,9 +87,13 @@ export function createSessionRecorder(deps: SessionRecorderDeps): MutationRecord
       }
 
       if (touchErr !== undefined) {
-        // record() succeeded, so the path stays unmarked — but the heartbeat failure is still
-        // real, so let FileService.notify log it too.
-        throw touchErr;
+        // record() succeeded, so the path stays unmarked. Warn directly rather than rethrowing:
+        // FileService.notify would log any throw here as a failed attribution, which is not what
+        // happened — the change was recorded fine, only the liveness heartbeat failed.
+        warn(
+          `heartbeat for project "${id}" failed while recording "${rel}" (the change itself ` +
+            `was recorded): ${touchErr instanceof Error ? touchErr.message : String(touchErr)}`,
+        );
       }
     },
   };

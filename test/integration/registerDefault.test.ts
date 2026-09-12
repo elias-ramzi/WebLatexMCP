@@ -13,7 +13,7 @@ import {
   registryPath,
 } from '../../src/services/projectRegistry.js';
 import { sessionStateDir } from '../../src/lib/sessionPaths.js';
-import type { ServerConfig } from '../../src/types.js';
+import type { ProjectConfig, ServerConfig } from '../../src/types.js';
 
 /**
  * Regression coverage for the documented "make an existing project the default" flow:
@@ -32,11 +32,17 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-async function setup(): Promise<{ client: Client; workspace: string }> {
+async function setup(
+  initialProjects: ProjectConfig[] = [],
+): Promise<{ client: Client; workspace: string }> {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-regdefault-'));
   cleanups.push(() => rm(workspace, { recursive: true, force: true }));
 
-  const config: ServerConfig = { workspaceRoot: workspace, sessionId: 'test', projects: [] };
+  const config: ServerConfig = {
+    workspaceRoot: workspace,
+    sessionId: 'test',
+    projects: initialProjects,
+  };
   const ctx = createContext(
     config,
     new CredentialResolver({}),
@@ -198,7 +204,7 @@ describe('register_project reports dropped fields on a silent re-registration', 
     });
 
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain('dropping its stored rootFile=main.tex, branch=master');
+    expect(textOf(res)).toContain('dropping its rootFile=main.tex, branch=master');
   });
 
   it('says nothing about dropped fields when the re-registration repeats them', async () => {
@@ -264,6 +270,31 @@ describe('register_project reports dropped fields on a silent re-registration', 
     });
 
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain('dropping its stored followSymlinks=true');
+    expect(textOf(res)).toContain('dropping its followSymlinks=true');
+  });
+
+  it('names dropped fields for a project configured in-process only, with no registry entry', async () => {
+    // Mirrors a project configured via WEB_LATEX_MCP_PROJECTS, or registered in-session via
+    // project_sync { gitUrl } — either way `ProjectManager` holds it in `this.projects` but it was
+    // never written to the workspace registry, so `registryEntry` alone would find nothing and
+    // the report would stay silent about the exact loss it exists to name (see
+    // `ProjectManager.previousRegistration`).
+    const { client, workspace } = await setup([
+      {
+        id: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        branch: 'master',
+      },
+    ]);
+
+    expect(readProjectRegistry(workspace)).toEqual([]);
+
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', gitUrl: 'https://git.overleaf.com/def', clone: false },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('dropping its branch=master');
   });
 });

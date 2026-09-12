@@ -8,6 +8,7 @@ import { createServer } from '../../src/server.js';
 import { createContext, type AppContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
+import { GitService } from '../../src/services/gitService.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -78,6 +79,40 @@ async function setup(
   cleanups.push(() => client.close());
   await client.callTool({ name: 'project_sync', arguments: { project: 'demo', mode: 'clone' } });
   return { client, ctx, remote };
+}
+
+const IDENTITY = { name: 'Test', email: 'test@example.com' };
+
+/**
+ * Two sessions sharing one clone (mirrors `multiSession.test.ts`'s `session()` helper) — needed
+ * to produce a genuine same-line collision, which `setup()` above (a single session) cannot.
+ */
+async function setupTwoSessions(
+  seed: Record<string, string>,
+): Promise<{ session: (id: string) => Promise<{ client: Client; ctx: AppContext }> }> {
+  const remote = await createFakeRemote(seed);
+  cleanups.push(remote.cleanup);
+  const workspace = await tmp('ovl-unrecorded-multi-ws-');
+  const dir = path.join(workspace, 'demo');
+  await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+  const session = async (id: string): Promise<{ client: Client; ctx: AppContext }> => {
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: id,
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `test-${id}`, version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+    return { client, ctx };
+  };
+
+  return { session };
 }
 
 describe('an unrecorded shadow entry settles once deliberately taken', () => {
@@ -233,5 +268,115 @@ describe('an unrecorded shadow entry settles once deliberately taken', () => {
     // Directory coverage: settle drops the entry even though `paths` named the directory, not the
     // exact file the entry tracks.
     expect(await ctx.shadows.hasChanges('demo')).toBe(false);
+  });
+
+  it('reports `unrecorded` as a subset of `conflicted` in structuredContent', async () => {
+    const { client, ctx } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      'notes.tex': 'original\n',
+    });
+
+    // main.tex: a normal, committable session edit.
+    const wroteMain = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wroteMain), textOf(wroteMain)).toBe(false);
+
+    // notes.tex: force the unrecorded failure mode (see the first test above for why the second
+    // write matters — it is what actually desyncs the shadow from what ends up committed).
+    const wroteNotes = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'notes.tex', content: 'edited\n' },
+    });
+    expect(isError(wroteNotes), textOf(wroteNotes)).toBe(false);
+    await ctx.shadows.markUnrecorded('demo', 'notes.tex');
+    const wroteNotesAgain = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'notes.tex', content: 'edited again\n' },
+    });
+    expect(isError(wroteNotesAgain), textOf(wroteNotesAgain)).toBe(false);
+
+    // Default (session) scope commits main.tex and leaves notes.tex excluded — this is a
+    // successful commit, not a refusal, so the result's structuredContent is what a caller reads.
+    const committed = await client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'commit main.tex, leave notes.tex excluded' },
+    });
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const sc = structured(committed);
+    expect(sc.conflicted).toEqual(['notes.tex']);
+    // The field this test exists for: pre-fix, `unrecorded` is absent from structuredContent
+    // entirely (the schema's description said "see the result text for which", which a
+    // structured-only client cannot act on).
+    expect(sc.unrecorded).toEqual(['notes.tex']);
+    expect((sc.unrecorded as string[]).every((p) => (sc.conflicted as string[]).includes(p))).toBe(
+      true,
+    );
+  });
+
+  it('names both clauses when a commit excludes a collided file and an unrecorded file together', async () => {
+    const REL_COLLIDE = 'sections/x.tex';
+    const { session } = await setupTwoSessions({
+      [REL_COLLIDE]: 'A sentence to collide on.\n',
+      'notes.tex': 'original\n',
+    });
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // beta rewrites the sentence first (its shadow now expects the base line as prior content).
+    const editBeta = await beta.client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'demo',
+        path: REL_COLLIDE,
+        edits: [
+          { oldString: 'A sentence to collide on.', newString: 'Beta rewrites the sentence.' },
+        ],
+      },
+    });
+    expect(isError(editBeta), textOf(editBeta)).toBe(false);
+
+    // alpha then rewrites the very same line, on the shared working tree beta just changed —
+    // exactly the sequence multiSession.test.ts's collision test uses (there for session "B"):
+    // alpha's own recorded shadow still expects the *original* line as its base, so the mutation
+    // recorder's three-way merge of alpha's change against that base conflicts, and the entry is
+    // flagged rather than guessed at.
+    const editAlpha = await alpha.client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'demo',
+        path: REL_COLLIDE,
+        edits: [
+          { oldString: 'Beta rewrites the sentence.', newString: 'Alpha rewrites the sentence.' },
+        ],
+      },
+    });
+    expect(isError(editAlpha), textOf(editAlpha)).toBe(false);
+
+    // alpha also edits notes.tex, then forces the unrecorded failure mode on it.
+    const wroteNotes = await alpha.client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'notes.tex', content: 'edited\n' },
+    });
+    expect(isError(wroteNotes), textOf(wroteNotes)).toBe(false);
+    await alpha.ctx.shadows.markUnrecorded('demo', 'notes.tex');
+    const wroteNotesAgain = await alpha.client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'notes.tex', content: 'edited again\n' },
+    });
+    expect(isError(wroteNotesAgain), textOf(wroteNotesAgain)).toBe(false);
+
+    // alpha's default-scope commit now excludes both files, for two different reasons — the
+    // wording must name each file under the right clause, not lump them into one.
+    const blocked = await alpha.client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'alpha tries to commit' },
+    });
+    expect(isError(blocked), textOf(blocked)).toBe(true);
+    const text = textOf(blocked);
+    // Each file is named under its own clause, not lumped together under the wrong one.
+    expect(text).toMatch(/notes\.tex could not be recorded/);
+    expect(text).toMatch(new RegExp(`changed the same lines of.*${REL_COLLIDE}`));
   });
 });

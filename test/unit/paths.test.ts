@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveInside, samePath, toFileUrl, toPosix } from '../../src/lib/paths.js';
@@ -59,6 +59,37 @@ describe('samePath', () => {
 
   it('says two different paths are different regardless of platform', () => {
     expect(samePath('/tmp/project/figures/x.png', '/tmp/project/figures/y.png')).toBe(false);
+  });
+
+  describe('with the platform stubbed', () => {
+    // The test above only ever asserts against the *real* process.platform, so on Linux CI it
+    // only exercises the exact-comparison branch — a samePath that always used `===` would still
+    // pass it there. Stub process.platform so each of the three branches actually runs, whatever
+    // platform the test happens to execute on.
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    // Built from one common absolute base with path.join/path.resolve so this is correct whether
+    // the file runs on POSIX or Windows separators.
+    const base = path.resolve(path.join('tmp', 'project'));
+    const upper = path.join(base, 'Figures', 'x.png');
+    const lower = path.join(base, 'figures', 'x.png');
+
+    it('treats a case mismatch as the same path on darwin', () => {
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+      expect(samePath(upper, lower)).toBe(true);
+    });
+
+    it('treats a case mismatch as the same path on win32', () => {
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+      expect(samePath(upper, lower)).toBe(true);
+    });
+
+    it('treats a case mismatch as a different path on linux', () => {
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+      expect(samePath(upper, lower)).toBe(false);
+    });
   });
 });
 

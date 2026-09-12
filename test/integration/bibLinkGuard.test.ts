@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, readFile, symlink, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile, symlink, lstat } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -170,5 +170,52 @@ describe('the .bib guard follows a symlink to where it actually lands', () => {
     });
     expect(isError(res)).toBe(false);
     expect(Buffer.compare(await readFile(path.join(clone, 'real.png')), PNG)).toBe(0);
+  });
+
+  // Regression: PR #64 added the linkTarget check above the destination-by-name check, so a
+  // destination that was never an allowed asset type (e.g. "notes.txt") but happens to be a
+  // symlink to another non-asset file got the *link* refusal instead of the *name* refusal —
+  // wrong reason, and (for a local project with followSymlinks) would echo an outside path that
+  // the by-name gate would have refused without ever touching the filesystem. CLAUDE.md's
+  // add_asset bullet requires the destination's own name to be judged first, before anything
+  // else — including this link check — touches the filesystem.
+  it('add_asset refuses a non-asset-named destination by its own name, not by the link it happens to be (regression)', async () => {
+    const { client, clone } = await setupProject();
+    await writeFile(path.join(clone, 'draft.txt'), 'original draft\n');
+    await symlink('draft.txt', path.join(clone, 'notes.txt'));
+    const res = await client.callTool({
+      name: 'add_asset',
+      arguments: {
+        project: 'demo',
+        path: 'notes.txt',
+        contentBase64: PNG.toString('base64'),
+      },
+    });
+    expect(isError(res)).toBe(true);
+    expect(plainText(res)).toContain('notes.txt');
+    // The truthful refusal is the by-name one (assetTypeBlockedMessage), never the link message.
+    expect(plainText(res)).not.toMatch(/is a link to/);
+    expect(await readFile(path.join(clone, 'draft.txt'), 'utf8')).toBe('original draft\n');
+  });
+
+  // Coverage addition, not a regression test: the existing "refuses writing through a link to
+  // refs.bib" test above only exercises a link to a .bib. This exercises the other half of the
+  // link message's purpose — an asset-named destination (clears the by-name check) that links to
+  // a .tex file. Passes both before and after the fix above; it guards against the by-name check
+  // ever swallowing the link check rather than running alongside it.
+  it('add_asset still refuses an asset-named destination that links to a non-asset .tex target', async () => {
+    const { client, clone } = await setupProject();
+    await symlink(path.join('..', 'main.tex'), path.join(clone, 'figures', 'z.png'));
+    const res = await client.callTool({
+      name: 'add_asset',
+      arguments: {
+        project: 'demo',
+        path: 'figures/z.png',
+        contentBase64: PNG.toString('base64'),
+      },
+    });
+    expect(isError(res)).toBe(true);
+    expect(plainText(res)).toMatch(/is a link to "main\.tex"/);
+    expect(await readFile(path.join(clone, 'main.tex'), 'utf8')).toBe('\\documentclass{article}\n');
   });
 });

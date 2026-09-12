@@ -363,6 +363,66 @@ describe('ProjectManager', () => {
     });
   });
 
+  describe('previousRegistration', () => {
+    it('falls back to the in-process config when the id has no registry entry', () => {
+      // The case PR #64 missed: a project configured through WEB_LATEX_MCP_PROJECTS (or
+      // registered in-session via project_sync { gitUrl }) is held only in `this.projects` and
+      // was never written to the registry — `registryEntry`-style "registry only" lookup finds
+      // nothing here, which is exactly the silent-loss gap this method exists to close.
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [
+            {
+              id: 'thesis',
+              gitUrl: 'https://git.overleaf.com/abc',
+              rootFile: 'thesis.tex',
+              branch: 'main',
+            },
+          ],
+        },
+        store,
+      );
+
+      expect(pm.previousRegistration('thesis')).toEqual({
+        id: 'thesis',
+        gitUrl: 'https://git.overleaf.com/abc',
+        rootFile: 'thesis.tex',
+        branch: 'main',
+      });
+    });
+
+    it('prefers the registry’s own entry over a stale in-process config', () => {
+      // Same reasoning as setDefaultProject's "not a stale in-process snapshot" case: a peer
+      // session may have re-registered the id since this process last loaded it.
+      const store = makeFakeRegistry();
+      store.entries = [
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/def', rootFile: 'new.tex' },
+      ];
+      const pm = new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def', rootFile: 'old.tex' }],
+        },
+        store,
+      );
+
+      expect(pm.previousRegistration('paper')).toEqual({
+        id: 'paper',
+        gitUrl: 'https://git.overleaf.com/def',
+        rootFile: 'new.tex',
+      });
+    });
+
+    it('returns undefined when neither the registry nor the in-process config knows the id', () => {
+      const pm = new ProjectManager(makeConfig(), makeFakeRegistry());
+      expect(pm.previousRegistration('ghost')).toBeUndefined();
+    });
+  });
+
   it('falls back to the registry’s persisted default when the config has none', () => {
     const store = makeFakeRegistry();
     store.entries = [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }];

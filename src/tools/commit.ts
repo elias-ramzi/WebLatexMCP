@@ -50,9 +50,15 @@ const outputSchema = {
     .describe(
       'Files this session still holds as excluded after the commit — whether or not `paths` ' +
         'named them — because this session and a commit changed the same lines, or because ' +
-        "this session's own record of its change failed (see the result text for which). " +
+        "this session's own record of its change failed (see `unrecorded` for which). " +
         'Re-read them, redo the edit on the current content, then commit again — or take them ' +
         'deliberately with scope "all".',
+    ),
+  unrecorded: z
+    .array(z.string())
+    .describe(
+      "Subset of `conflicted`: files excluded because this session's own record of its change " +
+        'failed, not because of a collision. Take them with scope "all" or discard them.',
     ),
 };
 
@@ -92,12 +98,18 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // this session's shadow said about a path just committed (including a sticky
           // conflicted/unrecorded flag) is settled by that act, not by a merge. "session" needs
           // nothing extra: the refresh below settles what landed the normal way.
-          if (effective === 'all') {
+          if (effective === 'all' || effective === 'paths') {
             const taken = settlePaths(paths);
-            if (taken === 'everything') await ctx.shadows.clear(id);
-            else await ctx.shadows.settle(id, taken);
-          } else if (effective === 'paths') {
-            await ctx.shadows.settle(id, (paths ?? []).map(toPosix));
+            if (taken === 'everything') {
+              // "all" with no paths: the whole tree was taken. Unreachable for "paths" (commitPaths
+              // refuses an empty or "."-shaped list before anything is committed) — and even then
+              // never widened to `clear`: a "paths" commit must not settle what it did not name,
+              // and the commit has already landed, so throwing here would report an error for a
+              // commit that happened.
+              if (effective === 'all') await ctx.shadows.clear(id);
+            } else {
+              await ctx.shadows.settle(id, taken);
+            }
           }
 
           // The commit moved HEAD (or the store was settled directly above): carry forward
@@ -152,6 +164,7 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               session: ctx.shadows.sessionId,
               leftUncommitted: res.leftUncommitted,
               conflicted,
+              unrecorded,
             },
           };
         });
@@ -213,20 +226,27 @@ async function commitSession(
 
   const conflicted = selected.filter((c) => c.conflicted).map((c) => c.path);
   const unrecorded = selected.filter((c) => c.unrecorded).map((c) => c.path);
+  const unrecordedSet = new Set(unrecorded);
+  const collided = conflicted.filter((p) => !unrecordedSet.has(p));
   const committable = selected.filter((c) => !c.conflicted);
   if (committable.length === 0 && !opts.allowEmpty) {
     throw new Error(
-      conflicted.length > 0
-        ? conflicted.length === unrecorded.length
-          ? `Nothing to commit: every change could not be recorded (${conflicted.join(', ')}) — ` +
-            'see the server log for why. Commit with scope "all" to take the working tree as it ' +
-            "stands, or discard those files to give up this session's version."
-          : `Nothing to commit: every change is conflicted (${conflicted.join(', ')}) — this ` +
-            'session and someone else changed the same lines, so which edit is whose cannot be ' +
-            'decided here. Commit with scope "all" to take the working tree as it stands, or ' +
-            "discard those files to give up this session's version."
-        : 'Nothing to commit (this session has made no changes). Use scope "all" to commit ' +
-            'changes made by other sessions or outside this server.',
+      conflicted.length === 0
+        ? 'Nothing to commit (this session has made no changes). Use scope "all" to commit ' +
+            'changes made by other sessions or outside this server.'
+        : unrecorded.length > 0 && collided.length > 0
+          ? `Nothing to commit: every change is excluded — ${unrecorded.join(', ')} could not be ` +
+            'recorded (see the server log for why), and this session and someone else changed ' +
+            `the same lines of ${collided.join(', ')}. Commit with scope "all" to take the ` +
+            "working tree as it stands, or discard those files to give up this session's version."
+          : unrecorded.length > 0
+            ? `Nothing to commit: every change could not be recorded (${unrecorded.join(', ')}) — ` +
+              'see the server log for why. Commit with scope "all" to take the working tree as it ' +
+              "stands, or discard those files to give up this session's version."
+            : `Nothing to commit: every change is conflicted (${collided.join(', ')}) — this ` +
+              'session and someone else changed the same lines, so which edit is whose cannot be ' +
+              'decided here. Commit with scope "all" to take the working tree as it stands, or ' +
+              "discard those files to give up this session's version.",
     );
   }
 

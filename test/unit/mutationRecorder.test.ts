@@ -66,13 +66,14 @@ describe('createSessionRecorder', () => {
     expect(owned).toEqual([{ path: REL, sessionId: SESSION }]);
   });
 
-  it('a touch() failure alone does not mark the path — record still runs, and the touch error still rethrows', async () => {
+  it('a touch() failure alone does not mark the path — record still runs, resolves, and warns instead of rethrowing', async () => {
     // touch() is only a liveness heartbeat; it says nothing about whether the shadow itself could
     // be updated. Its failure must never mark a path conflicted/unrecorded on its own — only
     // record() failing does that. record() here is wired to a real, working ShadowStore (HEAD
     // readable), so it succeeds normally despite touch() throwing.
     const shadows = new ShadowStore(workspace, SESSION, () => Promise.resolve(null));
     let recordCalled = false;
+    const warnings: string[] = [];
     const recorder = createSessionRecorder({
       idForDir: () => PROJECT,
       isLocal: () => false,
@@ -84,15 +85,17 @@ describe('createSessionRecorder', () => {
         await shadows.record(id, dir, rel, before, after);
       },
       markUnrecorded: (id, rel) => shadows.markUnrecorded(id, rel),
-      warn: () => {},
+      warn: (msg) => warnings.push(msg),
     });
 
-    // The touch error is still real and still worth logging — FileService.notify logs whatever
-    // this rejects with — so it is rethrown once record() has run.
-    await expect(recorder.record(DIR, REL, null, 'hello\n')).rejects.toThrow(
-      'touch failed (simulated)',
-    );
+    // The touch error is real, but rethrowing it would make FileService.notify log it as a failed
+    // *attribution* — false, since the change itself was recorded fine. So the recorder resolves,
+    // and the heartbeat failure is only surfaced through `warn`.
+    await expect(recorder.record(DIR, REL, null, 'hello\n')).resolves.toBeUndefined();
     expect(recordCalled).toBe(true);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(REL);
+    expect(warnings[0]).toContain('touch failed (simulated)');
 
     // Not marked: the shadow holds a normal, unflagged entry for the write that actually
     // succeeded, exactly as if touch() had never been wired to fail at all.
@@ -106,6 +109,7 @@ describe('createSessionRecorder', () => {
     // Both fail: record()'s failure is what marks the path (touch's failure is incidental here),
     // and the record error — not the touch error — is what gets rethrown, since markUnrecorded
     // fires on record()'s failure path.
+    let markUnrecordedCalled = false;
     const recorder = createSessionRecorder({
       idForDir: () => PROJECT,
       isLocal: () => false,
@@ -115,11 +119,14 @@ describe('createSessionRecorder', () => {
       record: async () => {
         throw new Error('git HEAD unreadable (simulated)');
       },
-      markUnrecorded: async () => {},
+      markUnrecorded: async () => {
+        markUnrecordedCalled = true;
+      },
       warn: () => {},
     });
 
     await expect(recorder.record(DIR, REL, null, 'hello\n')).rejects.toThrow('git HEAD unreadable');
+    expect(markUnrecordedCalled).toBe(true);
   });
 
   it('does nothing for a local project — no touch, no record, no marking', async () => {

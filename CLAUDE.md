@@ -130,9 +130,11 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `conflicted` + `unrecorded`, so a peer's `scope: "paths"` refuses it and this session's own commit
   excludes it, instead of a live session's edit showing up as owned by nobody. And **taking the tree
   deliberately settles what it took**: after a `scope: "all"`/`"paths"` commit, `commit` drops this
-  session's entries for the committed paths (`ShadowStore.settle`/`clear`) — the flag is never cleared
-  on an edit, but an entry whose path the session just committed as it stands has nothing left to
-  guard, and leaving it would wedge the default scope forever.
+  session's entries _under the paths the commit was given_ (`ShadowStore.settle`/`clear`, by
+  `coversPath`), whether or not git staged each one — deliberately, since an entry whose working tree
+  already equals HEAD stages nothing yet must still un-wedge. The flag is never cleared on an edit, and
+  `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
+  deliberate take or a discard ends that state.
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
@@ -168,7 +170,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
   model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
-  not blocked. It judges the **link-resolved** name too (`FileService.linkTarget`): an in-project
+  not blocked. It judges the **link-resolved** name too (`FileService.linkTarget` — symlinks only: a hard
+  link is invisible to `realpath`, and git cannot commit one): an in-project
   `figures/x.png -> refs.bib` passes the escape check (it stays inside) and used to let `write_file`,
   `edit_file` and `add_asset` change the bibliography with no confirmation. `linkTarget` decides
   nothing about whether a path may be used — that stays `assertNoSymlinkEscape` — it only tells the

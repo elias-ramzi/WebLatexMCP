@@ -74,7 +74,7 @@ back from `registry.json` as it stands (for a project configured only through `W
 from this process's config). That form takes no other field: passing `rootFile`, `branch`, `username`,
 `tokenEnv` or `clone: false` with it is refused, because updating one needs `gitUrl` or `path` — and giving
 either re-registers the project from those arguments alone, replacing the stored entry, so pass every
-field you want kept — the result names any stored field the new registration dropped. That:
+field you want kept — the result names any field of the previous configuration (persisted or in-process) the new registration dropped. That:
 
 - makes it the default **immediately** in the current session — the very next call that omits `project`
   resolves to it;

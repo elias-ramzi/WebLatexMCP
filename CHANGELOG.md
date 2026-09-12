@@ -296,7 +296,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 ### Changed
 
 - **Re-registering a project says which stored fields it dropped.** `register_project` with `gitUrl`
-  or `path` on an id already in the registry replaces the stored entry from the arguments given — that
+  or `path` on an id already known (in the registry, or held in-process from the env or `project_sync`)
+  replaces the stored entry from the arguments given — that
   is unchanged and documented — but a `rootFile`, `branch`, `username`, `tokenEnv` or `followSymlinks`
   set earlier and not repeated vanished without a word. The result text now lists them with their old
   values so they can be re-registered on purpose. Internal clean-ups from the same review:
@@ -363,11 +364,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **A shadow record that fails no longer leaves a live session's edit owned by nobody.** The write was
   (and is) never failed for it, but the file then had no index entry, so a peer's `commit scope: "paths"`
   could take the session's in-flight lines and the session's own commit silently omitted them. The path
-  is now marked `conflicted` + `unrecorded` in the session's index: peers refuse it as owned, the
+  is now marked `conflicted` + `unrecorded` in the session's index (and `commit` returns the
+  `unrecorded` subset of `conflicted` in its structured output): peers refuse it as owned, the
   session's `commit` excludes it and says why, and it stays that way until taken with `scope: "all"` or
   discarded. Taking it now actually settles it: a `scope: "all"`/`"paths"` commit drops this session's
-  entries for the paths it committed (`ShadowStore.settle`), so a conflicted or unrecorded entry no
-  longer lingers and keeps the default scope refusing after the tree was taken deliberately. A
+  entries under the paths it was given (`ShadowStore.settle`), so a conflicted or unrecorded entry no
+  longer lingers and keeps the default scope refusing after the tree was taken deliberately — and
+  `refresh` leaves an unrecorded entry alone, so a later commit by a peer cannot quietly make it
+  committable again with a shadow that is missing the session's write. A
   heartbeat (`touch`) failure alone marks nothing — only a failed shadow record does. What remains is
   an index that cannot be written at all (documented in CONCURRENCY.md).
 - **A peer's `register_project { default: true }` now reaches every env-unset session the same way.**

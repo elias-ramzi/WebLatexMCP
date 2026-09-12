@@ -3,7 +3,7 @@ import { droppedRegistrationFields } from '../../src/tools/registerProject.js';
 import type { ProjectConfig } from '../../src/types.js';
 
 /**
- * Unit coverage for the pure helper behind `register_project`'s "dropping its stored ..." note.
+ * Unit coverage for the pure helper behind `register_project`'s "dropping its ..." note.
  * `ProjectRegistry.upsert` replaces the whole stored entry on a re-registration (documented,
  * intentional — see docs/configuration.md); this helper only computes what got silently lost, it
  * never changes what gets persisted.
