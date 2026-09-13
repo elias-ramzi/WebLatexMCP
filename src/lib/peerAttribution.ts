@@ -119,13 +119,33 @@ export function formatAge(fromIso: string, nowMs: number): string {
 }
 
 /**
- * Renders the push-refusal message: which disputed files belong to which live peer, dated, so the
+ * Default closing paragraph — written for `push`'s caller, who is about to rebase. A caller in a
+ * different vocabulary (e.g. `project_sync`, about to fast-forward-pull) should pass its own
+ * `closing` string instead of this one.
+ */
+const DEFAULT_CLOSING =
+  'Pushing has to rebase, which would sweep up or overwrite in-flight work. A recent last write ' +
+  'means the owner is mid-edit: wait for it to commit. Otherwise take ownership deliberately ' +
+  'with commit scope "all" (or scope "paths" for named files) and push again.';
+
+/**
+ * Renders the peer-refusal message: which disputed files belong to which live peer, dated, so the
  * caller knows whether to wait (a recent last write means the owner is mid-edit) or to take
  * ownership deliberately. Keep the first line's exact prefix
  * (`Uncommitted changes in the shared clone are not this session's:`) — existing tests match
  * `not this session`.
+ *
+ * `closing` is the final paragraph's text, in the calling tool's own vocabulary — `push` is about
+ * to rebase, `project_sync` is about to fast-forward-pull, and the advice ("push again" vs. "sync
+ * again") must match. Defaults to the push-specific wording so `push`'s own call site (which never
+ * passes this) is unaffected.
  */
-export function renderPeerRefusal(theirs: string[], a: Attribution, nowMs: number): string {
+export function renderPeerRefusal(
+  theirs: string[],
+  a: Attribution,
+  nowMs: number,
+  closing: string = DEFAULT_CLOSING,
+): string {
   const lines: string[] = [
     `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}.`,
   ];
@@ -156,11 +176,7 @@ export function renderPeerRefusal(theirs: string[], a: Attribution, nowMs: numbe
     );
   }
 
-  lines.push(
-    'Pushing has to rebase, which would sweep up or overwrite in-flight work. A recent last write ' +
-      'means the owner is mid-edit: wait for it to commit. Otherwise take ownership deliberately ' +
-      'with commit scope "all" (or scope "paths" for named files) and push again.',
-  );
+  lines.push(closing);
 
   return lines.join('\n');
 }

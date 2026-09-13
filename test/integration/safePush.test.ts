@@ -8,6 +8,8 @@ import { GitService, UntrackedOverwriteError } from '../../src/services/gitServi
 import { FileService } from '../../src/services/fileService.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import type { ServerConfig } from '../../src/types.js';
+import { planConflictPayload, CONFLICT_SIDE_CAP } from '../../src/lib/conflictBudget.js';
+import { renderConflictText, buildConflictFilePayload } from '../../src/lib/conflictText.js';
 
 describe('safe push (pull-rebase + branch review) against a bare-repo stand-in', () => {
   const cleanups: Array<() => Promise<void>> = [];
@@ -129,6 +131,106 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
 
     // The remote was not modified by our failed push.
     expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
+  });
+
+  describe('conflict payload budget (large sides do not blow past a tool result cap)', () => {
+    // A single file whose base/ours/theirs are each well past CONFLICT_SIDE_CAP (12000 chars) —
+    // the shape of the real-world failure: one conflicted file's sides alone produced a
+    // 67,485-character tool result, past the client's cap, so it was never delivered.
+    function bigContent(lines: number): string {
+      return (
+        Array.from({ length: lines }, (_, i) => `line ${i} of the document body`).join('\n') + '\n'
+      );
+    }
+
+    async function setupBigConflict(): Promise<{
+      remote: FakeRemote;
+      git: GitService;
+      dir: string;
+    }> {
+      const original = bigContent(600); // ~18k chars — comfortably over CONFLICT_SIDE_CAP
+      const { remote, git, files, dir } = await setup({ 'main.tex': original });
+      await files.applyEdits(dir, 'main.tex', [
+        { oldString: 'line 10 of the document body', newString: 'line 10 LOCAL' },
+      ]);
+      await git.commit(dir, { message: 'local edits line 10' });
+
+      // Remote edits the SAME line, so this stays a genuine (small) overlap — only the sides
+      // (the whole file, on each side) are large, not the hunk itself.
+      const remoteEdited = original.replace('line 10 of the document body', 'line 10 REMOTE');
+      await pushCommit(remote, { 'main.tex': remoteEdited }, 'remote edits line 10');
+
+      return { remote, git, dir };
+    }
+
+    it('bounds both channels, keeps the essential fields, and restores full sides on request', async () => {
+      const { remote, git, dir } = await setupBigConflict();
+      const before = await headSha(dir);
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(res.status).toBe('conflict');
+      const conflict = res.conflict!;
+      // Sanity: this really is the large-sides shape the budget exists for.
+      const f = conflict.files.find((x) => x.path === 'main.tex')!;
+      expect(f.base!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+      expect(f.ours!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+      expect(f.theirs!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+
+      // --- auto (default): both channels bounded well under the 67,485 chars that failed. ---
+      // (A raw size ceiling here would be vacuous either way: this shape — one file, three huge
+      // sides, zero/tiny hunks — was already bounded by CONFLICT_SIDE_CAP alone before the
+      // rendered-size budgeting fix, so a `text.length < N` assertion would pass whether or not
+      // that fix is present. What genuinely distinguishes "budgeted" from "not" for THIS shape is
+      // the elision metadata itself: every oversized side must be marked `elided`, with its TRUE
+      // size, and a working `read_file(path, ref)` pointer — see the worst-case shapes in
+      // `conflictText.test.ts` for the rendered-size regression coverage this fix is really for.
+      const plan = planConflictPayload(conflict.files, {
+        detail: 'auto',
+        refs: { mergeBase: conflict.mergeBase, rebasedOnto: conflict.rebasedOnto },
+      });
+      const text = renderConflictText(res.summary, conflict, { detail: 'auto' });
+      const structuredFiles = buildConflictFilePayload(conflict, plan);
+      expect(plan.truncated).toBe(true);
+      const entry = structuredFiles.find((sf) => sf.path === 'main.tex')!;
+      expect(entry.elided?.base).toBeDefined();
+      expect(entry.elided?.ours).toBeDefined();
+      expect(entry.elided?.theirs).toBeDefined();
+      expect(entry.elided?.base?.chars).toBe(f.base!.length);
+      expect(entry.elided?.ours?.chars).toBe(f.ours!.length);
+      expect(entry.elided?.theirs?.chars).toBe(f.theirs!.length);
+      expect(entry.base).toBeNull();
+      expect(entry.ours).toBeNull();
+      expect(entry.theirs).toBeNull();
+
+      // --- the ~3% a caller needs to act must never be what gets cut. ---
+      expect(conflict.conflictPaths).toEqual(['main.tex']);
+      expect(conflict.remoteHead).toBeTruthy();
+      expect(conflict.mergeBase).toBeTruthy();
+      expect(conflict.remoteCommits.map((c) => c.message)).toContain('remote edits line 10');
+      expect(text).toContain(conflict.remoteHead);
+      expect(text).toContain('remote edits line 10');
+
+      // --- conflictDetail: 'full' restores the complete sides. ---
+      const fullPlan = planConflictPayload(conflict.files, {
+        detail: 'full',
+        refs: { mergeBase: conflict.mergeBase, rebasedOnto: conflict.rebasedOnto },
+      });
+      const fullText = renderConflictText(res.summary, conflict, { detail: 'full' });
+      const fullStructured = buildConflictFilePayload(conflict, fullPlan);
+      expect(fullPlan.truncated).toBe(false);
+      expect(fullText).toContain(f.base!);
+      expect(fullText).toContain(f.ours!);
+      expect(fullText).toContain(f.theirs!);
+      expect(fullStructured[0]!.base).toBe(f.base);
+      expect(fullStructured[0]!.ours).toBe(f.ours);
+      expect(fullStructured[0]!.theirs).toBe(f.theirs);
+      expect(fullStructured[0]!.elided).toBeUndefined();
+
+      // --- the clone is still at its pre-push state after the aborted conflict. ---
+      expect(await headSha(dir)).toBe(before);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+    });
   });
 
   it('commits pending work first when a message is given', async () => {

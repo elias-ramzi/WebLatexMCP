@@ -2,7 +2,55 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import type { SyncResult } from '../services/gitService.js';
+import { LocalChangesOverwriteError, type SyncResult } from '../services/gitService.js';
+import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
+
+/**
+ * Closing paragraph for a `project_sync` refusal, in pull vocabulary (there is no rebase here —
+ * `syncPull` is a plain `merge --ff-only`) — the sibling of push's own closing text in
+ * `renderPeerRefusal`'s default.
+ */
+const PULL_CLOSING =
+  'The pull would overwrite this in-flight work. A recent last write means the owner is ' +
+  'mid-edit: wait for it to commit. Otherwise take ownership deliberately with commit ' +
+  'scope "paths" (naming just these files) or scope "all", then sync again.';
+
+/**
+ * A pull refused with `LocalChangesOverwriteError` names which tracked file(s) block it, but not
+ * whose edits they are. Attribute each named path to whichever live peer session's shadow claims
+ * it — same shape as push's `guardPeerWork` (src/tools/push.ts) — so the caller can tell "wait for
+ * a mid-edit peer" from "these are my own uncommitted changes".
+ *
+ * Paths this session itself owns (per its own shadow) are subtracted first, exactly as
+ * `guardPeerWork` subtracts `mine` before attributing `theirs` — otherwise this session's own
+ * edits would be reported as "not this session's", which is false. When nothing foreign remains
+ * (or no live peer exists at all) there is nothing to attribute, so the plain typed message passes
+ * through unchanged.
+ */
+async function enrichLocalChangesOverwrite(
+  ctx: AppContext,
+  id: string,
+  err: unknown,
+): Promise<Error> {
+  if (!(err instanceof LocalChangesOverwriteError) || err.paths.length === 0) {
+    return err instanceof Error ? err : new Error(String(err));
+  }
+  const peers = await ctx.sessions.livePeers(id);
+  if (peers.length === 0) return err;
+
+  const mine = new Set((await ctx.shadows.changes(id)).map((c) => c.path));
+  const theirs = err.paths.filter((p) => !mine.has(p));
+  if (theirs.length === 0) return err;
+
+  const attribution = attributePeers(
+    theirs,
+    peers,
+    await collectPeerShadows(ctx.shadows, id, peers),
+  );
+  return new Error(
+    `${err.message}\n\n${renderPeerRefusal(theirs, attribution, Date.now(), PULL_CLOSING)}`,
+  );
+}
 
 const inputSchema = {
   project: z
@@ -64,7 +112,11 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           if (mode === 'clone') {
             throw new Error(`Project "${cfg.id}" is already cloned; use mode "pull" or "auto".`);
           }
-          result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
+          try {
+            result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
+          } catch (err) {
+            throw await enrichLocalChangesOverwrite(ctx, cfg.id, err);
+          }
         }
 
         // A clone or ff-pull rewrites files on disk; drop stale baselines so post-sync content

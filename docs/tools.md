@@ -412,10 +412,19 @@ diff against the sha your own last `commit` returned, or use `status`, whose `se
 `commit` locally, then `push` with `confirm: true`. Because people may also be editing in the Overleaf
 web editor, `push` is **safe by default**: it `pull --rebase`s onto the latest remote (immediately before
 pushing) and **never force-pushes**. A rebase conflict means the agent and a human touched the same lines —
-`push` aborts the rebase and returns `status: "conflict"` — a full 3-way payload: each conflicted file's
-`base`/`ours`/`theirs` (full contents) plus a marker `hunks` view, and top-level `conflictPaths`,
-`remoteHead`, `mergeBase`, and `remoteCommits`. (You can read any side directly with `read_file(path, ref)`
-— `ref` takes `remoteHead`/`mergeBase` or any commit sha.) It
+`push` aborts the rebase and returns `status: "conflict"` — a per-file 3-way payload: each conflicted
+file's `base`/`ours`/`theirs` plus a marker `hunks` view, and top-level `conflictPaths` (every conflicted
+path, never capped), `remoteHead`, `mergeBase`, and `remoteCommits`. (You can read any side directly with
+`read_file(path, ref)` — `ref` takes `remoteHead`/`mergeBase` or any commit sha.) By default
+(`conflictDetail: "auto"`) the per-file payload is **budgeted** to fit in one tool result: `hunks` are
+allocated first (least recoverable once the rebase aborts), then `base`/`ours`/`theirs`, each capped
+individually — a part that doesn't fit comes back `null` with a matching `elided` entry (its true size and
+a `read_file(path, ref)` pointer to fetch it in full; an elided `hunks` block has no `ref` of its own —
+reconstruct it from the fetched sides) — and a `null` with **no** `elided` entry still means the ordinary
+thing, absent on that side (added/deleted). Past 20 conflicted files the rest get no per-file detail at
+all, though they remain fully named in `conflictPaths`. `conflictTruncated` is true whenever any of that
+fired. Pass `conflictDetail: "full"` for the old, uncapped behavior — every side of every file in full,
+no file limit — when you want the complete payload and can take the size. It
 never auto-merges. To resolve, retry `push` with a `resolutions` array — the full merged content for each
 conflicted file (`.bib` files need `confirmBibEdit: true`); the set is validated (missing/extra files are
 named; a path that is a symlink on our or their side of the conflict is refused outright, since content
@@ -426,8 +435,8 @@ push landing in the gap between fetch and push — the pull-rebase is retried au
 rounds); losing every round returns `status: "remote-moved"` with nothing pushed and the clone intact —
 re-run `push`. **That retry does not apply when `expectedRemoteHead` was given**: pinning it means you
 asked to be refused rather than have your merge silently rebased over a second remote move, so it is one
-round only — a lost race is reported straight away as `status: "remote-moved"`, nothing pushed. The whole
-conflict payload is delivered in the result **text**
+round only — a lost race is reported straight away as `status: "remote-moved"`, nothing pushed. The
+(budgeted, by default) conflict payload is delivered in the result **text** too
 (not only `structuredContent`), so a client that drops structured fields can still resolve. A successful
 `direct` push also reports `rebasedOver` — the remote commits that landed underneath your change. For
 larger edits, `mode: "branch"` commits to a local review branch and returns its diff, landing it only on

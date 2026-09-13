@@ -9,7 +9,9 @@ import {
   renderConflictText,
   renderLandedUpstream,
   renderRebasedOver,
+  buildConflictFilePayload,
 } from '../lib/conflictText.js';
+import { planConflictPayload, CONFLICT_MAX_FILES } from '../lib/conflictBudget.js';
 import { toPosix } from '../lib/paths.js';
 import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
 import { foldCase } from '../lib/caseFold.js';
@@ -60,12 +62,55 @@ const conflictHunkSchema = z.object({
   remote: z.array(z.string()),
 });
 
+const conflictElisionSchema = z.object({
+  chars: z.number().describe('The TRUE (untruncated) character count of the elided part.'),
+  ref: z
+    .string()
+    .optional()
+    .describe('read_file(path, ref) call that fetches this part in full. Sides only.'),
+  count: z.number().optional().describe('hunks only: how many hunks were elided.'),
+  spans: z
+    .array(z.object({ startLine: z.number(), endLine: z.number() }))
+    .optional()
+    .describe('hunks only: the line span each elided hunk covered in the conflicted working file.'),
+});
+
+/** `null` is ambiguous by itself: "absent" (added/deleted) and "elided for size" both look like
+ * `null`. The `elided.<key>` entry is what tells them apart — see `conflictFileSchema.elided`. */
+const nullSideDescribe = (label: string, key: 'base' | 'ours' | 'theirs'): string =>
+  `Full content ${label}, or null. null with no matching \`elided.${key}\` entry means the file ` +
+  `did not exist on this side (added/deleted); null WITH an \`elided.${key}\` entry means the ` +
+  "content was dropped to fit the payload budget — fetch it via that entry's `ref`.";
+
 const conflictFileSchema = z.object({
   path: z.string(),
-  base: z.string().nullable().describe('Full content at the merge-base (common ancestor).'),
-  ours: z.string().nullable().describe('Full content of our (local) version.'),
-  theirs: z.string().nullable().describe('Full content of the remote version that landed.'),
-  hunks: z.array(conflictHunkSchema).describe('Marker view of just the overlapping regions.'),
+  base: z
+    .string()
+    .nullable()
+    .describe(nullSideDescribe('at the merge-base (common ancestor)', 'base')),
+  ours: z.string().nullable().describe(nullSideDescribe('of our (local) version', 'ours')),
+  theirs: z
+    .string()
+    .nullable()
+    .describe(nullSideDescribe('of the remote version that landed', 'theirs')),
+  hunks: z
+    .array(conflictHunkSchema)
+    .describe(
+      'Marker view of just the overlapping regions. Empty when elided for size — see `elided.hunks`.',
+    ),
+  elided: z
+    .object({
+      base: conflictElisionSchema.optional(),
+      ours: conflictElisionSchema.optional(),
+      theirs: conflictElisionSchema.optional(),
+      hunks: conflictElisionSchema.optional(),
+    })
+    .optional()
+    .describe(
+      'Present iff some part of this file was dropped to fit the payload budget (conflictDetail: ' +
+        '"auto", the default). Absent when everything for this file fit, or when conflictDetail: ' +
+        '"full" was requested.',
+    ),
 });
 
 const diffFileSchema = z.object({
@@ -136,6 +181,21 @@ const inputSchema = {
         'this push is reported as "remote-moved" (nothing pushed) after one attempt, rather than ' +
         'retried up to 3 times.',
     ),
+  conflictDetail: z
+    .enum(['auto', 'full'])
+    .optional()
+    .describe(
+      'How much of a "conflict" result\'s per-file content to return. "auto" (default) budgets ' +
+        'the payload so it fits in a tool result: the marker `hunks` view is allocated first, in ' +
+        'file order (it is the least recoverable part once the rebase aborts), then base/ours/' +
+        'theirs, in file order and base-then-ours-then-theirs, each also capped individually so ' +
+        `one huge side cannot starve every other file. Past ${CONFLICT_MAX_FILES} conflicted ` +
+        'files the rest get no per-file detail at all (still fully listed in conflictPaths). An ' +
+        'elided side is fetchable in one call via read_file(path, ref); an elided hunks block has ' +
+        'no ref of its own — reconstruct it from the (fetched) sides. "full" returns every side ' +
+        'of every file in full, uncapped — for a caller that wants the complete payload and can ' +
+        'take the size.',
+    ),
   confirm: z
     .literal(true)
     .describe('Must be set to true to confirm pushing (or staging a review branch).'),
@@ -158,16 +218,29 @@ const outputSchema = {
   remoteHead: z.string().optional(),
   mergeBase: z.string().nullable().optional(),
   remoteCommits: z.array(remoteCommitSchema).optional(),
+  conflictTruncated: z
+    .boolean()
+    .optional()
+    .describe(
+      'True iff any file in conflictFiles has an `elided` entry (conflictDetail: "auto" cut ' +
+        'something to fit the payload budget). Absent unless status === "conflict".',
+    ),
   // status === 'awaiting-approval'
   base: z.string().optional(),
   diff: z.string().optional(),
   diffFiles: z.array(diffFileSchema).optional(),
 };
 
-/** Flatten a SafePushResult into the tool's flat structuredContent (remote redacted). */
+/**
+ * Flatten a SafePushResult into the tool's flat structuredContent (remote redacted). A conflict's
+ * per-file payload is bounded by `planConflictPayload` and shared verbatim with the text channel
+ * (`renderConflictText` computes the same plan from the same `{ detail }`, deterministically) — so
+ * `conflictDetail` decides once and both channels agree on what got cut.
+ */
 function safePushToolResult(
   res: SafePushResult,
   secrets: Array<string | undefined>,
+  conflictDetail: 'auto' | 'full',
 ): CallToolResult {
   const structured: Record<string, unknown> = {
     status: res.status,
@@ -182,17 +255,22 @@ function safePushToolResult(
   if (res.rebasedOver) structured.rebasedOver = res.rebasedOver;
   if (res.remoteHead && !res.conflict) structured.remoteHead = res.remoteHead;
   if (res.conflict) {
-    structured.conflictFiles = res.conflict.files;
+    const plan = planConflictPayload(res.conflict.files, {
+      detail: conflictDetail,
+      refs: { mergeBase: res.conflict.mergeBase, rebasedOnto: res.conflict.rebasedOnto },
+    });
+    structured.conflictFiles = buildConflictFilePayload(res.conflict, plan);
     structured.conflictPaths = res.conflict.conflictPaths;
     structured.rebasedOnto = res.conflict.rebasedOnto;
     structured.remoteHead = res.conflict.remoteHead;
     structured.mergeBase = res.conflict.mergeBase;
     structured.remoteCommits = res.conflict.remoteCommits;
+    structured.conflictTruncated = plan.truncated;
   }
   // Put the full resolution payload in the model-visible text, not only structuredContent (which a
   // client may drop): per-file sides, the remote head to echo back, and what landed upstream.
   const text = res.conflict
-    ? renderConflictText(res.summary, res.conflict)
+    ? renderConflictText(res.summary, res.conflict, { detail: conflictDetail })
     : res.status === 'remote-moved'
       ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
       : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
@@ -209,9 +287,19 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         'onto the latest remote before pushing and never force-pushes; on success it reports the ' +
         'new tip (pushedSha) and the remote commits it rebased over (rebasedOver). A conflict means ' +
         'someone touched the same lines: it aborts the rebase (clone back to pre-push state, nothing ' +
-        'half-merged) and returns status "conflict" with a full 3-way payload — per file base/ours/' +
-        'theirs plus a marker `hunks` view, and top-level conflictPaths, remoteHead, mergeBase, and ' +
-        'remoteCommits (all in the result text, not just structuredContent). It never auto-resolves. ' +
+        'half-merged) and returns status "conflict" with a per-file base/ours/theirs plus a marker ' +
+        '`hunks` view, and top-level conflictPaths (every conflicted path, never capped or elided), ' +
+        'remoteHead, mergeBase, and remoteCommits (all in the result text, not just ' +
+        'structuredContent). By default (conflictDetail: "auto") that per-file payload is budgeted ' +
+        'to fit in one tool result: hunks are allocated first, in file order, since they cannot be ' +
+        'cheaply re-derived once the rebase aborts; base/ours/theirs are allocated next, in file ' +
+        'order and base-then-ours-then-theirs, each individually capped so one huge side cannot ' +
+        `starve every other file's sides. Past ${CONFLICT_MAX_FILES} conflicted files the rest get ` +
+        'no per-file detail at all (still fully listed in conflictPaths); conflictTruncated is true ' +
+        'whenever any of that fired. An elided side is fetchable in one call via ' +
+        'read_file(path, ref); an elided hunks block has no ref of its own — reconstruct it from ' +
+        'the (fetched) sides. Set conflictDetail: "full" for the complete, uncapped payload ' +
+        'instead. It never auto-resolves. ' +
         'To resolve, retry with `resolutions` (the full merged content per conflicted file; the set ' +
         'is validated and missing/extra files are named), optionally passing expectedRemoteHead ' +
         '(the reported remoteHead) so the push is refused if the remote moved again. `.bib` files ' +
@@ -241,6 +329,7 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
       resolutions,
       confirmBibEdit,
       expectedRemoteHead,
+      conflictDetail = 'auto',
     }) => {
       try {
         const cfg = ctx.projectManager.requireGitProject(project, 'push to');
@@ -267,14 +356,14 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
             // isn't misread as an out-of-band change.
             ctx.files.resetBaselines(dir);
             await ctx.shadows.refresh(id, dir);
-            return safePushToolResult(res, secrets);
+            return safePushToolResult(res, secrets, conflictDetail);
           }
 
           if (mode === 'branch') {
             if (!branch) throw new Error('Branch mode requires a "branch" name.');
             if (approve) {
               const res = await ctx.git.landBranch(dir, cfg.gitUrl, auth, { branch, base });
-              return safePushToolResult(res, secrets);
+              return safePushToolResult(res, secrets, conflictDetail);
             }
             if (!message) {
               throw new Error('Branch mode requires a commit "message" to stage the work.');
@@ -300,7 +389,7 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
           // The rebase moved HEAD, so carry this session's remaining shadow onto it — and settle
           // whatever of it just went out.
           await ctx.shadows.refresh(id, dir);
-          return safePushToolResult(res, secrets);
+          return safePushToolResult(res, secrets, conflictDetail);
         });
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());

@@ -11,6 +11,76 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **The `push` conflict payload is bounded, in both channels, by one budget** (#68). A conflict on a
+  single ~20k-character section file returned a 67,485-character result — past the client's tool-result
+  cap, so it was never delivered to the model at all, and the documented way out (retry `push` with
+  `resolutions`) became unreachable at ordinary section-file sizes. The three sides plus `hunks` were
+  96.6% of it; the 3% a caller actually needs in order to _act_ — `remoteHead`, `mergeBase`,
+  `conflictPaths`, `remoteCommits` — was buried underneath, including the very refs
+  `read_file(path, ref)` needs, so the overflow disabled the documented alternative to itself. The text
+  channel already elided a side over 12,000 characters, but `structuredContent.conflictFiles` was copied
+  verbatim and wholly unbounded, and since the cap was per side per _file_ over an uncapped file loop, a
+  ten-file conflict multiplied past any of it. Both channels now render from **one** plan
+  (`src/lib/conflictBudget.ts`, a pure planner in the shape of `inlineBudget.ts`), so they cannot drift:
+  `CONFLICT_SIDE_CAP` (12,000, the former `INLINE_CAP`, now single-source) caps any one **side** and
+  `CONFLICT_CONTENT_BUDGET` (20,000) caps the payload **in total, across every file**. The budget is
+  charged against **rendered** size, not raw content: the marker boilerplate around each hunk, each
+  file's header and each side's label are named constants (`HUNK_MARKER_OVERHEAD` and friends), pinned
+  by tests that fail if the render strings drift away from them — budgeting the content alone left a
+  few hundred small hunks rendering ~64,000 characters while the plan called itself bounded. Two hard
+  caps sit underneath for the shapes no per-item budget can bound: `CONFLICT_MAX_FILES` (20) limits how
+  many files get a detailed block, and `CONFLICT_MAX_SPANS` (20) limits the line spans listed for an
+  elided hunk block, since eliding hunks _to save space_ could otherwise emit a bigger payload than
+  keeping them. A 250-file conflict used to render ~50,000 characters and report
+  `conflictTruncated: false`; it is now ~8,000 and correctly flagged. **The top-level fields are never
+  what gets cut**: `conflictPaths` lists every conflicted path however many there are, and
+  `remoteHead`, `mergeBase`, `rebasedOnto` and `remoteCommits` always survive — burying those under the
+  bulk was the original bug. What gets cut is
+  ordered by what the caller can get back: `hunks` are allocated **first and cut last**, because once the
+  rebase aborts the marker view is gone from the working tree, while a side is one
+  `read_file(path, ref)` away — so an elided side carries the exact ref to fetch it and elided hunks
+  carry their count and line spans. The reporter's proposal — `conflictDetail: "hunks"` dropping the
+  sides by _default_ — was declined: docs/CONCURRENCY.md and CLAUDE.md both promise all three sides so an
+  MCP-only client can resolve without a shell, and defaulting them off regresses the ordinary small
+  conflict (three 2k sides, one round trip) to fix the rare large one. `conflictDetail: "full"` is the
+  opt-in that lifts every cap instead. Because `null` on a side **already** means "absent — added or
+  deleted on this side", an elided side is never left as a bare `null`: a per-file `elided` record says
+  which parts were dropped and how big they were, and `conflictTruncated` reports it at the top level.
+  `GitService` is untouched — it still builds the complete report, which is what `resolvePush`
+  re-surfaces when a resolution is missing; the budget applies at the formatting boundary only. Also
+  declined: accepting a resolution as a _path_ in the clone, since for a shell-less client the merged
+  bytes cross the model once either way, and a merged file in the working tree is a tracked modification
+  the rebase then refuses over. One correction to the report, since it changes the severity: Claude
+  Desktop identifies as `claude-ai` and has `structuredContent` stripped at the transport
+  (`src/lib/outputSchemaCompat.ts`), so it only ever received the already-elided text — the overflow is
+  specific to clients that _keep_ structured output.
+- **`project_sync` refuses a dirty-tree pull in this server's vocabulary, not git's** (#68). A pull over
+  a locally modified tracked file returned git's stderr verbatim — _"Please commit your changes or stash
+  them before you merge"_ — which prescribes `stash`, a command this server does not expose, and never
+  mentions `commit` or `discard`, which it does. Of the two exits git offered, one does not exist here;
+  on a client with no shell it cannot be reached at all. The tracked wording now has the typed
+  `LocalChangesOverwriteError` that the untracked wording has had (`UntrackedOverwriteError`), carrying
+  the parsed paths and saying that nothing changed — `merge --ff-only` aborts cleanly, so HEAD did not
+  move and the working tree is exactly as it was — then naming the exits this server actually has and
+  stating plainly that git's `stash` advice is not available. Because the error knows exactly which
+  paths collided, it prescribes them: `commit` with `scope: "paths"` and those paths, or `discard`
+  scoped to those paths — not bare `scope: "all"` and not a bare `discard`, which reverts the whole
+  working tree. That mirrors the sibling `UntrackedOverwriteError`, and for the same reason: following
+  `scope: "all"` here would sweep a live peer's in-flight edits into this session's commit, while
+  `scope: "paths"` fails closed on any path a live peer owns. The tool layer then attributes each
+  remaining path to the live peer session whose shadow claims it, through the same `peerAttribution`
+  helpers `push`'s refusal uses — but **subtracting this session's own paths first**, exactly as `push`
+  does, since `livePeers` excludes self and an unfiltered list would report the caller's own edits as
+  belonging to nobody. The closing advice is now the calling tool's own: `push` talks about rebasing and
+  pushing again, `project_sync` about syncing again. Both refusals share one
+  indented-path-list parser, differing only in the opening line they key on, and the two regexes are
+  written so they can never cross-fire — they lead to different fixes. Deliberately implemented as a
+  translation of git's refusal **after** it happens rather than a working-tree pre-check: `merge
+--ff-only` succeeds over a dirty tree whenever the incoming commits do not touch the dirty files, and a
+  status-based gate would refuse pulls git would happily perform. ff-only stays ff-only, and `--autostash`
+  stays rejected for the reason already recorded for `push`: a pop is an automatic merge of somebody's
+  uncommitted lines, and a pop conflict leaves markers behind.
+
 - **`commit scope: "paths"` — commit exactly the files you name, and nothing else** (#61). A session
   whose work reached the clone without going through `edit_file` / `write_file` — a script's output,
   the client's own file tools — owns nothing in its shadow, so `scope: "session"` had nothing to commit
@@ -328,6 +398,28 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `execCapture` is defined in terms of `execCaptureBytes` (one spawn body, and a multi-byte character
   split across two output chunks now decodes correctly), and `FileService.readBytes` refuses a file over
   the 2 MiB read cap instead of loading it whole.
+- **`session-feedback` grades the evidence behind each finding** (#68). The skill already told a
+  shell-less session how to fill the environment block, but said nothing about step 2, _Reconstruct the
+  session_ — and that is the step where the shell decides whether a finding is _correct_, not merely
+  present. The report that prompted this change was written from a compacted conversation, and its
+  headline finding came out wrong about **which side of the call failed**: recalled as the `resolutions`
+  request being unwieldy, when the defect was the conflict response never being delivered. Those have
+  different fixes, and the recalled version would have been filed with no less confidence. Step 2 now
+  says to grade every finding's evidence as **observed** (the call and its result are still visible) or
+  **recalled** (rebuilt from memory or from a compaction summary), to stamp a recalled finding's issue
+  block `_unverified — reconstructed from recollection_`, and to say in the chat summary that the session
+  was reconstructed without a re-readable transcript — the same way the environment block already states
+  what it could not measure. Compaction is called out alongside the no-shell case rather than folded into
+  it, because a compaction summary is the same lossy recollection **even with a shell sitting right
+  there**. One deviation from what the report asked for: ranking stays **by impact**, with the evidence
+  grade as an annotation rather than a reordering. Dropping or demoting a high-impact finding for being
+  recalled loses it outright, which costs more than a flagged claim a maintainer has to double-check.
+- **`render_pages` says how to measure below a point.** The same report asked for a vector-geometry tool
+  partly on the premise that "at 150 dpi a point is ~2 px" — too coarse to match two table heights. `dpi`
+  already accepts up to 1200, bounded by the 4000px cap on the clipped edge, so a narrow clipped band
+  resolves at roughly 16.7 px/pt; the tool's description now says so. The tool itself is not built — see
+  the split issue — but the premise it rested on was already false.
+
 - **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
   `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`
   classification and `read_file`'s binary-file refusal, a `.tif` or `.ico` that previously read as

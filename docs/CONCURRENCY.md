@@ -90,6 +90,15 @@ change. So we do **not** auto-resolve. On any conflict `push`:
 2. **Surfaces all three sides** — the merge-base, our version, and the version that
    landed on the remote — as a structured `status: "conflict"` result (also rendered
    into the result _text_, so a client that drops structured fields can still read it).
+   By default that per-file payload is **budgeted** to fit in one tool result: `hunks`
+   are kept first (least recoverable once the rebase aborts), then `base`/`ours`/`theirs`,
+   each capped individually; whatever doesn't fit comes back `null` with a matching
+   `elided` entry (its true size plus a `read_file(path, ref)` pointer to fetch it in
+   full) — distinct from an ordinary `null` with no `elided` entry, which just means
+   the file didn't exist on that side. Past 20 conflicted files the rest get no
+   per-file detail at all, though every path stays listed in `conflictPaths`.
+   `conflictDetail: "full"` asks for the old, uncapped behavior instead. See
+   [`tools.md`](tools.md#reviewable-safe-pushes) for the field-level detail.
 3. **Stops**, and waits for a human to adjudicate.
 
 Failing safe and asking a human beats merging wrong. A conflict is information, not

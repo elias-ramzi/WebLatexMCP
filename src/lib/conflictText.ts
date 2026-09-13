@@ -1,24 +1,72 @@
 import type { ConflictReport, RemoteCommit } from '../services/gitService.js';
 import type { ConflictHunk } from './conflictParser.js';
+import {
+  planConflictPayload,
+  readFileRefCall,
+  renderElidedHunkSpans,
+  type ConflictHunksPartPlan,
+  type ConflictPartPlan,
+  type ConflictPayloadPlan,
+  type ConflictRefs,
+} from './conflictBudget.js';
 
 /**
  * Render a {@link ConflictReport} into the plain text of the tool result — the part an MCP client
- * always shows the model. The structured fields carry the same data, but a client may drop them, so
- * everything needed to compute a merge (per-file sides, the remote head, what landed) also goes
- * here. Large sides are elided with a `read_file(path, ref)` pointer to keep the payload bounded.
+ * always shows the model — and into the per-file shape `push.ts` puts in `structuredContent`. Both
+ * are built from the SAME {@link ConflictPayloadPlan} (see `conflictBudget.ts`), so a side or a
+ * `hunks` block elided from one is elided from the other too — they can never disagree about what
+ * got cut. Large parts are elided with a `read_file(path, ref)` pointer (sides) or a hunk
+ * count/line-span note (hunks, which are not independently fetchable) to keep both payloads
+ * bounded without losing the ability to reconstruct what was cut.
  */
 
-/** Above this many characters, a side is elided from the text (still available via read_file/struct). */
-const INLINE_CAP = 12000;
+/** The two report-level refs an elided side's pointer embeds, extracted once so both the plan and
+ * the render below use the exact same values. */
+function refsOf(report: ConflictReport): ConflictRefs {
+  return { mergeBase: report.mergeBase, rebasedOnto: report.rebasedOnto };
+}
 
-function renderSide(label: string, content: string | null, hint: string): string {
+function planFor(report: ConflictReport, opts?: { detail?: 'auto' | 'full' }): ConflictPayloadPlan {
+  return planConflictPayload(report.files, {
+    detail: opts?.detail ?? 'auto',
+    refs: refsOf(report),
+  });
+}
+
+/**
+ * The three side labels as rendered in the text channel. Exported (rather than left as inline
+ * literals at each call site) so `conflictText.test.ts` can pin `SIDE_LABEL_OVERHEAD`
+ * (`conflictBudget.ts`, sized off the longest of the three) against the real strings.
+ */
+export const SIDE_LABELS: Record<'base' | 'ours' | 'theirs', string> = {
+  base: 'base (common ancestor)',
+  ours: 'ours (local)',
+  theirs: 'theirs (remote that landed)',
+};
+
+/**
+ * Exported so `conflictText.test.ts` can pin `SIDE_ELISION_OVERHEAD` (`conflictBudget.ts`) against
+ * this exact elided-branch template, the same way `renderHunkMarkers`/`fileHeaderLine` are exported
+ * for their own constants.
+ */
+export function renderSide(
+  label: string,
+  content: string | null,
+  part: ConflictPartPlan,
+  hint: string,
+): string {
   if (content === null) return `${label}: (absent — added or deleted on this side)`;
-  if (content.length > INLINE_CAP) return `${label}: (${content.length} chars, elided — ${hint})`;
+  if (!part.included) return `${label}: (${part.chars} chars, elided — ${hint})`;
   return `${label}:\n${content}`;
 }
 
-/** Git-style `<<<<<<< ours / ======= / >>>>>>> theirs` blocks for the overlapping regions. */
-function renderHunks(hunks: ConflictHunk[]): string {
+/**
+ * Git-style `<<<<<<< ours / ======= / >>>>>>> theirs` blocks for the overlapping regions.
+ * Exported so `conflictText.test.ts` can pin `HUNK_MARKER_OVERHEAD` (`conflictBudget.ts`) against
+ * this exact template — the budget planner's rendered-size accounting depends on the two never
+ * drifting apart.
+ */
+export function renderHunkMarkers(hunks: ConflictHunk[]): string {
   return hunks
     .map(
       (h) =>
@@ -28,7 +76,42 @@ function renderHunks(hunks: ConflictHunk[]): string {
     .join('\n');
 }
 
-export function renderConflictText(summary: string, report: ConflictReport): string {
+/**
+ * The `━━━━━ path ━━━━━` file separator line. Exported (and factored out of the inline template
+ * it used to be) so `conflictText.test.ts` can pin `FILE_HEADER_OVERHEAD` (`conflictBudget.ts`)
+ * against this exact format.
+ */
+export function fileHeaderLine(path: string): string {
+  return `━━━━━ ${path} ━━━━━`;
+}
+
+/**
+ * `overlap:` block for one file — the full marker view when hunks fit the budget, or (when they
+ * do not) how many there were and the line span each covered, so the caller knows what to
+ * reconstruct after fetching the (possibly also elided) sides. Once the rebase aborts, the marker
+ * file is gone from the working tree, so this line-span note is the only clue left.
+ *
+ * Exported so `conflictText.test.ts` can pin `HUNK_ELISION_TEXT_OVERHEAD` (`conflictBudget.ts`)
+ * against this exact elided-branch template, the same way `renderHunkMarkers`/`fileHeaderLine` are
+ * exported for their own constants.
+ */
+export function renderHunksBlock(hunks: ConflictHunk[], part: ConflictHunksPartPlan): string {
+  if (!part.included) {
+    const spansText = renderElidedHunkSpans(part.spans, part.count);
+    return (
+      `overlap: (${part.count} hunk(s), ${part.chars} chars, elided — ${spansText}; ` +
+      `fetch base/ours/theirs to reconstruct the merge)`
+    );
+  }
+  return `overlap:\n${renderHunkMarkers(hunks)}`;
+}
+
+export function renderConflictText(
+  summary: string,
+  report: ConflictReport,
+  opts?: { detail?: 'auto' | 'full' },
+): string {
+  const plan = planFor(report, opts);
   const out: string[] = [summary, '', report.guidance, ''];
   out.push(`remoteHead: ${report.remoteHead} (${report.remoteHead.slice(0, 8)})`);
   out.push('Pass remoteHead back as `expectedRemoteHead` when you resolve.');
@@ -46,25 +129,109 @@ export function renderConflictText(summary: string, report: ConflictReport): str
     '',
     `Conflicted file(s) (${report.conflictPaths.length}): ${report.conflictPaths.join(', ')}`,
   );
+  if (plan.note) out.push(plan.note);
   // Fetch pointer for a side that's too large to inline — an exact ref, no shell needed.
+  const refs = refsOf(report);
   const baseHint = (p: string): string =>
-    report.mergeBase
-      ? `read_file("${p}", ref="${report.mergeBase}")`
-      : 'see the overlap markers above';
-  for (const f of report.files) {
-    out.push('', `━━━━━ ${f.path} ━━━━━`);
-    if (f.hunks.length) out.push('overlap:', renderHunks(f.hunks));
-    out.push(renderSide('base (common ancestor)', f.base, baseHint(f.path)));
-    out.push(renderSide('ours (local)', f.ours, `read_file("${f.path}", ref="HEAD")`));
+    readFileRefCall(p, 'base', refs) ?? 'see the overlap markers above';
+  // plan.files is capped at CONFLICT_MAX_FILES (in 'auto'; uncapped in 'full') and aligns
+  // index-for-index with the FIRST plan.files.length entries of report.files.
+  for (let i = 0; i < plan.files.length; i++) {
+    const f = report.files[i]!;
+    const fp = plan.files[i]!;
+    out.push('', fileHeaderLine(f.path));
+    if (f.hunks.length || !fp.hunks.included) out.push(renderHunksBlock(f.hunks, fp.hunks));
+    out.push(renderSide(SIDE_LABELS.base, f.base, fp.base, baseHint(f.path)));
+    out.push(renderSide(SIDE_LABELS.ours, f.ours, fp.ours, readFileRefCall(f.path, 'ours', refs)!));
     out.push(
-      renderSide(
-        'theirs (remote that landed)',
-        f.theirs,
-        `read_file("${f.path}", ref="${report.rebasedOnto}")`,
-      ),
+      renderSide(SIDE_LABELS.theirs, f.theirs, fp.theirs, readFileRefCall(f.path, 'theirs', refs)!),
+    );
+  }
+  if (plan.omittedFiles && plan.omittedFiles.length) {
+    out.push(
+      '',
+      `… ${plan.omittedFiles.length} more conflicted file(s) not detailed here — see ` +
+        'conflictPaths above for their names.',
     );
   }
   return out.join('\n');
+}
+
+/** One elided part: its true (untruncated) size, and how to get the full content back. */
+export interface ConflictElision {
+  chars: number;
+  /** `read_file(path, ref)` call for a side; absent for `hunks`, which are not fetchable on their own. */
+  ref?: string;
+  /** `hunks` only: how many hunks and where, so the caller can reconstruct after fetching the sides. */
+  count?: number;
+  spans?: Array<{ startLine: number; endLine: number }>;
+}
+
+export interface ConflictFilePayload {
+  path: string;
+  base: string | null;
+  ours: string | null;
+  theirs: string | null;
+  hunks: ConflictHunk[];
+  /**
+   * Present iff some part of THIS file was dropped to fit the payload budget. A part's value is
+   * `null` both when it is genuinely absent (added/deleted on that side) and when it was elided —
+   * this record is what tells the two apart: `null` with no matching key here means absent, `null`
+   * WITH a key here means elided for size (fetch it via `ref`).
+   */
+  elided?: {
+    base?: ConflictElision;
+    ours?: ConflictElision;
+    theirs?: ConflictElision;
+    hunks?: ConflictElision;
+  };
+}
+
+/**
+ * Build the structured (`push.ts`'s `structuredContent.conflictFiles`) shape from the same plan
+ * `renderConflictText` uses — the two channels are built from one decision, not re-derived
+ * independently, so they cannot drift apart on what got cut.
+ */
+export function buildConflictFilePayload(
+  report: ConflictReport,
+  plan: ConflictPayloadPlan,
+): ConflictFilePayload[] {
+  const refs = refsOf(report);
+  const sideRef = (path: string, key: 'base' | 'ours' | 'theirs'): string =>
+    readFileRefCall(path, key, refs) ?? 'no merge base (unrelated histories)';
+
+  // plan.files is capped at CONFLICT_MAX_FILES (in 'auto'; uncapped in 'full') — a file beyond the
+  // cap gets no entry here at all, only in the report's own (uncapped) `conflictPaths`.
+  return plan.files.map((fp, i) => {
+    const f = report.files[i]!;
+    const elided: NonNullable<ConflictFilePayload['elided']> = {};
+    let anyElided = false;
+
+    const sideValue = (key: 'base' | 'ours' | 'theirs'): string | null => {
+      const content = f[key];
+      if (content === null) return null; // genuinely absent — never marked `elided`
+      const part = fp[key];
+      if (!part.included) {
+        anyElided = true;
+        elided[key] = { chars: part.chars, ref: sideRef(f.path, key) };
+        return null;
+      }
+      return content;
+    };
+
+    const base = sideValue('base');
+    const ours = sideValue('ours');
+    const theirs = sideValue('theirs');
+
+    let hunks = f.hunks;
+    if (!fp.hunks.included) {
+      anyElided = true;
+      elided.hunks = { chars: fp.hunks.chars, count: fp.hunks.count, spans: fp.hunks.spans };
+      hunks = [];
+    }
+
+    return { path: f.path, base, ours, theirs, hunks, ...(anyElided ? { elided } : {}) };
+  });
 }
 
 /**

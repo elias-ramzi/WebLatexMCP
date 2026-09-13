@@ -43,6 +43,22 @@ session to look at.
      push-refused-when-behind) — was it right to fire, and did its message explain the way forward?
    - a point where the user had to correct, re-explain, or repeat themselves — that is usually a tool
      description or a doc failing, not a user failing.
+
+   This walk assumes the calls are still there to read. When they are not — the conversation has been
+   compacted, or it is long enough that only a shell replaying the transcript could recover it — you are
+   working from recollection, and recollection is what turns a finding that is _present_ into one that is
+   merely _plausible_. Compaction is the sharper case precisely because it bites with a shell sitting
+   right there: the summary that survived is itself the lossy retelling, so treat it like a missing
+   transcript rather than folding it into the no-shell case.
+   Grade every finding's evidence as **observed** (the tool call and its result are still visible in the
+   conversation) or **recalled** (rebuilt from memory, or from a compaction summary). Carry the grade
+   through: stamp a recalled finding's issue block with `_unverified — reconstructed from recollection_`,
+   and say in the chat summary that the session was reconstructed without a re-readable transcript — the
+   same way the environment block already says what it could not measure. Don't let the grade move a
+   finding in step 6's ranking, which stays by impact: a high-impact finding you can only recall is still
+   worth filing, marked, so a maintainer can re-derive it before acting on it — dropping or demoting it
+   for being recalled loses it outright, which costs more than a flagged claim someone has to double-check.
+
 3. **Classify each candidate finding** into exactly one bucket. The bucket picks the issue form:
    - **`bug`** — the server did the wrong thing: wrong output, a crash, a guard that fired when it
      should not have (or stayed silent when it should have fired). → **Bug report** form.
