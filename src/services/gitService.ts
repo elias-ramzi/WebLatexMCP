@@ -9,6 +9,50 @@ import { execCapture, execCaptureBytes } from '../lib/exec.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
+/**
+ * ASCII-only case fold — lowercases only `A-Z`, nothing else. This is what git's own
+ * `core.ignorecase` folding does (and only that): a full-Unicode `toLowerCase()` would also fold
+ * e.g. U+212A KELVIN SIGN to ASCII `k`, over-matching a pair git itself treats as different names.
+ * Shared by every case-insensitive lookup in this file so they all agree with git and never
+ * over-match.
+ */
+function foldCase(name: string): string {
+  return name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/**
+ * An exact-first, ASCII-fold-otherwise lookup over one tree/index listing (e.g.
+ * `ls-tree -r -z --name-only <ref>` or `ls-files -z`). `resolve(rel)` returns the listing's own
+ * spelling for `rel`: `rel` itself when the listing holds it verbatim — which is also the answer
+ * on a case-sensitive repository, or for a path the listing doesn't track at all — otherwise the
+ * first entry (in listing order) whose ASCII fold equals `rel`'s fold, otherwise `rel` unchanged.
+ * `has(rel)` is the tracked/not-tracked question alone, without resolving.
+ *
+ * Exact-first matters when a tree legitimately holds both `Notes.txt` and `notes.txt` (e.g. a
+ * case-sensitive contributor added both): a caller naming one of them exactly must land on that
+ * one, never on whichever entry happened to sort last.
+ */
+function canonicalNames(names: string[]): {
+  resolve(rel: string): string;
+  has(rel: string): boolean;
+} {
+  const exact = new Set(names);
+  const folded = new Map<string, string>();
+  for (const name of names) {
+    const key = foldCase(name);
+    if (!folded.has(key)) folded.set(key, name);
+  }
+  return {
+    resolve(rel: string): string {
+      if (exact.has(rel)) return rel;
+      return folded.get(foldCase(rel)) ?? rel;
+    },
+    has(rel: string): boolean {
+      return exact.has(rel) || folded.has(foldCase(rel));
+    },
+  };
+}
+
 export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged';
 
 export interface SyncResult {
@@ -278,6 +322,28 @@ export function hasLinkOnConflictSide(lsFilesOutput: string): boolean {
 }
 
 /**
+ * The first ancestor of `rel` (POSIX, relative to `dir`, excluding `rel` itself and `dir`) that
+ * is a symbolic link in the working tree, as a POSIX relative path, or null when no ancestor is
+ * a link. An ancestor that does not exist ends the walk (nothing below it can be a link). The
+ * final component is deliberately not judged here — `hasSymlinkMode` owns that.
+ */
+export async function linkedAncestor(dir: string, rel: string): Promise<string | null> {
+  const segments = toPosix(rel).split('/').filter(Boolean);
+  for (let i = 1; i < segments.length; i++) {
+    const prefix = segments.slice(0, i).join('/');
+    try {
+      const st = await lstat(path.join(dir, ...segments.slice(0, i)));
+      if (st.isSymbolicLink()) return prefix;
+    } catch {
+      // Ancestor does not exist — nothing below it can be a link either. (An unreadable one
+      // ends the walk too; the `writeFile` that follows fails on it just the same.)
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Wraps git operations via the system `git` CLI (through simple-git). Auth is injected
  * in-memory per network call and never persisted to .git/config.
  */
@@ -291,6 +357,19 @@ export class GitService {
      */
     private readonly hooks: { beforePush?: (attempt: number) => Promise<void> } = {},
   ) {}
+
+  /**
+   * Per-dir cache of {@link isCaseInsensitive}'s answer — `readAtRefBytes` runs it once per
+   * shadow entry per `status`, and it costs a `git config` spawn every time otherwise. A
+   * `core.ignorecase` flip mid-process (a hand `git config` while this server is running) is not
+   * tracked; the cached answer sticks for the life of this `GitService` instance.
+   */
+  private readonly caseInsensitive = new Map<string, Promise<boolean>>();
+  /** {@link canonicalAtRef}'s memoised listing, one per dir, keyed by the tree sha it lists. */
+  private readonly canonicalByTree = new Map<
+    string,
+    { key: string; names: ReturnType<typeof canonicalNames> }
+  >();
 
   /** Stage and commit locally. Does not push. */
   async commit(
@@ -363,8 +442,30 @@ export class GitService {
     // `commit`'s `fromHead` branch does.
     await this.resetIndexToHead(dir, git);
 
+    // `update-index --cacheinfo`/`--force-remove` do no case-alias lookup the way `git add`
+    // does: on a case-insensitive repository (`core.ignorecase = true`, git's own default on
+    // clone/init on macOS and Windows) a caller who spells a tracked file in another case than
+    // HEAD — the same file on that filesystem — would otherwise stage a SECOND, case-differing
+    // tree entry (or, for a deletion, remove nothing). The index was just reset to HEAD above,
+    // so list it once and fold every file's path onto HEAD's own spelling before touching the
+    // index. `foldCase` IS git's own ASCII-only case folding (never Unicode), so it matches what
+    // `core.ignorecase` does and never over-matches a non-ASCII case pair (a Kelvin sign, a
+    // dotted capital I); `canonicalNames` resolves exact-first, so when the tree legitimately
+    // holds both `Notes.txt` and `notes.txt`, naming one exactly lands on that one, never on
+    // whichever entry happened to sort last. On a case-sensitive repository this costs nothing
+    // extra: `canonical` is `null` and every path is used as the caller spelled it.
+    const canonical =
+      (await this.isCaseInsensitive(dir)) && (await this.revParseOrNull(git, 'HEAD')) !== null
+        ? canonicalNames(
+            (await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']))
+              .split('\0')
+              .filter(Boolean),
+          )
+        : null;
+
     for (const file of opts.files) {
-      const rel = toPosix(file.path);
+      const posixPath = toPosix(file.path);
+      const rel = canonical ? canonical.resolve(posixPath) : posixPath;
       if (file.content === null) {
         await git.raw(['update-index', '--force-remove', '--', rel]);
         continue;
@@ -429,6 +530,11 @@ export class GitService {
    *   scope "all" with `paths`): plain `check-ignore`, which hides index-tracked paths exactly as
    *   `git add` accepts them, so a force-added file stays committable there and a hand
    *   `git rm --cached` one is reported ignored rather than surfacing git's raw "Use -f" hint.
+   *   `check-ignore` itself judges the index by exact name only — on a case-insensitive
+   *   repository (`core.ignorecase = true`) an index entry `Notes.txt` does not save a
+   *   `*.txt`-matched `notes.txt` from being reported ignored, even though `git add -- notes.txt`
+   *   would stage it as `Notes.txt` — so this route folds the matches against `git ls-files -z`
+   *   itself (exact-first, ASCII fold otherwise) when the repository is case-insensitive.
    */
   async ignoredPaths(
     dir: string,
@@ -453,50 +559,142 @@ export class GitService {
       .split('\0')
       .filter(Boolean)
       .map((p) => toPosix(p));
-    if (matched.length === 0 || opts.tracked === 'index') return matched;
-    const tracked = await this.trackedAtHead(simpleGit(dir), matched);
+    if (matched.length === 0) return matched;
+    if (opts.tracked === 'index') {
+      if (!(await this.isCaseInsensitive(dir))) return matched;
+      const indexNames = (await simpleGit(dir).raw(['ls-files', '-z'])).split('\0').filter(Boolean);
+      const canonical = canonicalNames(indexNames);
+      return matched.filter((p) => !canonical.has(p));
+    }
+    const tracked = await this.trackedAtHead(dir, matched);
     return matched.filter((p) => !tracked.has(p));
   }
 
   /**
-   * Which of `rels` (POSIX, relative to the clone) HEAD tracks — exact names only, so a directory
-   * pathspec's recursive matches never count for a file of the same name. Empty for an unborn
-   * HEAD (nothing is tracked yet). Two spawns (`rev-parse`, `ls-tree`), run only when
-   * `check-ignore` matched something.
+   * Whether the repository at `dir` has `core.ignorecase = true` set (git's own default on
+   * clone/init on macOS and Windows). Shared by `trackedAtHead`, `commitContents`,
+   * `canonicalAtRef` and `ignoredPaths`'s `'index'` route. Cached per `dir` on this instance —
+   * see {@link caseInsensitive}'s doc comment for what that does and does not track.
    */
-  private async trackedAtHead(git: SimpleGit, rels: string[]): Promise<Set<string>> {
+  private async isCaseInsensitive(dir: string): Promise<boolean> {
+    let cached = this.caseInsensitive.get(dir);
+    if (!cached) {
+      cached = (async () => {
+        const ignorecase = await execCapture('git', ['config', '--type=bool', 'core.ignorecase'], {
+          cwd: dir,
+        });
+        return ignorecase.code === 0 && ignorecase.stdout.trim() === 'true';
+      })();
+      this.caseInsensitive.set(dir, cached);
+      // A spawn failure is not an answer: forget it so the next call asks again.
+      cached.catch(() => this.caseInsensitive.delete(dir));
+    }
+    return cached;
+  }
+
+  /**
+   * Which of `rels` (POSIX, relative to the clone) HEAD tracks. Empty for an unborn HEAD
+   * (nothing is tracked yet). Run only when `check-ignore` matched something.
+   *
+   * On an ordinary (case-sensitive) repository this is exact names only, via a literal
+   * pathspec (`--literal-pathspecs` because `a[1].tex` is a glob to git otherwise) intersected
+   * with `rels` — cheap, and a directory pathspec's recursive matches never count for a file of
+   * the same name.
+   *
+   * `core.ignorecase = true` — which git sets on clone/init on macOS and Windows — breaks that:
+   * HEAD can track `Notes.txt` while an ignore rule (`*.txt`) matches, and the caller (and the
+   * file on disk) spell it `notes.txt`. A literal pathspec is compared byte-for-byte regardless
+   * of `core.ignorecase` (verified against real git), so `ls-tree -- notes.txt` never matches
+   * the tree entry `Notes.txt` and a tracked file was reported ignored. There is no pathspec that
+   * is both literal (so `a[1].tex` isn't a glob) and case-insensitive, so on an ignorecase
+   * repository we list the whole tree with no pathspec and fold names ourselves via
+   * `canonicalNames` — `foldCase` IS git's own ASCII-only case folding (never Unicode), so it
+   * matches what `core.ignorecase` itself does and never over-matches a non-ASCII case pair (a
+   * Kelvin sign, a dotted capital I), and resolution is exact-first, so a tree holding both
+   * `Notes.txt` and `notes.txt` is judged correctly for whichever one the caller actually named.
+   * The directory components fold too (`Sub/Notes.txt` vs `sub/notes.txt`), since folding runs
+   * over the whole relative path. The returned set holds the CALLER's spellings (from `rels`),
+   * because `ignoredPaths` filters `matched` (also the caller's spellings) by `tracked.has(p)`.
+   */
+  private async trackedAtHead(dir: string, rels: string[]): Promise<Set<string>> {
+    const git = simpleGit(dir);
     if ((await this.revParseOrNull(git, 'HEAD')) === null) return new Set();
-    // `-z` so a name with a newline or non-ASCII byte comes back verbatim, not C-quoted;
-    // `--literal-pathspecs` because `a[1].tex` is a glob to git otherwise.
-    const out = await git.raw([
-      '--literal-pathspecs',
-      'ls-tree',
-      '-r',
-      '-z',
-      '--name-only',
-      'HEAD',
-      '--',
-      ...rels,
-    ]);
-    const wanted = new Set(rels);
-    return new Set(out.split('\0').filter((name) => wanted.has(name)));
+    const caseInsensitive = await this.isCaseInsensitive(dir);
+    // `-z` so a name with a newline or non-ASCII byte comes back verbatim, not C-quoted.
+    if (!caseInsensitive) {
+      const out = await git.raw([
+        '--literal-pathspecs',
+        'ls-tree',
+        '-r',
+        '-z',
+        '--name-only',
+        'HEAD',
+        '--',
+        ...rels,
+      ]);
+      const wanted = new Set(rels);
+      return new Set(out.split('\0').filter((name) => wanted.has(name)));
+    }
+    // A pathspec can't be both literal and case-insensitive, so list the whole tree and fold.
+    const out = await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
+    const canonical = canonicalNames(out.split('\0').filter(Boolean));
+    return new Set(rels.filter((rel) => canonical.has(rel)));
+  }
+
+  /**
+   * `rel`'s own spelling as tracked at `ref`, or `rel` unchanged when the repository is
+   * case-sensitive, `ref`'s tree listing can't be read (tolerated — fall through, never throw),
+   * or `ref` doesn't track `rel` in any spelling. Shared by `readAtRef`/`readAtRefBytes` so a
+   * caller who spells a tracked `Notes.txt` as `notes.txt` on a case-insensitive repository
+   * (`core.ignorecase = true`, git's own default on macOS/Windows clones) is answered from the
+   * real tree entry rather than getting `null` back — which is how `ShadowStore.readHead` (its
+   * only caller other than `readAtRef`/`readAtRefBytes` themselves, indirectly) used to seed a
+   * null base for such a spelling, turning a session's shadow into the whole working-tree file,
+   * peer lines included. Deliberately NOT used by the conflict-report `showOrNull` call sites —
+   * those paths (from `git diff --diff-filter=U` etc.) come from git itself and are already in
+   * whichever spelling git tracks.
+   */
+  private async canonicalAtRef(
+    dir: string,
+    git: SimpleGit,
+    ref: string,
+    rel: string,
+  ): Promise<string> {
+    if (!(await this.isCaseInsensitive(dir))) return rel;
+    // `ShadowStore` asks once per entry per `status`, so the whole-tree listing is memoised by
+    // the tree it describes: one `rev-parse` (a line of output) per call, the listing only when
+    // the ref moved. One entry per dir — the ref this is asked about is HEAD in practice.
+    const sha = await this.revParseOrNull(git, `${ref}^{tree}`);
+    if (sha === null) return rel;
+    const key = `${dir}\0${sha}`;
+    let names = this.canonicalByTree.get(dir);
+    if (!names || names.key !== key) {
+      let listing: string[];
+      try {
+        listing = (await git.raw(['ls-tree', '-r', '-z', '--name-only', sha]))
+          .split('\0')
+          .filter(Boolean);
+      } catch {
+        return rel;
+      }
+      names = { key, names: canonicalNames(listing) };
+      this.canonicalByTree.set(dir, names);
+    }
+    return names.names.resolve(rel);
   }
 
   /**
    * Read a path's content at a commit-ish, or null when it does not exist there. Decodes as
    * text (via simple-git's `git show`) — for content that may not be valid UTF-8 (a binary
-   * asset), use `readAtRefBytes` instead.
+   * asset), use `readAtRefBytes` instead. On a case-insensitive repository, resolves `relPath` to
+   * `ref`'s own spelling first — see {@link canonicalAtRef}.
    */
   async readAtRef(dir: string, ref: string, relPath: string): Promise<string | null> {
-    return this.showOrNull(simpleGit(dir), ref, toPosix(relPath));
+    const git = simpleGit(dir);
+    const rel = await this.canonicalAtRef(dir, git, ref, toPosix(relPath));
+    return this.showOrNull(git, ref, rel);
   }
 
-  /**
-   * Byte-exact analogue of `readAtRef`: read a path's content at a commit-ish as a raw
-   * `Buffer`, or null when it does not exist there. Use this for content that may not be
-   * valid UTF-8 (e.g. a PNG), since `readAtRef`/simple-git's `git show` decode as text and
-   * would corrupt such bytes.
-   */
   /**
    * The commit HEAD points at, or `'unborn'` for a repository with no commits yet. Never throws:
    * `ShadowStore.refresh` calls this once per call to decide whether a conflicted entry's verdict
@@ -507,10 +705,16 @@ export class GitService {
     return (await this.revParseOrNull(simpleGit(dir), 'HEAD')) ?? 'unborn';
   }
 
+  /**
+   * Byte-exact analogue of `readAtRef`: read a path's content at a commit-ish as a raw
+   * `Buffer`, or null when it does not exist there. Use this for content that may not be
+   * valid UTF-8 (e.g. a PNG), since `readAtRef`/simple-git's `git show` decode as text and
+   * would corrupt such bytes. Same case-insensitive resolution as `readAtRef` — see
+   * {@link canonicalAtRef}.
+   */
   async readAtRefBytes(dir: string, ref: string, relPath: string): Promise<Buffer | null> {
-    const res = await execCaptureBytes('git', ['show', `${ref}:${toPosix(relPath)}`], {
-      cwd: dir,
-    });
+    const rel = await this.canonicalAtRef(dir, simpleGit(dir), ref, toPosix(relPath));
+    const res = await execCaptureBytes('git', ['show', `${ref}:${rel}`], { cwd: dir });
     if (res.code !== 0) return null;
     return res.stdout;
   }
@@ -890,8 +1094,14 @@ export class GitService {
       // link points, and `git add` would then stage the untouched link as if it had been resolved.
       // Check the paused rebase's working tree (`lstat`) and the ours/theirs conflict stages in
       // the index (`git ls-files -s`, mode 120000) — either side can carry the link; a link only
-      // in the base stage is one both sides already replaced, and is not refused.
+      // in the base stage is one both sides already replaced, and is not refused. Ancestor
+      // directories are checked too: git itself never leaves a conflicted path beneath a link
+      // (a side that turns a directory into a link gets the tracked file moved aside with an
+      // unmerged 120000 entry the stage check above already refuses), but a link can be placed
+      // by hand into the working tree while the rebase is paused, and `writeFile` would follow
+      // it wherever it points.
       const linked: string[] = [];
+      const underLink: Array<{ rel: string; via: string }> = [];
       for (const rel of step.unmerged) {
         try {
           resolveInside(dir, rel);
@@ -900,8 +1110,10 @@ export class GitService {
           throw err;
         }
         if (await this.hasSymlinkMode(dir, git, rel)) linked.push(rel);
+        const via = await linkedAncestor(dir, rel);
+        if (via) underLink.push({ rel, via });
       }
-      if (linked.length > 0) {
+      if (linked.length > 0 || underLink.length > 0) {
         await this.abortRebaseIfInProgress(git);
         throw new Error(
           linked
@@ -909,6 +1121,14 @@ export class GitService {
               (rel) =>
                 `"${rel}" is a symbolic link on at least one side of this conflict; a resolution ` +
                 'carries file content and cannot resolve a link.',
+            )
+            .concat(
+              underLink.map(
+                ({ rel, via }) =>
+                  `"${rel}" lies under "${via}", a symbolic link in the working tree; a ` +
+                  'resolution is written at the path it names and cannot be written through a ' +
+                  'link.',
+              ),
             )
             .join(' ') +
             ' Nothing was pushed and the rebase was aborted, so the clone is back to where it was ' +
@@ -1180,8 +1400,12 @@ export class GitService {
    */
   async showAtRef(dir: string, ref: string, relPath: string): Promise<string> {
     if (/^-/.test(ref)) throw new Error(`Invalid ref "${ref}".`);
+    const git = simpleGit(dir);
+    // Same case fold as `readAtRef`: on an ignorecase clone the working-tree read of `notes.txt`
+    // succeeds (the filesystem folds), so the `ref` read of it must not fail on the spelling.
+    const rel = await this.canonicalAtRef(dir, git, ref, toPosix(relPath));
     try {
-      return await simpleGit(dir).show([`${ref}:${relPath}`]);
+      return await git.show([`${ref}:${rel}`]);
     } catch {
       throw new Error(`"${relPath}" does not exist at ref "${ref}" (or the ref is unknown).`);
     }

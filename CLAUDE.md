@@ -148,7 +148,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   used to get the file reported ignored, and the session's edit dropped, while the reset put it
   straight back); against the live index for `scope: "all"` with `paths`, whose `git add` runs over
   the index as it stands. Keep the two paired, or the filter passes a path `git add` then refuses
-  with its raw "Use -f" hint. The flag is never cleared on an edit, and
+  with its raw "Use -f" hint. When `core.ignorecase` is set, every by-name lookup against HEAD or
+  the index folds ASCII case the way `git add` does — a literal pathspec and `git show ref:path`
+  never do — with the exact spelling winning when both exist: the ignore filter (both bases),
+  `readAtRef`/`readAtRefBytes` (the shadow's base) and `showAtRef` (`read_file` with a `ref`), and
+  `commitContents`, which stages under
+  HEAD's spelling because `update-index --cacheinfo` does no case-alias lookup. A `Notes.txt`
+  edited as `notes.txt` on macOS was otherwise reported ignored, seeded a null shadow base, and
+  committed as a second tree entry. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
   deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
   its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call

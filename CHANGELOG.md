@@ -387,8 +387,16 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   HEAD for the session scope and `scope: "paths"`, which reset the index to HEAD first — so a hand
   `git rm --cached` no longer gets the file reported ignored (and the session's edit dropped) while
   the reset put it straight back — and against the live index for `scope: "all"` with `paths`,
-  whose `git add` runs over the index as it stands. A request whose every path is ignored is
-  refused by name, not with "no changes". Pathspecs handed to `git add` and `ls-files` are now
+  whose `git add` runs over the index as it stands. On a case-insensitive repository
+  (`core.ignorecase`, which git sets on macOS and Windows clones) the HEAD lookup folds case, so a
+  file tracked as `Notes.txt` and edited as `notes.txt` is tracked, not ignored — under either
+  basis. The same ASCII fold (git's own; exact spelling wins where a tree holds both) now applies
+  wherever this server looks a path up by name: the session's shadow base is read from HEAD's
+  spelling, so such an edit no longer seeds an empty base and swallows a peer's uncommitted lines
+  whole, and the session commit stages under HEAD's spelling, since `update-index --cacheinfo`
+  does none of the case-alias lookup `git add` does — such an edit used to land as a second,
+  case-differing tree entry, and a deletion removed nothing. A request whose every path is
+  ignored is refused by name, not with "no changes". Pathspecs handed to `git add` and `ls-files` are now
   literal, never globs: naming `a[1].tex` used to stage a peer's dirty `a1.tex` past the ownership
   check.
 - **`status` (and every tool that starts from it) works on a clone of an empty remote.** The branch
@@ -414,14 +422,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   paused rebase's working tree, or the ours/theirs index stage at mode 120000) is now refused by
   name, the rebase aborted and the clone left where it was before the rebase started. A link only in
   the _base_ stage — one both sides already replaced with a regular file — is an ordinary content
-  conflict and is not refused, since nothing a resolution could land on is a link any more. The
-  index-side check (and `commitContents`' mode lookup) passes the path as a literal pathspec, not a
-  glob, so `a[1].tex` is never judged by `a1.tex`'s entry. Separately, the unmerged-path listing lacked
-  `core.quotePath=false`, so a conflict on `é.tex` came back as `"\303\251.tex"`, with an empty
-  per-file report and a resolution for `é.tex` rejected as "not supplied"; it now matches every other
-  path-returning call. (The issue's item 10 — a literal newline in a path mis-splitting `--numstat` —
-  turned out not to be a defect: git C-quotes control characters whatever `core.quotePath` says, so the
-  row count stays right; the quoting bug that _was_ real is this one.)
+  conflict and is not refused, since nothing a resolution could land on is a link any more. A path
+  beneath a symlinked directory (`sub/x.tex` under a link `sub`) is refused the same way: git never
+  checks a conflicted file out beneath a link itself, but one placed by hand while the rebase is
+  paused would otherwise redirect the write. The index-side check (and `commitContents`' mode
+  lookup) passes the path as a literal pathspec, not a glob, so `a[1].tex` is never judged by
+  `a1.tex`'s entry. Separately, the unmerged-path listing lacked `core.quotePath=false`, so a
+  conflict on `é.tex` came back as `"\303\251.tex"`, with an empty per-file report and a resolution
+  for `é.tex` rejected as "not supplied"; it now matches every other path-returning call. (The
+  issue's item 10 — a literal newline in a path mis-splitting `--numstat` — turned out not to be a
+  defect: git C-quotes control characters whatever `core.quotePath` says, so the row count stays
+  right; the quoting bug that _was_ real is this one.)
 - **A write through an in-project symlink is attributed to the link's target** (#66, item 4). A
   confirmed `write_file`/`edit_file`/`add_asset` through a tracked `link.tex -> main.tex` changed
   `main.tex` on disk but recorded the change under `link.tex`, whose HEAD content is the target string:

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, appendFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, appendFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -482,5 +482,340 @@ describe('commit skips files git ignores', () => {
     expect(sc.ignored).toEqual(['build/out.log']);
     expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['main.tex']);
     void dir;
+  });
+});
+
+/**
+ * Regression tests for issue #66 item 2: `GitService.ignoredPaths` with `tracked: 'head'`
+ * subtracts what `trackedAtHead` finds via a *literal* pathspec (`--literal-pathspecs
+ * ls-tree ... -- <rels>`), intersected with the caller's spelling by exact string equality.
+ * On a case-insensitive repository (`core.ignorecase = true`, which git sets on clone/init on
+ * macOS and Windows) HEAD can track `Notes.txt` while the caller — and the file on disk — spell
+ * it `notes.txt`; a literal pathspec `notes.txt` never matches the tree entry `Notes.txt`, so a
+ * tracked file was reported ignored. Exercises `ctx.git.ignoredPaths` directly against a clone
+ * whose `core.ignorecase` is set explicitly in each test, so the result is deterministic on
+ * Linux, macOS and Windows CI alike regardless of the host filesystem's own case sensitivity.
+ */
+describe('ignored vs tracked on a case-insensitive repository', () => {
+  async function commitTracked(dir: string, relPath: string, content: string): Promise<void> {
+    const full = path.join(dir, relPath);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+    const git = simpleGit(dir);
+    await git.raw(['add', '-f', '--', relPath]);
+    await git.raw(['commit', '-m', `add ${relPath}`]);
+  }
+
+  it('(a) folds case when core.ignorecase=true: a tracked "Notes.txt" is not reported ignored for "notes.txt"', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['notes.txt'], { tracked: 'head' });
+    expect(result).toEqual([]);
+  });
+
+  it('(b) core.ignorecase=false: "notes.txt" stays ignored (it is a different file from tracked "Notes.txt")', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'false']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['notes.txt'], { tracked: 'head' });
+    expect(result).toEqual(['notes.txt']);
+  });
+
+  it('(c) core.ignorecase=true: the fold does not over-match a name tracked in no spelling', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['other.txt'], { tracked: 'head' });
+    expect(result).toEqual(['other.txt']);
+  });
+
+  it('(d) core.ignorecase=true: directory components fold too ("Sub/Notes.txt" vs "sub/notes.txt")', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Sub/Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['sub/notes.txt'], { tracked: 'head' });
+    expect(result).toEqual([]);
+  });
+
+  it('(e) core.ignorecase=true: the exact tracked spelling still works', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['Notes.txt'], { tracked: 'head' });
+    expect(result).toEqual([]);
+  });
+});
+
+/**
+ * Regression tests for issue #66 item 3: `commitContents` stages via `update-index --cacheinfo`
+ * / `--force-remove`, neither of which does the case-alias lookup `git add` does. On a
+ * case-insensitive repository (`core.ignorecase = true`) a session that spells a tracked file
+ * differently from HEAD (`notes.txt` vs tracked `Notes.txt` — the same file on disk) must stage
+ * under HEAD's spelling, or the tree ends up with both names for what is one file on that
+ * filesystem, and a deletion under the caller's spelling removes nothing.
+ */
+describe("commitContents stages under HEAD's spelling on a case-insensitive repository", () => {
+  async function commitTracked(dir: string, relPath: string, content: string): Promise<void> {
+    const full = path.join(dir, relPath);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+    const git = simpleGit(dir);
+    await git.raw(['add', '-f', '--', relPath]);
+    await git.raw(['commit', '-m', `add ${relPath}`]);
+  }
+
+  it('(f) core.ignorecase=true: editing "notes.txt" stages under tracked "Notes.txt", not as a second entry', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await commitTracked(dir, 'Sub/Notes.txt', 'sub notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const res = await ctx.git.commitContents(dir, {
+      message: 'edit under caller spelling',
+      files: [{ path: 'notes.txt', content: 'changed\n' }],
+    });
+    expect(res.committed).toBe(true);
+
+    const git = simpleGit(dir);
+    const tree = (await git.raw(['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n')
+      .filter(Boolean);
+    expect(tree).toContain('Notes.txt');
+    expect(tree).not.toContain('notes.txt');
+    expect(await git.show(['HEAD:Notes.txt'])).toBe('changed\n');
+  });
+
+  it('(g) core.ignorecase=true: deleting "sub/notes.txt" removes tracked "Sub/Notes.txt"', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await commitTracked(dir, 'Sub/Notes.txt', 'sub notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const res = await ctx.git.commitContents(dir, {
+      message: 'delete under caller spelling',
+      files: [{ path: 'sub/notes.txt', content: null }],
+    });
+    expect(res.committed).toBe(true);
+
+    const git = simpleGit(dir);
+    const tree = (await git.raw(['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n')
+      .filter(Boolean);
+    expect(tree).not.toContain('Sub/Notes.txt');
+    expect(tree).not.toContain('sub/notes.txt');
+    expect(tree).toContain('Notes.txt');
+  });
+
+  it('(h) core.ignorecase=false: editing "notes.txt" against tracked "Notes.txt" creates a second, case-differing entry', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'false']);
+
+    const res = await ctx.git.commitContents(dir, {
+      message: 'edit under caller spelling, case-sensitive repo',
+      files: [{ path: 'notes.txt', content: 'new\n' }],
+    });
+    expect(res.committed).toBe(true);
+
+    const git = simpleGit(dir);
+    const tree = (await git.raw(['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n')
+      .filter(Boolean);
+    expect(tree).toContain('Notes.txt');
+    expect(tree).toContain('notes.txt');
+  });
+
+  it("(i) core.ignorecase=true: a brand-new file with no HEAD counterpart stages under the caller's spelling", async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const res = await ctx.git.commitContents(dir, {
+      message: 'new file',
+      files: [{ path: 'fresh.txt', content: 'f\n' }],
+    });
+    expect(res.committed).toBe(true);
+
+    const git = simpleGit(dir);
+    const tree = (await git.raw(['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n')
+      .filter(Boolean);
+    expect(tree).toContain('fresh.txt');
+  });
+});
+
+/**
+ * Regression tests for issue #66's remaining case-fold defects:
+ *  (j)/(k): `readAtRef`/`readAtRefBytes` did no case-fold at all, whatever `core.ignorecase`
+ *   says, so a caller spelling a tracked `Notes.txt` as `notes.txt` got `null` back — which is
+ *   how `ShadowStore.readHead` seeded a null base and a session's shadow became the whole
+ *   working-tree file, peer lines included (see sessionCaseFold.test.ts for the end-to-end case).
+ *  (l): the fold must be exact-first, not last-wins, when a tree holds both spellings.
+ *  (m): the fold must be ASCII-only, never over-matching a non-ASCII case pair (Kelvin sign).
+ *  (n): `ignoredPaths(..., { tracked: 'index' })` did no fold either.
+ */
+describe('case-fold defects in readAtRef/readAtRefBytes/ignoredPaths (index)', () => {
+  async function commitTracked(dir: string, relPath: string, content: string): Promise<void> {
+    const full = path.join(dir, relPath);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+    const git = simpleGit(dir);
+    await git.raw(['add', '-f', '--', relPath]);
+    await git.raw(['commit', '-m', `add ${relPath}`]);
+  }
+
+  it('(j) core.ignorecase=true: readAtRef/readAtRefBytes resolve "notes.txt" to tracked "Notes.txt"', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const text = await ctx.git.readAtRef(dir, 'HEAD', 'notes.txt');
+    expect(text).toBe('notes\n');
+    const bytes = await ctx.git.readAtRefBytes(dir, 'HEAD', 'notes.txt');
+    expect(bytes).not.toBeNull();
+    expect((bytes as Buffer).equals(Buffer.from('notes\n', 'utf8'))).toBe(true);
+  });
+
+  it('(j2) showAtRef (the read_file ref route) folds under core.ignorecase=true, not false', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+    expect(await ctx.git.showAtRef(dir, 'HEAD', 'notes.txt')).toBe('notes\n');
+  });
+
+  it('(k2) core.ignorecase=false: showAtRef("notes.txt") fails against tracked "Notes.txt"', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'false']);
+    await expect(ctx.git.showAtRef(dir, 'HEAD', 'notes.txt')).rejects.toThrow(/does not exist/);
+  });
+
+  it('(k) core.ignorecase=false: readAtRef("notes.txt") stays null against tracked "Notes.txt"', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'false']);
+
+    const text = await ctx.git.readAtRef(dir, 'HEAD', 'notes.txt');
+    expect(text).toBeNull();
+  });
+
+  // A case-insensitive host filesystem cannot hold both `Notes.txt` and `notes.txt` on disk at
+  // once, so this setup (which needs both committed) only runs on Linux.
+  describe.skipIf(process.platform !== 'linux')(
+    'both spellings tracked (Linux only, needs a case-sensitive host filesystem)',
+    () => {
+      it('(l) core.ignorecase=true, both "Notes.txt" and "notes.txt" tracked: exact spelling wins', async () => {
+        const { ctx, dir } = await setup({
+          'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+        });
+        // Alphabetically, "Notes.txt" (ASCII 'N' = 0x4E) sorts before "notes.txt" ('n' = 0x6E), so
+        // a naive `new Map([...].map(name => [name.toLowerCase(), name]))` over `ls-tree`'s sorted
+        // output always keeps the *lowercase* entry — the uppercase one is silently overwritten
+        // regardless of which one the caller actually asked for. Ask for "Notes.txt" (the exact,
+        // already-lowercase-losing spelling) to catch that, rather than "notes.txt" which the bug
+        // happens to resolve correctly by the same accident of sort order.
+        // Three spellings, not two: `ls-tree` sorts by byte, so with only `Notes.txt` and
+        // `notes.txt` a first-wins fold map answers `Notes.txt` by accident of sort order. With
+        // `NOTES.txt` sorting first, only an exact-first lookup lands on `Notes.txt`.
+        await commitTracked(dir, 'NOTES.txt', 'shout\n');
+        await commitTracked(dir, 'Notes.txt', 'upper\n');
+        await commitTracked(dir, 'notes.txt', 'lower\n');
+        await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+        const text = await ctx.git.readAtRef(dir, 'HEAD', 'Notes.txt');
+        expect(text).toBe('upper\n');
+        expect(await ctx.git.showAtRef(dir, 'HEAD', 'Notes.txt')).toBe('upper\n');
+
+        const res = await ctx.git.commitContents(dir, {
+          message: 'edit exact spelling',
+          files: [{ path: 'Notes.txt', content: 'upper-changed\n' }],
+        });
+        expect(res.committed).toBe(true);
+        const git = simpleGit(dir);
+        expect(await git.show(['HEAD:Notes.txt'])).toBe('upper-changed\n');
+        expect(await git.show(['HEAD:notes.txt'])).toBe('lower\n');
+        expect(await git.show(['HEAD:NOTES.txt'])).toBe('shout\n');
+      });
+    },
+  );
+
+  it('(m) core.ignorecase=true: commitContents does not over-fold a non-ASCII case pair (Kelvin sign)', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await commitTracked(dir, 'k.tex', 'lower k\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    // U+212A KELVIN SIGN, which JS's `toLowerCase()` folds to ASCII 'k' but git's ASCII-only
+    // `core.ignorecase` folding never would.
+    const kelvinPath = '\u212A.tex';
+    const res = await ctx.git.commitContents(dir, {
+      message: 'new file with a look-alike name',
+      files: [{ path: kelvinPath, content: 'kelvin\n' }],
+    });
+    expect(res.committed).toBe(true);
+
+    const git = simpleGit(dir);
+    const tree = (await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']))
+      .split('\0')
+      .filter(Boolean);
+    expect(tree).toContain(kelvinPath);
+    expect(tree).toContain('k.tex');
+    expect(await git.show(['HEAD:k.tex'])).toBe('lower k\n');
+  });
+
+  it('(n) core.ignorecase=true: ignoredPaths with tracked "index" folds too', async () => {
+    const { ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+      '.gitignore': '*.txt\n',
+    });
+    await commitTracked(dir, 'Notes.txt', 'notes\n');
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+
+    const result = await ctx.git.ignoredPaths(dir, ['notes.txt'], { tracked: 'index' });
+    expect(result).toEqual([]);
+
+    await simpleGit(dir).raw(['rm', '--cached', '--', 'Notes.txt']);
+    const afterRm = await ctx.git.ignoredPaths(dir, ['notes.txt'], { tracked: 'index' });
+    expect(afterRm).toEqual(['notes.txt']);
   });
 });

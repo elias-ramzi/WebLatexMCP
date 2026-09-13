@@ -47,6 +47,12 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
       .revparse(['HEAD'])
       .then((s) => s.trim());
 
+  /** The bare remote's own `<branch>` tip via `ls-remote` — never a clone's remote-tracking ref. */
+  async function remoteTip(fromClone: string, url: string, branch: string): Promise<string> {
+    const out = await simpleGit(fromClone).listRemote([url, `refs/heads/${branch}`]);
+    return out.trim().split(/\s+/)[0] ?? '';
+  }
+
   async function noRebaseInProgress(dir: string): Promise<boolean> {
     for (const d of ['rebase-merge', 'rebase-apply']) {
       try {
@@ -85,6 +91,7 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
       await gitB.add(['notes.tex']);
       await gitB.commit('retarget notes.tex to an outside symlink');
       await gitB.push('origin', remote.branch);
+      const pushedByB = (await gitB.revparse(['HEAD'])).trim();
 
       // Our clone A: change notes.tex as a regular file, commit.
       await files.applyEdits(dir, 'notes.tex', [{ oldString: 'alpha', newString: 'alpha-local' }]);
@@ -110,9 +117,8 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
       expect(await headSha(dir)).toBe(before);
       expect(await noRebaseInProgress(dir)).toBe(true);
       expect((await git.status(dir)).clean).toBe(true);
-      const remoteHeadAfter = await simpleGit(cloneB).revparse(['origin/master']);
-      const oursRemoteHead = await gitB.revparse(['origin/master']);
-      expect(remoteHeadAfter.trim()).toBe(oursRemoteHead.trim());
+      // Ask the bare remote itself (not a clone's stale remote-tracking ref) what it holds.
+      expect(await remoteTip(cloneB, remote.url, remote.branch)).toBe(pushedByB);
     });
 
     it('refuses when OUR side has the symlink, in-project target', async () => {
@@ -296,4 +302,82 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
   // A plain regular-file conflict resolving and pushing through `resolvePush` is already covered
   // by "applies merged content, continues the rebase, and pushes" in test/integration/safePush.test.ts —
   // not duplicated here.
+
+  describe.skipIf(process.platform === 'win32')(
+    'a directory replaced by a symlink upstream (posix only)',
+    () => {
+      // NOTE: this is a characterisation test, not regression coverage for `linkedAncestor`. When
+      // upstream turns a tracked directory into a symlink, git's rebase moves the *symlink* side
+      // aside to a synthetic `sub~HEAD` unmerged path and leaves `sub` itself as a real directory
+      // in the working tree (verified empirically: `git diff --name-only --diff-filter=U` reports
+      // exactly `sub/x.tex` and `sub~HEAD`, and `sub` on disk is a plain directory). So
+      // `sub/x.tex`'s ancestor `sub` is never actually a symlink at resolution time — this layout
+      // is already refused by the existing stage-2/3 check (`hasSymlinkMode`) on the synthetic
+      // `sub~HEAD` path, which is itself a symlink. It passes identically before and after this
+      // change; `test/unit/linkedAncestor.test.ts` is what actually exercises `linkedAncestor`.
+      it('refuses via the existing stage-2/3 link check on the synthetic sub~HEAD path', async () => {
+        const { remote, git, dir } = await setup({
+          'main.tex': 'root\n',
+          'sub/x.tex': 'alpha\n',
+        });
+
+        // Outside dir the retargeted symlink will point at — outside both clones entirely.
+        const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-outside-'));
+        cleanups.push(() => rm(outsideDir, { recursive: true, force: true }));
+        await writeFile(path.join(outsideDir, 'secret.txt'), 'SECRET', 'utf8');
+
+        // Clone B (remote side): replace the tracked directory `sub` with a symlink to `outside`.
+        const cloneB = await mkdtemp(path.join(os.tmpdir(), 'ovl-rpl-b-'));
+        cleanups.push(() => rm(cloneB, { recursive: true, force: true }));
+        const gitB = simpleGit(cloneB);
+        await gitB.clone(remote.url, cloneB);
+        await gitB.addConfig('user.email', 'other@example.com');
+        await gitB.addConfig('user.name', 'Other');
+        await gitB.addConfig('core.autocrlf', 'false');
+        await rm(path.join(cloneB, 'sub'), { recursive: true, force: true });
+        await symlink(outsideDir, path.join(cloneB, 'sub'));
+        await gitB.add(['-A']);
+        await gitB.commit('retarget sub to an outside symlink');
+        await gitB.push('origin', remote.branch);
+        const pushedByB = (await gitB.revparse(['HEAD'])).trim();
+
+        // Our clone A: edit sub/x.tex as a regular file, commit.
+        await writeFile(path.join(dir, 'sub', 'x.tex'), 'alpha-local\n', 'utf8');
+        await git.commit(dir, { message: 'local edit to sub/x.tex' });
+
+        const before = await headSha(dir);
+        const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+        expect(conflict.status).toBe('conflict');
+        // What the tool's normal conflict path actually reports for this layout.
+        // The synthetic name git gives the moved-aside link (`sub~HEAD` here) is the merge
+        // backend's label and has varied across git versions, so only its shape is asserted.
+        const paths = conflict.conflict?.conflictPaths ?? [];
+        expect(paths).toContain('sub/x.tex');
+        expect(paths.some((p) => p.startsWith('sub~'))).toBe(true);
+
+        await expect(
+          git.resolvePush(
+            dir,
+            remote.url,
+            { username: 'git' },
+            { resolutions: [{ path: 'sub/x.tex', content: 'merged content' }] },
+          ),
+        ).rejects.toThrow(/symbolic link/);
+
+        // Nothing was written through the symlink.
+        expect(await readFile(path.join(outsideDir, 'secret.txt'), 'utf8')).toBe('SECRET');
+        try {
+          await stat(path.join(outsideDir, 'x.tex'));
+          expect.fail('x.tex should not have been written into the outside directory');
+        } catch {
+          // ENOENT — good.
+        }
+        expect(await headSha(dir)).toBe(before);
+        expect(await noRebaseInProgress(dir)).toBe(true);
+        expect((await git.status(dir)).clean).toBe(true);
+        // Ask the bare remote itself (not a clone's stale remote-tracking ref) what it holds.
+        expect(await remoteTip(cloneB, remote.url, remote.branch)).toBe(pushedByB);
+      });
+    },
+  );
 });
