@@ -6,6 +6,7 @@ import {
   type Attribution,
 } from '../../src/lib/peerAttribution.js';
 import type { PeerShadowEntry } from '../../src/services/shadowStore.js';
+import { foldCase } from '../../src/lib/caseFold.js';
 
 const entry = (path: string, touchedAt: string | null = null): PeerShadowEntry => ({
   path,
@@ -70,6 +71,34 @@ describe('attributePeers', () => {
     const beta = a.sessions.find((s) => s.sessionId === 'beta');
     expect(beta?.unreadable).toBe(true);
     expect(beta?.owns).toEqual(THEIRS);
+  });
+
+  describe('with a fold function (case-insensitive repository)', () => {
+    const PEER = [{ sessionId: 'p', heartbeatAt: '2026-01-01T00:00:10.000Z' }];
+
+    it('attributes a dirty path to a peer whose shadow lists it under a different case', () => {
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', [entry('Notes.txt')]]]);
+      const a = attributePeers(['notes.txt'], PEER, entries, foldCase);
+      const p = a.sessions.find((s) => s.sessionId === 'p');
+      expect(p?.owns).toEqual(['notes.txt']);
+      expect(a.unowned).toEqual([]);
+    });
+
+    it('without a fold, the same peer misses it and it falls into unowned', () => {
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', [entry('Notes.txt')]]]);
+      const a = attributePeers(['notes.txt'], PEER, entries);
+      const p = a.sessions.find((s) => s.sessionId === 'p');
+      expect(p?.owns).toEqual([]);
+      expect(a.unowned).toEqual(['notes.txt']);
+    });
+
+    it('an unreadable peer still claims every disputed path, fold or not', () => {
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', null]]);
+      const withFold = attributePeers(['notes.txt'], PEER, entries, foldCase);
+      const withoutFold = attributePeers(['notes.txt'], PEER, entries);
+      expect(withFold.sessions[0]?.owns).toEqual(['notes.txt']);
+      expect(withoutFold.sessions[0]?.owns).toEqual(['notes.txt']);
+    });
   });
 });
 

@@ -27,11 +27,20 @@ export interface Attribution {
  * the map entirely) is treated as owning every disputed path — the same fail-closed rule
  * `peerEntries` documents: `null` means unreadable, never "owns nothing". That peer therefore never
  * contributes to `unowned`, since it might own anything.
+ *
+ * `fold` is git's own ASCII case fold (`foldCase`, `src/lib/caseFold.ts`) — pass it only when the
+ * caller has established the repository is case-insensitive (`GitService.isCaseInsensitive`);
+ * left unset, membership stays byte-exact. It is needed here because `theirs` arrives spelled the
+ * way git reports the dirty path (the index's own spelling), while a peer's shadow key is
+ * whatever spelling the caller who wrote it used — on a case-insensitive clone the two can name
+ * the same file differently, and an unfolded comparison would miss the owner and misreport the
+ * path as `unowned`. `owns` keeps `theirs`'s own elements (git's spelling), never the peer's.
  */
 export function attributePeers(
   theirs: string[],
   peers: Array<{ sessionId: string; heartbeatAt: string }>,
   entries: Map<string, PeerShadowEntry[] | null>,
+  fold: (p: string) => string = (p) => p,
 ): Attribution {
   const claimed = new Set<string>();
 
@@ -48,8 +57,8 @@ export function attributePeers(
       };
     }
 
-    const paths = new Set(peerEntries.map((e) => e.path));
-    const owns = theirs.filter((t) => paths.has(t));
+    const paths = new Set(peerEntries.map((e) => fold(e.path)));
+    const owns = theirs.filter((t) => paths.has(fold(t)));
     for (const o of owns) claimed.add(o);
     return {
       sessionId: p.sessionId,

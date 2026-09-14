@@ -212,7 +212,9 @@ peer session exists and the tree holds work that is not this session's — the
 alternative would be sweeping their in-flight paragraph into the push or rewriting
 the tree underneath them.
 
-The refusal says what is known: per live session, the files its shadow owns, how long
+On a `core.ignorecase` clone (git's default on macOS and Windows) ownership is judged with git's
+own ASCII case fold, so a peer's `notes.txt` and git's `Notes.txt` are one file; elsewhere the
+comparison is byte-exact. The refusal says what is known: per live session, the files its shadow owns, how long
 ago it last wrote through the server, and how long ago it was last seen; and, apart,
 the files no live session owns (edited outside the server, or left by a session that
 has since exited). That is what separates "wait" from "take over": a write seconds old

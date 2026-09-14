@@ -6,6 +6,7 @@ import {
   type OwnedPath,
 } from '../../src/lib/commitPaths.js';
 import type { PeerShadowEntry } from '../../src/services/shadowStore.js';
+import { foldCase } from '../../src/lib/caseFold.js';
 
 const entry = (path: string): PeerShadowEntry => ({
   path,
@@ -34,6 +35,29 @@ describe('coversPath', () => {
   it('"." and "" cover nothing', () => {
     expect(coversPath('.', 'a.tex')).toBe(false);
     expect(coversPath('', 'a.tex')).toBe(false);
+  });
+
+  describe('with a fold function (case-insensitive repository)', () => {
+    it('is byte-exact by default — no fold means a differently-cased name is NOT covered', () => {
+      expect(coversPath('notes.txt', 'Notes.txt')).toBe(false);
+    });
+
+    it('covers a differently-cased exact match when folded', () => {
+      expect(coversPath('notes.txt', 'Notes.txt', foldCase)).toBe(true);
+    });
+
+    it('covers a differently-cased directory entry when folded', () => {
+      expect(coversPath('sub', 'Sub/x.tex', foldCase)).toBe(true);
+    });
+
+    it('still refuses a differently-named directory sharing a prefix, even folded', () => {
+      expect(coversPath('sub', 'Subx/x.tex', foldCase)).toBe(false);
+    });
+
+    it('never folds a Kelvin sign onto ASCII k — git itself would not', () => {
+      // U+212A KELVIN SIGN is outside foldCase's deliberately ASCII-only A-Z range.
+      expect(coversPath('aK.tex', 'ak.tex', foldCase)).toBe(false);
+    });
   });
 });
 
@@ -98,5 +122,28 @@ describe('peerOwnership', () => {
     const { owned, unreadable } = peerOwnership(['sections/method.tex'], peers, entries);
     expect(unreadable).toEqual(['beta']);
     expect(owned.some((o) => o.sessionId === 'beta')).toBe(false);
+  });
+
+  describe('with a fold function (case-insensitive repository)', () => {
+    it("finds a peer entry whose spelling differs only in case, and reports the peer's own spelling", () => {
+      const peers = [{ sessionId: 'p' }];
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', [entry('Notes.txt')]]]);
+      const { owned } = peerOwnership(['notes.txt'], peers, entries, foldCase);
+      expect(owned).toEqual<OwnedPath[]>([{ path: 'Notes.txt', sessionId: 'p' }]);
+    });
+
+    it('without a fold, a differently-cased peer entry is not found', () => {
+      const peers = [{ sessionId: 'p' }];
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', [entry('Notes.txt')]]]);
+      const { owned } = peerOwnership(['notes.txt'], peers, entries);
+      expect(owned).toEqual([]);
+    });
+
+    it('a peer mapped to null is unreadable whether or not a fold is passed', () => {
+      const peers = [{ sessionId: 'p' }];
+      const entries = new Map<string, PeerShadowEntry[] | null>([['p', null]]);
+      expect(peerOwnership(['notes.txt'], peers, entries, foldCase).unreadable).toEqual(['p']);
+      expect(peerOwnership(['notes.txt'], peers, entries).unreadable).toEqual(['p']);
+    });
   });
 });

@@ -21,6 +21,16 @@ import type { ServerConfig } from '../../src/types.js';
  * needed instead.
  */
 const writeFileMockState = vi.hoisted(() => ({ failPath: null as string | null }));
+/**
+ * T8 (issue #66): a conflicted path lying beneath a working-tree symlink (`linkedAncestor` in
+ * gitService.ts) is a branch `resolvePush` refuses on, but git itself never actually produces the
+ * layout through an ordinary conflict (a side that turns a directory into a link gets the file
+ * moved aside as its own unmerged 120000 entry, which the sibling stage check already refuses) —
+ * so the branch that composes the "lies under … a symbolic link" message had no reaching test.
+ * Arming `lstatMockState.linkPath` makes exactly one `lstat` call, for exactly that path, report a
+ * symlink once, then disarms — the same shape as `writeFileMockState` above.
+ */
+const lstatMockState = vi.hoisted(() => ({ linkPath: null as string | null }));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -39,6 +49,16 @@ vi.mock('node:fs/promises', async (importOriginal) => {
         throw err;
       }
       return actual.writeFile(filePath, data, options);
+    },
+    lstat: async (filePath: Parameters<typeof actual.lstat>[0]) => {
+      if (lstatMockState.linkPath !== null && filePath === lstatMockState.linkPath) {
+        lstatMockState.linkPath = null;
+        return {
+          isSymbolicLink: () => true,
+          isDirectory: () => false,
+        } as unknown as Awaited<ReturnType<typeof actual.lstat>>;
+      }
+      return actual.lstat(filePath);
     },
   };
 });
@@ -460,6 +480,147 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
 
       // The clone is back to exactly where it was: no rebase in progress, clean status, same
       // HEAD, and the bare remote's tip untouched (nothing pushed).
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await headSha(dir)).toBe(before);
+      expect(await remoteTip(dir, remote.url, remote.branch)).toBe(remoteBefore);
+    });
+  });
+
+  // Issue #66 (T5): the loop-priming rebase step, `let step = await this.runRebaseStep(...)`
+  // before the `for (...!step.ok...)` loop in `resolvePush`, sits OUTSIDE the loop body's own
+  // catch-everything try/catch (the one the "throw mid-loop" describe above exercises). If
+  // `runRebaseStep`'s own catch throws while trying to answer "is this a conflict?" (its
+  // `unmergedPaths` call spawns `git diff`, which can itself fail — e.g. EAGAIN under process
+  // pressure), nothing aborted the paused rebase and the error propagated with the clone left
+  // mid-rebase, contradicting the same guarantee the mid-loop describe protects for every step
+  // after the first.
+  describe('a throw from the priming rebase step (before the loop) still aborts the rebase', () => {
+    it('unmergedPaths failing on the very first pull --rebase leaves the clone exactly as it was', async () => {
+      const { remote, git, dir } = await setup({ 'notes.tex': 'alpha\n' });
+
+      await writeFile(path.join(dir, 'notes.tex'), 'alpha-local\n', 'utf8');
+      await git.commit(dir, { message: 'local edit to notes.tex' });
+      await pushCommit(remote, { 'notes.tex': 'alpha-remote\n' }, 'remote edit to notes.tex');
+
+      const before = await headSha(dir);
+      const remoteBefore = await remoteTip(dir, remote.url, remote.branch);
+      // `safePush` runs its own rebase attempt, hits the same conflict, and aborts back to this
+      // pre-push state — leaving `resolvePush`'s own fetch + priming `pull --rebase` (the call
+      // under test) to hit that same conflict fresh a moment later.
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toEqual(['notes.tex']);
+
+      const spy = vi
+        .spyOn(
+          GitService.prototype as unknown as {
+            unmergedPaths: (...a: unknown[]) => Promise<string[]>;
+          },
+          'unmergedPaths',
+        )
+        .mockRejectedValueOnce(new Error('EAGAIN: spawn failed'));
+      try {
+        await expect(
+          git.resolvePush(
+            dir,
+            remote.url,
+            { username: 'git' },
+            { resolutions: [{ path: 'notes.tex', content: 'merged\n' }] },
+          ),
+        ).rejects.toThrow(/EAGAIN/);
+      } finally {
+        spy.mockRestore();
+      }
+
+      // Pre-fix: this is false — the priming call's own catch propagated the EAGAIN failure
+      // without ever calling `abortRebaseIfInProgress`, leaving `pull --rebase`'s conflict paused
+      // (conflict markers on disk, rebase-merge state directory present).
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await headSha(dir)).toBe(before);
+      expect(await remoteTip(dir, remote.url, remote.branch)).toBe(remoteBefore);
+    });
+  });
+
+  // The same class in `safePush`'s own rebase attempt (`tryRebase`): its catch lists the unmerged
+  // paths and builds the conflict report BEFORE `rebase --abort`, so a throw from either left the
+  // clone mid-rebase.
+  describe("a throw inside safePush's own rebase attempt still aborts the rebase", () => {
+    it('unmergedPaths failing during the push rebase leaves the clone exactly as it was', async () => {
+      const { remote, git, dir } = await setup({ 'notes.tex': 'alpha\n' });
+
+      await writeFile(path.join(dir, 'notes.tex'), 'alpha-local\n', 'utf8');
+      await git.commit(dir, { message: 'local edit to notes.tex' });
+      await pushCommit(remote, { 'notes.tex': 'alpha-remote\n' }, 'remote edit to notes.tex');
+
+      const before = await headSha(dir);
+      const remoteBefore = await remoteTip(dir, remote.url, remote.branch);
+
+      const spy = vi
+        .spyOn(
+          GitService.prototype as unknown as {
+            unmergedPaths: (...a: unknown[]) => Promise<string[]>;
+          },
+          'unmergedPaths',
+        )
+        .mockRejectedValueOnce(new Error('EAGAIN: spawn failed'));
+      try {
+        await expect(git.safePush(dir, remote.url, { username: 'git' })).rejects.toThrow(/EAGAIN/);
+      } finally {
+        spy.mockRestore();
+      }
+
+      // Pre-fix: false — `tryRebase`'s catch propagated the failure with the rebase still paused.
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await headSha(dir)).toBe(before);
+      expect(await remoteTip(dir, remote.url, remote.branch)).toBe(remoteBefore);
+    });
+  });
+
+  // Issue #66 (T8): see the `lstatMockState` doc comment at the top of this file. This exercises
+  // the `linkedAncestor` refusal branch of `resolvePush` that, per the PR that added it, has no
+  // way to be reached through git alone.
+  describe('a conflicted path lying under a symlinked ancestor directory (mocked lstat)', () => {
+    afterEach(() => {
+      // Backstop, mirroring `writeFileMockState`'s: an armed failure must never leak into another
+      // test even if this one fails before it fires.
+      lstatMockState.linkPath = null;
+    });
+
+    it("refuses via linkedAncestor when the conflicted path's ancestor directory is (mocked as) a symlink", async () => {
+      const { remote, git, files, dir } = await setup({ 'sub/notes.tex': 'alpha\n' });
+      await files.applyEdits(dir, 'sub/notes.tex', [
+        { oldString: 'alpha', newString: 'alpha-local' },
+      ]);
+      await git.commit(dir, { message: 'local edit to sub/notes.tex' });
+      await pushCommit(
+        remote,
+        { 'sub/notes.tex': 'alpha-remote\n' },
+        'remote edit to sub/notes.tex',
+      );
+
+      const before = await headSha(dir);
+      const remoteBefore = await remoteTip(dir, remote.url, remote.branch);
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toEqual(['sub/notes.tex']);
+
+      // Without arming the mock, this resolution would simply succeed (there is no actual
+      // symlink anywhere in this layout) — proving the message is unreachable through git alone,
+      // and that the mock is what makes the branch fire. This is characterisation of a
+      // previously-untested branch, not a regression fix for prior behaviour.
+      lstatMockState.linkPath = path.join(dir, 'sub');
+      await expect(
+        git.resolvePush(
+          dir,
+          remote.url,
+          { username: 'git' },
+          { resolutions: [{ path: 'sub/notes.tex', content: 'merged\n' }] },
+        ),
+      ).rejects.toThrow(/"sub\/notes\.tex" lies under "sub", a symbolic link/);
+
       expect(await noRebaseInProgress(dir)).toBe(true);
       expect((await git.status(dir)).clean).toBe(true);
       expect(await headSha(dir)).toBe(before);

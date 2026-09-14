@@ -155,11 +155,23 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `commitContents`, which stages under
   HEAD's spelling because `update-index --cacheinfo` does no case-alias lookup. A `Notes.txt`
   edited as `notes.txt` on macOS was otherwise reported ignored, seeded a null shadow base, and
-  committed as a second tree entry. **One by-name lookup does not fold yet**: the `scope: "paths"`
-  peer-ownership check (`coversPath`/`peerOwnership` in `src/lib/commitPaths.ts`) compares shadow
-  index keys byte-for-byte, so on an ignorecase clone a live peer's `Notes.txt` entry does not
-  protect a request naming `notes.txt`, and `git add` then stages the one on-disk file — the peer's
-  lines included. Known gap, tracked as its own issue; do not describe the fold as total. The flag is never cleared on an edit, and
+  committed as a second tree entry. The tool layer's own by-name comparisons fold
+  the same way: `coversPath`/`peerOwnership`/`attributePeers`/`ShadowStore.settle` take an
+  optional `fold`, and `commit` (every scope: the ownership check, the rescue, the session-scope
+  `paths` filter, the settle), `push` (attribution, and the split of dirty paths into mine/theirs)
+  and `status` (its session/other split) pass `foldCase` (`src/lib/caseFold.ts`, the one home of git's ASCII-only fold and the exact-first
+  `canonicalNames` lookup) exactly when `GitService.isCaseInsensitive(dir)` says so — otherwise
+  they stay byte-exact, which is what a `--literal-pathspecs` call downstream does too. Before this,
+  a live peer's `Notes.txt` entry did not protect a request naming `notes.txt`, and `git add` staged
+  the peer's lines. Keep the lib functions pure: the fold is a parameter, the decision is the
+  caller's, and the source of truth is one method — `core.ignorecase` in the clone's config, never
+  the filesystem: a repository copied onto a case-insensitive disk without that setting keeps every
+  comparison byte-exact, as git itself would. `canonicalNames.resolve` also folds the longest
+  tracked _directory_ prefix (`sub/new.tex` → `Sub/new.tex` while HEAD tracks `Sub/`), exact-first
+  at every depth, so a new file never opens a second, case-differing directory in the tree; and
+  `commitContents` refuses, before any index write, a session whose entries spell one file two ways
+  — the second `update-index --cacheinfo` would otherwise win silently. `GitService.commit` with
+  `paths` resolves each one to the index's spelling too, since a literal pathspec never folds. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
   deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
   its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call
@@ -387,7 +399,9 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   file moved aside as an unmerged 120000 entry the stage check already refuses), but a link placed by
   hand while the rebase is paused would have `writeFile` follow it. Every exception raised inside the
   paused rebase — not only the deliberate refusals — aborts it before propagating, so a failed spawn
-  never leaves the clone mid-rebase. `unmergedPaths` passes `-c core.quotePath=false` like every other
+  never leaves the clone mid-rebase — including the priming `pull --rebase` (`runRebaseStep`) and
+  `push`'s own attempt (`tryRebase`): both abort first when listing the unmerged paths fails, and
+  `tryRebase` also when building the conflict report fails. `unmergedPaths` passes `-c core.quotePath=false` like every other
   path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never be
   resolved by name.
 - **A pathspec handed to git is literal, never a glob.** Every `git add`, `ls-files`, `ls-tree`,
@@ -398,8 +412,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   compared literal names. A new git call site that takes a path must carry the flag too. Callers see
   the same rule in the `paths` description: matched literally, no globs — so a `sections/*.tex` is
   never expanded: `scope: "paths"` refuses it in server words ("not changed in the working tree"),
-  `scope: "all"` with `paths` surfaces git's own "did not match any files" (pre-existing; no dirty
-  check runs on that route).
+  every route refuses a path that is neither on disk nor tracked in server words before `git add`
+  sees it. `discard` with `paths` checks out only the tracked subset (resolved to the index's
+  spelling on an ignorecase clone, or a case-spelled request would silently discard nothing) and
+  runs `clean -f` over every requested path, so an untracked name is removed rather than tripping
+  `checkout`; and it settles only the named paths in every session's records (`ShadowStore.settleAll`)
+  — `clearAll` is for the whole-tree discard alone, since dropping a peer's unrelated record is what
+  lets a later `scope: "paths"` take its lines.
 - **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
   range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
   rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,

@@ -11,6 +11,7 @@ import {
   type HeadShaReader,
 } from '../../src/services/shadowStore.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
+import { foldCase } from '../../src/lib/caseFold.js';
 
 /** Assert the store tracks exactly one change, and return it. */
 function only(changes: ShadowChange[]): ShadowChange {
@@ -283,6 +284,14 @@ describe('ShadowStore', () => {
       expect(remaining.map((c) => c.path)).toEqual(['notes.tex']);
     });
 
+    it('strips a leading "./" the way the tool layer does, so "./a.tex" settles "a.tex"', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      const dropped = await store.settle(PROJECT, ['./a.tex']);
+      expect(dropped).toEqual(['a.tex']);
+      expect(await store.changes(PROJECT)).toEqual([]);
+    });
+
     it('drops every entry under a covering directory', async () => {
       const store = makeStore('a');
       await store.record(PROJECT, DIR, 'figures/a.tex', null, 'a\n');
@@ -330,6 +339,35 @@ describe('ShadowStore', () => {
       await expect(readFile(shadowPath)).rejects.toThrow();
       await expect(readFile(basePath)).rejects.toThrow();
     });
+
+    describe('case fold (issue #66)', () => {
+      it('drops a differently-cased entry when a fold is passed, and returns its own spelling', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Notes.txt', null, 'fresh\n');
+
+        const dropped = await store.settle(PROJECT, ['notes.txt'], foldCase);
+        expect(dropped).toEqual(['Notes.txt']);
+        expect(await store.changes(PROJECT)).toEqual([]);
+      });
+
+      it('just outside: without a fold, a differently-cased request drops nothing', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Notes.txt', null, 'fresh\n');
+
+        const dropped = await store.settle(PROJECT, ['notes.txt']);
+        expect(dropped).toEqual([]);
+        expect(only(await store.changes(PROJECT)).path).toBe('Notes.txt');
+      });
+
+      it('a directory request drops a differently-cased entry underneath it, with a fold', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Sub/x.tex', null, 'x\n');
+
+        const dropped = await store.settle(PROJECT, ['sub'], foldCase);
+        expect(dropped).toEqual(['Sub/x.tex']);
+        expect(await store.changes(PROJECT)).toEqual([]);
+      });
+    });
   });
 
   it('clearAll drops every session, not just this one', async () => {
@@ -341,6 +379,48 @@ describe('ShadowStore', () => {
     await a.clearAll(PROJECT);
     expect(await a.hasChanges(PROJECT)).toBe(false);
     expect(await b.hasChanges(PROJECT)).toBe(false);
+  });
+
+  describe('settleAll (issue #66)', () => {
+    it('settles only the named path, in every session, leaving unrelated entries in every session intact', async () => {
+      const one = makeStore('one');
+      const two = makeStore('two');
+      await one.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      await two.record(PROJECT, DIR, 'b.tex', null, 'b\n');
+      await two.record(PROJECT, DIR, 'sub/c.tex', null, 'c\n');
+
+      // Callable from either store — settleAll does not depend on the calling store's own
+      // sessionId, only on the workspace/project it was constructed with.
+      const dropped = await one.settleAll(PROJECT, ['b.tex']);
+      expect(dropped).toEqual(['b.tex']);
+
+      expect((await one.peerEntries(PROJECT, 'one'))?.map((e) => e.path)).toEqual(['a.tex']);
+      expect((await one.peerEntries(PROJECT, 'two'))?.map((e) => e.path).sort()).toEqual([
+        'sub/c.tex',
+      ]);
+    });
+
+    it('drops a differently-cased entry only when a fold is passed', async () => {
+      const one = makeStore('one');
+      const two = makeStore('two');
+      await one.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      await two.record(PROJECT, DIR, 'b.tex', null, 'b\n');
+
+      const droppedNoFold = await one.settleAll(PROJECT, ['B.TEX']);
+      expect(droppedNoFold).toEqual([]);
+      expect((await one.peerEntries(PROJECT, 'two'))?.map((e) => e.path)).toEqual(['b.tex']);
+
+      const droppedFolded = await one.settleAll(PROJECT, ['B.TEX'], foldCase);
+      expect(droppedFolded).toEqual(['b.tex']);
+      expect(await one.peerEntries(PROJECT, 'two')).toEqual([]);
+      // Untouched throughout.
+      expect((await one.peerEntries(PROJECT, 'one'))?.map((e) => e.path)).toEqual(['a.tex']);
+    });
+
+    it('returns [] and touches nothing when there is no session state at all yet', async () => {
+      const store = makeStore('a');
+      await expect(store.settleAll(PROJECT, ['anything'])).resolves.toEqual([]);
+    });
   });
 
   it('stamps touchedAt from the injected clock on every record, updating on later edits', async () => {

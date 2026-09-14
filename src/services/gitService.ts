@@ -6,52 +6,10 @@ import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js'
 import { isBibFile } from '../lib/bib.js';
 import { resolveInside, toPosix } from '../lib/paths.js';
 import { execCapture, execCaptureBytes } from '../lib/exec.js';
+import { canonicalNames, foldCase } from '../lib/caseFold.js';
+import { coversPath } from '../lib/commitPaths.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
-
-/**
- * ASCII-only case fold — lowercases only `A-Z`, nothing else. This is what git's own
- * `core.ignorecase` folding does (and only that): a full-Unicode `toLowerCase()` would also fold
- * e.g. U+212A KELVIN SIGN to ASCII `k`, over-matching a pair git itself treats as different names.
- * Shared by every case-insensitive lookup in this file so they all agree with git and never
- * over-match.
- */
-function foldCase(name: string): string {
-  return name.replace(/[A-Z]/g, (c) => c.toLowerCase());
-}
-
-/**
- * An exact-first, ASCII-fold-otherwise lookup over one tree/index listing (e.g.
- * `ls-tree -r -z --name-only <ref>` or `ls-files -z`). `resolve(rel)` returns the listing's own
- * spelling for `rel`: `rel` itself when the listing holds it verbatim — which is also the answer
- * on a case-sensitive repository, or for a path the listing doesn't track at all — otherwise the
- * first entry (in listing order) whose ASCII fold equals `rel`'s fold, otherwise `rel` unchanged.
- * `has(rel)` is the tracked/not-tracked question alone, without resolving.
- *
- * Exact-first matters when a tree legitimately holds both `Notes.txt` and `notes.txt` (e.g. a
- * case-sensitive contributor added both): a caller naming one of them exactly must land on that
- * one, never on whichever entry happened to sort last.
- */
-function canonicalNames(names: string[]): {
-  resolve(rel: string): string;
-  has(rel: string): boolean;
-} {
-  const exact = new Set(names);
-  const folded = new Map<string, string>();
-  for (const name of names) {
-    const key = foldCase(name);
-    if (!folded.has(key)) folded.set(key, name);
-  }
-  return {
-    resolve(rel: string): string {
-      if (exact.has(rel)) return rel;
-      return folded.get(foldCase(rel)) ?? rel;
-    },
-    has(rel: string): boolean {
-      return exact.has(rel) || folded.has(foldCase(rel));
-    },
-  };
-}
 
 export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged';
 
@@ -385,9 +343,55 @@ export class GitService {
       await this.resetIndexToHead(dir, git);
     }
     if (opts.paths && opts.paths.length > 0) {
+      // A literal pathspec never folds case (verified against real git), so on a
+      // case-insensitive repository (`core.ignorecase = true`, git's own default on macOS/Windows
+      // clones) a caller who names a tracked file in another case than HEAD/the index — the same
+      // file on that filesystem — got git's raw "did not match any files" rather than staging it
+      // (e.g. deleting the on-disk `Notes.txt` and committing `paths: ["notes.txt"]`). List the
+      // index once (after the reset above when `fromHead`, so it reflects HEAD; the live index
+      // otherwise, which is what the `git add` below stages over) and resolve every requested path
+      // onto its own tracked spelling first. A path the index does not track keeps the caller's
+      // spelling unchanged, so it still fails exactly as before. On a case-sensitive repository
+      // this costs nothing extra: no listing, paths used byte-exact.
+      let paths = opts.paths;
+      if (await this.isCaseInsensitive(dir)) {
+        const indexNames = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean);
+        const canonical = canonicalNames(indexNames);
+        paths = opts.paths.map((p) => canonical.resolve(toPosix(p)));
+      }
+      // A path that matches nothing at all — not tracked, not on disk — is a caller mistake (a
+      // typo, or a path from a different project), not something `git add` should be asked to
+      // resolve: unfiltered, it exits 128 with git's raw `fatal: pathspec '…' did not match any
+      // files`. Checked against the post-fold spellings above, since those are what gets staged.
+      // "Tracked" is judged the way `coversPath` judges a `scope: "paths"` request covering a
+      // shadow entry: a literal, `--literal-pathspecs` `ls-files` listing of exactly these paths,
+      // where naming a directory matches every file beneath it. "On disk" is a plain `lstat` —
+      // a file, a directory, even a dangling symlink all count as "something is there", so only
+      // `lstat` itself failing means nothing is. A path matching only one of the two still commits
+      // as before (e.g. a tracked file removed on disk stages its deletion); this only refuses when
+      // BOTH say no.
+      const indexed = (await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...paths]))
+        .split('\0')
+        .filter(Boolean);
+      const unmatched: string[] = [];
+      for (const p of paths) {
+        if (indexed.some((name) => coversPath(p, name))) continue;
+        const onDisk = await lstat(path.join(dir, p)).then(
+          () => true,
+          () => false,
+        );
+        if (!onDisk) unmatched.push(p);
+      }
+      if (unmatched.length > 0) {
+        throw new Error(
+          `Nothing at: ${unmatched.join(', ')} — not in the working tree and not tracked. Paths ` +
+            'are matched literally: no globs, exact spelling (case-folded only on a ' +
+            'core.ignorecase clone).',
+        );
+      }
       // `--literal-pathspecs`: a pathspec is a glob by default, so naming `a[1].tex` would also
       // stage a peer's dirty `a1.tex` — past the ownership check, which compared literal names.
-      await git.raw(['--literal-pathspecs', 'add', '--', ...opts.paths]);
+      await git.raw(['--literal-pathspecs', 'add', '--', ...paths]);
     } else {
       await git.add(['-A']);
     }
@@ -454,14 +458,53 @@ export class GitService {
     // holds both `Notes.txt` and `notes.txt`, naming one exactly lands on that one, never on
     // whichever entry happened to sort last. On a case-sensitive repository this costs nothing
     // extra: `canonical` is `null` and every path is used as the caller spelled it.
+    const insensitive = await this.isCaseInsensitive(dir);
     const canonical =
-      (await this.isCaseInsensitive(dir)) && (await this.revParseOrNull(git, 'HEAD')) !== null
+      insensitive && (await this.revParseOrNull(git, 'HEAD')) !== null
         ? canonicalNames(
             (await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']))
               .split('\0')
               .filter(Boolean),
           )
         : null;
+
+    // Two spellings of one file (`Notes.txt` and `notes.txt`, two shadow entries) resolve to the
+    // same tree entry above — the second `update-index --cacheinfo` for it would silently
+    // overwrite the first with no error. Catch that before touching the index at all (not just
+    // before this path's own write), so a collision anywhere in `opts.files` never leaves an
+    // earlier file half-staged. Unreachable when `canonical` is null (case-sensitive repository):
+    // two distinct spellings there are two distinct tree entries, not a collision.
+    //
+    // Keyed on `foldCase(rel)`, not `rel` itself: when NEITHER spelling is tracked yet (both
+    // brand new — `New.tex` and `new.tex`, say), `canonical.resolve` has nothing to fold either
+    // one onto and returns each unchanged, so keying on `rel` directly left two distinct keys and
+    // let both stage as separate tree entries for what this filesystem treats as one file. Folding
+    // the key catches that pair too, tracked or not.
+    // Gated on the repository being case-insensitive, not on `canonical`: on an unborn HEAD
+    // (nothing tracked yet) there is no listing to resolve through, but two new spellings that
+    // fold together are still one file on that filesystem and must still be refused.
+    if (insensitive) {
+      const bySpelling = new Map<string, string>();
+      for (const file of opts.files) {
+        const posixPath = toPosix(file.path);
+        const rel = canonical ? canonical.resolve(posixPath) : posixPath;
+        const key = foldCase(rel);
+        const other = bySpelling.get(key);
+        if (other !== undefined && other !== posixPath) {
+          const message = canonical?.has(rel)
+            ? `"${other}" and "${posixPath}" are two spellings of one file ("${rel}") on this ` +
+              'case-insensitive repository, and this session changed both — committing both ' +
+              'would silently keep only one. Discard one of them, or commit the working tree ' +
+              'with scope "all".'
+            : `"${other}" and "${posixPath}" are two spellings of one new file on this ` +
+              'case-insensitive repository — neither is tracked yet, and committing both would ' +
+              'create two tree entries for what this filesystem treats as one file. Discard one ' +
+              'of them, or commit the working tree with scope "all".';
+          throw new Error(message);
+        }
+        bySpelling.set(key, posixPath);
+      }
+    }
 
     for (const file of opts.files) {
       const posixPath = toPosix(file.path);
@@ -587,10 +630,12 @@ export class GitService {
   /**
    * Whether the repository at `dir` has `core.ignorecase = true` set (git's own default on
    * clone/init on macOS and Windows). Shared by `trackedAtHead`, `commitContents`,
-   * `canonicalAtRef` and `ignoredPaths`'s `'index'` route. Cached per `dir` on this instance —
+   * `canonicalAtRef` and `ignoredPaths`'s `'index'` route — and public so the tool layer can
+   * apply the same fold (`src/lib/caseFold.ts`) to its own by-name comparisons (peer ownership,
+   * peer attribution), which must agree with git about which two spellings are one file. Cached per `dir` on this instance —
    * see {@link caseInsensitive}'s doc comment for what that does and does not track.
    */
-  private async isCaseInsensitive(dir: string): Promise<boolean> {
+  async isCaseInsensitive(dir: string): Promise<boolean> {
     let cached = this.caseInsensitive.get(dir);
     if (!cached) {
       cached = (async () => {
@@ -844,7 +889,41 @@ export class GitService {
     if (paths && paths.length > 0) {
       // `--literal-pathspecs`, as for every path-taking call in this file: a pathspec is a glob by
       // default, and this is the most destructive place for `a[1].tex` to also mean `a1.tex`.
-      await git.raw(['--literal-pathspecs', 'checkout', '--', ...paths]);
+      // `checkout --` errors "did not match any file(s) known to git" for a path git does not
+      // track at all — there is nothing at HEAD to check it back out to — so an untracked path
+      // (e.g. a scratch file the caller wants discarded alongside a tracked edit) used to fail the
+      // whole call before `clean` ever ran, discarding nothing. Restrict `checkout` to the subset
+      // the index actually tracks (`coversPath`'s directory rule, as in `commit` above: naming a
+      // directory tracked underneath still counts), and skip it entirely when that subset is
+      // empty. `clean -f` always runs over every requested path regardless — untracked is exactly
+      // what it exists to remove, and a path matching nothing there at all is already a silent
+      // no-op (exit 0), not an error.
+      // A literal pathspec never folds case (as in `commit` above), so on a case-insensitive
+      // repository (`core.ignorecase = true`) a caller naming a tracked file in another case than
+      // the index — the same file on that filesystem — matched nothing below, `checkout` was
+      // skipped, and `clean -f` cannot remove a tracked file: `discarded: true` came back with the
+      // edit still sitting on disk. Resolve every requested path onto the index's own spelling
+      // first, the same way `commit`'s `paths` branch does; a path the index does not track keeps
+      // the caller's spelling unchanged, so an untracked scratch file still falls through to
+      // `clean` exactly as before. On a case-sensitive repository this costs nothing extra.
+      const caseInsensitive = await this.isCaseInsensitive(dir);
+      let resolvedPaths = paths;
+      if (caseInsensitive) {
+        const indexNames = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean);
+        const canonical = canonicalNames(indexNames);
+        resolvedPaths = paths.map((p) => canonical.resolve(toPosix(p)));
+      }
+      const indexed = (
+        await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...resolvedPaths])
+      )
+        .split('\0')
+        .filter(Boolean);
+      const tracked = resolvedPaths.filter((p) =>
+        indexed.some((name) => coversPath(p, name, caseInsensitive ? foldCase : undefined)),
+      );
+      if (tracked.length > 0) {
+        await git.raw(['--literal-pathspecs', 'checkout', '--', ...tracked]);
+      }
       await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...paths]);
     } else {
       await git.checkout(['--', '.']);
@@ -1556,7 +1635,16 @@ export class GitService {
       await op();
       return { ok: true };
     } catch (err) {
-      const unmerged = await this.unmergedPaths(git);
+      // Everything in this catch runs while the rebase may be paused: listing the unmerged paths
+      // and building the report can themselves fail (a spawn error), and a throw from either
+      // must not leave the clone mid-rebase — abort first, then propagate.
+      let unmerged: string[];
+      try {
+        unmerged = await this.unmergedPaths(git);
+      } catch (listErr) {
+        await this.abortRebaseIfInProgress(git);
+        throw listErr;
+      }
       if (unmerged.length === 0) {
         // Not a conflict (e.g. a network/auth failure). Don't leave a rebase half-applied.
         await this.abortRebaseIfInProgress(git);
@@ -1564,7 +1652,13 @@ export class GitService {
       }
       // Mid-rebase the branch ref still points at our original tip, so the report is read from
       // refs (valid now); the working tree supplies the marker view before we abort.
-      const report = await this.buildConflictReport(git, dir, oursRef, remoteRef, unmerged);
+      let report: ConflictReport;
+      try {
+        report = await this.buildConflictReport(git, dir, oursRef, remoteRef, unmerged);
+      } catch (reportErr) {
+        await this.abortRebaseIfInProgress(git);
+        throw reportErr;
+      }
       await git.raw(['rebase', '--abort']);
       return { ok: false, report };
     }
@@ -1580,7 +1674,18 @@ export class GitService {
       await op();
       return { ok: true };
     } catch (err) {
-      const unmerged = await this.unmergedPaths(git);
+      // `unmergedPaths` itself can throw (a spawn failure) rather than answer "no conflict" — and
+      // this method is called once to prime the loop in `resolvePush`, from a call site outside
+      // that loop's own catch-everything try/catch. Left unguarded, a throw here propagated with
+      // the clone mid-rebase, contradicting the "clone is back to where it was" guarantee every
+      // other exit from a paused rebase honours.
+      let unmerged: string[];
+      try {
+        unmerged = await this.unmergedPaths(git);
+      } catch (unmergedErr) {
+        await this.abortRebaseIfInProgress(git);
+        throw unmergedErr;
+      }
       if (unmerged.length === 0) {
         await this.abortRebaseIfInProgress(git);
         throw untrackedOverwriteFromError(err) ?? err;

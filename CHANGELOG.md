@@ -375,6 +375,36 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **Every by-name comparison in `commit`, `push` and `status` that decides what is staged, owned,
+  settled or reported now folds case where git does — the peer-ownership check included**
+  (#67 "Known, not fixed"). `commit` scope `"paths"`'s peer-ownership check and `push`'s peer
+  attribution compared shadow index keys byte-for-byte, so on a `core.ignorecase` clone (git's
+  default on macOS/Windows) a live peer's `Notes.txt` entry did not protect a request naming
+  `notes.txt` — `git add` staged the peer's lines under this session's name — and a push refusal
+  attributed git's `Notes.txt` to nobody. `coversPath`/`peerOwnership`/`attributePeers` take an
+  optional fold; the tools pass git's own ASCII fold (`src/lib/caseFold.ts`, the one home of
+  `foldCase` and the exact-first `canonicalNames` lookup) exactly when `GitService.isCaseInsensitive`
+  says so, and stay byte-exact otherwise. On the same configuration: a case-spelled path through
+  `scope: "paths"`/`"all"` with `paths` (deleting a tracked `Notes.txt` and naming `notes.txt`) is
+  resolved to the index's spelling before `git add` instead of surfacing git's raw "did not match
+  any files"; a new file under a case-differing tracked directory (`sub/new.tex` while HEAD has
+  `Sub/`) stages under the tracked directory's spelling instead of creating a second, case-differing
+  directory in the tree; and a session that changed both spellings of one file is refused by name
+  before anything is staged, where the second spelling used to win silently. Each fold has its
+  `core.ignorecase=false` twin test proving the comparison stays byte-exact there.
+- **`resolvePush` aborts the rebase when the priming step itself fails; `commit` and `discard` never
+  surface git's "did not match" for a path that matches nothing** (#67 review deferrals). The
+  `pull --rebase` that opens a resolution ran outside the loop's try/catch, so a spawn failure while
+  listing the unmerged paths left the clone mid-rebase; it aborts first now. `commit` with `paths`
+  refuses, in server words, any path that is neither on disk nor tracked, before `git add` sees it.
+  `discard` with `paths` checks out only the tracked subset (resolved to the index's spelling on an
+  ignorecase clone) and runs `clean -f` over every requested path, so naming an untracked file
+  removes it instead of failing on `checkout`; a path matching nothing is a no-op. A path-limited
+  `discard` now settles only the named paths in every session's records instead of clearing every
+  session's whole record for the project — before, a path-limited discard of a tracked path wiped every session's records, and one naming
+  only an untracked path failed outright. The
+  under-a-symlink refusal in `resolvePush` now has a reaching test (a mocked `lstat`), since git
+  itself never produces that layout.
 - **A deletion under a linked directory is recorded where the file really was** (#67 review). With a
   tracked in-project link `linkdir -> realdir`, `delete_file linkdir/notes.tex` removes the real
   `realdir/notes.tex` — but the session's record was filed under the link's path, a key git rejects
@@ -442,10 +472,7 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   (`core.ignorecase`, which git sets on macOS and Windows clones) the HEAD lookup folds case, so a
   file tracked as `Notes.txt` and edited as `notes.txt` is tracked, not ignored — under either
   basis. The same ASCII fold (git's own; exact spelling wins where a tree holds both) now applies
-  wherever this server looks a path up by name — with one exception, tracked separately:
-  `scope: "paths"`'s peer-ownership check (`coversPath`/`peerOwnership` in
-  `src/lib/commitPaths.ts`) still compares shadow index keys byte-for-byte, so on an ignorecase
-  clone a peer's `Notes.txt` entry does not protect a request naming `notes.txt`. Elsewhere: the session's shadow base is read from HEAD's
+  wherever this server looks a path up by name: the session's shadow base is read from HEAD's
   spelling, so such an edit no longer seeds an empty base and swallows a peer's uncommitted lines
   whole, and the session commit stages under HEAD's spelling, since `update-index --cacheinfo`
   does none of the case-alias lookup `git add` does — such an edit used to land as a second,

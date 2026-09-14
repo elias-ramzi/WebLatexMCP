@@ -542,7 +542,7 @@ export class ShadowStore {
   /**
    * Drop every entry this session tracks whose path is covered by one of `paths` (`coversPath` —
    * a directory covers everything under it), regardless of `conflicted`/`unrecorded`. Returns the
-   * dropped paths.
+   * dropped paths, in this session's own shadow spelling.
    *
    * Called by `commit` after a `scope: "all"`/`"paths"` commit, and only after that commit has
    * actually landed. It drops every entry *under the paths the commit was given* (`coversPath` —
@@ -556,19 +556,80 @@ export class ShadowStore {
    * flagged": nothing here clears the flag on an *edit* (`record` never calls this), and `refresh`
    * still refuses to resolve one on its own. The entry disappears because the session took the
    * tree deliberately — the exact remedy every conflicted/unrecorded message names.
+   *
+   * `fold` is git's own ASCII case fold (`foldCase`, `src/lib/caseFold.ts`), passed by the caller
+   * only when the repository is case-insensitive (`GitService.isCaseInsensitive`) — see
+   * `coversPath`. On an ignorecase clone this session's entry can be keyed under a different
+   * spelling than the path `commit` was asked to take (`git add`/`commitContents` staged it under
+   * whichever spelling won), and without the fold that entry never matches, so it stays wedged
+   * forever even though the commit that was meant to resolve it landed.
    */
-  async settle(projectId: string, paths: string[]): Promise<string[]> {
-    const wanted = paths.map(toPosix);
+  async settle(
+    projectId: string,
+    paths: string[],
+    fold?: (p: string) => string,
+  ): Promise<string[]> {
+    // Same normal form as the tool layer's `settlePaths`: POSIX, leading `./` stripped.
+    const wanted = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
     const index = await this.readIndex(projectId);
     const dropped: string[] = [];
     for (const rel of Object.keys(index.entries)) {
-      if (wanted.some((p) => coversPath(p, rel))) {
+      if (wanted.some((p) => coversPath(p, rel, fold))) {
         await this.forget(projectId, rel);
         delete index.entries[rel];
         dropped.push(rel);
       }
     }
     await this.writeIndex(projectId, index);
+    return dropped;
+  }
+
+  /**
+   * Drop *every* session's entries covered by `paths` (`coversPath`, as `settle` above) — for a
+   * path-limited `discard`, which rewrites only the named paths on disk and so must settle only
+   * the records that describe them, leaving every other session's unrelated in-flight work
+   * (`session.json` heartbeat included) intact. `clearAll` remains the whole-tree tool: it drops
+   * every session's *entire* shadow state because a whole-tree discard leaves nothing on disk any
+   * shadow could still describe.
+   *
+   * Iterates every session directory the same way `clearAll` does (a listing failure — no
+   * `.sessions/<projectId>` yet — is "nothing to settle", not an error) and applies the same
+   * per-entry removal `settle` uses, just against each session's own directory rather than only
+   * this store's `sessionId`. Returns every dropped path, in each owning session's own spelling
+   * (a path can appear more than once if, oddly, two sessions both tracked it).
+   */
+  async settleAll(
+    projectId: string,
+    paths: string[],
+    fold?: (p: string) => string,
+  ): Promise<string[]> {
+    // Same normal form as the tool layer's `settlePaths`: POSIX, leading `./` stripped.
+    const wanted = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
+    const root = sessionStateDir(this.workspaceRoot, projectId);
+    let sessionIds: string[];
+    try {
+      sessionIds = (await readdir(root, { withFileTypes: true }))
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch {
+      return [];
+    }
+
+    const dropped: string[] = [];
+    for (const sessionId of sessionIds) {
+      const dir = path.join(root, sessionId);
+      const index = await this.readIndexAt(dir);
+      let changed = false;
+      for (const rel of Object.keys(index.entries)) {
+        if (wanted.some((p) => coversPath(p, rel, fold))) {
+          await this.forgetAt(dir, rel);
+          delete index.entries[rel];
+          dropped.push(rel);
+          changed = true;
+        }
+      }
+      if (changed) await this.writeIndexAt(dir, index);
+    }
     return dropped;
   }
 
@@ -622,9 +683,19 @@ export class ShadowStore {
     return path.join(this.dir(projectId), 'base', rel);
   }
 
-  private async readIndex(projectId: string): Promise<ShadowIndex> {
+  private readIndex(projectId: string): Promise<ShadowIndex> {
+    return this.readIndexAt(this.dir(projectId));
+  }
+
+  private writeIndex(projectId: string, index: ShadowIndex): Promise<void> {
+    return this.writeIndexAt(this.dir(projectId), index);
+  }
+
+  /** Reads the shadow index at an arbitrary session directory — `readIndex` for this session,
+   * `settleAll` for every session's. Shared so both stay in exact agreement on the on-disk shape. */
+  private async readIndexAt(dir: string): Promise<ShadowIndex> {
     try {
-      const raw = await readFile(path.join(this.dir(projectId), 'shadow.json'), 'utf8');
+      const raw = await readFile(path.join(dir, 'shadow.json'), 'utf8');
       const parsed = JSON.parse(raw) as ShadowIndex;
       return parsed.entries ? parsed : { entries: {} };
     } catch {
@@ -632,8 +703,8 @@ export class ShadowStore {
     }
   }
 
-  private async writeIndex(projectId: string, index: ShadowIndex): Promise<void> {
-    const dir = this.dir(projectId);
+  /** Writes the shadow index at an arbitrary session directory — see `readIndexAt`. */
+  private async writeIndexAt(dir: string, index: ShadowIndex): Promise<void> {
     await mkdir(dir, { recursive: true });
     await writeAtomic(path.join(dir, 'shadow.json'), JSON.stringify(index, null, 2));
   }
@@ -658,10 +729,19 @@ export class ShadowStore {
     await rm(this.shadowPath(projectId, rel), { force: true });
   }
 
-  private async forget(projectId: string, rel: string): Promise<void> {
+  private forget(projectId: string, rel: string): Promise<void> {
+    return this.forgetAt(this.dir(projectId), rel);
+  }
+
+  /**
+   * Removes the shadow and base files for `rel` under an arbitrary session directory — the
+   * per-entry removal `settle` (this session, via `forget`) and `settleAll` (every session) share,
+   * so dropping an index entry always sheds the same on-disk files whichever one drops it.
+   */
+  private async forgetAt(dir: string, rel: string): Promise<void> {
     await Promise.all([
-      rm(this.shadowPath(projectId, rel), { force: true }),
-      rm(this.basePath(projectId, rel), { force: true }),
+      rm(path.join(dir, 'shadow', rel), { force: true }),
+      rm(path.join(dir, 'base', rel), { force: true }),
     ]);
   }
 }
