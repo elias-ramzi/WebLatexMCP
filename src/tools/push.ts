@@ -67,7 +67,11 @@ const conflictElisionSchema = z.object({
   ref: z
     .string()
     .optional()
-    .describe('read_file(path, ref) call that fetches this part in full. Sides only.'),
+    .describe(
+      'Sides only. Normally the read_file(path, ref) call that fetches this part in full — but ' +
+        'when the two histories are unrelated there is no merge base to read the `base` side ' +
+        'from, and this instead states that, so check it looks like a call before issuing one.',
+    ),
   count: z.number().optional().describe('hunks only: how many hunks were elided.'),
   spans: z
     .array(z.object({ startLine: z.number(), endLine: z.number() }))

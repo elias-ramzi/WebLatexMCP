@@ -118,15 +118,107 @@ export function formatAge(fromIso: string, nowMs: number): string {
   return remHour ? `${totalDay}d ${remHour}h` : `${totalDay}d`;
 }
 
+/** Join at most `max` entries, appending `, … N more` for whatever didn't fit — mirrors
+ * `capList` in `src/services/gitService.ts` (not exported from there, so reimplemented here).
+ * It bounds the closing's own list only; the lines above it (`theirs`, each session's `owns`,
+ * `unowned`) still render in full, so this keeps the closing from repeating a long list one more
+ * time rather than making the whole message bounded. */
+function capList(items: string[], max: number): string {
+  if (items.length <= max) return items.join(', ');
+  const shown = items.slice(0, max);
+  return `${shown.join(', ')}, … ${items.length - max} more`;
+}
+
+const CLOSING_PATH_CAP = 20;
+
 /**
- * Default closing paragraph — written for `push`'s caller, who is about to rebase. A caller in a
- * different vocabulary (e.g. `project_sync`, about to fast-forward-pull) should pass its own
- * `closing` string instead of this one.
+ * True when `s` may own any of the disputed paths: a readable peer that owns at least one, or a
+ * peer whose index is unreadable — which `attributePeers` already treats as owning everything, so
+ * it must get the same advice as a confirmed owner (fail closed on advice too, not only on the
+ * refusal itself).
  */
-const DEFAULT_CLOSING =
-  'Pushing has to rebase, which would sweep up or overwrite in-flight work. A recent last write ' +
-  'means the owner is mid-edit: wait for it to commit. Otherwise take ownership deliberately ' +
-  'with commit scope "all" (or scope "paths" for named files) and push again.';
+function isPeerOwning(s: PeerAttribution): boolean {
+  return s.unreadable || s.owns.length > 0;
+}
+
+/**
+ * The calling tool's own vocabulary for a composed closing: `push` is about to rebase and will
+ * push again, `project_sync` is about to fast-forward-pull and will sync again. Only the framing
+ * differs — which commit route applies to which group is a property of `commit`'s guards, not of
+ * the caller, so that half is shared.
+ */
+export interface ClosingVocabulary {
+  /** Why the caller is blocked, and the wait-for-the-owner advice. Ends with a full stop. */
+  opening: string;
+  /** What to do once ownership is settled, e.g. `'Then push again.'`. */
+  retry: string;
+}
+
+/** `push`'s framing — it has to rebase, and retries by pushing. */
+export const PUSH_VOCABULARY: ClosingVocabulary = {
+  opening:
+    'Pushing has to rebase, which would sweep up or overwrite in-flight work. A recent last ' +
+    'write means the owner is mid-edit: wait for it to commit.',
+  retry: 'Then push again.',
+};
+
+/**
+ * Composes a refusal's closing paragraph from the attribution itself, instead of one static
+ * paragraph that blurred two groups needing opposite advice together:
+ *
+ * - **Peer-owned files** (owned by a readable peer, or by a peer whose index is unreadable and so
+ *   may own anything) can only be taken with `commit scope: "all"` — `scope: "paths"` refuses
+ *   outright any path a live session's shadow lists (`src/tools/commit.ts`), so naming it here
+ *   would send the caller into a guaranteed second refusal.
+ * - **Unowned files** (no live, readable peer's shadow claims them — edited outside the server, or
+ *   left by a session that has since exited) commit cleanly with `scope: "paths"` naming just
+ *   them, which is the *better* route for this group since it can't sweep in a peer's lines the
+ *   way `scope: "all"` would.
+ *
+ * Each group, when present, gets its own sentence naming its own route — never one piece of advice
+ * applied to both. Both `push` and `project_sync` compose from here: which route works is decided
+ * by `commit`'s peer guard, so a caller that worded it independently would drift from the guard.
+ */
+export function composeClosing(a: Attribution, vocab: ClosingVocabulary): string {
+  const { opening, retry } = vocab;
+
+  const hasOwned = a.sessions.some(isPeerOwning);
+  const hasUnowned = a.unowned.length > 0;
+
+  // An unreadable index refuses `scope: "paths"` on its own terms (whatever paths are named), a
+  // readable owner refuses the paths it lists — different triggers, same unavailable route, so the
+  // sentence names the route rather than one of the two triggers.
+  const ownedAdvice =
+    'Taking the peer-owned files requires committing with scope "all" — scope "paths" is not an ' +
+    'option for them: it refuses any path a live session owns, and refuses outright while a live ' +
+    "session's change index cannot be read.";
+  const only = a.unowned.length === 1;
+  const unownedAdvice =
+    `${capList(a.unowned, CLOSING_PATH_CAP)} — not owned by any live session — can be committed ` +
+    `on ${only ? 'its' : 'their'} own with scope "paths", naming just ` +
+    `${only ? 'that path' : 'those paths'}: that does not sweep in anyone else's work, and is ` +
+    `preferable to scope "all" for ${only ? 'it' : 'them'}.`;
+
+  if (hasOwned && hasUnowned) {
+    return `${opening} ${ownedAdvice} ${unownedAdvice} ${retry}`;
+  }
+  if (hasOwned) {
+    return `${opening} ${ownedAdvice} ${retry}`;
+  }
+  if (hasUnowned) {
+    return `${opening} ${unownedAdvice} ${retry}`;
+  }
+  // Unreachable in practice: `renderPeerRefusal` is only called with a non-empty `theirs`, and
+  // `attributePeers` puts every such path either in some session's `owns` or in `unowned`, so one
+  // of the two branches above always fires. Kept as a defensive default — and worded like the
+  // peer-owned branch rather than the old "(or scope \"paths\" for named files)", because if it
+  // ever does fire we cannot show a path is unowned, and `scope: "paths"` refuses a path a live
+  // session owns. Advising the route that fails closed is the safe direction to be wrong in.
+  return (
+    `${opening} Take ownership deliberately with commit scope "all" — scope "paths" refuses ` +
+    `outright any path a live session owns. ${retry}`
+  );
+}
 
 /**
  * Renders the peer-refusal message: which disputed files belong to which live peer, dated, so the
@@ -137,14 +229,15 @@ const DEFAULT_CLOSING =
  *
  * `closing` is the final paragraph's text, in the calling tool's own vocabulary — `push` is about
  * to rebase, `project_sync` is about to fast-forward-pull, and the advice ("push again" vs. "sync
- * again") must match. Defaults to the push-specific wording so `push`'s own call site (which never
- * passes this) is unaffected.
+ * again") must match. When omitted (as `push`'s own call site does), it is composed from `a` by
+ * `composeClosing` with {@link PUSH_VOCABULARY}, so peer-owned and unowned files each get the
+ * route that actually works. A caller in another vocabulary passes its own — see `project_sync`.
  */
 export function renderPeerRefusal(
   theirs: string[],
   a: Attribution,
   nowMs: number,
-  closing: string = DEFAULT_CLOSING,
+  closing?: string,
 ): string {
   const lines: string[] = [
     `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}.`,
@@ -176,7 +269,7 @@ export function renderPeerRefusal(
     );
   }
 
-  lines.push(closing);
+  lines.push(closing ?? composeClosing(a, PUSH_VOCABULARY));
 
   return lines.join('\n');
 }

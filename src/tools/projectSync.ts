@@ -3,17 +3,32 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { LocalChangesOverwriteError, type SyncResult } from '../services/gitService.js';
-import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
+import {
+  attributePeers,
+  collectPeerShadows,
+  composeClosing,
+  renderPeerRefusal,
+  type ClosingVocabulary,
+} from '../lib/peerAttribution.js';
 
 /**
- * Closing paragraph for a `project_sync` refusal, in pull vocabulary (there is no rebase here —
- * `syncPull` is a plain `merge --ff-only`) — the sibling of push's own closing text in
- * `renderPeerRefusal`'s default.
+ * `project_sync`'s framing for the composed closing: pull vocabulary (there is no rebase here —
+ * `syncPull` is a plain `merge --ff-only`), retrying by syncing rather than pushing.
+ *
+ * Only the framing is local. Which commit route applies to which group is composed by
+ * `composeClosing` from the attribution, exactly as `push`'s closing is: this used to be a static
+ * paragraph offering `scope: "paths"` first, which bounces off `commit`'s peer guard for any path a
+ * live session owns — the same dead advice that guard exists to give, one message over. The typed
+ * `LocalChangesOverwriteError` above still prescribes `scope: "paths"` for the collision as a
+ * whole, which is right for the common case of the caller's own edits; this paragraph is what
+ * corrects it for the subset a peer turns out to own.
  */
-const PULL_CLOSING =
-  'The pull would overwrite this in-flight work. A recent last write means the owner is ' +
-  'mid-edit: wait for it to commit. Otherwise take ownership deliberately with commit ' +
-  'scope "paths" (naming just these files) or scope "all", then sync again.';
+const PULL_VOCABULARY: ClosingVocabulary = {
+  opening:
+    'The pull would overwrite this in-flight work. A recent last write means the owner is ' +
+    'mid-edit: wait for it to commit.',
+  retry: 'Then sync again.',
+};
 
 /**
  * A pull refused with `LocalChangesOverwriteError` names which tracked file(s) block it, but not
@@ -47,9 +62,9 @@ async function enrichLocalChangesOverwrite(
     peers,
     await collectPeerShadows(ctx.shadows, id, peers),
   );
-  return new Error(
-    `${err.message}\n\n${renderPeerRefusal(theirs, attribution, Date.now(), PULL_CLOSING)}`,
-  );
+  const now = Date.now();
+  const closing = composeClosing(attribution, PULL_VOCABULARY);
+  return new Error(`${err.message}\n\n${renderPeerRefusal(theirs, attribution, now, closing)}`);
 }
 
 const inputSchema = {

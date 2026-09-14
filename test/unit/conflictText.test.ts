@@ -13,6 +13,7 @@ import {
 import {
   planConflictPayload,
   renderElidedHunkSpans,
+  sideElisionHint,
   CONFLICT_SIDE_CAP,
   CONFLICT_CONTENT_BUDGET,
   CONFLICT_MAX_FILES,
@@ -24,6 +25,7 @@ import {
   SIDE_ELISION_OVERHEAD,
   HUNK_ELISION_TEXT_OVERHEAD,
   type ConflictPayloadPlan,
+  type ConflictRefs,
 } from '../../src/lib/conflictBudget.js';
 import type { ConflictHunk } from '../../src/lib/conflictParser.js';
 import type {
@@ -199,6 +201,96 @@ describe('buildConflictFilePayload (structured channel) agrees with the text cha
   });
 });
 
+describe('no-merge-base hint is honest about what is actually on screen (dead-advice fix)', () => {
+  // `report()`'s default file has mergeBase set; these tests override it to null (unrelated
+  // histories) and force `base` to elide via CONFLICT_SIDE_CAP, independent of the aggregate
+  // budget, so only `hunksRendered` (whether THIS file's hunks block shows full markers) varies
+  // between cases.
+  function noMergeBaseConflict(fileOverrides: Partial<ConflictFileDetail>): ConflictReport {
+    const rep = report({ mergeBase: null });
+    return { ...rep, files: [{ ...rep.files[0]!, ...fileOverrides }] };
+  }
+
+  it('hunks rendered: text points at the markers AND states there is no merge base', () => {
+    // Default file's hunk (small) survives in full — hunks really are on screen.
+    const conflicted = noMergeBaseConflict({ base: 'z'.repeat(CONFLICT_SIDE_CAP + 1) });
+    const plan = planConflictPayload(conflicted.files, {
+      detail: 'auto',
+      refs: { mergeBase: conflicted.mergeBase, rebasedOnto: conflicted.rebasedOnto },
+    });
+    expect(plan.files[0]!.hunks.included).toBe(true); // sanity: markers really are rendered
+
+    const text = renderConflictText('conflict', conflicted);
+    const structured = buildConflictFilePayload(conflicted, plan);
+
+    expect(text).toContain('overlap markers above');
+    expect(text).toContain('no merge base');
+    expect(structured[0]!.elided?.base?.ref).toBe('no merge base (unrelated histories)');
+  });
+
+  it('hunks elided: text must NOT mention markers, only the honest no-merge-base wording (dead advice)', () => {
+    const hugeHunk = {
+      startLine: 10,
+      endLine: 20,
+      local: ['l'.repeat(CONFLICT_CONTENT_BUDGET + 1)],
+      remote: ['r'],
+    };
+    const conflicted = noMergeBaseConflict({
+      hunks: [hugeHunk],
+      base: 'z'.repeat(CONFLICT_SIDE_CAP + 1),
+    });
+    const plan = planConflictPayload(conflicted.files, {
+      detail: 'auto',
+      refs: { mergeBase: conflicted.mergeBase, rebasedOnto: conflicted.rebasedOnto },
+    });
+    expect(plan.files[0]!.hunks.included).toBe(false); // sanity: markers really are cut
+
+    const text = renderConflictText('conflict', conflicted);
+    const structured = buildConflictFilePayload(conflicted, plan);
+
+    expect(text).not.toContain('markers');
+    expect(text).toContain('no merge base (unrelated histories)');
+    expect(structured[0]!.elided?.base?.ref).toBe('no merge base (unrelated histories)');
+  });
+
+  it('file has no hunks at all (hunks: []): same honest wording, not the markers pointer', () => {
+    // Distinct input from "hunks elided" above: an empty array is never `included: false` (there
+    // is nothing to cut), so this must not accidentally fall through to the markers branch either.
+    const conflicted = noMergeBaseConflict({ hunks: [], base: 'z'.repeat(CONFLICT_SIDE_CAP + 1) });
+    const plan = planConflictPayload(conflicted.files, {
+      detail: 'auto',
+      refs: { mergeBase: conflicted.mergeBase, rebasedOnto: conflicted.rebasedOnto },
+    });
+    expect(plan.files[0]!.hunks.included).toBe(true); // trivially true; nothing to elide
+    expect(conflicted.files[0]!.hunks).toHaveLength(0);
+
+    const text = renderConflictText('conflict', conflicted);
+    const structured = buildConflictFilePayload(conflicted, plan);
+
+    expect(text).not.toContain('markers');
+    expect(text).toContain('no merge base (unrelated histories)');
+    expect(structured[0]!.elided?.base?.ref).toBe('no merge base (unrelated histories)');
+  });
+
+  it('mergeBase present: hint unchanged in both channels (common path does not regress)', () => {
+    const rep = report();
+    const conflicted: ConflictReport = {
+      ...rep,
+      files: [{ ...rep.files[0]!, base: 'x'.repeat(20000) }],
+    };
+    const plan = planConflictPayload(conflicted.files, {
+      detail: 'auto',
+      refs: { mergeBase: conflicted.mergeBase, rebasedOnto: conflicted.rebasedOnto },
+    });
+    const text = renderConflictText('conflict', conflicted);
+    const structured = buildConflictFilePayload(conflicted, plan);
+
+    const expectedRef = `read_file("sections/04.tex", ref="${MERGE_BASE}")`;
+    expect(text).toContain(expectedRef);
+    expect(structured[0]!.elided?.base?.ref).toBe(expectedRef);
+  });
+});
+
 describe('renderRebasedOver', () => {
   it('summarizes the commits landed underneath a successful push', () => {
     const text = renderRebasedOver([
@@ -317,6 +409,32 @@ describe('overhead constants stay pinned to the real render format (finding 1)',
     expect(rendered.length - String(count).length - String(chars).length - spansText.length).toBe(
       HUNK_ELISION_TEXT_OVERHEAD,
     );
+  });
+
+  it('SIDE_ELISION_OVERHEAD matches renderSide for BOTH no-merge-base hint variants (dead-advice fix)', () => {
+    // `sideElisionCost` (conflictBudget.ts) charges `SIDE_ELISION_OVERHEAD + digits +
+    // hint.text.length` using whichever variant `sideElisionHint` selects for a given
+    // `hunksRendered`. If the two variants' real rendered lengths ever drift from what the
+    // planner charges, this is the test that catches it — the same style as the
+    // SIDE_ELISION_OVERHEAD test above, just against both real hint strings instead of a
+    // placeholder.
+    const refsNoMergeBase: ConflictRefs = { mergeBase: null, rebasedOnto: 'origin/master' };
+    const chars = 4321;
+    for (const hunksRendered of [true, false]) {
+      const hint = sideElisionHint('sections/04.tex', 'base', refsNoMergeBase, hunksRendered);
+      // The JSON side must also carry the exact fact both channels agree on, regardless of
+      // `hunksRendered` — this is the JSON hint that never varies.
+      expect(hint.json).toBe('no merge base (unrelated histories)');
+      // SIDE_ELISION_OVERHEAD is sized off the LONGEST label (theirs) — see the sibling pinning
+      // test above — so render under that label here too, the same way that test does.
+      const rendered = renderSide(SIDE_LABELS.theirs, 'x', { included: false, chars }, hint.text);
+      expect(rendered.length - String(chars).length - hint.text.length).toBe(SIDE_ELISION_OVERHEAD);
+    }
+    // And the two variants really are different lengths — otherwise this test would not be
+    // exercising the bug the accounting-care warns about.
+    const withMarkers = sideElisionHint('p.tex', 'base', refsNoMergeBase, true).text;
+    const withoutMarkers = sideElisionHint('p.tex', 'base', refsNoMergeBase, false).text;
+    expect(withMarkers.length).not.toBe(withoutMarkers.length);
   });
 });
 

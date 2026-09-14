@@ -39,7 +39,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   ordered by what the caller can get back: `hunks` are allocated **first and cut last**, because once the
   rebase aborts the marker view is gone from the working tree, while a side is one
   `read_file(path, ref)` away — so an elided side carries the exact ref to fetch it and elided hunks
-  carry their count and line spans. The reporter's proposal — `conflictDetail: "hunks"` dropping the
+  carry their count and line spans. Where there is no merge base to fetch from at all (unrelated
+  histories), the pointer says so in both channels rather than sending the caller to overlap markers
+  that the same budget may just have elided — the two channels used to disagree on exactly that, one
+  naming the missing merge base and the other pointing at markers not on screen. The reporter's
+  proposal — `conflictDetail: "hunks"` dropping the
   sides by _default_ — was declined: docs/CONCURRENCY.md and CLAUDE.md both promise all three sides so an
   MCP-only client can resolve without a shell, and defaulting them off regresses the ordinary small
   conflict (three 2k sides, one round trip) to fix the rare large one. `conflictDetail: "full"` is the
@@ -72,7 +76,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   helpers `push`'s refusal uses — but **subtracting this session's own paths first**, exactly as `push`
   does, since `livePeers` excludes self and an unfiltered list would report the caller's own edits as
   belonging to nobody. The closing advice is now the calling tool's own: `push` talks about rebasing and
-  pushing again, `project_sync` about syncing again. Both refusals share one
+  pushing again, `project_sync` about syncing again — but **both compose it from the attribution**
+  rather than each carrying a static paragraph, because the files they list fall into two groups needing
+  **opposite** advice. A peer-owned file can only be taken with `scope: "all"`, since `scope: "paths"`
+  refuses outright any path a live session's shadow lists — so the closing now says that, instead of
+  offering `scope: "paths"` as a parenthetical alternative that would have bounced. A file **no** live
+  session owns is the reverse: `scope: "paths"` naming just those paths is the better route, because it
+  cannot sweep in a peer's lines the way `scope: "all"` would. A peer whose change index is unreadable
+  is advised as an owner, not as unowned — the advice fails closed exactly as the refusal does. Sharing
+  one composer is the point rather than a tidy-up: which route works is decided by `commit`'s peer
+  guard, so two tools wording it independently is two chances to drift out of step with that guard —
+  which is exactly what had happened, `project_sync` still offering `scope: "paths"` first for files a
+  peer may own. Both refusals share one
   indented-path-list parser, differing only in the opening line they key on, and the two regexes are
   written so they can never cross-fire — they lead to different fixes. Deliberately implemented as a
   translation of git's refusal **after** it happens rather than a working-tree pre-check: `merge

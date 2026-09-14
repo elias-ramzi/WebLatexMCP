@@ -232,4 +232,167 @@ describe('renderPeerRefusal', () => {
     const text = renderPeerRefusal(THEIRS, a, NOW);
     expect(text).not.toContain('No live session owns');
   });
+
+  describe('default closing, composed from the attribution', () => {
+    it('peer-owned only: advises scope "all", explains why "paths" refuses, never offers "paths" for these files', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'beta',
+            heartbeatAt: new Date(NOW - 10_000).toISOString(),
+            owns: ['a.tex', 'b.tex'],
+            lastWriteAt: new Date(NOW - 42_000).toISOString(),
+            unreadable: false,
+          },
+        ],
+        unowned: [],
+      };
+      const text = renderPeerRefusal(['a.tex', 'b.tex'], a, NOW);
+      const closing = text.split('\n').pop() as string;
+
+      expect(closing).toContain('scope "all"');
+      // Pins the *meaning* — that the route is unavailable and why — rather than one phrasing,
+      // since the sentence also has to cover the unreadable-index trigger.
+      expect(closing).toContain('scope "paths" is not an option');
+      expect(closing).toMatch(/refuses any path a live session owns/);
+      // The unowned-route sentence (naming paths for scope "paths") must not appear here — there
+      // is no unowned group in this shape.
+      expect(closing).not.toContain('preferable to scope "all"');
+    });
+
+    it('unowned only: advises scope "paths" naming the paths, and does not push the caller to scope "all"', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'gamma',
+            heartbeatAt: new Date(NOW - 10_000).toISOString(),
+            owns: [],
+            lastWriteAt: null,
+            unreadable: false,
+          },
+        ],
+        unowned: ['notes.txt', 'draft.tex'],
+      };
+      const text = renderPeerRefusal(['notes.txt', 'draft.tex'], a, NOW);
+      const closing = text.split('\n').pop() as string;
+
+      expect(closing).toContain('scope "paths"');
+      expect(closing).toContain('notes.txt, draft.tex');
+      expect(closing).toContain('preferable to scope "all"');
+      // Never *advises* taking scope "all" for this group.
+      expect(closing).not.toContain('requires committing with scope "all"');
+      // Plural group reads as plural — the list is built from a variable-length path set, so the
+      // agreement has to follow it rather than being fixed at whichever case was written first.
+      expect(closing).toContain('on their own');
+      expect(closing).toContain('naming just those paths');
+      expect(closing).not.toContain('on its own');
+    });
+
+    it('unowned, exactly one path: the advice reads as singular', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'gamma',
+            heartbeatAt: new Date(NOW - 10_000).toISOString(),
+            owns: [],
+            lastWriteAt: null,
+            unreadable: false,
+          },
+        ],
+        unowned: ['notes.txt'],
+      };
+      const closing = renderPeerRefusal(['notes.txt'], a, NOW).split('\n').pop() as string;
+
+      expect(closing).toContain('on its own');
+      expect(closing).toContain('naming just that path');
+      expect(closing).not.toContain('on their own');
+    });
+
+    it('both groups present: each gets its own route, tied to its own group', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'beta',
+            heartbeatAt: new Date(NOW - 10_000).toISOString(),
+            owns: ['a.tex'],
+            lastWriteAt: new Date(NOW - 42_000).toISOString(),
+            unreadable: false,
+          },
+        ],
+        unowned: ['notes.txt'],
+      };
+      const text = renderPeerRefusal(['a.tex', 'notes.txt'], a, NOW);
+      const closing = text.split('\n').pop() as string;
+
+      expect(closing).toContain('requires committing with scope "all"');
+      // Pins the *meaning* — that the route is unavailable and why — rather than one phrasing,
+      // since the sentence also has to cover the unreadable-index trigger.
+      expect(closing).toContain('scope "paths" is not an option');
+      expect(closing).toMatch(/refuses any path a live session owns/);
+      expect(closing).toContain('notes.txt');
+      expect(closing).toContain('scope "paths"');
+      expect(closing).toContain('preferable to scope "all"');
+    });
+
+    it('an unreadable peer is treated as peer-owned: advises scope "all", never scope "paths" as a route', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'delta',
+            heartbeatAt: new Date(NOW - 5_000).toISOString(),
+            owns: THEIRS,
+            lastWriteAt: null,
+            unreadable: true,
+          },
+        ],
+        unowned: [],
+      };
+      const text = renderPeerRefusal(THEIRS, a, NOW);
+      const closing = text.split('\n').pop() as string;
+
+      expect(closing).toContain('scope "all"');
+      // Pins the *meaning* — that the route is unavailable and why — rather than one phrasing,
+      // since the sentence also has to cover the unreadable-index trigger.
+      expect(closing).toContain('scope "paths" is not an option');
+      expect(closing).toMatch(/refuses any path a live session owns/);
+      expect(closing).not.toContain('preferable to scope "all"');
+    });
+
+    it('an explicit closing argument still overrides everything, even with peer-owned files present', () => {
+      const a: Attribution = {
+        sessions: [
+          {
+            sessionId: 'beta',
+            heartbeatAt: new Date(NOW - 10_000).toISOString(),
+            owns: ['a.tex'],
+            lastWriteAt: new Date(NOW - 42_000).toISOString(),
+            unreadable: false,
+          },
+        ],
+        unowned: [],
+      };
+      const text = renderPeerRefusal(['a.tex'], a, NOW, 'CUSTOM CLOSING TEXT');
+      expect(text.split('\n').pop()).toBe('CUSTOM CLOSING TEXT');
+      expect(text).not.toContain('scope "all"');
+    });
+
+    it('caps the unowned path list in the closing at the boundary', () => {
+      const paths = Array.from({ length: 20 }, (_, i) => `f${i}.tex`);
+      const a: Attribution = { sessions: [], unowned: paths };
+      const text = renderPeerRefusal(paths, a, NOW);
+      const closing = text.split('\n').pop() as string;
+      expect(closing).toContain(paths.join(', '));
+      expect(closing).not.toContain('more');
+    });
+
+    it('caps the unowned path list in the closing one over the boundary', () => {
+      const paths = Array.from({ length: 21 }, (_, i) => `f${i}.tex`);
+      const a: Attribution = { sessions: [], unowned: paths };
+      const text = renderPeerRefusal(paths, a, NOW);
+      const closing = text.split('\n').pop() as string;
+      expect(closing).toContain(paths.slice(0, 20).join(', '));
+      expect(closing).toContain('1 more');
+      expect(closing).not.toContain(paths[20] as string);
+    });
+  });
 });

@@ -132,9 +132,10 @@ const LONGEST_SIDE_LABEL = 'theirs (remote that landed)';
  * Literal characters `renderSide`'s ELIDED branch wraps around one side — `${label}: (` + the
  * `chars` digits + ` chars, elided — ` + the hint + `)` — sized against the longest label (so a
  * shorter one never under-counts, same technique as `SIDE_LABEL_OVERHEAD`), EXCLUDING the digits
- * of `chars` and the hint text (both charged exactly: the hint always embeds the file's path plus
- * either `"HEAD"`, the merge-base sha, or `rebasedOnto` — all known to the planner via
- * {@link ConflictRefs}). Pinned against the real `renderSide` output in `conflictText.test.ts`.
+ * of `chars` and the hint text (charged exactly, via {@link sideElisionHint}: the `read_file(...)`
+ * pointer's real length when a ref exists, or the no-merge-base hint's real length — which varies
+ * by whether the file's hunks are actually on screen — when it does not). Pinned against the real
+ * `renderSide` output in `conflictText.test.ts`.
  */
 export const SIDE_ELISION_OVERHEAD =
   LONGEST_SIDE_LABEL.length + ': ('.length + ' chars, elided — '.length + ')'.length;
@@ -150,18 +151,24 @@ export const SIDE_ELISION_OVERHEAD =
 export const HUNK_ELISION_TEXT_OVERHEAD = 87;
 
 /**
- * Text shown for `base`'s elision hint when there is no merge base at all (unrelated histories) —
- * duplicated from `renderConflictText`'s `baseHint` fallback so the planner can charge its exact
- * length without importing from `conflictText.ts`.
+ * Text hint for `base`'s elision when there is no merge base (unrelated histories) AND this file's
+ * hunks block is NOT rendered (elided, or the file has no hunks at all) — pointing at "the overlap
+ * markers above" would be dead advice, since nothing is on screen for it to point at. This is also
+ * the structured channel's `elided.base.ref` in EVERY no-merge-base case (see
+ * {@link sideElisionHint}), so both channels agree on the bare fact even where the text
+ * additionally mentions markers below.
  */
-const NO_MERGE_BASE_TEXT_HINT = 'see the overlap markers above';
+const NO_MERGE_BASE_HINT = 'no merge base (unrelated histories)';
 
 /**
- * Text shown in `elided.base.ref`'s structured-channel fallback when there is no merge base —
- * duplicated from `buildConflictFilePayload`'s `sideRef` fallback for the same reason as
- * {@link NO_MERGE_BASE_TEXT_HINT}.
+ * Text hint for `base`'s elision when there is no merge base (unrelated histories) but this file's
+ * hunks block IS rendered alongside it (full overlap markers, not the elided placeholder, not an
+ * empty `hunks: []`) — pointing at "the overlap markers above" refers to something actually on
+ * screen. States the no-merge-base fact too, so the text is never silent about why `base` has no
+ * ref of its own.
  */
-const NO_MERGE_BASE_JSON_HINT = 'no merge base (unrelated histories)';
+const NO_MERGE_BASE_TEXT_HINT_WITH_MARKERS =
+  'see the overlap markers above (no merge base — unrelated histories)';
 
 /** The two top-level refs an elided side's `read_file(path, ref=...)` pointer embeds (`ours`
  * always reads `HEAD`, no ref of the report's own needed). Passed into the planner so it can
@@ -179,8 +186,8 @@ export type ConflictSideKey = 'base' | 'ours' | 'theirs';
  * shared by the text hint (`renderConflictText`'s `baseHint`, and the `ours`/`theirs` hints) and
  * the structured `elided.<key>.ref` (`buildConflictFilePayload`'s `sideRef`), so both channels name
  * the exact same call and this module's cost accounting can charge its exact length. `null` only
- * for `base` with no merge base (unrelated histories) — callers supply their own (channel-specific)
- * fallback text in that case.
+ * for `base` with no merge base (unrelated histories) — {@link sideElisionHint} below supplies the
+ * shared fallback in that case.
  */
 export function readFileRefCall(
   path: string,
@@ -190,6 +197,44 @@ export function readFileRefCall(
   if (key === 'ours') return `read_file("${path}", ref="HEAD")`;
   if (key === 'theirs') return `read_file("${path}", ref="${refs.rebasedOnto}")`;
   return refs.mergeBase ? `read_file("${path}", ref="${refs.mergeBase}")` : null;
+}
+
+/** The elision hint for one side of one file, in both channels — see {@link sideElisionHint}. */
+export interface SideElisionHint {
+  text: string;
+  json: string;
+}
+
+/**
+ * The hint an elided side shows in both channels: {@link readFileRefCall}'s pointer when a ref
+ * exists, or — for `base` alone, when there is no merge base (unrelated histories) — the honest
+ * no-merge-base wording. Shared by the render side (`conflictText.ts`'s `renderSide`/
+ * `buildConflictFilePayload` calls) and the cost side ({@link sideElisionCost} below) the same way
+ * {@link readFileRefCall} and {@link renderElidedHunkSpans} are, so the two can never select
+ * different text for the same input.
+ *
+ * `hunksRendered` says whether THIS file's `hunks` block is showing full overlap markers on screen
+ * right now — not merely present in the source, and not the elided placeholder or an empty
+ * `hunks: []` — because only then does "see the overlap markers above" point at something real.
+ * The JSON hint never varies with it: the structured channel states the bare fact regardless, so
+ * both channels agree on WHAT happened even when the text additionally explains where to look.
+ * Irrelevant to `ours`/`theirs` (whose ref is never null), but required of every caller regardless,
+ * so a future call site cannot silently pick the wrong branch by omitting it.
+ */
+export function sideElisionHint(
+  path: string,
+  key: ConflictSideKey,
+  refs: ConflictRefs,
+  hunksRendered: boolean,
+): SideElisionHint {
+  const ref = readFileRefCall(path, key, refs);
+  if (ref) return { text: ref, json: ref };
+  // Only `base` with no merge base ever reaches here — readFileRefCall never returns null for
+  // ours/theirs.
+  return {
+    text: hunksRendered ? NO_MERGE_BASE_TEXT_HINT_WITH_MARKERS : NO_MERGE_BASE_HINT,
+    json: NO_MERGE_BASE_HINT,
+  };
 }
 
 /**
@@ -379,21 +424,23 @@ function hunksElisionCost(
  * What eliding one side of one file actually costs to render — the `(N chars, elided —
  * read_file(...))` pointer (text) or the `elided.<key>` entry (structured), in the more expensive
  * of the two channels. Charged against the same budget as inclusion for the same reason as
- * {@link hunksElisionCost}.
+ * {@link hunksElisionCost}. `hunksRendered` is threaded through to {@link sideElisionHint} so the
+ * charge reflects whichever hint text will actually be rendered for `base` when there is no merge
+ * base — the hunks pass (above) always runs first, so by the time this is called for a file's
+ * sides, that file's `hunks.included` decision already exists to derive it from.
  */
 function sideElisionCost(
   path: string,
   key: ConflictSideKey,
   chars: number,
   refs: ConflictRefs,
+  hunksRendered: boolean,
 ): number {
-  const ref = readFileRefCall(path, key, refs);
-  const hintForText = ref ?? NO_MERGE_BASE_TEXT_HINT;
-  const hintForJson = ref ?? NO_MERGE_BASE_JSON_HINT;
-  const textCost = SIDE_ELISION_OVERHEAD + String(chars).length + hintForText.length;
+  const hint = sideElisionHint(path, key, refs, hunksRendered);
+  const textCost = SIDE_ELISION_OVERHEAD + String(chars).length + hint.text.length;
   // Real JSON.stringify of the exact `elided.<key>` shape `buildConflictFilePayload` builds — see
   // the note on `hunksElisionCost` above for why this is exact rather than decomposed further.
-  const jsonCost = JSON.stringify({ chars, ref: hintForJson }).length;
+  const jsonCost = JSON.stringify({ chars, ref: hint.json }).length;
   return Math.max(textCost, jsonCost);
 }
 
@@ -467,6 +514,11 @@ export function planConflictPayload(
 
   // Pass 2: sides, in file order and base/ours/theirs order within a file, against what's left.
   const filePlans: ConflictFilePlan[] = cappedFiles.map((f) => {
+    // Whether THIS file's hunks block is actually showing full overlap markers on screen — the
+    // hunks pass above already decided this, so the no-merge-base hint (base only) can be honest
+    // about it instead of guessing. `hunksRendered` is false for an empty `hunks: []` too (that
+    // case is always `included: true` trivially, but there is nothing to point at either).
+    const hunksRendered = f.hunks.length > 0 && hunksPlans.get(f.path)!.included;
     const sidePlans = {} as Record<ConflictSideKey, ConflictPartPlan>;
     for (const key of SIDE_KEYS) {
       const content = f[key];
@@ -479,7 +531,7 @@ export function planConflictPayload(
       if (chars > CONFLICT_SIDE_CAP) {
         sideCapExceeded = true;
         sidePlans[key] = { included: false, chars };
-        budgetRemaining -= sideElisionCost(f.path, key, chars, refs);
+        budgetRemaining -= sideElisionCost(f.path, key, chars, refs, hunksRendered);
         continue;
       }
       // The structured channel is JSON: charge its real (escape-inclusive) length, not raw
@@ -491,7 +543,7 @@ export function planConflictPayload(
       } else {
         aggregateBudgetExceeded = true;
         sidePlans[key] = { included: false, chars };
-        budgetRemaining -= sideElisionCost(f.path, key, chars, refs);
+        budgetRemaining -= sideElisionCost(f.path, key, chars, refs, hunksRendered);
       }
     }
     return {

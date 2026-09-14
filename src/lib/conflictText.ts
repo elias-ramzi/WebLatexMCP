@@ -2,8 +2,8 @@ import type { ConflictReport, RemoteCommit } from '../services/gitService.js';
 import type { ConflictHunk } from './conflictParser.js';
 import {
   planConflictPayload,
-  readFileRefCall,
   renderElidedHunkSpans,
+  sideElisionHint,
   type ConflictHunksPartPlan,
   type ConflictPartPlan,
   type ConflictPayloadPlan,
@@ -132,8 +132,6 @@ export function renderConflictText(
   if (plan.note) out.push(plan.note);
   // Fetch pointer for a side that's too large to inline — an exact ref, no shell needed.
   const refs = refsOf(report);
-  const baseHint = (p: string): string =>
-    readFileRefCall(p, 'base', refs) ?? 'see the overlap markers above';
   // plan.files is capped at CONFLICT_MAX_FILES (in 'auto'; uncapped in 'full') and aligns
   // index-for-index with the FIRST plan.files.length entries of report.files.
   for (let i = 0; i < plan.files.length; i++) {
@@ -141,10 +139,32 @@ export function renderConflictText(
     const fp = plan.files[i]!;
     out.push('', fileHeaderLine(f.path));
     if (f.hunks.length || !fp.hunks.included) out.push(renderHunksBlock(f.hunks, fp.hunks));
-    out.push(renderSide(SIDE_LABELS.base, f.base, fp.base, baseHint(f.path)));
-    out.push(renderSide(SIDE_LABELS.ours, f.ours, fp.ours, readFileRefCall(f.path, 'ours', refs)!));
+    // Whether THIS file's hunks block is actually showing full overlap markers right now — see
+    // `sideElisionHint`'s doc comment for why `base`'s no-merge-base hint needs to know this.
+    const hunksRendered = f.hunks.length > 0 && fp.hunks.included;
     out.push(
-      renderSide(SIDE_LABELS.theirs, f.theirs, fp.theirs, readFileRefCall(f.path, 'theirs', refs)!),
+      renderSide(
+        SIDE_LABELS.base,
+        f.base,
+        fp.base,
+        sideElisionHint(f.path, 'base', refs, hunksRendered).text,
+      ),
+    );
+    out.push(
+      renderSide(
+        SIDE_LABELS.ours,
+        f.ours,
+        fp.ours,
+        sideElisionHint(f.path, 'ours', refs, hunksRendered).text,
+      ),
+    );
+    out.push(
+      renderSide(
+        SIDE_LABELS.theirs,
+        f.theirs,
+        fp.theirs,
+        sideElisionHint(f.path, 'theirs', refs, hunksRendered).text,
+      ),
     );
   }
   if (plan.omittedFiles && plan.omittedFiles.length) {
@@ -160,7 +180,11 @@ export function renderConflictText(
 /** One elided part: its true (untruncated) size, and how to get the full content back. */
 export interface ConflictElision {
   chars: number;
-  /** `read_file(path, ref)` call for a side; absent for `hunks`, which are not fetchable on their own. */
+  /**
+   * For a side: normally the `read_file(path, ref)` call that fetches it in full. With no merge
+   * base (unrelated histories) there is no ref for `base`, so it states that instead of naming a
+   * call the caller cannot make. Absent for `hunks`, which are not fetchable on their own.
+   */
   ref?: string;
   /** `hunks` only: how many hunks and where, so the caller can reconstruct after fetching the sides. */
   count?: number;
@@ -197,13 +221,14 @@ export function buildConflictFilePayload(
   plan: ConflictPayloadPlan,
 ): ConflictFilePayload[] {
   const refs = refsOf(report);
-  const sideRef = (path: string, key: 'base' | 'ours' | 'theirs'): string =>
-    readFileRefCall(path, key, refs) ?? 'no merge base (unrelated histories)';
 
   // plan.files is capped at CONFLICT_MAX_FILES (in 'auto'; uncapped in 'full') — a file beyond the
   // cap gets no entry here at all, only in the report's own (uncapped) `conflictPaths`.
   return plan.files.map((fp, i) => {
     const f = report.files[i]!;
+    // See `renderConflictText`'s identical line — kept in sync with the text channel so both
+    // select the same hint for `base` (see `sideElisionHint`'s doc comment).
+    const hunksRendered = f.hunks.length > 0 && fp.hunks.included;
     const elided: NonNullable<ConflictFilePayload['elided']> = {};
     let anyElided = false;
 
@@ -213,7 +238,10 @@ export function buildConflictFilePayload(
       const part = fp[key];
       if (!part.included) {
         anyElided = true;
-        elided[key] = { chars: part.chars, ref: sideRef(f.path, key) };
+        elided[key] = {
+          chars: part.chars,
+          ref: sideElisionHint(f.path, key, refs, hunksRendered).json,
+        };
         return null;
       }
       return content;
