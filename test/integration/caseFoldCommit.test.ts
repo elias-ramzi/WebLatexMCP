@@ -198,7 +198,7 @@ describe('commitContents folds a new file under a case-differing tracked directo
  */
 describe('commitContents refuses two spellings of one file colliding in one session (issue #66 item 4)', () => {
   it('refuses, names both spellings, and leaves HEAD/index untouched', async () => {
-    const { client, dir } = await setup({ 'Notes.txt': 'a\nb\nc\n' });
+    const { client, ctx, dir } = await setup({ 'Notes.txt': 'a\nb\nc\n' });
     await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
     const git = simpleGit(dir);
     const headBefore = (await git.revparse(['HEAD'])).trim();
@@ -214,11 +214,26 @@ describe('commitContents refuses two spellings of one file colliding in one sess
     });
     expect(isError(w2), textOf(w2)).toBe(false);
 
+    // CI diagnostics (macOS/Windows differ from the Linux hard-link emulation here).
+    const changesBefore = (await ctx.shadows.changes('demo')).map((c) => ({
+      path: c.path,
+      content: c.content,
+      conflicted: c.conflicted,
+      unrecorded: c.unrecorded,
+    }));
+    console.error(
+      '[item4-diag] ignorecase =',
+      (await git.raw(['config', 'core.ignorecase'])).trim(),
+    );
+    console.error('[item4-diag] changes before commit =', JSON.stringify(changesBefore));
+    console.error('[item4-diag] status before commit =', JSON.stringify(await git.status()));
     const committed = await client.callTool({
       name: 'commit',
       arguments: { project: 'demo', message: 'edit both spellings' },
     });
-    expect(isError(committed)).toBe(true);
+    console.error('[item4-diag] commit result =', textOf(committed));
+    console.error('[item4-diag] status after =', JSON.stringify(await git.status()));
+    expect(isError(committed), textOf(committed)).toBe(true);
     expect(textOf(committed)).toMatch(/Notes\.txt/);
     expect(textOf(committed)).toMatch(/notes\.txt/);
 

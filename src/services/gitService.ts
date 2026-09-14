@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
 import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js';
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
@@ -280,6 +280,26 @@ export function hasLinkOnConflictSide(lsFilesOutput: string): boolean {
 }
 
 /**
+ * Whether `rel` (POSIX, relative to `dir`) exists on disk under exactly that spelling, judged one
+ * directory listing at a time — `lstat` alone answers "something is there" on a case-insensitive
+ * filesystem even when only another spelling is. Any unreadable ancestor counts as absent.
+ */
+async function existsWithExactSpelling(dir: string, rel: string): Promise<boolean> {
+  let current = dir;
+  for (const segment of toPosix(rel).split('/').filter(Boolean)) {
+    let names: string[];
+    try {
+      names = await readdir(current);
+    } catch {
+      return false;
+    }
+    if (!names.includes(segment)) return false;
+    current = path.join(current, segment);
+  }
+  return true;
+}
+
+/**
  * The first ancestor of `rel` (POSIX, relative to `dir`, excluding `rel` itself and `dir`) that
  * is a symbolic link in the working tree, as a POSIX relative path, or null when no ancestor is
  * a link. An ancestor that does not exist ends the walk (nothing below it can be a link). The
@@ -376,11 +396,11 @@ export class GitService {
       const unmatched: string[] = [];
       for (const p of paths) {
         if (indexed.some((name) => coversPath(p, name))) continue;
-        const onDisk = await lstat(path.join(dir, p)).then(
-          () => true,
-          () => false,
-        );
-        if (!onDisk) unmatched.push(p);
+        // Judged by exact spelling, segment by segment, not by `lstat`: on a case-insensitive
+        // filesystem `lstat("sub")` succeeds for an on-disk `Sub`, but a literal pathspec on a
+        // repository configured case-sensitive (`core.ignorecase=false`) matches nothing there,
+        // and git's raw "did not match any files" surfaced (Windows CI).
+        if (!(await existsWithExactSpelling(dir, p))) unmatched.push(p);
       }
       if (unmatched.length > 0) {
         throw new Error(
