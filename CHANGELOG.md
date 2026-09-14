@@ -389,8 +389,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   resolved to the index's spelling before `git add` instead of surfacing git's raw "did not match
   any files"; a new file under a case-differing tracked directory (`sub/new.tex` while HEAD has
   `Sub/`) stages under the tracked directory's spelling instead of creating a second, case-differing
-  directory in the tree; and a session that changed both spellings of one file is refused by name
-  before anything is staged, where the second spelling used to win silently. Each fold has its
+  directory in the tree; and a session that writes both spellings of one file gets one shadow entry (the store folds the
+  second key onto the first, since on that filesystem `shadow/notes.txt` _is_ `shadow/Notes.txt`
+  and a second entry used to overwrite the first's shadow with HEAD's bytes, so the commit found
+  nothing staged); an index that still spells one file two ways is refused by name before
+  anything is staged, where the second spelling used to win silently. Each fold has its
   `core.ignorecase=false` twin test proving the comparison stays byte-exact there.
 - **`resolvePush` aborts the rebase when the priming step itself fails; `commit` and `discard` never
   surface git's "did not match" for a path that matches nothing** (#67 review deferrals). The

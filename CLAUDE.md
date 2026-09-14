@@ -169,8 +169,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   comparison byte-exact, as git itself would. `canonicalNames.resolve` also folds the longest
   tracked _directory_ prefix (`sub/new.tex` → `Sub/new.tex` while HEAD tracks `Sub/`), exact-first
   at every depth, so a new file never opens a second, case-differing directory in the tree; and
-  `commitContents` refuses, before any index write, a session whose entries spell one file two ways
-  — the second `update-index --cacheinfo` would otherwise win silently. `GitService.commit` with
+  on such a clone `ShadowStore.record` folds a new key onto an existing entry that differs only
+  in ASCII case (the store is handed `isCaseInsensitive` like its other git hooks), because
+  `shadow/<rel>` and `base/<rel>` sit on the same filesystem, where `shadow/notes.txt` _is_
+  `shadow/Notes.txt` — a second entry silently overwrote the first's shadow with HEAD's bytes and
+  the commit found nothing staged (macOS CI). `commitContents` still refuses, before any index
+  write, an index that spells one file two ways (a legacy one), rather than let the second
+  `update-index --cacheinfo` win silently. `GitService.commit` with
   `paths` resolves each one to the index's spelling too, since a literal pathspec never folds. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
   deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so

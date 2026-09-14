@@ -1188,3 +1188,64 @@ describe('latestTouch', () => {
     expect(latestTouch([entry(null), entry(null)])).toBeNull();
   });
 });
+
+describe('entry keys fold onto an existing spelling on a case-insensitive clone', () => {
+  const PROJECT = 'demo';
+  const DIR = '/nonexistent';
+  const HEAD = 'a\nb\nc\n';
+  async function makeFoldingStore(insensitive: boolean): Promise<{
+    store: ShadowStore;
+    cleanup: () => Promise<void>;
+  }> {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-shadow-fold-'));
+    const store = new ShadowStore(
+      workspace,
+      'a',
+      () => Promise.resolve(Buffer.from(HEAD, 'utf8')),
+      Date.now,
+      undefined,
+      undefined,
+      () => Promise.resolve(insensitive),
+    );
+    return { store, cleanup: () => rm(workspace, { recursive: true, force: true }) };
+  }
+
+  it('records a second spelling into the first entry (one file, one shadow)', async () => {
+    const { store, cleanup } = await makeFoldingStore(true);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.record(PROJECT, DIR, 'notes.txt', 'AAA\n', 'BBB\n');
+      const changes = await store.changes(PROJECT);
+      expect(changes.map((c) => c.path)).toEqual(['Notes.txt']);
+      expect(changes[0]?.content).toBe('BBB\n');
+      expect(changes[0]?.conflicted).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('just outside: byte-exact keys on a case-sensitive clone', async () => {
+    const { store, cleanup } = await makeFoldingStore(false);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.record(PROJECT, DIR, 'notes.txt', HEAD, 'BBB\n');
+      const paths = (await store.changes(PROJECT)).map((c) => c.path).sort();
+      expect(paths).toEqual(['Notes.txt', 'notes.txt']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('markUnrecorded reuses the folded key once record has learnt the answer', async () => {
+    const { store, cleanup } = await makeFoldingStore(true);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.markUnrecorded(PROJECT, 'notes.txt');
+      const changes = await store.changes(PROJECT);
+      expect(changes.map((c) => c.path)).toEqual(['Notes.txt']);
+      expect(changes[0]?.unrecorded).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+});

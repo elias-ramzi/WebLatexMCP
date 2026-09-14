@@ -80,6 +80,9 @@ export function createContext(
     // HEAD's commit sha, once per `refresh`, so a permanently conflicted entry is not re-merged and
     // re-hashed (two `git hash-object` spawns) on every status/commit/push while HEAD stands still.
     (dir) => git.headSha(dir),
+    // Two spellings of one name are one file on an ignorecase clone — and must be one shadow
+    // entry, or the second spelling's on-disk shadow file overwrites the first's.
+    (dir) => git.isCaseInsensitive(dir),
   );
   // Every mutation this server makes is folded into this session's shadow, so `commit` can later
   // stage this session's lines alone. FileService is handed the hook rather than the store so it

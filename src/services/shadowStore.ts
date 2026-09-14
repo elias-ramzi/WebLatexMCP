@@ -4,6 +4,7 @@ import { merge3 } from '../lib/merge3.js';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
 import { toPosix } from '../lib/paths.js';
 import { coversPath } from '../lib/commitPaths.js';
+import { foldCase } from '../lib/caseFold.js';
 import { writeAtomic } from './sessionRegistry.js';
 
 /**
@@ -169,7 +170,44 @@ export class ShadowStore {
     private readonly now: () => number = Date.now,
     private readonly cleanHash?: CleanHasher,
     private readonly resolveHeadSha?: HeadShaReader,
+    /**
+     * Whether the clone at `projectDir` has `core.ignorecase` set (see
+     * `GitService.isCaseInsensitive`). On such a clone two spellings of one name are one file —
+     * and one shadow: `shadow/<rel>` and `base/<rel>` live on the same filesystem, where
+     * `shadow/notes.txt` IS `shadow/Notes.txt`, so a second entry keyed by the other spelling
+     * silently overwrote the first's shadow with HEAD's bytes (macOS CI). `record` therefore
+     * folds a new key onto an existing entry that differs only in ASCII case, so two such keys
+     * never coexist. Optional and injected like the other git-facing hooks; absent means
+     * byte-exact keys.
+     */
+    private readonly isCaseInsensitive?: (projectDir: string) => Promise<boolean>,
   ) {}
+
+  /** `isCaseInsensitive`'s last answer per project, so `markUnrecorded` (no dir) can reuse it. */
+  private readonly insensitiveByProject = new Map<string, boolean>();
+
+  private async caseInsensitive(projectId: string, projectDir: string): Promise<boolean> {
+    if (!this.isCaseInsensitive) return false;
+    try {
+      const answer = await this.isCaseInsensitive(projectDir);
+      this.insensitiveByProject.set(projectId, answer);
+      return answer;
+    } catch {
+      // Unanswerable — keys stay byte-exact for this call, which only ever creates a separate
+      // entry, never loses one.
+      return this.insensitiveByProject.get(projectId) ?? false;
+    }
+  }
+
+  /**
+   * The index key `rel` belongs to: `rel` itself when the index holds it or the clone is
+   * case-sensitive; otherwise an existing key equal to it under git's ASCII fold, if any.
+   */
+  private entryKey(index: ShadowIndex, rel: string, insensitive: boolean): string {
+    if (!insensitive || index.entries[rel]) return rel;
+    const folded = foldCase(rel);
+    return Object.keys(index.entries).find((k) => foldCase(k) === folded) ?? rel;
+  }
 
   /**
    * Whether `a` and `b` are the same content *as git would store it* at `rel` — i.e. they clean-
@@ -219,8 +257,12 @@ export class ShadowStore {
     before: string | Buffer | null,
     after: string | Buffer | null,
   ): Promise<void> {
-    const rel = toPosix(relPath);
     const index = await this.readIndex(projectId);
+    const rel = this.entryKey(
+      index,
+      toPosix(relPath),
+      await this.caseInsensitive(projectId, projectDir),
+    );
     let entry = index.entries[rel];
     const isBinaryChange = Buffer.isBuffer(before) || Buffer.isBuffer(after);
 
@@ -351,8 +393,12 @@ export class ShadowStore {
    * stamped too, since the session did write the file.
    */
   async markUnrecorded(projectId: string, relPath: string): Promise<void> {
-    const rel = toPosix(relPath);
     const index = await this.readIndex(projectId);
+    const rel = this.entryKey(
+      index,
+      toPosix(relPath),
+      this.insensitiveByProject.get(projectId) ?? false,
+    );
     const entry: ShadowIndexEntry = index.entries[rel] ?? { deleted: false, baseExists: false };
     entry.conflicted = true;
     entry.unrecorded = true;

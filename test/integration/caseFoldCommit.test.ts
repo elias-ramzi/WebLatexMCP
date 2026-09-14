@@ -196,12 +196,11 @@ describe('commitContents folds a new file under a case-differing tracked directo
  * over the first, and the commit landed missing one of the session's own edits with no error at
  * all. `commitContents` must refuse the whole commit instead, before any index write.
  */
-describe('commitContents refuses two spellings of one file colliding in one session (issue #66 item 4)', () => {
-  it('refuses, names both spellings, and leaves HEAD/index untouched', async () => {
+describe('two spellings of one tracked file in one session are one entry (issue #66 item 4)', () => {
+  it('ignorecase=true: the second spelling folds into the first entry and the commit carries its content', async () => {
     const { client, ctx, dir } = await setup({ 'Notes.txt': 'a\nb\nc\n' });
     await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
     const git = simpleGit(dir);
-    const headBefore = (await git.revparse(['HEAD'])).trim();
 
     const w1 = await client.callTool({
       name: 'write_file',
@@ -214,34 +213,41 @@ describe('commitContents refuses two spellings of one file colliding in one sess
     });
     expect(isError(w2), textOf(w2)).toBe(false);
 
-    // CI diagnostics (macOS/Windows differ from the Linux hard-link emulation here).
-    const changesBefore = (await ctx.shadows.changes('demo')).map((c) => ({
-      path: c.path,
-      content: c.content,
-      conflicted: c.conflicted,
-      unrecorded: c.unrecorded,
-    }));
-    console.error(
-      '[item4-diag] ignorecase =',
-      (await git.raw(['config', 'core.ignorecase'])).trim(),
-    );
-    console.error('[item4-diag] changes before commit =', JSON.stringify(changesBefore));
-    console.error('[item4-diag] status before commit =', JSON.stringify(await git.status()));
+    // One entry, keyed by the first spelling: on a case-insensitive filesystem the two names are
+    // one file AND one on-disk shadow file, so a second entry used to overwrite the first's
+    // shadow with HEAD's bytes and the commit found nothing staged (macOS/Windows CI).
+    const changes = await ctx.shadows.changes('demo');
+    expect(changes.map((c) => c.path)).toEqual(['Notes.txt']);
+    expect(changes[0]?.content).toBe('BBB\n');
+
     const committed = await client.callTool({
       name: 'commit',
       arguments: { project: 'demo', message: 'edit both spellings' },
     });
-    console.error('[item4-diag] commit result =', textOf(committed));
-    console.error('[item4-diag] status after =', JSON.stringify(await git.status()));
-    expect(isError(committed), textOf(committed)).toBe(true);
-    expect(textOf(committed)).toMatch(/Notes\.txt/);
-    expect(textOf(committed)).toMatch(/notes\.txt/);
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const sha = structured(committed).sha as string;
+    expect(await git.show([`${sha}:Notes.txt`])).toBe('BBB\n');
+    const t = await tree(dir);
+    expect(t).toContain('Notes.txt');
+    expect(t).not.toContain('notes.txt');
+  });
 
-    const headAfter = (await git.revparse(['HEAD'])).trim();
-    expect(headAfter).toBe(headBefore);
-
-    const status = await git.status();
-    expect(status.staged).toEqual([]);
+  it('commitContents still refuses a legacy index that spells one file two ways (ignorecase=true)', async () => {
+    const { ctx, dir } = await setup({ 'Notes.txt': 'a\nb\nc\n' });
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+    const git = simpleGit(dir);
+    const headBefore = (await git.revparse(['HEAD'])).trim();
+    await expect(
+      ctx.git.commitContents(dir, {
+        message: 'both',
+        files: [
+          { path: 'Notes.txt', content: 'AAA\n' },
+          { path: 'notes.txt', content: 'BBB\n' },
+        ],
+      }),
+    ).rejects.toThrow(/"Notes\.txt" and "notes\.txt"/);
+    expect((await git.revparse(['HEAD'])).trim()).toBe(headBefore);
+    expect((await git.status()).staged).toEqual([]);
   });
 
   it('just outside — core.ignorecase=false: both spellings commit as two separate tree entries', async () => {
@@ -280,11 +286,10 @@ describe('commitContents refuses two spellings of one file colliding in one sess
  * entries for what this filesystem treats as one file.
  */
 describe('commitContents refuses two brand-new spellings colliding in one session (issue #66 finding 3)', () => {
-  it('refuses even when neither spelling is tracked yet, names both, leaves HEAD/index untouched', async () => {
-    const { client, dir } = await setup({ 'main.tex': 'orig\n' });
+  it('two spellings of one NEW file fold into one entry too; the legacy refusal covers an old index', async () => {
+    const { client, ctx, dir } = await setup({ 'main.tex': 'orig\n' });
     await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
     const git = simpleGit(dir);
-    const headBefore = (await git.revparse(['HEAD'])).trim();
 
     const w1 = await client.callTool({
       name: 'write_file',
@@ -297,18 +302,31 @@ describe('commitContents refuses two brand-new spellings colliding in one sessio
     });
     expect(isError(w2), textOf(w2)).toBe(false);
 
+    expect((await ctx.shadows.changes('demo')).map((c) => c.path)).toEqual(['New.tex']);
     const committed = await client.callTool({
       name: 'commit',
       arguments: { project: 'demo', message: 'add both spellings of one new file' },
     });
-    expect(isError(committed)).toBe(true);
-    expect(textOf(committed)).toMatch(/New\.tex/);
-    expect(textOf(committed)).toMatch(/new\.tex/);
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const t = await tree(dir);
+    expect(t).toContain('New.tex');
+    expect(t).not.toContain('new.tex');
+    expect(await git.show(['HEAD:New.tex'])).toBe('BBB\n');
 
-    const headAfter = (await git.revparse(['HEAD'])).trim();
-    expect(headAfter).toBe(headBefore);
-    const status = await git.status();
-    expect(status.staged).toEqual([]);
+    // A legacy index (written before keys folded) can still spell one new file two ways:
+    // `commitContents` refuses it by name rather than staging two tree entries for one file.
+    const headBefore = (await git.revparse(['HEAD'])).trim();
+    await expect(
+      ctx.git.commitContents(dir, {
+        message: 'legacy',
+        files: [
+          { path: 'Other.tex', content: 'x\n' },
+          { path: 'other.tex', content: 'y\n' },
+        ],
+      }),
+    ).rejects.toThrow(/"Other\.tex" and "other\.tex"/);
+    expect((await git.revparse(['HEAD'])).trim()).toBe(headBefore);
+    expect((await git.status()).staged).toEqual([]);
   });
 
   it('just outside — core.ignorecase=false: both new spellings commit as two separate tree entries', async () => {
@@ -338,8 +356,8 @@ describe('commitContents refuses two brand-new spellings colliding in one sessio
   });
 });
 
-describe('the two-spellings refusal holds on an unborn HEAD too (issue #66 item 4, re-verify)', () => {
-  it('ignorecase=true, empty remote: New.tex and new.tex are refused before anything is staged', async () => {
+describe('two spellings on an unborn HEAD (issue #66 item 4, re-verify)', () => {
+  it('ignorecase=true, empty remote: the second spelling folds into the first entry; the legacy refusal still holds', async () => {
     const remoteTmp = await mkdtemp(path.join(os.tmpdir(), 'ovl-casefold-empty-'));
     cleanups.push(() => rm(remoteTmp, { recursive: true, force: true }));
     const bareDir = path.join(remoteTmp, 'empty.git');
@@ -381,15 +399,27 @@ describe('the two-spellings refusal holds on an unborn HEAD too (issue #66 item 
       });
       expect(isError(wrote), textOf(wrote)).toBe(false);
     }
+    // The store folds the second spelling into the first entry, so one tree entry lands with the
+    // later content; the `commitContents` refusal stays as a backstop for a legacy index.
+    expect((await ctx.shadows.changes('demo')).map((c) => c.path)).toEqual(['New.tex']);
     const committed = await client.callTool({
       name: 'commit',
       arguments: { project: 'demo', message: 'both spellings' },
     });
-    // Pre-fix: the guard was gated on the HEAD listing, which an unborn HEAD has none of, so
-    // both spellings landed as two tree entries.
-    expect(isError(committed)).toBe(true);
-    expect(textOf(committed)).toMatch(/New\.tex/);
-    expect(textOf(committed)).toMatch(/new\.tex/);
-    expect((await simpleGit(dir).raw(['diff', '--cached', '--name-only'])).trim()).toBe('');
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const listed = (await simpleGit(dir).raw(['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n')
+      .filter(Boolean);
+    expect(listed).toEqual(['New.tex']);
+    expect(await simpleGit(dir).show(['HEAD:New.tex'])).toBe('two\n');
+    await expect(
+      ctx.git.commitContents(dir, {
+        message: 'legacy',
+        files: [
+          { path: 'Old.tex', content: 'x\n' },
+          { path: 'old.tex', content: 'y\n' },
+        ],
+      }),
+    ).rejects.toThrow(/"Old\.tex" and "old\.tex"/);
   });
 });
