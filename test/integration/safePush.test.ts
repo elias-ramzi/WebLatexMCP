@@ -133,6 +133,42 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
   });
 
+  // Regression: `conflictResult`'s summary used to join `conflictPaths` uncapped
+  // (`report.conflictPaths.join(', ')`), so a many-file conflict repeated the full path list a
+  // second time on top of the already-uncapped `conflictPaths` in structuredContent and the
+  // text's own "Conflicted file(s) (N): ..." line. It must use the same `capList(…, 20)` house
+  // cap as everywhere else in this file, while `conflictPaths` itself — the one thing a caller
+  // needs to act — stays uncapped.
+  it('caps the summary at 20 conflicted paths while conflictPaths stays uncapped at 25', async () => {
+    const fileNames = Array.from({ length: 25 }, (_, i) => `f${String(i).padStart(2, '0')}.tex`);
+    const initial = Object.fromEntries(fileNames.map((n) => [n, 'alpha\nbeta\ngamma\n']));
+    const { remote, git, files, dir } = await setup(initial);
+
+    for (const n of fileNames) {
+      await files.applyEdits(dir, n, [{ oldString: 'beta', newString: 'beta-local' }]);
+    }
+    await git.commit(dir, { message: 'local edits to every file' });
+
+    // Remote edits the SAME line in every file — a genuine overlap in all 25.
+    const remoteEdited = Object.fromEntries(
+      fileNames.map((n) => [n, 'alpha\nbeta-remote\ngamma\n']),
+    );
+    await pushCommit(remote, remoteEdited, 'remote edits every file');
+
+    const res = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(res.status).toBe('conflict');
+    const conflict = res.conflict!;
+
+    // The one thing a caller needs in order to act stays uncapped.
+    expect(conflict.conflictPaths).toHaveLength(25);
+
+    // The summary is capped: it names the first 20 and appends the house "… N more" tail — not
+    // a 25-entry repeat of conflictPaths.
+    expect(res.summary).toMatch(/… 5 more/);
+    for (const n of fileNames.slice(0, 20)) expect(res.summary).toContain(n);
+    for (const n of fileNames.slice(20)) expect(res.summary).not.toContain(n);
+  });
+
   describe('conflict payload budget (large sides do not blow past a tool result cap)', () => {
     // A single file whose base/ours/theirs are each well past CONFLICT_SIDE_CAP (12000 chars) —
     // the shape of the real-world failure: one conflicted file's sides alone produced a

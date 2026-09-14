@@ -11,7 +11,11 @@ import {
   renderRebasedOver,
   buildConflictFilePayload,
 } from '../lib/conflictText.js';
-import { planConflictPayload, CONFLICT_MAX_FILES } from '../lib/conflictBudget.js';
+import {
+  planConflictPayload,
+  CONFLICT_MAX_FILES,
+  CONFLICT_MAX_SPANS,
+} from '../lib/conflictBudget.js';
 import { toPosix } from '../lib/paths.js';
 import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
 import { foldCase } from '../lib/caseFold.js';
@@ -76,7 +80,11 @@ const conflictElisionSchema = z.object({
   spans: z
     .array(z.object({ startLine: z.number(), endLine: z.number() }))
     .optional()
-    .describe('hunks only: the line span each elided hunk covered in the conflicted working file.'),
+    .describe(
+      'hunks only: the line span each elided hunk covered in the conflicted working file — ' +
+        `capped at the first ${CONFLICT_MAX_SPANS}; \`count\` is the true total, so \`count > ` +
+        'spans.length` means the rest were dropped.',
+    ),
 });
 
 /** `null` is ambiguous by itself: "absent" (added/deleted) and "elided for size" both look like
@@ -226,8 +234,10 @@ const outputSchema = {
     .boolean()
     .optional()
     .describe(
-      'True iff any file in conflictFiles has an `elided` entry (conflictDetail: "auto" cut ' +
-        'something to fit the payload budget). Absent unless status === "conflict".',
+      'True iff conflictDetail: "auto" cut anything to fit the payload budget — a file in ' +
+        `conflictFiles carries an \`elided\` entry, or conflicted files past ${CONFLICT_MAX_FILES} ` +
+        'got no per-file block at all (still listed in conflictPaths). Absent unless status === ' +
+        '"conflict".',
     ),
   // status === 'awaiting-approval'
   base: z.string().optional(),

@@ -416,7 +416,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   hunk and array element, the per-file `━━━━━ path ━━━━━` header, the per-side label) or a conflict with
   many small hunks/files reproduces the same blowup with the content itself nowhere near the limit —
   `HUNK_MARKER_OVERHEAD`/`HUNK_JSON_OVERHEAD`/`HUNK_LINE_ELEMENT_OVERHEAD`/`FILE_HEADER_OVERHEAD`/
-  `SIDE_LABEL_OVERHEAD` name each piece and are pinned by tests that render a known input and check the
+  `SIDE_LABEL_OVERHEAD`/`SIDE_ELISION_OVERHEAD`/`HUNK_ELISION_TEXT_OVERHEAD` name each piece (the last
+  two are what an _elision_ itself costs — cutting is not free) and are pinned by tests that render a known input and check the
   constant still accounts for it, so `conflictText.ts`'s templates can't silently drift out from under
   them. `hunks` are allocated first (least recoverable once the rebase aborts, so cut last) and
   `base`/`ours`/`theirs` next (individually cap at `CONFLICT_SIDE_CAP`, cut first — recoverable in one

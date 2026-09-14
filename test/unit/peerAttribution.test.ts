@@ -3,6 +3,8 @@ import {
   attributePeers,
   formatAge,
   renderPeerRefusal,
+  composeClosing,
+  PUSH_VOCABULARY,
   REFUSAL_PATH_CAP,
   type Attribution,
 } from '../../src/lib/peerAttribution.js';
@@ -601,6 +603,46 @@ describe('renderPeerRefusal', () => {
       expect(pointerIdx).toBeGreaterThan(noneOwnIdx);
       expect(pointerIdx).toBeLessThan(lines.length - 1);
     });
+
+    // The header-length setter (`theirs.length > REFUSAL_PATH_CAP`) is the only `truncated` setter
+    // any real `attributePeers` output can trip in production — the two later setters, on an
+    // individual session's `owns` and on `unowned`, are documented as unreachable there because
+    // both lists are always subsets of `theirs`, so either one exceeding the cap already implies
+    // `theirs` does too. Every other test in this file that exercises the pointer builds an
+    // Attribution (by hand or via `attributePeers`) whose `owns` or `unowned` ALSO exceeds the cap,
+    // so it can't tell the header-length setter apart from the two "unreachable" ones — a mutant
+    // that stubs `truncated` to `false` still passes every one of them. This test isolates the
+    // header-only case: 21 total disputed paths, split via the real `attributePeers` so two peers
+    // own exactly 10 each and one path is unowned — every per-list count stays at or under the cap
+    // (10, 10, 1), so only `theirs.length` (21) exceeds it.
+    it('renders the pointer for a real attributePeers split whose theirs exceeds the cap but every per-list count does not', () => {
+      const owned1 = Array.from({ length: 10 }, (_, i) => `o1-${i}.tex`);
+      const owned2 = Array.from({ length: 10 }, (_, i) => `o2-${i}.tex`);
+      const theirs = [...owned1, ...owned2, 'unowned.tex'];
+      expect(theirs.length).toBe(21);
+
+      const peers = [
+        { sessionId: 'beta', heartbeatAt: new Date(NOW - 10_000).toISOString() },
+        { sessionId: 'gamma', heartbeatAt: new Date(NOW - 20_000).toISOString() },
+      ];
+      const entries = new Map<string, PeerShadowEntry[] | null>([
+        ['beta', owned1.map((p) => entry(p))],
+        ['gamma', owned2.map((p) => entry(p))],
+      ]);
+
+      const a = attributePeers(theirs, peers, entries);
+      // Sanity: every per-list count is at or under the cap — only theirs.length trips it.
+      for (const s of a.sessions) expect(s.owns.length).toBeLessThanOrEqual(REFUSAL_PATH_CAP);
+      expect(a.unowned.length).toBeLessThanOrEqual(REFUSAL_PATH_CAP);
+      expect(a.unowned).toEqual(['unowned.tex']);
+
+      const text = renderPeerRefusal(theirs, a, NOW);
+      const lines = text.split('\n');
+      const header = lines[0] as string;
+
+      expect(header.endsWith(', … 1 more.')).toBe(true);
+      expect(text).toContain('Lists here are capped at 20 paths');
+    });
   });
 
   it('renders the realistic refusal shape: an owning peer AND a non-empty unowned set, both over the cap', () => {
@@ -666,5 +708,78 @@ describe('renderPeerRefusal', () => {
     expect(line).not.toContain('more');
     // No path is echoed on this line — it may own anything, not "these specific files".
     expect(line).not.toContain('p50.tex');
+  });
+});
+
+describe('composeClosing retracts discard for peer-owned files', () => {
+  // `commit scope: "paths"` refuses a peer-owned path outright, so the closing's `ownedAdvice`
+  // already corrects the typed `LocalChangesOverwriteError`'s "commit scope: paths, OR discard"
+  // prescription for the commit half. Nothing retracted the discard half: `discard` has no
+  // ownership guard at all, so a caller following the typed message's "discard, paths: [...]"
+  // over a live peer's owned file would destroy that peer's uncommitted work.
+  const NOW = Date.parse('2026-01-01T00:10:00.000Z');
+
+  const readableOwner: Attribution = {
+    sessions: [
+      {
+        sessionId: 'beta',
+        heartbeatAt: new Date(NOW - 10_000).toISOString(),
+        owns: ['a.tex'],
+        lastWriteAt: new Date(NOW - 42_000).toISOString(),
+        unreadable: false,
+      },
+    ],
+    unowned: [],
+  };
+
+  const unreadablePeer: Attribution = {
+    sessions: [
+      {
+        sessionId: 'delta',
+        heartbeatAt: new Date(NOW - 5_000).toISOString(),
+        owns: ['a.tex'],
+        lastWriteAt: null,
+        unreadable: true,
+      },
+    ],
+    unowned: [],
+  };
+
+  const mixed: Attribution = {
+    sessions: [
+      {
+        sessionId: 'beta',
+        heartbeatAt: new Date(NOW - 10_000).toISOString(),
+        owns: ['a.tex'],
+        lastWriteAt: new Date(NOW - 42_000).toISOString(),
+        unreadable: false,
+      },
+    ],
+    unowned: ['notes.txt'],
+  };
+
+  const unownedOnly: Attribution = { sessions: [], unowned: ['notes.txt'] };
+
+  it('retracts discard when a readable peer owns a file', () => {
+    const closing = composeClosing(readableOwner, PUSH_VOCABULARY);
+    expect(closing).toContain('`discard`');
+    expect(closing).toMatch(/no ownership guard/);
+  });
+
+  it('retracts discard when the owning peer is unreadable', () => {
+    const closing = composeClosing(unreadablePeer, PUSH_VOCABULARY);
+    expect(closing).toContain('`discard`');
+    expect(closing).toMatch(/no ownership guard/);
+  });
+
+  it('retracts discard for the owned group of a mixed owned+unowned closing', () => {
+    const closing = composeClosing(mixed, PUSH_VOCABULARY);
+    expect(closing).toContain('`discard`');
+    expect(closing).toMatch(/no ownership guard/);
+  });
+
+  it('says nothing about discard when only unowned files are present', () => {
+    const closing = composeClosing(unownedOnly, PUSH_VOCABULARY);
+    expect(closing).not.toContain('discard');
   });
 });

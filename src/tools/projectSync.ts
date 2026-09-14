@@ -41,6 +41,11 @@ const PULL_VOCABULARY: ClosingVocabulary = {
  * edits would be reported as "not this session's", which is false. When nothing foreign remains
  * (or no live peer exists at all) there is nothing to attribute, so the plain typed message passes
  * through unchanged.
+ *
+ * The decoration itself can fail (an unreadable session dir, a transient fs error reading a peer's
+ * shadow index) — that must never cost the caller the typed `LocalChangesOverwriteError` it needs
+ * to act on, so any failure past the `instanceof` check falls back to the original error unchanged
+ * rather than replacing it.
  */
 async function enrichLocalChangesOverwrite(
   ctx: AppContext,
@@ -50,21 +55,25 @@ async function enrichLocalChangesOverwrite(
   if (!(err instanceof LocalChangesOverwriteError) || err.paths.length === 0) {
     return err instanceof Error ? err : new Error(String(err));
   }
-  const peers = await ctx.sessions.livePeers(id);
-  if (peers.length === 0) return err;
+  try {
+    const peers = await ctx.sessions.livePeers(id);
+    if (peers.length === 0) return err;
 
-  const mine = new Set((await ctx.shadows.changes(id)).map((c) => c.path));
-  const theirs = err.paths.filter((p) => !mine.has(p));
-  if (theirs.length === 0) return err;
+    const mine = new Set((await ctx.shadows.changes(id)).map((c) => c.path));
+    const theirs = err.paths.filter((p) => !mine.has(p));
+    if (theirs.length === 0) return err;
 
-  const attribution = attributePeers(
-    theirs,
-    peers,
-    await collectPeerShadows(ctx.shadows, id, peers),
-  );
-  const now = Date.now();
-  const closing = composeClosing(attribution, PULL_VOCABULARY);
-  return new Error(`${err.message}\n\n${renderPeerRefusal(theirs, attribution, now, closing)}`);
+    const attribution = attributePeers(
+      theirs,
+      peers,
+      await collectPeerShadows(ctx.shadows, id, peers),
+    );
+    const now = Date.now();
+    const closing = composeClosing(attribution, PULL_VOCABULARY);
+    return new Error(`${err.message}\n\n${renderPeerRefusal(theirs, attribution, now, closing)}`);
+  } catch {
+    return err;
+  }
 }
 
 const inputSchema = {

@@ -1908,7 +1908,7 @@ export class GitService {
       branch,
       summary:
         `Rebase onto ${report.rebasedOnto} conflicts in ${report.files.length} file(s) ` +
-        `(${report.conflictPaths.join(', ')}). The rebase was aborted and nothing was pushed — ` +
+        `(${capList(report.conflictPaths, 20)}). The rebase was aborted and nothing was pushed — ` +
         'resolve the overlap and push the merged content back (see docs/tools.md).',
       conflict: report,
     };
@@ -2160,23 +2160,33 @@ const UNTRACKED_OVERWRITE_RE =
   /following untracked working tree files would be (?:overwritten|removed) by (?:checkout|merge)/i;
 
 /**
- * Pull the indented file list following the first line matching `startRe` out of one of git's
- * "would be overwritten" error blocks. Shared by both the untracked-file and the
- * tracked-modification refusals, which differ only in their opening line's wording — the
- * indented-path-list shape underneath is identical. Stops at the first non-tab-indented line, or
- * an (already-trimmed) blank line, whichever comes first.
+ * Pull the indented file list following EVERY line matching `startRe` out of git's "would be
+ * overwritten" error text, concatenated in order and deduplicated. Shared by both the
+ * untracked-file and the tracked-modification refusals, which differ only in their opening
+ * line's wording — the indented-path-list shape underneath is identical. Real git (2.46) emits
+ * a SEPARATE block per group of files when a tree has both index-only staged changes and
+ * worktree modifications the incoming commit touches, not one block listing everything —
+ * collecting only the first block silently dropped every path named in the rest. Each block
+ * stops at its first non-tab-indented line, or an (already-trimmed) blank line, whichever comes
+ * first; scanning then resumes looking for the next `startRe` match.
  */
 function parseIndentedPathList(message: string, startRe: RegExp): string[] {
   const lines = message.split('\n');
-  const start = lines.findIndex((line) => startRe.test(line));
-  if (start === -1) return [];
+  const seen = new Set<string>();
   const paths: string[] = [];
-  for (let i = start + 1; i < lines.length; i++) {
-    const line = lines[i] ?? '';
-    if (!line.startsWith('\t')) break;
-    const trimmed = line.replace(/^\t/, '').trim();
-    if (!trimmed) break;
-    paths.push(toPosix(trimmed));
+  for (let i = 0; i < lines.length; i++) {
+    if (!startRe.test(lines[i] ?? '')) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j] ?? '';
+      if (!line.startsWith('\t')) break;
+      const trimmed = line.replace(/^\t/, '').trim();
+      if (!trimmed) break;
+      const posix = toPosix(trimmed);
+      if (!seen.has(posix)) {
+        seen.add(posix);
+        paths.push(posix);
+      }
+    }
   }
   return paths;
 }

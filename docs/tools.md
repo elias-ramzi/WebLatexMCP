@@ -420,7 +420,7 @@ path, never capped), `remoteHead`, `mergeBase`, and `remoteCommits`. (You can re
 allocated first (least recoverable once the rebase aborts), then `base`/`ours`/`theirs`, each capped
 individually — a part that doesn't fit comes back `null` with a matching `elided` entry (its true size and
 a `read_file(path, ref)` pointer to fetch it in full; an elided `hunks` block has no `ref` of its own —
-reconstruct it from the fetched sides) — and a `null` with **no** `elided` entry still means the ordinary
+it carries its hunk `count` and the first 20 line `spans`; reconstruct it from the fetched sides) — and a `null` with **no** `elided` entry still means the ordinary
 thing, absent on that side (added/deleted). Past 20 conflicted files the rest get no per-file detail at
 all, though they remain fully named in `conflictPaths`. `conflictTruncated` is true whenever any of that
 fired. Pass `conflictDetail: "full"` for the old, uncapped behavior — every side of every file in full,

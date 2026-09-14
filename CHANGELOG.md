@@ -63,7 +63,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   them before you merge"_ — which prescribes `stash`, a command this server does not expose, and never
   mentions `commit` or `discard`, which it does. Of the two exits git offered, one does not exist here;
   on a client with no shell it cannot be reached at all. The tracked wording now has the typed
-  `LocalChangesOverwriteError` that the untracked wording has had (`UntrackedOverwriteError`), carrying
+  `LocalChangesOverwriteError` that the untracked wording has had on `push` (`UntrackedOverwriteError`;
+  an untracked file blocking a _pull_ still surfaces git's own wording), carrying
   the parsed paths and saying that nothing changed — `merge --ff-only` aborts cleanly, so HEAD did not
   move and the working tree is exactly as it was — then naming the exits this server actually has and
   stating plainly that git's `stash` advice is not available. Because the error knows exactly which
@@ -80,7 +81,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   rather than each carrying a static paragraph, because the files they list fall into two groups needing
   **opposite** advice. A peer-owned file can only be taken with `scope: "all"`, since `scope: "paths"`
   refuses outright any path a live session's shadow lists — so the closing now says that, instead of
-  offering `scope: "paths"` as a parenthetical alternative that would have bounced. A file **no** live
+  offering `scope: "paths"` as a parenthetical alternative that would have bounced — and it retracts the
+  scoped `discard` for that group too, since `discard` has no ownership guard and would destroy the
+  owner's uncommitted work. A file **no** live
   session owns is the reverse: `scope: "paths"` naming just those paths is the better route, because it
   cannot sweep in a peer's lines the way `scope: "all"` would. A peer whose change index is unreadable
   is advised as an owner, not as unowned — the advice fails closed exactly as the refusal does. Sharing

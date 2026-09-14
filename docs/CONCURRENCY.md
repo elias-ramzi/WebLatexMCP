@@ -228,7 +228,9 @@ ago it last wrote through the server, and how long ago it was last seen; and, ap
 the files no live session owns (edited outside the server, or left by a session that
 has since exited). That is what separates "wait" from "take over": a write seconds old
 is a peer mid-paragraph; one hours old, from a session that is merely still open, is a
-judgement the caller can now make with `commit scope: "all"` or `"paths"`. A session
+judgement the caller can now make with `commit scope: "all"` (peer-owned files) or
+`"paths"` (files no live session owns) — never with `discard`, which has no ownership
+guard and would destroy the owner's uncommitted work. A session
 whose index cannot be read is treated as owning everything, never as owning nothing.
 A write is never failed because its shadow record could not be written, but the
 failure is not silent either: the path is marked in the session's index as

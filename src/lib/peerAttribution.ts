@@ -201,7 +201,8 @@ export function composeClosing(a: Attribution, vocab: ClosingVocabulary): string
   const ownedAdvice =
     'Taking the peer-owned files requires committing with scope "all" — scope "paths" is not an ' +
     'option for them: it refuses any path a live session owns, and refuses outright while a live ' +
-    "session's change index cannot be read.";
+    "session's change index cannot be read. Do not `discard` them either: discard has no " +
+    "ownership guard, so it would destroy the owner's uncommitted work.";
   const only = a.unowned.length === 1;
   const unownedAdvice =
     `${capList(a.unowned, REFUSAL_PATH_CAP)} — not owned by any live session — can be committed ` +
@@ -226,7 +227,8 @@ export function composeClosing(a: Attribution, vocab: ClosingVocabulary): string
   // session owns. Advising the route that fails closed is the safe direction to be wrong in.
   return (
     `${opening} Take ownership deliberately with commit scope "all" — scope "paths" refuses ` +
-    `outright any path a live session owns. ${retry}`
+    'outright any path a live session owns. Do not `discard` them either: discard has no ' +
+    `ownership guard, so it would destroy the owner's uncommitted work. ${retry}`
   );
 }
 

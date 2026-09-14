@@ -63,6 +63,41 @@ describe('LocalChangesOverwriteError / localChangesOverwriteFromError', () => {
     expect(err?.paths).toEqual(['tables/results.tex', 'sections/intro.tex', 'notes/scratch.md']);
   });
 
+  // Regression: real git (2.46 against a bare repo) emits a SEPARATE "would be overwritten by
+  // merge" block per group of files when the tree has both index-only staged changes and
+  // worktree modifications the incoming commit touches — not one block listing everything.
+  // Collecting only the paths after the FIRST such block silently drops every path named in the
+  // second, so the `paths` argument the message prescribes (`commit scope: "paths"`) names a
+  // subset and the next sync refuses again on the rest.
+  it('collects paths from EVERY "would be overwritten" block, not just the first', () => {
+    const stderr =
+      'error: Your local changes to the following files would be overwritten by merge:\n' +
+      '\ta.tex\n' +
+      'Please commit your changes or stash them before you merge.\n' +
+      'error: Your local changes to the following files would be overwritten by merge:\n' +
+      '\tb.tex\n' +
+      '\tc.tex\n' +
+      'Please commit your changes or stash them before you merge.\n' +
+      'Aborting\n';
+    const err = localChangesOverwriteFromError(new Error(stderr));
+    expect(err).toBeInstanceOf(LocalChangesOverwriteError);
+    expect(err?.paths).toEqual(['a.tex', 'b.tex', 'c.tex']);
+  });
+
+  it('deduplicates a path repeated across two "would be overwritten" blocks', () => {
+    const stderr =
+      'error: Your local changes to the following files would be overwritten by merge:\n' +
+      '\ta.tex\n' +
+      'Please commit your changes or stash them before you merge.\n' +
+      'error: Your local changes to the following files would be overwritten by merge:\n' +
+      '\ta.tex\n' +
+      '\tb.tex\n' +
+      'Please commit your changes or stash them before you merge.\n' +
+      'Aborting\n';
+    const err = localChangesOverwriteFromError(new Error(stderr));
+    expect(err?.paths).toEqual(['a.tex', 'b.tex']);
+  });
+
   it('names the paths, mentions commit and discard, and does not prescribe stash', () => {
     const err = new LocalChangesOverwriteError(['tables/results.tex']);
     expect(err.message).toContain('tables/results.tex');

@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
-import { createContext } from '../../src/context.js';
+import { createContext, type AppContext } from '../../src/context.js';
 import { createServer } from '../../src/server.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
@@ -49,7 +49,7 @@ describe('project_sync pull-refusal attribution', () => {
   async function setup(): Promise<{
     remote: FakeRemote;
     dir: string;
-    session: (id: string) => Promise<Session>;
+    session: (id: string, patchCtx?: (ctx: AppContext) => void) => Promise<Session>;
   }> {
     const remote = await createFakeRemote({ [REL]: BASE });
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-syncattr-'));
@@ -63,9 +63,10 @@ describe('project_sync pull-refusal attribution', () => {
     const dir = path.join(workspace, 'demo');
     await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
 
-    const session = async (id: string): Promise<Session> => {
+    const session = async (id: string, patchCtx?: (ctx: AppContext) => void): Promise<Session> => {
       const config: ServerConfig = { ...baseConfig, sessionId: id };
       const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+      patchCtx?.(ctx);
       const server = createServer(ctx);
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: `test-${id}`, version: '0.0.0' });
@@ -152,5 +153,45 @@ describe('project_sync pull-refusal attribution', () => {
     expect(err).toContain("not this session's");
     expect(err).toContain('beta\\" owns');
     expect(err).toContain(REL);
+
+    // The composed closing must retract `discard` for beta's owned file too — the typed
+    // LocalChangesOverwriteError this refusal is appended to already says "discard" earlier (it
+    // prescribes `discard, paths: [...]` as one of its two named routes for the collision as a
+    // whole), so asserting the word appears anywhere would pass without the retraction. Assert
+    // instead that a retraction sentence appears strictly AFTER the peer-ownership line.
+    const peerLineIdx = err.indexOf('beta\\" owns');
+    expect(peerLineIdx).toBeGreaterThanOrEqual(0);
+    const after = err.slice(peerLineIdx);
+    expect(after).toContain('discard');
+    expect(after).toMatch(/no ownership guard/);
+  });
+
+  it('falls back to the plain typed refusal when the peer-attribution enrichment itself fails', async () => {
+    // A rejection from ctx.sessions.livePeers (or ctx.shadows.changes/collectPeerShadows) — an
+    // unreadable session dir, a transient fs error — must not replace the typed
+    // LocalChangesOverwriteError the caller needs to act on; it should just mean the refusal isn't
+    // decorated with peer attribution this time.
+    const { remote, session } = await setup();
+    const alpha = await session('alpha', (ctx) => {
+      ctx.sessions.livePeers = async () => {
+        throw new Error('boom');
+      };
+    });
+
+    await editMethod(alpha, 'It states the assumption, per alpha (broken attribution).');
+
+    await pushCommit(
+      remote,
+      { [REL]: BASE.replace('opens the method.', 'opens it, remotely, again.') },
+      'remote edit 2',
+    );
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    // Precondition: the typed error named the path, so the enrichment entered its `try` (an
+    // empty `paths` returns before it) and the stubbed `livePeers` really did throw.
+    expect(err).toContain(REL);
+    expect(err).toContain('The pull was refused; nothing changed');
+    expect(err).not.toContain('boom');
   });
 });
