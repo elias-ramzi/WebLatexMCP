@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -78,6 +78,20 @@ describe.skipIf(process.platform === 'win32')(
       // Pre-fix: ['a1.tex', 'a[1].tex'] — the glob matched both.
       expect(files).toEqual(['a[1].tex']);
       expect(sc.leftUncommitted).toEqual(['a1.tex']);
+    });
+
+    it('discard naming a[1].tex does not revert a dirty a1.tex', async () => {
+      const { client, clone } = await setup({ 'a1.tex': 'one\n', 'a[1].tex': 'bracket\n' });
+      await writeFile(path.join(clone, 'a1.tex'), 'one changed\n', 'utf8');
+      await writeFile(path.join(clone, 'a[1].tex'), 'bracket changed\n', 'utf8');
+      const res = await client.callTool({
+        name: 'discard',
+        arguments: { project: 'demo', paths: ['a[1].tex'], confirm: true },
+      });
+      expect((res as { isError?: boolean }).isError).not.toBe(true);
+      // Pre-fix: `git checkout -- 'a[1].tex'` globbed onto a1.tex and reverted it too.
+      expect(await readFile(path.join(clone, 'a1.tex'), 'utf8')).toBe('one changed\n');
+      expect(await readFile(path.join(clone, 'a[1].tex'), 'utf8')).toBe('bracket\n');
     });
   },
 );

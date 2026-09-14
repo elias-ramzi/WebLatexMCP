@@ -375,6 +375,57 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **A deletion under a linked directory is recorded where the file really was** (#67 review). With a
+  tracked in-project link `linkdir -> realdir`, `delete_file linkdir/notes.tex` removes the real
+  `realdir/notes.tex` — but the session's record was filed under the link's path, a key git rejects
+  ("beyond a symbolic link"), so every later session commit failed with that raw fatal, unrelated files
+  included. `delete` now attributes the removal to the parent resolved through links plus the literal
+  final component (`attributedDeletePath`): a link named `link.tex` still records as `link.tex` (`rm`
+  removes the link), a path under a linked directory records as the real file. Like the write-side
+  attribution, a resolution failure never fails the delete — one stderr line, and the given name is
+  used. `add_citation`'s confirmation diff now goes through the same `changedPath` rule as
+  `write_file`/`edit_file`, so a `.bib` that is itself a link shows the target's diff instead of an
+  empty one.
+- **`commit scope: "paths"` no longer surfaces git's raw "did not match any files" for a stale record**
+  (#67 review). The item-2 rescue let a requested path that this session still tracked past the
+  "not changed in the working tree" refusal so a stale record could settle — but it also put that
+  path into `git add`, which fatals when nothing is left on disk (`write_file` then `delete_file`, or a
+  hand `rm`). A path that covers nothing dirty stages nothing by definition, so it is now kept out of
+  the `git add` pathspec and settled by the handler as before; when nothing stageable remains the
+  call returns `committed: false` with the record under `settled`. The ignore list also survives the
+  mixed case: when some requested paths are ignored and the rest already match HEAD, `GitService`'s
+  bare nothing-to-commit error is rethrown carrying `ignored`, the result lists them, and the headline
+  says which paths were skipped as ignored and which already matched HEAD, instead of claiming the
+  tree matched HEAD for a dirty ignored file. `scope: "all"` with `paths` now hands git a POSIX,
+  `./`-stripped form, as `scope: "paths"` also now does (a Windows `sub\notes.tex` used to reach
+  `--literal-pathspecs add` verbatim), and the `paths` description says what both scopes already
+  did: matched literally, no globs. `sha`'s description names the `"unborn"` sentinel.
+- **Ignored session entries are reported and settled whatever their flags** (#67 review). A record
+  that was both git-ignored and `conflicted`/`unrecorded` (this session wrote an excluded note, a
+  peer wrote the same lines) was never settled and never listed under `ignored`; the refusal called
+  it conflicted and pointed at `scope: "all"`, which cannot commit an ignored file either. The ignore
+  check now runs over every session entry, ignored ones are settled and dropped from
+  `conflicted`/`unrecorded` before the refusal is worded. A `scope: "paths"`/`"all"` request naming a
+  _directory_ also names, under `ignored`, the session's ignored entries beneath it that `git add`
+  skipped and the take settled. The `discard` hint says what `discard` does: it reverts those paths
+  for every session, not only this one.
+- **A tracked link replaced by a regular file commits as one** (#67 review). `commitContents`'
+  refusal to stage content over a mode-120000 entry judged the index right after its reset to HEAD,
+  so `delete_file link.tex` then `write_file link.tex` — a typechange `git add` records without
+  comment — was refused, and the remedy named the two calls the caller had just made. The refusal now
+  fires only when the path is _still_ a symlink on disk (the stale-record case it exists for); a
+  regular file there stages as `100644`.
+- **`resolvePush` aborts the paused rebase on _any_ exception, not only its deliberate refusals** (#67
+  review). A failed `ls-files`/`add` spawn or `writeFile` inside the loop used to propagate with the
+  clone left mid-rebase (conflict markers on disk, detached HEAD) — two of those spawns were new in
+  #67, the other legs older. The loop body is now one try/catch around `abortRebaseIfInProgress`. The
+  symlink refusal's text also names the shell-free way out, `reset_to_remote (confirm: true)`, as the
+  conflict report's guidance already did. `GitService.diff` passes `--literal-pathspecs` like `add`,
+  `ls-files` and `ls-tree`, since the write tools' confirmation diff now feeds it a path a caller
+  named — and so does `discard` with `paths` (`checkout`/`clean`), the most destructive place for
+  `a[1].tex` to also mean `a1.tex`. One consequence for old session state: a shadow key filed under
+  a linked directory by a pre-fix `delete_file` is now refused by `check-ignore` even on a
+  `conflicted` entry; `discard` clears it, and no such key is written any more.
 - **A session commit no longer takes files git ignores** (#66, item 1). `scope: "session"` stages
   from the session's shadow with `update-index`, which never consults `.gitignore` or
   `.git/info/exclude` — so a file this server wrote that git would never stage (the `summarize-paper`
@@ -391,12 +442,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   (`core.ignorecase`, which git sets on macOS and Windows clones) the HEAD lookup folds case, so a
   file tracked as `Notes.txt` and edited as `notes.txt` is tracked, not ignored — under either
   basis. The same ASCII fold (git's own; exact spelling wins where a tree holds both) now applies
-  wherever this server looks a path up by name: the session's shadow base is read from HEAD's
+  wherever this server looks a path up by name — with one exception, tracked separately:
+  `scope: "paths"`'s peer-ownership check (`coversPath`/`peerOwnership` in
+  `src/lib/commitPaths.ts`) still compares shadow index keys byte-for-byte, so on an ignorecase
+  clone a peer's `Notes.txt` entry does not protect a request naming `notes.txt`. Elsewhere: the session's shadow base is read from HEAD's
   spelling, so such an edit no longer seeds an empty base and swallows a peer's uncommitted lines
   whole, and the session commit stages under HEAD's spelling, since `update-index --cacheinfo`
   does none of the case-alias lookup `git add` does — such an edit used to land as a second,
   case-differing tree entry, and a deletion removed nothing. A request whose every path is
-  ignored is refused by name, not with "no changes". Pathspecs handed to `git add` and `ls-files` are now
+  ignored is refused by name, not with "no changes". Pathspecs handed to `git add`, `ls-files`, `ls-tree` and `diff` are now
   literal, never globs: naming `a[1].tex` used to stage a peer's dirty `a1.tex` past the ownership
   check.
 - **`status` (and every tool that starts from it) works on a clone of an empty remote.** The branch

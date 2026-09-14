@@ -397,9 +397,11 @@ export class FileService {
    * project anyway (see CLAUDE.md's "Local projects never see git" bullet), and an absolute path
    * must never reach the recorder.
    *
-   * `delete` does NOT go through this — see the comment at its call site: `rm(abs)` removes the
-   * link itself, never the target, so attributing the deletion to the link's own name is already
-   * correct.
+   * `delete` uses a related but distinct helper, {@link attributedDeletePath}: unlike a write,
+   * `rm(abs)` removes exactly the entry `abs` names, so when the link is relPath's FINAL
+   * component the link itself is what disappears and the literal name is already correct — but an
+   * ANCESTOR directory that is itself a link (`linkdir -> realdir`) means the bytes removed live
+   * at `realdir/notes.tex`, not `linkdir/notes.tex`, so only the parent is resolved through links.
    */
   private async attributedPath(projectDir: string, abs: string, relPath: string): Promise<string> {
     // Called after the bytes are on disk, so it must not fail the write: for a git project
@@ -418,6 +420,50 @@ export class FileService {
       target = null;
     }
     return changedPath(target, relPath);
+  }
+
+  /**
+   * The name a deletion through `relPath` should be attributed to: the PARENT directory resolved
+   * through links, joined with `relPath`'s literal basename — never the basename resolved through
+   * a link of its own.
+   *
+   * `rm(abs)` removes exactly the entry `abs` names. When the link is relPath's *final* component
+   * (`link.tex -> main.tex`), that entry is the link, so the correct attribution is the link's own
+   * name — the parent resolves to `null` (no link above it) and this falls back to `relPath`. But
+   * when an *ancestor* directory is the link (`linkdir -> realdir`), `rm(<project>/linkdir/notes.tex)`
+   * removes `<project>/realdir/notes.tex` — a real file the shadow store must key on, or the next
+   * session commit tries to stage a path beyond a symlink (`linkdir/notes.tex`), which `git
+   * check-ignore`/`update-index` refuse outright, wedging the session (issue #66 item 6).
+   *
+   * Like {@link attributedPath}, this must never fail the delete: on a resolution error it logs one
+   * `console.error` line and falls back to the given name.
+   */
+  private async attributedDeletePath(
+    projectDir: string,
+    abs: string,
+    relPath: string,
+  ): Promise<string> {
+    const parentAbs = path.dirname(abs);
+    // dirname(abs) for a top-level path is projectDir itself; the matching relative side is "." —
+    // resolveLinkTarget treats that as "the root, unresolved" and correctly returns null.
+    const relParent = path.posix.dirname(toPosix(relPath));
+    let parentTarget: string | null;
+    try {
+      parentTarget = await this.resolveLinkTarget(projectDir, parentAbs, relParent);
+    } catch (err) {
+      console.error(
+        `[web-latex-mcp] could not resolve where the parent directory of "${relPath}" lands; ` +
+          'attributing the deletion to that name as given:',
+        err instanceof Error ? err.message : err,
+      );
+      parentTarget = null;
+    }
+    if (parentTarget === null) return toPosix(relPath);
+    const base = path.posix.basename(toPosix(relPath));
+    const full = path.isAbsolute(parentTarget)
+      ? parentTarget
+      : toPosix(path.posix.join(parentTarget, base));
+    return changedPath(full, relPath);
   }
 
   async list(
@@ -716,12 +762,18 @@ export class FileService {
       }
     }
     const current = currentBytes?.toString('utf8') ?? null;
-    // Deliberately NOT run through attributedPath: rm(abs) removes the link itself (mode 120000
-    // in the index), never the target it points to, so the deletion is already correctly
-    // attributed to the link's own name.
+    // Deliberately NOT run through attributedPath: `rm(abs)` removes exactly the entry `abs`
+    // names, never resolving relPath's own final component through a link the way a write's
+    // target resolution would. But an ANCESTOR directory can itself be a link, and the parent is
+    // resolved through links by attributedDeletePath — see its doc comment.
     await rm(abs);
     this.revisions.forget(abs);
-    await this.notify(projectDir, relPath, current, null);
+    await this.notify(
+      projectDir,
+      await this.attributedDeletePath(projectDir, abs, relPath),
+      current,
+      null,
+    );
     return { path: relPath };
   }
 

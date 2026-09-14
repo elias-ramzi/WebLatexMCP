@@ -169,4 +169,85 @@ describe.skipIf(process.platform === 'win32')('FileService attributes writes thr
       ExternalChangeError,
     );
   });
+
+  /**
+   * Deletion through an ANCESTOR link (`linkdir -> realdir`, not the final path component) must be
+   * attributed to the file actually removed (`realdir/notes.tex`), not the beyond-a-symlink path
+   * (`linkdir/notes.tex`) that `git check-ignore`/`update-index` refuse outright — see issue #66
+   * item 6 and CLAUDE.md's "Parallel sessions share a clone; commits don't" bullet.
+   */
+  describe('delete through a linked ANCESTOR directory', () => {
+    it('deletes the real file and attributes the deletion under the target directory', async () => {
+      await mkdir(path.join(dir, 'realdir'), { recursive: true });
+      await writeFile(path.join(dir, 'realdir', 'notes.tex'), 'note body\n', 'utf8');
+      await symlink('realdir', path.join(dir, 'linkdir'));
+
+      await files.delete(dir, 'linkdir/notes.tex');
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.relPath).toBe('realdir/notes.tex');
+      expect(calls[0]!.after).toBeNull();
+      expect(calls[0]!.before).toBe('note body\n');
+      const stillLinked = await lstat(path.join(dir, 'linkdir'));
+      expect(stillLinked.isSymbolicLink()).toBe(true);
+      await expect(readFile(path.join(dir, 'realdir', 'notes.tex'), 'utf8')).rejects.toThrow();
+    });
+
+    it('a nested ancestor link resolves through the full chain', async () => {
+      await mkdir(path.join(dir, 'realdir', 'sub'), { recursive: true });
+      await writeFile(path.join(dir, 'realdir', 'sub', 'notes.tex'), 'deep\n', 'utf8');
+      await symlink('realdir', path.join(dir, 'linkdir'));
+
+      await files.delete(dir, 'linkdir/sub/notes.tex');
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.relPath).toBe('realdir/sub/notes.tex');
+    });
+
+    it('the final component being the link (not an ancestor) still attributes to the link itself', async () => {
+      await writeFile(path.join(dir, 'main.tex'), 'A\n', 'utf8');
+      await symlink('main.tex', path.join(dir, 'link.tex'));
+
+      await files.delete(dir, 'link.tex');
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.relPath).toBe('link.tex');
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('A\n');
+    });
+
+    it('a plain file with no link anywhere in its path is attributed to its own name', async () => {
+      await writeFile(path.join(dir, 'notes.tex'), 'A\n', 'utf8');
+
+      await files.delete(dir, 'notes.tex');
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.relPath).toBe('notes.tex');
+    });
+
+    it('falls back to the given name, and logs to stderr, when the parent cannot be resolved', async () => {
+      await mkdir(path.join(dir, 'realdir'), { recursive: true });
+      await writeFile(path.join(dir, 'realdir', 'notes.tex'), 'note body\n', 'utf8');
+      await symlink('realdir', path.join(dir, 'linkdir'));
+      const resolver = vi
+        .spyOn(
+          files as unknown as { resolveLinkTarget: () => Promise<string | null> },
+          'resolveLinkTarget',
+        )
+        .mockRejectedValueOnce(new Error('ELOOP: simulated'));
+      const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await files.delete(dir, 'linkdir/notes.tex');
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.relPath).toBe('linkdir/notes.tex');
+        expect(resolver).toHaveBeenCalledTimes(1);
+        expect(stderr).toHaveBeenCalledTimes(1);
+        expect(String(stderr.mock.calls[0]![0])).toMatch(
+          /could not resolve where the parent directory of "linkdir\/notes.tex" lands/,
+        );
+      } finally {
+        resolver.mockRestore();
+        stderr.mockRestore();
+      }
+    });
+  });
 });

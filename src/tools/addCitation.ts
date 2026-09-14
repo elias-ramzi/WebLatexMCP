@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { changeDiff } from '../lib/changeDiff.js';
+import { changeDiff, changedPath } from '../lib/changeDiff.js';
 import { isBibFile, mergeBibEntry } from '../lib/bib.js';
 
 const inputSchema = {
@@ -79,14 +79,14 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const target = await resolveBibFile(ctx, dir, bibFile);
+          const bibPath = await resolveBibFile(ctx, dir, bibFile);
           // Re-fetch from DBLP so the appended text always originates from the API.
           const bibtex = await ctx.dblp.fetchBibtex(key);
           // No baseline from this read: it happens before the already-present early return, and a
           // path that writes nothing must not claim the caller has seen the file (that is exactly
           // what made every compile disarm the guard). The write below is safe without it — see
           // there.
-          const existing = await ctx.files.readText(dir, target);
+          const existing = await ctx.files.readText(dir, bibPath);
           const merged = mergeBibEntry(existing, bibtex);
 
           if (merged.alreadyPresent) {
@@ -95,11 +95,11 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
               content: [
                 {
                   type: 'text',
-                  text: `${merged.key} is already in ${target}:${at}; nothing added.`,
+                  text: `${merged.key} is already in ${bibPath}:${at}; nothing added.`,
                 },
               ],
               structuredContent: {
-                path: target,
+                path: bibPath,
                 key: merged.key,
                 added: false,
                 alreadyPresent: true,
@@ -114,19 +114,30 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           // appended, so it cannot lose a hand edit — it is built on top of it. The staleness
           // check would only refuse a write that is already safe, which is why this read did not
           // need to arm the guard to get past it.
+          // A write through an in-project link changes the target, so that is the path to diff —
+          // same rule as write_file/edit_file (changedPath in src/lib/changeDiff.ts). Resolved
+          // BEFORE the write, as those tools do: `linkTarget` can throw (ELOOP, EACCES), and a
+          // throw after the write would report an error for a citation that already landed.
+          const linkTarget = await ctx.files.linkTarget(dir, bibPath);
           await ctx.files.write(dir, {
-            path: target,
+            path: bibPath,
             content: merged.content,
             createDirs: true,
             overrideExternalChanges: true,
           });
-          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, target);
+          const diff = await changeDiff(
+            ctx.projectManager,
+            ctx.git,
+            id,
+            dir,
+            changedPath(linkTarget, bibPath),
+          );
           const at = entryLine(merged.content, merged.key);
-          const summary = `added ${merged.key} to ${target}:${at}\n\n${bibtex}`;
+          const summary = `added ${merged.key} to ${bibPath}:${at}\n\n${bibtex}`;
           return {
             content: [{ type: 'text', text: diff ? `${summary}\n\n${diff}` : summary }],
             structuredContent: {
-              path: target,
+              path: bibPath,
               key: merged.key,
               added: true,
               alreadyPresent: false,

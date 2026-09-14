@@ -10,6 +10,7 @@ import { createServer } from '../../src/server.js';
 import { createContext, type AppContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
+import { GitService } from '../../src/services/gitService.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -482,6 +483,243 @@ describe('commit skips files git ignores', () => {
     expect(sc.ignored).toEqual(['build/out.log']);
     expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['main.tex']);
     void dir;
+  });
+});
+
+const IDENTITY = { name: 'Test', email: 'test@example.com' };
+
+/**
+ * Two sessions sharing one clone (mirrors `unrecordedCommit.test.ts`'s `setupTwoSessions`) — needed
+ * to force a genuine record-time collision on a git-ignored file, which a single session cannot.
+ */
+async function setupTwoSessions(
+  seed: Record<string, string>,
+): Promise<{ session: (id: string) => Promise<{ client: Client; ctx: AppContext }>; dir: string }> {
+  const remote = await createFakeRemote(seed);
+  cleanups.push(remote.cleanup);
+  const workspace = await tmp('ovl-ignored-multi-ws-');
+  const dir = path.join(workspace, 'demo');
+  await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+  const session = async (id: string): Promise<{ client: Client; ctx: AppContext }> => {
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: id,
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `test-${id}`, version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+    return { client, ctx };
+  };
+
+  return { session, dir };
+}
+
+/**
+ * Regression tests for the PR #67 review finding 1: `commitSession` used to compute
+ * `committableAll = selected.filter(c => !c.conflicted)` and check `ignoredPaths` only over that —
+ * so an entry that was BOTH `conflicted` (or `unrecorded`) and git-ignored (this session wrote an
+ * excluded file, a peer collided with it on the same lines) was never settled and never listed
+ * under `ignored`. The refusal said "every change is conflicted (note.md) … Commit with scope
+ * 'all'" — but scope "all" can never commit an ignored file either, so the only way out was
+ * `discard`, throwing away the session's other in-flight edits along with it.
+ */
+describe('a conflicted-and-ignored session entry settles and reports as ignored (finding 1)', () => {
+  it('settles the ignored+conflicted entry, commits the rest, and a second commit finds nothing left', async () => {
+    const { session, dir } = await setupTwoSessions({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'note.md\n');
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // alpha creates the excluded file first, establishing its own shadow for it.
+    const wroteNote = await alpha.client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'note.md', content: 'A sentence to collide on.\n' },
+    });
+    expect(isError(wroteNote), textOf(wroteNote)).toBe(false);
+
+    // beta rewrites the same line on the shared working tree — beta's own shadow for this
+    // (untracked, git-ignored) path has no HEAD counterpart, so its first touch applies its edit
+    // directly (see ShadowStore.record's `shadowStr === null` branch).
+    const editBeta = await beta.client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'demo',
+        path: 'note.md',
+        edits: [
+          { oldString: 'A sentence to collide on.', newString: 'Beta rewrites the sentence.' },
+        ],
+      },
+    });
+    expect(isError(editBeta), textOf(editBeta)).toBe(false);
+
+    // alpha then edits the very same line, on the tree beta already changed: alpha's shadow still
+    // expects its own original content as the base, so the mutation recorder's three-way merge
+    // against beta's edit conflicts, and alpha's entry for note.md is flagged — exactly the
+    // sequence unrecordedCommit.test.ts's collision test uses.
+    // `overrideExternalChanges` is needed here for an unrelated reason: alpha's OWN FileService
+    // baseline for note.md (set when it wrote the file above) no longer matches the disk once
+    // beta's edit landed, so the ordinary out-of-band-edit guard would refuse first. That guard is
+    // not what this test is about — the shadow-level collision below fires regardless.
+    const editAlpha = await alpha.client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'demo',
+        path: 'note.md',
+        edits: [
+          { oldString: 'Beta rewrites the sentence.', newString: 'Alpha rewrites the sentence.' },
+        ],
+        overrideExternalChanges: true,
+      },
+    });
+    expect(isError(editAlpha), textOf(editAlpha)).toBe(false);
+
+    // Confirm the setup actually produced a conflicted, git-ignored entry before proving the fix.
+    const beforeCommit = await alpha.ctx.shadows.changes('demo');
+    const noteEntry = beforeCommit.find((c) => c.path === 'note.md');
+    expect(noteEntry?.conflicted, JSON.stringify(beforeCommit)).toBe(true);
+
+    // alpha also makes a normal, committable edit.
+    const wroteMain = await alpha.client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'Hello, edited.\n' },
+    });
+    expect(isError(wroteMain), textOf(wroteMain)).toBe(false);
+
+    const committed = await alpha.client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'settle the ignored-and-conflicted entry' },
+    });
+    expect(isError(committed), textOf(committed)).toBe(false);
+    const sc = structured(committed);
+    expect(sc.committed).toBe(true);
+    expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['main.tex']);
+    // Pre-fix: `ignored` is `[]` here (only checked over the non-conflicted subset) and
+    // `conflicted` contains "note.md" — this is the assertion that fails before the fix.
+    expect(sc.ignored).toEqual(['note.md']);
+    expect(sc.conflicted).toEqual([]);
+    expect(sc.unrecorded).toEqual([]);
+    const text = textOf(committed);
+    expect(text).not.toMatch(/note\.md.*conflicted|conflicted.*note\.md/);
+
+    // A second commit from alpha finds nothing left wedged — the ignored+conflicted entry was
+    // actually settled, not merely hidden from this result.
+    const second = await alpha.client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'nothing left' },
+    });
+    expect(isError(second), textOf(second)).toBe(true);
+    expect(textOf(second)).toMatch(/Nothing to commit \(no staged changes\)/);
+    expect(textOf(second)).not.toMatch(/conflicted/);
+    expect(textOf(second)).not.toMatch(/ignore/);
+    expect(await alpha.ctx.shadows.hasChanges('demo')).toBe(false);
+  });
+});
+
+/**
+ * Regression tests for the PR #67 review finding 2: scope "paths" (and scope "all" with `paths`)
+ * naming a DIRECTORY silently settles a this-session ignored entry underneath it. `git add --
+ * notes` skips `notes/ig.md` without complaint (unlike naming it directly, which git refuses
+ * outright), the commit lands, and `settle(["notes"])` drops the `notes/ig.md` shadow record —
+ * never committed, never reported under `ignored`.
+ */
+describe('scope "paths"/"all" naming a directory reports a nested ignored entry (finding 2)', () => {
+  it('scope "paths" naming the directory reports the nested ignored file', async () => {
+    const { client, ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes/ig.md\n');
+
+    const wroteA = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'notes/a.tex',
+        content: 'a note\n',
+        createDirs: true,
+      },
+    });
+    expect(isError(wroteA), textOf(wroteA)).toBe(false);
+    const wroteIg = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'notes/ig.md',
+        content: 'ignored note\n',
+        createDirs: true,
+      },
+    });
+    expect(isError(wroteIg), textOf(wroteIg)).toBe(false);
+
+    const result = await client.callTool({
+      name: 'commit',
+      arguments: {
+        project: 'demo',
+        message: 'commit the notes directory',
+        scope: 'paths',
+        paths: ['notes'],
+      },
+    });
+    expect(isError(result), textOf(result)).toBe(false);
+    const sc = structured(result);
+    expect(sc.committed).toBe(true);
+    expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['notes/a.tex']);
+    // Pre-fix: `ignored` is `[]` here even though `notes/ig.md` was silently skipped by `git add`.
+    expect(sc.ignored).toEqual(['notes/ig.md']);
+    expect(sc.settled).toContain('notes/ig.md');
+    void ctx;
+  });
+
+  it('scope "all" with paths naming the directory reports the nested ignored file too', async () => {
+    const { client, ctx, dir } = await setup({
+      'main.tex': '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n',
+    });
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes/ig.md\n');
+
+    const wroteA = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'notes/a.tex',
+        content: 'a note\n',
+        createDirs: true,
+      },
+    });
+    expect(isError(wroteA), textOf(wroteA)).toBe(false);
+    const wroteIg = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'demo',
+        path: 'notes/ig.md',
+        content: 'ignored note\n',
+        createDirs: true,
+      },
+    });
+    expect(isError(wroteIg), textOf(wroteIg)).toBe(false);
+
+    const result = await client.callTool({
+      name: 'commit',
+      arguments: {
+        project: 'demo',
+        message: 'commit the notes directory, scope all',
+        scope: 'all',
+        paths: ['notes'],
+      },
+    });
+    expect(isError(result), textOf(result)).toBe(false);
+    const sc = structured(result);
+    expect(sc.committed).toBe(true);
+    expect((sc.files as Array<{ path: string }>).map((f) => f.path)).toEqual(['notes/a.tex']);
+    expect(sc.ignored).toEqual(['notes/ig.md']);
+    expect(sc.settled).toContain('notes/ig.md');
+    void ctx;
   });
 });
 

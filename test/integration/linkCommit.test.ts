@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, mkdir, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -225,3 +225,96 @@ describe.skipIf(process.platform === 'win32')('commit through an in-project syml
     expect(await lsTreeMode(clone, 'link.tex')).toBeNull();
   });
 });
+
+/**
+ * `createFakeRemote`'s seeding writes plain files only; a directory symlink alongside the real
+ * files it points at has to be committed and pushed through a second, throwaway clone too — the
+ * same route `pushSymlink` uses for a single-file link.
+ */
+async function pushDirWithSymlink(
+  remote: FakeRemote,
+  files: Record<string, string>,
+  linkName: string,
+  linkTarget: string,
+): Promise<void> {
+  const dir = await tmp('ovl-linkseed-dir-');
+  const git = simpleGit(dir);
+  await git.clone(remote.url, dir);
+  await git.addConfig('user.email', 'seed3@example.com');
+  await git.addConfig('user.name', 'Seed3');
+  await git.addConfig('core.autocrlf', 'false');
+  for (const [rel, content] of Object.entries(files)) {
+    const full = path.join(dir, rel);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content);
+  }
+  await symlink(linkTarget, path.join(dir, linkName));
+  await git.add(['.']);
+  await git.commit(`add ${linkName} -> ${linkTarget} with files`);
+  await git.push('origin', remote.branch);
+}
+
+/**
+ * A deletion through an ANCESTOR link (`linkdir -> realdir`, not the final path component) must be
+ * attributed to the file actually removed (`realdir/notes.tex`), not to the beyond-a-symlink path
+ * (`linkdir/notes.tex`) — see issue #66 item 6 and CLAUDE.md's "Parallel sessions share a clone;
+ * commits don't" bullet.
+ *
+ * Pre-fix, `delete_file linkdir/notes.tex` removed the real file on disk but recorded the shadow
+ * entry under `linkdir/notes.tex`: the next `commit` (any scope, even of an unrelated file) fails
+ * with `git check-ignore failed: fatal: pathspec 'linkdir/notes.tex' is beyond a symbolic link`,
+ * wedging the session.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'commit through a linked ANCESTOR directory (issue #66 item 6)',
+  () => {
+    it('delete_file through linkdir/notes.tex removes realdir/notes.tex and commits cleanly, and a later commit still lands', async () => {
+      const remote = await createFakeRemote({
+        'main.tex': '\\documentclass{article}\n',
+      });
+      cleanups.push(remote.cleanup);
+      await pushDirWithSymlink(
+        remote,
+        { 'realdir/notes.tex': 'note body\n' },
+        'linkdir',
+        'realdir',
+      );
+
+      const { client, clone } = await setup(remote);
+
+      const deleted = await client.callTool({
+        name: 'delete_file',
+        arguments: { project: 'demo', path: 'linkdir/notes.tex' },
+      });
+      expect(isError(deleted), textOf(deleted)).toBe(false);
+
+      const committed = await client.callTool({
+        name: 'commit',
+        arguments: { project: 'demo', message: 'delete via linkdir' },
+      });
+      // Pre-fix: fails with "pathspec 'linkdir/notes.tex' is beyond a symbolic link".
+      expect(isError(committed), textOf(committed)).toBe(false);
+      const result = structured(committed);
+      expect(result.committed).toBe(true);
+      const files = (result.files as Array<{ path: string }>).map((f) => f.path);
+      expect(files).toContain('realdir/notes.tex');
+
+      expect(await lsTreeMode(clone, 'realdir/notes.tex')).toBeNull();
+      expect(await lsTreeMode(clone, 'linkdir')).toBe('120000');
+
+      const wrote = await client.callTool({
+        name: 'write_file',
+        arguments: { project: 'demo', path: 'other.tex', content: 'unrelated\n' },
+      });
+      expect(isError(wrote), textOf(wrote)).toBe(false);
+      const committed2 = await client.callTool({
+        name: 'commit',
+        arguments: { project: 'demo', message: 'unrelated file' },
+      });
+      expect(isError(committed2), textOf(committed2)).toBe(false);
+      expect(structured(committed2).committed).toBe(true);
+      const files2 = (structured(committed2).files as Array<{ path: string }>).map((f) => f.path);
+      expect(files2).toContain('other.tex');
+    });
+  },
+);

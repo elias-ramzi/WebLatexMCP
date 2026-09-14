@@ -49,9 +49,11 @@ interface ShadowIndexEntry {
    * (leaving the shadow and base exactly as they were) and `refresh` writes nothing on either
    * conflicting branch — so `refresh` skips recomputing it: no HEAD blob read, no shadow read, no
    * merge, no `sameAsGitSees` spawn. Absent on entries written before this field existed (simply
-   * re-evaluated once, which then sets it) and on a `record`-time collision (set only by
-   * `refresh`, so the *next* `refresh` still evaluates that one fully, once). Cleared wherever
-   * `conflicted` is cleared.
+   * re-evaluated once, which then sets it) and on a `record`-time collision: set only by
+   * `refresh`, and only on its three conflicting branches — so while HEAD still equals such an
+   * entry's base, each `refresh` reads HEAD's blob and the base, finds them equal and moves on
+   * (no merge, no spawn) without ever setting the memo; the field is first set by the `refresh`
+   * that runs after HEAD moves. Cleared wherever `conflicted` is cleared.
    */
   conflictHead?: string;
   /**

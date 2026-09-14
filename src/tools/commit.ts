@@ -15,7 +15,9 @@ const inputSchema = {
     .array(z.string())
     .optional()
     .describe(
-      'Limit the commit to these paths. Defaults to every change in scope; required for scope "paths".',
+      'Limit the commit to these paths. Defaults to every change in scope; required for scope ' +
+        '"paths". Matched literally for every scope — no globs, exact spelling (case-folded only ' +
+        'on a core.ignorecase clone).',
     ),
   scope: z
     .enum(['session', 'all', 'paths'])
@@ -34,7 +36,13 @@ const inputSchema = {
 
 const outputSchema = {
   committed: z.boolean(),
-  sha: z.string(),
+  sha: z
+    .string()
+    .describe(
+      'Commit sha the clone is now at, as a full hex string — or the literal sentinel ' +
+        '"unborn" for a clone with no commits yet (the text renders that as "no commits yet", ' +
+        'never the sentinel itself).',
+    ),
   filesChanged: z.number(),
   files: z.array(z.object({ path: z.string(), added: z.number(), removed: z.number() })),
   scope: z.enum(['session', 'all', 'paths']).describe('The scope actually applied.'),
@@ -117,7 +125,7 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               res =
                 effective === 'paths'
                   ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
-                  : await commitEverything(ctx, dir, { message, paths, allowEmpty });
+                  : await commitEverything(ctx, id, dir, { message, paths, allowEmpty });
             } catch (err) {
               // `GitService.commit`/`commitContents` throw `NothingToCommitError` (a type, not a
               // message to match on) when there was nothing to stage for the paths in scope,
@@ -208,6 +216,14 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // `headSha` reports a clone with no commits as the sentinel "unborn" — say so rather than
           // presenting the sentinel as if it were a commit id.
           const headAt = res.sha === 'unborn' ? 'no commits yet' : `HEAD ${res.sha.slice(0, 8)}`;
+          // Three shapes for the "nothing landed" headline, judged by whether the settled paths
+          // are entirely accounted for by `ignored` (issue #66 review, finding 2): all requested
+          // paths ignored (the original text), none of them (the original "already matches HEAD"
+          // text), or a mix — some skipped as ignored, the rest settled because the working tree
+          // already matched HEAD for them. Conflating the two reasons under one sentence would
+          // misreport why the ignored path(s) specifically were skipped.
+          const ignoredSet = new Set(res.ignored);
+          const settledAllIgnored = settled.length > 0 && settled.every((p) => ignoredSet.has(p));
           const headline = res.committed
             ? `committed ${res.sha.slice(0, 8)} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
               `not yet pushed${
@@ -217,13 +233,18 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
                     ? ' (named paths)'
                     : ' (whole clone)'
               }`
-            : res.ignored.length
-              ? `nothing to commit — every requested path is ignored by git (never committed by ` +
-                `any scope): ${res.ignored.join(', ')}; settled this session's stale record of: ` +
-                `${settled.join(', ')} (${headAt})`
-              : 'nothing to commit — the working tree already matches HEAD for the requested paths; ' +
+            : res.ignored.length === 0
+              ? 'nothing to commit — the working tree already matches HEAD for the requested paths; ' +
                 `settled this session's stale record of: ${settled.join(', ')} ` +
-                `(not yet pushed: ${headAt})`;
+                `(not yet pushed: ${headAt})`
+              : settledAllIgnored
+                ? `nothing to commit — every requested path is ignored by git (never committed by ` +
+                  `any scope): ${res.ignored.join(', ')}; settled this session's stale record of: ` +
+                  `${settled.join(', ')} (${headAt})`
+                : `nothing to commit — ${res.ignored.join(', ')} skipped as ignored by git (never ` +
+                  `committed by any scope); nothing to commit for the rest of the requested paths ` +
+                  `— the working tree already matches HEAD there; settled this session's stale ` +
+                  `record of: ${settled.join(', ')} (${headAt})`;
           const text = [
             headline,
             ...res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
@@ -295,8 +316,9 @@ export function settlePaths(paths: string[] | undefined): string[] | 'everything
 function discardHint(paths: string[]): string {
   return (
     ` or discard them (discard { paths: ${JSON.stringify(paths)}, confirm: true }) to give up ` +
-    "this session's version. If the working tree already matches HEAD for a file, scope " +
-    '"all" or scope "paths" naming it settles the record without a commit.'
+    "this session's version, which also throws away any other session's uncommitted work at " +
+    'those paths. If the working tree already matches HEAD for a file, scope "all" or scope ' +
+    '"paths" naming it settles the record without a commit.'
   );
 }
 
@@ -345,22 +367,22 @@ async function commitSession(
     );
   }
 
-  const conflicted = selected.filter((c) => c.conflicted).map((c) => c.path);
-  const unrecorded = selected.filter((c) => c.unrecorded).map((c) => c.path);
-  const unrecordedSet = new Set(unrecorded);
-  const collided = conflicted.filter((p) => !unrecordedSet.has(p));
-  const committableAll = selected.filter((c) => !c.conflicted);
-
   // `commitContents` stages via `hash-object` + `update-index --add`, which — unlike `git add`
   // — consults no ignore rules at all. A file this session wrote that git ignores (e.g. a
   // skill's local-only note kept out of git via `.git/info/exclude`) must never ride along in
   // the default scope, so it is filtered out here, the same way `git add` would already have
-  // skipped it under scope "all"/"paths".
+  // skipped it under scope "all"/"paths". Checked over every `selected` entry, `conflicted` or
+  // `unrecorded` ones included (issue #66 review, finding 1): an ignored file is never committed
+  // by any scope, so a `conflicted`/`unrecorded` flag on one is meaningless — it can never be
+  // resolved by taking it with scope "all" either, since scope "all" is `git add`, which skips an
+  // ignored path just the same. Settling it here, before it is ever classified as `conflicted`/
+  // `unrecorded` below, is what actually resolves it rather than leaving it recoverable only by
+  // `discard`.
   const ignored =
-    committableAll.length > 0
+    selected.length > 0
       ? await ctx.git.ignoredPaths(
           dir,
-          committableAll.map((c) => c.path),
+          selected.map((c) => c.path),
           // `commitContents` resets the index to HEAD before staging, so "tracked" means HEAD.
           { tracked: 'head' },
         )
@@ -372,7 +394,16 @@ async function commitSession(
     await ctx.shadows.settle(id, ignored);
   }
   const ignoredSet = new Set(ignored);
-  const committable = committableAll.filter((c) => !ignoredSet.has(c.path));
+  // Everything below is judged only over the non-ignored remainder: an ignored-and-conflicted
+  // entry was just settled above, so it must not reappear in `conflicted`/`unrecorded`/`collided`
+  // (which the caller reads from this function's return, and the handler reads again afterward
+  // from `ctx.shadows.changes` — already empty for it, since `settle` dropped the record).
+  const notIgnored = selected.filter((c) => !ignoredSet.has(c.path));
+  const conflicted = notIgnored.filter((c) => c.conflicted).map((c) => c.path);
+  const unrecorded = notIgnored.filter((c) => c.unrecorded).map((c) => c.path);
+  const unrecordedSet = new Set(unrecorded);
+  const collided = conflicted.filter((p) => !unrecordedSet.has(p));
+  const committable = notIgnored.filter((c) => !c.conflicted);
 
   if (committable.length === 0 && !opts.allowEmpty) {
     const ignoredSentence =
@@ -429,6 +460,14 @@ async function commitSession(
  * Returns the paths still safe to hand to `git add`, plus which of the requested ones were
  * dropped (`ignoredPaths` itself returns POSIX-normalised paths, so membership is checked on the
  * normalised form).
+ *
+ * Also normalises every returned path the way `settlePaths` does (`toPosix`, strip a leading
+ * `./`), so both call sites hand `git add` — and `--literal-pathspecs`, which reads a path
+ * literally, backslashes included — the same normal form regardless of how the caller spelled it.
+ * `commitEverything` used to hand `git add` the caller's raw strings verbatim; on Windows a native
+ * `sub\notes.tex` reached git unconverted, where `--literal-pathspecs` treats the backslash as
+ * itself rather than a separator. `commitPaths` already normalised before calling here, so this is
+ * a no-op there (idempotent on an already-POSIX, dot-stripped path).
  */
 async function withoutIgnored(
   ctx: AppContext,
@@ -436,16 +475,45 @@ async function withoutIgnored(
   paths: string[],
   tracked: 'head' | 'index',
 ): Promise<{ paths: string[]; ignored: string[] }> {
-  if (paths.length === 0) return { paths, ignored: [] };
-  const ignored = await ctx.git.ignoredPaths(dir, paths, { tracked });
-  if (ignored.length === 0) return { paths, ignored };
+  const normalized = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
+  if (normalized.length === 0) return { paths: normalized, ignored: [] };
+  const ignored = await ctx.git.ignoredPaths(dir, normalized, { tracked });
+  if (ignored.length === 0) return { paths: normalized, ignored };
   const ignoredSet = new Set(ignored);
-  return { paths: paths.filter((p) => !ignoredSet.has(toPosix(p))), ignored };
+  return { paths: normalized.filter((p) => !ignoredSet.has(p)), ignored };
+}
+
+/**
+ * Names this session's shadow entries that a stageable requested DIRECTORY path silently swallows
+ * — an entry strictly *under* one of `stageable` (never a path equal to one of them: those are
+ * already judged by `withoutIgnored` above) that git itself would skip when staging that
+ * directory. `git --literal-pathspecs add -- notes` does not fail the way it does for an ignored
+ * path named directly ("The following paths are ignored… Use -f") — it silently omits the nested
+ * ignored file, the same way `git add -A` always has. `commit`'s handler already settles this
+ * session's record for every entry under a taken path once the commit lands (`ShadowStore.settle`,
+ * by `coversPath`) regardless of whether git actually staged it — so the file was never committed
+ * and, before this, never named under `ignored` either (issue #66 review, finding 2). This adds
+ * only the *report*: it changes nothing about what `git add` stages or what `settle` drops.
+ */
+async function ignoredUnderRequestedDirs(
+  ctx: AppContext,
+  dir: string,
+  id: string,
+  stageable: string[],
+  tracked: 'head' | 'index',
+): Promise<string[]> {
+  const tracked_ = (await ctx.shadows.changes(id)).map((c) => c.path);
+  const candidates = tracked_.filter((p) =>
+    stageable.some((req) => req !== p && coversPath(req, p)),
+  );
+  if (candidates.length === 0) return [];
+  return ctx.git.ignoredPaths(dir, candidates, { tracked });
 }
 
 /** Commit every change in the clone — the pre-session behaviour, now opt-in. */
 async function commitEverything(
   ctx: AppContext,
+  id: string,
   dir: string,
   opts: { message: string; paths?: string[]; allowEmpty?: boolean },
 ): Promise<CommitOutcome> {
@@ -464,10 +532,27 @@ async function commitEverything(
       );
     }
     paths = filtered.paths;
+    // Finding 2: a requested directory can itself be stageable while silently swallowing a
+    // nested ignored entry this session tracks — name it too.
+    const nested = await ignoredUnderRequestedDirs(ctx, dir, id, paths, 'index');
+    for (const p of nested) if (!ignored.includes(p)) ignored.push(p);
   }
   // Without `paths` this is a plain `git add -A`, which already honours .gitignore/
   // .git/info/exclude on its own — nothing is ever taken here that `ignoredPaths` would flag.
-  const res = await ctx.git.commit(dir, { ...opts, paths });
+  let res;
+  try {
+    res = await ctx.git.commit(dir, { ...opts, paths });
+  } catch (err) {
+    // `GitService.commit` itself throws a bare `NothingToCommitError()` (no `ignored`) when
+    // staging the filtered set adds nothing — e.g. every non-ignored requested path already
+    // matches HEAD. Carry the ignore list computed above onto it, or the handler reports
+    // `ignored: []` and its headline claims nothing was ignored when something plainly was
+    // (issue #66 review, finding 2).
+    if (err instanceof NothingToCommitError && ignored.length > 0) {
+      throw new NothingToCommitError(err.message, ignored);
+    }
+    throw err;
+  }
   return { ...res, leftUncommitted: [], conflicted: [], ignored };
 }
 
@@ -497,7 +582,7 @@ async function commitPaths(
     );
   }
 
-  const normalized = [...new Set(opts.paths.map(toPosix))];
+  const normalized = [...new Set(opts.paths.map((p) => toPosix(p).replace(/^(\.\/)+/, '')))];
   for (const p of normalized) {
     if (p.startsWith('-')) throw new Error(`Invalid path: "${p}"`);
     // No symlink-escape check here (unlike FileService reads/writes): this scope never reads or
@@ -522,23 +607,28 @@ async function commitPaths(
   const dirty = [
     ...new Set([...status.unstaged, ...status.untracked, ...status.staged].map(toPosix)),
   ];
-  let uncovered = uncoveredPaths(normalized, dirty);
-  if (uncovered.length > 0) {
-    // A path with nothing dirty in the working tree can still be this session's own tracked
-    // change — e.g. an `unrecorded`/`conflicted` entry whose content already equals HEAD (a hand
-    // commit or revert settled it before this call ever ran `git status`). That is not "nothing to
-    // commit at this path": it is a stale shadow record this deliberate scope should be able to
-    // settle (issue #66 item 2), so `git.commit` below gets the chance to say "nothing staged"
-    // itself — which the handler turns into a settlement — rather than refusing here first with a
-    // misleading "not changed in the working tree" for a path this session plainly did track.
+  // `rescued`: requested paths that cover nothing dirty in the working tree, but that this
+  // deliberate scope still lets through the refusal below because this session's own shadow still
+  // tracks them (a stale `unrecorded`/`conflicted` entry a hand commit or revert already settled at
+  // HEAD — issue #66 item 2). Kept separate from `normalized` from here on: a rescued path stages
+  // nothing by definition (there is no dirty content on disk or in the index to add), so handing it
+  // to `git add` below would either no-op (harmless) or, when nothing at all is left on disk for
+  // it (a deleted file), fatal raw ("did not match any files") — issue #66 review, finding 1. It
+  // stays in `normalized` for the peer-ownership check just below (still "requested"), and the
+  // handler settles every originally-requested path regardless (`settlePaths(paths)` over the
+  // tool's own input, not this function's `stageable`).
+  const uncoveredInitial = uncoveredPaths(normalized, dirty);
+  let rescued: string[] = [];
+  if (uncoveredInitial.length > 0) {
     const tracked = (await ctx.shadows.changes(id)).map((c) => c.path);
-    uncovered = uncovered.filter((p) => !tracked.some((t) => coversPath(p, t)));
-  }
-  if (uncovered.length > 0) {
-    throw new Error(
-      `Nothing to commit at: ${uncovered.join(', ')} — not changed in the working tree. Paths ` +
-        'are matched literally: no globs, exact case, and no ".." segments.',
-    );
+    const stillUncovered = uncoveredInitial.filter((p) => !tracked.some((t) => coversPath(p, t)));
+    if (stillUncovered.length > 0) {
+      throw new Error(
+        `Nothing to commit at: ${stillUncovered.join(', ')} — not changed in the working tree. ` +
+          'Paths are matched literally: no globs, exact case, and no ".." segments.',
+      );
+    }
+    rescued = uncoveredInitial;
   }
 
   // Fail closed: a live peer's shadow says which of the dirty files are its in-flight edits.
@@ -566,22 +656,52 @@ async function commitPaths(
   // so an ignored-but-tracked-by-this-session path (the `coversPath` filter above lets a stale
   // shadow entry for one past the uncovered-paths refusal) never reaches `git add` as a raw error.
   // After the ownership check on purpose: a path a live peer owns is refused as owned, whatever
-  // git thinks of it — the more informative answer, and one that settles nothing of ours.
-  const { paths: stageable, ignored } = await withoutIgnored(ctx, dir, normalized, 'head');
+  // git thinks of it — the more informative answer, and one that settles nothing of ours. Checked
+  // over the full `normalized` list (rescued paths included) so a genuinely ignored-and-tracked
+  // path is reported as ignored, not silently dropped for covering nothing dirty.
+  const { paths: notIgnored, ignored } = await withoutIgnored(ctx, dir, normalized, 'head');
+  // Only a path that actually covers something dirty may reach `git add` — a rescued path (see
+  // above) is excluded here even when it is not ignored, since it stages nothing either way.
+  const rescuedSet = new Set(rescued);
+  const stageable = notIgnored.filter((p) => !rescuedSet.has(p));
+  // Finding 2: a requested directory can itself be stageable (not ignored) while silently
+  // swallowing a nested ignored entry this session tracks underneath it — `git add -- notes`
+  // omits `notes/ig.md` without complaint, unlike naming it directly. Name it under `ignored` too
+  // — `settle` below already drops its record regardless, so it was otherwise committed nowhere
+  // and reported nowhere.
+  // Over `notIgnored`, not `stageable`: a directory whose only session change beneath it is an
+  // ignored file covers nothing dirty (git status never lists an ignored file), so it is a rescued
+  // path — and the report must still name that file as ignored, not let the handler call it
+  // "already matches HEAD". The helper only reports; nothing about staging depends on its input.
+  const nested = await ignoredUnderRequestedDirs(ctx, dir, id, notIgnored, 'head');
+  for (const p of nested) if (!ignored.includes(p)) ignored.push(p);
   if (stageable.length === 0) {
     throw new NothingToCommitError(
-      `Nothing to commit: ${ignored.join(', ')} ignored by git (.gitignore / .git/info/exclude) ` +
-        '— an ignored file is never committed by any scope.',
+      ignored.length > 0
+        ? `Nothing to commit: ${ignored.join(', ')} ignored by git (.gitignore / ` +
+            '.git/info/exclude) — an ignored file is never committed by any scope.'
+        : 'Nothing to commit: the requested paths matched nothing to stage.',
       ignored,
     );
   }
 
-  const res = await ctx.git.commit(dir, {
-    message: opts.message,
-    paths: stageable,
-    allowEmpty: opts.allowEmpty,
-    fromHead: true,
-  });
+  let res;
+  try {
+    res = await ctx.git.commit(dir, {
+      message: opts.message,
+      paths: stageable,
+      allowEmpty: opts.allowEmpty,
+      fromHead: true,
+    });
+  } catch (err) {
+    // Same carry-forward as `commitEverything`: `GitService.commit` can still throw a bare
+    // `NothingToCommitError()` (e.g. a peer's commit landed the same content between our `status`
+    // above and this `add`), and the ignore list computed above must not be lost when it does.
+    if (err instanceof NothingToCommitError && ignored.length > 0) {
+      throw new NothingToCommitError(err.message, ignored);
+    }
+    throw err;
+  }
 
   const statusAfter = await ctx.git.status(dir);
   const leftUncommitted = [

@@ -470,17 +470,31 @@ export class GitService {
         await git.raw(['update-index', '--force-remove', '--', rel]);
         continue;
       }
-      const mode = (await this.indexMode(git, rel)) ?? '100644';
-      // A shadow entry can only name a link when it predates the write-through-a-link fix (a
-      // stale record filed under the link's own name): staging text under a 120000 mode would
-      // produce a symlink whose target is that text, not a real file. A `null` content
-      // (deletion) of a link stays allowed — that's the link itself going away.
+      let mode = (await this.indexMode(git, rel)) ?? '100644';
+      // The index mode reflects HEAD (the index was just reset above), not the working tree, so
+      // a session that `delete_file`d a link and then `write_file`d a regular file over the same
+      // name still finds 120000 here. Judge the working tree before refusing: if the path is
+      // STILL a symbolic link on disk, this is a stale shadow record filed under the link's own
+      // name (predates the write-through-a-link fix) and staging text under 120000 would produce
+      // a symlink whose target is that text, not a real file — refuse it. Otherwise (a regular
+      // file now on disk, or the link removed and nothing put back) this is an ordinary
+      // link-to-file typechange, the same one `git add` would record as mode 100644. A `null`
+      // content (deletion) of a link stays allowed either way — that's the link itself going away.
       if (mode === '120000') {
-        throw new Error(
-          `"${rel}" is a symbolic link in the index; a content commit cannot replace a link with ` +
-            `file content. Delete the link first (delete_file), or commit the working tree with ` +
-            `scope "all".`,
-        );
+        // Fail closed: only a file that is verifiably gone (ENOENT) or verifiably a regular file
+        // clears the refusal. Any other `lstat` failure (EACCES on the parent, ELOOP) means the
+        // path could not be judged, and an unjudged path must not stage content over HEAD's link.
+        const stillLinked = await lstat(path.join(dir, rel))
+          .then((st) => st.isSymbolicLink())
+          .catch((err: NodeJS.ErrnoException) => err.code !== 'ENOENT');
+        if (stillLinked) {
+          throw new Error(
+            `"${rel}" is still a symbolic link in the index and the working tree; a content ` +
+              `commit cannot replace a link with file content. Delete the link first ` +
+              `(delete_file), or commit the working tree with scope "all".`,
+          );
+        }
+        mode = '100644';
       }
       const sha = await this.hashObject(dir, rel, file.content);
       await git.raw(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`]);
@@ -730,9 +744,13 @@ export class GitService {
    * alongside is produced separately and still renders a rename as a rename.
    */
   private async numstat(git: SimpleGit, args: string[]): Promise<DiffFile[]> {
+    // `--literal-pathspecs`: shares `diff()`'s `tail` array, which can carry a caller-supplied
+    // pathspec (`-- opts.path`) — without it the same glob expansion `diff()`'s patch call is
+    // guarded against would also inflate this diffstat.
     const out = await git.raw([
       '-c',
       'core.quotePath=false',
+      '--literal-pathspecs',
       'diff',
       '--no-renames',
       '--numstat',
@@ -824,8 +842,10 @@ export class GitService {
   async discard(dir: string, paths?: string[]): Promise<{ discarded: boolean }> {
     const git = simpleGit(dir);
     if (paths && paths.length > 0) {
-      await git.checkout(['--', ...paths]);
-      await git.clean('f', ['--', ...paths]);
+      // `--literal-pathspecs`, as for every path-taking call in this file: a pathspec is a glob by
+      // default, and this is the most destructive place for `a[1].tex` to also mean `a1.tex`.
+      await git.raw(['--literal-pathspecs', 'checkout', '--', ...paths]);
+      await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...paths]);
     } else {
       await git.checkout(['--', '.']);
       await git.clean('fd');
@@ -1077,88 +1097,97 @@ export class GitService {
     // can never spin forever.
     const maxSteps = opts.resolutions.length + 5;
     for (let i = 0; !step.ok; i++) {
-      if (i >= maxSteps) {
-        await this.abortRebaseIfInProgress(git);
-        throw new Error(
-          'Rebase did not converge after applying the supplied resolutions; aborted without ' +
-            'pushing. Re-pull and try the resolution again.',
-        );
-      }
-      // A resolution carries file content, never a link target. Refuse to write through a symlink
-      // on either side of the conflict before anything else for this step — including before the
-      // "every conflicted path needs a resolution" check below, since a type-change conflict
-      // (symlink vs. regular file) can add a synthetic path git itself invents (`notes.tex~HEAD`)
-      // that no caller would think to supply a resolution for; the link is what must be refused,
-      // not a spurious "missing resolution". `writeFile` follows a link (in-project or pointing
-      // outside the clone entirely), so a resolved "notes.tex" would silently land wherever the
-      // link points, and `git add` would then stage the untouched link as if it had been resolved.
-      // Check the paused rebase's working tree (`lstat`) and the ours/theirs conflict stages in
-      // the index (`git ls-files -s`, mode 120000) — either side can carry the link; a link only
-      // in the base stage is one both sides already replaced, and is not refused. Ancestor
-      // directories are checked too: git itself never leaves a conflicted path beneath a link
-      // (a side that turns a directory into a link gets the tracked file moved aside with an
-      // unmerged 120000 entry the stage check above already refuses), but a link can be placed
-      // by hand into the working tree while the rebase is paused, and `writeFile` would follow
-      // it wherever it points.
-      const linked: string[] = [];
-      const underLink: Array<{ rel: string; via: string }> = [];
-      for (const rel of step.unmerged) {
-        try {
-          resolveInside(dir, rel);
-        } catch (err) {
-          await this.abortRebaseIfInProgress(git);
-          throw err;
+      // The whole step is one try/catch so that ANY throw out of it — not just the two deliberate
+      // refusals below — aborts the paused rebase first. `hasSymlinkMode`'s `ls-files` spawn,
+      // `linkedAncestor`'s `lstat`s, `writeFile`, and the `git add` spawn can all throw (a
+      // permission error, a spawn failure) and, uncaught, would otherwise leave the clone mid-rebase
+      // (conflict markers on disk, detached HEAD) — contradicting the "clone is back to where it
+      // was" guarantee this method documents. The `missing`-resolution branch below `return`s
+      // rather than throws, so it is unaffected by this catch and keeps its own explicit abort.
+      try {
+        if (i >= maxSteps) {
+          throw new Error(
+            'Rebase did not converge after applying the supplied resolutions; aborted without ' +
+              'pushing. Re-pull and try the resolution again.',
+          );
         }
-        if (await this.hasSymlinkMode(dir, git, rel)) linked.push(rel);
-        const via = await linkedAncestor(dir, rel);
-        if (via) underLink.push({ rel, via });
-      }
-      if (linked.length > 0 || underLink.length > 0) {
+        // A resolution carries file content, never a link target. Refuse to write through a
+        // symlink on either side of the conflict before anything else for this step — including
+        // before the "every conflicted path needs a resolution" check below, since a type-change
+        // conflict (symlink vs. regular file) can add a synthetic path git itself invents
+        // (`notes.tex~HEAD`) that no caller would think to supply a resolution for; the link is
+        // what must be refused, not a spurious "missing resolution". `writeFile` follows a link
+        // (in-project or pointing outside the clone entirely), so a resolved "notes.tex" would
+        // silently land wherever the link points, and `git add` would then stage the untouched
+        // link as if it had been resolved. Check the paused rebase's working tree (`lstat`) and
+        // the ours/theirs conflict stages in the index (`git ls-files -s`, mode 120000) — either
+        // side can carry the link; a link only in the base stage is one both sides already
+        // replaced, and is not refused. Ancestor directories are checked too: git itself never
+        // leaves a conflicted path beneath a link (a side that turns a directory into a link gets
+        // the tracked file moved aside with an unmerged 120000 entry the stage check above already
+        // refuses), but a link can be placed by hand into the working tree while the rebase is
+        // paused, and `writeFile` would follow it wherever it points.
+        const linked: string[] = [];
+        const underLink: Array<{ rel: string; via: string }> = [];
+        for (const rel of step.unmerged) {
+          resolveInside(dir, rel);
+          if (await this.hasSymlinkMode(dir, git, rel)) linked.push(rel);
+          const via = await linkedAncestor(dir, rel);
+          if (via) underLink.push({ rel, via });
+        }
+        if (linked.length > 0 || underLink.length > 0) {
+          throw new Error(
+            linked
+              .map(
+                (rel) =>
+                  `"${rel}" is a symbolic link on at least one side of this conflict; a resolution ` +
+                  'carries file content and cannot resolve a link.',
+              )
+              .concat(
+                underLink.map(
+                  ({ rel, via }) =>
+                    `"${rel}" lies under "${via}", a symbolic link in the working tree; a ` +
+                    'resolution is written at the path it names and cannot be written through a ' +
+                    'link.',
+                ),
+              )
+              .join(' ') +
+              ' Nothing was pushed and the rebase was aborted, so the clone is back to where it ' +
+              'was before it started — resolve that path by hand and push again, or call ' +
+              'reset_to_remote (confirm: true) to rewind the clone to the current remote head ' +
+              "(it discards this clone's unpushed commits) so you can re-apply your edits cleanly.",
+          );
+        }
+        const missing = step.unmerged.filter((rel) => !byPath.has(rel));
+        if (missing.length > 0) {
+          // Can't resolve without content for every conflicted file — fail safe: build the full
+          // report, then abort so the clone returns to its pre-resolve state (nothing
+          // half-merged). This is a `return`, not a throw, so the outer catch below never sees it
+          // — the abort here stays explicit.
+          const report = await this.buildConflictReport(
+            git,
+            dir,
+            branch,
+            `origin/${branch}`,
+            step.unmerged,
+          );
+          await this.abortRebaseIfInProgress(git);
+          report.guidance =
+            `No resolution was supplied for: ${missing.join(', ')}. Every conflicted file must be ` +
+            `included in "resolutions" (all conflicted paths: ${report.conflictPaths.join(', ')}). ` +
+            report.guidance;
+          return this.conflictResult(gitUrl, report);
+        }
+        for (const rel of step.unmerged) {
+          await writeFile(path.join(dir, rel), byPath.get(rel) as string, 'utf8');
+          await git.raw(['--literal-pathspecs', 'add', '--', rel]);
+          used.add(rel);
+        }
+        step = await this.runRebaseStep(git, () => git.raw(['rebase', '--continue']));
+      } catch (err) {
         await this.abortRebaseIfInProgress(git);
-        throw new Error(
-          linked
-            .map(
-              (rel) =>
-                `"${rel}" is a symbolic link on at least one side of this conflict; a resolution ` +
-                'carries file content and cannot resolve a link.',
-            )
-            .concat(
-              underLink.map(
-                ({ rel, via }) =>
-                  `"${rel}" lies under "${via}", a symbolic link in the working tree; a ` +
-                  'resolution is written at the path it names and cannot be written through a ' +
-                  'link.',
-              ),
-            )
-            .join(' ') +
-            ' Nothing was pushed and the rebase was aborted, so the clone is back to where it was ' +
-            'before it started — resolve that path by hand and push again.',
-        );
+        throw err;
       }
-      const missing = step.unmerged.filter((rel) => !byPath.has(rel));
-      if (missing.length > 0) {
-        // Can't resolve without content for every conflicted file — fail safe: build the full
-        // report, then abort so the clone returns to its pre-resolve state (nothing half-merged).
-        const report = await this.buildConflictReport(
-          git,
-          dir,
-          branch,
-          `origin/${branch}`,
-          step.unmerged,
-        );
-        await this.abortRebaseIfInProgress(git);
-        report.guidance =
-          `No resolution was supplied for: ${missing.join(', ')}. Every conflicted file must be ` +
-          `included in "resolutions" (all conflicted paths: ${report.conflictPaths.join(', ')}). ` +
-          report.guidance;
-        return this.conflictResult(gitUrl, report);
-      }
-      for (const rel of step.unmerged) {
-        await writeFile(path.join(dir, rel), byPath.get(rel) as string, 'utf8');
-        await git.raw(['--literal-pathspecs', 'add', '--', rel]);
-        used.add(rel);
-      }
-      step = await this.runRebaseStep(git, () => git.raw(['rebase', '--continue']));
     }
 
     // Reject extra (non-conflicted) resolutions: undo the completed rebase and name them, so a
@@ -1439,8 +1468,12 @@ export class GitService {
     // ("main.tex" as a branch) is not an ambiguous argument.
     const tail = opts.path ? ['--', opts.path] : opts.ref !== undefined ? ['--'] : [];
     const patchArgs = [...base, ...tail];
+    // `--literal-pathspecs` (like `add`/`ls-files`/`ls-tree` above): a pathspec is a glob by
+    // default, so a caller-fed path (this is what `changeDiff`'s write_file/edit_file
+    // confirmation diff passes) named "a[1].tex" would also diff a dirty "a1.tex" that nobody
+    // asked about. Must precede the subcommand, so this bypasses `git.diff()` for a raw call.
     const [diff, files] = await Promise.all([
-      git.diff(patchArgs),
+      git.raw(['--literal-pathspecs', 'diff', ...patchArgs]),
       this.numstat(git, [...base, ...tail]),
     ]);
     return { diff, files };

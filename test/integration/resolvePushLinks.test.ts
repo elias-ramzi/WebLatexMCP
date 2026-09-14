@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, readFile, writeFile, stat, symlink, lstat } from 'node:fs/promises';
@@ -8,6 +8,40 @@ import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import type { ServerConfig } from '../../src/types.js';
+
+/**
+ * PR #67 review finding B's regression test needs `writeFile` (as `GitService.resolvePush` calls
+ * it, via `node:fs/promises`) to reject exactly once, for exactly one path, mid-resolution — a
+ * real permission error on the conflicted file itself doesn't work here because the internal
+ * `pull --rebase` that pauses on the conflict re-checks-out that file fresh (default mode bits)
+ * as part of resolving, so any chmod applied before calling `resolvePush` is undone before the
+ * loop's own `writeFile` runs. `vi.hoisted` state + a partial `vi.mock` of `node:fs/promises`
+ * (delegating to the real implementation for everything else, and for `writeFile` itself once
+ * `failWriteFileOnce` is unset) lets the test arm a single failure at the exact moment it's
+ * needed instead.
+ */
+const writeFileMockState = vi.hoisted(() => ({ failPath: null as string | null }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    writeFile: async (
+      filePath: Parameters<typeof actual.writeFile>[0],
+      data: Parameters<typeof actual.writeFile>[1],
+      options?: Parameters<typeof actual.writeFile>[2],
+    ) => {
+      if (writeFileMockState.failPath !== null && filePath === writeFileMockState.failPath) {
+        writeFileMockState.failPath = null;
+        const err = new Error(
+          `EACCES: permission denied, open '${String(filePath)}'`,
+        ) as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      }
+      return actual.writeFile(filePath, data, options);
+    },
+  };
+});
 
 describe('resolvePush refuses to write a resolution through a symlink', () => {
   const cleanups: Array<() => Promise<void>> = [];
@@ -380,4 +414,56 @@ describe('resolvePush refuses to write a resolution through a symlink', () => {
       });
     },
   );
+
+  // PR #67 review finding B: the paused-rebase loop in `resolvePush` used to abort the rebase
+  // explicitly only before its two deliberate refusal throws (the symlink check above, and the
+  // "did not converge" bound). `hasSymlinkMode`'s `ls-files` spawn, `linkedAncestor`'s `lstat`s,
+  // `writeFile`, and the `git add` spawn were unprotected: any of THEM throwing left the clone
+  // mid-rebase (conflict markers on disk, detached HEAD) — contradicting "the clone is back to
+  // where it was before it started" that CLAUDE.md and this method's own doc comment promise.
+  // Not posix-gated: no symlink and no `[` is involved, and a spawn failure is likeliest on the
+  // Windows CI leg — the one platform the other suites in this file cannot cover.
+  describe('a throw mid-loop (not one of the two deliberate refusals) still aborts the rebase', () => {
+    afterEach(() => {
+      // Backstop for the in-test `finally`: an armed failure must never leak into another test.
+      writeFileMockState.failPath = null;
+    });
+    it('a writeFile failure while applying a resolution leaves the clone exactly as it was', async () => {
+      const { remote, git, dir } = await setup({ 'notes.tex': 'alpha\n' });
+
+      await writeFile(path.join(dir, 'notes.tex'), 'alpha-local\n', 'utf8');
+      await git.commit(dir, { message: 'local edit to notes.tex' });
+      await pushCommit(remote, { 'notes.tex': 'alpha-remote\n' }, 'remote edit to notes.tex');
+
+      const before = await headSha(dir);
+      const remoteBefore = await remoteTip(dir, remote.url, remote.branch);
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      expect(conflict.conflict?.conflictPaths).toEqual(['notes.tex']);
+
+      // Arm a single `writeFile` failure for exactly the conflicted path, disarmed again the
+      // instant it fires (see the `vi.mock` above) so it can't affect any later write in this
+      // or another test.
+      writeFileMockState.failPath = path.join(dir, 'notes.tex');
+      try {
+        await expect(
+          git.resolvePush(
+            dir,
+            remote.url,
+            { username: 'git' },
+            { resolutions: [{ path: 'notes.tex', content: 'merged\n' }] },
+          ),
+        ).rejects.toThrow(/EACCES/);
+      } finally {
+        writeFileMockState.failPath = null;
+      }
+
+      // The clone is back to exactly where it was: no rebase in progress, clean status, same
+      // HEAD, and the bare remote's tip untouched (nothing pushed).
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await headSha(dir)).toBe(before);
+      expect(await remoteTip(dir, remote.url, remote.branch)).toBe(remoteBefore);
+    });
+  });
 });

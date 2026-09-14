@@ -136,3 +136,43 @@ describe('diff reports plain, unquoted paths', () => {
     expect(paths[0]).not.toMatch(UNSAFE_CHARS);
   });
 });
+
+/**
+ * PR #67 review finding D: `GitService.diff` passed `opts.path` to `git diff` as `['--', path]`
+ * without `--literal-pathspecs` — a pathspec is a glob by default, so a `path` of "a[1].tex" also
+ * matches "a1.tex". `add`/`ls-files`/`ls-tree` already carry the flag (see
+ * `literalPathspec.test.ts`, which pins the same fix for `commit`'s scope "paths"); `diff` did
+ * not, and `diff`'s `path` is exactly what `changeDiff` (the confirmation diff shown by
+ * write_file/edit_file) feeds it. `[` is not a legal filename character on Windows, hence the
+ * same skip `literalPathspec.test.ts` uses.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'diff scopes a bracketed path literally, not as a glob',
+  () => {
+    it('diffing "a[1].tex" does not also report the dirty "a1.tex"', async () => {
+      const client = await setup({ 'a1.tex': 'one\n', 'a[1].tex': 'bracket\n' });
+
+      // Both dirty, so a glob-expanded pathspec would sweep both into the result.
+      await client.callTool({
+        name: 'write_file',
+        arguments: { project: 'demo', path: 'a1.tex', content: 'one changed\n' },
+      });
+      await client.callTool({
+        name: 'write_file',
+        arguments: { project: 'demo', path: 'a[1].tex', content: 'bracket changed\n' },
+      });
+
+      const res = await client.callTool({
+        name: 'diff',
+        arguments: { project: 'demo', path: 'a[1].tex' },
+      });
+      const structured = res.structuredContent as unknown as DiffStructured;
+
+      // Pre-fix: `files` also names 'a1.tex', and `diff` (the patch text) also carries its hunk.
+      expect(structured.files.map((f) => f.path)).toEqual(['a[1].tex']);
+      expect(structured.diff).toContain('bracket changed');
+      expect(structured.diff).not.toContain('a1.tex');
+      expect(structured.diff).not.toContain('one changed');
+    });
+  },
+);
