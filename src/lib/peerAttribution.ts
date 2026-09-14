@@ -120,16 +120,26 @@ export function formatAge(fromIso: string, nowMs: number): string {
 
 /** Join at most `max` entries, appending `, … N more` for whatever didn't fit — mirrors
  * `capList` in `src/services/gitService.ts` (not exported from there, so reimplemented here).
- * It bounds the closing's own list only; the lines above it (`theirs`, each session's `owns`,
- * `unowned`) still render in full, so this keeps the closing from repeating a long list one more
- * time rather than making the whole message bounded. */
+ * Every path list in the rendered message is bounded by this — the header's `theirs`, each
+ * session's `owns`, the "No live session owns" line's `unowned`, and the closing's own copy of
+ * `unowned` — so what remains unbounded is the *number of session lines*, one per live peer,
+ * bounded in practice by how many sessions are concurrently heartbeating rather than by any list
+ * length. */
 function capList(items: string[], max: number): string {
   if (items.length <= max) return items.join(', ');
   const shown = items.slice(0, max);
   return `${shown.join(', ')}, … ${items.length - max} more`;
 }
 
-const CLOSING_PATH_CAP = 20;
+/**
+ * The one cap for every path list `renderPeerRefusal` (and its `composeClosing`) render. A single
+ * exported constant, not one chosen per call site: this file already grew a shared
+ * `composeClosing` because two independently-worded messages drifted apart, and four
+ * independently-chosen cap values would be the same mistake one level down. 20 is the existing
+ * house value — `capList(paths, 20)` in `src/services/gitService.ts`, `CONFLICT_MAX_FILES` in
+ * `src/lib/conflictBudget.ts`.
+ */
+export const REFUSAL_PATH_CAP = 20;
 
 /**
  * True when `s` may own any of the disputed paths: a readable peer that owns at least one, or a
@@ -194,7 +204,7 @@ export function composeClosing(a: Attribution, vocab: ClosingVocabulary): string
     "session's change index cannot be read.";
   const only = a.unowned.length === 1;
   const unownedAdvice =
-    `${capList(a.unowned, CLOSING_PATH_CAP)} — not owned by any live session — can be committed ` +
+    `${capList(a.unowned, REFUSAL_PATH_CAP)} — not owned by any live session — can be committed ` +
     `on ${only ? 'its' : 'their'} own with scope "paths", naming just ` +
     `${only ? 'that path' : 'those paths'}: that does not sweep in anyone else's work, and is ` +
     `preferable to scope "all" for ${only ? 'it' : 'them'}.`;
@@ -239,8 +249,10 @@ export function renderPeerRefusal(
   nowMs: number,
   closing?: string,
 ): string {
+  let truncated = theirs.length > REFUSAL_PATH_CAP;
+
   const lines: string[] = [
-    `Uncommitted changes in the shared clone are not this session's: ${theirs.join(', ')}.`,
+    `Uncommitted changes in the shared clone are not this session's: ${capList(theirs, REFUSAL_PATH_CAP)}.`,
   ];
 
   for (const s of a.sessions) {
@@ -253,19 +265,57 @@ export function renderPeerRefusal(
     } else if (s.owns.length === 0) {
       lines.push(`Live session "${s.sessionId}" owns nothing here — ${heartbeat}.`);
     } else {
+      // Unreachable as a *decider* for any Attribution attributePeers actually produces: owns is
+      // always a subset of theirs (built as theirs.filter(...)), so owns.length > REFUSAL_PATH_CAP
+      // already implies theirs.length > REFUSAL_PATH_CAP, which the header check above already
+      // caught. Kept only because renderPeerRefusal takes theirs and a as independent arguments —
+      // a hand-built Attribution could own more paths than theirs lists, and this stops that case
+      // from rendering a truncated owns list with no pointer to `status`.
+      if (s.owns.length > REFUSAL_PATH_CAP) truncated = true;
       const lastWrite = s.lastWriteAt
         ? `last write ${formatAge(s.lastWriteAt, nowMs)} ago`
         : 'no write on record';
       lines.push(
-        `Live session "${s.sessionId}" owns ${s.owns.join(', ')} — ${lastWrite}, ${heartbeat}.`,
+        `Live session "${s.sessionId}" owns ${capList(s.owns, REFUSAL_PATH_CAP)} — ${lastWrite}, ${heartbeat}.`,
       );
     }
   }
 
   if (a.unowned.length > 0) {
+    // Same reasoning as the owns-list setter above: unowned is also always a subset of theirs
+    // (attributePeers builds it as theirs.filter((t) => !claimed.has(t))), so this can't fire as a
+    // decider for any Attribution the server actually builds — the header check already caught it.
+    // Kept for the same hand-built-Attribution defence.
+    if (a.unowned.length > REFUSAL_PATH_CAP) truncated = true;
     lines.push(
-      `No live session owns ${a.unowned.join(', ')} — edited outside this server, or left by a ` +
-        'session that has exited.',
+      `No live session owns ${capList(a.unowned, REFUSAL_PATH_CAP)} — edited outside this server, ` +
+        'or left by a session that has exited.',
+    );
+  }
+
+  // Two things this line deliberately does not say.
+  //
+  // It does not say `status` reports *these* lists, because that is only true for `push`, whose
+  // `theirs` is built exactly as `otherChanges` is. `project_sync` renders the same line over the
+  // tracked paths an incoming commit would overwrite — a strict subset of `otherChanges`, and a
+  // set no `status` field reproduces. So the claim is the weaker true one: every omitted path is
+  // in there, among more besides.
+  //
+  // And it spells out a derivation rather than just naming the two fields, because `status` has
+  // no `unowned`-shaped field and `otherChanges` is the whole disputed set, peer-owned files
+  // included. A caller who fed that to `commit scope: "paths"` — which is what the closing
+  // advises for unowned files — would hit the live-peer guard in `src/tools/commit.ts`, which
+  // throws before committing anything rather than skipping the offending paths. Naming a field
+  // that bounces off a guard one tool over is the failure `composeClosing` above exists to end;
+  // it would be back, one layer down, in a pointer that merely sounded helpful.
+  if (truncated) {
+    lines.push(
+      `Lists here are capped at ${REFUSAL_PATH_CAP} paths, the closing's included. \`status\` ` +
+        'names every path they omit, uncapped: `otherChanges` is every uncommitted file this ' +
+        'session did not write — a superset of the files named here — and ' +
+        '`activeSessions[].changes` is what each session claims, with a `live` flag. Subtract ' +
+        "every live session's `changes` from `otherChanges` for the files no live session owns; " +
+        'a session whose `changes` is null may own any of them.',
     );
   }
 

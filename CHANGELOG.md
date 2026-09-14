@@ -404,6 +404,40 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **Every path list in the peer refusal is bounded, and the message says where the whole one is**
+  (#68). `push` and `project_sync` refuse while a live peer session has in-flight work, and the
+  refusal names the disputed files three times over: the header's full list, each live session's
+  `owns`, and the files no live session owns. Only the closing paragraph's copy was capped, so a tree
+  with hundreds of dirty files rendered three long lists — and the _same_ `unowned` list came back
+  capped in one paragraph and uncapped in the one above it, which is incoherent on its face. All four
+  now cap at one exported `REFUSAL_PATH_CAP` (20, the house value already used by `capList` in
+  `GitService` and by `CONFLICT_MAX_FILES`), single-source for the same reason the closing itself
+  became a shared composer: four independently chosen cap values would be the same drift one level
+  down. Capping here costs more than capping the conflict payload did, and the entry is worth reading
+  for that reason: this refusal is an `Error`, and `errorResult` returns text with **no**
+  `structuredContent`, so a dropped path is dropped from the response entirely rather than merely
+  from one of two channels. What makes that acceptable is that `status` already carries the complete
+  lists on purpose — its `otherChanges` is built exactly as `push` builds the disputed set, and its
+  `activeSessions[].changes` is whole even though its own _text_ shows five paths per peer. The
+  message names them when, and only when, a cap actually fired; never otherwise, since announcing a
+  cap that did not fire is the same false statement about a payload that `conflictBudget`'s `note`
+  rule exists to prevent. It names them as a **derivation**, not as two fields to go read, and that
+  distinction is the whole point: `status` has no `unowned`-shaped field, and `otherChanges` is the
+  _whole_ disputed set — peer-owned files included — so a caller who fed it to `commit scope:
+"paths"`, as the closing directs for unowned files, would hit the live-peer guard and lose the
+  entire call. The pointer therefore spells out that the unowned set is `otherChanges` minus every
+  live session's `changes`, with a null `changes` claiming everything. Naming a field that bounces
+  off the guard one tool over is the exact failure the shared `composeClosing` above was written to
+  end; it would have been re-introduced here, one layer down, by a pointer that merely sounded
+  helpful. For the same reason the line claims the _weaker_ thing — that `status` names every path
+  the lists omit, among more besides — rather than that it reports these lists back: that identity
+  holds for `push`, whose disputed set is built exactly as `otherChanges` is, but not for
+  `project_sync`, which renders the same line over the tracked paths an incoming commit would
+  overwrite, a strict subset no `status` field reproduces. One message shared by two tools may only
+  assert what is true for both, which is the same discipline the shared closing imposed. The unreadable-peer line still lists no paths at
+  all — that peer is treated as owning everything precisely because it might own anything, and
+  printing a concrete list would read as a claim about which.
+
 - **Re-registering a project says which stored fields it dropped.** `register_project` with `gitUrl`
   or `path` on an id already known (in the registry, or held in-process from the env or `project_sync`)
   replaces the stored entry from the arguments given — that

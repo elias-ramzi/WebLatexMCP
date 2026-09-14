@@ -241,6 +241,27 @@ naming it, and it shows up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
 
+Every path list in that refusal is capped at 20 (`REFUSAL_PATH_CAP`): the header's
+disputed set, each session's `owns`, the unowned line, and the closing's copy of it.
+The cap costs more here than in the conflict payload, because the refusal is an error
+and so has only a text channel — a dropped path is dropped from the response, not
+merely from one of two renderings of it. `status` is what makes that affordable: its
+`otherChanges` is the same disputed set, and its `activeSessions[].changes` is complete
+per session, both uncapped in `structuredContent` even though its own text shows five
+paths per peer. The refusal names them only when a cap actually fired, never as
+boilerplate — and names them as a derivation rather than as two fields to go read.
+That is deliberate: there is no `unowned`-shaped field in `status`, and `otherChanges`
+is the whole disputed set, peer-owned files included, so feeding it to
+`commit scope: "paths"` — which is what the closing advises for unowned files — would
+bounce off the live-peer guard and fail the whole call. The files no live session owns
+are `otherChanges` minus every live session's `changes`, a null `changes` claiming
+everything, and the message says so. It also claims no more than that: `status` names
+every omitted path, among more besides, rather than reporting these lists back. The
+stronger claim holds for `push`, whose disputed set is built exactly as `otherChanges`
+is, but not for `project_sync`, whose blocking set is the tracked paths an incoming
+commit would overwrite — a strict subset no `status` field reproduces. A message two
+tools share may only assert what is true for both.
+
 Once past that peer guard — no live peer, or every live peer's work is already
 committed — the push still has to rebase, and git itself draws a further line:
 **untracked files never block it.** They ride through the rebase untouched, whoever
