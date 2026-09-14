@@ -132,9 +132,61 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   deliberately settles what it took**: after a `scope: "all"`/`"paths"` commit, `commit` drops this
   session's entries _under the paths the commit was given_ (`ShadowStore.settle`/`clear`, by
   `coversPath`), whether or not git staged each one — deliberately, since an entry whose working tree
-  already equals HEAD stages nothing yet must still un-wedge. The flag is never cleared on an edit, and
+  already equals HEAD stages nothing yet must still un-wedge — and when git reports nothing to stage
+  at all for an `"all"`/`"paths"` request that covers a tracked entry (the content is already at HEAD:
+  a `push` with `message` committed it, or a hand revert), `commit` settles those entries and returns
+  `committed: false` with them under `settled`, rather than refusing and leaving the only way out an
+  empty commit or a discard; a request covering nothing this session tracks still refuses as before.
+  **A session commit skips what git ignores** (`GitService.ignoredPaths`, run once per commit):
+  `commitContents` stages by `update-index`, which never consults `.gitignore`/`.git/info/exclude`,
+  so the `summarize-paper` note that relies on the exclude was committed and pushed by the default
+  scope while `"all"` (`git add -A`) left it alone. Ignored entries are settled and reported under
+  `ignored`. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
+  and "tracked" is judged **where the staging step that follows will look** (`ignoredPaths`'
+  `tracked` option): against HEAD for `commitContents` and `scope: "paths"`, which reset the index
+  to HEAD first (`check-ignore --no-index` minus what `ls-tree HEAD` lists — a hand `git rm --cached`
+  used to get the file reported ignored, and the session's edit dropped, while the reset put it
+  straight back); against the live index for `scope: "all"` with `paths`, whose `git add` runs over
+  the index as it stands. Keep the two paired, or the filter passes a path `git add` then refuses
+  with its raw "Use -f" hint. When `core.ignorecase` is set, every by-name lookup against HEAD or
+  the index folds ASCII case the way `git add` does — a literal pathspec and `git show ref:path`
+  never do — with the exact spelling winning when both exist: the ignore filter (both bases),
+  `readAtRef`/`readAtRefBytes` (the shadow's base) and `showAtRef` (`read_file` with a `ref`), and
+  `commitContents`, which stages under
+  HEAD's spelling because `update-index --cacheinfo` does no case-alias lookup. A `Notes.txt`
+  edited as `notes.txt` on macOS was otherwise reported ignored, seeded a null shadow base, and
+  committed as a second tree entry. The tool layer's own by-name comparisons fold
+  the same way: `coversPath`/`peerOwnership`/`attributePeers`/`ShadowStore.settle` take an
+  optional `fold`, and `commit` (every scope: the ownership check, the rescue, the session-scope
+  `paths` filter, the settle), `push` (attribution, and the split of dirty paths into mine/theirs)
+  and `status` (its session/other split) pass `foldCase` (`src/lib/caseFold.ts`, the one home of git's ASCII-only fold and the exact-first
+  `canonicalNames` lookup) exactly when `GitService.isCaseInsensitive(dir)` says so — otherwise
+  they stay byte-exact, which is what a `--literal-pathspecs` call downstream does too. Before this,
+  a live peer's `Notes.txt` entry did not protect a request naming `notes.txt`, and `git add` staged
+  the peer's lines. Keep the lib functions pure: the fold is a parameter, the decision is the
+  caller's, and the source of truth is one method — `core.ignorecase` in the clone's config, never
+  the filesystem: a repository copied onto a case-insensitive disk without that setting keeps every
+  comparison byte-exact, as git itself would. `canonicalNames.resolve` also folds the longest
+  tracked _directory_ prefix (`sub/new.tex` → `Sub/new.tex` while HEAD tracks `Sub/`), exact-first
+  at every depth, so a new file never opens a second, case-differing directory in the tree; and
+  on such a clone `ShadowStore.record` folds a new key onto an existing entry that differs only
+  in ASCII case (the store is handed `isCaseInsensitive` like its other git hooks), because
+  `shadow/<rel>` and `base/<rel>` sit on the same filesystem, where `shadow/notes.txt` _is_
+  `shadow/Notes.txt` — a second entry silently overwrote the first's shadow with HEAD's bytes and
+  the commit found nothing staged (macOS CI). `commitContents` still refuses, before any index
+  write, an index that spells one file two ways (a legacy one), rather than let the second
+  `update-index --cacheinfo` win silently. `GitService.commit` with
+  `paths` resolves each one to the index's spelling too, since a literal pathspec never folds. The flag is never cleared on an edit, and
   `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
-  deliberate take or a discard ends that state.
+  deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
+  its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call
+  (`GitService.headSha`, wired as the store's `HeadShaReader`) and **skips a conflicted entry whose
+  `conflictHead` is that commit** — otherwise every `status`/`commit`/`push` re-merged and re-hashed
+  (two `git hash-object` spawns) each permanently conflicted asset, forever. The memo never clears a
+  flag; a HEAD move re-evaluates in full, and an entry without the field (older index, or a
+  `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
+  reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
+  never clear one.
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
@@ -177,7 +229,9 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   nothing about whether a path may be used — that stays `assertNoSymlinkEscape` — it only tells the
   tool layer what the path is called at the far end, so every name-based gate can judge that too; it
   runs inside `runExclusive`, so a peer cannot plant the link between the check and the write.
-  `delete_file` judges only the literal name: removing a link removes the link, not what it points at.
+  `delete_file` judges only the literal name: removing a link removes the link, not what it points at
+  (a delete _under_ a linked directory does remove the real file — the shadow record follows it, see
+  `attributedDeletePath` below — but the name gate still judges what the caller named).
 - **`add_writing_convention` is guarded too, for the opposite reason.** When no extra writing guide is
   configured (`ctx.config.extraWritingGuidePath` unset), the unconfigured-guide error wins outright —
   there is nothing to confirm writing to a destination that doesn't exist, so the tool goes straight to
@@ -251,7 +305,23 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   was resolved and found to leave; a path past `MAX_REPORTED_PATH_CHECKS` was never resolved at all.
   Never report the second as the first. `resolveThroughLinks` resolves a link's target in turn, too —
   stopping at the literal target let `notes.tex -> sub/pwned` through a linked `sub` pass the check and
-  land outside.
+  land outside. **A write through an in-project link is attributed to the link's target**
+  (`attributedPath` in `FileService`, fed to the mutation recorder by `write`/`writeBytes`/
+  `applyEdits`): the bytes land in the target, so the session's shadow must name the target, or the
+  entry carries the link's HEAD blob (its target string) as base and three-way merges text against
+  `"main.tex"` — a bogus `conflicted` on the link while the real edit is owned by nobody — and a
+  dangling tracked link committed as a mode-120000 blob whose target string _was_ the new text.
+  `delete` is attributed to the _parent resolved through links_ plus the literal final component
+  (`attributedDeletePath`): `rm` of a link named `link.tex` removes the link, so that name stays; but
+  `rm` of `linkdir/notes.tex` through a tracked `linkdir -> realdir` removes the real
+  `realdir/notes.tex`, and recording it under the link's path filed a key git rejects ("beyond a
+  symbolic link") — every later session commit failed on it, unrelated files included. The baseline key is
+  untouched by this — identity for the revision tracker is still the `resolveInside` string; only the
+  name the recorder is told changes. And `commitContents` refuses content for a path whose index mode
+  is 120000 _unless `lstat` shows a regular file or ENOENT_ (still a link, or unstattable, is refused —
+  fail closed), so no stale entry can produce that link-with-text blob again — the index was just reset to HEAD, so its mode says what HEAD has, not
+  what the session did: a link the session `delete_file`d and `write_file`d over as a regular file is
+  the typechange `git add` records without comment, and stages as `100644`.
 - **The compile backend is preflighted, and only an _unchosen_ default is ever substituted.**
   `CompilerResolver` (`src/services/compilerResolver.ts`) calls `isAvailable()` before compiling —
   which nothing did until a user on a tectonic-only machine got a raw `spawn latexmk ENOENT` naming
@@ -310,16 +380,50 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   credential helpers (e.g. `gh auth setup-git`).
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
-- **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict `push`
-  aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way payload per
-  file (`base`/`ours`/`theirs` + marker `hunks`) plus `conflictPaths`/`remoteHead`/`remoteCommits`. This
-  payload is rendered into the result **text** (`src/lib/conflictText.ts`), not only `structuredContent`,
-  so an MCP-only client can resolve without a shell. The caller resolves by retrying `push` with
-  `resolutions` (full merged content per file — used verbatim, applied _inside_ the rebase via add +
-  `rebase --continue`); the set is validated (missing/extra files named), `expectedRemoteHead` guards
-  against a moved remote (compare full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays
-  gated behind `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs`
-  directly. Keep the merged text originating from the caller.
+- **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict
+  `push` aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way
+  payload per file (`base`/`ours`/`theirs` + marker `hunks`) plus
+  `conflictPaths`/`remoteHead`/`remoteCommits`. This payload is rendered into the result **text**
+  (`src/lib/conflictText.ts`), not only `structuredContent`, so an MCP-only client can resolve
+  without a shell. The caller resolves by retrying `push` with `resolutions` (full merged content
+  per file — used verbatim, applied _inside_ the rebase via add + `rebase --continue`); the set is
+  validated (missing/extra files named), `expectedRemoteHead` guards against a moved remote (compare
+  full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays gated behind
+  `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs` directly.
+  Keep the merged text originating from the caller. **A resolution is file content, so a path that
+  is a symlink on _either_ side of the conflict is refused** (rebase aborted, clone back to its
+  pre-push state) — `resolvePush` checks `lstat` in the paused rebase _and_ the ours/theirs index
+  stages (2/3) for mode 120000 (`hasLinkOnConflictSide`; a link only in the _base_ stage is one both
+  sides already replaced with a file, an ordinary content conflict), inside `GitService`, because
+  the link that matters is upstream's, materialised only by the paused rebase, which a pre-check in
+  the tool against our HEAD cannot see. Before this, a collaborator's `notes.tex -> /outside` made a
+  resolution write through the link into the outside file and then report nothing-to-push, and
+  `notes.tex -> refs.bib` reached a `.bib` past the literal-name `confirmBibEdit` gate. A conflicted
+  path that lies _under_ a working-tree symlink (`linkedAncestor`) is refused the same way: git itself
+  never leaves a conflicted path beneath a link (a side that turns a directory into a link gets the
+  file moved aside as an unmerged 120000 entry the stage check already refuses), but a link placed by
+  hand while the rebase is paused would have `writeFile` follow it. Every exception raised inside the
+  paused rebase — not only the deliberate refusals — aborts it before propagating, so a failed spawn
+  never leaves the clone mid-rebase — including the priming `pull --rebase` (`runRebaseStep`) and
+  `push`'s own attempt (`tryRebase`): both abort first when listing the unmerged paths fails, and
+  `tryRebase` also when building the conflict report fails. `unmergedPaths` passes `-c core.quotePath=false` like every other
+  path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never be
+  resolved by name.
+- **A pathspec handed to git is literal, never a glob.** Every `git add`, `ls-files`, `ls-tree`,
+  `diff` (patch and numstat) and `discard`'s `checkout`/`clean` call that takes a path the caller or
+  a shadow named runs with `--literal-pathspecs` (the global option, _before_ the subcommand;
+  `check-ignore --stdin` reads paths, not pathspecs, and needs none): without it `a[1].tex` is a glob that also matches `a1.tex`,
+  and under `scope: "paths"` that staged a peer's dirty `a1.tex` past the ownership check, which had
+  compared literal names. A new git call site that takes a path must carry the flag too. Callers see
+  the same rule in the `paths` description: matched literally, no globs — so a `sections/*.tex` is
+  never expanded: `scope: "paths"` refuses it in server words ("not changed in the working tree"),
+  every route refuses a path that is neither on disk nor tracked in server words before `git add`
+  sees it. `discard` with `paths` checks out only the tracked subset (resolved to the index's
+  spelling on an ignorecase clone, or a case-spelled request would silently discard nothing) and
+  runs `clean -f` over every requested path, so an untracked name is removed rather than tripping
+  `checkout`; and it settles only the named paths in every session's records (`ShadowStore.settleAll`)
+  — `clearAll` is for the whole-tree discard alone, since dropping a peer's unrelated record is what
+  lets a later `scope: "paths"` take its lines.
 - **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
   range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
   rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,

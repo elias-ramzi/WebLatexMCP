@@ -12,6 +12,7 @@ import {
 } from '../lib/conflictText.js';
 import { toPosix } from '../lib/paths.js';
 import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
+import { foldCase } from '../lib/caseFold.js';
 
 /**
  * Refuse to push while a live sibling session has uncommitted work in the shared clone.
@@ -35,14 +36,19 @@ async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<
   const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
   if (dirty.length === 0) return;
 
-  const mine = new Set((await ctx.shadows.changes(id)).map((c) => c.path));
-  const theirs = dirty.filter((p) => !mine.has(p));
+  // On a `core.ignorecase` clone git reports a dirty file in the index's spelling while a shadow
+  // key carries the spelling the session wrote it under; fold both the way git does there, and
+  // compare byte-for-byte everywhere else (the same rule `commit` scope "paths" applies).
+  const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
+  const mine = new Set((await ctx.shadows.changes(id)).map((c) => fold(c.path)));
+  const theirs = dirty.filter((p) => !mine.has(fold(p)));
   if (theirs.length === 0) return;
 
   const attribution = attributePeers(
     theirs,
     peers,
     await collectPeerShadows(ctx.shadows, id, peers),
+    fold,
   );
   throw new Error(renderPeerRefusal(theirs, attribution, Date.now()));
 }

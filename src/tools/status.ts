@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { syncState, syncSummary } from '../lib/syncState.js';
 import { toPosix } from '../lib/paths.js';
+import { foldCase } from '../lib/caseFold.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
 import { latestTouch } from '../services/shadowStore.js';
 import { renderCommitLines } from '../lib/conflictText.js';
@@ -125,9 +126,14 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         await ctx.shadows.refresh(id, dir);
         const changes = await ctx.shadows.changes(id);
         const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
-        const owned = new Set(changes.map((c) => c.path));
-        const sessionChanges = dirty.filter((p) => owned.has(p)).sort();
-        const otherChanges = dirty.filter((p) => !owned.has(p)).sort();
+        // git reports a dirty file in the index's spelling; on a `core.ignorecase` clone that can
+        // differ in case from the spelling this session wrote it under (its shadow key), so the
+        // split folds the way git does there and stays byte-exact everywhere else — the same
+        // rule `commit` and `push` apply.
+        const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
+        const owned = new Set(changes.map((c) => fold(c.path)));
+        const sessionChanges = dirty.filter((p) => owned.has(fold(p))).sort();
+        const otherChanges = dirty.filter((p) => !owned.has(fold(p))).sort();
         const conflictedChanges = changes.filter((c) => c.conflicted).map((c) => c.path);
         const peers = (await ctx.sessions.peers(id)).filter((p) => !p.self);
         // Read-only, no lock: every peer's shadow index (live or not — a session that exited

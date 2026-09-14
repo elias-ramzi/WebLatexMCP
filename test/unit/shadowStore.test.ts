@@ -8,8 +8,10 @@ import {
   type ShadowChange,
   type PeerShadowEntry,
   type CleanHasher,
+  type HeadShaReader,
 } from '../../src/services/shadowStore.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
+import { foldCase } from '../../src/lib/caseFold.js';
 
 /** Assert the store tracks exactly one change, and return it. */
 function only(changes: ShadowChange[]): ShadowChange {
@@ -69,10 +71,44 @@ describe('ShadowStore', () => {
       crlfNormalizingHasher,
     );
 
+  /**
+   * Fake HEAD *commit sha*, kept separate from the fake HEAD *content* map (`head`) above: real
+   * git only moves the sha when a commit lands, so a test can change `head`'s bytes (simulating a
+   * peer landing new content) independently of whether it also "commits" (bumps this). The
+   * conflictHead memo (issue #66 item 6) keys off exactly this sha, not off the content.
+   */
+  let headCommit: string;
+
+  /** Wraps a `CleanHasher` to count how many times it is actually invoked (i.e. spawned). */
+  const countingHasher = (base: CleanHasher): { hasher: CleanHasher; count: () => number } => {
+    let calls = 0;
+    const hasher: CleanHasher = async (dir, rel, bytes) => {
+      calls += 1;
+      return base(dir, rel, bytes);
+    };
+    return { hasher, count: () => calls };
+  };
+
+  const identityHasher: CleanHasher = (_dir, _rel, bytes) =>
+    Promise.resolve(bytes.toString('utf8'));
+
+  /** Same as `makeStore`, but with a `CleanHasher` and a `HeadShaReader` wired in, for exercising
+   * the conflictHead memo. */
+  const makeMemoStore = (sessionId: string, hasher: CleanHasher): ShadowStore =>
+    new ShadowStore(
+      workspace,
+      sessionId,
+      (_dir, rel) => Promise.resolve(head.get(rel) ?? null),
+      undefined,
+      hasher,
+      ((_dir: string) => Promise.resolve(headCommit)) as HeadShaReader,
+    );
+
   beforeEach(async () => {
     workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-shadow-'));
     head = new Map();
     setHead(REL, BASE);
+    headCommit = 'c0';
   });
 
   afterEach(async () => {
@@ -248,6 +284,14 @@ describe('ShadowStore', () => {
       expect(remaining.map((c) => c.path)).toEqual(['notes.tex']);
     });
 
+    it('strips a leading "./" the way the tool layer does, so "./a.tex" settles "a.tex"', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      const dropped = await store.settle(PROJECT, ['./a.tex']);
+      expect(dropped).toEqual(['a.tex']);
+      expect(await store.changes(PROJECT)).toEqual([]);
+    });
+
     it('drops every entry under a covering directory', async () => {
       const store = makeStore('a');
       await store.record(PROJECT, DIR, 'figures/a.tex', null, 'a\n');
@@ -295,6 +339,35 @@ describe('ShadowStore', () => {
       await expect(readFile(shadowPath)).rejects.toThrow();
       await expect(readFile(basePath)).rejects.toThrow();
     });
+
+    describe('case fold (issue #66)', () => {
+      it('drops a differently-cased entry when a fold is passed, and returns its own spelling', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Notes.txt', null, 'fresh\n');
+
+        const dropped = await store.settle(PROJECT, ['notes.txt'], foldCase);
+        expect(dropped).toEqual(['Notes.txt']);
+        expect(await store.changes(PROJECT)).toEqual([]);
+      });
+
+      it('just outside: without a fold, a differently-cased request drops nothing', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Notes.txt', null, 'fresh\n');
+
+        const dropped = await store.settle(PROJECT, ['notes.txt']);
+        expect(dropped).toEqual([]);
+        expect(only(await store.changes(PROJECT)).path).toBe('Notes.txt');
+      });
+
+      it('a directory request drops a differently-cased entry underneath it, with a fold', async () => {
+        const store = makeStore('a');
+        await store.record(PROJECT, DIR, 'Sub/x.tex', null, 'x\n');
+
+        const dropped = await store.settle(PROJECT, ['sub'], foldCase);
+        expect(dropped).toEqual(['Sub/x.tex']);
+        expect(await store.changes(PROJECT)).toEqual([]);
+      });
+    });
   });
 
   it('clearAll drops every session, not just this one', async () => {
@@ -306,6 +379,48 @@ describe('ShadowStore', () => {
     await a.clearAll(PROJECT);
     expect(await a.hasChanges(PROJECT)).toBe(false);
     expect(await b.hasChanges(PROJECT)).toBe(false);
+  });
+
+  describe('settleAll (issue #66)', () => {
+    it('settles only the named path, in every session, leaving unrelated entries in every session intact', async () => {
+      const one = makeStore('one');
+      const two = makeStore('two');
+      await one.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      await two.record(PROJECT, DIR, 'b.tex', null, 'b\n');
+      await two.record(PROJECT, DIR, 'sub/c.tex', null, 'c\n');
+
+      // Callable from either store — settleAll does not depend on the calling store's own
+      // sessionId, only on the workspace/project it was constructed with.
+      const dropped = await one.settleAll(PROJECT, ['b.tex']);
+      expect(dropped).toEqual(['b.tex']);
+
+      expect((await one.peerEntries(PROJECT, 'one'))?.map((e) => e.path)).toEqual(['a.tex']);
+      expect((await one.peerEntries(PROJECT, 'two'))?.map((e) => e.path).sort()).toEqual([
+        'sub/c.tex',
+      ]);
+    });
+
+    it('drops a differently-cased entry only when a fold is passed', async () => {
+      const one = makeStore('one');
+      const two = makeStore('two');
+      await one.record(PROJECT, DIR, 'a.tex', null, 'a\n');
+      await two.record(PROJECT, DIR, 'b.tex', null, 'b\n');
+
+      const droppedNoFold = await one.settleAll(PROJECT, ['B.TEX']);
+      expect(droppedNoFold).toEqual([]);
+      expect((await one.peerEntries(PROJECT, 'two'))?.map((e) => e.path)).toEqual(['b.tex']);
+
+      const droppedFolded = await one.settleAll(PROJECT, ['B.TEX'], foldCase);
+      expect(droppedFolded).toEqual(['b.tex']);
+      expect(await one.peerEntries(PROJECT, 'two')).toEqual([]);
+      // Untouched throughout.
+      expect((await one.peerEntries(PROJECT, 'one'))?.map((e) => e.path)).toEqual(['a.tex']);
+    });
+
+    it('returns [] and touches nothing when there is no session state at all yet', async () => {
+      const store = makeStore('a');
+      await expect(store.settleAll(PROJECT, ['anything'])).resolves.toEqual([]);
+    });
   });
 
   it('stamps touchedAt from the injected clock on every record, updating on later edits', async () => {
@@ -878,6 +993,176 @@ describe('ShadowStore', () => {
       expect(change.conflicted).toBe(true);
     });
   });
+
+  describe('conflictHead memo (issue #66 item 6)', () => {
+    it('does not re-hash a conflicted entry while HEAD stays put', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const a = makeMemoStore('a', hasher);
+      const b = makeMemoStore('b', hasher);
+
+      await a.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per B.'));
+
+      // A's commit lands: HEAD moves to different bytes on the same line B touched.
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+
+      expect(count()).toBe(0);
+      const first = await b.refresh(PROJECT, DIR);
+      expect(first.conflicted).toEqual([REL]);
+      // The settled check's sameAsGitSees fallback spawns the hasher twice (idA/idB) before
+      // falling through to the merge3 conflict — this is the pre-fix baseline cost per call.
+      expect(count()).toBe(2);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      // Three more refreshes with HEAD unchanged must not grow the hasher call count at all —
+      // pre-fix, each of these would add 2 more (6 total).
+      for (let i = 0; i < 3; i++) {
+        const refreshed = await b.refresh(PROJECT, DIR);
+        expect(refreshed.conflicted).toEqual([REL]);
+        expect(count()).toBe(2);
+        expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+      }
+    });
+
+    it('re-evaluates once HEAD moves again, and can settle', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const a = makeMemoStore('a', hasher);
+      const b = makeMemoStore('b', hasher);
+
+      await a.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per B.'));
+
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.refresh(PROJECT, DIR);
+      expect(count()).toBe(2);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      // HEAD moves to exactly what B's own shadow already holds (e.g. someone applied B's fix) —
+      // the memo must not freeze the stale verdict past this move: it settles.
+      headCommit = 'c2';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per B.'));
+      const settled = await b.refresh(PROJECT, DIR);
+      expect(settled.settled).toEqual([REL]);
+      expect(settled.conflicted).toEqual([]);
+      expect(await b.changes(PROJECT)).toEqual([]);
+      // bytesEqual(head, shadow) matched directly — no hasher spawn needed for this move.
+      expect(count()).toBe(2);
+
+      // A fresh conflict, then HEAD moves to a THIRD, still-conflicting commit: the evaluation
+      // must re-run (hasher spawns again) and the new conflictHead must be the new sha, not stuck
+      // on the first one. `before` matches the entry's re-anchored base (the settled HEAD content)
+      // exactly, so this record() applies cleanly (no hasher spawn) and leaves a fresh shadow to
+      // conflict against.
+      await b.record(
+        PROJECT,
+        DIR,
+        REL,
+        BASE.replace('Alpha line.', 'Alpha per B.'),
+        BASE.replace('Alpha line.', 'Alpha per B, again.'),
+      );
+      expect(count()).toBe(2); // unchanged — that record() applied directly
+      headCommit = 'c3';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A, again.'));
+      const reconflicted = await b.refresh(PROJECT, DIR);
+      expect(reconflicted.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // settled-check fallback spawned again for this new HEAD
+
+      headCommit = 'c4';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A, yet again.'));
+      const reconflictedAgain = await b.refresh(PROJECT, DIR);
+      expect(reconflictedAgain.conflicted).toEqual([REL]);
+      expect(count()).toBe(6); // re-evaluated again — a new HEAD sha each time, no memo hit
+    });
+
+    it('a record-time collision (no conflictHead yet) is fully evaluated once by the next refresh, then memoised', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const store = makeMemoStore('a', hasher);
+
+      // First edit lands in the shadow.
+      await store.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      // A second record() call whose "before" no longer matches the shadow (a peer wrote to the
+      // same line in the working tree between the two calls) and whose "after" changes it a third
+      // way: shadow/before/after all differ on the same line, so record()'s own merge3 conflicts.
+      // This branch (record, not refresh) never sets conflictHead — see the class doc comment.
+      await store.record(
+        PROJECT,
+        DIR,
+        REL,
+        BASE.replace('Alpha line.', 'Alpha per B.'),
+        BASE.replace('Alpha line.', 'Alpha per C.'),
+      );
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+      // record()'s own raw-comparison-failed fallback (before the merge3 that finds the conflict)
+      // already spawns the hasher twice — this is what "no conflictHead yet" costs on its own,
+      // separate from what the next refresh costs.
+      expect(count()).toBe(2);
+
+      // Move HEAD to yet another value on the same line, so refresh has real work to do.
+      headCommit = 'c1';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per HEAD.'));
+
+      const first = await store.refresh(PROJECT, DIR);
+      expect(first.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // fully evaluated exactly once (settled-check fallback: +2)
+
+      const second = await store.refresh(PROJECT, DIR);
+      expect(second.conflicted).toEqual([REL]);
+      expect(count()).toBe(4); // memoised — the second call spawns nothing more
+    });
+
+    it('an old index entry with conflicted:true but no conflictHead is re-evaluated, not skipped', async () => {
+      const { hasher, count } = countingHasher(identityHasher);
+      const dir = sessionDir(workspace, PROJECT, 'legacy-conflict');
+      await mkdir(path.join(dir, 'shadow', 'sections'), { recursive: true });
+      await mkdir(path.join(dir, 'base', 'sections'), { recursive: true });
+      await writeFile(
+        path.join(dir, 'shadow', REL),
+        BASE.replace('Alpha line.', 'Alpha SHADOW.'),
+        'utf8',
+      );
+      await writeFile(path.join(dir, 'base', REL), BASE, 'utf8');
+      await writeFile(
+        path.join(dir, 'shadow.json'),
+        JSON.stringify({
+          entries: { [REL]: { deleted: false, baseExists: true, conflicted: true } },
+        }),
+        'utf8',
+      );
+
+      const store = makeMemoStore('legacy-conflict', hasher);
+      headCommit = 'cX';
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha HEAD.'));
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.conflicted).toEqual([REL]);
+      expect(count()).toBe(2); // the missing field forced a full evaluation
+
+      const raw = JSON.parse(await readFile(path.join(dir, 'shadow.json'), 'utf8')) as {
+        entries: Record<string, { conflictHead?: string }>;
+      };
+      expect(raw.entries[REL]?.conflictHead).toBe('cX');
+
+      // Now that conflictHead is set, a further refresh with the same HEAD is memoised.
+      const again = await store.refresh(PROJECT, DIR);
+      expect(again.conflicted).toEqual([REL]);
+      expect(count()).toBe(2);
+    });
+
+    it('leaves conflictHead unset on an unrecorded entry — it is skipped before the memo check', async () => {
+      const store = makeMemoStore('a', identityHasher);
+      await store.markUnrecorded(PROJECT, REL);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.conflicted).toEqual([REL]);
+
+      const raw = JSON.parse(
+        await readFile(path.join(sessionDir(workspace, PROJECT, 'a'), 'shadow.json'), 'utf8'),
+      ) as { entries: Record<string, { conflictHead?: string }> };
+      expect(raw.entries[REL]?.conflictHead).toBeUndefined();
+    });
+  });
 });
 
 describe('latestTouch', () => {
@@ -901,5 +1186,66 @@ describe('latestTouch', () => {
 
   it('returns null when every entry has no touchedAt', () => {
     expect(latestTouch([entry(null), entry(null)])).toBeNull();
+  });
+});
+
+describe('entry keys fold onto an existing spelling on a case-insensitive clone', () => {
+  const PROJECT = 'demo';
+  const DIR = '/nonexistent';
+  const HEAD = 'a\nb\nc\n';
+  async function makeFoldingStore(insensitive: boolean): Promise<{
+    store: ShadowStore;
+    cleanup: () => Promise<void>;
+  }> {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-shadow-fold-'));
+    const store = new ShadowStore(
+      workspace,
+      'a',
+      () => Promise.resolve(Buffer.from(HEAD, 'utf8')),
+      Date.now,
+      undefined,
+      undefined,
+      () => Promise.resolve(insensitive),
+    );
+    return { store, cleanup: () => rm(workspace, { recursive: true, force: true }) };
+  }
+
+  it('records a second spelling into the first entry (one file, one shadow)', async () => {
+    const { store, cleanup } = await makeFoldingStore(true);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.record(PROJECT, DIR, 'notes.txt', 'AAA\n', 'BBB\n');
+      const changes = await store.changes(PROJECT);
+      expect(changes.map((c) => c.path)).toEqual(['Notes.txt']);
+      expect(changes[0]?.content).toBe('BBB\n');
+      expect(changes[0]?.conflicted).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('just outside: byte-exact keys on a case-sensitive clone', async () => {
+    const { store, cleanup } = await makeFoldingStore(false);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.record(PROJECT, DIR, 'notes.txt', HEAD, 'BBB\n');
+      const paths = (await store.changes(PROJECT)).map((c) => c.path).sort();
+      expect(paths).toEqual(['Notes.txt', 'notes.txt']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('markUnrecorded reuses the folded key once record has learnt the answer', async () => {
+    const { store, cleanup } = await makeFoldingStore(true);
+    try {
+      await store.record(PROJECT, DIR, 'Notes.txt', HEAD, 'AAA\n');
+      await store.markUnrecorded(PROJECT, 'notes.txt');
+      const changes = await store.changes(PROJECT);
+      expect(changes.map((c) => c.path)).toEqual(['Notes.txt']);
+      expect(changes[0]?.unrecorded).toBe(true);
+    } finally {
+      await cleanup();
+    }
   });
 });

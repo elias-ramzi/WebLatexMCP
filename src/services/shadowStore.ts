@@ -4,6 +4,7 @@ import { merge3 } from '../lib/merge3.js';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
 import { toPosix } from '../lib/paths.js';
 import { coversPath } from '../lib/commitPaths.js';
+import { foldCase } from '../lib/caseFold.js';
 import { writeAtomic } from './sessionRegistry.js';
 
 /**
@@ -23,6 +24,14 @@ export type HeadReader = (projectDir: string, relPath: string) => Promise<Buffer
  */
 export type CleanHasher = (projectDir: string, relPath: string, bytes: Buffer) => Promise<string>;
 
+/**
+ * The commit sha HEAD currently points at, or the literal `'unborn'` when the project has no
+ * commit yet — never throws. Injected for the same reason `HeadReader`/`CleanHasher` are: the
+ * store stays independent of `GitService`, and tests can drive it without a repository. This is
+ * what lets `refresh` memoise a conflicted verdict: see the class doc comment and `refresh`.
+ */
+export type HeadShaReader = (projectDir: string) => Promise<string>;
+
 /** One file this session has changed, as tracked on disk. */
 interface ShadowIndexEntry {
   /** True when this session's change to the file is its deletion. */
@@ -35,6 +44,19 @@ interface ShadowIndexEntry {
    * from commits until the conflict is dealt with.
    */
   conflicted?: boolean;
+  /**
+   * The commit sha HEAD had when `refresh` last judged this entry conflicted. While HEAD is still
+   * that commit, the verdict cannot have changed — `record` early-returns on `conflicted`
+   * (leaving the shadow and base exactly as they were) and `refresh` writes nothing on either
+   * conflicting branch — so `refresh` skips recomputing it: no HEAD blob read, no shadow read, no
+   * merge, no `sameAsGitSees` spawn. Absent on entries written before this field existed (simply
+   * re-evaluated once, which then sets it) and on a `record`-time collision: set only by
+   * `refresh`, and only on its three conflicting branches — so while HEAD still equals such an
+   * entry's base, each `refresh` reads HEAD's blob and the base, finds them equal and moves on
+   * (no merge, no spawn) without ever setting the memo; the field is first set by the `refresh`
+   * that runs after HEAD moves. Cleared wherever `conflicted` is cleared.
+   */
+  conflictHead?: string;
   /**
    * When this session last wrote the file, ISO 8601. Set on every `record` call — including the
    * conflicted early return, since the session did write the file even though the shadow could
@@ -147,7 +169,45 @@ export class ShadowStore {
     private readonly readHead: HeadReader,
     private readonly now: () => number = Date.now,
     private readonly cleanHash?: CleanHasher,
+    private readonly resolveHeadSha?: HeadShaReader,
+    /**
+     * Whether the clone at `projectDir` has `core.ignorecase` set (see
+     * `GitService.isCaseInsensitive`). On such a clone two spellings of one name are one file —
+     * and one shadow: `shadow/<rel>` and `base/<rel>` live on the same filesystem, where
+     * `shadow/notes.txt` IS `shadow/Notes.txt`, so a second entry keyed by the other spelling
+     * silently overwrote the first's shadow with HEAD's bytes (macOS CI). `record` therefore
+     * folds a new key onto an existing entry that differs only in ASCII case, so two such keys
+     * never coexist. Optional and injected like the other git-facing hooks; absent means
+     * byte-exact keys.
+     */
+    private readonly isCaseInsensitive?: (projectDir: string) => Promise<boolean>,
   ) {}
+
+  /** `isCaseInsensitive`'s last answer per project, so `markUnrecorded` (no dir) can reuse it. */
+  private readonly insensitiveByProject = new Map<string, boolean>();
+
+  private async caseInsensitive(projectId: string, projectDir: string): Promise<boolean> {
+    if (!this.isCaseInsensitive) return false;
+    try {
+      const answer = await this.isCaseInsensitive(projectDir);
+      this.insensitiveByProject.set(projectId, answer);
+      return answer;
+    } catch {
+      // Unanswerable — keys stay byte-exact for this call, which only ever creates a separate
+      // entry, never loses one.
+      return this.insensitiveByProject.get(projectId) ?? false;
+    }
+  }
+
+  /**
+   * The index key `rel` belongs to: `rel` itself when the index holds it or the clone is
+   * case-sensitive; otherwise an existing key equal to it under git's ASCII fold, if any.
+   */
+  private entryKey(index: ShadowIndex, rel: string, insensitive: boolean): string {
+    if (!insensitive || index.entries[rel]) return rel;
+    const folded = foldCase(rel);
+    return Object.keys(index.entries).find((k) => foldCase(k) === folded) ?? rel;
+  }
 
   /**
    * Whether `a` and `b` are the same content *as git would store it* at `rel` — i.e. they clean-
@@ -197,8 +257,12 @@ export class ShadowStore {
     before: string | Buffer | null,
     after: string | Buffer | null,
   ): Promise<void> {
-    const rel = toPosix(relPath);
     const index = await this.readIndex(projectId);
+    const rel = this.entryKey(
+      index,
+      toPosix(relPath),
+      await this.caseInsensitive(projectId, projectDir),
+    );
     let entry = index.entries[rel];
     const isBinaryChange = Buffer.isBuffer(before) || Buffer.isBuffer(after);
 
@@ -234,6 +298,7 @@ export class ShadowStore {
       // A deletion is not mergeable — record it as this session's change outright.
       entry.deleted = true;
       entry.conflicted = false;
+      delete entry.conflictHead;
       await this.removeShadow(projectId, rel);
     } else if (entry.binary) {
       // Binary content has no honest merge — there is no such thing as a merged PNG. A peer
@@ -268,6 +333,7 @@ export class ShadowStore {
       if (beforeMatchesShadow) {
         entry.deleted = false;
         entry.conflicted = false;
+        delete entry.conflictHead;
         await this.writeShadow(projectId, rel, toBuffer(after));
       } else {
         entry.conflicted = true;
@@ -290,6 +356,7 @@ export class ShadowStore {
         // erases — the edit applies to the shadow directly.
         entry.deleted = false;
         entry.conflicted = false;
+        delete entry.conflictHead;
         await this.writeShadow(projectId, rel, Buffer.from(afterStr, 'utf8'));
       } else if (shadowStr !== null && beforeStr !== null) {
         // Re-checked (rather than asserted) so the compiler can narrow these to `string`:
@@ -303,6 +370,7 @@ export class ShadowStore {
         } else {
           entry.deleted = false;
           entry.conflicted = false;
+          delete entry.conflictHead;
           await this.writeShadow(projectId, rel, Buffer.from(merged, 'utf8'));
         }
       }
@@ -325,8 +393,12 @@ export class ShadowStore {
    * stamped too, since the session did write the file.
    */
   async markUnrecorded(projectId: string, relPath: string): Promise<void> {
-    const rel = toPosix(relPath);
     const index = await this.readIndex(projectId);
+    const rel = this.entryKey(
+      index,
+      toPosix(relPath),
+      this.insensitiveByProject.get(projectId) ?? false,
+    );
     const entry: ShadowIndexEntry = index.entries[rel] ?? { deleted: false, baseExists: false };
     entry.conflicted = true;
     entry.unrecorded = true;
@@ -415,10 +487,18 @@ export class ShadowStore {
    * so nothing is resolved on the session's behalf. An `unrecorded` entry is skipped entirely —
    * its shadow is known-incomplete, so neither a clean merge nor "HEAD equals the shadow" says
    * anything about it — and reported under `conflicted` as it was.
+   *
+   * A conflicted entry whose `conflictHead` still matches the current HEAD is reported without
+   * re-reading HEAD's blob, re-reading the shadow, re-running `merge3`, or spawning
+   * `sameAsGitSees` — that verdict cannot have changed since HEAD has not moved and neither
+   * `record` nor `refresh` touch a conflicted entry's shadow/base (see `ShadowIndexEntry.conflictHead`).
+   * HEAD's sha is resolved at most once per call, before the loop, when a `HeadShaReader` is
+   * wired.
    */
   async refresh(projectId: string, projectDir: string): Promise<RefreshResult> {
     const index = await this.readIndex(projectId);
     const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
+    const headSha = this.resolveHeadSha ? await this.resolveHeadSha(projectDir) : undefined;
 
     for (const [rel, entry] of Object.entries(index.entries)) {
       if (entry.unrecorded === true) {
@@ -431,6 +511,15 @@ export class ShadowStore {
         // So: touch nothing, leave the entry exactly as it is, and keep it flagged. Only a
         // deliberate take (`settle`/`clear`, i.e. commit scope "all"/"paths") or a discard ends
         // this state.
+        result.conflicted.push(rel);
+        continue;
+      }
+
+      if (entry.conflicted === true && headSha !== undefined && entry.conflictHead === headSha) {
+        // HEAD has not moved since this entry was last judged conflicted, and a conflicted
+        // entry's shadow/base are frozen (`record` early-returns on it; `refresh` writes nothing
+        // on either conflicting branch below) — so the verdict is unchanged. Skip the HEAD read,
+        // the shadow read, the merge, and the `sameAsGitSees` spawns entirely.
         result.conflicted.push(rel);
         continue;
       }
@@ -459,6 +548,7 @@ export class ShadowStore {
       if (head === null || shadow === null) {
         // One side is a delete: no text to merge, and picking a winner would be a guess.
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -467,6 +557,7 @@ export class ShadowStore {
         // A binary shadow whose HEAD moved to different bytes has no honest merge — there is no
         // such thing as a merged PNG — so it is reported as a conflict, never merged.
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -478,6 +569,7 @@ export class ShadowStore {
       );
       if (conflicted) {
         entry.conflicted = true;
+        if (headSha !== undefined) entry.conflictHead = headSha;
         result.conflicted.push(rel);
         continue;
       }
@@ -485,6 +577,7 @@ export class ShadowStore {
       await this.writeBase(projectId, rel, head);
       entry.baseExists = true;
       entry.conflicted = false;
+      delete entry.conflictHead;
       result.advanced.push(rel);
     }
 
@@ -495,7 +588,7 @@ export class ShadowStore {
   /**
    * Drop every entry this session tracks whose path is covered by one of `paths` (`coversPath` —
    * a directory covers everything under it), regardless of `conflicted`/`unrecorded`. Returns the
-   * dropped paths.
+   * dropped paths, in this session's own shadow spelling.
    *
    * Called by `commit` after a `scope: "all"`/`"paths"` commit, and only after that commit has
    * actually landed. It drops every entry *under the paths the commit was given* (`coversPath` —
@@ -509,19 +602,80 @@ export class ShadowStore {
    * flagged": nothing here clears the flag on an *edit* (`record` never calls this), and `refresh`
    * still refuses to resolve one on its own. The entry disappears because the session took the
    * tree deliberately — the exact remedy every conflicted/unrecorded message names.
+   *
+   * `fold` is git's own ASCII case fold (`foldCase`, `src/lib/caseFold.ts`), passed by the caller
+   * only when the repository is case-insensitive (`GitService.isCaseInsensitive`) — see
+   * `coversPath`. On an ignorecase clone this session's entry can be keyed under a different
+   * spelling than the path `commit` was asked to take (`git add`/`commitContents` staged it under
+   * whichever spelling won), and without the fold that entry never matches, so it stays wedged
+   * forever even though the commit that was meant to resolve it landed.
    */
-  async settle(projectId: string, paths: string[]): Promise<string[]> {
-    const wanted = paths.map(toPosix);
+  async settle(
+    projectId: string,
+    paths: string[],
+    fold?: (p: string) => string,
+  ): Promise<string[]> {
+    // Same normal form as the tool layer's `settlePaths`: POSIX, leading `./` stripped.
+    const wanted = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
     const index = await this.readIndex(projectId);
     const dropped: string[] = [];
     for (const rel of Object.keys(index.entries)) {
-      if (wanted.some((p) => coversPath(p, rel))) {
+      if (wanted.some((p) => coversPath(p, rel, fold))) {
         await this.forget(projectId, rel);
         delete index.entries[rel];
         dropped.push(rel);
       }
     }
     await this.writeIndex(projectId, index);
+    return dropped;
+  }
+
+  /**
+   * Drop *every* session's entries covered by `paths` (`coversPath`, as `settle` above) — for a
+   * path-limited `discard`, which rewrites only the named paths on disk and so must settle only
+   * the records that describe them, leaving every other session's unrelated in-flight work
+   * (`session.json` heartbeat included) intact. `clearAll` remains the whole-tree tool: it drops
+   * every session's *entire* shadow state because a whole-tree discard leaves nothing on disk any
+   * shadow could still describe.
+   *
+   * Iterates every session directory the same way `clearAll` does (a listing failure — no
+   * `.sessions/<projectId>` yet — is "nothing to settle", not an error) and applies the same
+   * per-entry removal `settle` uses, just against each session's own directory rather than only
+   * this store's `sessionId`. Returns every dropped path, in each owning session's own spelling
+   * (a path can appear more than once if, oddly, two sessions both tracked it).
+   */
+  async settleAll(
+    projectId: string,
+    paths: string[],
+    fold?: (p: string) => string,
+  ): Promise<string[]> {
+    // Same normal form as the tool layer's `settlePaths`: POSIX, leading `./` stripped.
+    const wanted = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
+    const root = sessionStateDir(this.workspaceRoot, projectId);
+    let sessionIds: string[];
+    try {
+      sessionIds = (await readdir(root, { withFileTypes: true }))
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch {
+      return [];
+    }
+
+    const dropped: string[] = [];
+    for (const sessionId of sessionIds) {
+      const dir = path.join(root, sessionId);
+      const index = await this.readIndexAt(dir);
+      let changed = false;
+      for (const rel of Object.keys(index.entries)) {
+        if (wanted.some((p) => coversPath(p, rel, fold))) {
+          await this.forgetAt(dir, rel);
+          delete index.entries[rel];
+          dropped.push(rel);
+          changed = true;
+        }
+      }
+      if (changed) await this.writeIndexAt(dir, index);
+    }
     return dropped;
   }
 
@@ -575,9 +729,19 @@ export class ShadowStore {
     return path.join(this.dir(projectId), 'base', rel);
   }
 
-  private async readIndex(projectId: string): Promise<ShadowIndex> {
+  private readIndex(projectId: string): Promise<ShadowIndex> {
+    return this.readIndexAt(this.dir(projectId));
+  }
+
+  private writeIndex(projectId: string, index: ShadowIndex): Promise<void> {
+    return this.writeIndexAt(this.dir(projectId), index);
+  }
+
+  /** Reads the shadow index at an arbitrary session directory — `readIndex` for this session,
+   * `settleAll` for every session's. Shared so both stay in exact agreement on the on-disk shape. */
+  private async readIndexAt(dir: string): Promise<ShadowIndex> {
     try {
-      const raw = await readFile(path.join(this.dir(projectId), 'shadow.json'), 'utf8');
+      const raw = await readFile(path.join(dir, 'shadow.json'), 'utf8');
       const parsed = JSON.parse(raw) as ShadowIndex;
       return parsed.entries ? parsed : { entries: {} };
     } catch {
@@ -585,8 +749,8 @@ export class ShadowStore {
     }
   }
 
-  private async writeIndex(projectId: string, index: ShadowIndex): Promise<void> {
-    const dir = this.dir(projectId);
+  /** Writes the shadow index at an arbitrary session directory — see `readIndexAt`. */
+  private async writeIndexAt(dir: string, index: ShadowIndex): Promise<void> {
     await mkdir(dir, { recursive: true });
     await writeAtomic(path.join(dir, 'shadow.json'), JSON.stringify(index, null, 2));
   }
@@ -611,10 +775,19 @@ export class ShadowStore {
     await rm(this.shadowPath(projectId, rel), { force: true });
   }
 
-  private async forget(projectId: string, rel: string): Promise<void> {
+  private forget(projectId: string, rel: string): Promise<void> {
+    return this.forgetAt(this.dir(projectId), rel);
+  }
+
+  /**
+   * Removes the shadow and base files for `rel` under an arbitrary session directory — the
+   * per-entry removal `settle` (this session, via `forget`) and `settleAll` (every session) share,
+   * so dropping an index entry always sheds the same on-disk files whichever one drops it.
+   */
+  private async forgetAt(dir: string, rel: string): Promise<void> {
     await Promise.all([
-      rm(this.shadowPath(projectId, rel), { force: true }),
-      rm(this.basePath(projectId, rel), { force: true }),
+      rm(path.join(dir, 'shadow', rel), { force: true }),
+      rm(path.join(dir, 'base', rel), { force: true }),
     ]);
   }
 }

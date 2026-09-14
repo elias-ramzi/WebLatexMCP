@@ -189,7 +189,21 @@ between.
 
 There are two honest ways out, and both are the caller's decision: commit with
 `scope: "all"` to take the working tree as it stands, or discard those files to give
-up that session's version.
+up that session's version (which also throws away any other session's uncommitted
+work at those paths — `discard` reverts the working tree, not one session's view of
+it). Taking the tree settles the record; and when git finds
+nothing to stage for the paths taken — the content is already at HEAD, because a
+`push` with `message` committed it or a hand edit reverted it — the record is settled
+without a commit (`committed: false`, the files under `settled`), so a stale flag never
+forces an empty commit to get out.
+
+One more thing a session commit never takes: a file git ignores. Staging from the
+shadow bypasses `git add`, which is the only place `.gitignore` and
+`.git/info/exclude` are consulted, so `commit` asks git first and skips those files
+(reported under `ignored`) — they stay in the working tree, out of every commit and
+every push, as the exclude entry intended. And because no scope can ever commit one, an
+ignored entry is settled and its record dropped whatever its `conflicted`/`unrecorded`
+state, so it never wedges the default scope behind a remedy that cannot work.
 
 ### Pushing with peers around
 
@@ -198,7 +212,9 @@ peer session exists and the tree holds work that is not this session's — the
 alternative would be sweeping their in-flight paragraph into the push or rewriting
 the tree underneath them.
 
-The refusal says what is known: per live session, the files its shadow owns, how long
+On a `core.ignorecase` clone (git's default on macOS and Windows) ownership is judged with git's
+own ASCII case fold, so a peer's `notes.txt` and git's `Notes.txt` are one file; elsewhere the
+comparison is byte-exact. The refusal says what is known: per live session, the files its shadow owns, how long
 ago it last wrote through the server, and how long ago it was last seen; and, apart,
 the files no live session owns (edited outside the server, or left by a session that
 has since exited). That is what separates "wait" from "take over": a write seconds old

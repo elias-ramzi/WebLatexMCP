@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
-import { changeDiff } from '../lib/changeDiff.js';
+import { changeDiff, changedPath } from '../lib/changeDiff.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -68,7 +68,14 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
             throw new Error(bibEditBlockedMessage(relPath, target));
           }
           const res = await ctx.files.applyEdits(dir, relPath, edits, { overrideExternalChanges });
-          const diff = await changeDiff(ctx.projectManager, ctx.git, id, dir, relPath);
+          // A write through an in-project link changed the target, so that is the path to diff.
+          const diff = await changeDiff(
+            ctx.projectManager,
+            ctx.git,
+            id,
+            dir,
+            changedPath(target, relPath),
+          );
           const headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
           return {
             content: [
