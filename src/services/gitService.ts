@@ -286,7 +286,10 @@ export function hasLinkOnConflictSide(lsFilesOutput: string): boolean {
  */
 async function existsWithExactSpelling(dir: string, rel: string): Promise<boolean> {
   let current = dir;
-  for (const segment of toPosix(rel).split('/').filter(Boolean)) {
+  // `.` segments name the directory itself (`"."`, `./x`): the whole tree exists.
+  for (const segment of toPosix(rel)
+    .split('/')
+    .filter((s) => s !== '' && s !== '.')) {
     let names: string[];
     try {
       names = await readdir(current);
