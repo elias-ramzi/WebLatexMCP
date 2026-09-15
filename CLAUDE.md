@@ -97,8 +97,11 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   recorder in `context.ts` skips them too (no HEAD of ours to three-way merge against). Compiled PDFs
   are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
   read and edit in place, not litter in place.
-- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/clone/add_citation) must run inside
-  `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/project_sync/add_citation) must run
+  inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+  The lock file lives outside the clone (`src/lib/sessionPaths.ts`), so `project_sync` takes it before a
+  first clone too. The peer-refusal logic `push` and `project_sync` share (`guardPeerWork`,
+  `enrichPullRefusal`) lives in `src/lib/peerRefusal.ts`, not in the tools.
   `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`), because
   sibling agent sessions are separate server processes over the same clone.
 - **Parallel sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names this process
@@ -381,8 +384,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
 - **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
   refuses when behind. Keep this guarantee.
 - **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict
-  `push` aborts (clone back to pre-push state) and returns `status: 'conflict'` with a full 3-way
-  payload per file (`base`/`ours`/`theirs` + marker `hunks`) plus
+  `push` aborts (clone back to pre-push state) and returns `status: 'conflict'` with a per-file
+  payload (`base`/`ours`/`theirs` + marker `hunks`) plus
   `conflictPaths`/`remoteHead`/`remoteCommits`. This payload is rendered into the result **text**
   (`src/lib/conflictText.ts`), not only `structuredContent`, so an MCP-only client can resolve
   without a shell. The caller resolves by retrying `push` with `resolutions` (full merged content
@@ -409,6 +412,35 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `tryRebase` also when building the conflict report fails. `unmergedPaths` passes `-c core.quotePath=false` like every other
   path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never be
   resolved by name.
+  **The per-file payload is budgeted, not "full", by default** (`conflictDetail: 'auto'`,
+  `src/lib/conflictBudget.ts`): a conflict on one large file once produced a ~67k-character result past a
+  client's cap, undelivered — and a second round showed the budget itself has to be charged against
+  RENDERED size (the `<<<<<<<`/`=======`/`>>>>>>>` marker boilerplate, the JSON punctuation around every
+  hunk and array element, the per-file `━━━━━ path ━━━━━` header, the per-side label) or a conflict with
+  many small hunks/files reproduces the same blowup with the content itself nowhere near the limit —
+  `HUNK_MARKER_OVERHEAD`/`HUNK_JSON_OVERHEAD`/`HUNK_LINE_ELEMENT_OVERHEAD`/`FILE_HEADER_OVERHEAD`/
+  `SIDE_LABEL_OVERHEAD`/`SIDE_ELISION_OVERHEAD`/`HUNK_ELISION_TEXT_OVERHEAD` name each piece (the last
+  two are what an _elision_ itself costs — cutting is not free) and are pinned by tests that render a known input and check the
+  constant still accounts for it, so `conflictText.ts`'s templates can't silently drift out from under
+  them. `hunks` are allocated first (least recoverable once the rebase aborts, so cut last) and
+  `base`/`ours`/`theirs` next (individually cap at `CONFLICT_SIDE_CAP`, cut first — recoverable in one
+  `read_file(path, ref)` call). `CONFLICT_MAX_FILES` (20, matching `capList`'s house style) caps how many
+  conflicted files ever get a detailed block at all — the rest stay fully named in the never-capped,
+  never-elided `conflictPaths`, which is the one thing a caller needs in order to act. A part that doesn't
+  fit comes back `null` with a matching `elided` entry (true size + how to fetch it); `null` with **no**
+  `elided` entry keeps meaning what it always did — absent on that side (added/deleted) — and that
+  distinction must never blur. The reported `note` names only whichever cap actually fired (per-side,
+  aggregate, or file count), never a reason that didn't. `conflictDetail: 'full'` is the uncapped escape
+  hatch, unchanged. Text and `structuredContent` are built from ONE plan object — `push.ts` plans once
+  and hands the same object to `renderConflictText` and `buildConflictFilePayload`, which assert that
+  the plan and the report line up file by file — so they can never disagree about what got cut. When
+  the mandatory per-file headers alone exhaust the budget (long paths), the `note` says so first rather
+  than blaming the aggregate cap. `remoteCommits` is bounded on a conflict result too — `CONFLICT_MAX_COMMITS`
+  (20) commits of `CONFLICT_MAX_COMMIT_FILES` (5) files each, the caps the text channel already applied,
+  with `remoteCommitsOmitted` and per-commit `filesOmitted` counting what was cut and the text pointing
+  at `status.behindCommits` (uncapped, and identical once the rebase has aborted) instead of at
+  `structuredContent`. `rebasedOver` on a successful push and `status`'s own commit lists stay uncapped,
+  and `renderCommitLines`'s default "(see structuredContent)" pointer stays true for them.
 - **A pathspec handed to git is literal, never a glob.** Every `git add`, `ls-files`, `ls-tree`,
   `diff` (patch and numstat) and `discard`'s `checkout`/`clean` call that takes a path the caller or
   a shadow named runs with `--literal-pathspecs` (the global option, _before_ the subcommand;

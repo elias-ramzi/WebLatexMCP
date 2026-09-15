@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import type { SyncResult } from '../services/gitService.js';
+import { enrichPullRefusal } from '../lib/peerRefusal.js';
 
 const inputSchema = {
   project: z
@@ -49,35 +50,48 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
         }
         const cfg = ctx.projectManager.requireGitProject(project, 'sync with');
         const dir = ctx.projectManager.projectPath(cfg.id);
-        const cloned = await ctx.projectManager.hasClone(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
 
-        let result: SyncResult;
-        if (!cloned) {
-          if (mode === 'pull') {
-            throw new Error(`Project "${cfg.id}" is not cloned yet; use mode "clone" or "auto".`);
-          }
-          await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
-          const ab = await ctx.git.aheadBehind(dir);
-          result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
-        } else {
-          if (mode === 'clone') {
-            throw new Error(`Project "${cfg.id}" is already cloned; use mode "pull" or "auto".`);
-          }
-          result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
-        }
+        const result = await ctx.projectManager.runExclusive(cfg.id, async () => {
+          const cloned = await ctx.projectManager.hasClone(cfg.id);
 
-        // A clone or ff-pull rewrites files on disk; drop stale baselines so post-sync content
-        // isn't misread as an out-of-band user edit.
-        if (result.action === 'cloned' || result.action === 'pulled') {
-          ctx.files.resetBaselines(dir);
-        }
-        if (result.action === 'pulled') {
-          // A pull moves HEAD but keeps uncommitted work, so this session's changes are still
-          // real — carry them onto the new HEAD rather than forgetting whose they are. Peers do
-          // the same lazily on their next call.
-          await ctx.shadows.refresh(cfg.id, dir);
-        }
+          let result: SyncResult;
+          if (!cloned) {
+            if (mode === 'pull') {
+              throw new Error(`Project "${cfg.id}" is not cloned yet; use mode "clone" or "auto".`);
+            }
+            await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
+            const ab = await ctx.git.aheadBehind(dir);
+            result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
+          } else {
+            if (mode === 'clone') {
+              throw new Error(`Project "${cfg.id}" is already cloned; use mode "pull" or "auto".`);
+            }
+            try {
+              result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
+            } catch (err) {
+              throw await enrichPullRefusal(
+                { sessions: ctx.sessions, shadows: ctx.shadows, git: ctx.git },
+                cfg.id,
+                dir,
+                err,
+              );
+            }
+          }
+
+          // A clone or ff-pull rewrites files on disk; drop stale baselines so post-sync content
+          // isn't misread as an out-of-band user edit.
+          if (result.action === 'cloned' || result.action === 'pulled') {
+            ctx.files.resetBaselines(dir);
+          }
+          if (result.action === 'pulled') {
+            // A pull moves HEAD but keeps uncommitted work, so this session's changes are still
+            // real — carry them onto the new HEAD rather than forgetting whose they are. Peers do
+            // the same lazily on their next call.
+            await ctx.shadows.refresh(cfg.id, dir);
+          }
+          return result;
+        });
 
         const payload = { project: cfg.id, path: dir, ...result };
         return {

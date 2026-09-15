@@ -90,6 +90,15 @@ change. So we do **not** auto-resolve. On any conflict `push`:
 2. **Surfaces all three sides** — the merge-base, our version, and the version that
    landed on the remote — as a structured `status: "conflict"` result (also rendered
    into the result _text_, so a client that drops structured fields can still read it).
+   By default that per-file payload is **budgeted** to fit in one tool result: `hunks`
+   are kept first (least recoverable once the rebase aborts), then `base`/`ours`/`theirs`,
+   each capped individually; whatever doesn't fit comes back `null` with a matching
+   `elided` entry (its true size plus a `read_file(path, ref)` pointer to fetch it in
+   full) — distinct from an ordinary `null` with no `elided` entry, which just means
+   the file didn't exist on that side. Past 20 conflicted files the rest get no
+   per-file detail at all, though every path stays listed in `conflictPaths`.
+   `conflictDetail: "full"` asks for the old, uncapped behavior instead. See
+   [`tools.md`](tools.md#reviewable-safe-pushes) for the field-level detail.
 3. **Stops**, and waits for a human to adjudicate.
 
 Failing safe and asking a human beats merging wrong. A conflict is information, not
@@ -145,7 +154,8 @@ works and is still isolated, but it shows up to the others under a generated id.
 Every mutating operation takes a lock file beside the clone for the duration, on top
 of the in-process mutex. A session that crashes cannot release its lock, so a lock is
 reclaimed once its owning process is gone, or once it stops being refreshed. Callers
-wait rather than fail; only a genuinely stuck holder produces an error, and it names
+wait rather than fail for up to 30 seconds; a holder still busy past that (a long fetch)
+or a genuinely stuck one produces an error, and it names
 the session holding it.
 
 ### Committing only your own work
@@ -219,7 +229,9 @@ ago it last wrote through the server, and how long ago it was last seen; and, ap
 the files no live session owns (edited outside the server, or left by a session that
 has since exited). That is what separates "wait" from "take over": a write seconds old
 is a peer mid-paragraph; one hours old, from a session that is merely still open, is a
-judgement the caller can now make with `commit scope: "all"` or `"paths"`. A session
+judgement the caller can now make with `commit scope: "all"` (peer-owned files) or
+`"paths"` (files no live session owns) — never with `discard`, which has no ownership
+guard and would destroy the owner's uncommitted work. A session
 whose index cannot be read is treated as owning everything, never as owning nothing.
 A write is never failed because its shadow record could not be written, but the
 failure is not silent either: the path is marked in the session's index as
@@ -231,6 +243,33 @@ written (a full or unwritable `.sessions/`): then the edit is in the tree with n
 naming it, and it shows up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
+
+Every path list in that refusal is capped at 20 (`REFUSAL_PATH_CAP`): the header's
+disputed set, each session's `owns`, the unowned line, and the closing's copy of it.
+The cap costs more here than in the conflict payload, because the refusal is an error
+and so has only a text channel — a dropped path is dropped from the response, not
+merely from one of two renderings of it. `status` is what makes that affordable: its
+`otherChanges` is the same disputed set — staged, unstaged and untracked alike, so a
+path modified only in the index is not left out — and its `activeSessions[].changes` is
+complete per session, both uncapped in `structuredContent` even though its own text shows
+five paths per peer. The refusal names them only when a cap actually fired, never as
+boilerplate — and names them as a derivation rather than as two fields to go read.
+That is deliberate: there is no `unowned`-shaped field in `status`, and `otherChanges`
+is the whole disputed set, peer-owned files included, so feeding it to
+`commit scope: "paths"` — which is what the closing advises for unowned files — would
+bounce off the live-peer guard and fail the whole call. The files no live session owns
+are `otherChanges` minus every live session's `changes`, a null `changes` claiming
+everything, and the message says so. It also claims no more than that: `status` names
+every omitted path, among more besides, rather than reporting these lists back. The
+stronger claim holds for `push`, whose disputed set is built exactly as `otherChanges`
+is, but not for `project_sync`, whose blocking set is the paths an incoming commit
+would overwrite, tracked or untracked — a strict subset no `status` field reproduces. A message two
+tools share may only assert what is true for both.
+
+`project_sync` takes the same per-project lock every mutating tool does, so a peer's
+write never interleaves with a fast-forward pull — and a peer waiting on that lock gives
+up after 30 seconds, so a sync that fetches for longer costs it one refused call rather
+than a silently interleaved one.
 
 Once past that peer guard — no live peer, or every live peer's work is already
 committed — the push still has to rebase, and git itself draws a further line:

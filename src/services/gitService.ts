@@ -8,6 +8,7 @@ import { resolveInside, toPosix } from '../lib/paths.js';
 import { execCapture, execCaptureBytes } from '../lib/exec.js';
 import { canonicalNames, foldCase } from '../lib/caseFold.js';
 import { coversPath } from '../lib/commitPaths.js';
+import { REFUSAL_PATH_CAP } from '../lib/peerAttribution.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
@@ -162,21 +163,38 @@ export interface ConflictResolution {
 type RebaseStep = { ok: true } | { ok: false; unmerged: string[] };
 
 /**
- * A rebase step aborted (or never even started) because the remote has a commit adding a path
- * that already exists, untracked, in the working tree — git refuses to silently clobber content
- * it doesn't track. The clone is left at its pre-push state; nothing was pushed. `paths` names
- * the colliding file(s) when git's own error names them, and is empty when it didn't.
+ * A rebase or fast-forward step aborted (or never even started) because the remote has a commit
+ * adding a path that already exists, untracked, in the working tree — git refuses to silently
+ * clobber content it doesn't track. `paths` names the colliding file(s) when git's own error
+ * names them, and is empty when it didn't.
+ *
+ * `operation` picks the wording: **push** (the default, and the only case that existed before
+ * this class grew a pull path) is thrown from mid-rebase — the clone is left at its pre-push
+ * state, nothing was pushed. **pull** is thrown from `syncPull`'s `merge --ff-only`, which aborts
+ * cleanly on this refusal (there's no rebase to unwind) — same "nothing changed" opener as
+ * {@link LocalChangesOverwriteError}. The two wordings prescribe different exits: a pull refusal
+ * has no in-flight rebase to resume, so re-syncing after clearing the collision is a plain `push`
+ * (which itself rebases and surfaces a proper conflict), not "retry the push".
  */
 export class UntrackedOverwriteError extends Error {
   readonly paths: string[];
+  readonly operation: 'push' | 'pull';
 
-  constructor(paths: string[]) {
-    super(UntrackedOverwriteError.buildMessage(paths));
+  constructor(paths: string[], operation: 'push' | 'pull' = 'push') {
+    super(UntrackedOverwriteError.buildMessage(paths, operation));
     this.name = 'UntrackedOverwriteError';
     this.paths = paths;
+    this.operation = operation;
   }
 
-  private static buildMessage(paths: string[]): string {
+  private static buildMessage(paths: string[], operation: 'push' | 'pull'): string {
+    return operation === 'pull'
+      ? UntrackedOverwriteError.buildPullMessage(paths)
+      : UntrackedOverwriteError.buildPushMessage(paths);
+  }
+
+  /** Unchanged byte-for-byte from before `operation` existed — existing tests pin this. */
+  private static buildPushMessage(paths: string[]): string {
     const nothingPushed =
       'The rebase a push needs was aborted. Nothing was pushed; the clone is back to its ' +
       'pre-push state.';
@@ -191,16 +209,146 @@ export class UntrackedOverwriteError extends Error {
         'remote version with read_file(path, ref="origin/<branch>").'
       );
     }
-    const pathsJson = JSON.stringify(paths);
+    const capped = capPaths(paths);
+    const pathList = capList(paths, REFUSAL_PATH_CAP);
+    const pathsJson = JSON.stringify(capped);
     return (
-      `${nothingPushed} The remote has a commit adding ${paths.join(', ')}, which already ` +
+      `${nothingPushed} The remote has a commit adding ${pathList}, which already ` +
       `exist${paths.length === 1 ? 's' : ''} untracked in the working tree. Commit ` +
       `${paths.length === 1 ? 'it' : 'them'} with \`commit\`, \`scope: "paths"\`, ` +
       `\`paths: ${pathsJson}\` so the next push surfaces a proper conflict instead of this abort ` +
       '(`scope: "all"` also works but sweeps in every other file in the working tree, including ' +
       "a peer session's in-flight edits) — or delete/move " +
       `${paths.length === 1 ? 'it' : 'them'}, then read the remote version with ` +
-      'read_file(path, ref="origin/<branch>").'
+      `read_file(path, ref="origin/<branch>").${capNote(paths, capped, 'the push get further')}`
+    );
+  }
+
+  /**
+   * `merge --ff-only` aborts cleanly on this refusal — same "nothing changed" opener as
+   * {@link LocalChangesOverwriteError}. Unlike the tracked-file sibling, git's own suggestion
+   * here ("move or remove") is not relayed: the server's own exits below cover it (`discard`
+   * IS a move/remove), and `LocalChangesOverwriteError`'s stash caveat doesn't apply to this
+   * refusal at all — git never suggests stash for an untracked-file collision.
+   */
+  private static buildPullMessage(paths: string[]): string {
+    const nothingChanged =
+      'The pull was refused; nothing changed — the clone is exactly as it was before this call.';
+    if (paths.length === 0) {
+      return (
+        `${nothingChanged} The remote has a commit adding an untracked file already present in ` +
+        'the working tree, but git did not name it — check `status` for untracked files that ' +
+        'might collide with the remote. Commit the colliding one (`commit` with `scope: "paths"` ' +
+        'and `paths: [...]`), then `push` — the rebase a push performs is what surfaces a proper ' +
+        'conflict between the two versions (a plain sync after committing would only report the ' +
+        'histories as diverged; `scope: "all"` also works but sweeps in every other file, ' +
+        "including a peer session's in-flight edits). Or `discard` it (`discard` with " +
+        '`paths: [...]`) to remove the untracked file, after which the sync succeeds — read the ' +
+        'remote version with read_file(path, ref="origin/<branch>") afterwards if wanted (a bare ' +
+        '`discard` also works but reverts the whole working tree). Or leave it uncommitted and ' +
+        'sync later.'
+      );
+    }
+    const capped = capPaths(paths);
+    const pathList = capList(paths, REFUSAL_PATH_CAP);
+    const pathsJson = JSON.stringify(capped);
+    const plural = paths.length > 1;
+    return (
+      `${nothingChanged} The remote has a commit adding ${pathList}, which already ` +
+      `exist${plural ? '' : 's'} untracked in the working tree, so the fast-forward would ` +
+      `overwrite ${plural ? 'them' : 'it'}. Commit ${plural ? 'them' : 'it'} with \`commit\`, ` +
+      `\`scope: "paths"\`, \`paths: ${pathsJson}\`, then \`push\` — the rebase a push performs is ` +
+      'what surfaces a proper conflict between the two versions (a plain sync after committing ' +
+      'would only report the histories as diverged; `scope: "all"` also works but sweeps in ' +
+      `every other file, including a peer session's in-flight edits). Or \`discard\` ` +
+      `${plural ? 'them' : 'it'} with \`discard\`, \`paths: ${pathsJson}\` to remove the ` +
+      `untracked file${plural ? 's' : ''}, after which the sync succeeds — read the remote ` +
+      'version with read_file(path, ref="origin/<branch>") afterwards if wanted (a bare ' +
+      `\`discard\` also works but reverts the whole working tree). Or leave ` +
+      `${plural ? 'them' : 'it'} uncommitted and sync later.` +
+      capNote(paths, capped, 'the sync get further')
+    );
+  }
+}
+
+/**
+ * A `project_sync` pull was refused because the fast-forward would overwrite a locally modified
+ * *tracked* file — the sibling case to {@link UntrackedOverwriteError}, but for a file the clone
+ * already tracks rather than one sitting untracked in the working tree. `merge --ff-only` aborts
+ * cleanly on this refusal (unlike a rebase), so nothing changed: HEAD did not move and the working
+ * tree is exactly as it was. `paths` names the colliding file(s) when git's own error names them,
+ * and is empty when it didn't.
+ *
+ * Git's own message tells the caller to `stash` — a command this server does not expose (a stash
+ * pop is an automatic merge of someone's uncommitted lines, and a pop conflict leaves markers in
+ * the tree; see the ff-only/no-autostash rationale next to `push`). The message here says so
+ * explicitly and points at the three exits this server actually has instead: `commit`, `discard`,
+ * or simply syncing later.
+ *
+ * git's `unpack_trees` accumulates rejects per error type and prints every non-empty block, so a
+ * single `merge --ff-only` can refuse over a tracked-modification collision AND an untracked-file
+ * collision at once (confirmed against real git). When that happens, `pullRefusalFromError` folds
+ * both blocks into ONE `LocalChangesOverwriteError` whose `paths` is the union — tracked entries
+ * first, then untracked, deduplicated — rather than reporting only whichever block a `??` chain
+ * reached first: the caller needs a single `paths` argument that clears everything the sync will
+ * refuse over, not one that clears half of it and refuses again right after. `untrackedPaths`
+ * names the subset of `paths` that is untracked rather than modified, purely so the message can
+ * call out that `discard`ing those removes the file rather than reverting it.
+ */
+export class LocalChangesOverwriteError extends Error {
+  readonly paths: string[];
+  readonly untrackedPaths: string[];
+
+  constructor(paths: string[], opts?: { untracked?: string[] }) {
+    const untrackedPaths = opts?.untracked ?? [];
+    super(LocalChangesOverwriteError.buildMessage(paths, untrackedPaths));
+    this.name = 'LocalChangesOverwriteError';
+    this.paths = paths;
+    this.untrackedPaths = untrackedPaths;
+  }
+
+  private static buildMessage(paths: string[], untrackedPaths: string[]): string {
+    const nothingChanged =
+      'The pull was refused; nothing changed — the clone is exactly as it was before this call.';
+    const stashNote =
+      "Git's own message suggests `stash` for this — that command is not available here.";
+    if (paths.length === 0) {
+      return (
+        `${nothingChanged} An incoming commit would overwrite a locally modified tracked file, ` +
+        'but git did not name it — check `status` for modified files that might collide with the ' +
+        'remote. Commit just those (`commit` with `scope: "paths"` and `paths: [...]`), then ' +
+        '`push` — the rebase a push performs is what surfaces a proper conflict between the two ' +
+        'versions (a plain sync after committing would only report the histories as diverged; ' +
+        '`scope: "all"` also works but sweeps in every other file, including a peer session\'s ' +
+        'in-flight edits). Or `discard` just those (`discard` with `paths: [...]`), after which ' +
+        'the sync succeeds (a bare `discard` also works but reverts the whole working tree, ' +
+        "including a peer session's in-flight edits). Or leave them uncommitted and sync later. " +
+        stashNote
+      );
+    }
+    const plural = paths.length > 1;
+    // Cap consistently everywhere a path could appear in this message — the prose list AND the
+    // JSON `paths` argument — so a path beyond the cap never leaks out through either channel.
+    const capped = capPaths(paths);
+    const pathList = capList(paths, REFUSAL_PATH_CAP);
+    const pathsJson = JSON.stringify(capped);
+    // With more paths than the cap, the prescribed `paths` names only the first 20, so following
+    // this message clears 20 of them and the next sync refuses again on the rest. Say so rather
+    // than promising a success the argument cannot deliver — `status` is where the full list is.
+    const partial = capNote(paths, capped, 'the sync get further');
+    const untracked = untrackedCollisionNote(untrackedPaths, capped);
+    return (
+      `${nothingChanged} The remote has a commit touching ${pathList}, which ${plural ? 'have' : 'has'} ` +
+      `uncommitted local modification${plural ? 's' : ''}, so the fast-forward would overwrite ` +
+      `${plural ? 'them' : 'it'}. Commit ${plural ? 'them' : 'it'} with \`commit\`, ` +
+      `\`scope: "paths"\`, \`paths: ${pathsJson}\`, then \`push\` — the rebase a push performs is ` +
+      'what surfaces a proper conflict between the two versions (a plain sync after committing ' +
+      'would only report the histories as diverged; `scope: "all"` also works but sweeps in ' +
+      `every other file, including a peer session's in-flight edits). Or \`discard\` ` +
+      `${plural ? 'them' : 'it'} with \`discard\`, \`paths: ${pathsJson}\`, after which the sync ` +
+      'succeeds (a bare `discard` also works but reverts the whole working tree, including a ' +
+      `peer session's in-flight edits), or leave ${plural ? 'them' : 'it'} uncommitted and sync ` +
+      `later.${partial}${untracked} ${stashNote}`
     );
   }
 }
@@ -1480,7 +1628,11 @@ export class GitService {
     if (ab.ahead > 0) {
       return { action: 'diverged', ahead: ab.ahead, behind: ab.behind, diverged: true };
     }
-    await git.merge(['--ff-only', `origin/${ab.branch}`]);
+    try {
+      await git.merge(['--ff-only', `origin/${ab.branch}`]);
+    } catch (err) {
+      throw pullRefusalFromError(err);
+    }
     const after = await this.aheadBehindOf(git);
     return { action: 'pulled', ahead: after.ahead, behind: after.behind, diverged: false };
   }
@@ -1838,7 +1990,7 @@ export class GitService {
       branch,
       summary:
         `Rebase onto ${report.rebasedOnto} conflicts in ${report.files.length} file(s) ` +
-        `(${report.conflictPaths.join(', ')}). The rebase was aborted and nothing was pushed — ` +
+        `(${capList(report.conflictPaths, 20)}). The rebase was aborted and nothing was pushed — ` +
         'resolve the overlap and push the merged content back (see docs/tools.md).',
       conflict: report,
     };
@@ -2058,6 +2210,51 @@ function capList(items: string[], max: number): string {
 }
 
 /**
+ * `paths` truncated to at most `REFUSAL_PATH_CAP` entries — the cap a refusal message's literal
+ * `paths: [...]` argument shares with its prose list, so a path beyond it never leaks out
+ * through either channel.
+ */
+function capPaths(paths: string[]): string[] {
+  return paths.length > REFUSAL_PATH_CAP ? paths.slice(0, REFUSAL_PATH_CAP) : paths;
+}
+
+/**
+ * Trailing note appended to a refusal message when `paths` exceeds the cap: the prescribed
+ * `paths` argument names only the first `capped.length` of `paths.length`, so following it
+ * clears that many and the rest will refuse again — never promise the sync/push a plain success
+ * the argument can't deliver. Shared by every capped refusal message (`LocalChangesOverwriteError`
+ * and both `UntrackedOverwriteError` wordings) so the sentence can't drift between them.
+ * `progresses` names, in the caller's own words, what "clearing them" gets past (e.g. "the sync
+ * get further"). Empty string when nothing was cut.
+ */
+function capNote(paths: string[], capped: string[], progresses: string): string {
+  if (paths.length <= capped.length) return '';
+  return (
+    ` That \`paths\` list is the first ${capped.length} of ${paths.length}: clearing them lets ` +
+    `${progresses}, but the rest will refuse it again — \`status\` lists them all.`
+  );
+}
+
+/**
+ * Trailing sentence for {@link LocalChangesOverwriteError} calling out which of `capped` (the
+ * message's own capped `paths`) is untracked rather than modified — `discard`ing an untracked
+ * path deletes the file instead of reverting it, worth flagging separately from the tracked
+ * majority. Filtered to `capped` (not the raw `untrackedPaths`) so the sentence never names a path
+ * that isn't actually in the `paths: [...]` argument above it. Empty string when nothing to add.
+ */
+function untrackedCollisionNote(untrackedPaths: string[], capped: string[]): string {
+  const shown = untrackedPaths.filter((p) => capped.includes(p));
+  if (shown.length === 0) return '';
+  const plural = shown.length > 1;
+  const list = capList(shown, REFUSAL_PATH_CAP);
+  return (
+    ` Of these, ${list} exist${plural ? '' : 's'} untracked rather than modified: the same ` +
+    '`commit`/`discard` calls clear them too (that is why they are in `paths` above), and a ' +
+    '`discard` of an untracked path removes the file.'
+  );
+}
+
+/**
  * Shared message for both `safePush` and `resolvePush` refusing a dirty tree: names the tracked
  * modifications blocking the rebase, and separately reassures that any untracked files present
  * are not why — they ride through a push untouched. Each list is capped (20 modified, 10
@@ -2089,27 +2286,114 @@ function uncommittedModificationsMessage(modified: string[], untracked: string[]
 const UNTRACKED_OVERWRITE_RE =
   /following untracked working tree files would be (?:overwritten|removed) by (?:checkout|merge)/i;
 
-/** Pull the indented file list out of git's "would be overwritten" error text. */
-function parseUntrackedOverwritePaths(message: string): string[] {
+/**
+ * Pull the indented file list following EVERY line matching `startRe` out of git's "would be
+ * overwritten" error text, concatenated in order and deduplicated. Shared by both the
+ * untracked-file and the tracked-modification refusals, which differ only in their opening
+ * line's wording — the indented-path-list shape underneath is identical. Real git (2.46) emits
+ * a SEPARATE block per group of files when a tree has both index-only staged changes and
+ * worktree modifications the incoming commit touches, not one block listing everything —
+ * collecting only the first block silently dropped every path named in the rest. Each block
+ * stops at its first non-tab-indented line, or an (already-trimmed) blank line, whichever comes
+ * first; scanning then resumes looking for the next `startRe` match.
+ */
+function parseIndentedPathList(message: string, startRe: RegExp): string[] {
   const lines = message.split('\n');
-  const start = lines.findIndex((line) => UNTRACKED_OVERWRITE_RE.test(line));
-  if (start === -1) return [];
+  const seen = new Set<string>();
   const paths: string[] = [];
-  for (let i = start + 1; i < lines.length; i++) {
-    const line = lines[i] ?? '';
-    if (!line.startsWith('\t')) break;
-    const trimmed = line.replace(/^\t/, '').trim();
-    if (!trimmed) break;
-    paths.push(toPosix(trimmed));
+  for (let i = 0; i < lines.length; i++) {
+    if (!startRe.test(lines[i] ?? '')) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j] ?? '';
+      if (!line.startsWith('\t')) break;
+      const trimmed = line.replace(/^\t/, '').trim();
+      if (!trimmed) break;
+      const posix = toPosix(trimmed);
+      if (!seen.has(posix)) {
+        seen.add(posix);
+        paths.push(posix);
+      }
+    }
   }
   return paths;
 }
 
-/** Recognise git's "would be overwritten" refusal in a caught error and turn it into our type. */
-function untrackedOverwriteFromError(err: unknown): UntrackedOverwriteError | null {
+/** Pull the indented file list out of git's "would be overwritten" error text. */
+function parseUntrackedOverwritePaths(message: string): string[] {
+  return parseIndentedPathList(message, UNTRACKED_OVERWRITE_RE);
+}
+
+/**
+ * Recognise git's "would be overwritten" refusal in a caught error and turn it into our type.
+ * `operation` picks the wording (`'push'` by default, matching every pre-existing call site);
+ * exported for direct unit testing of the regex/parsing, the same seam
+ * `localChangesOverwriteFromError` already exposes.
+ */
+export function untrackedOverwriteFromError(
+  err: unknown,
+  operation: 'push' | 'pull' = 'push',
+): UntrackedOverwriteError | null {
   const message = err instanceof Error ? err.message : String(err);
   if (!UNTRACKED_OVERWRITE_RE.test(message)) return null;
-  return new UntrackedOverwriteError(parseUntrackedOverwritePaths(message));
+  return new UntrackedOverwriteError(parseUntrackedOverwritePaths(message), operation);
+}
+
+/**
+ * Matches git's refusal to fast-forward (or check out) over a *tracked* file with uncommitted
+ * local modifications — the sibling wording to {@link UNTRACKED_OVERWRITE_RE}, but for a file the
+ * clone already tracks. Git uses "merge" wording for `merge --ff-only` (what `syncPull` runs) and
+ * "checkout" wording for a plain checkout of the same commit; both are the same underlying
+ * refusal, so both are matched. Deliberately does not match {@link UNTRACKED_OVERWRITE_RE}'s
+ * "untracked working tree files" wording — the two must never cross-fire, since they lead to
+ * different fixes (commit/discard here; commit under `scope: "paths"` or delete/move there).
+ */
+const LOCAL_CHANGES_OVERWRITE_RE =
+  /local changes to the following files would be overwritten by (?:merge|checkout)/i;
+
+/**
+ * Recognise git's "local changes ... would be overwritten" refusal and turn it into our type.
+ * `syncPull` goes through {@link pullRefusalFromError} (which also handles the case where git
+ * prints both refusal blocks); this is that function's tracked-only half, kept exported as the unit
+ * seam for the regex/parsing (the same string-matching fragility the sibling
+ * `UntrackedOverwriteError` machinery has — matched against git's raw stderr, not a stable API).
+ */
+export function localChangesOverwriteFromError(err: unknown): LocalChangesOverwriteError | null {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!LOCAL_CHANGES_OVERWRITE_RE.test(message)) return null;
+  return new LocalChangesOverwriteError(parseIndentedPathList(message, LOCAL_CHANGES_OVERWRITE_RE));
+}
+
+/**
+ * Recognise a `merge --ff-only` refusal (as thrown by `syncPull`) and turn it into the error to
+ * throw. Factored out of `syncPull`'s catch so the both-blocks-at-once case is unit-testable
+ * without a live git process. git's `unpack_trees` can refuse over a tracked-modification
+ * collision, an untracked-file collision, or — accumulating rejects per error type — BOTH in the
+ * same call; see {@link LocalChangesOverwriteError}'s doc comment for why that case collapses into
+ * one error carrying the union rather than reporting only whichever block is checked first. The
+ * single-type cases are unchanged: untracked-only still yields the pull-worded
+ * {@link UntrackedOverwriteError}, tracked-only still yields a plain {@link LocalChangesOverwriteError}.
+ * An error matching neither is rethrown untouched.
+ */
+export function pullRefusalFromError(err: unknown): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  const trackedMatches = LOCAL_CHANGES_OVERWRITE_RE.test(message);
+  const untrackedMatches = UNTRACKED_OVERWRITE_RE.test(message);
+  if (trackedMatches && untrackedMatches) {
+    const tracked = parseIndentedPathList(message, LOCAL_CHANGES_OVERWRITE_RE);
+    const untracked = parseIndentedPathList(message, UNTRACKED_OVERWRITE_RE);
+    const seen = new Set(tracked);
+    const union = [...tracked, ...untracked.filter((p) => !seen.has(p))];
+    return new LocalChangesOverwriteError(union, { untracked });
+  }
+  if (untrackedMatches) {
+    return new UntrackedOverwriteError(parseUntrackedOverwritePaths(message), 'pull');
+  }
+  if (trackedMatches) {
+    return new LocalChangesOverwriteError(
+      parseIndentedPathList(message, LOCAL_CHANGES_OVERWRITE_RE),
+    );
+  }
+  return err instanceof Error ? err : new Error(message);
 }
 
 /** Prepend `justLanded` (newest first) onto `existing`, dropping any hash already present. */

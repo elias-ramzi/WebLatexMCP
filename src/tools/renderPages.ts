@@ -132,6 +132,9 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
         '(unless inline: false) plus its path, width/height in pixels, the resolution rendered at, ' +
         'and the page box in PostScript points. Use dpi for a precise crop (e.g. 150 dpi on one ' +
         'clipped column) or maxEdgePx for a budget-friendly overview (default 1600px longest edge). ' +
+        'For sub-point measurement (matching two table heights, checking rule alignment), clip a ' +
+        'narrow band and push dpi toward its 1200 cap instead of rendering a whole page — a tight ' +
+        'clip at high dpi resolves well under a point per pixel. ' +
         'Fails with a message to run compile first when nothing has been compiled yet.',
       inputSchema,
       outputSchema,

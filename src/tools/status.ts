@@ -5,6 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { syncState, syncSummary } from '../lib/syncState.js';
 import { toPosix } from '../lib/paths.js';
 import { foldCase } from '../lib/caseFold.js';
+import { dedupeFolded } from '../lib/peerRefusal.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
 import { latestTouch } from '../services/shadowStore.js';
 import { renderCommitLines } from '../lib/conflictText.js';
@@ -61,12 +62,14 @@ const outputSchema = {
   session: z.string().describe('Id of this session.'),
   sessionChanges: z
     .array(z.string())
-    .describe('Uncommitted files this session edited — what a default commit would send.'),
+    .describe(
+      'Uncommitted files this session edited (staged or not) — what a default commit would send.',
+    ),
   otherChanges: z
     .array(z.string())
     .describe(
-      "Uncommitted files this session did not edit — another session's in-flight work, or " +
-        'edits made outside this server. A default commit leaves these alone.',
+      "Uncommitted files this session did not edit (staged or not) — another session's in-flight " +
+        'work, or edits made outside this server. A default commit leaves these alone.',
     ),
   activeSessions: z
     .array(
@@ -125,12 +128,23 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         // what a commit would actually do rather than a stale picture.
         await ctx.shadows.refresh(id, dir);
         const changes = await ctx.shadows.changes(id);
-        const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
         // git reports a dirty file in the index's spelling; on a `core.ignorecase` clone that can
         // differ in case from the spelling this session wrote it under (its shadow key), so the
         // split folds the way git does there and stays byte-exact everywhere else — the same
-        // rule `commit` and `push` apply.
+        // rule `commit` and `push` apply. Computed before the dedupe below, not after: on such a
+        // clone the three git lists can name the very same file under two different spellings, and
+        // deduping on the raw string would let both survive as if they were two files.
         const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
+        // `status.staged` joins the working-tree lists so a path dirty only in the index (a hand
+        // `git add`, or an interrupted `commitContents`) is not invisible to `otherChanges`/
+        // `sessionChanges` — the same rescue `commit`'s `scope: "paths"` already applies to its own
+        // dirty set (`src/tools/commit.ts`, `commitPaths`). Deduped on the folded key, keeping the
+        // first-seen spelling for display: a path can be both staged and unstaged (staged once,
+        // then edited again), or — on an ignorecase clone — reported under two spellings.
+        const dirty = dedupeFolded(
+          [...status.unstaged, ...status.untracked, ...status.staged].map(toPosix),
+          fold,
+        );
         const owned = new Set(changes.map((c) => fold(c.path)));
         const sessionChanges = dirty.filter((p) => owned.has(fold(p))).sort();
         const otherChanges = dirty.filter((p) => !owned.has(fold(p))).sort();

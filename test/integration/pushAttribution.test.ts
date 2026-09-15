@@ -4,6 +4,7 @@ import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { simpleGit } from 'simple-git';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import { createContext } from '../../src/context.js';
 import { createServer } from '../../src/server.js';
@@ -151,6 +152,32 @@ describe('push refusal attribution and status freshness', () => {
     const err = await callExpectingError(a, 'push', { message: 'push A', confirm: true });
     expect(err).toContain('No live session owns notes.txt');
     expect(err).toContain('beta\\" owns nothing here');
+  });
+
+  it('refuses a push over a path staged by hand only — dirty in the index, not the working tree', async () => {
+    // `status.staged` must join the peer guard's dirty set the same way it joins `status`'s own
+    // `otherChanges`: a path modified only in the index (someone ran `git add` by hand, or an
+    // interrupted `commitContents`) is invisible to git's unstaged/untracked lists, but it is
+    // still uncommitted work a push's rebase would have to sweep up or overwrite. Before this fix,
+    // `guardPeerWork` never saw it, so push proceeded straight into `GitService.safePush`, whose
+    // own pre-rebase check (`trackedModifiedPaths`) then refused it with a differently-worded,
+    // unattributed message — never naming beta as a possible owner.
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    // Register beta as a live session, without editing anything through the server.
+    await call(b, 'status', {});
+
+    // A brand-new file staged directly with git, bypassing the server entirely: `git status`
+    // reports it neither unstaged nor untracked, only staged.
+    await writeFile(path.join(dir, 'notes.txt'), 'hand staged\n', 'utf8');
+    await simpleGit(dir).add(['notes.txt']);
+
+    // No `message`: a push that auto-commits the whole working tree (message given) would just
+    // silently sweep the staged file into alpha's commit rather than fail — this scenario is
+    // about the guard refusing *before* any commit/rebase is attempted at all.
+    const err = await callExpectingError(a, 'push', { confirm: true });
+    expect(err).toContain('No live session owns notes.txt');
   });
 
   it('flags an unreadable peer index in the refusal rather than treating it as owning nothing', async () => {
