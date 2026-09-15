@@ -14,6 +14,10 @@ import {
 import { COMPILER_KINDS } from './services/compilerResolver.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from './lib/rewriteMode.js';
 import type { RewriteMode } from './lib/rewriteMode.js';
+// One list of ids, shared with the reference-lookup resolver: a private copy here could accept
+// an id the resolver never tries (or reject one it does) — the same reasoning as COMPILER_KINDS.
+import { REFERENCE_SOURCES } from './lib/referenceKey.js';
+import type { ReferenceSourceId } from './lib/referenceKey.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 /**
@@ -156,6 +160,153 @@ function parseCompilerChoice(raw: string | undefined): {
     );
   }
   return { kind: value as CompilerKind, explicit: true };
+}
+
+/**
+ * Select the reference-lookup backend (DBLP / Crossref / OpenAlex) from
+ * `WEB_LATEX_MCP_REFERENCE_SOURCE` — and say whether that was a *choice*, nothing at all, or a
+ * value this server cannot use.
+ *
+ * **An invalid value does NOT throw**, and `parseCompilerChoice`'s precedent deliberately does
+ * not transfer here. Note the difference is NOT that throwing is better scoped there — it is
+ * not: `parseCompilerChoice` throws inside `loadConfig` too, so it costs every tool exactly the
+ * same way. The difference is what is left afterwards. A LaTeX server that cannot compile has
+ * little to offer; one that cannot search DBLP still has twenty-odd working tools. This setting
+ * is scoped to `search_references` and nothing else, so throwing costs a user every tool in the
+ * server — `read_file`, `compile`, `commit`, `push` — because `loadConfig` runs before the
+ * transport exists and the process exits, which most MCP clients surface only as "MCP server
+ * failed to start". `parseRewriteMode`, below, already takes the proportionate route for a
+ * setting of comparable blast radius; this one takes it too.
+ *
+ * **But the alternative is not a silent fallback**, and that is the half a later "fix" will want
+ * to take. Quietly reverting to the unpinned DBLP→Crossref→OpenAlex order would break "an
+ * assertion, never an inference" outright: the user named a bibliography, and answering from a
+ * *different* one is a different claim, not a degraded version of the same one. So the rejected
+ * value is REMEMBERED and returned as `invalid`, `explicit` stays false (a rejected value is
+ * nobody's choice, and `referenceSourceExplicit` must stay the sole licence for a substitution),
+ * and `ReferenceResolver` refuses an unpinned search by name — while a per-call `source:`, which
+ * is its own assertion, keeps working. Everything else in the server is unaffected. That is what
+ * "proportionate" means here: refuse the thing configured, not the process.
+ *
+ * The rejection is logged to stderr — never stdout, which is the JSON-RPC channel — in the same
+ * shape `parseContactEmail` uses, and the value is `elide`d. It is elided in the RETURNED
+ * `invalid` too, not only in the log: unlike the contact email, this value is echoed onward into
+ * the tool's refusal message and into `server_info`, so a pasted multi-kilobyte env var would
+ * otherwise reach a model's context three times over. The elision says how much was cut.
+ *
+ * One deliberate difference from `parseCompilerChoice`, worth not "fixing" later: an unset value
+ * here returns `source: undefined`, never a default id. `parseCompilerChoice` can default to
+ * `latexmk` because the *tool* substitutes a missing backend; here the *resolver* is what owns
+ * fallback order across three backends (trying each in turn, e.g. on a DBLP anti-bot block), so
+ * config must stay silent about which one wins rather than naming a winner the resolver would
+ * then have to un-name.
+ */
+export function parseReferenceSource(raw: string | undefined): {
+  source: ReferenceSourceId | undefined;
+  explicit: boolean;
+  /** The rejected value, trimmed and elided. Set ONLY when the value named no known backend. */
+  invalid: string | undefined;
+} {
+  const trimmed = raw?.trim();
+  if (!trimmed) return { source: undefined, explicit: false, invalid: undefined };
+  const value = trimmed.toLowerCase();
+  if ((REFERENCE_SOURCES as readonly string[]).includes(value)) {
+    return { source: value as ReferenceSourceId, explicit: true, invalid: undefined };
+  }
+  const shown = elide(trimmed);
+  console.error(
+    `WEB_LATEX_MCP_REFERENCE_SOURCE "${shown}" is invalid; expected one of: ` +
+      `${REFERENCE_SOURCES.join(', ')}. search_references will refuse to search until this is ` +
+      'fixed or unset (a per-call source: still works); every other tool is unaffected.',
+  );
+  return { source: undefined, explicit: false, invalid: shown };
+}
+
+/**
+ * Resolve an optional contact address for the "polite pool" Crossref and OpenAlex offer to
+ * requests that identify a contact. This is a privacy boundary: the address is read ONLY from
+ * `WEB_LATEX_MCP_CONTACT_EMAIL` — never derived from `git config user.email` or any other
+ * source — because it is sent to two third-party services, and the only thing that may put a
+ * user's address there is the user deliberately setting this variable. Opt-in, not inferred.
+ *
+ * A malformed value is a convenience failure, not a correctness one (the same reasoning as
+ * `parseRewriteMode`): it does not throw, it logs the rejection to stderr (never stdout — the
+ * JSON-RPC channel) and returns undefined, so a typo costs only the polite-pool speedup. It does
+ * not cost it *silently*, though: `loadConfig` also records `contactEmailInvalid`, so a rejected
+ * value is distinguishable from an unset one in `server_info` rather than being byte-identical
+ * to a default install with nothing to explain why the polite pool is off.
+ * Checked here, not merely "looks emailish": the value is interpolated into a URL query
+ * parameter, so `&`, `?`, `#`, `/` and any whitespace/control character (including a newline)
+ * are rejected too — those could otherwise let a malformed value alter the request URL. Length
+ * is capped for the same reason: the value goes into a `User-Agent` header *and* a `mailto=`
+ * query parameter, and a pasted multi-kilobyte value draws a 431 from some fronts, which reaches
+ * the caller as "Crossref could not be reached" with nothing naming the variable that caused it.
+ * Rejecting it here spends the same stderr line every other malformed value gets, and names the
+ * real cause.
+ */
+export function parseContactEmail(raw: string | undefined): string | undefined {
+  return resolveContactEmail(raw).email;
+}
+
+/**
+ * The single derivation behind `parseContactEmail`, returning what `loadConfig` needs and the
+ * exported wrapper does not: whether a value was present and REJECTED, as opposed to absent.
+ *
+ * Kept as one function rather than two tests of the same string, for `parseCompilerChoice`'s
+ * reason: two derivations of "was this usable" can disagree, and this one is also the thing
+ * that decides whether a stderr line is spent. `parseContactEmail` stays a thin wrapper so its
+ * exported signature — an address or undefined, which is all any caller wants — is unchanged.
+ *
+ * What is returned is a BOOLEAN, never the offending value; see `ServerConfig.contactEmailInvalid`
+ * for why this is the one rejected setting whose value is not carried forward.
+ */
+function resolveContactEmail(raw: string | undefined): {
+  email: string | undefined;
+  /** True only when a non-empty value was set and could not be used. Unset is not invalid. */
+  invalid: boolean;
+} {
+  const value = raw?.trim();
+  if (!value) return { email: undefined, invalid: false };
+  if (isUsableContactEmail(value)) return { email: value, invalid: false };
+  // The rejected value is echoed back so the typo is visible — but it is echoed ELIDED, since
+  // the one rejection reason that has no short value is "too long", and dumping a pasted
+  // multi-kilobyte token into the log trades one oversized string for another. This log line is
+  // the ONLY place the rejected address appears: stderr is the operator's own terminal, whereas
+  // `server_info` is read by a model, so the flag below is all that travels onward.
+  console.error(
+    `WEB_LATEX_MCP_CONTACT_EMAIL "${elide(raw ?? '')}" is not usable as a contact address; ` +
+      'ignoring it. Expected a plain email address (no query-altering characters, no ' +
+      `whitespace, at most ${MAX_CONTACT_EMAIL_LENGTH} characters).`,
+  );
+  return { email: undefined, invalid: true };
+}
+
+/** Shorten an over-long value for a log line, saying what was cut rather than hiding it. */
+function elide(value: string, max = 120): string {
+  return value.length <= max ? value : `${value.slice(0, max)}… (${value.length} characters)`;
+}
+
+/**
+ * RFC 5321's limit on a forward path, and the cap on a usable contact address. Anything longer
+ * is a paste accident, not an address, and it would be sent in a header and a query parameter.
+ */
+const MAX_CONTACT_EMAIL_LENGTH = 254;
+
+/** True when `value` is a plausible, URL-query-safe email address. See `parseContactEmail`. */
+function isUsableContactEmail(value: string): boolean {
+  // Measured on the trimmed value, like every check below it.
+  if (value.length > MAX_CONTACT_EMAIL_LENGTH) return false;
+  // Reject anything that could alter a URL query string, or that is not a single flat token.
+  if (/[\s&?#/]/.test(value)) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  const at = value.split('@');
+  if (at.length !== 2) return false;
+  const [local, domain] = at;
+  if (!local || !domain) return false;
+  if (!domain.includes('.')) return false;
+  const domainParts = domain.split('.');
+  return domainParts.every((part) => part.length > 0);
 }
 
 /**
@@ -323,6 +474,14 @@ export function loadConfig(
     env.WEB_LATEX_MCP_WRITING_GUIDE_EXTRA,
     cwd,
   );
+  const {
+    source: referenceSource,
+    explicit: referenceSourceExplicit,
+    invalid: referenceSourceInvalid,
+  } = parseReferenceSource(env.WEB_LATEX_MCP_REFERENCE_SOURCE);
+  const { email: contactEmail, invalid: contactEmailRejected } = resolveContactEmail(
+    env.WEB_LATEX_MCP_CONTACT_EMAIL,
+  );
 
   return {
     workspaceRoot,
@@ -338,6 +497,13 @@ export function loadConfig(
     rewriteMode,
     rewriteModeExplicit,
     extraWritingGuidePath,
+    referenceSource,
+    referenceSourceExplicit,
+    referenceSourceInvalid,
+    contactEmail,
+    // Set only when a value was actually rejected: a `false` on every healthy install would say
+    // "a value was considered", which is exactly the state this flag exists to tell apart.
+    ...(contactEmailRejected ? { contactEmailInvalid: true } : {}),
   };
 }
 

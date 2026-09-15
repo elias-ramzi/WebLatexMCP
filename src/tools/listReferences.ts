@@ -114,8 +114,9 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         'exact, @string macros resolved), a LaTeX thebibliography of \\bibitem entries, and a ' +
         'reference list written as prose in a markdown or plain-text document. Use this instead ' +
         'of read_file + regex to answer "does this reference exist?" or "find the entry for ' +
-        'Author 2025" — pass `filter` to search. To look a paper UP on DBLP instead, use ' +
-        'search_references. Read-only, and it needs no git remote, so it works on a local project.',
+        'Author 2025" — pass `filter` to search. To look a paper UP in an external bibliography ' +
+        '(DBLP, Crossref or OpenAlex) instead, use search_references. Read-only, and it needs no ' +
+        'git remote, so it works on a local project.',
       inputSchema,
       outputSchema,
     },

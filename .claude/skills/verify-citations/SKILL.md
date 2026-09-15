@@ -1,25 +1,32 @@
 ---
 name: verify-citations
-description: Verify the references of a document against DBLP — check each one's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write an audit report you can open, and optionally annotate the entries you confirmed. Works whatever shape the bibliography has — a BibTeX .bib, a LaTeX thebibliography, or a reference list written as prose in a markdown or plain-text document — and whether the document is on a git remote (Overleaf, GitHub) or is just a directory on this machine with no remote at all. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a paper, proposal, or draft. Read-only for the bibliography by default (the report is a separate local file, never pushed); never changes it without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
+description: Verify the references of a document against DBLP, Crossref and OpenAlex — check each one's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write an audit report you can open, and optionally annotate the entries you confirmed. Works whatever shape the bibliography has — a BibTeX .bib, a LaTeX thebibliography, or a reference list written as prose in a markdown or plain-text document — and whether the document is on a git remote (Overleaf, GitHub) or is just a directory on this machine with no remote at all. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a paper, proposal, or draft. Read-only for the bibliography by default (the report is a separate local file, never pushed); never changes it without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
 ---
 
-# Verify a document's references against DBLP
+# Verify a document's references against DBLP, Crossref and OpenAlex
 
-Audit the references a document actually carries against the **DBLP** database (via the
-`web-latex-mcp` MCP tools) and surface anything that doesn't line up. For each reference you compare
-four fields against the canonical DBLP record:
+Audit the references a document actually carries against a **bibliography service** — DBLP,
+Crossref or OpenAlex, reached through the `web-latex-mcp` MCP tools' `search_references` /
+`add_citation` — and surface anything that doesn't line up. Left unpinned, `search_references`
+tries DBLP first, then Crossref, then OpenAlex, substituting one that cannot be reached (dblp.org
+in particular currently sits behind an anti-bot proof-of-work wall, so a DBLP attempt may simply
+fail — this fallback exists for exactly that case). The result always says which backend actually
+answered (`source`), and, only on a substitution, which one it stood in for (`fallbackFrom`) and
+why (`hint`). For each reference you compare four fields against the canonical record the
+answering service returns:
 
 1. **Title** of the paper.
 2. **Authors** — the **complete** author list. A citation must name **every** author; a reference that
    truncates with `and others` / "et al." (which renders as an abbreviated list) is a defect to flag,
    even when the names it does list are correct.
-3. **Venue** — conference or journal. Bibliographies and DBLP both abbreviate heavily (CVPR, NeurIPS,
-   ICLR…), so normalize before comparing.
+3. **Venue** — conference or journal. Bibliographies and these services both abbreviate heavily
+   (CVPR, NeurIPS, ICLR…), so normalize before comparing.
 4. **Publication year**.
 
 The point is to catch wrong years, misspelled or missing authors, a truncated author list, a preprint
-cited where a published version exists, a mangled title, or a reference that isn't on DBLP at all —
-and to let the **user** decide what to do about each one. You verify; you do not silently fix.
+cited where a published version exists, a mangled title, or a reference none of the three services
+can confirm — and to let the **user** decide what to do about each one. You verify; you do not
+silently fix.
 
 ## What counts as a bibliography
 
@@ -34,8 +41,8 @@ tells you, per entry, which one you got (`format`):
 | `prose`   | A reference list in a markdown / plain-text document          | No — heuristic. **Read `raw`** before deciding anything.        |
 
 For `prose` (and often `bibitem`) entries, `title` or `authors` may be missing simply because nothing
-in the text delimited them. That is not a defect in the reference — it means you must build the DBLP
-query from `raw` yourself. Never report "no title" as a finding for a prose entry.
+in the text delimited them. That is not a defect in the reference — it means you must build the
+`search_references` query from `raw` yourself. Never report "no title" as a finding for a prose entry.
 
 ## The one rule that overrides everything
 
@@ -54,9 +61,11 @@ bibliography is not.
 Writing the **audit report** (see _The audit report_) is not a bibliography write and is exempt: it's
 a single file that never touches the document and is never pushed.
 
-**Verification comes from DBLP, not from your own memory.** Do not "confirm" a reference from what
-you think you know about the paper — only an actual DBLP match counts. If DBLP can't confirm it, it's
-unverified, and you say so.
+**Verification comes from the bibliography service that answered — DBLP, Crossref or OpenAlex —
+never from your own memory.** Do not "confirm" a reference from what you think you know about the
+paper — only an actual match from one of these services counts. If none of them can confirm it,
+it's unverified, and you say so. (An entry a service couldn't be _reached_ to check is a different
+thing — see _Handling "not found" vs. "couldn't check"_ — never report that as unverified either.)
 
 ## Workflow
 
@@ -102,10 +111,10 @@ Run in order. Stop and report if a step fails.
    - If several files carry them (a `.bib` **and** a prose list, say), say so and ask which is
      authoritative before verifying — they may disagree, and that disagreement is itself a finding.
 
-4. **Ask the scope: everything, or only what the draft cites?** Before doing any DBLP work, ask
+4. **Ask the scope: everything, or only what the draft cites?** Before doing any lookup work, ask
    whether to verify **every** entry or **only those actually cited**. Default to recommending
    **only-cited** — a `.bib` often carries far more entries than the draft uses, and each extra one is
-   another (rate-limited) DBLP call.
+   another (rate-limited) bibliography-service call.
 
    For a key-based bibliography, `check_citations` does the scoping for you (see _Scoping to cited
    entries_). For a prose reference list there are no keys, so "only-cited" isn't separable — verify
@@ -114,26 +123,32 @@ Run in order. Stop and report if a step fails.
    **Skip** any entry already carrying a `% verified-by-claude:` comment (see below) unless the user
    asks to re-check everything.
 
-5. **Match each entry against DBLP — one paper at a time, sequentially.** For each entry, call
-   `search_references` with a query built from the distinctive title words plus the first author's
-   surname (e.g. `deep residual learning he`). For a `prose` or `bibitem` entry whose `title` came
-   back empty, build the query from `raw` — pick the distinctive noun phrase and a surname yourself.
-   Keep `maxResults` small (5–8). Classify the result (see _Classifying a match_), then move to the
-   next entry. **Do not fan out parallel DBLP calls** (see _Pace DBLP requests_ — it rate-limits
-   hard). Process the whole list one entry at a time.
+5. **Match each entry against a bibliography service — one paper at a time, sequentially.** For each
+   entry, call `search_references` with a query built from the distinctive title words plus the first
+   author's surname (e.g. `deep residual learning he`), and leave `source` unset so the server tries
+   DBLP, then Crossref, then OpenAlex on its own, substituting one that can't be reached. For a
+   `prose` or `bibitem` entry whose `title` came back empty, build the query from `raw` — pick the
+   distinctive noun phrase and a surname yourself. Keep `maxResults` small (5–8). Note which backend
+   answered (`source` in the result — you need it for the report) and, if it substituted for one that
+   was unreachable, `fallbackFrom`/`hint`. Classify the result (see _Classifying a match_ and, for a
+   zero-hit answer or a failed call, _Handling "not found" vs. "couldn't check"_), then move to the
+   next entry. **Do not fan out parallel lookups** (see _Pace bibliography-service requests_ — all
+   three rate-limit hard). Process the whole list one entry at a time.
 
 6. **Triage, don't interrogate.** Entries that match confidently need no questions — just count them.
-   Only entries with a discrepancy or no match get escalated to the user.
+   Only entries with a discrepancy, no match, or a service that couldn't be reached get escalated to
+   the user.
 
 7. **Resolve the doubtful ones with the user.** Go through the flagged entries (one at a time, or a
-   few at a time if there are many), showing the reference as written beside the DBLP record and
-   naming the exact discrepancy. Let the user decide. **Never resolve a doubt by guessing.**
+   few at a time if there are many), showing the reference as written beside the service's candidate
+   record and naming the exact discrepancy. Let the user decide. **Never resolve a doubt by guessing.**
 
 8. **Report — inline and to a file.** Give the short inline summary (how many verified cleanly, how
-   many need attention with the specifics, how many weren't found on DBLP; if you scoped to cited
-   entries, how many you skipped). **Then write the persistent report** per _The audit report_ below
-   and surface its link. Capture each flagged entry's **final** status — including how the user
-   resolved it in step 7 (accepted as-is, left unverified, or fixed).
+   many need attention with the specifics, how many weren't found by any service, how many couldn't be
+   checked because a service was unreachable; if you scoped to cited entries, how many you skipped).
+   **Then write the persistent report** per _The audit report_ below and surface its link. Capture
+   each flagged entry's **final** status — including how the user resolved it in step 7 (accepted
+   as-is, left unverified, or fixed).
 
 9. **(Optional, opt-in) Annotate.** If — and only if — the user wants it, mark each confirmed entry
    (see _Annotating verified entries_). This is the one and only bibliography write the skill makes on
@@ -161,11 +176,12 @@ pandoc's `[@key]` / `@key` in markdown, against every `.bib` and `\bibitem` list
 - **`duplicateKeys`** — the same key defined twice; the later definition is silently ignored by
   BibTeX, so this is worth surfacing.
 - **`incompleteEntries`** — BibTeX entries missing a field their type requires (an
-  `@inproceedings` with no `booktitle`, say). A formatting defect, independent of whether DBLP
-  confirms the paper — report it alongside the DBLP findings.
+  `@inproceedings` with no `booktitle`, say). A formatting defect, independent of whether a
+  bibliography service confirms the paper — report it alongside those findings.
 
 Verify only the entries whose key appears in the citations. This tool is a **structural** check: it
-says nothing about whether a reference is factually right. That is what the DBLP pass is for.
+says nothing about whether a reference is factually right. That is what the bibliography-service pass
+is for.
 
 ## When the bibliography lives in a different project
 
@@ -183,8 +199,9 @@ writing a path that walks out of this one.
 Read the result with the shared bibliography in mind:
 
 - **`undefinedCitations`** — cited in the draft, absent from the shared `.bib`. This is the finding
-  that matters. The entry has to be added **there**: `add_citation { project: "shared-bib", … }` from
-  a DBLP result, and it needs that project's permission, not this one's.
+  that matters. The entry has to be added **there**: `add_citation { project: "shared-bib", key: … }`
+  from a `search_references` result (the namespaced key it returns, whichever service it came from),
+  and it needs that project's permission, not this one's.
 - **`uncitedEntries`** comes back **empty**, and that is correct rather than a miss — a shared
   bibliography is supposed to hold entries this draft does not cite. Do not report it as a finding,
   and do not go looking for the entries by hand. To audit the shared bibliography as a whole, run
@@ -192,27 +209,31 @@ Read the result with the shared bibliography in mind:
 - **`duplicateKeys` / `incompleteEntries`** cover only the entries the draft cites, for the same
   reason. `entryCount` still tells you how large the shared `.bib` is.
 
-Then verify each cited entry against DBLP as usual, reading it with
+Then verify each cited entry against a bibliography service as usual, reading it with
 `list_references { project: "shared-bib", filter: "<surname or title words>" }` — `filter` is what
 keeps this cheap: one query per reference rather than a 300-entry `.bib` in context. When the draft's
 own prose reference list and the shared `.bib` disagree on a field, say which project you are quoting
-for each. Do not assume the `.bib` is right; it is a _candidate_, and DBLP is the arbiter.
+for each. Do not assume the `.bib` is right; it is a _candidate_, and the service that confirms it is
+the arbiter.
 
 A prose reference list carries no cite keys, so `check_citations` has nothing to match on. In that
 case, keep to the two-call comparison: `list_references { project: "proposal" }` for the draft's own
 list, then look each reference up in the shared bibliography by title plus first-author surname plus
 year.
 
-## Pace DBLP requests
+## Pace bibliography-service requests
 
-DBLP is a free public API and **rate-limits aggressively**. Firing many `search_references` calls at
-once (or in big parallel batches) gets you `429 Too Many Requests` and timeouts, which is slower
-overall than going steadily — you end up waiting out cooldowns. Lessons from real runs:
+DBLP, Crossref and OpenAlex are all free public APIs and **rate-limit aggressively**. Firing many
+`search_references` calls at once (or in big parallel batches) gets you `429 Too Many Requests` and
+timeouts on whichever one you're hitting, which is slower overall than going steadily — you end up
+waiting out cooldowns. This applies whether a given call lands on DBLP, Crossref, or OpenAlex — the
+server may substitute between them per entry, but your calling discipline stays the same. Lessons
+from real runs:
 
 - **Go strictly sequential: one `search_references` per entry, awaited before the next.** Paper-by-
-  paper is _more_ efficient here than asking for a batch all at once, because it never trips the
+  paper is _more_ efficient here than asking for a batch all at once, because it never trips a
   limiter.
-- **Don't burst.** Never issue DBLP queries in parallel, and don't pre-fetch the whole list up front.
+- **Don't burst.** Never issue lookups in parallel, and don't pre-fetch the whole list up front.
 - **On a `429` or a timeout, back off briefly and retry** — a few seconds, doubling if it repeats
   (e.g. 5s → 10s → 20s). That's enough; **don't sit on multi-minute fixed timers** between every call —
   that's overcorrecting and makes a long bibliography crawl.
@@ -223,34 +244,71 @@ overall than going steadily — you end up waiting out cooldowns. Lessons from r
 
 Compare on normalized text. `list_references` has already stripped the LaTeX from `bibtex` entries
 (capitalization braces, `\&`, accents, `$…$`), so compare lowercased with whitespace collapsed. For
-authors, compare on **surnames** (DBLP returns "First Last"; `list_references` normalizes BibTeX's
-"Last, First" to match), and check the **count** too — the reference must list every author DBLP does,
-in the same order.
+authors, compare on **surnames** (these services return "First Last"; `list_references` normalizes
+BibTeX's "Last, First" to match), and check the **count** too — the reference must list every author
+the service's record does, in the same order.
 
 `truncatedAuthors: true` — BibTeX `and others`, or a literal "et al." in prose — is **always a
 defect**, independent of the name comparison: the rendered citation will not name everyone. Treat it
-as a **doubt** and give the user the full list from DBLP so they can complete the entry.
+as a **doubt** and give the user the full list from the confirming record so they can complete the
+entry.
 
-- **Confident match** — the top DBLP hit's title matches, **every** author matches (same surnames,
-  same count, `truncatedAuthors` false), the year is identical, and the venue is consistent after
-  abbreviation normalization. No need to bother the user; mark it verified.
+- **Confident match** — the top hit's title matches, **every** author matches (same surnames, same
+  count, `truncatedAuthors` false), the year is identical, and the venue is consistent after
+  abbreviation normalization. No need to bother the user; mark it verified, noting which service
+  confirmed it (`source`).
 - **Doubt** — the title matches but something disagrees: a different year (even ±1), a
   misspelled/missing/extra author, a truncated author list, a venue that doesn't reconcile, **or** the
-  reference cites an arXiv/preprint while DBLP has a published version (or vice-versa — an `arxivId`
-  on the entry with a conference record on DBLP is exactly this case), **or** several DBLP records are
-  equally plausible. Escalate to the user.
-- **Not found** — no DBLP hit has a matching title. Escalate, but note that some legitimate references
-  (books, tech reports, standards, very new or niche work) simply aren't indexed by DBLP — "not found"
-  means "DBLP can't confirm it", not "it's wrong". For a **prose** entry, rule out a parsing problem
+  reference cites an arXiv/preprint while the service has a published version (or vice-versa — an
+  `arxivId` on the entry with a conference record on the service's side is exactly this case), **or**
+  several candidate records are equally plausible. Escalate to the user.
+- **Not found** — the service answered (zero matching hits), so this is a real negative — see
+  _Handling "not found" vs. "couldn't check"_ below for when to retry before reporting it as such. Note
+  that some legitimate references (books, tech reports, standards, very new or niche work, or anything
+  outside DBLP's computer-science scope) simply aren't indexed by any of the three — "not found" means
+  "no service can confirm it", not "it's wrong". For a **prose** entry, rule out a parsing problem
   first: re-read `raw` and re-query before calling it not-found.
+- **Couldn't check** — `search_references` itself failed rather than answering (every backend in the
+  default order was unreachable, or a backend you pinned was down). This is **not a verdict about the
+  reference** — see the same section below; never fold it into "unverified" or "not found".
 
 When a field disagrees, prefer treating it as a **doubt** over silently calling it verified. The cost
 of asking is a question; the cost of a false "verified" is a citation error shipped to a reviewer.
 
+## Handling "not found" vs. "couldn't check"
+
+With three backends, a lookup can come back empty-handed in two very different ways, and conflating
+them mis-reports good references as doubtful:
+
+- **The service answered, and found nothing.** `search_references` returned normally, with `source`
+  naming the backend that actually looked and `results` empty (or none of the hits matching). This is
+  a **real negative** — but also worth a second look before you write it off: DBLP indexes computer
+  science only, so a zero-hit answer with `source: "dblp"` is not yet evidence for a paper outside CS.
+  Retry once, pinned to `source: "crossref"` (the broadest coverage of the three), before calling it
+  not found. Only once the backends you've reasonably tried each come back empty does "not found"
+  stand.
+- **No service could be reached.** The `search_references` call itself threw — every backend in the
+  default order failed (`BackendUnavailableError`-style refusal), or a backend you pinned was down. **This is not an answer about the
+  reference at all** — it is an infrastructure hiccup, and reporting it as "unverified" or "not found"
+  would flag a perfectly good citation because a service was slow or down (dblp.org's anti-bot wall is
+  the case this is most likely to happen for). Back off and retry (see _Pace bibliography-service
+  requests_); if it still fails after retries, tell the user the lookup infrastructure was unreachable
+  for this entry and leave it **unclassified** in the report — neither "verified" nor "not found".
+- **The server refused before searching.** If the message names `WEB_LATEX_MCP_REFERENCE_SOURCE`
+  as holding a value that is not a backend, this is a configuration problem, not an outage:
+  retrying will not help, and backing off once per entry would burn the whole retry ladder on
+  every reference in the bibliography. Either pass `source: "crossref"` for the rest of the run
+  (a per-call pin still works) or stop and tell the user to fix or unset that variable.
+
+Only pin `source` deliberately: for a retry after a genuine zero-hit answer, or when the user asks for
+one backend by name. The default, unpinned call is what lets the DBLP → Crossref → OpenAlex fallback
+run at all — pinning it on every call would throw that safety net away, which is why the skill's
+default procedure never does.
+
 ## Venue abbreviations
 
-The same venue appears in many forms across a bibliography and DBLP. Treat these as equivalent (DBLP
-usually returns the short form on the left; the document may use any of them):
+The same venue appears in many forms across a bibliography and these services. Treat these as
+equivalent (a service usually returns the short form on the left; the document may use any of them):
 
 - **CVPR** = IEEE/CVF Conference on Computer Vision and Pattern Recognition
 - **ICCV** = International Conference on Computer Vision · **ECCV** = European Conference on Computer Vision
@@ -271,17 +329,23 @@ many). Make the discrepancy obvious. For each, show:
 
 - the **reference as it stands**: cite key or number, title, authors, venue, year — and for a prose
   entry, the `raw` line, since that is what the user will recognize;
-- the **DBLP candidate(s)**: title, authors, venue, year, and the DBLP key — or "no DBLP match found";
+- the **candidate record(s)**, from whichever service answered: title, authors, venue, year, the
+  record key, and which service it's from (`source`) — or "no match found on <the service(s) tried>";
 - a one-line statement of **what differs** (e.g. "the draft says 2019, DBLP says 2020"; "the reference
-  cites the arXiv preprint; DBLP has the CVPR 2021 version"; "author _J. Smith_ not on the DBLP
-  record"; "the author list is truncated with `and others` — DBLP lists all 7, paste them in").
+  cites the arXiv preprint; Crossref has the CVPR 2021 version"; "author _J. Smith_ not on the
+  record"; "the author list is truncated with `and others` — OpenAlex lists all 7, paste them in").
 
 Offer concrete choices, e.g. _Accept as-is (mark verified)_ · _Leave unverified / flag it_ · _Update
-the entry from DBLP (I'll need your go-ahead to edit it)_. Only act on what the user picks. If they
-ask you to fix a `.bib` entry, that's a `confirmBibEdit: true` edit — make exactly the change they
-approved and nothing more; the cleanest fix is usually to remove the stale entry and re-add it with
-`add_citation` from the DBLP key, so the new text again originates from DBLP rather than from you
-(`add_citation` returns the file and line it landed on, so you can confirm without re-reading).
+the entry from \<service\> (I'll need your go-ahead to edit it)_. Only act on what the user picks. If
+they ask you to fix a `.bib` entry, that's a `confirmBibEdit: true` edit — make exactly the change
+they approved and nothing more; the cleanest fix is usually to remove the stale entry and re-add it
+with `add_citation` from the matching record's key, so the new text again originates from the service
+rather than from you (`add_citation` returns the file and line it landed on, so you can confirm
+without re-reading).
+
+A **couldn't-check** entry (see _Handling "not found" vs. "couldn't check"_) has nothing to ask the
+user about the reference itself — don't route it through AskUserQuestion as if it were a discrepancy.
+Just say plainly which entries a service failure left unchecked, and offer to retry.
 
 For a **prose** reference list there is no `add_citation` path — the entry has to be rewritten in the
 document's own style. Show the user the exact replacement text and get their yes before writing it.
@@ -291,10 +355,11 @@ document's own style. Show the user the exact replacement text and get their yes
 Once entries are confirmed, the user may want them marked so a later run can skip them. Only with
 their explicit yes:
 
-**In a `.bib`** — add a single comment line **immediately above** the entry:
+**In a `.bib`** — add a single comment line **immediately above** the entry, naming the namespaced
+record key you matched (so it also names which service confirmed it):
 
 ```bibtex
-% verified-by-claude: DBLP conf/cvpr/HeZRS16 on 2026-06-24
+% verified-by-claude: dblp:conf/cvpr/HeZRS16 on 2026-06-24
 @inproceedings{he2016deep,
   ...
 }
@@ -313,10 +378,12 @@ their explicit yes:
 Do **not** annotate a markdown reference list: leave the document alone and let the audit report carry
 the record. Say so rather than inventing a marker.
 
-Common to all: include the DBLP key you matched and today's date, so the annotation is auditable. It
-is **idempotent** — an entry that already has a `verified-by-claude:` line is left alone, which is what
-makes re-runs cheap. Only annotate **confident matches** (or entries the user explicitly accepted).
-Never annotate something still in doubt.
+Common to all: include the namespaced record key you matched (e.g. `dblp:conf/cvpr/HeZRS16`,
+`crossref:10.1109/CVPR.2016.90`, `openalex:W2194775991`) and today's date, so the annotation is
+auditable and names which service confirmed the entry. It is **idempotent** — an entry that already
+has a `verified-by-claude:` line is left alone, which is what makes re-runs cheap. Only annotate
+**confident matches** (or entries the user explicitly accepted). Never annotate something still in
+doubt, and never annotate a **couldn't-check** entry — it was never confirmed by anything.
 
 ## The audit report
 
@@ -380,8 +447,10 @@ through the server. Don't claim it's excluded unless the `git` command above act
 
 ### Contents
 
-A header marker, then the totals and the per-entry findings (derive every row from the DBLP
-comparisons — the same evidence you showed inline):
+A header marker, then the totals and the per-entry findings (derive every row from the comparisons
+you made against whichever service answered — the same evidence you showed inline). Record **which
+service confirmed or was checked against** for every entry — a Crossref confirmation and a DBLP one
+are different evidence, and the reader should be able to tell them apart:
 
 ```markdown
 <!--
@@ -392,7 +461,8 @@ Generated: 2026-07-16 · Source: ref.bib (bibtex) · Scope: only-cited
 
 # Citation audit — <paper title or project id>
 
-**Totals:** N checked · N verified · N need attention · N not found on DBLP · N skipped (uncited)
+**Totals:** N checked · N verified · N need attention · N not found · N couldn't be checked
+(service unreachable) · N skipped (uncited)
 
 ## Cited but not defined
 
@@ -400,30 +470,40 @@ Generated: 2026-07-16 · Source: ref.bib (bibtex) · Scope: only-cited
 
 ## Needs attention
 
-| reference  | field   | as written             | on DBLP          | resolution      |
-| ---------- | ------- | ---------------------- | ---------------- | --------------- |
-| he2016deep | year    | 2015                   | 2016             | user fixed      |
-| vaswani17  | authors | truncated `and others` | 8 authors listed | left unverified |
+| reference  | field   | as written             | confirmed record | source   | resolution      |
+| ---------- | ------- | ---------------------- | ---------------- | -------- | --------------- |
+| he2016deep | year    | 2015                   | 2016             | dblp     | user fixed      |
+| vaswani17  | authors | truncated `and others` | 8 authors listed | crossref | left unverified |
 
-## Not found on DBLP
+## Not found
 
-- `key` — title — (books, tech reports, standards, or very new work may simply be unindexed)
+- `key` — title — checked against dblp, crossref (books, tech reports, standards, or very new /
+  non-CS work may simply be unindexed by any of the three)
+
+## Could not check (service unreachable)
+
+- `key` — title — dblp and crossref were unreachable when checked; this is not a finding about the
+  reference, just an unresolved lookup — retry the audit later to fill it in
 
 ## Verified
 
-- `key` — matched DBLP `conf/cvpr/HeZRS16` (list them, or just the count — the user's preference)
+- `key` — matched `dblp:conf/cvpr/HeZRS16` (list them, or just the count and a source breakdown —
+  the user's preference)
 ```
 
 Drop the "Cited but not defined" section when the bibliography has no cite keys (a prose list), and
-identify prose entries by their number and title rather than a key.
+identify prose entries by their number and title rather than a key. Drop the "Could not check" section
+entirely when every entry got an actual answer from some service — don't leave an empty heading.
 
 On a re-run, overwrite the report with the current findings, preserving any notes the user added by
 hand.
 
 ## After you finish
 
-Report concisely: total references checked, how many verified against DBLP, the specific ones that
-need the user's attention and why, and any that weren't on DBLP. **Surface the
+Report concisely: total references checked, how many verified (and against which service), the
+specific ones that need the user's attention and why, any that no service could confirm, and any that
+couldn't be checked because a service was unreachable (distinct from "not found" — don't blur the
+two). **Surface the
 `citation-report.local.md` link** (clickable when the file is inside the workspace) and note it's
 local-only — never pushed. If you annotated, say which file(s) you touched. For a **git** project,
 remind the user that — per CLAUDE.md — `commit`/`push` happen only when they ask, so nothing has left

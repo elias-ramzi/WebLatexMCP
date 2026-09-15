@@ -4,10 +4,17 @@ import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
-import { loadConfig, parseRewriteMode, parseExtraWritingGuide } from '../../src/config.js';
+import {
+  loadConfig,
+  parseRewriteMode,
+  parseExtraWritingGuide,
+  parseReferenceSource,
+  parseContactEmail,
+} from '../../src/config.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 import { registryPath } from '../../src/services/projectRegistry.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
+import { REFERENCE_SOURCES } from '../../src/lib/referenceKey.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -513,5 +520,268 @@ describe('loadConfig with a malformed WEB_LATEX_MCP_WRITING_GUIDE_EXTRA', () => 
       '/work/paper',
     );
     expect(cfg.extraWritingGuidePath).toBeUndefined();
+  });
+});
+
+describe('parseReferenceSource', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('is unset (not a default id) when unset, empty, or whitespace-only', () => {
+    // Unlike parseCompilerChoice, unset must stay undefined: the resolver owns fallback
+    // order across the three backends, so config must not name a winner.
+    const unset = { source: undefined, explicit: false, invalid: undefined };
+    expect(parseReferenceSource(undefined)).toEqual(unset);
+    expect(parseReferenceSource('')).toEqual(unset);
+    expect(parseReferenceSource('   ')).toEqual(unset);
+  });
+
+  it('accepts each valid id, case-insensitively and trimmed', () => {
+    for (const id of REFERENCE_SOURCES) {
+      expect(parseReferenceSource(id)).toEqual({ source: id, explicit: true, invalid: undefined });
+    }
+    expect(parseReferenceSource('  DBLP  ')).toEqual({
+      source: 'dblp',
+      explicit: true,
+      invalid: undefined,
+    });
+  });
+
+  it('does NOT throw on an invalid value: it reports it as `invalid` and logs to stderr', () => {
+    // The blast radius of this setting is search_references and nothing else, so a typo must
+    // not take down read_file/compile/commit/push with it. `explicit` stays false: a rejected
+    // value is not a choice, so nothing downstream may describe it as one.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    expect(parseReferenceSource('scopus')).toEqual({
+      source: undefined,
+      explicit: false,
+      invalid: 'scopus',
+    });
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const line = String(errorSpy.mock.calls[0]?.[0]);
+    // Exactly what the thrown message said, so nothing is lost by not throwing.
+    expect(line).toContain(
+      'WEB_LATEX_MCP_REFERENCE_SOURCE "scopus" is invalid; expected one of: dblp, crossref, openalex.',
+    );
+    // And it must say the failure is scoped, or the line reads like the old fatal one.
+    expect(line).toMatch(/search_references/);
+    // stdout is the JSON-RPC channel: a config warning there corrupts the protocol stream.
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps the rejected value verbatim (trimmed, original case) so a refusal can name it', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseReferenceSource('  Crossreff  ').invalid).toBe('Crossreff');
+  });
+
+  it('elides an over-long rejected value rather than carrying kilobytes into every refusal', () => {
+    // A pasted multi-kilobyte env var reaches a stderr line, the tool refusal AND server_info.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const huge = 'z'.repeat(5000);
+
+    const out = parseReferenceSource(huge);
+    expect(out.invalid).not.toBe(huge);
+    expect(out.invalid!.length).toBeLessThan(200);
+    expect(out.invalid).toMatch(/\(5000 characters\)$/);
+    expect(String(errorSpy.mock.calls[0]?.[0]).length).toBeLessThan(600);
+  });
+
+  it('wires into loadConfig as referenceSource/referenceSourceExplicit', () => {
+    expect(loadConfig({}).referenceSource).toBeUndefined();
+    expect(loadConfig({}).referenceSourceExplicit).toBe(false);
+
+    const cfg = loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'crossref' });
+    expect(cfg.referenceSource).toBe('crossref');
+    expect(cfg.referenceSourceExplicit).toBe(true);
+  });
+
+  it('wires an invalid value through loadConfig as referenceSourceInvalid, and starts', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'scopus' });
+
+    expect(cfg.referenceSourceInvalid).toBe('scopus');
+    expect(cfg.referenceSource).toBeUndefined();
+    // `referenceSourceExplicit` stays the sole licence for a substitution, and a rejected value
+    // is not an assertion — otherwise a typo would pin the resolver to an undefined backend.
+    expect(cfg.referenceSourceExplicit).toBe(false);
+    // The rest of the server is untouched: this is the whole point of not throwing.
+    expect(cfg.compiler).toBe('latexmk');
+    expect(cfg.workspaceRoot).toBeTruthy();
+  });
+
+  it('leaves referenceSourceInvalid absent for a valid or unset value', () => {
+    expect(loadConfig({}).referenceSourceInvalid).toBeUndefined();
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'openalex' }).referenceSourceInvalid,
+    ).toBeUndefined();
+  });
+});
+
+describe('parseContactEmail', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('is undefined when unset, empty, or whitespace-only', () => {
+    expect(parseContactEmail(undefined)).toBeUndefined();
+    expect(parseContactEmail('')).toBeUndefined();
+    expect(parseContactEmail('   ')).toBeUndefined();
+  });
+
+  it('round-trips a good address, trimmed', () => {
+    expect(parseContactEmail('  me@example.com  ')).toBe('me@example.com');
+  });
+
+  it.each([
+    'not-an-email',
+    'a@b', // no dot in the domain
+    '@b.com', // empty local part
+    'a@', // empty domain
+    'a b@c.com', // whitespace
+    'a@b.com&foo=1', // query-altering character
+    'a@b.com/x', // query-altering character
+    'a@b.com\npad', // newline
+    'a@b@c.com', // two @
+  ])('rejects %j without throwing, returning undefined', (bad) => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => parseContactEmail(bad)).not.toThrow();
+    expect(parseContactEmail(bad)).toBeUndefined();
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('logs the rejection to stderr, never stdout (stdout is the JSON-RPC channel)', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(parseContactEmail('not-an-email')).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('WEB_LATEX_MCP_CONTACT_EMAIL');
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('caps the length at 254 characters (RFC 5321), rejecting one character over', () => {
+    // An oversized value is interpolated into a User-Agent header and a `mailto=` query
+    // parameter; some fronts answer that with 431, which surfaces as "Crossref could not be
+    // reached" with nothing pointing at the env var that caused it. Boundary on both sides.
+    const address = (total: number) => `${'a'.repeat(total - '@example.com'.length)}@example.com`;
+    const ok = address(254);
+    const tooLong = address(255);
+    expect(ok).toHaveLength(254);
+    expect(tooLong).toHaveLength(255);
+
+    expect(parseContactEmail(ok)).toBe(ok);
+    // The cap is measured against the TRIMMED value, like every other check here.
+    expect(parseContactEmail(`   ${ok}   `)).toBe(ok);
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    // A malformed value stays a convenience failure, never a correctness one: no throw.
+    expect(() => parseContactEmail(tooLong)).not.toThrow();
+    expect(parseContactEmail(tooLong)).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('WEB_LATEX_MCP_CONTACT_EMAIL');
+    // The rejected value is echoed elided, not dumped: "too long" is the one rejection reason
+    // whose value has no bound, and a multi-kilobyte log line is the same problem again.
+    expect(message).not.toContain(tooLong);
+    expect(message).toContain('254');
+    // stdout is the JSON-RPC channel.
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('wires into loadConfig as contactEmail', () => {
+    expect(loadConfig({}).contactEmail).toBeUndefined();
+    expect(loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' }).contactEmail).toBe(
+      'me@example.com',
+    );
+  });
+
+  it('never derives a contact email from another address the server already knows', () => {
+    // A privacy boundary, and the plausible regression is not "invent an address" — it is
+    // "reuse one we already have". The server is configured with a commit-author address; that
+    // must NOT become the address sent to Crossref and OpenAlex. Asserting only that an empty
+    // env yields undefined pins nothing: there is no code path for it to disable.
+    const withAuthor = loadConfig(
+      {
+        WEB_LATEX_MCP_AUTHOR_EMAIL: 'elias@example.com',
+        WEB_LATEX_MCP_AUTHOR_NAME: 'Elias',
+      },
+      '/some/dir',
+      () => true,
+    );
+    expect(withAuthor.contactEmail).toBeUndefined();
+
+    // And it IS populated when — and only when — its own variable is set.
+    const withContact = loadConfig(
+      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
+      '/some/dir',
+      () => true,
+    );
+    expect(withContact.contactEmail).toBe('me@example.com');
+  });
+});
+
+describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused with unset', () => {
+  // `parseContactEmail` already drops a malformed value and logs one stderr line. What that
+  // leaves behind is byte-identical to a default install: `contactEmailConfigured: false` and
+  // no polite-pool clause anywhere. `contactEmailInvalid` is what tells the two apart — the
+  // same silent-failure doctrine as `referenceSourceInvalid` and `extraWritingGuideLoaded`.
+  const rejected = 'someone.private@localhost'; // no dot in the domain, so not usable
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sets contactEmailInvalid when the value is set but not a usable address', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+
+    expect(cfg.contactEmailInvalid).toBe(true);
+    // The flag REPORTS that the polite pool is off; it must never switch it back on.
+    expect(cfg.contactEmail).toBeUndefined();
+    // And the rest of the server is untouched, as for every other malformed optional setting.
+    expect(cfg.compiler).toBe('latexmk');
+  });
+
+  it('remembers only the boolean — the rejected address is personal data, and is dropped', () => {
+    // Deliberately unlike `referenceSourceInvalid`, which keeps the user's own typo of a
+    // backend id. An address identifies a person, and config is copied into server_info.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+
+    expect(cfg.contactEmailInvalid).toBe(true);
+    expect(JSON.stringify(cfg)).not.toContain(rejected);
+    // Not only the whole address: a local part alone still identifies the user.
+    expect(JSON.stringify(cfg)).not.toContain('someone.private');
+  });
+
+  it('leaves contactEmailInvalid unset for a usable address and for none at all', () => {
+    // CONTROL: passes before and after this change. It pins the shape — the flag is set only
+    // when a value was actually rejected, so an implementation reporting `false` for every
+    // healthy install (which would make the field meaningless in `server_info`) fails here.
+    const ok = loadConfig(
+      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
+      '/some/dir',
+      () => true,
+    );
+    expect(ok.contactEmail).toBe('me@example.com');
+    expect(ok.contactEmailInvalid).toBeUndefined();
+
+    const none = loadConfig({}, '/some/dir', () => true);
+    expect(none.contactEmail).toBeUndefined();
+    expect(none.contactEmailInvalid).toBeUndefined();
+  });
+
+  it('keeps parseContactEmail returning the address itself, for its existing callers', () => {
+    // CONTROL: passes before and after. The exported signature is load-bearing for the unit
+    // tests above and for anything else reading the address; surfacing the new flag must not
+    // change it into an object.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseContactEmail('me@example.com')).toBe('me@example.com');
+    expect(parseContactEmail(rejected)).toBeUndefined();
   });
 });

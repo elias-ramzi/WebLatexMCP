@@ -52,9 +52,10 @@ export function registerListSkills(server: McpServer, skills: Skill[]): void {
       title: 'List the bundled LaTeX skills',
       description:
         'List the LaTeX procedures bundled with this server — formatting a project, normalizing a ' +
-        '.bib, verifying citations against DBLP, preparing an arXiv submission, summarizing a ' +
-        'paper — each with what it does and when to use it. Pass `skill` to get one back in full ' +
-        'and follow it. Worth calling when a request sounds like one of these: the bundled ' +
+        '.bib, verifying citations against DBLP, Crossref or OpenAlex, preparing an arXiv ' +
+        'submission, summarizing a paper — each with what it does and when to use it. Pass ' +
+        '`skill` to get one back in full and follow it. Worth calling when a request sounds ' +
+        'like one of these: the bundled ' +
         'procedure knows this server’s tools and guardrails, so it beats improvising.',
       inputSchema,
       outputSchema,

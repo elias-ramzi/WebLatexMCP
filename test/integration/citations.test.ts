@@ -15,6 +15,7 @@ import { SyncTexService } from '../../src/services/synctex.js';
 import { CommentStore } from '../../src/services/commentStore.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
+import { ReferenceResolver } from '../../src/services/referenceResolver.js';
 import { DoctorService } from '../../src/services/doctor.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
@@ -91,7 +92,22 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       synctex: new SyncTexService(),
       comments: new CommentStore(),
       credentials: new CredentialResolver({}),
-      dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+      // Only DBLP is stubbed: every key in this suite is a DBLP one, and the resolver routes by
+      // the key. The other two backends throw if consulted, so a routing regression that sent a
+      // dblp: key to Crossref would fail loudly here rather than quietly fetching nothing.
+      references: new ReferenceResolver({
+        dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+        crossref: {
+          search: () => Promise.reject(new Error('crossref must not be consulted in this suite')),
+          fetchBibtex: () =>
+            Promise.reject(new Error('crossref must not be consulted in this suite')),
+        },
+        openalex: {
+          search: () => Promise.reject(new Error('openalex must not be consulted in this suite')),
+          resolveDoi: () =>
+            Promise.reject(new Error('openalex must not be consulted in this suite')),
+        },
+      }),
       doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>

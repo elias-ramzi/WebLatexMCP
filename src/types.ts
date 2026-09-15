@@ -1,4 +1,5 @@
 import type { RewriteMode } from './lib/rewriteMode.js';
+import type { ReferenceSourceId } from './lib/referenceKey.js';
 
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
@@ -154,6 +155,65 @@ export interface ServerConfig {
    * the user's conventions with no signal.
    */
   extraWritingGuideLoaded?: boolean;
+  /**
+   * Reference-lookup backend named by `WEB_LATEX_MCP_REFERENCE_SOURCE`, from
+   * `parseReferenceSource` in `src/config.ts`. Unlike `compiler`, `loadConfig` does NOT default
+   * this to one of `dblp` / `crossref` / `openalex` when unset: an unset value stays `undefined`
+   * so the reference-lookup resolver owns fallback order across the three backends, rather than
+   * config naming a winner the resolver would then have to un-name.
+   */
+  referenceSource?: ReferenceSourceId;
+  /**
+   * True when `WEB_LATEX_MCP_REFERENCE_SOURCE` actually named a backend, as opposed to
+   * `referenceSource` being unset. Mirrors `compilerExplicit`/`rewriteModeExplicit`: an assertion
+   * is never reported as a default, and (here) there is no default to conflate it with.
+   */
+  referenceSourceExplicit?: boolean;
+  /**
+   * The value `WEB_LATEX_MCP_REFERENCE_SOURCE` held when it named no known backend — remembered
+   * rather than discarded, and NOT merged into `referenceSource`.
+   *
+   * Remembered, because the refusal has to name it: `parseReferenceSource` does not throw (the
+   * setting governs `search_references` and nothing else, so a typo must not cost the user every
+   * other tool), so the only thing that tells a user why searching refuses is a message quoting
+   * what they actually typed, in the tool's error and in `server_info`. Discarding it would leave
+   * the server behaving differently from a default install with nothing to explain the
+   * difference — the silent-failure shape `extraWritingGuideLoaded` exists to prevent.
+   *
+   * Not merged into `referenceSource`, because that field is typed `ReferenceSourceId` and the
+   * whole point is that this value is not one — and because a rejected value is not a choice:
+   * `referenceSourceExplicit` stays false, so nothing downstream can read a typo as an assertion
+   * and pin the resolver to a backend that does not exist. Set means refuse; unset means normal.
+   * Already trimmed and elided by `parseReferenceSource`, since it is echoed to a model.
+   */
+  referenceSourceInvalid?: string;
+  /**
+   * Contact address from `WEB_LATEX_MCP_CONTACT_EMAIL`, offered to Crossref/OpenAlex for their
+   * faster "polite pool". A privacy boundary: this is read ONLY from that env var by
+   * `parseContactEmail` — never derived from `git config user.email` or any other source — so
+   * nothing reaches a third-party service unless the user deliberately opted in.
+   */
+  contactEmail?: string;
+  /**
+   * True when `WEB_LATEX_MCP_CONTACT_EMAIL` was set to something `parseContactEmail` could not
+   * use. Same silent-failure doctrine as `referenceSourceInvalid` above: dropping the rejection
+   * entirely would leave the server behaving differently from a default install — the polite
+   * pool off, `contactEmailConfigured: false`, no clause in `server_info`'s text — with nothing
+   * a tool can reach to explain the difference, the one startup stderr line being invisible in
+   * most MCP clients.
+   *
+   * A BOOLEAN, and deliberately never the value, which is the one place this field diverges
+   * from `referenceSourceInvalid`. That one carries the user's own typo of a backend id, which
+   * is safe to echo and has to be echoed for the refusal to name it. This one would carry an
+   * email address: personal data, and `server_info`'s output is read by a model and travels
+   * into its context. Whether the value was rejected is the most that may be said, and it is
+   * enough — the user knows what they typed, and the full value is already in the stderr line
+   * on their own terminal. Do not "improve" this into a string.
+   *
+   * Set only when a value was present and rejected; unset (never `false`) otherwise, so it
+   * cannot be read as "a value was considered" on a default install.
+   */
+  contactEmailInvalid?: boolean;
 }
 
 /** Where the `viewer` tool expects the PDF viewer to be opened. */

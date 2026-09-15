@@ -47,7 +47,7 @@ art` vs `state-of-the-art`, `Transformer` vs `transformer`).
   with `%`, unless the user puts comments in scope.
 - Citation keys, numbers, results, or claims — you cannot verify those by reading.
 - Anything in a `.bib` file. Skip `.bib` files entirely; normalizing a bibliography is
-  `format-bibliography`, and checking one against DBLP is `verify-citations`.
+  `format-bibliography`, and checking one against a bibliography service is `verify-citations`.
 
 ## How to write a finding
 

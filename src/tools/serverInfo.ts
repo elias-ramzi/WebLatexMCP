@@ -6,6 +6,7 @@ import { toPosix } from '../lib/paths.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
 import { countWritingConventions } from '../lib/writingConventions.js';
+import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
 
 const outputSchema = {
   name: z.string(),
@@ -29,6 +30,49 @@ const outputSchema = {
         'substitutes a ' +
         'backend that is. This field does not probe PATH — run doctor for what is actually ' +
         "installed, or read a compile result's own `compiler` for what ran.",
+    ),
+  referenceSource: z
+    .string()
+    .optional()
+    .describe(
+      'The bibliography backend pinned by WEB_LATEX_MCP_REFERENCE_SOURCE, when one is. Absent ' +
+        'means nothing is pinned: search_references tries DBLP, then Crossref, then OpenAlex, ' +
+        'and substitutes one it cannot reach — a search result reports which actually answered. ' +
+        'Pinned, a backend is never substituted and an unreachable one is an error. This field ' +
+        'does not probe the network.',
+    ),
+  referenceSourceInvalid: z
+    .string()
+    .optional()
+    .describe(
+      'Set when WEB_LATEX_MCP_REFERENCE_SOURCE holds a value that names no backend — the value ' +
+        'itself, so the typo is visible. Present means search_references REFUSES an unpinned ' +
+        'search (it will not substitute a bibliography the user did not name); passing a ' +
+        'per-call source: still works, and every other tool is unaffected. The server starts ' +
+        'normally: this setting governs one tool, so a typo in it is not a startup failure. ' +
+        'Unlike contactEmail, this is the user’s own typo rather than personal data, so the ' +
+        'value itself is reported — elided past 120 characters with the true length ' +
+        'appended, since it is echoed into a model’s context in three places (the stderr ' +
+        'line, the search_references refusal, and here).',
+    ),
+  contactEmailConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_CONTACT_EMAIL is set to a usable address. Crossref and OpenAlex ' +
+        'give identified clients a faster "polite pool". The address itself is deliberately NOT ' +
+        'reported — only whether one is configured — since it is the user’s personal data and ' +
+        'this output is read by a model.',
+    ),
+  contactEmailInvalid: z
+    .boolean()
+    .optional()
+    .describe(
+      'Set when WEB_LATEX_MCP_CONTACT_EMAIL holds a value that is not a usable address: the ' +
+        'polite pool is OFF, and off because of that value rather than because nothing was ' +
+        'configured — which contactEmailConfigured alone cannot tell apart. Absent means the ' +
+        'variable is unset or fine. Only the fact of the rejection is reported, never the ' +
+        'value: unlike referenceSourceInvalid (the user’s own typo of a backend id), this one ' +
+        'is an email address — personal data — and this output is read by a model.',
     ),
   rewriteMode: z
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
@@ -98,7 +142,10 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         "user's conventions are silently ignored forever with nothing to tell them — plus a live " +
         'count of the bullets currently in that file (writingGuideExtraRuleCount), which reflects a ' +
         'rule added during this session even though the loaded instructions and the ' +
-        'guide://latex/writing-guide resource are both fixed at startup. Use this to confirm which ' +
+        'guide://latex/writing-guide resource are both fixed at startup. It also reports when ' +
+        'WEB_LATEX_MCP_REFERENCE_SOURCE holds a value that names no bibliography backend, which ' +
+        'is the reason search_references would be refusing an unpinned search while every other ' +
+        'tool works. Use this to confirm which ' +
         'version of the MCP server is running.',
       inputSchema: {},
       outputSchema,
@@ -111,6 +158,17 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         workspaceLocal: ctx.config.workspaceIsLocal ?? false,
         workspaceExcludePattern: ctx.config.workspaceExcludePattern,
         compiler: ctx.config.compiler ?? 'latexmk',
+        // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
+        // "dblp" here would describe the fallback order's first try as a choice someone made.
+        referenceSource: ctx.config.referenceSourceExplicit
+          ? ctx.config.referenceSource
+          : undefined,
+        // Reported apart from `referenceSource`, never folded into it: the value is not a
+        // backend id, and a rejected value is nobody's choice.
+        referenceSourceInvalid: ctx.config.referenceSourceInvalid,
+        contactEmailConfigured: ctx.config.contactEmail !== undefined,
+        // The boolean, and only the boolean: `ctx.config` never holds the rejected address.
+        contactEmailInvalid: ctx.config.contactEmailInvalid,
         rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
         // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
         // default when the env names nothing, so that form would call every default install
@@ -145,12 +203,32 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
           : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT ` +
             `loaded${countClause}; these conventions are not in effect\n`;
       }
+      // An unusable WEB_LATEX_MCP_REFERENCE_SOURCE REPLACES the unpinned description rather than
+      // appending to it: search_references refuses in that state, so describing the fallback
+      // order here would tell a user diagnosing that refusal exactly the wrong thing.
+      const referencesDetail = info.referenceSourceInvalid
+        ? `WEB_LATEX_MCP_REFERENCE_SOURCE is set to "${info.referenceSourceInvalid}", which is ` +
+          `not a backend (expected one of: ${REFERENCE_SOURCES.join(', ')}) — search_references ` +
+          'REFUSES until it is fixed or unset, unless the call passes source:. Every other tool ' +
+          'is unaffected'
+        : info.referenceSource
+          ? `${info.referenceSource} (WEB_LATEX_MCP_REFERENCE_SOURCE — never substituted)`
+          : 'dblp, then crossref, then openalex (unpinned — an unreachable one is substituted)';
+      // Same shape, and for the same reason: an unusable WEB_LATEX_MCP_CONTACT_EMAIL REPLACES
+      // the reassuring clause instead of silently reading as "nobody configured a contact".
+      // The address itself is never rendered — only that one was set and rejected.
+      const contactDetail = info.contactEmailInvalid
+        ? ', polite-pool contact IGNORED (WEB_LATEX_MCP_CONTACT_EMAIL is not a usable address)'
+        : info.contactEmailConfigured
+          ? ', polite-pool contact set'
+          : '';
       const text =
         `web-latex-mcp v${info.version}\n` +
         `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
         excludeLine +
         writingGuideLine +
         `compiler: ${info.compiler}\n` +
+        `references: ${referencesDetail}${contactDetail}\n` +
         `rewrite mode (default): ${info.rewriteMode}` +
         (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
       return {

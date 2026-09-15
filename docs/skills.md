@@ -8,7 +8,7 @@ the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------- |
 | [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                                                                                  | `.tex`                   | `/format-latex-project` |
 | [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`.                                                         | `.tex` (in-place mode)   | `/arxiv-clean-project`  |
-| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                                                                       | local report; opt-in bib | `/verify-citations`     |
+| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, Crossref and OpenAlex, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                                                | local report; opt-in bib | `/verify-citations`     |
 | [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                                                                  | `.bib` + `.tex`          | `/format-bibliography`  |
 | [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                                                                   | local note only          | `/summarize-paper`      |
 | [`proofread-document`](../.claude/skills/proofread-document/SKILL.md)     | Hunts **typos** — spelling, doubled or missing words, agreement, punctuation, quotes, unescaped LaTeX characters, inconsistent hyphenation of a repeated term. Reports each as an exact minimal substitution and applies nothing until you say so. Never rewrites prose for style; never touches a `.bib`.                                                                                                                      | opt-in `.tex`            | `/proofread-document`   |
@@ -120,14 +120,17 @@ before any `commit`/`push`. In-place mode is destructive (it strips your live pr
 skill flags that first. The cleaner is a Python CLI installed on demand (`pipx`/`pip`). Ask Claude to
 "clean my project for arXiv".
 
-## `verify-citations` — audit citations against DBLP
+## `verify-citations` — audit citations against DBLP, Crossref or OpenAlex
 
-**Audits the references a document actually carries** against [DBLP](https://dblp.org). For each entry it
+**Audits the references a document actually carries** against a bibliography service — DBLP, Crossref or
+OpenAlex, reached via `search_references`, which tries DBLP first, then Crossref, then OpenAlex, and
+substitutes one that can't be reached (dblp.org's anti-bot wall makes this common). For each entry it
 compares the **title**, **authors**, **venue** (reconciling abbreviations like CVPR / NeurIPS / ICLR with
-their full names), and **publication year** to the canonical DBLP record via `search_references`. Confident
+their full names), and **publication year** to the canonical record the answering service returns. Confident
 matches are tallied silently; anything doubtful — a wrong year, a misspelled or missing author, an author
-list truncated with `and others`, a preprint cited where a published version exists, or an entry DBLP can't
-find — is brought back to **you** with the reference shown beside the DBLP record, so you decide what to do.
+list truncated with `and others`, a preprint cited where a published version exists, or an entry none of
+the three services can find — is brought back to **you** with the reference shown beside the candidate
+record, so you decide what to do.
 
 **It does not need a `.bib`, and it does not need a remote.** Via
 [`list_references`](tools.md#references-in-any-format) it reads a BibTeX `.bib`, a LaTeX
@@ -139,7 +142,7 @@ folder in place. When the bibliography has cite keys it also runs
 own finding rather than as "unverified".
 
 It is **read-only by default and never edits the bibliography without your explicit say-so** (for a `.bib`,
-also behind the [`.bib` protection](tools.md#citations-via-dblp)); optionally, on entries you confirm, it
+also behind the [`.bib` protection](tools.md#citations-via-dblp-crossref-or-openalex)); optionally, on entries you confirm, it
 adds a `% verified-by-claude` comment (ignored by BibTeX, so the PDF is unchanged) that later runs skip —
 never in a markdown draft, where no comment stays invisible. Every run also writes a **local audit report**
 (`citation-report.local.md` — git-excluded at the clone root for a git project, and for a local project
@@ -152,7 +155,7 @@ Brings a `.bib` into a single house style: it **deduplicates** entries (e.g. an 
 published version), **renames cite keys** to a consistent `firstauthorYEARtag` scheme
 (`chambon2024pointbev`), **harmonizes venue names** (pick short `CVPR` _or_ long "Computer Vision and
 Pattern Recognition", not a mix), and applies **one field policy** — strip or systematically add `url` /
-`doi` / `pages` (added values are pulled from DBLP, not invented). Unlike `verify-citations`, this one
+`doi` / `pages` (added values are pulled from the service's record — DBLP, Crossref or OpenAlex — not invented). Unlike `verify-citations`, this one
 **edits** the `.bib`, so it is permission-gated: it agrees a policy with you, previews the changes, and
 writes only on your go-ahead. Renaming a cite key would break every `\cite{…}`, so the skill **propagates
 renames into the `.tex` in the same pass** and uses **compile (no `Citation … undefined` warnings) as its

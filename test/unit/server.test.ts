@@ -11,8 +11,12 @@ import { composeWritingGuide } from '../../src/lib/writingGuide.js';
 import type { AppContext } from '../../src/context.js';
 import type { Skill } from '../../src/lib/skills.js';
 
-// Tool/resource registration never touches the context (handlers do, lazily), so an
-// empty stand-in is enough to exercise the server's initialization surface.
+// Registration is *almost* context-free — handlers read the bag lazily — so an empty stand-in
+// exercises the server's initialization surface. The one exception is `search_references`,
+// whose description and `source` field text depend on how this server is configured and are
+// therefore built at registration: it reads `ctx.config` and tolerates it being absent,
+// describing the default, precisely so this stand-in keeps working. If another tool ever
+// needs the context that early, it has to tolerate the same thing or this fake grows a field.
 const fakeCtx = {} as unknown as AppContext;
 
 async function connect(

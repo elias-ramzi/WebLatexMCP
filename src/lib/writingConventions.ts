@@ -109,8 +109,8 @@ function escapeLeadingBlockMarker(line: string): string {
  * Why direct writes to the extra writing-guide file are refused, and the way forward.
  * Returned from `add_writing_convention` when `confirmGuideEdit` is unset.
  *
- * Unlike a `.bib` write — where the guard exists because entry text must come from DBLP,
- * never the model — the text appended here originates from the model by design (a
+ * Unlike a `.bib` write — where the guard exists because entry text must come from a
+ * bibliography service (DBLP, Crossref or OpenAlex), never the model — the text appended here originates from the model by design (a
  * caller-phrased rule). What the guard buys is the user's acknowledgement, because the
  * write lands outside every project sandbox: `targetPath` is loaded into the server's MCP
  * `instructions` at every future startup, so one call quietly changes what every later

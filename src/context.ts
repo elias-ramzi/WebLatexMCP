@@ -10,6 +10,9 @@ import { SyncTexService } from './services/synctex.js';
 import { CommentStore } from './services/commentStore.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
+import { CrossrefService } from './services/crossref.js';
+import { OpenAlexService } from './services/openalex.js';
+import { ReferenceResolver } from './services/referenceResolver.js';
 import { DoctorService } from './services/doctor.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
@@ -44,7 +47,12 @@ export interface AppContext {
   synctex: SyncTexService;
   comments: CommentStore;
   credentials: CredentialResolver;
-  dblp: DblpService;
+  /**
+   * Chooses which bibliography backend answers a lookup. Tools go through this, never a
+   * concrete backend: which service answers is a resolution decision (config, per-call pin,
+   * substitution when one is unreachable) and must have exactly one home.
+   */
+  references: ReferenceResolver;
   /** Local toolchain diagnostics — see `src/services/doctor.ts`. */
   doctor: DoctorService;
   /** Who else is working on a project right now — see `src/services/sessionRegistry.ts`. */
@@ -159,7 +167,23 @@ export function createContext(
     synctex,
     comments,
     credentials,
-    dblp: new DblpService(),
+    // A contact email is sent only when the user set WEB_LATEX_MCP_CONTACT_EMAIL. Crossref and
+    // OpenAlex offer a faster "polite pool" to identified clients; we never infer an address.
+    references: new ReferenceResolver(
+      {
+        dblp: new DblpService(),
+        crossref: new CrossrefService(undefined, { contactEmail: config.contactEmail }),
+        openalex: new OpenAlexService(undefined, { contactEmail: config.contactEmail }),
+      },
+      {
+        source: config.referenceSource,
+        explicit: config.referenceSourceExplicit,
+        // A WEB_LATEX_MCP_REFERENCE_SOURCE value that names no backend: the server starts (the
+        // setting governs one tool), and the resolver refuses an unpinned search by name rather
+        // than substituting a bibliography the user did not ask for.
+        invalidSource: config.referenceSourceInvalid,
+      },
+    ),
     doctor: new DoctorService(),
     sessions,
     shadows,

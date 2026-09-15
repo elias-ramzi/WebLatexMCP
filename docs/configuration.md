@@ -12,6 +12,8 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`. **Always wins** over a default persisted via `register_project { default: true }`, even across a restart. See [Setting a default project](#setting-a-default-project).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. Setting it is an **assertion**: that backend is never substituted, and a missing one is an error. Left unset, a missing `latexmk` falls back to an installed `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                               |
+| `WEB_LATEX_MCP_REFERENCE_SOURCE`                           | no       | Bibliography backend for `search_references`: `dblp`, `crossref` or `openalex`. Setting it is an **assertion**: only that backend is tried, and one that cannot be reached is an error. Left unset, the server tries DBLP, then Crossref, then OpenAlex, and substitutes one it cannot reach — the result reports which answered. An unrecognised value does **not** stop the server: it is logged to stderr, reported by `server_info`, and makes `search_references` refuse an unpinned search by name (a per-call `source:` still works) — every other tool is unaffected. See [Reference backend](#reference-backend).                                |
+| `WEB_LATEX_MCP_CONTACT_EMAIL`                              | no       | Contact address sent to Crossref and OpenAlex, which give identified clients a faster "polite pool". **Opt-in only** — nothing is sent unless you set this, and it is never derived from your git config. A value that is not a plausible, URL-safe address — or is longer than 254 characters, RFC 5321's limit — is ignored with a note on stderr, and reported by `server_info` as `contactEmailInvalid` — as a boolean only, never the address, since unlike a mistyped backend id that value is personal data. See [Reference backend](#reference-backend).                                                                                          |
 | `WEB_LATEX_MCP_REWRITE_MODE`                               | no       | Default [rewrite-preservation mode](tools.md#rewrite-preservation-mode) for `edit_file`: `off` (default — nothing is preserved unless configured), `prose`, or `always`. Only the default — a project's own `set_rewrite_mode` setting wins over it, and a per-call `preserveOriginal` wins over both. An unrecognised value falls back to `off` and logs the rejection to stderr rather than failing to start; an empty or whitespace-only value is treated as unset.                                                                                                                                                                                    |
 | `WEB_LATEX_MCP_AUTHOR_NAME` / `WEB_LATEX_MCP_AUTHOR_EMAIL` | no       | Identity used for commits. Default `WebLatexMCP <web-latex-mcp@localhost>`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `WEB_LATEX_MCP_WRITING_GUIDE`                              | no       | Path to a LaTeX writing guide surfaced to the client. **Replaces** the bundled [`writing-guide.md`](writing-guide.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -191,6 +193,79 @@ than failing on a machine that can compile perfectly well. Someone who set it _d
 substituting would silently override them — and the two backends are not interchangeable (tectonic is
 XeTeX-only and drops every snippet), so the override would surface as a changed PDF rather than as an
 error.
+
+## Reference backend
+
+`search_references` looks a paper up in an external bibliography, and `add_citation` fetches its
+BibTeX from that same service. Three backends are supported.
+
+- **DBLP** — computer science only, but the best metadata and cite keys for it. Serves BibTeX
+  directly.
+- **Crossref** — every discipline, the broadest coverage, and the publisher of record for most DOIs.
+  Serves BibTeX directly, via its own `transform` endpoint.
+- **OpenAlex** — broad and open, good for work Crossref indexes thinly. **Publishes no BibTeX of its
+  own**: an `openalex:` key is resolved to the record's DOI and the entry fetched from Crossref. A
+  record with no DOI is refused rather than assembled from metadata — see below.
+
+### Record keys are namespaced
+
+A search result's `key` names its backend: `dblp:conf/cvpr/HeZRS16`, `crossref:10.1109/CVPR.2016.90`,
+`openalex:W2194775991`. `add_citation` routes on that prefix, so a key always goes back to the service
+that issued it — whatever `WEB_LATEX_MCP_REFERENCE_SOURCE` says, since the configured source governs
+_searching_, not fetching a record you already found. Bare DBLP keys still work, as do bare DOIs and
+`dblp.org` / `doi.org` / `openalex.org` URLs.
+
+### Choosing a bibliography, and when one is substituted
+
+`search_references` also takes a per-call `source:` argument, which wins over the environment.
+
+**A default falls back; a choice does not** — the same rule as the
+[compile backend](#compile-backend), for the same reason: a setting is an assertion, never an
+inference.
+
+- **`WEB_LATEX_MCP_REFERENCE_SOURCE` unset** — the server tries DBLP, then Crossref, then OpenAlex,
+  and substitutes one that cannot be reached. The result's `source` always names the backend that
+  actually answered, and on a substitution `fallbackFrom` and `hint` say what happened, in the text
+  channel as well as in `structuredContent`. A substitution is reported, never silent.
+- **`WEB_LATEX_MCP_REFERENCE_SOURCE` set**, or a per-call `source:` — **never** substituted. A backend
+  that cannot be reached is an error naming both routes out, rather than a quiet switch to a different
+  bibliography than the one you asked for.
+- **`WEB_LATEX_MCP_REFERENCE_SOURCE` set to something that is not a backend** (a typo like `crossreff`)
+  — the server starts normally, logs the rejection to stderr, and `server_info` reports the value under
+  `referenceSourceInvalid`. `search_references` then **refuses** an unpinned search with a message
+  naming the value, the three valid ids, and both ways out: fix or unset the variable, or pass
+  `source:` on the call — which still works. Nothing else in the server is affected: this setting
+  governs `search_references` alone, so a typo in it is not a reason to lose `read_file`, `compile`,
+  `commit` or `push`. It refuses rather than falling back to the unpinned order for the same reason a
+  reachable-but-unasked-for backend is never substituted: you named a bibliography, and answering from
+  a different one is a different claim.
+
+**A search that succeeds with no results is an answer, not a failure.** It is returned as-is and no
+other backend is tried: falling through would turn "DBLP has never heard of this" into "here is what
+Crossref found instead", which is a different claim. If a paper is outside computer science, retry it
+with `source: "crossref"` rather than reading an empty DBLP result as "this reference is wrong".
+
+This fallback earns its keep right now: `dblp.org` currently sits behind an anti-bot proof-of-work
+challenge, which it serves with an HTTP 200 and an HTML body. The server detects that and reports it
+as a backend being unreachable — so an unpinned lookup simply answers from Crossref instead.
+
+### Why an OpenAlex record without a DOI is refused
+
+`add_citation` is the only sanctioned way into a `.bib`, and it is only worth that status because the
+entry text provably comes from the service rather than from a model. OpenAlex serves no BibTeX, so its
+records reach a bibliography only through their DOI. When there is no DOI there is no canonical entry
+to fetch, and the server will not compose one from metadata — it refuses and tells you to search the
+paper on DBLP or Crossref instead. That refusal is deliberate: a synthesized entry would look exactly
+like a verified one.
+
+### The polite pool
+
+Crossref and OpenAlex both offer identified clients a faster service tier. The server sends an
+identifying `User-Agent` naming the project and version, and — **only if you set
+`WEB_LATEX_MCP_CONTACT_EMAIL`** — a `mailto` alongside it. Nothing is sent otherwise: the address is
+never read from your git config or inferred any other way, because sending a personal address to a
+third party should be a deliberate act. `server_info` reports whether one is configured, never the
+address itself.
 
 ## Rewrite-preservation mode
 
