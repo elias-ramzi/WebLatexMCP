@@ -524,26 +524,70 @@ describe('loadConfig with a malformed WEB_LATEX_MCP_WRITING_GUIDE_EXTRA', () => 
 });
 
 describe('parseReferenceSource', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('is unset (not a default id) when unset, empty, or whitespace-only', () => {
     // Unlike parseCompilerChoice, unset must stay undefined: the resolver owns fallback
     // order across the three backends, so config must not name a winner.
-    expect(parseReferenceSource(undefined)).toEqual({ source: undefined, explicit: false });
-    expect(parseReferenceSource('')).toEqual({ source: undefined, explicit: false });
-    expect(parseReferenceSource('   ')).toEqual({ source: undefined, explicit: false });
+    const unset = { source: undefined, explicit: false, invalid: undefined };
+    expect(parseReferenceSource(undefined)).toEqual(unset);
+    expect(parseReferenceSource('')).toEqual(unset);
+    expect(parseReferenceSource('   ')).toEqual(unset);
   });
 
   it('accepts each valid id, case-insensitively and trimmed', () => {
     for (const id of REFERENCE_SOURCES) {
-      expect(parseReferenceSource(id)).toEqual({ source: id, explicit: true });
+      expect(parseReferenceSource(id)).toEqual({ source: id, explicit: true, invalid: undefined });
     }
-    expect(parseReferenceSource('  DBLP  ')).toEqual({ source: 'dblp', explicit: true });
+    expect(parseReferenceSource('  DBLP  ')).toEqual({
+      source: 'dblp',
+      explicit: true,
+      invalid: undefined,
+    });
   });
 
-  it('throws on an invalid value, naming the variable and every valid id', () => {
-    expect(() => parseReferenceSource('scopus')).toThrow(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
-    expect(() => parseReferenceSource('scopus')).toThrow(
+  it('does NOT throw on an invalid value: it reports it as `invalid` and logs to stderr', () => {
+    // The blast radius of this setting is search_references and nothing else, so a typo must
+    // not take down read_file/compile/commit/push with it. `explicit` stays false: a rejected
+    // value is not a choice, so nothing downstream may describe it as one.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    expect(parseReferenceSource('scopus')).toEqual({
+      source: undefined,
+      explicit: false,
+      invalid: 'scopus',
+    });
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const line = String(errorSpy.mock.calls[0]?.[0]);
+    // Exactly what the thrown message said, so nothing is lost by not throwing.
+    expect(line).toContain(
       'WEB_LATEX_MCP_REFERENCE_SOURCE "scopus" is invalid; expected one of: dblp, crossref, openalex.',
     );
+    // And it must say the failure is scoped, or the line reads like the old fatal one.
+    expect(line).toMatch(/search_references/);
+    // stdout is the JSON-RPC channel: a config warning there corrupts the protocol stream.
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps the rejected value verbatim (trimmed, original case) so a refusal can name it', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseReferenceSource('  Crossreff  ').invalid).toBe('Crossreff');
+  });
+
+  it('elides an over-long rejected value rather than carrying kilobytes into every refusal', () => {
+    // A pasted multi-kilobyte env var reaches a stderr line, the tool refusal AND server_info.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const huge = 'z'.repeat(5000);
+
+    const out = parseReferenceSource(huge);
+    expect(out.invalid).not.toBe(huge);
+    expect(out.invalid!.length).toBeLessThan(200);
+    expect(out.invalid).toMatch(/\(5000 characters\)$/);
+    expect(String(errorSpy.mock.calls[0]?.[0]).length).toBeLessThan(600);
   });
 
   it('wires into loadConfig as referenceSource/referenceSourceExplicit', () => {
@@ -555,10 +599,25 @@ describe('parseReferenceSource', () => {
     expect(cfg.referenceSourceExplicit).toBe(true);
   });
 
-  it('propagates the throw through loadConfig on an invalid value', () => {
-    expect(() => loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'scopus' })).toThrow(
-      /WEB_LATEX_MCP_REFERENCE_SOURCE/,
-    );
+  it('wires an invalid value through loadConfig as referenceSourceInvalid, and starts', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'scopus' });
+
+    expect(cfg.referenceSourceInvalid).toBe('scopus');
+    expect(cfg.referenceSource).toBeUndefined();
+    // `referenceSourceExplicit` stays the sole licence for a substitution, and a rejected value
+    // is not an assertion — otherwise a typo would pin the resolver to an undefined backend.
+    expect(cfg.referenceSourceExplicit).toBe(false);
+    // The rest of the server is untouched: this is the whole point of not throwing.
+    expect(cfg.compiler).toBe('latexmk');
+    expect(cfg.workspaceRoot).toBeTruthy();
+  });
+
+  it('leaves referenceSourceInvalid absent for a valid or unset value', () => {
+    expect(loadConfig({}).referenceSourceInvalid).toBeUndefined();
+    expect(
+      loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'openalex' }).referenceSourceInvalid,
+    ).toBeUndefined();
   });
 });
 
@@ -601,6 +660,36 @@ describe('parseContactEmail', () => {
     expect(errorSpy).toHaveBeenCalled();
     const message = errorSpy.mock.calls[0]?.[0] as string;
     expect(message).toContain('WEB_LATEX_MCP_CONTACT_EMAIL');
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('caps the length at 254 characters (RFC 5321), rejecting one character over', () => {
+    // An oversized value is interpolated into a User-Agent header and a `mailto=` query
+    // parameter; some fronts answer that with 431, which surfaces as "Crossref could not be
+    // reached" with nothing pointing at the env var that caused it. Boundary on both sides.
+    const address = (total: number) => `${'a'.repeat(total - '@example.com'.length)}@example.com`;
+    const ok = address(254);
+    const tooLong = address(255);
+    expect(ok).toHaveLength(254);
+    expect(tooLong).toHaveLength(255);
+
+    expect(parseContactEmail(ok)).toBe(ok);
+    // The cap is measured against the TRIMMED value, like every other check here.
+    expect(parseContactEmail(`   ${ok}   `)).toBe(ok);
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    // A malformed value stays a convenience failure, never a correctness one: no throw.
+    expect(() => parseContactEmail(tooLong)).not.toThrow();
+    expect(parseContactEmail(tooLong)).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('WEB_LATEX_MCP_CONTACT_EMAIL');
+    // The rejected value is echoed elided, not dumped: "too long" is the one rejection reason
+    // whose value has no bound, and a multi-kilobyte log line is the same problem again.
+    expect(message).not.toContain(tooLong);
+    expect(message).toContain('254');
+    // stdout is the JSON-RPC channel.
     expect(logSpy).not.toHaveBeenCalled();
   });
 

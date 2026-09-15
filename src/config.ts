@@ -164,11 +164,35 @@ function parseCompilerChoice(raw: string | undefined): {
 
 /**
  * Select the reference-lookup backend (DBLP / Crossref / OpenAlex) from
- * `WEB_LATEX_MCP_REFERENCE_SOURCE` — and say whether that was a *choice* or nothing at all.
- * Shaped after `parseCompilerChoice`: both answers come from one emptiness test so they can
- * never disagree, and an invalid value throws rather than silently falling back, because
- * searching a bibliography backend other than the one the user named is a wrong answer, not a
- * cosmetic difference (same reasoning as the compiler, unlike `parseRewriteMode` below).
+ * `WEB_LATEX_MCP_REFERENCE_SOURCE` — and say whether that was a *choice*, nothing at all, or a
+ * value this server cannot use.
+ *
+ * **An invalid value does NOT throw**, and `parseCompilerChoice`'s precedent deliberately does
+ * not transfer here. Note the difference is NOT that throwing is better scoped there — it is
+ * not: `parseCompilerChoice` throws inside `loadConfig` too, so it costs every tool exactly the
+ * same way. The difference is what is left afterwards. A LaTeX server that cannot compile has
+ * little to offer; one that cannot search DBLP still has twenty-odd working tools. This setting
+ * is scoped to `search_references` and nothing else, so throwing costs a user every tool in the
+ * server — `read_file`, `compile`, `commit`, `push` — because `loadConfig` runs before the
+ * transport exists and the process exits, which most MCP clients surface only as "MCP server
+ * failed to start". `parseRewriteMode`, below, already takes the proportionate route for a
+ * setting of comparable blast radius; this one takes it too.
+ *
+ * **But the alternative is not a silent fallback**, and that is the half a later "fix" will want
+ * to take. Quietly reverting to the unpinned DBLP→Crossref→OpenAlex order would break "an
+ * assertion, never an inference" outright: the user named a bibliography, and answering from a
+ * *different* one is a different claim, not a degraded version of the same one. So the rejected
+ * value is REMEMBERED and returned as `invalid`, `explicit` stays false (a rejected value is
+ * nobody's choice, and `referenceSourceExplicit` must stay the sole licence for a substitution),
+ * and `ReferenceResolver` refuses an unpinned search by name — while a per-call `source:`, which
+ * is its own assertion, keeps working. Everything else in the server is unaffected. That is what
+ * "proportionate" means here: refuse the thing configured, not the process.
+ *
+ * The rejection is logged to stderr — never stdout, which is the JSON-RPC channel — in the same
+ * shape `parseContactEmail` uses, and the value is `elide`d. It is elided in the RETURNED
+ * `invalid` too, not only in the log: unlike the contact email, this value is echoed onward into
+ * the tool's refusal message and into `server_info`, so a pasted multi-kilobyte env var would
+ * otherwise reach a model's context three times over. The elision says how much was cut.
  *
  * One deliberate difference from `parseCompilerChoice`, worth not "fixing" later: an unset value
  * here returns `source: undefined`, never a default id. `parseCompilerChoice` can default to
@@ -180,15 +204,22 @@ function parseCompilerChoice(raw: string | undefined): {
 export function parseReferenceSource(raw: string | undefined): {
   source: ReferenceSourceId | undefined;
   explicit: boolean;
+  /** The rejected value, trimmed and elided. Set ONLY when the value named no known backend. */
+  invalid: string | undefined;
 } {
-  const value = raw?.trim().toLowerCase();
-  if (!value) return { source: undefined, explicit: false };
-  if (!(REFERENCE_SOURCES as readonly string[]).includes(value)) {
-    throw new Error(
-      `WEB_LATEX_MCP_REFERENCE_SOURCE "${raw}" is invalid; expected one of: ${REFERENCE_SOURCES.join(', ')}.`,
-    );
+  const trimmed = raw?.trim();
+  if (!trimmed) return { source: undefined, explicit: false, invalid: undefined };
+  const value = trimmed.toLowerCase();
+  if ((REFERENCE_SOURCES as readonly string[]).includes(value)) {
+    return { source: value as ReferenceSourceId, explicit: true, invalid: undefined };
   }
-  return { source: value as ReferenceSourceId, explicit: true };
+  const shown = elide(trimmed);
+  console.error(
+    `WEB_LATEX_MCP_REFERENCE_SOURCE "${shown}" is invalid; expected one of: ` +
+      `${REFERENCE_SOURCES.join(', ')}. search_references will refuse to search until this is ` +
+      'fixed or unset (a per-call source: still works); every other tool is unaffected.',
+  );
+  return { source: undefined, explicit: false, invalid: shown };
 }
 
 /**
@@ -203,21 +234,43 @@ export function parseReferenceSource(raw: string | undefined): {
  * JSON-RPC channel) and returns undefined, so a typo silently costs only the polite-pool speedup.
  * Checked here, not merely "looks emailish": the value is interpolated into a URL query
  * parameter, so `&`, `?`, `#`, `/` and any whitespace/control character (including a newline)
- * are rejected too — those could otherwise let a malformed value alter the request URL.
+ * are rejected too — those could otherwise let a malformed value alter the request URL. Length
+ * is capped for the same reason: the value goes into a `User-Agent` header *and* a `mailto=`
+ * query parameter, and a pasted multi-kilobyte value draws a 431 from some fronts, which reaches
+ * the caller as "Crossref could not be reached" with nothing naming the variable that caused it.
+ * Rejecting it here spends the same stderr line every other malformed value gets, and names the
+ * real cause.
  */
 export function parseContactEmail(raw: string | undefined): string | undefined {
   const value = raw?.trim();
   if (!value) return undefined;
   if (isUsableContactEmail(value)) return value;
+  // The rejected value is echoed back so the typo is visible — but it is echoed ELIDED, since
+  // the one rejection reason that has no short value is "too long", and dumping a pasted
+  // multi-kilobyte token into the log trades one oversized string for another.
   console.error(
-    `WEB_LATEX_MCP_CONTACT_EMAIL "${raw}" is not usable as a contact address; ignoring it. ` +
-      'Expected a plain email address (no query-altering characters, no whitespace).',
+    `WEB_LATEX_MCP_CONTACT_EMAIL "${elide(raw ?? '')}" is not usable as a contact address; ` +
+      'ignoring it. Expected a plain email address (no query-altering characters, no ' +
+      `whitespace, at most ${MAX_CONTACT_EMAIL_LENGTH} characters).`,
   );
   return undefined;
 }
 
+/** Shorten an over-long value for a log line, saying what was cut rather than hiding it. */
+function elide(value: string, max = 120): string {
+  return value.length <= max ? value : `${value.slice(0, max)}… (${value.length} characters)`;
+}
+
+/**
+ * RFC 5321's limit on a forward path, and the cap on a usable contact address. Anything longer
+ * is a paste accident, not an address, and it would be sent in a header and a query parameter.
+ */
+const MAX_CONTACT_EMAIL_LENGTH = 254;
+
 /** True when `value` is a plausible, URL-query-safe email address. See `parseContactEmail`. */
 function isUsableContactEmail(value: string): boolean {
+  // Measured on the trimmed value, like every check below it.
+  if (value.length > MAX_CONTACT_EMAIL_LENGTH) return false;
   // Reject anything that could alter a URL query string, or that is not a single flat token.
   if (/[\s&?#/]/.test(value)) return false;
   // eslint-disable-next-line no-control-regex
@@ -396,9 +449,11 @@ export function loadConfig(
     env.WEB_LATEX_MCP_WRITING_GUIDE_EXTRA,
     cwd,
   );
-  const { source: referenceSource, explicit: referenceSourceExplicit } = parseReferenceSource(
-    env.WEB_LATEX_MCP_REFERENCE_SOURCE,
-  );
+  const {
+    source: referenceSource,
+    explicit: referenceSourceExplicit,
+    invalid: referenceSourceInvalid,
+  } = parseReferenceSource(env.WEB_LATEX_MCP_REFERENCE_SOURCE);
   const contactEmail = parseContactEmail(env.WEB_LATEX_MCP_CONTACT_EMAIL);
 
   return {
@@ -417,6 +472,7 @@ export function loadConfig(
     extraWritingGuidePath,
     referenceSource,
     referenceSourceExplicit,
+    referenceSourceInvalid,
     contactEmail,
   };
 }

@@ -175,7 +175,14 @@ export function createContext(
         crossref: new CrossrefService(undefined, { contactEmail: config.contactEmail }),
         openalex: new OpenAlexService(undefined, { contactEmail: config.contactEmail }),
       },
-      { source: config.referenceSource, explicit: config.referenceSourceExplicit },
+      {
+        source: config.referenceSource,
+        explicit: config.referenceSourceExplicit,
+        // A WEB_LATEX_MCP_REFERENCE_SOURCE value that names no backend: the server starts (the
+        // setting governs one tool), and the resolver refuses an unpinned search by name rather
+        // than substituting a bibliography the user did not ask for.
+        invalidSource: config.referenceSourceInvalid,
+      },
     ),
     doctor: new DoctorService(),
     sessions,

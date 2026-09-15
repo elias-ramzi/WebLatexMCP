@@ -147,6 +147,6 @@ selection or the clipboard button misbehaves, fall back to your OS browser (`tar
 ## Where to go next
 
 - **[Configuration](../configuration.md)** — every env var, how tokens resolve per host, project options.
-- **[Tools](../tools.md)** — the full tool list, the DBLP citation flow, how safe pushes work.
+- **[Tools](../tools.md)** — the full tool list, the citation flow, how safe pushes work.
 - **[Skills](../skills.md)** — `/format-latex-project`, `/verify-citations`, and friends.
 - Per-OS manual setup: [macOS](macos.md) · [Linux](linux.md) · [Windows](windows.md).

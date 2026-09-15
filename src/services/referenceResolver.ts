@@ -17,7 +17,15 @@
  *    Falling through on an empty result would silently turn "DBLP has never heard of this" into
  *    "here is something Crossref found instead", which is a different claim than the caller made.
  *
- * 2. **`fetchBibtex` routes by the KEY, never by the configured source.** A key came out of a
+ * 2. **A configured value that names no backend refuses; it does not fall back.**
+ *    `parseReferenceSource` no longer throws on a typo — the setting governs this one tool, and
+ *    failing to start would cost the user every other tool in the server — so an unusable value
+ *    arrives here as `invalidSource` and `search` refuses an unpinned call by name
+ *    (`ReferenceSourceInvalidError`). Falling through to `DEFAULT_SOURCE_ORDER` would be the
+ *    real violation of "an assertion, never an inference": the user named a bibliography. A
+ *    per-call `source:` is its own assertion and still works.
+ *
+ * 3. **`fetchBibtex` routes by the KEY, never by the configured source.** A key came out of a
  *    search result and carries its own provenance (`crossref:10.1109/…`), so it must go to the
  *    backend that issued it even when the config names another. Nothing is substituted here
  *    either: a key identifies one record in one backend, so there is nothing to substitute *to*.
@@ -71,6 +79,29 @@ export class ReferenceSourceUnavailableError extends Error {
   }
 }
 
+/**
+ * Thrown when `WEB_LATEX_MCP_REFERENCE_SOURCE` holds a value that names no backend at all.
+ *
+ * Deliberately NOT a `ReferenceSourceUnavailableError`: that type carries a
+ * `source: ReferenceSourceId`, and the whole problem here is that the configured value is not
+ * one — there is no id to put in the field. It is also not substitutable. Only
+ * `BackendUnavailableError` licenses trying the next backend, and this is not a backend failing
+ * to answer: the user asserted a bibliography, and quietly answering from the default order
+ * would give them a different bibliography than the one they named. Refusing is the honest
+ * answer, and it stays scoped to `search_references` — `fetchBibtex` routes by the key and
+ * never consults the configured source, so a bad value has nothing to do with it.
+ */
+export class ReferenceSourceInvalidError extends Error {
+  /** The rejected value, exactly as `parseReferenceSource` kept it (trimmed, elided). */
+  readonly value: string;
+
+  constructor(value: string, message: string) {
+    super(message);
+    this.name = 'ReferenceSourceInvalidError';
+    this.value = value;
+  }
+}
+
 /** Thrown when an OpenAlex record carries no DOI, so no canonical BibTeX exists to fetch. */
 export class NoCanonicalBibtexError extends Error {
   constructor(message: string) {
@@ -83,9 +114,16 @@ export class NoCanonicalBibtexError extends Error {
  * The backends are typed structurally, by the method each one actually needs, rather than as
  * the concrete service classes. Two reasons, and the second is the load-bearing one:
  * a unit test can pass a three-line fake instead of standing up three services with injected
- * `fetch`es; and `openalex` is typed with `resolveDoi` and **no** `fetchBibtex`, so the type
- * system itself records that OpenAlex publishes no BibTeX. A future edit that "completes" the
- * interface has to change this declaration to do it, which is a visible act rather than a quiet one.
+ * `fetch`es; and `openalex` is declared with `resolveDoi` and **no** `fetchBibtex`, so the
+ * *resolver* has no way to call one — `fetchBibtex` on an OpenAlex key routes through
+ * `resolveDoi` + Crossref or refuses, and adding a call here would not typecheck.
+ *
+ * That is all this declaration enforces, and the distinction matters given how much weight the
+ * ".bib bytes originate from the service" rule carries. TypeScript is structurally typed, so it
+ * is NOT a compile-time guarantee that `OpenAlexService` has no `fetchBibtex`: growing one on the
+ * class typechecks cleanly against `DoiBackend`, which only requires a subset. What pins the
+ * absence is a runtime assertion — `test/unit/openalex.test.ts` checks
+ * `'fetchBibtex' in service === false`. Keep that test; this declaration cannot stand in for it.
  */
 interface SearchBackend {
   search(query: string, opts?: { maxResults?: number }): Promise<ReferenceHit[]>;
@@ -113,10 +151,11 @@ export class ReferenceResolver {
   private readonly backends: ReferenceBackends;
   private readonly configured: ReferenceSourceId | undefined;
   private readonly explicit: boolean;
+  private readonly invalidSource: string | undefined;
 
   constructor(
     backends: ReferenceBackends,
-    opts: { source?: ReferenceSourceId; explicit?: boolean } = {},
+    opts: { source?: ReferenceSourceId; explicit?: boolean; invalidSource?: string } = {},
   ) {
     this.backends = backends;
     this.configured = opts.source;
@@ -124,6 +163,10 @@ export class ReferenceResolver {
     // configured value that arrived without `explicit` would otherwise silently disable the
     // fallback that makes the tool work when a backend is down.
     this.explicit = opts.explicit === true;
+    // `config.referenceSourceInvalid`: the user named a bibliography this server does not have.
+    // Never combined with `source`/`explicit` — those describe a *usable* choice, and this one
+    // is unusable by definition, so it can only ever produce a refusal, never a selection.
+    this.invalidSource = opts.invalidSource;
   }
 
   /** The backend object for an id. */
@@ -151,6 +194,18 @@ export class ReferenceResolver {
   ): Promise<ResolvedSearch> {
     const { maxResults } = opts;
     const pinned = this.pin(opts.source);
+
+    // A per-call `source:` is the caller's own assertion and wins, exactly as it wins over a
+    // *valid* configured source — so a broken env var never makes this tool unusable for a
+    // caller who names a backend. Only an unpinned search has to be refused, and it is refused
+    // rather than run: substituting the default order would answer from a bibliography the user
+    // did not name, which is the one outcome worse than a refusal.
+    if (!pinned && this.invalidSource !== undefined) {
+      throw new ReferenceSourceInvalidError(
+        this.invalidSource,
+        invalidSourceMessage(this.invalidSource),
+      );
+    }
 
     if (pinned) {
       try {
@@ -218,13 +273,21 @@ export class ReferenceResolver {
     // OpenAlex publishes no BibTeX at all, so the record's DOI is the only route to a canonical
     // entry. No DOI means there is nothing verifiable to fetch — and synthesizing one from
     // OpenAlex's JSON is exactly what this server refuses to do, so the refusal is the answer.
+    //
+    // The wording of that refusal is load-bearing. It is the only server-authored text that tells
+    // a model it may originate `.bib` entry bytes itself, so it must name the user's approval
+    // BEFORE the flag, in the same order `bibEditBlockedMessage` (src/lib/bib.ts) uses:
+    // `confirmBibEdit` is worth nothing except as the user's acknowledgement. Not shared with
+    // that function on purpose — different situation, different subject — so a test pins the
+    // order here instead.
     const doi = await this.backends.openalex.resolveDoi(id);
     if (doi === null) {
       throw new NoCanonicalBibtexError(
         `OpenAlex record "${id}" carries no DOI, and OpenAlex publishes no BibTeX of its own, ` +
           'so there is no canonical entry to fetch. Search for the paper again with ' +
           'source: "dblp" or source: "crossref" and add it from there; if it exists in neither, ' +
-          'the reference has to be added by hand with confirmBibEdit: true.',
+          'the reference has to be added by hand: first ask the user to approve the entry, ' +
+          'then write it with confirmBibEdit: true.',
       );
     }
     return { bibtex: await this.backends.crossref.fetchBibtex(doi), source, via: 'crossref' };
@@ -246,6 +309,22 @@ function pinnedMessage(pin: NonNullable<Pin>, err: BackendUnavailableError): str
     (pin.how === 'call'
       ? 'omit source: to let the server substitute one automatically.'
       : 'unset WEB_LATEX_MCP_REFERENCE_SOURCE to let the server substitute one automatically.')
+  );
+}
+
+/**
+ * Refusal for a configured source that names no backend — same wording discipline as
+ * `pinnedMessage`: name what is actually available, and both routes off the refusal.
+ */
+function invalidSourceMessage(value: string): string {
+  const ids = REFERENCE_SOURCES.map((s) => `"${s}"`).join(', ');
+  return (
+    `WEB_LATEX_MCP_REFERENCE_SOURCE is set to "${value}", which is not a bibliography backend ` +
+    `this server knows; expected one of: ${REFERENCE_SOURCES.join(', ')}. No search was run: ` +
+    'you named a bibliography, and answering from a different one would be a different claim. ' +
+    'Fix or unset WEB_LATEX_MCP_REFERENCE_SOURCE (unset restores the default order: ' +
+    `${DEFAULT_SOURCE_ORDER.join(', then ')}), or pass source: ${ids} on this call to search ` +
+    'one now. Every other tool on this server is unaffected by the setting.'
   );
 }
 

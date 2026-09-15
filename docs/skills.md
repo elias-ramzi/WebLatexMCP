@@ -155,7 +155,7 @@ Brings a `.bib` into a single house style: it **deduplicates** entries (e.g. an 
 published version), **renames cite keys** to a consistent `firstauthorYEARtag` scheme
 (`chambon2024pointbev`), **harmonizes venue names** (pick short `CVPR` _or_ long "Computer Vision and
 Pattern Recognition", not a mix), and applies **one field policy** — strip or systematically add `url` /
-`doi` / `pages` (added values are pulled from DBLP, not invented). Unlike `verify-citations`, this one
+`doi` / `pages` (added values are pulled from the service's record — DBLP, Crossref or OpenAlex — not invented). Unlike `verify-citations`, this one
 **edits** the `.bib`, so it is permission-gated: it agrees a policy with you, previews the changes, and
 writes only on your go-ahead. Renaming a cite key would break every `\cite{…}`, so the skill **propagates
 renames into the `.tex` in the same pass** and uses **compile (no `Citation … undefined` warnings) as its

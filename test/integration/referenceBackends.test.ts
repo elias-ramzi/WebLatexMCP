@@ -65,7 +65,10 @@ describe('multi-backend reference lookup through a real MCP client', () => {
 
   async function setup(
     refBackends: ReferenceBackends,
-    opts: { source?: ReferenceSourceId; explicit?: boolean } = {},
+    opts: { source?: ReferenceSourceId; explicit?: boolean; invalidSource?: string } = {},
+    // Server-level config the resolver knows nothing about. Kept apart from `opts` so the
+    // resolver keeps receiving exactly what it received before.
+    serverOpts: { contactEmail?: string; referenceSourceInvalid?: string } = {},
   ): Promise<{ client: Client; dir: string }> {
     const remote = await createFakeRemote({ 'main.tex': 'x\n', 'refs.bib': '' });
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-'));
@@ -76,6 +79,10 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       sessionId: 'test',
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',
+      ...(serverOpts.contactEmail ? { contactEmail: serverOpts.contactEmail } : {}),
+      ...(serverOpts.referenceSourceInvalid
+        ? { referenceSourceInvalid: serverOpts.referenceSourceInvalid }
+        : {}),
     };
     const pm = new ProjectManager(config);
     const git = new GitService();
@@ -200,6 +207,110 @@ describe('multi-backend reference lookup through a real MCP client', () => {
     expect(JSON.stringify(res.content)).toMatch(/was requested, so no other backend was tried/);
   });
 
+  it('refuses search_references when WEB_LATEX_MCP_REFERENCE_SOURCE holds an unusable value', async () => {
+    // The server started — that is the point. The typo costs the one tool it governs, by name,
+    // rather than every tool via a dead process whose only explanation went to stderr.
+    const { client } = await setup(
+      backends({
+        dblp: {
+          search: () => Promise.resolve([hit('dblp', 'dblp:conf/x/y', 'ResNet')]),
+          fetchBibtex: () => Promise.resolve(CROSSREF_BIBTEX),
+        },
+      }),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const res = await client.callTool({
+      name: 'search_references',
+      arguments: { query: 'deep residual learning' },
+    });
+
+    expect(res.isError).toBe(true);
+    const text = JSON.stringify(res.content);
+    expect(text).toMatch(/crossreff/);
+    expect(text).toMatch(/dblp, crossref, openalex/);
+    expect(text).toMatch(/unset WEB_LATEX_MCP_REFERENCE_SOURCE/);
+  });
+
+  it('still searches when the CALL names a backend, despite the unusable env value', async () => {
+    const { client } = await setup(
+      backends({
+        crossref: {
+          search: () =>
+            Promise.resolve([hit('crossref', 'crossref:10.1109/cvpr.2016.90', 'ResNet')]),
+          fetchBibtex: () => Promise.resolve(CROSSREF_BIBTEX),
+        },
+      }),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const res = await client.callTool({
+      name: 'search_references',
+      arguments: { query: 'deep residual learning', source: 'crossref' },
+    });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(res.isError).toBeFalsy();
+    expect(sc.source).toBe('crossref');
+    expect(sc.count).toBe(1);
+  });
+
+  it('still adds a citation despite the unusable env value — fetchBibtex routes by the key', async () => {
+    const { client, dir } = await setup(
+      backends({
+        crossref: {
+          search: () => Promise.resolve([]),
+          fetchBibtex: () => Promise.resolve(CROSSREF_BIBTEX),
+        },
+      }),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const res = await client.callTool({
+      name: 'add_citation',
+      arguments: { key: 'crossref:10.1109/CVPR.2016.90' },
+    });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(res.isError).toBeFalsy();
+    expect(sc.added).toBe(true);
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toContain('@inproceedings{He_2016,');
+  });
+
+  it('server_info surfaces the unusable value in BOTH channels', async () => {
+    // server_info is the one tool a user calls to ask "why does search_references refuse", so
+    // the misconfiguration has to be visible there — in the text too, not only structured.
+    const { client } = await setup(
+      backends({}),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(sc.referenceSourceInvalid).toBe('crossreff');
+    // Not reported as a pinned backend: a rejected value is nobody's choice.
+    expect(sc.referenceSource).toBeUndefined();
+    const text = JSON.stringify(res.content);
+    expect(text).toMatch(/references:/);
+    expect(text).toMatch(/crossreff/);
+    expect(text).toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+  });
+
+  it('server_info says nothing about an invalid source when there is none', async () => {
+    const { client } = await setup(backends({}));
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(sc.referenceSourceInvalid).toBeUndefined();
+    expect(JSON.stringify(res.content)).not.toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+  });
+
   it('add_citation routes a crossref key to Crossref and writes its bytes verbatim', async () => {
     const { client, dir } = await setup(
       backends({
@@ -282,5 +393,44 @@ describe('multi-backend reference lookup through a real MCP client', () => {
     expect(res.isError).toBe(true);
     expect(JSON.stringify(res.content)).toContain('add_citation');
     expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe('');
+  });
+
+  it('server_info says a polite-pool contact IS configured without reporting the address', async () => {
+    // The address is the user's personal data and this output is read by a model, so
+    // server_info reports only the boolean. Nothing else pinned that, which meant adding
+    // `contactEmail` to the info object for a "helpful" line passed the whole suite. Both
+    // channels are checked: structuredContent and the rendered text each reach the model on
+    // their own, so a leak into either is the whole leak.
+    const address = 'polite.pool.tester@example.invalid';
+    const localPart = 'polite.pool.tester';
+    const { client } = await setup(backends({}), {}, { contactEmail: address });
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(res.isError).toBeFalsy();
+    expect(sc.contactEmailConfigured).toBe(true);
+
+    const textChannel = JSON.stringify(res.content);
+    const structuredChannel = JSON.stringify(sc);
+    expect(textChannel).not.toContain(address);
+    expect(structuredChannel).not.toContain(address);
+    // Not just the whole address: a local part on its own still identifies the user, and a
+    // field holding one would pass an exact-string check against the full address.
+    expect(textChannel).not.toContain(localPart);
+    expect(structuredChannel).not.toContain(localPart);
+    // The boolean is the only signal, and the text says it in words rather than an address.
+    expect(textChannel).toContain('polite-pool contact set');
+  });
+
+  it('server_info reports contactEmailConfigured false when no contact is configured', async () => {
+    const { client } = await setup(backends({}));
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(res.isError).toBeFalsy();
+    expect(sc.contactEmailConfigured).toBe(false);
+    expect(JSON.stringify(res.content)).not.toContain('polite-pool contact set');
   });
 });

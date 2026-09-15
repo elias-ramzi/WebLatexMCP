@@ -11,6 +11,55 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Crossref and OpenAlex as reference backends, behind a resolver — and a DBLP client that sniffs
+  the body instead of trusting the status** (#72). `dblp.org` now sits behind an anti-bot
+  proof-of-work wall which it serves with **HTTP 200** and an HTML body, so `res.ok` was true and
+  `search_references` died inside `JSON.parse` with `Unexpected token '<'`, naming neither DBLP nor
+  the cause; `add_citation` was dead the same way. Worse, `fetchBibtex`'s guard was "the body
+  contains an `@`" and the interstitial carries `@licstart` in its JS-license header, so the bot
+  page passed the one check that exists to keep a web page out of a `.bib` — the old test passed
+  only because its fixture contained no `@`. Every backend now sniffs the payload
+  (`assertApiBody`), checks the JSON _shape_ (`assertApiShape` — a 200 carrying an error envelope
+  is a failure, not a silent zero-result), wraps transport failures (`fetchOrUnavailable`
+  /`readBodyOrUnavailable`, covering a body that stalls after the headers arrive as well as a
+  rejected fetch), and requires a real BibTeX entry header at a line start before any text reaches
+  a bibliography — cut to the leading run of entries at both ends, so neither a proxy banner
+  in front nor a `<script>` behind is appended, with an unbalanced body deliberately returned
+  whole rather than truncated. One normalizer now serves both the key parser and
+  `DblpService`, closing the last _copy_ of that boundary: the service's own normalizer stripped
+  any host, so `fetchBibtex('https://evil.com/rec/conf/x/y')` yielded the DBLP key `conf/x/y` —
+  unreachable through the resolver, which validates first, but one edit away from being
+  reachable, and the only input on which the two copies disagreed. `ReferenceResolver` (`src/services/referenceResolver.ts`) chooses which service
+  answers, on exactly the `CompilerResolver` rule — an unset `WEB_LATEX_MCP_REFERENCE_SOURCE` is a
+  default that may be substituted (dblp → crossref → openalex) with the substitution reported in
+  `hint`/`fallbackFrom`, never silently; the env var, or a per-call `source:` on
+  `search_references`, is an _assertion_ and an unreachable backend is then an error rather than a
+  quiet switch to a different bibliography. Only `BackendUnavailableError` substitutes: a search
+  that succeeds with **zero hits is an answer** and is returned as-is, since falling through would
+  turn "DBLP has never heard of this" into "here is what Crossref found instead". `fetchBibtex`
+  routes by the **key**, never by the configured source, and substitutes nothing — a key names one
+  record in one backend. Record keys are namespaced (`dblp:conf/cvpr/HeZRS16`,
+  `crossref:10.1109/CVPR.2016.90`, `openalex:W2194775991`) and parsed in one pure module,
+  `src/lib/referenceKey.ts`, whose validation is a security boundary — bare DBLP keys, bare DOIs
+  and service URLs still parse, so every existing caller, doc and skill keeps working. **OpenAlex
+  publishes no BibTeX at all**, verified against the live API, so its records are fetched from
+  Crossref by DOI and a record with **no** DOI is refused rather than assembled from metadata:
+  `OpenAlexService` has no `fetchBibtex`; the resolver's `DoiBackend` records that intent, and a
+  runtime assertion in `test/unit/openalex.test.ts` is what actually pins the absence, since
+  structural typing would admit a grown method.
+  A value that names no backend at all is the third case: it neither throws at startup — which
+  killed every tool in the server, `read_file` and `push` included, over a setting that governs
+  one — nor falls back, which would answer from a bibliography the user did not name. It is
+  reported by `server_info` and refuses the unpinned search alone, while a per-call `source:`
+  still works and `fetchBibtex` is untouched. New `WEB_LATEX_MCP_CONTACT_EMAIL` opts into
+  Crossref's and OpenAlex's polite pool — read only from
+  that variable, never derived from `git config`, validated so it cannot alter a request URL or
+  inject a header, and reported by `server_info` only as _whether_ one is set, never the address.
+  `search_references` and `add_citation` now report which service answered (`source`, and `via`
+  when OpenAlex was bridged through Crossref). The DBLP wall itself is upstream and unfixed: an
+  unpinned lookup works today by substituting Crossref, but `source: "dblp"` still fails until
+  DBLP exempts its API paths from the challenge.
+
 - **The `push` conflict payload is bounded, in both channels, by one budget** (#68). A conflict on a
   single ~20k-character section file returned a 67,485-character result — past the client's tool-result
   cap, so it was never delivered to the model at all, and the documented way out (retry `push` with

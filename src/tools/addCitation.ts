@@ -12,7 +12,8 @@ const inputSchema = {
     .min(1)
     .describe(
       'Namespaced record key from search_references — e.g. "dblp:conf/cvpr/HeZRS16", ' +
-        '"crossref:10.1109/CVPR.2016.90", "openalex:W2194775991". A bare DBLP key, a bare DOI, ' +
+        '"crossref:10.1109/CVPR.2016.90", "openalex:W2194775991", or "doi:<doi>" as an alias ' +
+        'for crossref. A bare DBLP key, a bare DOI, ' +
         'or a dblp.org / doi.org / openalex.org URL is accepted too. The key decides which ' +
         'service is asked, whatever the configured search source is: it came from a result, ' +
         'so it carries its own provenance.',

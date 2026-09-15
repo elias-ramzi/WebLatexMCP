@@ -170,6 +170,24 @@ export interface ServerConfig {
    */
   referenceSourceExplicit?: boolean;
   /**
+   * The value `WEB_LATEX_MCP_REFERENCE_SOURCE` held when it named no known backend — remembered
+   * rather than discarded, and NOT merged into `referenceSource`.
+   *
+   * Remembered, because the refusal has to name it: `parseReferenceSource` does not throw (the
+   * setting governs `search_references` and nothing else, so a typo must not cost the user every
+   * other tool), so the only thing that tells a user why searching refuses is a message quoting
+   * what they actually typed, in the tool's error and in `server_info`. Discarding it would leave
+   * the server behaving differently from a default install with nothing to explain the
+   * difference — the silent-failure shape `extraWritingGuideLoaded` exists to prevent.
+   *
+   * Not merged into `referenceSource`, because that field is typed `ReferenceSourceId` and the
+   * whole point is that this value is not one — and because a rejected value is not a choice:
+   * `referenceSourceExplicit` stays false, so nothing downstream can read a typo as an assertion
+   * and pin the resolver to a backend that does not exist. Set means refuse; unset means normal.
+   * Already trimmed and elided by `parseReferenceSource`, since it is echoed to a model.
+   */
+  referenceSourceInvalid?: string;
+  /**
    * Contact address from `WEB_LATEX_MCP_CONTACT_EMAIL`, offered to Crossref/OpenAlex for their
    * faster "polite pool". A privacy boundary: this is read ONLY from that env var by
    * `parseContactEmail` — never derived from `git config user.email` or any other source — so

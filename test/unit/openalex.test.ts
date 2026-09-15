@@ -2,6 +2,23 @@ import { describe, it, expect } from 'vitest';
 import { OpenAlexService, type FetchResponse } from '../../src/services/openalex.js';
 import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
 import { getServerVersion } from '../../src/lib/version.js';
+import { readFileSync } from 'node:fs';
+
+/**
+ * The repo URL the polite-pool User-Agent must lead to, read from package.json so the two
+ * cannot drift. Identifying honestly is the whole point of the polite pool; a URL that 404s
+ * identifies nobody, and the shipped one named a GitHub account that does not exist.
+ */
+function repoUrl(): string {
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
+    repository?: { url?: string };
+  };
+  const url = (pkg.repository?.url ?? '').replace(/^git\+/, '').replace(/\.git$/, '');
+  // Fail closed: a missing `repository.url` would make this '' and turn every assertion below
+  // into `toContain('')`, which passes for any string — the pin would go silently vacuous.
+  expect(url).toMatch(/^https:\/\/github\.com\/[^/]+\/[^/]+$/);
+  return url;
+}
 
 function ok(body: string): FetchResponse {
   return {
@@ -185,6 +202,16 @@ describe('OpenAlexService.search', () => {
     expect(headersWithEmail?.['User-Agent']).toContain('mailto:dev@example.com');
   });
 
+  it('identifies the project with the repo URL from package.json, not a 404ing one', async () => {
+    let headers: Record<string, string> | undefined;
+    const svc = new OpenAlexService((url, init) => {
+      headers = init?.headers;
+      return Promise.resolve(ok(SEARCH_JSON));
+    });
+    await svc.search('x');
+    expect(headers?.['User-Agent']).toContain(repoUrl());
+  });
+
   it('rejects an empty query and makes no request', async () => {
     let calls = 0;
     const svc = new OpenAlexService(() => {
@@ -358,6 +385,33 @@ describe('a TRANSPORT failure is substitutable, not a raw error', () => {
 
   it('OpenAlex’s by-record path converts a rejected fetch too', async () => {
     const svc = new OpenAlexService(reject(new TypeError('fetch failed')));
+    await expect(svc.resolveDoi('W2194775991')).rejects.toBeInstanceOf(BackendUnavailableError);
+  });
+});
+
+describe('a body-stream failure is substitutable too', () => {
+  /**
+   * A 200 whose BODY read fails. No `ok()`/`fail()` fixture can exhibit this — both resolve
+   * `text()` — yet the timeout signal handed to `fetch` governs the whole operation, body
+   * streaming included: headers that arrive fast followed by a stalled body reject at
+   * `res.text()`, not at the fetch call. An ECONNRESET mid-stream does the same.
+   */
+  function bodyFails(): FetchResponse {
+    const boom = () =>
+      Promise.reject(Object.assign(new Error('aborted'), { name: 'TimeoutError' }));
+    return { ok: true, status: 200, statusText: 'OK', text: boom, json: boom };
+  }
+
+  it('OpenAlex.search converts a rejected body read', async () => {
+    const svc = new OpenAlexService(() => Promise.resolve(bodyFails()));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.toThrow(/timed out after 15s/);
+  });
+
+  it('OpenAlex.resolveDoi converts a rejected body read', async () => {
+    // Worse here than anywhere: a raw rejection aborts the chain, and the doc comment on
+    // resolveDoi turns on "no DOI" staying distinguishable from "could not answer".
+    const svc = new OpenAlexService(() => Promise.resolve(bodyFails()));
     await expect(svc.resolveDoi('W2194775991')).rejects.toBeInstanceOf(BackendUnavailableError);
   });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
 import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
+import { normalizeDblpKey } from '../../src/lib/referenceKey.js';
 
 function ok(body: string): FetchResponse {
   return {
@@ -93,7 +94,9 @@ describe('DblpService.search', () => {
     expect(hits[0]?.authors).toEqual(['A. One']);
     expect(hits[0]?.key).toBe('dblp:k/1');
 
-    const empty = new DblpService(() => Promise.resolve(ok(JSON.stringify({ result: {} }))));
+    const empty = new DblpService(() =>
+      Promise.resolve(ok(JSON.stringify({ result: { hits: { '@total': '0' } } }))),
+    );
     expect(await empty.search('nothing')).toEqual([]);
   });
 
@@ -131,10 +134,27 @@ describe('DblpService.search', () => {
     await expect(dblp.search('x')).rejects.toThrow(/JSON in an unexpected shape/);
   });
 
-  it('still treats a present-but-empty result container as a real empty answer', async () => {
-    // The value just outside: `result` present, `hits` absent — DBLP genuinely found nothing.
-    const dblp = new DblpService(() => Promise.resolve(ok(JSON.stringify({ result: {} }))));
+  it('still treats a present-but-empty hits container as a real empty answer', async () => {
+    // The value just outside: `hits` present with no `hit` — the shape a real DBLP search that
+    // found nothing actually returns (`@total: "0"`). This must never become unavailable.
+    const dblp = new DblpService(() =>
+      Promise.resolve(
+        ok(JSON.stringify({ result: { query: 'x', hits: { '@total': '0', '@sent': '0' } } })),
+      ),
+    );
     await expect(dblp.search('x')).resolves.toEqual([]);
+  });
+
+  it('treats a `result` that is an ARRAY, or carries no hits container, as unavailable', async () => {
+    // `typeof [] === 'object'` — so the old guard admitted an array, and `{result:{}}` too.
+    // Either mapped to zero hits, and the resolver treats zero hits as an ANSWER: it stops the
+    // fallback chain and reports "No results for X on dblp" for a backend that never searched.
+    // The sibling crossref/openalex guards already reject both; this closes the daylight.
+    for (const body of ['{"result":[]}', '{"result":{}}']) {
+      const dblp = new DblpService(() => Promise.resolve(ok(body)));
+      await expect(dblp.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+      await expect(dblp.search('x')).rejects.toThrow(/JSON in an unexpected shape/);
+    }
   });
 
   it('says a 404 means no such record, not an outage', async () => {
@@ -195,9 +215,10 @@ describe('DblpService.fetchBibtex', () => {
     await expect(missing.fetchBibtex('conf/x/y')).rejects.toThrow(/404 Not Found/);
   });
 
-  it('never hands back the bot challenge as if it were an entry', async () => {
-    // Regression: `@licstart` in the interstitial satisfied the old `includes('@')` check,
-    // so a web page could reach the caller — and a user's .bib — as BibTeX.
+  it('refuses the interstitial page on its "<" prefix, before any entry check runs', async () => {
+    // Named for what it actually asserts: BOT_CHALLENGE starts with "<", so `assertApiBody`
+    // refuses it and `BIBTEX_ENTRY` is never consulted. The @licstart hole is pinned by the
+    // non-HTML test below — this one only proves the page never reaches the caller at all.
     const dblp = new DblpService(() => Promise.resolve(ok(BOT_CHALLENGE)));
     await expect(dblp.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toThrow(
       /HTML page instead of API data/,
@@ -214,6 +235,17 @@ describe('DblpService.fetchBibtex', () => {
   it('accepts a real entry whose only @ is the header', async () => {
     const dblp = new DblpService(() => Promise.resolve(ok(BIB)));
     expect(await dblp.fetchBibtex('conf/cvpr/HeZRS16')).toContain('@inproceedings');
+  });
+
+  it('rejects a NON-HTML body whose only "@" is an @licstart license header', async () => {
+    // The hole `BIBTEX_ENTRY` actually plugs, and the one no other test in this file reaches:
+    // every other @licstart fixture starts with "<", so `assertApiBody` refuses it first and the
+    // entry check never runs. A bare JS/CSS body carrying the same header does get that far —
+    // and the shipped `text.includes('@')` accepted it straight into a user's .bib.
+    const dblp = new DblpService(() =>
+      Promise.resolve(ok('/*\n@licstart The following is the entire license notice.\n@licend*/')),
+    );
+    await expect(dblp.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toThrow(/No BibTeX/);
   });
 });
 
@@ -245,6 +277,234 @@ describe('a TRANSPORT failure is substitutable, not a raw error', () => {
     const svc = new DblpService(reject(new TypeError('fetch failed')));
     await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toBeInstanceOf(
       BackendUnavailableError,
+    );
+  });
+});
+
+describe('a body-stream failure is substitutable too', () => {
+  /**
+   * A 200 whose BODY read fails. No `ok()`/`fail()` fixture can exhibit this — both resolve
+   * `text()` — yet it is the likeliest DBLP failure of all: the timeout signal handed to
+   * `fetch` governs the whole operation, body streaming included, so headers that arrive fast
+   * (the anti-bot interstitial does exactly this) followed by a stalled body reject at
+   * `res.text()`, not at the fetch call. An ECONNRESET mid-stream does the same.
+   */
+  function bodyFails(name = 'TimeoutError'): FetchResponse {
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: () => Promise.reject(Object.assign(new Error('aborted'), { name })),
+      json: () => Promise.reject(Object.assign(new Error('aborted'), { name })),
+    };
+  }
+
+  it('DBLP.search converts a rejected body read', async () => {
+    const svc = new DblpService(() => Promise.resolve(bodyFails()));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.toThrow(/timed out after 15s/);
+  });
+
+  it('DBLP.fetchBibtex converts a rejected body read', async () => {
+    const svc = new DblpService(() => Promise.resolve(bodyFails()));
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+
+  it('a mid-body ECONNRESET is substitutable as well, not a raw TypeError', async () => {
+    const svc = new DblpService(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        text: () => Promise.reject(new TypeError('terminated')),
+        json: () => Promise.reject(new TypeError('terminated')),
+      }),
+    );
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+  });
+});
+
+describe('fetchBibtex returns the entry, not whatever else shares the body', () => {
+  const ENTRY = '@inproceedings{Some:key,\n  title = {Deep Residual Learning}\n}';
+
+  // `BIBTEX_ENTRY.test(text)` only proves an entry exists SOMEWHERE. The return value was the
+  // WHOLE body, and `mergeBibEntry` appends it verbatim — so a proxy banner or a trailing
+  // <script> landed in the user's .bib. The guarantee is that entry text originates from the
+  // service; that is only sayable if the client can say WHICH bytes are the entry.
+  it('returns a clean entry byte-identically', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok(ENTRY)));
+    expect(await svc.fetchBibtex('conf/cvpr/HeZRS16')).toBe(ENTRY);
+  });
+
+  it('drops a leading error banner instead of handing it to the .bib', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok('Warning: proxy error<br>\n' + ENTRY)));
+    const text = await svc.fetchBibtex('conf/cvpr/HeZRS16');
+    expect(text).toBe(ENTRY);
+    expect(text).not.toContain('proxy error');
+  });
+
+  it('refuses a body whose only entry header is mid-line', async () => {
+    const svc = new DblpService(() =>
+      Promise.resolve(ok('Warning: proxy error @article{evil, note={x}}')),
+    );
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toThrow(/No BibTeX/);
+  });
+
+  // Everything AFTER the entry reached the .bib just as surely as everything before it:
+  // `mergeBibEntry` appends `entry.trim()` verbatim, so a trailing <script> or a paragraph of
+  // prose landed in the bibliography whole. The client can only claim entry text originates
+  // from the service if it can say where the entry ENDS as well as where it starts.
+  it('drops a trailing <script> instead of handing it to the .bib', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok(ENTRY + '\n<script>alert(1)</script>')));
+    const text = await svc.fetchBibtex('conf/cvpr/HeZRS16');
+    expect(text).toBe(ENTRY);
+    expect(text).not.toContain('script');
+  });
+
+  it('drops trailing prose after the entry', async () => {
+    const svc = new DblpService(() =>
+      Promise.resolve(
+        ok(ENTRY + '\n\nRetrieved from dblp.org on Tuesday. Please cite responsibly.'),
+      ),
+    );
+    expect(await svc.fetchBibtex('conf/cvpr/HeZRS16')).toBe(ENTRY);
+  });
+
+  it('keeps BOTH entries of a crossref-format body, byte-identically', async () => {
+    // DBLP's `param=1` bib emits the @inproceedings plus the @proceedings its `crossref` field
+    // names. Cutting at the first closing delimiter would corrupt the entry that survives —
+    // worse than the trailing junk the cut exists to remove.
+    const TWO = ENTRY + '\n\n@proceedings{DBLP:conf/cvpr/2016,\n  title = {CVPR 2016}\n}';
+    const svc = new DblpService(() => Promise.resolve(ok(TWO)));
+    expect(await svc.fetchBibtex('conf/cvpr/HeZRS16')).toBe(TWO);
+  });
+
+  it('fails OPEN on an unbalanced entry — the whole body, never a truncated one', async () => {
+    // A half-parsed entry would be this server authoring BibTeX, and `assertApiBody` plus the
+    // header check already stand in front of this. Pins the fallback, not a new behaviour.
+    const BROKEN = '@inproceedings{Some:key,\n  title = {Deep {Residual Learning}\n';
+    const svc = new DblpService(() => Promise.resolve(ok(BROKEN)));
+    expect(await svc.fetchBibtex('conf/cvpr/HeZRS16')).toBe(BROKEN.trim());
+  });
+});
+
+describe('an EMPTY 200 on the BibTeX path is a failure, not "no such record"', () => {
+  // "No BibTeX entry found on DBLP for ..." is a confident claim about the user's record. A
+  // truncated or empty body is not evidence for it — it is the backend failing to answer, and
+  // the resolver must be free to substitute. The deliberate exception is the 404, which really
+  // is DBLP saying the record does not exist, and is handled before this.
+  it('reports an empty body as unavailable', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok('')));
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.not.toThrow(/No BibTeX entry found/);
+  });
+
+  it('reports a whitespace-only body as unavailable', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok('   \n\n  ')));
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+
+  it('but a NON-empty body that is simply not BibTeX stays a plain answer', async () => {
+    // The value just outside — widening past "empty" is a separate design call.
+    const svc = new DblpService(() =>
+      Promise.resolve(ok('Moved Permanently. See https://example.org/')),
+    );
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.toThrow(/No BibTeX/);
+    await expect(svc.fetchBibtex('conf/cvpr/HeZRS16')).rejects.not.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+});
+
+describe('DblpService.normalizeKey delegates to the one normalizer in src/lib', () => {
+  // Two implementations of one security boundary is one edit away from two behaviours. The
+  // comment that called the duplication deliberate cited a lib -> service dependency that the
+  // delegation does not create: `dblp.ts` already imports from `referenceKey.ts`.
+  function outcome(fn: () => string): { ok: string } | { rejected: true } {
+    try {
+      return { ok: fn() };
+    } catch {
+      return { rejected: true };
+    }
+  }
+
+  const INPUTS = [
+    // Accepted shapes, including every one `acceptedFormsMessage` advertises for DBLP.
+    'conf/cvpr/HeZRS16',
+    'journals/corr/abs-1512-03385',
+    'www/HeZRS16',
+    '  conf/cvpr/HeZRS16  ',
+    '/conf/cvpr/HeZRS16',
+    '///conf/cvpr/HeZRS16',
+    'rec/conf/cvpr/HeZRS16',
+    'REC/conf/cvpr/HeZRS16',
+    'conf/cvpr/HeZRS16.bib',
+    'conf/cvpr/HeZRS16.HTML',
+    'conf/cvpr/HeZRS16.xml',
+    'https://dblp.org/rec/conf/cvpr/HeZRS16.bib',
+    'http://dblp.org/rec/conf/cvpr/HeZRS16',
+    'https://dblp.uni-trier.de/rec/conf/cvpr/HeZRS16.xml',
+    '10.1109/CVPR.2016.90',
+    'W2194775991',
+    // Refused shapes.
+    '',
+    '   ',
+    'conf/../../etc/passwd',
+    '../etc/passwd',
+    'conf/x/y?a=b',
+    'conf/x/y#frag',
+    'conf x/y',
+    '-conf/cvpr/HeZRS16',
+    '.bib',
+    // Host laundering — refused shapes like the rest, listed because this is where the two
+    // implementations used to part company, so a re-divergence would show up here first.
+    // What the laundering actually IS, and the assertion that it is refused rather than merely
+    // refused-identically, live in "refuses to launder an unrecognised host into a DBLP key".
+    'https://evil.com/rec/conf/cvpr/HeZRS16',
+    'https://dblp.org@evil.com/rec/conf/cvpr/HeZRS16',
+    'https://dblp.org.evil.com/rec/conf/x/y',
+    'ftp://dblp.org/rec/conf/cvpr/HeZRS16',
+  ];
+
+  // A tautology while the delegation stands — `DblpService.normalizeKey` calls the very function
+  // it is compared against — and that is the point: it is an anti-duplication tripwire, going red
+  // the day someone reintroduces a second implementation. It detects nothing about any particular
+  // input on its own, host laundering included; that is the next test's job.
+  it('accepts the same set and returns the same id for every input', () => {
+    for (const input of INPUTS) {
+      expect(
+        outcome(() => DblpService.normalizeKey(input)),
+        `input: ${JSON.stringify(input)}`,
+      ).toEqual(outcome(() => normalizeDblpKey(input)));
+    }
+  });
+
+  it('keeps its own public error message, which callers may match on', () => {
+    expect(() => DblpService.normalizeKey('conf/../../etc/passwd')).toThrow(
+      '"conf/../../etc/passwd" is not a valid DBLP record key.',
+    );
+    expect(() => DblpService.normalizeKey('')).toThrow('"" is not a valid DBLP record key.');
+    // And never leaks the lib normalizer's own, differently-worded refusal.
+    expect(() => DblpService.normalizeKey('conf x/y')).not.toThrow(/not a valid reference key/);
+  });
+
+  // This is the test that actually detects host laundering. `normalizeKey` used to strip ANY
+  // `scheme://host/`, so an unrecognised host's path came back as a DBLP key — exactly what
+  // `tryParseUrl`'s refusal and the anchored strip in `normalizeDblpKey` close for every other
+  // route in; delegating closed the last one. The pair below is what makes it detect rather than
+  // merely compare: the foreign host is refused, and the real one still resolves.
+  it('refuses to launder an unrecognised host into a DBLP key', () => {
+    expect(() => DblpService.normalizeKey('https://evil.com/rec/conf/cvpr/HeZRS16')).toThrow(
+      /not a valid DBLP record key/,
+    );
+    expect(DblpService.normalizeKey('https://dblp.org/rec/conf/cvpr/HeZRS16.bib')).toBe(
+      'conf/cvpr/HeZRS16',
     );
   });
 });

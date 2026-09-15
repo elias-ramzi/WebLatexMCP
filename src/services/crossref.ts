@@ -19,11 +19,13 @@
 import { getServerVersion } from '../lib/version.js';
 import { formatRecordKey, parseRecordKey } from '../lib/referenceKey.js';
 import {
-  BIBTEX_ENTRY,
+  bibtexEntrySpan,
   BODY_EXCERPT,
+  REQUEST_TIMEOUT_MS,
   BackendUnavailableError,
   assertApiBody,
   fetchOrUnavailable,
+  readBodyOrUnavailable,
   assertApiShape,
   httpHint,
   type FetchLike,
@@ -36,8 +38,6 @@ export type { FetchResponse, FetchLike } from './referenceBackend.js';
 const SERVICE = 'Crossref';
 
 const DEFAULT_BASE_URL = 'https://api.crossref.org';
-const REQUEST_TIMEOUT_MS = 15_000;
-
 // --- Crossref JSON shapes (loosely typed; the API is stable but verbose) ---
 
 interface CrossrefAuthor {
@@ -121,7 +121,7 @@ export class CrossrefService implements ReferenceBackend {
   private userAgent(): string {
     const version = getServerVersion();
     const contact = this.contactEmail ? `; mailto:${this.contactEmail}` : '';
-    return `web-latex-mcp/${version} (+https://github.com/eramzi/WebLatexMCP${contact})`;
+    return `web-latex-mcp/${version} (+https://github.com/elias-ramzi/WebLatexMCP${contact})`;
   }
 
   /** Search Crossref works, returning the top matches with their record keys. */
@@ -158,7 +158,7 @@ export class CrossrefService implements ReferenceBackend {
     // Read as text, not `res.json()`: a 200 can still carry a bot-challenge/interstitial page,
     // and the raw body is what makes that diagnosable instead of an "Unexpected token '<'"
     // buried inside JSON.parse.
-    const body = await res.text();
+    const body = await readBodyOrUnavailable(SERVICE, res, `a search for "${trimmed}"`);
     assertApiBody(SERVICE, body, `a search for "${trimmed}"`);
     let data: CrossrefSearchResponse;
     try {
@@ -191,31 +191,43 @@ export class CrossrefService implements ReferenceBackend {
       body,
     );
     const items = data.message?.items ?? [];
-    return (
-      items
-        // The DOI is the record's identity — `fetchBibtex`/`add_citation` cannot route without
-        // one, so an item with no DOI is skipped entirely rather than surfaced with a hole.
-        .filter((item): item is CrossrefItem & { DOI: string } => Boolean(item.DOI))
-        .map((item) => {
-          const doi = item.DOI;
-          return {
-            key: formatRecordKey('crossref', doi),
-            source: this.id,
-            // Crossref does not append a trailing "." the way DBLP does — nothing to strip here.
-            title: item.title?.[0] ?? '',
-            authors: authorNames(item.author),
-            year: extractYear(item.issued),
-            venue: firstNonEmpty(
-              item['container-title']?.[0],
-              item.event?.name,
-              item['short-container-title']?.[0],
-            ),
-            type: item.type,
-            doi,
-            url: item.URL,
-          } satisfies ReferenceHit;
-        })
-    );
+    const hits: ReferenceHit[] = [];
+    for (const item of items) {
+      // The DOI is the record's identity — `fetchBibtex`/`add_citation` cannot route without
+      // one, so an item with no DOI is skipped entirely rather than surfaced with a hole.
+      const doi = item.DOI;
+      if (!doi) continue;
+      // And a DOI that will not round-trip through `parseRecordKey` is skipped for the same
+      // reason: `formatRecordKey` composes blindly, so a DOI carrying a character outside the
+      // key allowlist produced a key the server itself refuses the moment `add_citation` parses
+      // it back — a result the user can see and cannot use, with the refusal arriving one tool
+      // call later and blaming the key. `extractWorkId` in the openalex client is defensive the
+      // same way; this is its missing half. Skipping costs one result, emitting costs a dead end.
+      const key = formatRecordKey('crossref', doi);
+      try {
+        const parsed = parseRecordKey(key);
+        if (parsed.source !== 'crossref' || parsed.id !== doi) continue;
+      } catch {
+        continue;
+      }
+      hits.push({
+        key,
+        source: this.id,
+        // Crossref does not append a trailing "." the way DBLP does — nothing to strip here.
+        title: item.title?.[0] ?? '',
+        authors: authorNames(item.author),
+        year: extractYear(item.issued),
+        venue: firstNonEmpty(
+          item['container-title']?.[0],
+          item.event?.name,
+          item['short-container-title']?.[0],
+        ),
+        type: item.type,
+        doi,
+        url: item.URL,
+      });
+    }
+    return hits;
   }
 
   /**
@@ -251,18 +263,38 @@ export class CrossrefService implements ReferenceBackend {
         `Crossref returned ${res.status} ${res.statusText} for DOI "${doi}".${httpHint(SERVICE, res.status, 'record')}`,
       );
     }
-    const text = (await res.text()).trim();
+    const text = (await readBodyOrUnavailable(SERVICE, res, `BibTeX for DOI "${doi}"`)).trim();
     assertApiBody(SERVICE, text, `a BibTeX request for DOI "${doi}"`);
+    // An empty body is the backend failing to answer, NOT an answer about the record. Falling
+    // through to "No BibTeX entry found ... for DOI "${doi}"" would state, confidently and on the
+    // user's behalf, that their record does not exist — because the response was truncated. The
+    // one genuine "no such record" is the 404, handled above. A non-empty body that simply is
+    // not BibTeX stays a plain Error: that is Crossref having said something we could read.
+    if (!text) {
+      throw new BackendUnavailableError(
+        SERVICE,
+        `Crossref returned an empty body for DOI "${doi}" — the response carried no data, so it is ` +
+          `no evidence about whether the record exists.`,
+      );
+    }
     // An entry header, not merely an "@" anywhere in the body: an interstitial page can carry
     // "@licstart", and this is the guard that keeps a web page out of a user's bibliography.
-    if (!BIBTEX_ENTRY.test(text)) {
+    const span = bibtexEntrySpan(text);
+    if (span === null) {
       throw new Error(`No BibTeX entry found on Crossref for DOI "${doi}".`);
     }
-    return text;
+    // The entry's own span, not the whole body: the header may be preceded by a banner or an
+    // error fragment and FOLLOWED by a <script> or a block of prose, and whatever this returns is
+    // appended verbatim to the user's .bib. The bytes between the two offsets are the service's,
+    // untouched — choosing where to cut is all this does.
+    return text.slice(span.start, span.end);
   }
 }
 
-/** Abort signal that fires after REQUEST_TIMEOUT_MS, so a hung request can't wedge a tool. */
+/** Abort signal that fires after the SHARED `REQUEST_TIMEOUT_MS`, so a hung request can't wedge a
+ * tool. Imported, never redeclared: `transportReason` quotes that same constant back as "timed
+ * out after 15s", so a local copy drifting would make the error message lie about the wait the
+ * user just sat through. Same rule as `parseCompilerChoice` — both answers from one place. */
 function timeoutSignal(): AbortSignal {
   return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 }

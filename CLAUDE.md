@@ -54,15 +54,17 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   (when the workspace is local) excludes the workspace-local clone dir from the host repo's git.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
-  `dblp`) passed to every tool handler.
+  `references`) passed to every tool handler.
 - `src/tools/*` — one file per tool: a zod `inputSchema`/`outputSchema` + a handler that calls services.
 - `src/prompts/skills.ts` — registers each bundled skill (`.claude/skills/*/SKILL.md`, loaded by
   `src/lib/skills.ts`) as an MCP prompt, so clients that don't read `.claude/skills` (Claude Desktop,
   Cursor) can still run them. Add a skill by adding its directory — no code change.
 - `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex **+
   cross-process lock**, dynamic registration), `GitService` (simple-git wrapper), `FileService`
-  (sandboxed fs), `LatexmkCompiler` (implements the `LatexCompiler` interface), `DblpService` (DBLP
-  search + canonical BibTeX fetch, with an injectable `fetch` for tests), `SessionRegistry` +
+  (sandboxed fs), `LatexmkCompiler` (implements the `LatexCompiler` interface), `ReferenceResolver`
+  (which bibliography answers a lookup — see below) over `DblpService` / `CrossrefService` /
+  `OpenAlexService` (search + canonical BibTeX fetch, each with an injectable `fetch` for tests),
+  `SessionRegistry` +
   `ShadowStore` (parallel sessions — see below), `logParser`, `auth`.
 
 **Two kinds of project.** `ProjectConfig` is a union (`src/types.ts`): a **git** project (`gitUrl`,
@@ -190,12 +192,60 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
   reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
   never clear one.
+- **Which bibliography answers a lookup is one decision, and it lives in `ReferenceResolver`.**
+  `search_references`/`add_citation` go through `ctx.references`, never a concrete backend.
+  Selection is the `CompilerResolver` rule — **an assertion, never an inference**: an unset
+  `WEB_LATEX_MCP_REFERENCE_SOURCE` is a _default_, so a backend that cannot answer may be
+  substituted (dblp → crossref → openalex), always reported in `hint`/`fallbackFrom`, never
+  silently; set — or a per-call `source:` — is an assertion, and an unreachable backend is an
+  error rather than a quiet switch to a different bibliography. `config.referenceSourceExplicit`
+  is the whole licence for a substitution, derived in one place (`parseReferenceSource`), exactly
+  as `compilerExplicit` is. There is a **third** state `compilerExplicit` has no analogue for: a
+  value that names no backend at all. It neither throws at startup nor falls back — throwing
+  killed every tool in the server over a setting that governs one, and falling back would answer
+  from a bibliography the user did not name, which is the inference this rule exists to forbid.
+  It is remembered as `config.referenceSourceInvalid`, logged to stderr, reported by
+  `server_info`, and refuses the **unpinned search alone** (`ReferenceSourceInvalidError`) — a
+  per-call `source:` is an assertion and still wins, and `fetchBibtex` routes by the key and is
+  untouched. Scope the refusal to what the setting actually governs. Two distinctions carry the rest, and both are easy to erase:
+  **only `BackendUnavailableError` substitutes** — a search that succeeds with zero hits is an
+  _answer_ and is returned as-is, because falling through would turn "DBLP has never heard of
+  this" into "here is what Crossref found instead", a different claim; and **`fetchBibtex` routes
+  by the key, never by the configured source**, and substitutes nothing, since a key names one
+  record in one backend. That is why a 200 carrying an anti-bot HTML page or a wrong-shaped JSON
+  envelope has to become `BackendUnavailableError` in the _backend_ (`assertApiBody` /
+  `assertApiShape` / `fetchOrUnavailable` / `readBodyOrUnavailable` in
+  `src/services/referenceBackend.ts`, where the shape is known — the body read needs the same
+  wrapper as the fetch call, because the timeout signal governs streaming too, so a stalled body
+  threw past the chain) rather than surfacing as an empty result the resolver would believe. The `.bib`
+  guarantee constrains this whole layer: **OpenAlex publishes no BibTeX at all**, so
+  `OpenAlexService` has no `fetchBibtex` and its records are fetched from Crossref by DOI. The
+  resolver's `DoiBackend` records that intent but does **not** enforce it — TypeScript is
+  structural, so a grown `fetchBibtex` would still satisfy the declaration; what pins the
+  absence is the runtime `'fetchBibtex' in service === false` assertion in
+  `test/unit/openalex.test.ts`, so keep that test. A
+  record with no DOI is _refused_, never assembled from metadata, because an entry composed from
+  fields is exactly the model-authored text `add_citation` exists to keep out. For the same
+  reason a fetched entry is cut to its own bytes and no further: `bibtexEntrySpan` finds the
+  leading run of line-anchored entries and `fetchBibtex` returns that slice, so neither a proxy
+  banner in front nor a `<script>` behind reaches a bibliography — while a body whose braces
+  never balance **fails open** — the span runs to the end of the text, so nothing after the
+  entry is cut — because a truncated entry is worse than an untidy one. Choosing a cut point in the service's bytes is allowed; inserting, reordering,
+  reformatting or completing them is not, and that is the whole line. Record keys are
+  namespaced (`dblp:conf/cvpr/HeZRS16`, `crossref:10.1109/CVPR.2016.90`, `openalex:W2194775991`)
+  and parsed in one pure module, `src/lib/referenceKey.ts`, whose validation is a **security
+  boundary** rather than a convenience: every id it returns is interpolated into a request URL
+  path, so it never returns a partially-validated value, and a key the server _emits_ must
+  re-parse to the same record. `WEB_LATEX_MCP_CONTACT_EMAIL` (Crossref's and OpenAlex's polite
+  pool) is opt-in only — never derived from `git config user.email` — and `server_info` reports
+  only _whether_ one is set, never the address.
+
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
   `format` and its verbatim `raw`, because only `bibtex` fields are exact; the prose extractor
   deliberately under-claims (a `title` only when the text delimits it, authors only before a
-  parenthesized year) so a wrong guess never sends a DBLP lookup after the wrong paper. `list_references`
+  parenthesized year) so a wrong guess never sends a bibliography lookup after the wrong paper. `list_references`
   and `check_citations` are the tools over it, and `src/lib/referenceSources.ts` decides which files to
   scan. Neither touches git — the case they exist for is a draft with no remote and no `.bib`.
 - **`check_citations` may read a second project — read-only, and only where the draft touches it.**
@@ -208,8 +258,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
     (which the user registered and owns). That is why the field is a project id, not a `"project:path"`
     string — a namespace overloaded onto a path field is one parse bug away from an escape.
   - **Read-only only.** Nothing writes across projects. `add_citation` into someone else's `.bib` stays a
-    separate, permissioned act, because the `.bib` guard and "entry text originates from DBLP" both
-    depend on that staying narrow.
+    separate, permissioned act, because the `.bib` guard and "entry text originates from the service"
+    both depend on that staying narrow.
   - **No lock is taken**, as for every read-only tool. `runExclusive` is per project and serialises
     writers; two concurrent reads of a `.bib` need nothing, and taking two locks would invite a deadlock
     against a peer session locking them in the other order.
@@ -223,8 +273,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
 
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
   (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
-  is `add_citation`, which re-fetches BibTeX from DBLP server-side so entry text never originates from the
-  model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
+  is `add_citation`, which re-fetches BibTeX from the issuing bibliography service server-side so entry
+  text never originates from the model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
   not blocked. It judges the **link-resolved** name too (`FileService.linkTarget` — symlinks only: a hard
   link is invisible to `realpath`, and git cannot commit one): an in-project
   `figures/x.png -> refs.bib` passes the escape check (it stays inside) and used to let `write_file`,
@@ -269,7 +319,7 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   discarding it — the habit Overleaf users already have. This has to be a guard the server enforces, not
   a prompt rule asking the model to retype the old text as `%`-commented lines: a preserved block is only
   worth anything if it is provably the bytes that were there, the same reasoning that keeps BibTeX entry
-  text originating from DBLP rather than from the model retyping it. **`edit_file` only, never
+  text originating from a bibliography service rather than from the model retyping it. **`edit_file` only, never
   `write_file`**: a whole-file write has no "old paragraph" to splice a comment above, only an entire old
   file, and commenting out all of it is never what is meant. A `.bib` target stays exempt regardless of
   mode — that file already has its own guard, and a `.bib`'s entries are not prose to preserve either way.

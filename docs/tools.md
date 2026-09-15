@@ -361,7 +361,7 @@ Two things about it are deliberate:
 
 `undefinedCitations` is the answer you came for: keys the draft cites that the shared bibliography does
 not define. Each one has to be added **there** — `add_citation { project: "shared-bib", … }`, from a
-DBLP result, with that project's permission.
+`search_references` result, with that project's permission.
 
 `list_references` has no equivalent parameter and needs none: it already reads whichever project
 `project` names, so listing another project's references is just `list_references { project:

@@ -2,6 +2,23 @@ import { describe, it, expect } from 'vitest';
 import { CrossrefService, type FetchResponse } from '../../src/services/crossref.js';
 import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
 import { getServerVersion } from '../../src/lib/version.js';
+import { readFileSync } from 'node:fs';
+
+/**
+ * The repo URL the polite-pool User-Agent must lead to, read from package.json so the two
+ * cannot drift. Identifying honestly is the whole point of the polite pool; a URL that 404s
+ * identifies nobody, and the shipped one named a GitHub account that does not exist.
+ */
+function repoUrl(): string {
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
+    repository?: { url?: string };
+  };
+  const url = (pkg.repository?.url ?? '').replace(/^git\+/, '').replace(/\.git$/, '');
+  // Fail closed: a missing `repository.url` would make this '' and turn every assertion below
+  // into `toContain('')`, which passes for any string — the pin would go silently vacuous.
+  expect(url).toMatch(/^https:\/\/github\.com\/[^/]+\/[^/]+$/);
+  return url;
+}
 
 function ok(body: string): FetchResponse {
   return {
@@ -149,6 +166,29 @@ describe('CrossrefService.search', () => {
     expect(Number.isNaN(hits[0]?.year)).toBe(false);
   });
 
+  it('identifies the project with the repo URL from package.json, not a 404ing one', async () => {
+    let headers: Record<string, string> | undefined;
+    const svc = new CrossrefService((url, init) => {
+      headers = init?.headers;
+      return Promise.resolve(ok(searchBody([RESNET_ITEM])));
+    });
+    await svc.search('x');
+    expect(headers?.['User-Agent']).toContain(repoUrl());
+  });
+
+  it('skips an item whose DOI would not round-trip as a record key', async () => {
+    // `formatRecordKey` composes blindly, so an odd DOI produced a key the server itself
+    // refuses when `add_citation` parses it back — a result the user can see but not use.
+    // `extractWorkId` in the openalex client already skips rather than emitting such a key.
+    const spaced = { DOI: '10.1234/has space', title: ['Spaced'] };
+    const quoted = { DOI: '10.1234/has"quote', title: ['Quoted'] };
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok(searchBody([spaced, quoted, RESNET_ITEM]))),
+    );
+    const hits = await svc.search('x');
+    expect(hits.map((h) => h.key)).toEqual(['crossref:10.1109/CVPR.2016.90']);
+  });
+
   it('rejects an empty query and makes no request', async () => {
     let calls = 0;
     const crossref = new CrossrefService(() => {
@@ -223,17 +263,46 @@ describe('CrossrefService.fetchBibtex', () => {
       called = true;
       return Promise.resolve(ok(BIB));
     });
-    await expect(crossref.fetchBibtex('../../etc/passwd')).rejects.toThrow();
+    // Note this one never reaches Crossref's own DOI validation: it fails as a malformed *DBLP*
+    // key, since an unprefixed string routes to dblp. The crossref:-prefixed case below is what
+    // actually exercises `normalizeDoi`'s ".." check.
+    await expect(crossref.fetchBibtex('../../etc/passwd')).rejects.toThrow(
+      /not a valid reference key/,
+    );
     expect(called).toBe(false);
   });
 
-  it('rejects an HTML body whose only "@" is an @licstart license header', async () => {
-    // Regression: a naive "body contains an @" check would accept this and let a web page
-    // into a user's .bib.
+  it('rejects a crossref-prefixed path traversal in the DOI itself', async () => {
+    let called = false;
+    const crossref = new CrossrefService(() => {
+      called = true;
+      return Promise.resolve(ok(BIB));
+    });
+    await expect(crossref.fetchBibtex('crossref:10.1234/../../x')).rejects.toThrow(
+      /not a valid reference key/,
+    );
+    expect(called).toBe(false);
+  });
+
+  it('refuses the interstitial page on its "<" prefix, before any entry check runs', async () => {
+    // Named for what it actually asserts: BOT_CHALLENGE starts with "<", so `assertApiBody`
+    // refuses it and `BIBTEX_ENTRY` is never consulted. The @licstart hole is pinned by the
+    // non-HTML test below — this one only proves the page never reaches the caller at all.
     const crossref = new CrossrefService(() => Promise.resolve(ok(BOT_CHALLENGE)));
     await expect(crossref.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(
       /HTML page instead of API data/,
     );
+  });
+
+  it('rejects a NON-HTML body whose only "@" is an @licstart license header', async () => {
+    // The hole `BIBTEX_ENTRY` actually plugs, and the one no other test in this file reaches:
+    // every other @licstart fixture starts with "<", so `assertApiBody` refuses it first and the
+    // entry check never runs. A bare JS/CSS body carrying the same header does get that far —
+    // and the shipped `text.includes('@')` accepted it straight into a user's .bib.
+    const crossref = new CrossrefService(() =>
+      Promise.resolve(ok('/*\n@licstart The following is the entire license notice.\n@licend*/')),
+    );
+    await expect(crossref.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/No BibTeX/);
   });
 
   it('rejects a plain non-BibTeX text body as a real (non-substitutable) answer', async () => {
@@ -310,6 +379,126 @@ describe('a TRANSPORT failure is substitutable, not a raw error', () => {
   it('Crossref’s by-record path converts a rejected fetch too', async () => {
     const svc = new CrossrefService(reject(new TypeError('fetch failed')));
     await expect(svc.fetchBibtex('crossref:10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+});
+
+describe('a body-stream failure is substitutable too', () => {
+  /**
+   * A 200 whose BODY read fails. No `ok()`/`fail()` fixture can exhibit this — both resolve
+   * `text()` — yet the timeout signal handed to `fetch` governs the whole operation, body
+   * streaming included: headers that arrive fast followed by a stalled body reject at
+   * `res.text()`, not at the fetch call. An ECONNRESET mid-stream does the same.
+   */
+  function bodyFails(): FetchResponse {
+    const boom = () =>
+      Promise.reject(Object.assign(new Error('aborted'), { name: 'TimeoutError' }));
+    return { ok: true, status: 200, statusText: 'OK', text: boom, json: boom };
+  }
+
+  it('Crossref.search converts a rejected body read', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(bodyFails()));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.toThrow(/timed out after 15s/);
+  });
+
+  it('Crossref.fetchBibtex converts a rejected body read', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(bodyFails()));
+    await expect(svc.fetchBibtex('crossref:10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+});
+
+describe('fetchBibtex returns the entry, not whatever else shares the body', () => {
+  const ENTRY = '@inproceedings{Some:key,\n  title = {Deep Residual Learning}\n}';
+
+  // `BIBTEX_ENTRY.test(text)` only proves an entry exists SOMEWHERE. The return value was the
+  // WHOLE body, and `mergeBibEntry` appends it verbatim — so a proxy banner or a trailing
+  // <script> landed in the user's .bib. The guarantee is that entry text originates from the
+  // service; that is only sayable if the client can say WHICH bytes are the entry.
+  it('returns a clean entry byte-identically', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok(ENTRY)));
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(ENTRY);
+  });
+
+  it('drops a leading error banner instead of handing it to the .bib', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok('Warning: proxy error<br>\n' + ENTRY)),
+    );
+    const text = await svc.fetchBibtex('10.1109/CVPR.2016.90');
+    expect(text).toBe(ENTRY);
+    expect(text).not.toContain('proxy error');
+  });
+
+  it('refuses a body whose only entry header is mid-line', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok('Warning: proxy error @article{evil, note={x}}')),
+    );
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/No BibTeX/);
+  });
+
+  // The trailing half of the same hole: `mergeBibEntry` appends what it is handed verbatim, so
+  // anything after the entry reached the user's .bib too.
+  it('drops a trailing <script> instead of handing it to the .bib', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok(ENTRY + '\n<script>alert(1)</script>')),
+    );
+    const text = await svc.fetchBibtex('10.1109/CVPR.2016.90');
+    expect(text).toBe(ENTRY);
+    expect(text).not.toContain('script');
+  });
+
+  it('drops trailing prose after the entry', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok(ENTRY + '\n\nRetrieved from api.crossref.org. Please cite responsibly.')),
+    );
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(ENTRY);
+  });
+
+  it('keeps BOTH entries of a two-entry body, byte-identically', async () => {
+    const TWO = ENTRY + '\n\n@proceedings{Some:proc,\n  title = {CVPR 2016}\n}';
+    const svc = new CrossrefService(() => Promise.resolve(ok(TWO)));
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(TWO);
+  });
+
+  it('fails OPEN on an unbalanced entry — the whole body, never a truncated one', async () => {
+    const BROKEN = '@article{Some:key,\n  title = {Deep {Residual Learning}\n';
+    const svc = new CrossrefService(() => Promise.resolve(ok(BROKEN)));
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(BROKEN.trim());
+  });
+});
+
+describe('an EMPTY 200 on the BibTeX path is a failure, not "no such record"', () => {
+  // "No BibTeX entry found on Crossref for ..." is a confident claim about the user's record. A
+  // truncated or empty body is not evidence for it — it is the backend failing to answer, and
+  // the resolver must be free to substitute. The deliberate exception is the 404, which really
+  // is Crossref saying the record does not exist, and is handled before this.
+  it('reports an empty body as unavailable', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok('')));
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.not.toThrow(
+      /No BibTeX entry found/,
+    );
+  });
+
+  it('reports a whitespace-only body as unavailable', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok('   \n\n  ')));
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+  });
+
+  it('but a NON-empty body that is simply not BibTeX stays a plain answer', async () => {
+    // The value just outside — widening past "empty" is a separate design call.
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok('Moved Permanently. See https://example.org/')),
+    );
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/No BibTeX/);
+    await expect(svc.fetchBibtex('10.1109/CVPR.2016.90')).rejects.not.toBeInstanceOf(
       BackendUnavailableError,
     );
   });

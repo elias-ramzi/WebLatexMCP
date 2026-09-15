@@ -8,13 +8,15 @@
  * citations, so the entry text always originates from DBLP, never the model.
  */
 
-import { formatRecordKey } from '../lib/referenceKey.js';
+import { formatRecordKey, normalizeDblpKey } from '../lib/referenceKey.js';
 import {
-  BIBTEX_ENTRY,
+  bibtexEntrySpan,
   BODY_EXCERPT,
+  REQUEST_TIMEOUT_MS,
   BackendUnavailableError,
   assertApiBody,
   fetchOrUnavailable,
+  readBodyOrUnavailable,
   assertApiShape,
   httpHint,
   type FetchLike,
@@ -30,8 +32,6 @@ const SERVICE = 'DBLP';
 export type DblpHit = ReferenceHit;
 
 const DEFAULT_BASE_URL = 'https://dblp.org';
-const VALID_KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-const REQUEST_TIMEOUT_MS = 15_000;
 
 // --- DBLP JSON shapes (loosely typed; the API is stable but verbose) ---
 
@@ -83,19 +83,30 @@ export class DblpService implements ReferenceBackend {
   }
 
   /**
-   * Strip a full URL / `.bib`|`.html` suffix down to a bare DBLP record key and
+   * Strip a full URL / `.bib`|`.html`|`.xml` suffix down to a bare DBLP record key and
    * validate it, so it can be safely interpolated into a request path.
+   *
+   * Delegates to `normalizeDblpKey` (`src/lib/referenceKey.ts`), which is the single
+   * implementation of this security boundary. It used to be a second one, kept because
+   * `src/lib` must not depend on `src/services` — but that constraint only forbids
+   * **lib -> service**, and this direction is the one this file already takes for
+   * `formatRecordKey`. The two copies had drifted exactly as a duplicated boundary does:
+   * this one stripped *any* `scheme://host/`, so `https://evil.com/rec/conf/x/y` came
+   * back as the DBLP key `conf/x/y` — the host laundering every other route in already
+   * refuses. Delegating closes that here too.
+   *
+   * The public contract is unchanged: same accepted set (bar that laundering), same
+   * returned id, and the same `"X" is not a valid DBLP record key.` message, which is why
+   * the lib refusal is caught and rethrown rather than propagated — a caller matching on
+   * that wording must not start seeing `acceptedFormsMessage`'s multi-source text for a
+   * method that only ever spoke about DBLP.
    */
   static normalizeKey(input: string): string {
-    let key = input.trim();
-    key = key.replace(/^https?:\/\/[^/]+\//i, '');
-    key = key.replace(/^\/+/, '');
-    key = key.replace(/^rec\//i, '');
-    key = key.replace(/\.(bib|html|xml)$/i, '');
-    if (!key || !VALID_KEY.test(key) || key.includes('..')) {
+    try {
+      return normalizeDblpKey(input);
+    } catch {
       throw new Error(`"${input}" is not a valid DBLP record key.`);
     }
-    return key;
   }
 
   /** Search DBLP publications, returning the top matches with their record keys. */
@@ -121,7 +132,7 @@ export class DblpService implements ReferenceBackend {
     }
     // Read as text, not `res.json()`: a 200 can still carry the bot-challenge page, and the raw
     // body is what makes that diagnosable instead of an "Unexpected token '<'" from deep in JSON.parse.
-    const body = await res.text();
+    const body = await readBodyOrUnavailable(SERVICE, res, `a search for "${trimmed}"`);
     assertApiBody(SERVICE, body, `a search for "${trimmed}"`);
     let data: DblpSearchResponse;
     try {
@@ -137,11 +148,24 @@ export class DblpService implements ReferenceBackend {
           JSON.stringify(body.trimStart().slice(0, BODY_EXCERPT)),
       );
     }
-    // `result` present with no `hits` is a legitimate empty answer; `result` absent is not an
-    // answer at all.
+    // A `hits` container present with no `hit` is a legitimate empty answer — that is exactly
+    // what a real DBLP search that found nothing returns. Anything shallower is not an answer:
+    // `typeof [] === 'object'`, so checking only for a non-null object admitted an ARRAY (the
+    // shape an error envelope uses) and a bare `{"result":{}}`, both of which mapped to zero
+    // hits — and the resolver treats zero hits as an ANSWER, stopping the fallback chain and
+    // reporting "no results" for a backend that never searched. The crossref and openalex guards
+    // are already this strict; leaving this one looser was daylight between clients that share
+    // a design.
+    const result = data?.result as { hits?: unknown } | undefined;
+    const hitsContainer = result?.hits;
     assertApiShape(
       SERVICE,
-      typeof data?.result === 'object' && data.result !== null,
+      typeof result === 'object' &&
+        result !== null &&
+        !Array.isArray(result) &&
+        typeof hitsContainer === 'object' &&
+        hitsContainer !== null &&
+        !Array.isArray(hitsContainer),
       `a search for "${trimmed}"`,
       body,
     );
@@ -186,18 +210,38 @@ export class DblpService implements ReferenceBackend {
         `DBLP returned ${res.status} ${res.statusText} for key "${key}".${httpHint(SERVICE, res.status, 'record')}`,
       );
     }
-    const text = (await res.text()).trim();
+    const text = (await readBodyOrUnavailable(SERVICE, res, `BibTeX for key "${key}"`)).trim();
     assertApiBody(SERVICE, text, `a BibTeX request for key "${key}"`);
+    // An empty body is the backend failing to answer, NOT an answer about the record. Falling
+    // through to "No BibTeX entry found ... for key "${key}"" would state, confidently and on the
+    // user's behalf, that their record does not exist — because the response was truncated. The
+    // one genuine "no such record" is the 404, handled above. A non-empty body that simply is
+    // not BibTeX stays a plain Error: that is DBLP having said something we could read.
+    if (!text) {
+      throw new BackendUnavailableError(
+        SERVICE,
+        `DBLP returned an empty body for key "${key}" — the response carried no data, so it is ` +
+          `no evidence about whether the record exists.`,
+      );
+    }
     // An entry header, not merely an `@` anywhere in the body: the bot-challenge page carries
     // `@licstart`, and this is the guard that keeps a web page out of a user's bibliography.
-    if (!BIBTEX_ENTRY.test(text)) {
+    const span = bibtexEntrySpan(text);
+    if (span === null) {
       throw new Error(`No BibTeX entry found on DBLP for key "${key}".`);
     }
-    return text;
+    // The entry's own span, not the whole body: the header may be preceded by a banner or an
+    // error fragment and FOLLOWED by a <script> or a block of prose, and whatever this returns is
+    // appended verbatim to the user's .bib. The bytes between the two offsets are the service's,
+    // untouched — choosing where to cut is all this does.
+    return text.slice(span.start, span.end);
   }
 }
 
-/** Abort signal that fires after REQUEST_TIMEOUT_MS, so a hung request can't wedge a tool. */
+/** Abort signal that fires after the SHARED `REQUEST_TIMEOUT_MS`, so a hung request can't wedge a
+ * tool. Imported, never redeclared: `transportReason` quotes that same constant back as "timed
+ * out after 15s", so a local copy drifting would make the error message lie about the wait the
+ * user just sat through. Same rule as `parseCompilerChoice` — both answers from one place. */
 function timeoutSignal(): AbortSignal {
   return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 }

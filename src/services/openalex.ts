@@ -20,9 +20,11 @@ import { getServerVersion } from '../lib/version.js';
 import { formatRecordKey, parseRecordKey } from '../lib/referenceKey.js';
 import {
   BODY_EXCERPT,
+  REQUEST_TIMEOUT_MS,
   BackendUnavailableError,
   assertApiBody,
   fetchOrUnavailable,
+  readBodyOrUnavailable,
   assertApiShape,
   httpHint,
   type FetchLike,
@@ -38,10 +40,8 @@ const SERVICE = 'OpenAlex';
 export type OpenAlexHit = ReferenceHit;
 
 const DEFAULT_BASE_URL = 'https://api.openalex.org';
-const REQUEST_TIMEOUT_MS = 15_000;
-
 /** Repo URL identified in the User-Agent, per OpenAlex's "polite pool" convention. */
-const USER_AGENT_URL = '+https://github.com/eramzi/WebLatexMCP';
+const USER_AGENT_URL = '+https://github.com/elias-ramzi/WebLatexMCP';
 
 // --- OpenAlex JSON shapes (loosely typed; only the fields this client reads) ---
 
@@ -166,7 +166,7 @@ export class OpenAlexService implements ReferenceBackend {
     }
     // Read as text, not `res.json()`: a 200 can still carry a bot-challenge page, and the raw
     // body is what makes that diagnosable instead of an "Unexpected token '<'" from JSON.parse.
-    const body = await res.text();
+    const body = await readBodyOrUnavailable(SERVICE, res, `a search for "${trimmed}"`);
     assertApiBody(SERVICE, body, `a search for "${trimmed}"`);
     let data: OpenAlexSearchResponse;
     try {
@@ -238,7 +238,7 @@ export class OpenAlexService implements ReferenceBackend {
         `OpenAlex lookup failed for work "${id}": ${res.status} ${res.statusText}.${httpHint(SERVICE, res.status, 'record')}`,
       );
     }
-    const body = await res.text();
+    const body = await readBodyOrUnavailable(SERVICE, res, `a lookup of work "${id}"`);
     assertApiBody(SERVICE, body, `a lookup of OpenAlex work "${id}"`);
     let data: OpenAlexWork;
     try {
@@ -264,7 +264,7 @@ export class OpenAlexService implements ReferenceBackend {
   }
 
   /**
-   * `User-Agent: web-latex-mcp/<version> (+https://github.com/eramzi/WebLatexMCP[; mailto:<email>])`.
+   * `User-Agent: web-latex-mcp/<version> (+https://github.com/elias-ramzi/WebLatexMCP[; mailto:<email>])`.
    * OpenAlex documents and requests this as honest self-identification — it grants identified
    * clients a faster "polite pool" — which is a different thing entirely from spoofing a
    * browser User-Agent to defeat a bot wall, and this server does neither of those elsewhere.
@@ -286,7 +286,10 @@ export class OpenAlexService implements ReferenceBackend {
   }
 }
 
-/** Abort signal that fires after REQUEST_TIMEOUT_MS, so a hung request can't wedge a tool. */
+/** Abort signal that fires after the SHARED `REQUEST_TIMEOUT_MS`, so a hung request can't wedge a
+ * tool. Imported, never redeclared: `transportReason` quotes that same constant back as "timed
+ * out after 15s", so a local copy drifting would make the error message lie about the wait the
+ * user just sat through. Same rule as `parseCompilerChoice` — both answers from one place. */
 function timeoutSignal(): AbortSignal {
   return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 }

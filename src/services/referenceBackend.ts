@@ -73,8 +73,231 @@ export const BODY_EXCERPT = 180;
 /** Shared request timeout, so a hung request cannot wedge a tool. */
 export const REQUEST_TIMEOUT_MS = 15_000;
 
-/** BibTeX entry header, e.g. `@inproceedings{DBLP:conf/cvpr/HeZRS16,`. */
-export const BIBTEX_ENTRY = /@[A-Za-z]+\s*[{(]\s*[^,\s})]+\s*,/;
+/**
+ * BibTeX entry header, e.g. `@inproceedings{DBLP:conf/cvpr/HeZRS16,`, **anchored to the start of
+ * a line**.
+ *
+ * The anchor is load-bearing twice over. It keeps out the `@word{`-shaped things a web page
+ * carries mid-line — an inline `@licstart` notice, a CSS `@media`/`@supports` rule, prose quoting
+ * an entry — and, more importantly, it gives `bibtexEntrySpan` a position that can honestly be
+ * cut from: a header found in the middle of `Warning: proxy error @article{evil,` has no line
+ * boundary in front of it, so there is no way to return the entry without also returning the
+ * banner. `\s*` after the `@word` is deliberately narrowed to `[ \t]*` for the same reason — a
+ * newline between the name and its brace is not an entry header anyone writes, and allowing one
+ * would let a match start on a line that is not the entry's.
+ */
+export const BIBTEX_ENTRY = /(^|\n)[ \t]*@[A-Za-z]+[ \t]*[{(]\s*[^,\s})]+\s*,/;
+
+/**
+ * The same header shape as {@link BIBTEX_ENTRY}, minus its `(^|\n)` prefix, for testing against a
+ * slice the caller has already positioned at the start of a line. Kept beside `BIBTEX_ENTRY` so
+ * the two shapes are edited together; a header accepted here but not there (or the reverse) would
+ * let the *continuation* rule admit something the *first* header would refuse.
+ */
+const BIBTEX_ENTRY_AT_LINE_START = /^[ \t]*@[A-Za-z]+[ \t]*[{(]\s*[^,\s})]+\s*,/;
+
+/** Byte range of the leading run of BibTeX entries in a service's response body. */
+export interface BibtexEntrySpan {
+  /** Offset of the `@` opening the first entry header. */
+  start: number;
+  /** Offset just past the last entry's closing delimiter. */
+  end: number;
+}
+
+/**
+ * The span of the leading run of BibTeX entries in `text`, or `null` when there is no
+ * line-anchored entry header at all.
+ *
+ * Both `fetchBibtex` implementations slice `text.slice(start, end)`, so their answer to "which
+ * bytes are the entry" comes from one place. Returning the whole body instead was how a service's
+ * error banner got appended verbatim to a user's `.bib` on one side, and a trailing
+ * `<script>alert(1)</script>` on the other: `mergeBibEntry` writes what it is handed, and
+ * `BIBTEX_ENTRY.test()` alone proves only that an entry is in there *somewhere*.
+ *
+ * **This is not the server authoring BibTeX, and must never become that.** All it does is choose
+ * a cut point in the bytes the service sent: everything between `start` and `end` is returned
+ * verbatim. Nothing is inserted, reordered, reformatted, completed or repaired — an entry this
+ * cannot parse is returned whole rather than fixed up (see the fail-open below), because the
+ * guarantee callers rely on is that entry text originates from the service, and the moment this
+ * function emits a byte the service did not send, that guarantee is gone.
+ *
+ * Four clauses, each load-bearing:
+ *
+ * - **Depth, over the pair the header opened with.** A `@article{` ends at the `}` that returns
+ *   depth to 0 and a `@article(` at the matching `)`, so a brace inside a field value (`title =
+ *   {A {Nested} Title}`) does not end the entry early. A delimiter preceded by a backslash is
+ *   ignored — `note = {a literal \}}` is one BibTeX writes — and a `"`-quoted value at depth 1 is
+ *   stepped over whole, because the braces inside one are the author's text and not the entry's
+ *   structure (`title = "A } weird title"`).
+ * - **A run of entries, not one.** After an entry closes, whitespace — plus a `%`-comment line or
+ *   an `@string`/`@preamble`/`@comment` block, which are separators rather than the end of the
+ *   run — is skipped, and if what follows opens another *line-anchored* header, that entry is
+ *   consumed too. A service legitimately answers with more than one: DBLP's `param=1` bib emits an
+ *   `@inproceedings` plus the `@proceedings` its `crossref` field names, and cutting the second
+ *   off would corrupt the entry that survives. Getting that wrong is worse than the junk this cut
+ *   removes — which is also why a skipped `@string` stays *inside* the span: it defines the macros
+ *   the entries around it use, and an entry with an unresolved abbreviation is corrupt too. So
+ *   skipping only ever widens `end`, and only as a bridge to a further entry: a trailing macro or
+ *   comment that no entry follows stays out, like any other trailing junk.
+ * - **A close that ends its line.** Depth reaching 0 is necessary but not sufficient: an unmatched
+ *   `}` inside a value reaches it in the middle of the entry, and cutting there yields a
+ *   syntactically broken fragment. Every entry a service emits closes as the last non-whitespace
+ *   character on its line, so a delimiter that fails that test is not believed and the scan fails
+ *   open instead.
+ * - **Fail open.** An entry whose delimiters never balance, or whose closing delimiter is not
+ *   believed, spans to the end of the text — exactly what this returned before it could see an end
+ *   at all. A truncated-but-plausible entry is worse than a whole one with junk after it, and
+ *   `assertApiBody` plus the header check already stand in front of this. When in doubt this
+ *   returns *more* of the service's bytes, never fewer; there is no case in which it returns
+ *   fewer than the service's own entry.
+ */
+export function bibtexEntrySpan(text: string): BibtexEntrySpan | null {
+  const match = BIBTEX_ENTRY.exec(text);
+  if (!match || match.index === undefined) return null;
+  // The match may open with the preceding newline and indentation; the entry starts at the `@`.
+  const start = match.index + match[0].indexOf('@');
+
+  let end = entryEnd(text, start);
+  if (end === null) return { start, end: text.length };
+  for (;;) {
+    const next = nextEntryHeader(text, end);
+    if (next.kind === 'end') return { start, end };
+    if (next.kind === 'failOpen') return { start, end: text.length };
+    const nextEnd = entryEnd(text, next.at);
+    if (nextEnd === null) return { start, end: text.length };
+    // Whatever the scan stepped over to get here — a `%` line, an `@string` block — lands inside
+    // the span by construction: `end` is one offset, moved forward past the entry that follows the
+    // separator. That is deliberate for `@string`, whose macros the entries need.
+    end = nextEnd;
+  }
+}
+
+/**
+ * What follows the entry that just closed: one more entry to keep, the end of the run, or a body
+ * this cannot read, which must widen the span to everything rather than risk cutting an entry in
+ * half. Three outcomes rather than `number | null` because the last two are opposites — collapsing
+ * them would either drop a legitimate trailing entry or keep every page's worth of trailing junk.
+ */
+type Continuation = { kind: 'entry'; at: number } | { kind: 'end' } | { kind: 'failOpen' };
+
+/**
+ * Offset just past the delimiter that closes the entry whose header begins at `at`, or `null` when
+ * the delimiters never balance, or when the delimiter that balances them is not believable (the
+ * two fail-open cases). The pair is whichever one the header opened with; the opening delimiter is
+ * the first `{` or `(` at or after `at`, which the header shape guarantees is the entry's own
+ * (`@[A-Za-z]+[ \t]*[{(]` admits nothing else in between).
+ */
+function entryEnd(text: string, at: number): number | null {
+  let i = at;
+  while (i < text.length && text[i] !== '{' && text[i] !== '(') i++;
+  if (i >= text.length) return null;
+  const open = text[i];
+  const close = open === '{' ? '}' : ')';
+  let depth = 0;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    // A character the document escaped is a literal in a field value, not structure. Checked ahead
+    // of the quote branch too: `author = "Kurt G\"{o}del"` is an umlaut, not the value's end.
+    if (text[i - 1] === '\\') continue;
+    // A `"`-quoted value is opaque — the braces inside it are the author's text. Only at depth 1,
+    // where a `"` can only be opening a value; inside a braced value it is an ordinary quotation
+    // mark. This is what makes the common over-balance (`title = "A } weird title"`) come out
+    // exactly right instead of by the fail-open below. An unterminated quote runs to the end of
+    // the text, so depth never returns to 0 and the whole body is returned — the safe direction.
+    if (depth === 1 && ch === '"') {
+      i = quotedValueEnd(text, i);
+      continue;
+    }
+    if (ch !== open && ch !== close) continue;
+    depth += ch === open ? 1 : -1;
+    if (depth !== 0) continue;
+    // Depth 0 is necessary, not sufficient. An unmatched `}` inside a value — one a `"`-quoted
+    // value did not account for, e.g. `title = {A } weird title}` — reaches depth 0 in the middle
+    // of the entry, and cutting there appends a broken fragment to the user's `.bib`: worse than
+    // the trailing junk this whole function exists to remove. Every entry a service emits closes
+    // at the end of its own line, and a `}` inside a value practically never does, so a delimiter
+    // that fails that test is not believed. `null` puts it on the same fail-open path as an entry
+    // that never balances at all.
+    return endsItsLine(text, i) ? i + 1 : null;
+  }
+  return null;
+}
+
+/**
+ * Offset of the `"` closing the value opened by the `"` at `at`, or `text.length` when it is never
+ * closed (which leaves the caller's depth scan unable to balance, so the body fails open).
+ */
+function quotedValueEnd(text: string, at: number): number {
+  for (let i = at + 1; i < text.length; i++) {
+    if (text[i] === '"' && text[i - 1] !== '\\') return i;
+  }
+  return text.length;
+}
+
+/**
+ * True when the character at `i` is the last non-whitespace one on its line (end of text counts).
+ * `\r` is trailing whitespace like a space or a tab, so a CRLF body is judged identically to an LF
+ * one — otherwise every entry a service sends with CRLF line endings would fail the test above and
+ * carry its trailing junk into the `.bib`.
+ */
+function endsItsLine(text: string, i: number): boolean {
+  for (let j = i + 1; j < text.length; j++) {
+    const ch = text[j];
+    if (ch === '\n') return true;
+    if (ch !== ' ' && ch !== '\t' && ch !== '\r') return false;
+  }
+  return true;
+}
+
+/**
+ * The same header shape as the *first* header, for the things that may legitimately sit between two
+ * entries without ending the run: a `@string` macro block (how a bibliography abbreviates the venue
+ * its entries cite), a `@preamble`, or a `@comment`. Line-anchored for the same reason an entry
+ * header is — one of these reached mid-line is part of somebody's web page.
+ */
+const BIBTEX_MACRO_AT_LINE_START = /^[ \t]*@(?:string|preamble|comment)[ \t]*[{(]/i;
+
+/**
+ * What follows the entry that ended at `from`. Whitespace is skipped, and so — repeatedly — are the
+ * separators above and `%`-comment lines, because stopping at the first thing that is not itself a
+ * header dropped a legitimate trailing entry: an `@inproceedings` whose `@proceedings` is separated
+ * by the `@string` both use, which is exactly the dangling-`crossref` corruption the continuation
+ * rule was written to prevent. Skipping only ever widens the span, never narrows it — a separator
+ * is only stepped over on the way to another entry, and the span stops at the last entry found.
+ *
+ * A header (or separator) that does *not* begin its own line ends the run: that is prose mentioning
+ * an entry rather than one more entry to keep.
+ */
+function nextEntryHeader(text: string, from: number): Continuation {
+  let bound = from;
+  for (;;) {
+    let j = bound;
+    while (j < text.length && /\s/.test(text[j] as string)) j++;
+    if (j >= text.length) return { kind: 'end' };
+    // Line-anchored means a newline was crossed getting here; everything from that newline to `j`
+    // is then whitespace by construction, so the patterns' leading `[ \t]*` covers it.
+    const lineStart = text.lastIndexOf('\n', j - 1) + 1;
+    if (lineStart <= bound) return { kind: 'end' };
+    if (text[j] === '%') {
+      const nl = text.indexOf('\n', j);
+      if (nl === -1) return { kind: 'end' };
+      // The newline itself, so the next line clears the line-anchor test above.
+      bound = nl;
+      continue;
+    }
+    if (text[j] !== '@') return { kind: 'end' };
+    const rest = text.slice(lineStart);
+    // Entry first: whatever the *first*-header rule accepts stays an entry here, so the two shapes
+    // cannot drift into disagreeing about what opens a run and what continues one.
+    if (BIBTEX_ENTRY_AT_LINE_START.test(rest)) return { kind: 'entry', at: j };
+    if (!BIBTEX_MACRO_AT_LINE_START.test(rest)) return { kind: 'end' };
+    const blockEnd = entryEnd(text, j);
+    // A separator we cannot find the end of is a body we cannot read. Ending the run here would
+    // drop whatever follows; fail open instead, on the same reasoning as an unbalanced entry.
+    if (blockEnd === null) return { kind: 'failOpen' };
+    bound = blockEnd;
+  }
+}
 
 /**
  * Reject a body that is a web page rather than the API's answer.
@@ -129,6 +352,35 @@ export async function fetchOrUnavailable(
     throw new BackendUnavailableError(
       service,
       `${service} could not be reached for ${what}: ${transportReason(err)}.`,
+    );
+  }
+}
+
+/**
+ * Read the response body, turning a **streaming** failure into `BackendUnavailableError`.
+ *
+ * `fetchOrUnavailable` covers only the call that resolves the *headers*. The abort signal handed
+ * to `fetch` governs the whole operation, body streaming included, so the likeliest DBLP failure
+ * of all rejects here rather than there: headers arrive fast (the anti-bot interstitial does
+ * exactly that), the body then stalls until the signal fires, and `res.text()` rejects with a
+ * `DOMException`/`TimeoutError`. An ECONNRESET mid-body is the same shape (`TypeError:
+ * terminated`). The resolver rethrows anything that is not `BackendUnavailableError`, so either
+ * one aborted the fallback chain at the very backend this feature exists to survive. Wrapping the
+ * fetch but not the body read leaves exactly half the timeout unguarded; every `res.text()` must
+ * go through here, for the same reason every `fetchImpl` call goes through `fetchOrUnavailable`.
+ */
+export async function readBodyOrUnavailable(
+  service: string,
+  res: FetchResponse,
+  what: string,
+): Promise<string> {
+  try {
+    return await res.text();
+  } catch (err) {
+    throw new BackendUnavailableError(
+      service,
+      `${service} could not be reached for ${what}: ${transportReason(err)} while reading the ` +
+        `response body.`,
     );
   }
 }

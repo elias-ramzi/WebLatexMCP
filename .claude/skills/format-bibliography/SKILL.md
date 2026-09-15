@@ -175,6 +175,6 @@ After reformatting an entry, add one comment line **immediately above** it so a 
 ## After you finish
 
 Report concisely: how many entries were deduplicated (and into which keys), how many keys were renamed
-(with the corresponding `.tex` updates), the venue style and field policy applied, and any entries DBLP
-couldn't complete. Confirm it still compiles with no undefined citations, and point the user at the `diff`
+(with the corresponding `.tex` updates), the venue style and field policy applied, and any entries no
+bibliography service could complete. Confirm it still compiles with no undefined citations, and point the user at the `diff`
 for both the `.bib` and the `.tex`. Remind them nothing is committed or pushed until they ask.

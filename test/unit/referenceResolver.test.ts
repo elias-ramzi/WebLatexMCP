@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   ReferenceResolver,
   ReferenceSourceUnavailableError,
+  ReferenceSourceInvalidError,
   NoCanonicalBibtexError,
   DEFAULT_SOURCE_ORDER,
   type ReferenceBackends,
@@ -76,7 +77,7 @@ describe('ReferenceResolver.search — unpinned (the default may be substituted)
   it('substitutes the next backend when one cannot answer, and says so', async () => {
     const s = spy({
       dblp: { search: down('DBLP') },
-      crossref: { search: [hit('crossref', 'crossref:10.1/x')] },
+      crossref: { search: [hit('crossref', 'crossref:10.1234/x')] },
     });
     const out = await new ReferenceResolver(s.backends).search('resnet');
 
@@ -184,7 +185,7 @@ describe('ReferenceResolver.search — with REAL backends over a rejecting fetch
         status: 200,
         statusText: 'OK',
         text: async () =>
-          JSON.stringify({ message: { items: [{ DOI: '10.1/x', title: ['T'], author: [] }] } }),
+          JSON.stringify({ message: { items: [{ DOI: '10.1234/x', title: ['T'], author: [] }] } }),
         json: async () => ({}),
       });
 
@@ -197,7 +198,94 @@ describe('ReferenceResolver.search — with REAL backends over a rejecting fetch
     expect(out.source).toBe('crossref');
     expect(out.fallbackFrom).toBe('dblp');
     expect(out.note).toMatch(/could not be reached/);
-    expect(out.hits[0]?.key).toBe('crossref:10.1/x');
+    expect(out.hits[0]?.key).toBe('crossref:10.1234/x');
+  });
+});
+
+describe('ReferenceResolver — WEB_LATEX_MCP_REFERENCE_SOURCE holds an unusable value', () => {
+  // The proportionate failure: the setting governs search_references and nothing else, so a
+  // typo refuses *that*, loudly and by name, instead of taking the server down at startup.
+  // Falling back to the unpinned order would be the real violation — the user asserted a
+  // bibliography, and answering from a different one is a different claim.
+
+  it('refuses an unpinned search, naming the bad value and every valid id', async () => {
+    const s = spy({ dblp: { search: [hit('dblp', 'd:1')] } });
+    const resolver = new ReferenceResolver(s.backends, { invalidSource: 'crossreff' });
+
+    await expect(resolver.search('resnet')).rejects.toBeInstanceOf(ReferenceSourceInvalidError);
+    await expect(resolver.search('resnet')).rejects.toThrow(/crossreff/);
+    await expect(resolver.search('resnet')).rejects.toThrow(/dblp, crossref, openalex/);
+    // Both routes out, the same discipline `pinnedMessage` follows.
+    await expect(resolver.search('resnet')).rejects.toThrow(/unset WEB_LATEX_MCP_REFERENCE_SOURCE/);
+    await expect(resolver.search('resnet')).rejects.toThrow(/source:/);
+    // And no backend was consulted: this is a refusal, not a substitution.
+    expect(s.calls).toEqual([]);
+  });
+
+  it('carries the rejected value on the error, and is NOT a ReferenceSourceUnavailableError', async () => {
+    // Deliberately a separate class: ReferenceSourceUnavailableError carries a
+    // `source: ReferenceSourceId`, and the bad value is not one. It is also not substitutable —
+    // only BackendUnavailableError licenses trying the next backend.
+    const s = spy({});
+    const resolver = new ReferenceResolver(s.backends, { invalidSource: 'scopus' });
+
+    const err = await resolver.search('x').then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ReferenceSourceInvalidError);
+    expect(err).not.toBeInstanceOf(ReferenceSourceUnavailableError);
+    expect((err as ReferenceSourceInvalidError).value).toBe('scopus');
+    expect((err as Error).name).toBe('ReferenceSourceInvalidError');
+  });
+
+  it('a per-call source: still searches normally — the failure stays proportionate', async () => {
+    // The one that proves the point: a broken env var must not make the tool unusable for a
+    // caller who names a backend. A per-call source is an explicit assertion and wins, exactly
+    // as it does over a *valid* configured source.
+    const s = spy({ crossref: { search: [hit('crossref', 'crossref:10.1234/x')] } });
+    const resolver = new ReferenceResolver(s.backends, { invalidSource: 'crossreff' });
+
+    const out = await resolver.search('resnet', { source: 'crossref' });
+
+    expect(out.source).toBe('crossref');
+    expect(out.hits[0]?.key).toBe('crossref:10.1234/x');
+    expect(out.fallbackFrom).toBeUndefined();
+    expect(s.calls).toEqual(['crossref.search']);
+  });
+
+  it('a per-call source that is down still fails as a pinned CALL, not as a bad env var', async () => {
+    const s = spy({ dblp: { search: down('DBLP') } });
+    const resolver = new ReferenceResolver(s.backends, { invalidSource: 'crossreff' });
+
+    await expect(resolver.search('x', { source: 'dblp' })).rejects.toBeInstanceOf(
+      ReferenceSourceUnavailableError,
+    );
+    await expect(resolver.search('x', { source: 'dblp' })).rejects.toThrow(
+      /source: "dblp" was requested/,
+    );
+  });
+
+  it('leaves fetchBibtex completely alone — it routes by the KEY, not by the config', async () => {
+    // A bad env var has nothing to do with fetching a record the caller already found: the key
+    // carries its own provenance. Pinned here so a future edit cannot widen the refusal into it.
+    const s = spy({ crossref: { bibtex: '@inproceedings{x,}' }, dblp: { bibtex: '@misc{d,}' } });
+    const resolver = new ReferenceResolver(s.backends, { invalidSource: 'crossreff' });
+
+    expect(await resolver.fetchBibtex('crossref:10.1109/CVPR.2016.90')).toEqual({
+      bibtex: '@inproceedings{x,}',
+      source: 'crossref',
+    });
+    expect(await resolver.fetchBibtex('conf/cvpr/HeZRS16')).toEqual({
+      bibtex: '@misc{d,}',
+      source: 'dblp',
+    });
+  });
+
+  it('is inert when no invalid value was configured', async () => {
+    const s = spy({ dblp: { search: [hit('dblp', 'd:1')] } });
+    const out = await new ReferenceResolver(s.backends, { invalidSource: undefined }).search('x');
+    expect(out.source).toBe('dblp');
   });
 });
 
@@ -304,6 +392,27 @@ describe('ReferenceResolver.fetchBibtex — routed by the key, never by config',
     await expect(resolver.fetchBibtex('openalex:W1')).rejects.toThrow(/carries no DOI/);
     await expect(resolver.fetchBibtex('openalex:W1')).rejects.toThrow(/confirmBibEdit/);
     expect(s.calls).not.toContain('crossref.fetchBibtex');
+  });
+
+  it('tells the caller to get the user’s approval BEFORE reaching for confirmBibEdit', async () => {
+    // This is the one place in the server where server-authored text tells a model it may
+    // originate `.bib` entry bytes itself. `confirmBibEdit` only means anything because it
+    // stands for the user's acknowledgement (CLAUDE.md, same reasoning as
+    // `add_writing_convention`), so the message has to name that approval — and name it
+    // *before* the flag, in the same order `bibEditBlockedMessage` uses. A message that only
+    // says "add it by hand with confirmBibEdit: true" reads as a licence to just set the flag.
+    const s = spy({ openalex: { doi: null } });
+    const err = await new ReferenceResolver(s.backends).fetchBibtex('openalex:W1').then(
+      () => {
+        throw new Error('expected a refusal');
+      },
+      (e: unknown) => e as Error,
+    );
+
+    expect(err).toBeInstanceOf(NoCanonicalBibtexError);
+    expect(err.message).toMatch(/ask the user to approve/i);
+    // Order matters: the approval is the precondition, the flag is what follows it.
+    expect(err.message).toMatch(/ask the user to approve[\s\S]*confirmBibEdit: true/i);
   });
 
   it('a no-DOI refusal is NOT a backend failure — it must not read as substitutable', async () => {
