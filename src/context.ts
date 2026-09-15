@@ -13,6 +13,7 @@ import { DblpService } from './services/dblp.js';
 import { DoctorService } from './services/doctor.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
+import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
 import { detectRootFile } from './lib/rootFile.js';
@@ -50,6 +51,8 @@ export interface AppContext {
   sessions: SessionRegistry;
   /** This session's own uncommitted changes — see `src/services/shadowStore.ts`. */
   shadows: ShadowStore;
+  /** Sticky per-project rewrite-preservation mode — see `src/services/rewriteModeStore.ts`. */
+  rewriteModes: RewriteModeStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
   credentialPortal: CredentialPortal;
 }
@@ -67,6 +70,7 @@ export function createContext(
   const git = new GitService(identity);
 
   const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
+  const rewriteModes = new RewriteModeStore(config.workspaceRoot);
   // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
   // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
   // `* text=auto` normalising a binary asset's line endings looks like a peer's change and sticks
@@ -159,6 +163,7 @@ export function createContext(
     doctor: new DoctorService(),
     sessions,
     shadows,
+    rewriteModes,
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),

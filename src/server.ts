@@ -10,6 +10,7 @@ import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
 import { registerAddAsset } from './tools/addAsset.js';
 import { registerEditFile } from './tools/editFile.js';
+import { registerSetRewriteMode } from './tools/setRewriteMode.js';
 import { registerCompile } from './tools/compile.js';
 import { registerRenderPages } from './tools/renderPages.js';
 import { registerViewer } from './tools/viewer.js';
@@ -75,6 +76,7 @@ export function createServer(
   registerWriteFile(server, ctx);
   registerAddAsset(server, ctx);
   registerEditFile(server, ctx);
+  registerSetRewriteMode(server, ctx);
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
   registerRenderPages(server, ctx);

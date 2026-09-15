@@ -172,6 +172,14 @@ directly. To get clean, reviewable results:
   usually localized and the log points to the offending line.
 - **Review the diff before pushing.** Treat edits like a collaborator's pull
   request: read `git diff`, then commit and push deliberately.
+- **When rewriting prose, replace the text directly — unless you are asked to
+  keep the old wording.** If the project has `edit_file`'s rewrite-preservation
+  mode turned on (`set_rewrite_mode`; off by default), the server comments the
+  original out above the replacement on its own, byte-exact — in that case do
+  not hand-type `%`-commented copies, which duplicate it and are not provably
+  the original. With the mode off and a preserved copy wanted, say so and offer
+  `set_rewrite_mode` or `edit_file`'s `preserveOriginal: true` rather than
+  retyping the paragraph as comments.
 
 ---
 

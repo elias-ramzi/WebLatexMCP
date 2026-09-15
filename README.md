@@ -159,7 +159,7 @@ project.
 Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
 
 - **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on; `add_asset` imports a figure/image from your machine when it isn't already in the project.
+- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on; `add_asset` imports a figure/image from your machine when it isn't already in the project. Rewriting a `.tex` paragraph can preserve the original by commenting it out above the replacement, the way Overleaf users already do — off by default, turned on per project with `set_rewrite_mode` or server-wide with `WEB_LATEX_MCP_REWRITE_MODE`, and overridden per call by `edit_file`'s `preserveOriginal` (see [Tools](docs/tools.md#rewrite-preservation-mode)).
 - **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
 - **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
@@ -196,12 +196,15 @@ unless you ask:
   **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an
   uploaded copy is a snapshot, so re-upload when a skill changes.
 
-**In Claude Code, three of them have a faster front door.** [`/format-latex`](.claude/commands/format-latex.md),
+**In Claude Code, four of them have a faster front door.** [`/format-latex`](.claude/commands/format-latex.md),
 [`/hunt-typo`](.claude/commands/hunt-typo.md), and [`/review-writing`](.claude/commands/review-writing.md) do the same
 work as `format-latex-project`, `proofread-document`, and `review-writing-guide`, but fan the per-file reading out
-across one subagent per file — cheaper, and parallel. They load the rules from the skill at run time rather than
-restating them, so the skill stays the single source of truth and the two cannot drift. Subagents are a Claude Code
-mechanism, so everywhere else the skill is the path, and it works on its own.
+across one subagent per file — cheaper, and parallel; they load the rules from the skill at run time rather than
+restating them, so the skill stays the single source of truth and the two cannot drift.
+[`/rewrite-mode`](.claude/commands/rewrite-mode.md) `<project> [off|prose|always]` is a front door of a different
+kind — over the `set_rewrite_mode` tool directly rather than a skill — to get or set a project's
+rewrite-preservation mode. Subagents are a Claude Code mechanism, so everywhere else the skill (or, for
+`/rewrite-mode`, the tool) is the path, and each works on its own.
 
 See the [skills guide](docs/skills.md) for what each skill does, [step-by-step installation](docs/skills.md#installing),
 and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).

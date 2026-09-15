@@ -264,6 +264,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   leak a file that slipped the allowlist). Every filesystem outcome on the source collapses to
   found / not-found / unresolvable with no errno text: a raw `ENOTDIR` on `/etc/passwd/x.png` used to
   say that `/etc/passwd` exists and is a file.
+- **Rewrite-preservation mode** — a habit Overleaf users already have, that the model had no way to
+  match: when `edit_file` rewrites a sentence or paragraph in a `.tex`/`.sty`/`.cls`/`.bbl`/`.latex`/`.ltx`
+  file, it can now comment the original out (`% ` on every line) above the replacement instead of
+  discarding it, so a rewrite reads in the diff the way a human's would — the old wording still there,
+  commented, for a co-author to see. This has to be enforced server-side rather than asked of the model
+  as a writing-guide rule: a preserved block is only trustworthy if it is provably the bytes that were
+  there, the same reason BibTeX entry text comes from DBLP rather than from the model retyping it. Three
+  modes — `off` (default — preservation is opt-in, since it writes bytes the caller did not ask for),
+  `prose`, `always` — with `prose` preserving only edits that look like an actual rewrite (at least 8
+  tokens, whitespace-separated, so a `\cite{…}` counts as one; mostly non-markup, not a near-identical
+  replacement), so a typo fix or a swapped `\cite` key is left alone. Turn preservation
+  on with `set_rewrite_mode` (per project) or `WEB_LATEX_MCP_REWRITE_MODE` (server-wide). The mode is
+  sticky per project (`set_rewrite_mode`, persisted outside the clone) and
+  defaults from `WEB_LATEX_MCP_REWRITE_MODE`; a per-call `preserveOriginal` on `edit_file` always wins
+  over both, in either direction. Never applies to `write_file` (no single old paragraph to comment out
+  above — the whole prior file isn't the same thing) or to a `.bib` (already gated by `confirmBibEdit`).
+  Preservation only fires on a **line-aligned** match — `oldString` starting at the beginning of a line
+  and ending at the end of one — and never on a `replaceAll` edit, since neither leaves a single safe
+  place to put a `%`-comment; either case applies the edit unchanged instead. The preserved block carries
+  no sentinel marker on purpose — it should look exactly like a paragraph a human commented out by hand,
+  and `arxiv-clean-project` already strips comments before submission. `list_projects` reports the
+  effective mode per project and `server_info` the server-wide default, both with an `envConfigured`
+  flag distinguishing a mode someone actually set from the built-in `off`, so it is never a hidden
+  setting. Preservation leaves the old text as a `% `-commented block, so a later call can match inside
+  it — within one call that is refused; across calls a match that lands only inside the comment is applied to the dead comment and reported as success, so it is the caller's context to get right (only a single line of the original still occurs verbatim, as `% <that line>`). In the
+  same call, an edit that matches only inside a block an earlier edit preserved is refused rather than
+  applied — it would otherwise rewrite dead commented-out text and report success for a change no reader
+  would ever see.
 
 - **`WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, and an `add_writing_convention` tool to write to it.** The
   existing `WEB_LATEX_MCP_WRITING_GUIDE` only _replaces_ the bundled `docs/writing-guide.md` — fine for
