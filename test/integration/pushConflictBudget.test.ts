@@ -376,6 +376,8 @@ describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
       expect(fullText).toContain('(see structuredContent)');
       expect(fullText).not.toContain('status.behindCommits');
     },
-    15000,
+    // 25 real commits + two rebase conflicts: ~7 s locally, but Windows CI runs git several
+    // times slower and tripped 15 s (CI run 34941611023). 60 s is a bound, not a target.
+    60_000,
   );
 });
