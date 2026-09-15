@@ -434,6 +434,8 @@ document.getElementById('popsave').onclick = async () => {
   pending = null;
 };
 
+let editingId = null; // pause auto-refresh while a note is being edited, so it isn't wiped
+
 function setPanel(open) {
   panel.classList.toggle('open', open);
   ctoggle.classList.toggle('on', open);
@@ -449,15 +451,27 @@ const PANEL_KEEP = '#bar, #panel, #fab, #pop';
 // pointerdown, not click: a drag that selects PDF text should dismiss on press, and the panel
 // overlays the viewer, so closing it mid-drag shifts nothing under the cursor.
 document.addEventListener('pointerdown', (e) => {
+  // Primary button only: touch and pen both report button 0, so no touch gesture is lost — but
+  // right-clicking the PDF to reach the context menu, or middle-clicking to autoscroll, is not a
+  // dismissal, and closing the panel behind the menu that just opened is not what was asked.
+  if (e.button !== 0) return;
   if (!panel.classList.contains('open')) return;
+  // An in-progress note edit lives inside the panel: an incidental click would move the edit box
+  // out from under the user and strand editingId set, which freezes every later refresh. The
+  // deliberate route out — the toolbar toggle — is unchanged.
+  if (editingId) return;
   const el = e.target;
   if (el && el.closest && el.closest(PANEL_KEEP)) return;
   setPanel(false);
 });
 window.addEventListener('keydown', (e) => {
   // defaultPrevented: the note popup's own Escape handled it first. editingId: an in-progress
-  // note edit lives inside the panel, and closing it would throw the text away.
+  // note edit lives inside the panel, and closing it would move it out from under the user.
   if (e.key !== 'Escape' || e.defaultPrevented || editingId) return;
+  // The popup's Escape is bound to its textarea, so a click on the quote (which is scrollable,
+  // and not focusable) leaves Escape unhandled — cancel the popup before dismissing the panel,
+  // so one keypress never does both.
+  if (pop.style.display === 'block') { document.getElementById('popcancel').click(); return; }
   if (panel.classList.contains('open')) setPanel(false);
 });
 
@@ -498,7 +512,6 @@ askBtn.addEventListener('click', async () => {
   setTimeout(() => { askBtn.textContent = label; }, 1800);
 });
 
-let editingId = null; // pause auto-refresh while a note is being edited, so it isn't wiped
 let lastComments = [];
 const cbase = () => '/p/' + encodeURIComponent(ID) + '/comments';
 

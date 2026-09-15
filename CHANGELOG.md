@@ -609,17 +609,70 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   under the cursor, and the selection (and the `selectionchange` handler that positions the 💬 Comment
   button) survives. The highlight layer is already `pointer-events: none`, so a click on a commented
   region falls through to the page div and dismisses like any other. Escape closes the panel too,
-  unless the note popup's own Escape already handled the key (`e.defaultPrevented`, rather than
-  re-reading `pop.style.display`, which `popcancel` has already set to `none` by the time the event
-  bubbles — one keypress would otherwise cancel the popup _and_ close the panel) or a note is mid-edit
-  inside the panel (`editingId`), where closing would throw away text the user has typed and not saved.
+  unless one of three things claims the key first: the note popup's own Escape already handled it
+  (`e.defaultPrevented`, rather than re-reading `pop.style.display` **first** — `popcancel` has
+  already set it to `none` by the time the event bubbles, so one keypress would otherwise cancel the
+  popup _and_ close the panel), a note is mid-edit inside the panel (`editingId`), or the note popup
+  is open, in which case the keypress cancels the popup and returns without touching the panel (the
+  branch below). Closing over an open edit does not throw the typed text away, as this entry first
+  claimed: `setPanel(false)` only removes a class (`.wlm-panel.open { display: block }`), so the
+  edit `<textarea>` and its value survive, and `refreshComments` — the only thing that rebuilds
+  `panellist` — early-returns while `editingId` is set, so reopening shows the same half-typed note.
+  What closing actually does is move the edit box out from under the user and, the cost that matters,
+  strand `editingId` set forever: every later `refreshComments()` then early-returns, so the 3s poll,
+  the post-save refresh, delete and undo all stop updating silently — a user adds a comment, sees
+  `flash('comment added')`, and neither the `#ccount` badge nor the panel list ever changes again.
+  **That same guard now sits on the `pointerdown` path**, which fires far more often than Escape and
+  shipped without it: an incidental click into the document no longer dismisses the panel mid-edit. The
+  deliberate route out is untouched — pressing the 💬 toggle while editing still closes the panel, as
+  it always did — and it still strands `editingId`, so the freeze described above stays reachable on
+  purpose. Closing that last route is deliberately left as a separate call: the toggle is an explicit
+  request, and honouring it without losing the pending text means deciding what happens to that text
+  (cancel it, save it, or keep it for the next open), which is a behaviour change to design rather
+  than a guard to add. **Escape now cancels an open note popup before it touches the panel, as long
+  as no inline note edit is live**: the popup's Escape is bound to the `popnote` textarea, and the
+  quote element (`.wlm-pop .q`) is `overflow: auto`, so clicking the quoted text to scroll it drops
+  focus to `<body>` and left the key unhandled — the panel behind closed while the popup the user
+  was dismissing stayed on screen, inverting the "Esc to cancel" the placeholder advertises.
+  `e.defaultPrevented` still comes first, and `pop.style.display` is still read only after it, so
+  the in-textarea case stays absorbed by the guard above rather than by a display check `popcancel`
+  has already invalidated. The qualifier is the matching gap to the 💬-toggle one above, and is
+  reported here as a known, deliberate limitation rather than fixed: `editingId` short-circuits the
+  whole keydown handler on its first guard line, so with an inline edit live _and_ the popup open,
+  Escape cancels neither — the popup stays up and the panel stays open. Reordering the popup branch
+  ahead of that guard is not obviously right (it would make Escape act on a popup while the user's
+  focus is in an edit box elsewhere), so it is left to the same separate call as the toggle case.
+  And **only a primary-button press dismisses** (`e.button !== 0`): `pointerdown` fires for every
+  button, so right-clicking the PDF to reach the browser context menu, or middle-clicking for
+  autoscroll, was closing the panel behind the menu it had just opened. Touch and pen both report
+  button 0, so this costs no touch gesture.
   The accepted cost: selecting PDF text while the panel is open now closes it, so adding a comment from
   an open panel ends with the panel shut. That is the gesture's whole point — dismiss on a click into
   the document — and the count in the toolbar still updates, so it is one click to bring it back. The
-  test asserts the handler is wired _and_ that every id in `PANEL_KEEP` still exists in the served HTML:
-  the viewer's client script is a template literal that no linter resolves, so a rename that leaves
-  `#pop` out of the list would silently turn "click the note popup" into "close the panel under me",
-  which the existing parse-only check cannot catch.
+  test asserts the handler is wired, that its body actually calls `setPanel(false)` and carries both of
+  the guards above, and that every id in `PANEL_KEEP` still exists in the served **markup** — the script
+  half is sliced off before the search, so no future string literal in the client script can let the
+  list corroborate itself. The viewer's client script is a template literal that no linter resolves, so
+  **renaming an element** — `#pop` to anything else — while `PANEL_KEEP` keeps the now-stale selector
+  would silently turn "click the note popup" into "close the panel under me", which the existing
+  parse-only check cannot catch. The list is also pinned **exactly** rather than checked with
+  `arrayContaining`, so **removing** an entry from `PANEL_KEEP` fails too: the looser assertion let
+  `#pop` be deleted from the list outright and still passed, which is the other half of the same
+  regression. The Escape handler, which had no coverage at all, is pinned the same way — both its
+  guards, and the popup-cancel branch sitting ahead of the panel branch. Every guard is matched on
+  its own line and ahead of the statement it guards, over a comment-stripped handler body, so none
+  of a rationale comment naming a guard that was deleted, a trailing `// if (editingId) return;`
+  decoy the line-leading strip cannot reach, or a guard moved below `setPanel(false)` reads as
+  present. (The strip stays line-leading on purpose: widening it to `//[^\n]*$` would eat
+  `'http://'`-shaped string literals, and pinning the guard's own line is both cheaper and more
+  precise.) And the Escape slice now checks its anchor rather than trusting it: `lastIndexOf` over
+  the listener registration never returns -1, so spelling this one `document.` instead of `window.`
+  — behaviour-identical, and the natural consistency edit beside the `document.`-bound pointerdown
+  handler — silently re-anchored the slice on the zoom shortcuts several kB earlier, where an
+  unrelated `getElementById('popcancel')` and `setPanel(false)` satisfied both popup assertions;
+  with that rename in place the popup-cancel branch could be deleted outright and the test stayed
+  green. The slice now asserts that nothing else registers a listener between its anchor and the
+  Escape guard, and that each call it probes appears exactly once inside it.
 - **Every by-name comparison in `commit`, `push` and `status` that decides what is staged, owned,
   settled or reported now folds case where git does — the peer-ownership check included**
   (#67 "Known, not fixed"). `commit` scope `"paths"`'s peer-ownership check and `push`'s peer
