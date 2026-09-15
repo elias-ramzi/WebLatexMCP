@@ -4,10 +4,17 @@ import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
-import { loadConfig, parseRewriteMode, parseExtraWritingGuide } from '../../src/config.js';
+import {
+  loadConfig,
+  parseRewriteMode,
+  parseExtraWritingGuide,
+  parseReferenceSource,
+  parseContactEmail,
+} from '../../src/config.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 import { registryPath } from '../../src/services/projectRegistry.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
+import { REFERENCE_SOURCES } from '../../src/lib/referenceKey.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -513,5 +520,118 @@ describe('loadConfig with a malformed WEB_LATEX_MCP_WRITING_GUIDE_EXTRA', () => 
       '/work/paper',
     );
     expect(cfg.extraWritingGuidePath).toBeUndefined();
+  });
+});
+
+describe('parseReferenceSource', () => {
+  it('is unset (not a default id) when unset, empty, or whitespace-only', () => {
+    // Unlike parseCompilerChoice, unset must stay undefined: the resolver owns fallback
+    // order across the three backends, so config must not name a winner.
+    expect(parseReferenceSource(undefined)).toEqual({ source: undefined, explicit: false });
+    expect(parseReferenceSource('')).toEqual({ source: undefined, explicit: false });
+    expect(parseReferenceSource('   ')).toEqual({ source: undefined, explicit: false });
+  });
+
+  it('accepts each valid id, case-insensitively and trimmed', () => {
+    for (const id of REFERENCE_SOURCES) {
+      expect(parseReferenceSource(id)).toEqual({ source: id, explicit: true });
+    }
+    expect(parseReferenceSource('  DBLP  ')).toEqual({ source: 'dblp', explicit: true });
+  });
+
+  it('throws on an invalid value, naming the variable and every valid id', () => {
+    expect(() => parseReferenceSource('scopus')).toThrow(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+    expect(() => parseReferenceSource('scopus')).toThrow(
+      'WEB_LATEX_MCP_REFERENCE_SOURCE "scopus" is invalid; expected one of: dblp, crossref, openalex.',
+    );
+  });
+
+  it('wires into loadConfig as referenceSource/referenceSourceExplicit', () => {
+    expect(loadConfig({}).referenceSource).toBeUndefined();
+    expect(loadConfig({}).referenceSourceExplicit).toBe(false);
+
+    const cfg = loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'crossref' });
+    expect(cfg.referenceSource).toBe('crossref');
+    expect(cfg.referenceSourceExplicit).toBe(true);
+  });
+
+  it('propagates the throw through loadConfig on an invalid value', () => {
+    expect(() => loadConfig({ WEB_LATEX_MCP_REFERENCE_SOURCE: 'scopus' })).toThrow(
+      /WEB_LATEX_MCP_REFERENCE_SOURCE/,
+    );
+  });
+});
+
+describe('parseContactEmail', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('is undefined when unset, empty, or whitespace-only', () => {
+    expect(parseContactEmail(undefined)).toBeUndefined();
+    expect(parseContactEmail('')).toBeUndefined();
+    expect(parseContactEmail('   ')).toBeUndefined();
+  });
+
+  it('round-trips a good address, trimmed', () => {
+    expect(parseContactEmail('  me@example.com  ')).toBe('me@example.com');
+  });
+
+  it.each([
+    'not-an-email',
+    'a@b', // no dot in the domain
+    '@b.com', // empty local part
+    'a@', // empty domain
+    'a b@c.com', // whitespace
+    'a@b.com&foo=1', // query-altering character
+    'a@b.com/x', // query-altering character
+    'a@b.com\npad', // newline
+    'a@b@c.com', // two @
+  ])('rejects %j without throwing, returning undefined', (bad) => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => parseContactEmail(bad)).not.toThrow();
+    expect(parseContactEmail(bad)).toBeUndefined();
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('logs the rejection to stderr, never stdout (stdout is the JSON-RPC channel)', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(parseContactEmail('not-an-email')).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    const message = errorSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('WEB_LATEX_MCP_CONTACT_EMAIL');
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it('wires into loadConfig as contactEmail', () => {
+    expect(loadConfig({}).contactEmail).toBeUndefined();
+    expect(loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' }).contactEmail).toBe(
+      'me@example.com',
+    );
+  });
+
+  it('never derives a contact email from another address the server already knows', () => {
+    // A privacy boundary, and the plausible regression is not "invent an address" — it is
+    // "reuse one we already have". The server is configured with a commit-author address; that
+    // must NOT become the address sent to Crossref and OpenAlex. Asserting only that an empty
+    // env yields undefined pins nothing: there is no code path for it to disable.
+    const withAuthor = loadConfig(
+      {
+        WEB_LATEX_MCP_AUTHOR_EMAIL: 'elias@example.com',
+        WEB_LATEX_MCP_AUTHOR_NAME: 'Elias',
+      },
+      '/some/dir',
+      () => true,
+    );
+    expect(withAuthor.contactEmail).toBeUndefined();
+
+    // And it IS populated when — and only when — its own variable is set.
+    const withContact = loadConfig(
+      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
+      '/some/dir',
+      () => true,
+    );
+    expect(withContact.contactEmail).toBe('me@example.com');
   });
 });

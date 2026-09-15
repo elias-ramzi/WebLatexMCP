@@ -14,6 +14,10 @@ import {
 import { COMPILER_KINDS } from './services/compilerResolver.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from './lib/rewriteMode.js';
 import type { RewriteMode } from './lib/rewriteMode.js';
+// One list of ids, shared with the reference-lookup resolver: a private copy here could accept
+// an id the resolver never tries (or reject one it does) — the same reasoning as COMPILER_KINDS.
+import { REFERENCE_SOURCES } from './lib/referenceKey.js';
+import type { ReferenceSourceId } from './lib/referenceKey.js';
 import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
 
 /**
@@ -156,6 +160,75 @@ function parseCompilerChoice(raw: string | undefined): {
     );
   }
   return { kind: value as CompilerKind, explicit: true };
+}
+
+/**
+ * Select the reference-lookup backend (DBLP / Crossref / OpenAlex) from
+ * `WEB_LATEX_MCP_REFERENCE_SOURCE` — and say whether that was a *choice* or nothing at all.
+ * Shaped after `parseCompilerChoice`: both answers come from one emptiness test so they can
+ * never disagree, and an invalid value throws rather than silently falling back, because
+ * searching a bibliography backend other than the one the user named is a wrong answer, not a
+ * cosmetic difference (same reasoning as the compiler, unlike `parseRewriteMode` below).
+ *
+ * One deliberate difference from `parseCompilerChoice`, worth not "fixing" later: an unset value
+ * here returns `source: undefined`, never a default id. `parseCompilerChoice` can default to
+ * `latexmk` because the *tool* substitutes a missing backend; here the *resolver* is what owns
+ * fallback order across three backends (trying each in turn, e.g. on a DBLP anti-bot block), so
+ * config must stay silent about which one wins rather than naming a winner the resolver would
+ * then have to un-name.
+ */
+export function parseReferenceSource(raw: string | undefined): {
+  source: ReferenceSourceId | undefined;
+  explicit: boolean;
+} {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return { source: undefined, explicit: false };
+  if (!(REFERENCE_SOURCES as readonly string[]).includes(value)) {
+    throw new Error(
+      `WEB_LATEX_MCP_REFERENCE_SOURCE "${raw}" is invalid; expected one of: ${REFERENCE_SOURCES.join(', ')}.`,
+    );
+  }
+  return { source: value as ReferenceSourceId, explicit: true };
+}
+
+/**
+ * Resolve an optional contact address for the "polite pool" Crossref and OpenAlex offer to
+ * requests that identify a contact. This is a privacy boundary: the address is read ONLY from
+ * `WEB_LATEX_MCP_CONTACT_EMAIL` — never derived from `git config user.email` or any other
+ * source — because it is sent to two third-party services, and the only thing that may put a
+ * user's address there is the user deliberately setting this variable. Opt-in, not inferred.
+ *
+ * A malformed value is a convenience failure, not a correctness one (the same reasoning as
+ * `parseRewriteMode`): it does not throw, it logs the rejection to stderr (never stdout — the
+ * JSON-RPC channel) and returns undefined, so a typo silently costs only the polite-pool speedup.
+ * Checked here, not merely "looks emailish": the value is interpolated into a URL query
+ * parameter, so `&`, `?`, `#`, `/` and any whitespace/control character (including a newline)
+ * are rejected too — those could otherwise let a malformed value alter the request URL.
+ */
+export function parseContactEmail(raw: string | undefined): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (isUsableContactEmail(value)) return value;
+  console.error(
+    `WEB_LATEX_MCP_CONTACT_EMAIL "${raw}" is not usable as a contact address; ignoring it. ` +
+      'Expected a plain email address (no query-altering characters, no whitespace).',
+  );
+  return undefined;
+}
+
+/** True when `value` is a plausible, URL-query-safe email address. See `parseContactEmail`. */
+function isUsableContactEmail(value: string): boolean {
+  // Reject anything that could alter a URL query string, or that is not a single flat token.
+  if (/[\s&?#/]/.test(value)) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  const at = value.split('@');
+  if (at.length !== 2) return false;
+  const [local, domain] = at;
+  if (!local || !domain) return false;
+  if (!domain.includes('.')) return false;
+  const domainParts = domain.split('.');
+  return domainParts.every((part) => part.length > 0);
 }
 
 /**
@@ -323,6 +396,10 @@ export function loadConfig(
     env.WEB_LATEX_MCP_WRITING_GUIDE_EXTRA,
     cwd,
   );
+  const { source: referenceSource, explicit: referenceSourceExplicit } = parseReferenceSource(
+    env.WEB_LATEX_MCP_REFERENCE_SOURCE,
+  );
+  const contactEmail = parseContactEmail(env.WEB_LATEX_MCP_CONTACT_EMAIL);
 
   return {
     workspaceRoot,
@@ -338,6 +415,9 @@ export function loadConfig(
     rewriteMode,
     rewriteModeExplicit,
     extraWritingGuidePath,
+    referenceSource,
+    referenceSourceExplicit,
+    contactEmail,
   };
 }
 

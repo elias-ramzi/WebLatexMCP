@@ -68,7 +68,8 @@ export function bibEditBlockedMessage(relPath: string, target?: string): string 
   return (
     `${subject} ` +
     'To add a reference, use search_references then add_citation, which fetch verified ' +
-    'BibTeX from DBLP. To change the .bib another way (e.g. remove or fix an entry), ' +
+    'BibTeX from DBLP, Crossref or OpenAlex. To change the .bib another way (e.g. remove or fix ' +
+    'an entry), ' +
     'first ask the user to approve the change, then retry with confirmBibEdit: true.'
   );
 }

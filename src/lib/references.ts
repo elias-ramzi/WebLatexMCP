@@ -6,7 +6,8 @@ import path from 'node:path';
  * A bibliography is not always a `.bib`. A EuroHPC proposal in markdown, a paper with an inline
  * `thebibliography` environment, and an Overleaf project with a `ref.bib` all carry the same thing —
  * a list of works, each with a title, some authors, a venue and a year — but only the last one can be
- * read with a BibTeX parser. Verification (against DBLP) is identical in all three cases, so the
+ * read with a BibTeX parser. Verification (against a bibliography service) is identical in all
+ * three cases, so the
  * parsing is what has to bend.
  *
  * Three formats, in descending order of how much the extracted fields can be trusted:

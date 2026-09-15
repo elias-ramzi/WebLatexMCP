@@ -1,4 +1,5 @@
 import type { RewriteMode } from './lib/rewriteMode.js';
+import type { ReferenceSourceId } from './lib/referenceKey.js';
 
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
@@ -154,6 +155,27 @@ export interface ServerConfig {
    * the user's conventions with no signal.
    */
   extraWritingGuideLoaded?: boolean;
+  /**
+   * Reference-lookup backend named by `WEB_LATEX_MCP_REFERENCE_SOURCE`, from
+   * `parseReferenceSource` in `src/config.ts`. Unlike `compiler`, `loadConfig` does NOT default
+   * this to one of `dblp` / `crossref` / `openalex` when unset: an unset value stays `undefined`
+   * so the reference-lookup resolver owns fallback order across the three backends, rather than
+   * config naming a winner the resolver would then have to un-name.
+   */
+  referenceSource?: ReferenceSourceId;
+  /**
+   * True when `WEB_LATEX_MCP_REFERENCE_SOURCE` actually named a backend, as opposed to
+   * `referenceSource` being unset. Mirrors `compilerExplicit`/`rewriteModeExplicit`: an assertion
+   * is never reported as a default, and (here) there is no default to conflate it with.
+   */
+  referenceSourceExplicit?: boolean;
+  /**
+   * Contact address from `WEB_LATEX_MCP_CONTACT_EMAIL`, offered to Crossref/OpenAlex for their
+   * faster "polite pool". A privacy boundary: this is read ONLY from that env var by
+   * `parseContactEmail` — never derived from `git config user.email` or any other source — so
+   * nothing reaches a third-party service unless the user deliberately opted in.
+   */
+  contactEmail?: string;
 }
 
 /** Where the `viewer` tool expects the PDF viewer to be opened. */

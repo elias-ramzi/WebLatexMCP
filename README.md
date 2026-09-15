@@ -57,8 +57,8 @@ document.
 - 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
   nobody sweeps up anyone else's half-written paragraph.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
-- 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
-- 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, DBLP citation audits, bibliography normalization.
+- 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP, Crossref or OpenAlex. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
+- 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 
 ## Install
 
@@ -161,7 +161,7 @@ Once connected, ask Claude to work on your project — it drives these [tools](d
 - **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
 - **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on; `add_asset` imports a figure/image from your machine when it isn't already in the project. Rewriting a `.tex` paragraph can preserve the original by commenting it out above the replacement, the way Overleaf users already do — off by default, turned on per project with `set_rewrite_mode` or server-wide with `WEB_LATEX_MCP_REWRITE_MODE`, and overridden per call by `edit_file`'s `preserveOriginal` (see [Tools](docs/tools.md#rewrite-preservation-mode)).
 - **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error (under `latexmk`; `tectonic`'s log names no `file:line`, so it yields none), and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
-- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
+- **Cite** — search [DBLP](https://dblp.org), [Crossref](https://www.crossref.org) or [OpenAlex](https://openalex.org) and add verified BibTeX entries (the server falls back between them, so a backend being down doesn't block you); list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
 - **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
 - **Remember a convention** — `add_writing_convention` appends one rule as a bullet to your configured project-specific writing guide (see [above](#project-specific-writing-conventions)), creating the file on first use. It takes no path — the destination is always the configured file — and the rule takes effect starting with your next session. If no guide is configured, it refuses first, naming the env var, before any confirmation is asked. Once one is configured, it requires `confirmGuideEdit: true`, since the write lands outside every project sandbox and into every future session's instructions — Claude should only set it after you've explicitly confirmed the convention should be remembered.
 
@@ -175,7 +175,7 @@ unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
-- **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
+- **`/verify-citations`** — audit a document's references against DBLP, Crossref or OpenAlex, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes) and report each as an exact minimal fix; applies nothing until you approve, and never rewrites prose for style.
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each. Proposes, never applies — it writes nothing at all.
@@ -212,7 +212,7 @@ and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 ## Documentation
 
 - [Configuration](docs/configuration.md) — environment variables, per-host token resolution, in-context guides, cross-platform notes.
-- [Tools](docs/tools.md) — full tool reference, the DBLP citation flow, and how safe pushes work.
+- [Tools](docs/tools.md) — full tool reference, the citation flow, and how safe pushes work.
 - [Skills](docs/skills.md) — what each bundled skill does, how to install it per client, and the two ways one runs.
 - [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere, and how parallel sessions share one clone.
 - [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
