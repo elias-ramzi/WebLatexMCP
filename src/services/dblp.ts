@@ -8,32 +8,26 @@
  * citations, so the entry text always originates from DBLP, never the model.
  */
 
-/** The subset of `fetch`'s Response this client needs — keeps tests trivial. */
-export interface FetchResponse {
-  ok: boolean;
-  status: number;
-  statusText: string;
-  text(): Promise<string>;
-  json(): Promise<unknown>;
-}
+import { formatRecordKey } from '../lib/referenceKey.js';
+import {
+  BIBTEX_ENTRY,
+  BODY_EXCERPT,
+  BackendUnavailableError,
+  assertApiBody,
+  fetchOrUnavailable,
+  assertApiShape,
+  httpHint,
+  type FetchLike,
+  type ReferenceBackend,
+  type ReferenceHit,
+} from './referenceBackend.js';
 
-export type FetchLike = (url: string) => Promise<FetchResponse>;
+export type { FetchResponse, FetchLike } from './referenceBackend.js';
+
+const SERVICE = 'DBLP';
 
 /** A publication match returned by the DBLP search endpoint. */
-export interface DblpHit {
-  /** DBLP record key, e.g. `conf/cvpr/HeZRS16` — pass this to add_citation. */
-  key: string;
-  title: string;
-  authors: string[];
-  year?: number;
-  /** Venue / journal name, when reported. */
-  venue?: string;
-  /** DBLP record type, e.g. "Conference and Workshop Papers". */
-  type?: string;
-  doi?: string;
-  /** DBLP record URL (HTML page). */
-  url?: string;
-}
+export type DblpHit = ReferenceHit;
 
 const DEFAULT_BASE_URL = 'https://dblp.org';
 const VALID_KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -75,12 +69,16 @@ function firstString(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
-export class DblpService {
+export class DblpService implements ReferenceBackend {
+  readonly id = 'dblp';
+  readonly name = SERVICE;
+
   private readonly fetchImpl: FetchLike;
   private readonly baseUrl: string;
 
   constructor(fetchImpl?: FetchLike, baseUrl: string = DEFAULT_BASE_URL) {
-    this.fetchImpl = fetchImpl ?? ((url) => fetch(url, { signal: timeoutSignal() }));
+    this.fetchImpl =
+      fetchImpl ?? ((url, init) => fetch(url, { headers: init?.headers, signal: timeoutSignal() }));
     this.baseUrl = baseUrl.replace(/\/+$/, '');
   }
 
@@ -108,11 +106,45 @@ export class DblpService {
     const url =
       `${this.baseUrl}/search/publ/api?q=${encodeURIComponent(trimmed)}` + `&format=json&h=${max}`;
 
-    const res = await this.fetchImpl(url);
+    const res = await fetchOrUnavailable(
+      SERVICE,
+      this.fetchImpl,
+      url,
+      undefined,
+      `a search for "${trimmed}"`,
+    );
     if (!res.ok) {
-      throw new Error(`DBLP search failed: ${res.status} ${res.statusText}`);
+      throw new BackendUnavailableError(
+        SERVICE,
+        `DBLP search failed: ${res.status} ${res.statusText}.${httpHint(SERVICE, res.status)}`,
+      );
     }
-    const data = (await res.json()) as DblpSearchResponse;
+    // Read as text, not `res.json()`: a 200 can still carry the bot-challenge page, and the raw
+    // body is what makes that diagnosable instead of an "Unexpected token '<'" from deep in JSON.parse.
+    const body = await res.text();
+    assertApiBody(SERVICE, body, `a search for "${trimmed}"`);
+    let data: DblpSearchResponse;
+    try {
+      data = JSON.parse(body) as DblpSearchResponse;
+    } catch {
+      // Unavailable, not a plain error: a backend that answers with unparseable JSON has failed
+      // to answer at all, so the resolver may substitute another one. (`fetchBibtex`'s "no entry
+      // found" stays a plain Error — that is a real answer about a DBLP-specific key, and no
+      // other backend could serve it.)
+      throw new BackendUnavailableError(
+        'DBLP',
+        `DBLP returned a body that is not JSON for a search for "${trimmed}". Body began: ` +
+          JSON.stringify(body.trimStart().slice(0, BODY_EXCERPT)),
+      );
+    }
+    // `result` present with no `hits` is a legitimate empty answer; `result` absent is not an
+    // answer at all.
+    assertApiShape(
+      SERVICE,
+      typeof data?.result === 'object' && data.result !== null,
+      `a search for "${trimmed}"`,
+      body,
+    );
     const hits = asArray(data.result?.hits?.hit);
     return hits
       .map((hit) => hit.info)
@@ -120,7 +152,8 @@ export class DblpService {
       .map((info) => {
         const year = info.year ? Number(info.year) : undefined;
         return {
-          key: info.key as string,
+          key: formatRecordKey('dblp', info.key as string),
+          source: this.id,
           title: (info.title ?? '').replace(/\.$/, ''),
           authors: authorNames(info.authors),
           year: Number.isFinite(year) ? year : undefined,
@@ -140,12 +173,24 @@ export class DblpService {
   async fetchBibtex(keyOrUrl: string): Promise<string> {
     const key = DblpService.normalizeKey(keyOrUrl);
     const url = `${this.baseUrl}/rec/${key}.bib?param=1`;
-    const res = await this.fetchImpl(url);
+    const res = await fetchOrUnavailable(
+      SERVICE,
+      this.fetchImpl,
+      url,
+      undefined,
+      `BibTeX for key "${key}"`,
+    );
     if (!res.ok) {
-      throw new Error(`DBLP returned ${res.status} ${res.statusText} for key "${key}".`);
+      throw new BackendUnavailableError(
+        SERVICE,
+        `DBLP returned ${res.status} ${res.statusText} for key "${key}".${httpHint(SERVICE, res.status, 'record')}`,
+      );
     }
     const text = (await res.text()).trim();
-    if (!text.includes('@')) {
+    assertApiBody(SERVICE, text, `a BibTeX request for key "${key}"`);
+    // An entry header, not merely an `@` anywhere in the body: the bot-challenge page carries
+    // `@licstart`, and this is the guard that keeps a web page out of a user's bibliography.
+    if (!BIBTEX_ENTRY.test(text)) {
       throw new Error(`No BibTeX entry found on DBLP for key "${key}".`);
     }
     return text;

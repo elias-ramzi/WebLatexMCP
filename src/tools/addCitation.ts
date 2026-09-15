@@ -11,7 +11,11 @@ const inputSchema = {
     .string()
     .min(1)
     .describe(
-      'DBLP record key from search_references (e.g. "conf/cvpr/HeZRS16"), or a dblp.org URL.',
+      'Namespaced record key from search_references — e.g. "dblp:conf/cvpr/HeZRS16", ' +
+        '"crossref:10.1109/CVPR.2016.90", "openalex:W2194775991". A bare DBLP key, a bare DOI, ' +
+        'or a dblp.org / doi.org / openalex.org URL is accepted too. The key decides which ' +
+        'service is asked, whatever the configured search source is: it came from a result, ' +
+        'so it carries its own provenance.',
     ),
   bibFile: z
     .string()
@@ -26,6 +30,13 @@ const outputSchema = {
   alreadyPresent: z.boolean(),
   /** Where the entry now sits, so the caller can confirm it without re-reading the file. */
   line: z.number().describe('1-based line the entry starts on, in the file after the write.'),
+  /** The bibliography the key belongs to. */
+  source: z.string(),
+  /**
+   * The service that actually issued the BibTeX, when it is not `source`. Only OpenAlex sets
+   * this: it publishes no BibTeX, so its records are fetched from Crossref by DOI.
+   */
+  via: z.string().optional(),
   bibtex: z.string(),
   diff: z.string(),
 };
@@ -66,12 +77,15 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'add_citation',
     {
-      title: 'Add a citation from DBLP',
+      title: 'Add a citation from a bibliography service',
       description:
-        'Fetch a reference from DBLP by its record key and append it to the bibliography. ' +
-        'This is the only sanctioned way to add to a .bib file: the BibTeX is fetched ' +
-        'from DBLP server-side, never hand-written, so entries are verifiable. Find the key ' +
-        'with search_references first. No-op (alreadyPresent) if the cite key is already in the file.',
+        'Fetch a reference from DBLP, Crossref or OpenAlex by its record key and append it to ' +
+        'the bibliography. This is the only sanctioned way to add to a .bib file: the BibTeX is ' +
+        'fetched from the service server-side, never hand-written, so entries are verifiable. ' +
+        'The key decides which service is asked. OpenAlex publishes no BibTeX of its own, so an ' +
+        'openalex: key is resolved to its DOI and the entry fetched from Crossref — a record ' +
+        'with no DOI is refused rather than assembled by hand. Find the key with ' +
+        'search_references first. No-op (alreadyPresent) if the cite key is already in the file.',
       inputSchema,
       outputSchema,
     },
@@ -80,8 +94,11 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           const bibPath = await resolveBibFile(ctx, dir, bibFile);
-          // Re-fetch from DBLP so the appended text always originates from the API.
-          const bibtex = await ctx.dblp.fetchBibtex(key);
+          // Re-fetch from the issuing service so the appended text always originates from the
+          // API, never from the model. An OpenAlex key is bridged to Crossref by its DOI, and
+          // refused outright when it has none — we never assemble an entry ourselves.
+          const fetched = await ctx.references.fetchBibtex(key);
+          const bibtex = fetched.bibtex;
           // No baseline from this read: it happens before the already-present early return, and a
           // path that writes nothing must not claim the caller has seen the file (that is exactly
           // what made every compile disarm the guard). The write below is safe without it — see
@@ -104,6 +121,8 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
                 added: false,
                 alreadyPresent: true,
                 line: at,
+                source: fetched.source,
+                ...(fetched.via ? { via: fetched.via } : {}),
                 bibtex,
                 diff: '',
               },
@@ -133,7 +152,10 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
             changedPath(linkTarget, bibPath),
           );
           const at = entryLine(merged.content, merged.key);
-          const summary = `added ${merged.key} to ${bibPath}:${at}\n\n${bibtex}`;
+          const from = fetched.via
+            ? `${fetched.source} via ${fetched.via}`
+            : String(fetched.source);
+          const summary = `added ${merged.key} to ${bibPath}:${at} (from ${from})\n\n${bibtex}`;
           return {
             content: [{ type: 'text', text: diff ? `${summary}\n\n${diff}` : summary }],
             structuredContent: {
@@ -142,6 +164,8 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
               added: true,
               alreadyPresent: false,
               line: at,
+              source: fetched.source,
+              ...(fetched.via ? { via: fetched.via } : {}),
               bibtex,
               diff,
             },

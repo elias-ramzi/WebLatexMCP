@@ -30,6 +30,24 @@ const outputSchema = {
         'backend that is. This field does not probe PATH — run doctor for what is actually ' +
         "installed, or read a compile result's own `compiler` for what ran.",
     ),
+  referenceSource: z
+    .string()
+    .optional()
+    .describe(
+      'The bibliography backend pinned by WEB_LATEX_MCP_REFERENCE_SOURCE, when one is. Absent ' +
+        'means nothing is pinned: search_references tries DBLP, then Crossref, then OpenAlex, ' +
+        'and substitutes one it cannot reach — a search result reports which actually answered. ' +
+        'Pinned, a backend is never substituted and an unreachable one is an error. This field ' +
+        'does not probe the network.',
+    ),
+  contactEmailConfigured: z
+    .boolean()
+    .describe(
+      'Whether WEB_LATEX_MCP_CONTACT_EMAIL is set to a usable address. Crossref and OpenAlex ' +
+        'give identified clients a faster "polite pool". The address itself is deliberately NOT ' +
+        'reported — only whether one is configured — since it is the user’s personal data and ' +
+        'this output is read by a model.',
+    ),
   rewriteMode: z
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
     .describe(
@@ -111,6 +129,12 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         workspaceLocal: ctx.config.workspaceIsLocal ?? false,
         workspaceExcludePattern: ctx.config.workspaceExcludePattern,
         compiler: ctx.config.compiler ?? 'latexmk',
+        // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
+        // "dblp" here would describe the fallback order's first try as a choice someone made.
+        referenceSource: ctx.config.referenceSourceExplicit
+          ? ctx.config.referenceSource
+          : undefined,
+        contactEmailConfigured: ctx.config.contactEmail !== undefined,
         rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
         // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
         // default when the env names nothing, so that form would call every default install
@@ -151,6 +175,11 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         excludeLine +
         writingGuideLine +
         `compiler: ${info.compiler}\n` +
+        `references: ${
+          info.referenceSource
+            ? `${info.referenceSource} (WEB_LATEX_MCP_REFERENCE_SOURCE — never substituted)`
+            : 'dblp, then crossref, then openalex (unpinned — an unreachable one is substituted)'
+        }${info.contactEmailConfigured ? ', polite-pool contact set' : ''}\n` +
         `rewrite mode (default): ${info.rewriteMode}` +
         (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
       return {

@@ -145,7 +145,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         '\\citep / \\textcite / \\autocite and friends in .tex, and pandoc `[@key]` in markdown, ' +
         'against .bib files and \\bibitem lists. This is the regex diff you would otherwise write ' +
         'by hand. It does NOT check whether a reference is factually correct — that is ' +
-        'search_references against DBLP, or the verify-citations skill. Pass ' +
+        'search_references against DBLP, Crossref or OpenAlex, or the verify-citations skill. Pass ' +
         '`bibliographyProject` to check a draft against a SHARED bibliography that lives in ' +
         'another registered project. Read-only; no git remote needed, so it works on a local ' +
         'project.',
@@ -181,7 +181,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
               `Found ${keyless} reference(s) in ${keylessIn.join(', ')}${where}, but none carry a cite ` +
                 'key — they are a numbered/prose reference list. check_citations matches cite keys, ' +
                 'so there is nothing here to cross-reference. Use list_references to read the list, ' +
-                'and verify each entry against DBLP with search_references.',
+                'and verify each entry against DBLP, Crossref or OpenAlex with search_references.',
             );
           }
           throw new Error(

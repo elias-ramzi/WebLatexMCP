@@ -24,18 +24,18 @@ rasterization — passed there unmodified.
 
 ## What works there, and what doesn't
 
-| Capability                                                                  | In a cloud session | Why                                                                                                                |
-| --------------------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `read_file` / `write_file` / `edit_file` / `list_files` / `status` / `diff` | ✅                 | Ordinary filesystem work in the VM                                                                                 |
-| `project_sync` / `commit` / `push` / `discard` / `reset_to_remote`          | ✅                 | Real git, with a token from the environment (see [Tokens](#tokens))                                                |
-| `compile`                                                                   | ✅                 | Once the [setup script](#setup-script--install-tex) installs TeX                                                   |
-| `render_pages`                                                              | ✅                 | `@napi-rs/canvas` ships a prebuilt linux-x64 binary. **This is how you look at the PDF from a phone**              |
-| `list_references` / `check_citations`                                       | ✅                 | Local parsing, no network                                                                                          |
-| `search_references` / `add_citation`                                        | ✅\*               | \*DBLP is not on the default allowlist — add `dblp.org` under [Network access](#network-access)                    |
-| `doctor`                                                                    | ✅                 | Worth running first in a fresh environment                                                                         |
-| `viewer`                                                                    | ❌                 | It binds `127.0.0.1` inside a VM you have no route to. `render_pages` is the replacement, and it works on a phone  |
-| `credential_portal`                                                         | ❌                 | Same reason — the page is loopback-only. Put the token in the environment instead                                  |
-| Your clone surviving the session                                            | ⚠️                 | The VM is reclaimed after a period of inactivity. **`push` before you stop**, or the work is gone with the sandbox |
+| Capability                                                                  | In a cloud session | Why                                                                                                                                                    |
+| --------------------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `read_file` / `write_file` / `edit_file` / `list_files` / `status` / `diff` | ✅                 | Ordinary filesystem work in the VM                                                                                                                     |
+| `project_sync` / `commit` / `push` / `discard` / `reset_to_remote`          | ✅                 | Real git, with a token from the environment (see [Tokens](#tokens))                                                                                    |
+| `compile`                                                                   | ✅                 | Once the [setup script](#setup-script--install-tex) installs TeX                                                                                       |
+| `render_pages`                                                              | ✅                 | `@napi-rs/canvas` ships a prebuilt linux-x64 binary. **This is how you look at the PDF from a phone**                                                  |
+| `list_references` / `check_citations`                                       | ✅                 | Local parsing, no network                                                                                                                              |
+| `search_references` / `add_citation`                                        | ✅\*               | \*No bibliography host is on the default allowlist — add `dblp.org`, `api.crossref.org` and `api.openalex.org` under [Network access](#network-access) |
+| `doctor`                                                                    | ✅                 | Worth running first in a fresh environment                                                                                                             |
+| `viewer`                                                                    | ❌                 | It binds `127.0.0.1` inside a VM you have no route to. `render_pages` is the replacement, and it works on a phone                                      |
+| `credential_portal`                                                         | ❌                 | Same reason — the page is loopback-only. Put the token in the environment instead                                                                      |
+| Your clone surviving the session                                            | ⚠️                 | The VM is reclaimed after a period of inactivity. **`push` before you stop**, or the work is gone with the sandbox                                     |
 
 ## 1. Pick the repository the session starts from
 
@@ -152,10 +152,15 @@ list what you need:
 ```
 git.overleaf.com
 dblp.org
+api.crossref.org
+api.openalex.org
 ```
 
-`git.overleaf.com` is what `project_sync` and `push` reach; `dblp.org` is what `search_references` and
-`add_citation` query. Add your own git host too if the paper lives somewhere other than GitHub, GitLab
+`git.overleaf.com` is what `project_sync` and `push` reach. The other three are the bibliography
+backends `search_references` and `add_citation` query — add **all three**, not just `dblp.org`: the
+server tries DBLP, then Crossref, then OpenAlex and substitutes one it cannot reach, so allowing only
+`dblp.org` leaves it with nothing to fall back to (and dblp.org is currently behind an anti-bot
+challenge, so the substitutes are the ones doing the work). Add your own git host too if the paper lives somewhere other than GitHub, GitLab
 or Bitbucket, which are on the default list already.
 
 ## 4. Start a session and check it
