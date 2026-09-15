@@ -294,6 +294,11 @@ them mis-reports good references as doubtful:
   the case this is most likely to happen for). Back off and retry (see _Pace bibliography-service
   requests_); if it still fails after retries, tell the user the lookup infrastructure was unreachable
   for this entry and leave it **unclassified** in the report — neither "verified" nor "not found".
+- **The server refused before searching.** If the message names `WEB_LATEX_MCP_REFERENCE_SOURCE`
+  as holding a value that is not a backend, this is a configuration problem, not an outage:
+  retrying will not help, and backing off once per entry would burn the whole retry ladder on
+  every reference in the bibliography. Either pass `source: "crossref"` for the rest of the run
+  (a per-call pin still works) or stop and tell the user to fix or unset that variable.
 
 Only pin `source` deliberately: for a retry after a genuine zero-hit answer, or when the user asks for
 one backend by name. The default, unpinned call is what lets the DBLP → Crossref → OpenAlex fallback

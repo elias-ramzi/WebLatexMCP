@@ -62,9 +62,10 @@ formatting; all logic lives in services so it is unit-testable without a live MC
 - `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex **+
   cross-process lock**, dynamic registration), `GitService` (simple-git wrapper), `FileService`
   (sandboxed fs), `LatexmkCompiler` (implements the `LatexCompiler` interface), `ReferenceResolver`
-  (which bibliography answers a lookup — see below) over `DblpService` / `CrossrefService` /
-  `OpenAlexService` (search + canonical BibTeX fetch, each with an injectable `fetch` for tests),
-  `SessionRegistry` +
+  (which bibliography answers a lookup — see below) over `DblpService` / `CrossrefService`
+  (search + canonical BibTeX fetch) and `OpenAlexService` (search + `resolveDoi` **only** — it
+  publishes no BibTeX, so its records are fetched from Crossref by DOI; see below), each with an
+  injectable `fetch` for tests, `SessionRegistry` +
   `ShadowStore` (parallel sessions — see below), `logParser`, `auth`.
 
 **Two kinds of project.** `ProjectConfig` is a union (`src/types.ts`): a **git** project (`gitUrl`,
@@ -222,8 +223,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `OpenAlexService` has no `fetchBibtex` and its records are fetched from Crossref by DOI. The
   resolver's `DoiBackend` records that intent but does **not** enforce it — TypeScript is
   structural, so a grown `fetchBibtex` would still satisfy the declaration; what pins the
-  absence is the runtime `'fetchBibtex' in service === false` assertion in
-  `test/unit/openalex.test.ts`, so keep that test. A
+  absence is the runtime `expect(svc.fetchBibtex).toBeUndefined()` assertion in
+  `test/unit/openalex.test.ts` ("OpenAlexService interface shape"), so keep that test. A
   record with no DOI is _refused_, never assembled from metadata, because an entry composed from
   fields is exactly the model-authored text `add_citation` exists to keep out. For the same
   reason a fetched entry is cut to its own bytes and no further: `bibtexEntrySpan` finds the

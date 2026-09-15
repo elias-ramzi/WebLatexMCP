@@ -28,8 +28,8 @@ Rules of this repo you must not relearn the hard way:
 - **Guards are load-bearing; preserve every one the task does not explicitly change:**
   git-backed tools call `requireGitProject` first; mutating tools run inside
   `ctx.projectManager.runExclusive(id, ...)`; `.bib` writes stay behind `confirmBibEdit`
-  (the sanctioned path is `add_citation`, whose entry text comes from DBLP, never the
-  model); `read`/`readText` record a revision baseline only with `recordBaseline: true`
+  (the sanctioned path is `add_citation`, whose entry text comes from the bibliography
+  service — DBLP, Crossref or OpenAlex — never the model); `read`/`readText` record a revision baseline only with `recordBaseline: true`
   and only when the caller asked for the whole file; every path resolves symlinks
   (`assertNoSymlinkEscape`), and paths the server picked (not the caller) pass
   `strictLinks: true`; `git pull` stays ff-only, `push` refuses when behind, conflicts

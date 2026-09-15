@@ -54,8 +54,12 @@ interface DblpSearchResponse {
   result?: { hits?: { hit?: Array<{ info?: DblpInfo }> } };
 }
 
-function asArray<T>(value: T | T[] | undefined): T[] {
-  if (value === undefined) return [];
+/** Wrap DBLP's XML-derived "absent / one / many" fields into a list. `null` counts as absent
+ * alongside `undefined`: `asArray(null)` used to be `[null]`, handing every caller a hole
+ * shaped like an element. (The call site for `hit` deliberately does NOT route a null through
+ * here — see `search`: an explicit null `hit` is not DBLP saying "no results".) */
+function asArray<T>(value: T | T[] | null | undefined): T[] {
+  if (value === undefined || value === null) return [];
   return Array.isArray(value) ? value : [value];
 }
 
@@ -169,24 +173,45 @@ export class DblpService implements ReferenceBackend {
       `a search for "${trimmed}"`,
       body,
     );
+    // `hit` ABSENT is DBLP's real empty answer (the `@total: "0"` body the guard above admits);
+    // an explicit `"hit": null` is not a shape DBLP serves, so it is not evidence that the query
+    // found nothing — a proxy or cache spelling "no hits" that way must stay substitutable. It
+    // gets its own refusal because `asArray` treats null as absent (it is generic, and
+    // `authorNames` wants exactly that), so routing it through there would turn a backend that
+    // never answered into an empty ANSWER, stopping the resolver's fallback chain.
+    const hitField = (hitsContainer as { hit?: unknown }).hit;
+    assertApiShape(SERVICE, hitField !== null, `a search for "${trimmed}"`, body);
     const hits = asArray(data.result?.hits?.hit);
-    return hits
-      .map((hit) => hit.info)
-      .filter((info): info is DblpInfo => Boolean(info?.key))
-      .map((info) => {
-        const year = info.year ? Number(info.year) : undefined;
-        return {
-          key: formatRecordKey('dblp', info.key as string),
-          source: this.id,
-          title: (info.title ?? '').replace(/\.$/, ''),
-          authors: authorNames(info.authors),
-          year: Number.isFinite(year) ? year : undefined,
-          venue: firstString(info.venue),
-          type: info.type,
-          doi: info.doi,
-          url: info.url,
-        } satisfies DblpHit;
-      });
+    try {
+      return hits
+        .map((hit) => hit.info)
+        .filter((info): info is DblpInfo => Boolean(info?.key))
+        .map((info) => {
+          const year = info.year ? Number(info.year) : undefined;
+          return {
+            key: formatRecordKey('dblp', info.key as string),
+            source: this.id,
+            title: (info.title ?? '').replace(/\.$/, ''),
+            authors: authorNames(info.authors),
+            year: Number.isFinite(year) ? year : undefined,
+            venue: firstString(info.venue),
+            type: info.type,
+            doi: info.doi,
+            url: info.url,
+          } satisfies DblpHit;
+        });
+    } catch (err) {
+      // The guard above validates the ENVELOPE; the elements inside it are whatever the body
+      // carried. A null element, or a numeric `title`, used to escape as a raw TypeError — and
+      // the resolver substitutes a backend only on BackendUnavailableError, so one malformed
+      // body aborted the whole fallback chain while the next backend held a good answer. Wrapped
+      // whole rather than guarded field by field, so this holds for fields nobody has thought of
+      // yet. `assertApiShape` always throws when passed `false`; rethrowing the original keeps
+      // the catch non-returning for the compiler and fails loudly rather than silently if that
+      // ever stops being true.
+      assertApiShape(SERVICE, false, `a search for "${trimmed}"`, body);
+      throw err;
+    }
   }
 
   /**

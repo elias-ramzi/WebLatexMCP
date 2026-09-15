@@ -415,3 +415,43 @@ describe('a body-stream failure is substitutable too', () => {
     await expect(svc.resolveDoi('W2194775991')).rejects.toBeInstanceOf(BackendUnavailableError);
   });
 });
+
+describe('a well-enveloped body whose ELEMENTS are malformed is unavailable, not a crash', () => {
+  // `results` being an array is an ENVELOPE check; the elements inside it were dereferenced
+  // blind, so a well-enveloped 200 carrying junk escaped as a raw TypeError. The resolver
+  // substitutes only on BackendUnavailableError, so that aborted the whole fallback chain.
+
+  it('refuses a null ELEMENT inside results', async () => {
+    const svc = new OpenAlexService(() => Promise.resolve(ok('{"results":[null]}')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('refuses a result whose id is not a string', async () => {
+    const svc = new OpenAlexService(() => Promise.resolve(ok('{"results":[{"id":42}]}')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('refuses a malformed doi on resolveDoi rather than crashing', async () => {
+    // Worse here than in `search`: "no DOI" is a real answer this method is allowed to give
+    // (`null`), so the failure must stay distinguishable from it — and a raw TypeError is
+    // neither, it just aborts the chain.
+    const svc = new OpenAlexService(() =>
+      Promise.resolve(ok('{"id":"https://openalex.org/W1","doi":42}')),
+    );
+    await expect(svc.resolveDoi('W1')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.resolveDoi('W1')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('still maps a well-formed body, and still answers a real empty search with []', async () => {
+    const good = new OpenAlexService(() =>
+      Promise.resolve(
+        ok(JSON.stringify({ results: [{ id: 'https://openalex.org/W1', display_name: 'T' }] })),
+      ),
+    );
+    expect((await good.search('x'))[0]?.key).toBe('openalex:W1');
+    const none = new OpenAlexService(() => Promise.resolve(ok(JSON.stringify({ results: [] }))));
+    await expect(none.search('x')).resolves.toEqual([]);
+  });
+});

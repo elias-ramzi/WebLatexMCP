@@ -311,3 +311,86 @@ describe('bibtexEntrySpan: a separator between entries does not end the run', ()
     expect(cut(body)).toBe(body);
   });
 });
+
+describe('bibtexEntrySpan: a believed closer is ALONE on its line and outside the other pair', () => {
+  function cut(text: string): string | null {
+    const span = bibtexEntrySpan(text);
+    return span === null ? null : text.slice(span.start, span.end);
+  }
+
+  const GOOD = '@inproceedings{a,\n  title = {A},\n}';
+
+  // `endsItsLine` alone only caught a stray closer sitting MID-line. A stray closer that happens
+  // to END its line was believed, and the entry was cut in half — the exact truncation the
+  // fail-open promise rules out. Every service closes an entry with a lone `}`/`)` on its own
+  // line, so demanding that costs nothing real and puts these bodies back on the fail-open path.
+
+  const OVER_BALANCED = '@article{k,\n  abstract = {Sentence one} extra }\n  author = {Foo}\n}';
+
+  it('fails open on an over-balanced entry whose stray } ENDS its line', () => {
+    // Before: `@article{k,\n  abstract = {Sentence one} extra }` — the author field and the real
+    // closer gone, a fragment appended to the user's .bib.
+    const body = OVER_BALANCED + '\njunk';
+    expect(cut(body)).toBe(body);
+  });
+
+  it('does not return a good entry plus the broken HALF of the next one', () => {
+    // The nastier shape: the corruption hides behind a valid leading entry.
+    const body = GOOD + '\n\n' + OVER_BALANCED + '\njunk';
+    expect(cut(body)).toBe(body);
+  });
+
+  it('fails open on a single-line entry, whose closer is not alone on its line', () => {
+    // A deliberate, documented consequence: a one-line entry has no believable closer, so the
+    // span runs to the end of the text. Fail open is the right answer — rescuing it would take a
+    // positional guess, which is what this function must never make.
+    const oneLine = '@inproceedings{x, title={T}}';
+    expect(cut(oneLine)).toBe(oneLine);
+    const withJunk = oneLine + '\njunk';
+    expect(cut(withJunk)).toBe(withJunk);
+  });
+
+  // The other half: `entryEnd` used to track ONE delimiter pair and ignore the other entirely, so
+  // inside `@article(...)` any `)` in a braced value was treated as the entry's closer.
+
+  it('fails open on a paren entry whose braced value carries a )', () => {
+    const body = '@article(k,\n  title = {A )\n},\n  author = {F}\n)\njunk';
+    // Before: `@article(k,\n  title = {A )` — an unbalanced fragment with a dangling `{`, which
+    // breaks every entry after it in the user's .bib.
+    expect(cut(body)).toBe(body);
+  });
+
+  it('fails open on a paren entry whose stray ) is ALONE on its line', () => {
+    // This one the line-position rule cannot catch on its own: the stray `)` is alone on its
+    // line, so only the brace counter says it is inside a value rather than closing the entry.
+    const body = '@article(k,\n  title = {A\n)\n},\n  author = {F}\n)\njunk';
+    expect(cut(body)).toBe(body);
+  });
+
+  it('fails open on a BRACE entry whose value carries an unmatched (', () => {
+    // Symmetrically: a `}` reached inside a paren-nested region is not the entry's closer either.
+    const body = '@article{k,\n  title = {A ( title},\n  author = {F}\n}\njunk';
+    expect(cut(body)).toBe(body);
+  });
+
+  it('still cuts a paren entry precisely when its parens inside braces balance', () => {
+    // NOT a regression pin (it passed before the fix too): it guards the other direction, that
+    // tracking the second pair does not turn every paren entry into a blanket fail-open.
+    const entry = '@article(k,\n  title = {A (nested) title},\n  author = {F}\n)';
+    expect(cut(entry + '\njunk')).toBe(entry);
+  });
+
+  // A `"`-quoted value must stay opaque even when an earlier value left the OTHER pair open.
+  // Gating the quote-skip on `otherDepth === 0` made it transparent there, so the delimiters
+  // inside a string counted as structure and the entry was cut at a `}` sitting inside one. The
+  // fragment is delimiter-balanced and ends with a lone closer on its own line — it looks whole —
+  // but its `"` is unterminated, which in a .bib swallows every entry appended after it. That is
+  // the "truncated-but-plausible" outcome this whole function ranks as worse than trailing junk,
+  // and it is the one direction the alone-on-its-line rule was not allowed to move.
+  it('keeps a quoted value opaque when an earlier value left the other pair open', () => {
+    const brace = '@article{k,\n  a = {x(},\n  b = "z)\n}\n",\n}';
+    expect(cut(brace)).toBe(brace);
+    const paren = '@article(k,\n  a = (x{),\n  b = "z}\n)\n",\n)';
+    expect(cut(paren)).toBe(paren);
+  });
+});

@@ -508,3 +508,55 @@ describe('DblpService.normalizeKey delegates to the one normalizer in src/lib', 
     );
   });
 });
+
+describe('a well-enveloped body whose ELEMENTS are malformed is unavailable, not a crash', () => {
+  // The shape guard above inspects the ENVELOPE only (`result`, then the `hits` container).
+  // Once it passes, the mapping step dereferenced every element blind, so a 200 with a perfect
+  // envelope and unreadable contents escaped as a raw TypeError — and the resolver substitutes
+  // a backend ONLY on BackendUnavailableError, rethrowing anything else. So one malformed body
+  // from the first backend aborted the entire fallback chain, with the next backend holding a
+  // perfectly good answer it was never asked for. Same class of hole `readBodyOrUnavailable`
+  // closed one layer up; it survived in the mappers.
+
+  it('refuses `hit: null` rather than reporting it as zero results', async () => {
+    // DBLP's JSON is XML-derived: `hit` is ABSENT for zero results, an object for one, an array
+    // for many. A proxy or cache spelling "no hits" as an explicit null clears the envelope
+    // guard — and must NOT come back as `[]`, because the resolver treats an empty list as an
+    // ANSWER: it would stop the chain and report "no results on dblp" for a search DBLP never
+    // ran. The genuine empty answer (`hits` present, no `hit`) is pinned above and unchanged.
+    const svc = new DblpService(() => Promise.resolve(ok('{"result":{"hits":{"hit":null}}}')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+    await expect(svc.search('x')).rejects.toThrow(/unexpected shape/);
+  });
+
+  it('refuses a null ELEMENT inside the hit array', async () => {
+    const svc = new DblpService(() => Promise.resolve(ok('{"result":{"hits":{"hit":[null]}}}')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('refuses a hit whose title is not a string', async () => {
+    // The field-by-field version of the same hole: `(info.title ?? '').replace` is a TypeError
+    // for a numeric title. Guarding `title` alone would leave `year`, `venue`, `authors` and
+    // every field nobody has thought of yet — which is why the mapping is wrapped whole.
+    const svc = new DblpService(() =>
+      Promise.resolve(
+        ok(JSON.stringify({ result: { hits: { hit: [{ info: { key: 'a/b', title: 42 } }] } } })),
+      ),
+    );
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('still maps a well-formed body, and still answers a real empty search with []', async () => {
+    // The values just outside, re-pinned here so a future "make it safe" cannot pass by
+    // refusing everything: a good body still maps, and a genuine no-results body is still [].
+    const good = new DblpService(() => Promise.resolve(ok(SEARCH_JSON)));
+    expect((await good.search('x'))[0]?.key).toBe('dblp:conf/cvpr/HeZRS16');
+    const none = new DblpService(() =>
+      Promise.resolve(ok(JSON.stringify({ result: { hits: { '@total': '0' } } }))),
+    );
+    await expect(none.search('x')).resolves.toEqual([]);
+  });
+});

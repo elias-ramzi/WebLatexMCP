@@ -585,3 +585,92 @@ describe('a trailing-dot FQDN is a legal spelling of a recognised host', () => {
     );
   });
 });
+
+describe('a single-dot segment is a silent rewrite too, not just ..', () => {
+  // The `..` check the other routes ran (`includes('..')`) let a lone `.` segment through, so
+  // `dblp:conf/./x` came back as the valid-looking `{source: 'dblp', id: 'conf/./x'}` — and the
+  // service layer interpolates that id into a request path, where WHATWG normalisation deletes
+  // the segment and fetches `https://dblp.org/rec/conf/x.bib`: a *different*, valid record than
+  // the key names, reported under the key the caller passed. `encodeURIComponent('.')` is `'.'`,
+  // so Crossref's per-segment encoding does not stop it either. The URL route already refused
+  // this (`hasDotSegment`); the prefixed and bare routes did not. Same boundary, same answer.
+  it('refuses a dot segment on the dblp-prefixed route', () => {
+    expect(() => parseRecordKey('dblp:conf/./x')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a dot segment in a bare DBLP key', () => {
+    expect(() => parseRecordKey('conf/./cvpr/HeZRS16')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a dot segment on the crossref-prefixed route', () => {
+    expect(() => parseRecordKey('crossref:10.1234/./x')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a dot segment in a bare DOI', () => {
+    expect(() => parseRecordKey('10.1234/./x')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a dot segment on the doi: alias route', () => {
+    expect(() => parseRecordKey('doi:10.1234/./x')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a trailing dot segment', () => {
+    // Nothing else rejects this one: `DBLP_KEY` admits it and there is no `..` to find.
+    expect(() => parseRecordKey('conf/x/.')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('dblp:conf/x/.')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('10.1234/x/.')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a leading dot segment', () => {
+    // Note for a future reader: unlike the cases above, this one passed *before* the per-segment
+    // check existed — `DBLP_KEY`'s `^[A-Za-z0-9]` anchor already refuses anything starting with a
+    // dot. It pins that the two guards agree, not the bug; the trailing-dot case is the one
+    // nothing else rejects.
+    expect(() => parseRecordKey('./conf/x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('dblp:./conf/x')).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses a dot segment the DBLP strip sequence would otherwise uncover', () => {
+    // The check must judge the key *after* the host/`rec/`/extension strip — the value that is
+    // actually interpolated — or `dblp:https://dblp.org/rec/conf/./x.bib` slips past it.
+    expect(() => parseRecordKey('dblp:https://dblp.org/rec/conf/./x.bib')).toThrow(
+      /not a valid reference key/,
+    );
+    expect(() => parseRecordKey('rec/conf/./x')).toThrow(/not a valid reference key/);
+  });
+
+  it('still refuses .. on every route (the widening must not narrow anything)', () => {
+    expect(() => parseRecordKey('dblp:conf/../x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('conf/../x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('crossref:10.1234/../x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('doi:10.1234/../x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('10.1234/../x')).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey('conf/../../etc/passwd')).toThrow(/not a valid reference key/);
+  });
+
+  // NOT a regression pin (it passed before the per-segment check too): it guards the other
+  // direction, that the widening does not start refusing ordinary identifiers.
+  it('leaves a dot *inside* a segment alone, which is what real keys are made of', () => {
+    // A `.` within a segment is not a dot segment: DOIs and DBLP keys are full of them, and a
+    // per-segment test that got this wrong would refuse essentially every real key.
+    expect(parseRecordKey('10.1109/CVPR.2016.90')).toEqual({
+      source: 'crossref',
+      id: '10.1109/CVPR.2016.90',
+    });
+    expect(parseRecordKey('conf/cvpr/HeZRS16')).toEqual({
+      source: 'dblp',
+      id: 'conf/cvpr/HeZRS16',
+    });
+    expect(parseRecordKey('journals/corr/abs-1512-03385')).toEqual({
+      source: 'dblp',
+      id: 'journals/corr/abs-1512-03385',
+    });
+    expect(parseRecordKey('https://doi.org/10.1109/CVPR.2016.90')).toEqual({
+      source: 'crossref',
+      id: '10.1109/CVPR.2016.90',
+    });
+    const sici = '10.1002/(SICI)1097-0142(19960101)77:1<50::AID-CNCR10>3.0.CO;2-#';
+    expect(parseRecordKey(`crossref:${sici}`)).toEqual({ source: 'crossref', id: sici });
+    expect(parseRecordKey(sici)).toEqual({ source: 'crossref', id: sici });
+  });
+});

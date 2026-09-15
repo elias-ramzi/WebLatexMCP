@@ -122,8 +122,9 @@ export class NoCanonicalBibtexError extends Error {
  * ".bib bytes originate from the service" rule carries. TypeScript is structurally typed, so it
  * is NOT a compile-time guarantee that `OpenAlexService` has no `fetchBibtex`: growing one on the
  * class typechecks cleanly against `DoiBackend`, which only requires a subset. What pins the
- * absence is a runtime assertion — `test/unit/openalex.test.ts` checks
- * `'fetchBibtex' in service === false`. Keep that test; this declaration cannot stand in for it.
+ * absence is a runtime assertion — `test/unit/openalex.test.ts` asserts
+ * `expect(svc.fetchBibtex).toBeUndefined()` ("OpenAlexService interface shape"). Keep that test;
+ * this declaration cannot stand in for it.
  */
 interface SearchBackend {
   search(query: string, opts?: { maxResults?: number }): Promise<ReferenceHit[]>;

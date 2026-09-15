@@ -192,40 +192,53 @@ export class CrossrefService implements ReferenceBackend {
     );
     const items = data.message?.items ?? [];
     const hits: ReferenceHit[] = [];
-    for (const item of items) {
-      // The DOI is the record's identity — `fetchBibtex`/`add_citation` cannot route without
-      // one, so an item with no DOI is skipped entirely rather than surfaced with a hole.
-      const doi = item.DOI;
-      if (!doi) continue;
-      // And a DOI that will not round-trip through `parseRecordKey` is skipped for the same
-      // reason: `formatRecordKey` composes blindly, so a DOI carrying a character outside the
-      // key allowlist produced a key the server itself refuses the moment `add_citation` parses
-      // it back — a result the user can see and cannot use, with the refusal arriving one tool
-      // call later and blaming the key. `extractWorkId` in the openalex client is defensive the
-      // same way; this is its missing half. Skipping costs one result, emitting costs a dead end.
-      const key = formatRecordKey('crossref', doi);
-      try {
-        const parsed = parseRecordKey(key);
-        if (parsed.source !== 'crossref' || parsed.id !== doi) continue;
-      } catch {
-        continue;
+    // The guard above validates the ENVELOPE (`message` an object, `items` a list); the elements
+    // inside it are whatever the body carried. A null item, or a non-list `author`, used to
+    // escape as a raw TypeError — and the resolver substitutes a backend only on
+    // BackendUnavailableError, so one malformed body aborted the whole fallback chain while the
+    // next backend held a good answer. Wrapped whole rather than guarded field by field, so the
+    // guarantee holds for the fields nobody has thought of yet.
+    try {
+      for (const item of items) {
+        // The DOI is the record's identity — `fetchBibtex`/`add_citation` cannot route without
+        // one, so an item with no DOI is skipped entirely rather than surfaced with a hole.
+        const doi = item.DOI;
+        if (!doi) continue;
+        // And a DOI that will not round-trip through `parseRecordKey` is skipped for the same
+        // reason: `formatRecordKey` composes blindly, so a DOI carrying a character outside the
+        // key allowlist produced a key the server itself refuses the moment `add_citation` parses
+        // it back — a result the user can see and cannot use, with the refusal arriving one tool
+        // call later and blaming the key. `extractWorkId` in the openalex client is defensive the
+        // same way; this is its missing half. Skipping costs one result, emitting costs a dead end.
+        const key = formatRecordKey('crossref', doi);
+        try {
+          const parsed = parseRecordKey(key);
+          if (parsed.source !== 'crossref' || parsed.id !== doi) continue;
+        } catch {
+          continue;
+        }
+        hits.push({
+          key,
+          source: this.id,
+          // Crossref does not append a trailing "." the way DBLP does — nothing to strip here.
+          title: item.title?.[0] ?? '',
+          authors: authorNames(item.author),
+          year: extractYear(item.issued),
+          venue: firstNonEmpty(
+            item['container-title']?.[0],
+            item.event?.name,
+            item['short-container-title']?.[0],
+          ),
+          type: item.type,
+          doi,
+          url: item.URL,
+        });
       }
-      hits.push({
-        key,
-        source: this.id,
-        // Crossref does not append a trailing "." the way DBLP does — nothing to strip here.
-        title: item.title?.[0] ?? '',
-        authors: authorNames(item.author),
-        year: extractYear(item.issued),
-        venue: firstNonEmpty(
-          item['container-title']?.[0],
-          item.event?.name,
-          item['short-container-title']?.[0],
-        ),
-        type: item.type,
-        doi,
-        url: item.URL,
-      });
+    } catch (err) {
+      // `assertApiShape` always throws when passed `false`; rethrowing the original keeps the
+      // catch non-returning for the compiler and fails loudly if that ever stops being true.
+      assertApiShape(SERVICE, false, `a search for "${trimmed}"`, body);
+      throw err;
     }
     return hits;
   }

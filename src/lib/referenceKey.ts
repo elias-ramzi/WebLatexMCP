@@ -33,7 +33,29 @@ export interface ParsedRecordKey {
 const DBLP_KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 /**
- * A DOI's registrant + suffix. DOIs legitimately contain `/`, so the explicit `..` check
+ * True when an already-stripped **record key** (not a URL — see `hasDotSegment` for that, a
+ * different input shape with a different contract) contains a path segment that is exactly `.`
+ * or exactly `..`.
+ *
+ * Both spellings, because both are rewritten away downstream. `..` is the traversal case; a
+ * lone `.` cannot ascend, but it is the same silent-rewrite failure this module refuses on the
+ * URL route: every id here is interpolated into a request path, and WHATWG normalisation
+ * deletes a `.` segment, so `dblp:conf/./x` fetched `https://dblp.org/rec/conf/x.bib` — a
+ * *different*, perfectly valid record than the key names, reported back under the key the
+ * caller passed. Crossref's per-segment `encodeURIComponent` does not stop it either:
+ * `encodeURIComponent('.')` is `'.'`. The URL route already refused this and the prefixed and
+ * bare routes did not, so the same input got three answers from one boundary.
+ *
+ * Per *segment*, never `includes('.')`: a dot **inside** a segment is what real identifiers are
+ * made of (`10.1109/CVPR.2016.90`, `journals/corr/abs-1512-03385`), and only a whole segment is
+ * a dot segment.
+ */
+function hasDotSegmentInKey(key: string): boolean {
+  return key.split('/').some((segment) => segment === '.' || segment === '..');
+}
+
+/**
+ * A DOI's registrant + suffix. DOIs legitimately contain `/`, so the explicit dot-segment check
  * below (not this allowlist) is what rejects traversal.
  *
  * The suffix class is an explicit allowlist, not a negated one, so a reader can see exactly
@@ -135,7 +157,9 @@ export function normalizeDblpKey(raw: string, original: string = raw): string {
   key = key.replace(/^\/+/, '');
   key = key.replace(/^rec\//i, '');
   key = key.replace(/\.(bib|html|xml)$/i, '');
-  if (!key || !DBLP_KEY.test(key) || key.includes('..')) {
+  // Judged *after* the strip sequence, on the value that is actually interpolated into the
+  // request path — `dblp:https://dblp.org/rec/conf/./x.bib` only reveals its dot segment here.
+  if (!key || !DBLP_KEY.test(key) || hasDotSegmentInKey(key)) {
     throw new Error(acceptedFormsMessage(original));
   }
   return key;
@@ -145,7 +169,7 @@ export function normalizeDblpKey(raw: string, original: string = raw): string {
  * treat a string as a DOI is made case-insensitively; the returned id is verbatim. */
 function normalizeDoi(raw: string, original: string): string {
   const id = raw.trim();
-  if (!id || id.includes('..') || !DOI_KEY.test(id)) {
+  if (!id || hasDotSegmentInKey(id) || !DOI_KEY.test(id)) {
     throw new Error(acceptedFormsMessage(original));
   }
   return id;

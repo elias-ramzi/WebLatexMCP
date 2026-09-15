@@ -139,17 +139,28 @@ export interface BibtexEntrySpan {
  *   the entries around it use, and an entry with an unresolved abbreviation is corrupt too. So
  *   skipping only ever widens `end`, and only as a bridge to a further entry: a trailing macro or
  *   comment that no entry follows stays out, like any other trailing junk.
- * - **A close that ends its line.** Depth reaching 0 is necessary but not sufficient: an unmatched
- *   `}` inside a value reaches it in the middle of the entry, and cutting there yields a
- *   syntactically broken fragment. Every entry a service emits closes as the last non-whitespace
- *   character on its line, so a delimiter that fails that test is not believed and the scan fails
- *   open instead.
+ * - **A close alone on its line, and outside the other pair.** Depth reaching 0 is necessary but
+ *   not sufficient: an unmatched `}` inside a value reaches it in the middle of the entry, and
+ *   cutting there yields a syntactically broken fragment. Two tests stand between depth 0 and a
+ *   cut. The delimiter must be the **only** non-whitespace character on its line — every entry a
+ *   service emits closes with a lone `}`/`)` on its own line, and "last on its line" alone
+ *   believed a stray closer that happened to end one (`abstract = {Sentence one} extra }`), which
+ *   cut the entry in half. And it must sit **outside the other delimiter pair**: inside
+ *   `@article(...)` a `)` in a braced value is the author's text, not the entry's close, so the
+ *   scan counts `{}` alongside `()` (and symmetrically for a `{`-entry) and refuses any closer
+ *   reached while the other pair is open. A delimiter failing either test is not believed and the
+ *   scan fails open instead.
  * - **Fail open.** An entry whose delimiters never balance, or whose closing delimiter is not
  *   believed, spans to the end of the text — exactly what this returned before it could see an end
  *   at all. A truncated-but-plausible entry is worse than a whole one with junk after it, and
  *   `assertApiBody` plus the header check already stand in front of this. When in doubt this
- *   returns *more* of the service's bytes, never fewer; there is no case in which it returns
- *   fewer than the service's own entry.
+ *   returns *more* of the service's bytes, never fewer. The guarantee that buys is exact, and it
+ *   is the believability rules above that pay for it: `end` is only ever placed at a delimiter
+ *   that closed the entry's own pair while no other pair was open **and** that stands alone on
+ *   its line, the way every service closes an entry — so a cut lands where the service ended an
+ *   entry, or nowhere at all. It is not a promise that no body can be misread: a body that closes
+ *   an entry some other way (a whole entry on one line) is not truncated, it simply gets no cut
+ *   point and comes back whole, junk and all.
  */
 export function bibtexEntrySpan(text: string): BibtexEntrySpan | null {
   const match = BIBTEX_ENTRY.exec(text);
@@ -181,44 +192,90 @@ export function bibtexEntrySpan(text: string): BibtexEntrySpan | null {
 type Continuation = { kind: 'entry'; at: number } | { kind: 'end' } | { kind: 'failOpen' };
 
 /**
+ * How a closing delimiter earns belief, so the two callers can demand different things of one.
+ * An **entry**'s closer must be alone on its line; a **separator block**'s need only end one.
+ */
+type CloserTest = (text: string, i: number) => boolean;
+
+/**
  * Offset just past the delimiter that closes the entry whose header begins at `at`, or `null` when
  * the delimiters never balance, or when the delimiter that balances them is not believable (the
  * two fail-open cases). The pair is whichever one the header opened with; the opening delimiter is
  * the first `{` or `(` at or after `at`, which the header shape guarantees is the entry's own
  * (`@[A-Za-z]+[ \t]*[{(]` admits nothing else in between).
+ *
+ * The *other* pair is counted alongside it, because the entry's own delimiters are structure only
+ * outside it. `@article(` opens a paren entry whose field values are still braced, so a `)` inside
+ * `title = {A ) title}` is the author's text; tracking one pair and ignoring the other cut that
+ * entry at the `)` and appended a fragment with a dangling `{` to the user's `.bib`, which then
+ * broke every entry after it. A closer reached while the other pair is open is refused outright
+ * rather than stepped over: refusing fails open, and failing open is the direction this function
+ * is allowed to be wrong in.
+ *
+ * `believes` is how a separator block opts out of the stricter half. Services close an *entry*
+ * with a lone delimiter on its own line, but write `@string{cvpr = "CVPR"}` on a single line, so
+ * demanding the strict shape there would fail open on every body carrying one — dropping the very
+ * trailing entry the separator exists to bridge to. A block's end is never a cut point either
+ * (`end` only ever comes from an entry's close), so the strict test buys nothing there.
  */
-function entryEnd(text: string, at: number): number | null {
+function entryEnd(text: string, at: number, believes: CloserTest = aloneOnItsLine): number | null {
   let i = at;
   while (i < text.length && text[i] !== '{' && text[i] !== '(') i++;
   if (i >= text.length) return null;
   const open = text[i];
   const close = open === '{' ? '}' : ')';
+  const otherOpen = open === '{' ? '(' : '{';
+  const otherClose = open === '{' ? ')' : '}';
   let depth = 0;
+  // Depth over the pair the header did NOT open with. Never negative: an unmatched `)` in a braced
+  // entry (`title = {Part 1)}`) opens nothing, so it must not put the counter into a state a later
+  // `(` would cancel back to 0.
+  let otherDepth = 0;
   for (; i < text.length; i++) {
     const ch = text[i];
     // A character the document escaped is a literal in a field value, not structure. Checked ahead
     // of the quote branch too: `author = "Kurt G\"{o}del"` is an umlaut, not the value's end.
     if (text[i - 1] === '\\') continue;
-    // A `"`-quoted value is opaque — the braces inside it are the author's text. Only at depth 1,
-    // where a `"` can only be opening a value; inside a braced value it is an ordinary quotation
-    // mark. This is what makes the common over-balance (`title = "A } weird title"`) come out
-    // exactly right instead of by the fail-open below. An unterminated quote runs to the end of
-    // the text, so depth never returns to 0 and the whole body is returned — the safe direction.
+    // A `"`-quoted value is opaque — the delimiters inside it are the author's text. Gated on
+    // `depth === 1` ONLY, deliberately: a `"` there can only be opening a value, and that is what
+    // makes the common over-balance (`title = "A } weird title"`) come out exactly right instead
+    // of by the fail-open below. An unterminated quote runs to the end of the text, so depth never
+    // returns to 0 and the whole body is returned — the safe direction.
+    //
+    // Do NOT add `&& otherDepth === 0` here. It reads like the natural companion to the
+    // `otherDepth` refusal below, and it is the opposite: it makes a quoted value *transparent*
+    // whenever an earlier value left the other pair open, so the delimiters inside a string start
+    // counting as structure. `@article{k,\n  a = {x(},\n  b = "z)\n}\n",\n}` was then cut at the
+    // `}` inside `b`'s string — a fragment that is delimiter-balanced and ends with a lone closer
+    // on its own line, so it looks like a whole entry while carrying an unterminated `"` that
+    // swallows every entry appended after it. `otherDepth` exists to REFUSE a closer (fail open),
+    // never to decide what is opaque; opacity may only ever be widened, never narrowed.
     if (depth === 1 && ch === '"') {
       i = quotedValueEnd(text, i);
+      continue;
+    }
+    if (ch === otherOpen) {
+      otherDepth++;
+      continue;
+    }
+    if (ch === otherClose) {
+      if (otherDepth > 0) otherDepth--;
       continue;
     }
     if (ch !== open && ch !== close) continue;
     depth += ch === open ? 1 : -1;
     if (depth !== 0) continue;
-    // Depth 0 is necessary, not sufficient. An unmatched `}` inside a value — one a `"`-quoted
-    // value did not account for, e.g. `title = {A } weird title}` — reaches depth 0 in the middle
-    // of the entry, and cutting there appends a broken fragment to the user's `.bib`: worse than
-    // the trailing junk this whole function exists to remove. Every entry a service emits closes
-    // at the end of its own line, and a `}` inside a value practically never does, so a delimiter
-    // that fails that test is not believed. `null` puts it on the same fail-open path as an entry
-    // that never balances at all.
-    return endsItsLine(text, i) ? i + 1 : null;
+    // Depth 0 is necessary, not sufficient — two ways it can be reached mid-entry, both of which
+    // used to cut a broken fragment into the user's `.bib`, worse than the trailing junk this
+    // whole function exists to remove. Inside the other pair, this delimiter is somebody's prose
+    // rather than the entry's close. And an unmatched `}` a `"`-quoted value did not account for
+    // (`title = {A } weird title}`) reaches depth 0 in the middle of the entry: what separates it
+    // from the real close is that a service's close is the only thing on its line, while one
+    // inside a value practically never is — "last on its line" alone still believed
+    // `abstract = {Sentence one} extra }`. `null` puts either on the same fail-open path as an
+    // entry that never balances at all.
+    if (otherDepth > 0) return null;
+    return believes(text, i) ? i + 1 : null;
   }
   return null;
 }
@@ -232,6 +289,22 @@ function quotedValueEnd(text: string, at: number): number {
     if (text[i] === '"' && text[i - 1] !== '\\') return i;
   }
   return text.length;
+}
+
+/**
+ * True when the character at `i` is the *only* non-whitespace one on its line — the last
+ * ({@link endsItsLine}) and also the first. The second half is what an entry's closer has to clear:
+ * `endsItsLine` alone believes a stray `}` that happens to sit at the end of a line
+ * (`abstract = {Sentence one} extra }`), and cutting there returns half an entry.
+ */
+function aloneOnItsLine(text: string, i: number): boolean {
+  if (!endsItsLine(text, i)) return false;
+  for (let j = i - 1; j >= 0; j--) {
+    const ch = text[j];
+    if (ch === '\n') return true;
+    if (ch !== ' ' && ch !== '\t' && ch !== '\r') return false;
+  }
+  return true;
 }
 
 /**
@@ -291,7 +364,9 @@ function nextEntryHeader(text: string, from: number): Continuation {
     // cannot drift into disagreeing about what opens a run and what continues one.
     if (BIBTEX_ENTRY_AT_LINE_START.test(rest)) return { kind: 'entry', at: j };
     if (!BIBTEX_MACRO_AT_LINE_START.test(rest)) return { kind: 'end' };
-    const blockEnd = entryEnd(text, j);
+    // `endsItsLine`, not the entry rule: `@string{cvpr = "CVPR"}` is how a service writes one, and
+    // demanding a lone `}` on its own line would fail open on every body that carries a separator.
+    const blockEnd = entryEnd(text, j, endsItsLine);
     // A separator we cannot find the end of is a body we cannot read. Ending the run here would
     // drop whatever follows; fail open instead, on the same reasoning as an unbalanced entry.
     if (blockEnd === null) return { kind: 'failOpen' };

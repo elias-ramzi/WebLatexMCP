@@ -503,3 +503,47 @@ describe('an EMPTY 200 on the BibTeX path is a failure, not "no such record"', (
     );
   });
 });
+
+describe('a well-enveloped body whose ELEMENTS are malformed is unavailable, not a crash', () => {
+  // The shape guard inspects the ENVELOPE only (`message` is an object, `items` is an array).
+  // Past it the mapping dereferenced every item blind, so a well-enveloped 200 carrying junk
+  // escaped as a raw TypeError — which the resolver rethrows instead of substituting, aborting
+  // the fallback chain. Wrapped whole rather than guarded field by field: the guarantee has to
+  // hold for the fields nobody has thought of yet.
+
+  it('refuses a null ELEMENT inside items', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok('{"message":{"items":[null]}}')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('refuses an item whose author list is not a list', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(
+        ok(JSON.stringify({ message: { items: [{ DOI: '10.1109/cvpr.2016.90', author: 42 }] } })),
+      ),
+    );
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.not.toBeInstanceOf(TypeError);
+  });
+
+  it('still maps a well-formed body, and still answers a real empty search with []', async () => {
+    // The values just outside: refusing everything would satisfy the tests above and nothing else.
+    const good = new CrossrefService(() =>
+      Promise.resolve(
+        ok(
+          JSON.stringify({
+            message: {
+              items: [{ DOI: '10.1109/cvpr.2016.90', title: ['Deep Residual Learning'] }],
+            },
+          }),
+        ),
+      ),
+    );
+    expect((await good.search('x'))[0]?.doi).toBe('10.1109/cvpr.2016.90');
+    const none = new CrossrefService(() =>
+      Promise.resolve(ok(JSON.stringify({ message: { items: [] } }))),
+    );
+    await expect(none.search('x')).resolves.toEqual([]);
+  });
+});

@@ -25,7 +25,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   rejected fetch), and requires a real BibTeX entry header at a line start before any text reaches
   a bibliography — cut to the leading run of entries at both ends, so neither a proxy banner
   in front nor a `<script>` behind is appended, with an unbalanced body deliberately returned
-  whole rather than truncated. One normalizer now serves both the key parser and
+  whole rather than truncated (a `@string` macro _preceding_ the first entry is cut with the
+  rest of the preamble; one _between_ entries stays inside the span, since the entries after it
+  need its macros — neither DBLP nor Crossref emits a leading one). One normalizer now serves both the key parser and
   `DblpService`, closing the last _copy_ of that boundary: the service's own normalizer stripped
   any host, so `fetchBibtex('https://evil.com/rec/conf/x/y')` yielded the DBLP key `conf/x/y` —
   unreachable through the resolver, which validates first, but one edit away from being
@@ -59,6 +61,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   when OpenAlex was bridged through Crossref). The DBLP wall itself is upstream and unfixed: an
   unpinned lookup works today by substituting Crossref, but `source: "dblp"` still fails until
   DBLP exempts its API paths from the challenge.
+
+- **Review fixes on the reference backends** (#74). Three defects found reviewing the entry above,
+  each reproduced before it was fixed. **A malformed-but-well-enveloped HTTP 200 aborted the whole
+  fallback chain**: `assertApiShape` validates the response _envelope_, and the mapping step then
+  dereferenced each element unguarded, so `{"result":{"hits":{"hit":null}}}` from DBLP escaped as a
+  raw `TypeError` — which the resolver rethrows by design — and Crossref was never tried, defeating
+  the substitution this whole feature exists for. (`asArray` fed it: it returned `[null]` for a
+  `null`, never `[]`.) Each mapper now converts an element-level throw to the same
+  `BackendUnavailableError` path, structurally, so the guarantee holds for fields nobody has thought
+  of yet; `hit: null` is refused explicitly rather than read as zero results, since an empty answer
+  would stop the chain just as effectively. **`bibtexEntrySpan` could truncate an entry**, contrary
+  to its own documented promise that it never returns fewer bytes than the service's entry: the
+  `endsItsLine` guard caught only a stray closing delimiter _mid_-line, so one that happened to end
+  its line was believed and the entry was cut in half (`abstract = {Sentence one} extra }`), and a
+  paren-delimited entry tracked no braces at all, so a `)` inside a braced value cut it leaving a
+  dangling `{` that would break every entry after it in the `.bib`. A closer is now believed only
+  when it stands **alone on its line** and **outside the other delimiter pair**; both tests only
+  ever fail _open_, and the doc block no longer claims more than the code delivers. **A lone `.`
+  path segment silently fetched a different record**: `normalizeDblpKey`/`normalizeDoi` rejected
+  `..` but not `.`, and WHATWG normalisation deletes such a segment from the request URL, so
+  `dblp:conf/./x` fetched `conf/x` — the caller's identifier rewritten into a different, valid one,
+  which is exactly what the URL route already refused and this module calls out as something a
+  security boundary may not do. All three routes now judge dot segments the same way, per segment,
+  so a dot _inside_ a segment (`10.1109/CVPR.2016.90`) is untouched. Plus docs: `CLAUDE.md` no
+  longer credits `OpenAlexService` with a `fetchBibtex` it deliberately does not have (contradicting
+  its own invariant 150 lines below), `docs/tools.md` documents the three reference fields
+  `server_info` now returns, and the README no longer implies `add_citation` falls back between
+  services — it routes by the key and substitutes nothing.
 
 - **The `push` conflict payload is bounded, in both channels, by one budget** (#68). A conflict on a
   single ~20k-character section file returned a 67,485-character result — past the client's tool-result

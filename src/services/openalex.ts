@@ -186,21 +186,33 @@ export class OpenAlexService implements ReferenceBackend {
     assertApiShape(SERVICE, Array.isArray(data?.results), `a search for "${trimmed}"`, body);
     const results = Array.isArray(data.results) ? data.results : [];
     const hits: OpenAlexHit[] = [];
-    for (const work of results) {
-      const workId = extractWorkId(work.id);
-      if (!workId) continue;
-      const year = work.publication_year;
-      hits.push({
-        key: formatRecordKey('openalex', workId),
-        source: this.id,
-        title: work.display_name ?? work.title ?? '',
-        authors: authorNames(work.authorships),
-        year: Number.isFinite(year) ? year : undefined,
-        venue: extractVenue(work),
-        type: work.type,
-        doi: stripDoi(work.doi),
-        url: work.id,
-      });
+    // `results` being an array is an ENVELOPE check; the elements inside it are whatever the body
+    // carried. A null result, or a numeric `id`, used to escape as a raw TypeError — and the
+    // resolver substitutes a backend only on BackendUnavailableError, so one malformed body
+    // aborted the whole fallback chain while the next backend held a good answer. Wrapped whole
+    // rather than guarded field by field, so this holds for fields nobody has thought of yet.
+    try {
+      for (const work of results) {
+        const workId = extractWorkId(work.id);
+        if (!workId) continue;
+        const year = work.publication_year;
+        hits.push({
+          key: formatRecordKey('openalex', workId),
+          source: this.id,
+          title: work.display_name ?? work.title ?? '',
+          authors: authorNames(work.authorships),
+          year: Number.isFinite(year) ? year : undefined,
+          venue: extractVenue(work),
+          type: work.type,
+          doi: stripDoi(work.doi),
+          url: work.id,
+        });
+      }
+    } catch (err) {
+      // `assertApiShape` always throws when passed `false`; rethrowing the original keeps the
+      // catch non-returning for the compiler and fails loudly if that ever stops being true.
+      assertApiShape(SERVICE, false, `a search for "${trimmed}"`, body);
+      throw err;
     }
     return hits;
   }
@@ -260,7 +272,16 @@ export class OpenAlexService implements ReferenceBackend {
       `a lookup of OpenAlex work "${id}"`,
       body,
     );
-    return stripDoi(data.doi) ?? null;
+    // Reading the record is the same envelope-vs-element split `search` has, and it matters more
+    // here: `null` is a real answer this method is allowed to give ("this record has no DOI"), so
+    // a malformed `doi` must surface as unavailable rather than as a raw TypeError — which is
+    // neither answer, and which the resolver rethrows instead of substituting.
+    try {
+      return stripDoi(data.doi) ?? null;
+    } catch (err) {
+      assertApiShape(SERVICE, false, `a lookup of OpenAlex work "${id}"`, body);
+      throw err;
+    }
   }
 
   /**
