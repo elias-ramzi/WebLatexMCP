@@ -434,9 +434,31 @@ document.getElementById('popsave').onclick = async () => {
   pending = null;
 };
 
-ctoggle.addEventListener('click', () => {
-  const open = panel.classList.toggle('open');
+function setPanel(open) {
+  panel.classList.toggle('open', open);
   ctoggle.classList.toggle('on', open);
+}
+ctoggle.addEventListener('click', () => setPanel(!panel.classList.contains('open')));
+
+// The panel overlays the page rather than sitting beside it, so clicking through to the PDF is
+// the natural way to dismiss it — and in an embedded browser (VS Code's Simple Browser) the
+// toolbar toggle is an awkward reach. Chrome the user clicks *while working with* the panel
+// never dismisses: the toolbar (whose own toggle would otherwise fire twice), the panel itself,
+// the selection button and its note popup.
+const PANEL_KEEP = '#bar, #panel, #fab, #pop';
+// pointerdown, not click: a drag that selects PDF text should dismiss on press, and the panel
+// overlays the viewer, so closing it mid-drag shifts nothing under the cursor.
+document.addEventListener('pointerdown', (e) => {
+  if (!panel.classList.contains('open')) return;
+  const el = e.target;
+  if (el && el.closest && el.closest(PANEL_KEEP)) return;
+  setPanel(false);
+});
+window.addEventListener('keydown', (e) => {
+  // defaultPrevented: the note popup's own Escape handled it first. editingId: an in-progress
+  // note edit lives inside the panel, and closing it would throw the text away.
+  if (e.key !== 'Escape' || e.defaultPrevented || editingId) return;
+  if (panel.classList.contains('open')) setPanel(false);
 });
 
 const undoBtn = document.getElementById('undodel');

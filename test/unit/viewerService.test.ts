@@ -73,6 +73,25 @@ describe('ViewerService', () => {
     for (const name of used) expect(pdfSrc).toContain(name);
   });
 
+  // Clicking the PDF dismisses the comment panel; everything named in PANEL_KEEP leaves it open.
+  // A rename that leaves an id out of that list turns "click the note popup" into "close the
+  // panel under me", which no parse check would catch.
+  it('keeps the comment panel open only for chrome that still exists in the page', async () => {
+    const html = await (await fetch(`${base}/p/demo`)).text();
+    const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
+    expect(script).toMatch(/document\.addEventListener\('pointerdown'/);
+    const keep = /const PANEL_KEEP = '([^']+)'/.exec(script)?.[1];
+    expect(keep).toBeTruthy();
+    const ids = keep!.split(',').map((s) => s.trim());
+    // The toolbar and the panel itself are load-bearing: without them the toggle would close the
+    // panel it just opened, and a click inside the list would dismiss it.
+    expect(ids).toEqual(expect.arrayContaining(['#bar', '#panel']));
+    for (const sel of ids) {
+      expect(sel).toMatch(/^#[\w-]+$/);
+      expect(html).toContain(`id="${sel.slice(1)}"`);
+    }
+  });
+
   it('404s an unknown project', async () => {
     const r = await fetch(`${base}/p/nope`);
     expect(r.status).toBe(404);
