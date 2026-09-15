@@ -594,6 +594,32 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **Clicking the PDF dismisses the viewer's comment panel** (#71). The panel _overlays_ the page
+  (`position: absolute` over `#viewerContainer`) rather than sitting beside it, so clicking through to
+  the document reads as the way out of it — but the only thing that closed it was the 💬 toolbar
+  toggle, and clicking the PDF did nothing at all. That is a papercut in a full browser window and a
+  real one in an embedded pane: in VS Code's Simple Browser the viewer is narrow, the panel covers most
+  of it, and the toggle is a reach back up to a 22px toolbar. A `pointerdown` listener on `document`
+  now closes the panel unless the click landed in chrome the user clicks _while working with_ it —
+  `#bar`, `#panel`, `#fab`, `#pop`, the `PANEL_KEEP` list. The toolbar has to be on that list and is
+  not merely conservative: without it the toggle would open the panel and the same gesture would
+  immediately close it, so `ctoggle` would appear dead. **`pointerdown`, not `click`**, so a drag that
+  selects PDF text dismisses on press rather than on release; that ordering is safe only because the
+  panel overlays the viewer instead of being laid out beside it — closing it mid-drag reflows nothing
+  under the cursor, and the selection (and the `selectionchange` handler that positions the 💬 Comment
+  button) survives. The highlight layer is already `pointer-events: none`, so a click on a commented
+  region falls through to the page div and dismisses like any other. Escape closes the panel too,
+  unless the note popup's own Escape already handled the key (`e.defaultPrevented`, rather than
+  re-reading `pop.style.display`, which `popcancel` has already set to `none` by the time the event
+  bubbles — one keypress would otherwise cancel the popup _and_ close the panel) or a note is mid-edit
+  inside the panel (`editingId`), where closing would throw away text the user has typed and not saved.
+  The accepted cost: selecting PDF text while the panel is open now closes it, so adding a comment from
+  an open panel ends with the panel shut. That is the gesture's whole point — dismiss on a click into
+  the document — and the count in the toolbar still updates, so it is one click to bring it back. The
+  test asserts the handler is wired _and_ that every id in `PANEL_KEEP` still exists in the served HTML:
+  the viewer's client script is a template literal that no linter resolves, so a rename that leaves
+  `#pop` out of the list would silently turn "click the note popup" into "close the panel under me",
+  which the existing parse-only check cannot catch.
 - **Every by-name comparison in `commit`, `push` and `status` that decides what is staged, owned,
   settled or reported now folds case where git does — the peer-ownership check included**
   (#67 "Known, not fixed"). `commit` scope `"paths"`'s peer-ownership check and `push`'s peer
