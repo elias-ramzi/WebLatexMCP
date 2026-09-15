@@ -231,7 +231,10 @@ export function parseReferenceSource(raw: string | undefined): {
  *
  * A malformed value is a convenience failure, not a correctness one (the same reasoning as
  * `parseRewriteMode`): it does not throw, it logs the rejection to stderr (never stdout — the
- * JSON-RPC channel) and returns undefined, so a typo silently costs only the polite-pool speedup.
+ * JSON-RPC channel) and returns undefined, so a typo costs only the polite-pool speedup. It does
+ * not cost it *silently*, though: `loadConfig` also records `contactEmailInvalid`, so a rejected
+ * value is distinguishable from an unset one in `server_info` rather than being byte-identical
+ * to a default install with nothing to explain why the polite pool is off.
  * Checked here, not merely "looks emailish": the value is interpolated into a URL query
  * parameter, so `&`, `?`, `#`, `/` and any whitespace/control character (including a newline)
  * are rejected too — those could otherwise let a malformed value alter the request URL. Length
@@ -242,18 +245,40 @@ export function parseReferenceSource(raw: string | undefined): {
  * real cause.
  */
 export function parseContactEmail(raw: string | undefined): string | undefined {
+  return resolveContactEmail(raw).email;
+}
+
+/**
+ * The single derivation behind `parseContactEmail`, returning what `loadConfig` needs and the
+ * exported wrapper does not: whether a value was present and REJECTED, as opposed to absent.
+ *
+ * Kept as one function rather than two tests of the same string, for `parseCompilerChoice`'s
+ * reason: two derivations of "was this usable" can disagree, and this one is also the thing
+ * that decides whether a stderr line is spent. `parseContactEmail` stays a thin wrapper so its
+ * exported signature — an address or undefined, which is all any caller wants — is unchanged.
+ *
+ * What is returned is a BOOLEAN, never the offending value; see `ServerConfig.contactEmailInvalid`
+ * for why this is the one rejected setting whose value is not carried forward.
+ */
+function resolveContactEmail(raw: string | undefined): {
+  email: string | undefined;
+  /** True only when a non-empty value was set and could not be used. Unset is not invalid. */
+  invalid: boolean;
+} {
   const value = raw?.trim();
-  if (!value) return undefined;
-  if (isUsableContactEmail(value)) return value;
+  if (!value) return { email: undefined, invalid: false };
+  if (isUsableContactEmail(value)) return { email: value, invalid: false };
   // The rejected value is echoed back so the typo is visible — but it is echoed ELIDED, since
   // the one rejection reason that has no short value is "too long", and dumping a pasted
-  // multi-kilobyte token into the log trades one oversized string for another.
+  // multi-kilobyte token into the log trades one oversized string for another. This log line is
+  // the ONLY place the rejected address appears: stderr is the operator's own terminal, whereas
+  // `server_info` is read by a model, so the flag below is all that travels onward.
   console.error(
     `WEB_LATEX_MCP_CONTACT_EMAIL "${elide(raw ?? '')}" is not usable as a contact address; ` +
       'ignoring it. Expected a plain email address (no query-altering characters, no ' +
       `whitespace, at most ${MAX_CONTACT_EMAIL_LENGTH} characters).`,
   );
-  return undefined;
+  return { email: undefined, invalid: true };
 }
 
 /** Shorten an over-long value for a log line, saying what was cut rather than hiding it. */
@@ -454,7 +479,9 @@ export function loadConfig(
     explicit: referenceSourceExplicit,
     invalid: referenceSourceInvalid,
   } = parseReferenceSource(env.WEB_LATEX_MCP_REFERENCE_SOURCE);
-  const contactEmail = parseContactEmail(env.WEB_LATEX_MCP_CONTACT_EMAIL);
+  const { email: contactEmail, invalid: contactEmailRejected } = resolveContactEmail(
+    env.WEB_LATEX_MCP_CONTACT_EMAIL,
+  );
 
   return {
     workspaceRoot,
@@ -474,6 +501,9 @@ export function loadConfig(
     referenceSourceExplicit,
     referenceSourceInvalid,
     contactEmail,
+    // Set only when a value was actually rejected: a `false` on every healthy install would say
+    // "a value was considered", which is exactly the state this flag exists to tell apart.
+    ...(contactEmailRejected ? { contactEmailInvalid: true } : {}),
   };
 }
 

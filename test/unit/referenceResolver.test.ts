@@ -146,30 +146,51 @@ describe('ReferenceResolver.search — unpinned (the default may be substituted)
     // The real "assertion, never an inference" case, and the one a `!== false` default would
     // silently break: a source arriving with no `explicit` flag at all was nobody's choice, so
     // it must not disable the fallback that keeps the tool working while a backend is down.
+    //
+    // Deliberately `openalex`, NOT `dblp`. Both earlier spellings of this test used `dblp`, which
+    // is DEFAULT_SOURCE_ORDER[0] — so they passed identically whether the configured source was
+    // preferred or ignored outright, and pinned neither. A non-default id is the only value that
+    // can tell the two apart.
     const s = spy({
-      dblp: { search: down('DBLP') },
-      crossref: { search: [hit('crossref', 'c:1')] },
+      openalex: { search: down('OpenAlex') },
+      dblp: { search: [hit('dblp', 'd:1')] },
     });
-    const out = await new ReferenceResolver(s.backends, { source: 'dblp' }).search('x');
+    const out = await new ReferenceResolver(s.backends, { source: 'openalex' }).search('x');
 
-    expect(out.source).toBe('crossref');
-    expect(out.fallbackFrom).toBe('dblp');
-    expect(s.calls).toEqual(['dblp.search', 'crossref.search']);
+    expect(out.source).toBe('dblp');
+    expect(out.fallbackFrom).toBe('openalex');
+    // Tried FIRST despite sitting last in DEFAULT_SOURCE_ORDER, then substituted: the compiler
+    // analogue exactly — an unchosen default is still the backend that runs, just a replaceable one.
+    expect(s.calls).toEqual(['openalex.search', 'dblp.search']);
   });
 
-  it('a configured source that is NOT explicit still allows substitution', async () => {
-    // An assertion, never an inference: a value arriving without `explicit` was nobody's choice.
+  it('a configured source that is NOT explicit is preferred, and still substitutable', async () => {
+    // An assertion, never an inference: a value arriving without `explicit` was nobody's choice,
+    // so it may be substituted — but it is still what gets tried first.
     const s = spy({
-      dblp: { search: down('DBLP') },
-      crossref: { search: [hit('crossref', 'c:1')] },
+      openalex: { search: down('OpenAlex') },
+      dblp: { search: [hit('dblp', 'd:1')] },
     });
     const out = await new ReferenceResolver(s.backends, {
-      source: 'dblp',
+      source: 'openalex',
       explicit: false,
     }).search('x');
 
-    expect(out.source).toBe('crossref');
-    expect(out.fallbackFrom).toBe('dblp');
+    expect(out.source).toBe('dblp');
+    expect(out.fallbackFrom).toBe('openalex');
+    expect(s.calls).toEqual(['openalex.search', 'dblp.search']);
+  });
+
+  it('a configured source that ANSWERS stops the chain, without consulting the default order', () => {
+    // The other direction: preferring the configured source must not turn into trying everything.
+    // Zero hits from it is an ANSWER and ends the search — the rule that keeps "this bibliography
+    // has never heard of it" from becoming "here is what another one found instead".
+    const s = spy({ openalex: { search: [] } });
+    return new ReferenceResolver(s.backends, { source: 'openalex' }).search('x').then((out) => {
+      expect(out.source).toBe('openalex');
+      expect(out.fallbackFrom).toBeUndefined();
+      expect(s.calls).toEqual(['openalex.search']);
+    });
   });
 });
 

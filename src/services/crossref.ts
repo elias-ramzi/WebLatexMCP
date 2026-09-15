@@ -271,10 +271,15 @@ export class CrossrefService implements ReferenceBackend {
       `BibTeX for DOI "${doi}"`,
     );
     if (!res.ok) {
-      throw new BackendUnavailableError(
-        SERVICE,
-        `Crossref returned ${res.status} ${res.statusText} for DOI "${doi}".${httpHint(SERVICE, res.status, 'record')}`,
-      );
+      // A 404 here is the backend ANSWERING — this key names no record — which is exactly what
+      // `httpHint` says below and what `BackendUnavailableError`'s own doc promises it is never
+      // thrown for. Every other non-OK status is the backend failing to answer, and stays
+      // substitutable. The message is identical either way; only the type differs, because only
+      // the type decides whether a resolver may fall through to another backend — and falling
+      // through on a missing record would be wrong even if there were a fallback to fall to:
+      // a DOI names one record, so there is nothing to substitute to.
+      const message = `Crossref returned ${res.status} ${res.statusText} for DOI "${doi}".${httpHint(SERVICE, res.status, 'record')}`;
+      throw res.status === 404 ? new Error(message) : new BackendUnavailableError(SERVICE, message);
     }
     const text = (await readBodyOrUnavailable(SERVICE, res, `BibTeX for DOI "${doi}"`)).trim();
     assertApiBody(SERVICE, text, `a BibTeX request for DOI "${doi}"`);

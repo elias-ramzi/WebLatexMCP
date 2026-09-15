@@ -8,7 +8,7 @@
  * `add_citation` refuses an OpenAlex record with no DOI instead of inventing an entry.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
@@ -16,6 +16,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createFakeRemote } from './helpers/bareRepo.js';
 import { createServer } from '../../src/server.js';
+import { loadConfig } from '../../src/config.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
@@ -33,6 +34,7 @@ import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import { ReferenceResolver, type ReferenceBackends } from '../../src/services/referenceResolver.js';
 import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
 import type { ReferenceHit } from '../../src/services/referenceBackend.js';
+import { REFERENCE_SOURCES } from '../../src/lib/referenceKey.js';
 import type { ReferenceSourceId } from '../../src/lib/referenceKey.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -61,6 +63,7 @@ describe('multi-backend reference lookup through a real MCP client', () => {
 
   afterEach(async () => {
     for (const c of cleanups.splice(0)) await c();
+    vi.restoreAllMocks();
   });
 
   async function setup(
@@ -68,11 +71,32 @@ describe('multi-backend reference lookup through a real MCP client', () => {
     opts: { source?: ReferenceSourceId; explicit?: boolean; invalidSource?: string } = {},
     // Server-level config the resolver knows nothing about. Kept apart from `opts` so the
     // resolver keeps receiving exactly what it received before.
-    serverOpts: { contactEmail?: string; referenceSourceInvalid?: string } = {},
+    serverOpts: {
+      contactEmail?: string;
+      /**
+       * A RAW `WEB_LATEX_MCP_CONTACT_EMAIL` value, resolved through the real `loadConfig` so a
+       * rejected address is dropped exactly the way the server drops it — the test never hands
+       * the config a value `loadConfig` would have refused, nor derives "invalid" itself.
+       */
+      contactEmailEnv?: string;
+      referenceSourceInvalid?: string;
+      /** Pinned by `WEB_LATEX_MCP_REFERENCE_SOURCE` — server-level, apart from the resolver's. */
+      referenceSource?: ReferenceSourceId;
+    } = {},
   ): Promise<{ client: Client; dir: string }> {
     const remote = await createFakeRemote({ 'main.tex': 'x\n', 'refs.bib': '' });
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-'));
     cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
+
+    const contact = serverOpts.contactEmailEnv
+      ? loadConfig(
+          { WEB_LATEX_MCP_CONTACT_EMAIL: serverOpts.contactEmailEnv },
+          workspace,
+          () => false,
+          () => [],
+          () => undefined,
+        )
+      : undefined;
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
@@ -80,6 +104,12 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',
       ...(serverOpts.contactEmail ? { contactEmail: serverOpts.contactEmail } : {}),
+      ...(contact
+        ? { contactEmail: contact.contactEmail, contactEmailInvalid: contact.contactEmailInvalid }
+        : {}),
+      ...(serverOpts.referenceSource
+        ? { referenceSource: serverOpts.referenceSource, referenceSourceExplicit: true }
+        : {}),
       ...(serverOpts.referenceSourceInvalid
         ? { referenceSourceInvalid: serverOpts.referenceSourceInvalid }
         : {}),
@@ -432,5 +462,141 @@ describe('multi-backend reference lookup through a real MCP client', () => {
     expect(res.isError).toBeFalsy();
     expect(sc.contactEmailConfigured).toBe(false);
     expect(JSON.stringify(res.content)).not.toContain('polite-pool contact set');
+  });
+  it('server_info says a REJECTED polite-pool contact was ignored, not merely absent', async () => {
+    // A malformed WEB_LATEX_MCP_CONTACT_EMAIL used to be byte-identical to never setting it:
+    // contactEmailConfigured false, no clause in the text. The polite pool was silently off
+    // with nothing a tool could reach to explain why — only one stderr line at startup, which
+    // most MCP clients bury. The invalid state REPLACES the reassuring clause, as an unusable
+    // WEB_LATEX_MCP_REFERENCE_SOURCE replaces the fallback-order description above.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { client } = await setup(
+      backends({}),
+      {},
+      // Rejected by parseContactEmail: no dot in the domain.
+      { contactEmailEnv: 'polite.pool.tester@localhost' },
+    );
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    expect(res.isError).toBeFalsy();
+    expect(sc.contactEmailInvalid).toBe(true);
+    // Still not "configured": the polite pool really is off. The flag explains it, not undoes it.
+    expect(sc.contactEmailConfigured).toBe(false);
+
+    const textChannel = JSON.stringify(res.content);
+    expect(textChannel).toMatch(/polite-pool contact IGNORED/);
+    expect(textChannel).toMatch(/WEB_LATEX_MCP_CONTACT_EMAIL/);
+    // The reassuring clause must not sit beside the refusal.
+    expect(textChannel).not.toContain('polite-pool contact set');
+  });
+
+  it('never reports the rejected address itself, in either channel', async () => {
+    // A rejected value is just as much personal data as an accepted one, and this output is
+    // read by a model. The sibling test above pins the valid case; the tempting "helpful" fix
+    // here is to echo the offending value the way referenceSourceInvalid does, which is exactly
+    // what must not happen.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const address = 'polite.pool.tester@localhost';
+    const localPart = 'polite.pool.tester';
+    const { client } = await setup(backends({}), {}, { contactEmailEnv: address });
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const sc = res.structuredContent as Record<string, unknown>;
+
+    // Guard against passing vacuously by reporting nothing at all: the state IS reported.
+    expect(sc.contactEmailInvalid).toBe(true);
+
+    const textChannel = JSON.stringify(res.content);
+    const structuredChannel = JSON.stringify(sc);
+    expect(textChannel).not.toContain(address);
+    expect(structuredChannel).not.toContain(address);
+    expect(textChannel).not.toContain(localPart);
+    expect(structuredChannel).not.toContain(localPart);
+  });
+
+  it('search_references does NOT promise a fallback the env value has disabled', async () => {
+    // The model reads the description first and always. Promising "tries DBLP, then Crossref,
+    // then OpenAlex" while an unpinned call is refused sends it to recover from an error it was
+    // told could not happen — the same wrong turn server_info already refuses to take.
+    const { client } = await setup(
+      backends({}),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const tools = await client.listTools();
+    const description = tools.tools.find((t) => t.name === 'search_references')?.description ?? '';
+
+    expect(description).toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+    expect(description).toMatch(/refus/i);
+    expect(description).toMatch(/source:/);
+    // Every valid id, since passing one is the only way to search in this state.
+    for (const id of REFERENCE_SOURCES) expect(description).toContain(id);
+    expect(description).not.toMatch(/tries DBLP, then Crossref, then OpenAlex/);
+  });
+
+  it('carries the same truth in the `source` FIELD, not only the tool description', async () => {
+    // The field's own .describe() repeated the tool description's promise verbatim — "omit it and
+    // the server substitutes one that is unreachable" — two fields away from the clause that was
+    // fixed. A model reads the field text while filling the call in, so leaving it behind would
+    // have moved the lie rather than removed it. Both are derived from `config` now.
+    const { client } = await setup(
+      backends({}),
+      { invalidSource: 'crossreff' },
+      { referenceSourceInvalid: 'crossreff' },
+    );
+
+    const tools = await client.listTools();
+    const tool = tools.tools.find((t) => t.name === 'search_references');
+    const field = JSON.stringify(tool?.inputSchema.properties ?? {});
+
+    expect(field).toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+    expect(field).toMatch(/REFUSED/);
+    expect(field).not.toMatch(/substitute one that is unreachable/);
+  });
+
+  it('describes the `source` field as pinned when the env names a real backend', async () => {
+    const { client } = await setup(
+      backends({}),
+      { source: 'crossref', explicit: true },
+      { referenceSource: 'crossref' },
+    );
+
+    const tools = await client.listTools();
+    const tool = tools.tools.find((t) => t.name === 'search_references');
+    const field = JSON.stringify(tool?.inputSchema.properties ?? {});
+
+    expect(field).toMatch(/pins it/);
+    expect(field).toContain('crossref');
+    expect(field).not.toMatch(/substitute one that is unreachable/);
+  });
+
+  it('search_references describes a server-pinned backend as pinned, not as a fallback order', async () => {
+    const { client } = await setup(
+      backends({}),
+      { source: 'crossref', explicit: true },
+      { referenceSource: 'crossref' },
+    );
+
+    const tools = await client.listTools();
+    const description = tools.tools.find((t) => t.name === 'search_references')?.description ?? '';
+
+    expect(description).toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
+    expect(description).toMatch(/crossref/);
+    expect(description).not.toMatch(/tries DBLP, then Crossref, then OpenAlex/);
+  });
+
+  it('search_references keeps the fallback wording when nothing is configured', async () => {
+    // CONTROL: passes before and after this change. It is here so the two variants above cannot
+    // be satisfied by deleting the default wording outright.
+    const { client } = await setup(backends({}));
+
+    const tools = await client.listTools();
+    const description = tools.tools.find((t) => t.name === 'search_references')?.description ?? '';
+
+    expect(description).toMatch(/tries DBLP, then Crossref, then OpenAlex/);
+    expect(description).not.toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
   });
 });

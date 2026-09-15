@@ -56,6 +56,20 @@ export interface ReferenceBackend {
  * happens to contain zero results, and never for a caller error (e.g. an invalid record
  * key) — a resolver layer distinguishes substitutable failure from a real answer purely
  * by this type, so the distinction has to stay exact.
+ *
+ * **A 404 is split by what the request addressed**, the same `record`/`query` distinction
+ * {@link httpHint} words its note by — so the type and the sentence beside it say the same
+ * thing:
+ *
+ * - A 404 on a request that **names a record** (`fetchBibtex`, `resolveDoi`) is the backend
+ *   *answering*: no record exists under that key. That is a plain `Error`, alongside the
+ *   "no BibTeX entry found" refusal in the same methods — and it must stay one, because a
+ *   key names one record in one backend, so there is nothing to substitute to.
+ * - A 404 on a **search** is the backend failing to answer — a wrong base URL or a changed
+ *   path, which another backend can well serve — and stays a `BackendUnavailableError`.
+ *
+ * An empty 200 on a record path is *not* covered by the first rule: an empty body is no
+ * evidence that the record is absent, so it stays unavailable.
  */
 export class BackendUnavailableError extends Error {
   readonly backend: string;

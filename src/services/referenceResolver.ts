@@ -183,6 +183,28 @@ export class ReferenceResolver {
   }
 
   /**
+   * The order an *unpinned* search tries backends in: the configured source first, then the rest
+   * of `DEFAULT_SOURCE_ORDER`.
+   *
+   * Reached only when the source is NOT an assertion — an explicit one is a pin and never gets
+   * here. So this is the `CompilerResolver` half of the analogy rather than the `pin()` half: an
+   * unchosen `latexmk` is still the backend that is *tried*, it is merely substitutable when it
+   * cannot answer. A configured-but-unchosen source that was skipped entirely would be a third
+   * thing, neither a choice nor a default — and the surprise lands on whoever next adds a config
+   * path that sets a source without marking it explicit, which `parseReferenceSource` does not do
+   * today. Preferring it changes nothing observable now and keeps the field from becoming a trap.
+   *
+   * Substitution is unaffected: this decides what is tried FIRST, never what may be substituted.
+   * Only `BackendUnavailableError` still licenses moving on, and a zero-hit answer still stops
+   * the chain wherever it happens.
+   */
+  private unpinnedOrder(): readonly ReferenceSourceId[] {
+    const preferred = this.configured;
+    if (!preferred) return DEFAULT_SOURCE_ORDER;
+    return [preferred, ...DEFAULT_SOURCE_ORDER.filter((s) => s !== preferred)];
+  }
+
+  /**
    * Search for publications.
    *
    * Pinned: that backend alone runs, and its failure is an error. Unpinned: the default order
@@ -221,7 +243,7 @@ export class ReferenceResolver {
     }
 
     const failures: Array<{ source: ReferenceSourceId; error: BackendUnavailableError }> = [];
-    for (const source of DEFAULT_SOURCE_ORDER) {
+    for (const source of this.unpinnedOrder()) {
       try {
         const hits = await this.backend(source).search(query, { maxResults });
         const first = failures[0];

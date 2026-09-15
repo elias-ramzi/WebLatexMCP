@@ -194,6 +194,26 @@ export interface ServerConfig {
    * nothing reaches a third-party service unless the user deliberately opted in.
    */
   contactEmail?: string;
+  /**
+   * True when `WEB_LATEX_MCP_CONTACT_EMAIL` was set to something `parseContactEmail` could not
+   * use. Same silent-failure doctrine as `referenceSourceInvalid` above: dropping the rejection
+   * entirely would leave the server behaving differently from a default install — the polite
+   * pool off, `contactEmailConfigured: false`, no clause in `server_info`'s text — with nothing
+   * a tool can reach to explain the difference, the one startup stderr line being invisible in
+   * most MCP clients.
+   *
+   * A BOOLEAN, and deliberately never the value, which is the one place this field diverges
+   * from `referenceSourceInvalid`. That one carries the user's own typo of a backend id, which
+   * is safe to echo and has to be echoed for the refusal to name it. This one would carry an
+   * email address: personal data, and `server_info`'s output is read by a model and travels
+   * into its context. Whether the value was rejected is the most that may be said, and it is
+   * enough — the user knows what they typed, and the full value is already in the stderr line
+   * on their own terminal. Do not "improve" this into a string.
+   *
+   * Set only when a value was present and rejected; unset (never `false`) otherwise, so it
+   * cannot be read as "a value was considered" on a default install.
+   */
+  contactEmailInvalid?: boolean;
 }
 
 /** Where the `viewer` tool expects the PDF viewer to be opened. */

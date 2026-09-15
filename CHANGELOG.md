@@ -90,6 +90,37 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `server_info` now returns, and the README no longer implies `add_citation` falls back between
   services — it routes by the key and substitutes nothing.
 
+- **The review items deferred on the reference backends, closed** (#74). Five follow-ups from the
+  same review, each one a case where the code was defensible but a reader could not tell.
+  **A configured source that was not an assertion was ignored outright** rather than merely
+  substitutable: `pin()` returns the env pin only when `explicit` is set, and nothing read
+  `configured` afterwards, so it was neither a choice nor a default but a third thing. It is now
+  tried **first** and still substitutable, which is the `CompilerResolver` rule this design says it
+  follows — an unchosen `latexmk` is still the compiler that runs. Nothing observable changes today
+  (`parseReferenceSource` never emits that combination), but the field stops being a trap for the
+  next config path that sets a source without marking it chosen; the two tests that named this both
+  used `dblp`, already first in the default order, so they passed under either behaviour and pinned
+  neither. **A malformed `WEB_LATEX_MCP_CONTACT_EMAIL` was byte-identical to an unset one** in
+  `server_info` — the polite pool silently off with nothing a tool could reach to explain it, the
+  exact silent-failure shape `extraWritingGuideLoaded` exists to prevent and that this release
+  already fixed for `referenceSourceInvalid`. A new `contactEmailInvalid` reports it as a
+  **boolean and never the value**, deliberately unlike `referenceSourceInvalid`: that one carries
+  the user's own typo of a backend id, this one would carry an email address into a model's
+  context. **`search_references` promised a fallback that an invalid setting had disabled** — in
+  its registered description _and_, two fields away, in the `source` field's own schema text, which
+  a model reads while filling the call in. Both are now derived from the same config, so they
+  cannot disagree, and both say plainly that an unpinned call is refused in that state.
+  **The request timeout had no test at all**: every test injects a `fetch`, so the arm that
+  attaches `AbortSignal.timeout` never ran, and deleting it left the suite green while the error
+  text kept promising "timed out after 15s". The lint rule that guards the constant could not see
+  that either, nor the hand-rolled `setTimeout(() => controller.abort(), …)` a contributor is
+  likeliest to paste; both are covered now. And **a 404 naming a record is the backend answering,
+  not the backend being down**, so it is a plain `Error` rather than the `BackendUnavailableError`
+  whose own doc says it is never a caller error — messages unchanged, and a 404 on a _search_
+  stays unavailable, since there it means a wrong path rather than a missing record. Harmless
+  while `fetchBibtex` has no fallback; wrong the moment one is added, because a key names one
+  record in one backend and there is nothing to substitute to.
+
 - **The `push` conflict payload is bounded, in both channels, by one budget** (#68). A conflict on a
   single ~20k-character section file returned a 67,485-character result — past the client's tool-result
   cap, so it was never delivered to the model at all, and the documented way out (retry `push` with

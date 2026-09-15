@@ -63,6 +63,17 @@ const outputSchema = {
         'reported — only whether one is configured — since it is the user’s personal data and ' +
         'this output is read by a model.',
     ),
+  contactEmailInvalid: z
+    .boolean()
+    .optional()
+    .describe(
+      'Set when WEB_LATEX_MCP_CONTACT_EMAIL holds a value that is not a usable address: the ' +
+        'polite pool is OFF, and off because of that value rather than because nothing was ' +
+        'configured — which contactEmailConfigured alone cannot tell apart. Absent means the ' +
+        'variable is unset or fine. Only the fact of the rejection is reported, never the ' +
+        'value: unlike referenceSourceInvalid (the user’s own typo of a backend id), this one ' +
+        'is an email address — personal data — and this output is read by a model.',
+    ),
   rewriteMode: z
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
     .describe(
@@ -156,6 +167,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         // backend id, and a rejected value is nobody's choice.
         referenceSourceInvalid: ctx.config.referenceSourceInvalid,
         contactEmailConfigured: ctx.config.contactEmail !== undefined,
+        // The boolean, and only the boolean: `ctx.config` never holds the rejected address.
+        contactEmailInvalid: ctx.config.contactEmailInvalid,
         rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
         // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
         // default when the env names nothing, so that form would call every default install
@@ -201,15 +214,21 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         : info.referenceSource
           ? `${info.referenceSource} (WEB_LATEX_MCP_REFERENCE_SOURCE — never substituted)`
           : 'dblp, then crossref, then openalex (unpinned — an unreachable one is substituted)';
+      // Same shape, and for the same reason: an unusable WEB_LATEX_MCP_CONTACT_EMAIL REPLACES
+      // the reassuring clause instead of silently reading as "nobody configured a contact".
+      // The address itself is never rendered — only that one was set and rejected.
+      const contactDetail = info.contactEmailInvalid
+        ? ', polite-pool contact IGNORED (WEB_LATEX_MCP_CONTACT_EMAIL is not a usable address)'
+        : info.contactEmailConfigured
+          ? ', polite-pool contact set'
+          : '';
       const text =
         `web-latex-mcp v${info.version}\n` +
         `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
         excludeLine +
         writingGuideLine +
         `compiler: ${info.compiler}\n` +
-        `references: ${referencesDetail}${
-          info.contactEmailConfigured ? ', polite-pool contact set' : ''
-        }\n` +
+        `references: ${referencesDetail}${contactDetail}\n` +
         `rewrite mode (default): ${info.rewriteMode}` +
         (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
       return {

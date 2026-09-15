@@ -724,3 +724,64 @@ describe('parseContactEmail', () => {
     expect(withContact.contactEmail).toBe('me@example.com');
   });
 });
+
+describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused with unset', () => {
+  // `parseContactEmail` already drops a malformed value and logs one stderr line. What that
+  // leaves behind is byte-identical to a default install: `contactEmailConfigured: false` and
+  // no polite-pool clause anywhere. `contactEmailInvalid` is what tells the two apart — the
+  // same silent-failure doctrine as `referenceSourceInvalid` and `extraWritingGuideLoaded`.
+  const rejected = 'someone.private@localhost'; // no dot in the domain, so not usable
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sets contactEmailInvalid when the value is set but not a usable address', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+
+    expect(cfg.contactEmailInvalid).toBe(true);
+    // The flag REPORTS that the polite pool is off; it must never switch it back on.
+    expect(cfg.contactEmail).toBeUndefined();
+    // And the rest of the server is untouched, as for every other malformed optional setting.
+    expect(cfg.compiler).toBe('latexmk');
+  });
+
+  it('remembers only the boolean — the rejected address is personal data, and is dropped', () => {
+    // Deliberately unlike `referenceSourceInvalid`, which keeps the user's own typo of a
+    // backend id. An address identifies a person, and config is copied into server_info.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+
+    expect(cfg.contactEmailInvalid).toBe(true);
+    expect(JSON.stringify(cfg)).not.toContain(rejected);
+    // Not only the whole address: a local part alone still identifies the user.
+    expect(JSON.stringify(cfg)).not.toContain('someone.private');
+  });
+
+  it('leaves contactEmailInvalid unset for a usable address and for none at all', () => {
+    // CONTROL: passes before and after this change. It pins the shape — the flag is set only
+    // when a value was actually rejected, so an implementation reporting `false` for every
+    // healthy install (which would make the field meaningless in `server_info`) fails here.
+    const ok = loadConfig(
+      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
+      '/some/dir',
+      () => true,
+    );
+    expect(ok.contactEmail).toBe('me@example.com');
+    expect(ok.contactEmailInvalid).toBeUndefined();
+
+    const none = loadConfig({}, '/some/dir', () => true);
+    expect(none.contactEmail).toBeUndefined();
+    expect(none.contactEmailInvalid).toBeUndefined();
+  });
+
+  it('keeps parseContactEmail returning the address itself, for its existing callers', () => {
+    // CONTROL: passes before and after. The exported signature is load-bearing for the unit
+    // tests above and for anything else reading the address; surfacing the new flag must not
+    // change it into an object.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseContactEmail('me@example.com')).toBe('me@example.com');
+    expect(parseContactEmail(rejected)).toBeUndefined();
+  });
+});

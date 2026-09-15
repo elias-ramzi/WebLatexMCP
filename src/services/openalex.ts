@@ -222,7 +222,9 @@ export class OpenAlexService implements ReferenceBackend {
    * the canonical BibTeX entry from Crossref instead — see the file header for why.
    *
    * Returns `null` when the record has no DOI. That is a real, well-formed answer ("this record
-   * has no DOI"), never a `BackendUnavailableError` and never a thrown plain error: the resolver
+   * has no DOI"), never a `BackendUnavailableError` and never a thrown plain error — that is about
+   * the ANSWER only; a transport failure or a non-OK status below still throws, and a 404 naming
+   * the record throws a plain `Error`: the resolver
    * turns `null` into the user-facing refusal, and that only works if "no DOI" stays
    * distinguishable from "the backend could not answer at all".
    */
@@ -245,10 +247,15 @@ export class OpenAlexService implements ReferenceBackend {
       `a lookup of work "${id}"`,
     );
     if (!res.ok) {
-      throw new BackendUnavailableError(
-        SERVICE,
-        `OpenAlex lookup failed for work "${id}": ${res.status} ${res.statusText}.${httpHint(SERVICE, res.status, 'record')}`,
-      );
+      // A 404 here is the backend ANSWERING — this key names no record — which is exactly what
+      // `httpHint` says below and what `BackendUnavailableError`'s own doc promises it is never
+      // thrown for. Every other non-OK status is the backend failing to answer, and stays
+      // substitutable. The message is identical either way; only the type differs, because only
+      // the type decides whether a resolver may fall through to another backend — and falling
+      // through on a missing record would be wrong even if there were a fallback to fall to:
+      // a work id names one record, so there is nothing to substitute to.
+      const message = `OpenAlex lookup failed for work "${id}": ${res.status} ${res.statusText}.${httpHint(SERVICE, res.status, 'record')}`;
+      throw res.status === 404 ? new Error(message) : new BackendUnavailableError(SERVICE, message);
     }
     const body = await readBodyOrUnavailable(SERVICE, res, `a lookup of work "${id}"`);
     assertApiBody(SERVICE, body, `a lookup of OpenAlex work "${id}"`);

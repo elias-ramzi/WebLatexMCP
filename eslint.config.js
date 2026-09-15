@@ -30,6 +30,10 @@ export default tseslint.config(
     // own, unrelated `NETWORK_TIMEOUT_MS` for its reachability probe, and nothing reports that
     // one back to a caller. The hazard is specific to the clients whose transport errors
     // `transportReason` words.
+    //
+    // The scope is three LITERAL paths, and nothing points back here from a backend file: **a
+    // fourth backend must be added to this list by hand**, or it ships outside every rule below
+    // and the drift they exist to catch goes uncaught in the one file nobody thought to check.
     files: ['src/services/dblp.ts', 'src/services/crossref.ts', 'src/services/openalex.ts'],
     rules: {
       'no-restricted-syntax': [
@@ -52,6 +56,28 @@ export default tseslint.config(
             'Pass the shared REQUEST_TIMEOUT_MS (from ./referenceBackend.js) to ' +
             'AbortSignal.timeout — transportReason reports that constant, so any other value ' +
             'makes the timeout message lie.',
+        },
+        {
+          // And this one pins the hazard arriving under a different NAME. Both rules above are
+          // written around `AbortSignal.timeout`, so the pre-17.3 idiom that predates it —
+          // `const c = new AbortController(); setTimeout(() => c.abort(), 20_000);` — walks past
+          // them reporting zero problems while reproducing the drift exactly: a timeout applied
+          // here, a different one reported by transportReason. It is also the copy a contributor
+          // is likeliest to paste, being what every older fetch-with-timeout snippet on the web
+          // still shows. A blanket ban is the honest shape of the rule: a reference backend
+          // issues one request and awaits it, so it has no legitimate use for a timer at all,
+          // and "no setTimeout in these three files" needs no exception carved into it.
+          // Both spellings: a bare `setTimeout(...)` and a qualified `globalThis.setTimeout(...)`
+          // (or `global.`/`window.`). The name-bound selector alone let the qualified form through,
+          // which is not a hypothetical — it is one keystroke from the form it does catch.
+          selector:
+            "CallExpression[callee.name='setTimeout'], CallExpression[callee.property.name='setTimeout']",
+          message:
+            'Do not hand-roll a request timeout with setTimeout + AbortController — pass the ' +
+            'shared REQUEST_TIMEOUT_MS (from ./referenceBackend.js) to AbortSignal.timeout ' +
+            'instead, since transportReason reports that constant and any separately applied ' +
+            'delay makes the timeout message lie. A reference backend has no other use for a ' +
+            'timer.',
         },
       ],
     },

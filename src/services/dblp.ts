@@ -230,10 +230,15 @@ export class DblpService implements ReferenceBackend {
       `BibTeX for key "${key}"`,
     );
     if (!res.ok) {
-      throw new BackendUnavailableError(
-        SERVICE,
-        `DBLP returned ${res.status} ${res.statusText} for key "${key}".${httpHint(SERVICE, res.status, 'record')}`,
-      );
+      // A 404 here is the backend ANSWERING — this key names no record — which is exactly what
+      // `httpHint` says below and what `BackendUnavailableError`'s own doc promises it is never
+      // thrown for. Every other non-OK status is the backend failing to answer, and stays
+      // substitutable. The message is identical either way; only the type differs, because only
+      // the type decides whether a resolver may fall through to another backend — and falling
+      // through on a missing record would be wrong even if there were a fallback to fall to:
+      // a key names one record in one backend, so there is nothing to substitute to.
+      const message = `DBLP returned ${res.status} ${res.statusText} for key "${key}".${httpHint(SERVICE, res.status, 'record')}`;
+      throw res.status === 404 ? new Error(message) : new BackendUnavailableError(SERVICE, message);
     }
     const text = (await readBodyOrUnavailable(SERVICE, res, `BibTeX for key "${key}"`)).trim();
     assertApiBody(SERVICE, text, `a BibTeX request for key "${key}"`);

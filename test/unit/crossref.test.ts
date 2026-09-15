@@ -1,6 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { CrossrefService, type FetchResponse } from '../../src/services/crossref.js';
-import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
+import {
+  BackendUnavailableError,
+  REQUEST_TIMEOUT_MS,
+} from '../../src/services/referenceBackend.js';
 import { getServerVersion } from '../../src/lib/version.js';
 import { readFileSync } from 'node:fs';
 
@@ -314,10 +317,18 @@ describe('CrossrefService.fetchBibtex', () => {
   });
 
   it('surfaces a non-OK HTTP response as unavailable', async () => {
-    const crossref = new CrossrefService(() => Promise.resolve(fail(404, 'Not Found')));
-    await expect(crossref.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+    // The unavailable assertion moved off the 404 and onto a 500: a 404 here names a record
+    // Crossref says it does not have, which is the backend ANSWERING, so it is now a plain
+    // Error — see "a 404 addressing a RECORD is Crossref answering" below. Every other non-OK
+    // status is still the backend failing to answer. The 404's own status text is still pinned
+    // here, since that half of the message is unchanged.
+    const down = new CrossrefService(() => Promise.resolve(fail(500, 'Internal Error')));
+    await expect(down.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
       BackendUnavailableError,
     );
+    await expect(down.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/500 Internal Error/);
+
+    const crossref = new CrossrefService(() => Promise.resolve(fail(404, 'Not Found')));
     await expect(crossref.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/404 Not Found/);
   });
 
@@ -545,5 +556,86 @@ describe('a well-enveloped body whose ELEMENTS are malformed is unavailable, not
       Promise.resolve(ok(JSON.stringify({ message: { items: [] } }))),
     );
     await expect(none.search('x')).resolves.toEqual([]);
+  });
+});
+
+/**
+ * The `init` the DEFAULT fetch arm hands the global `fetch`. Declared here rather than reaching
+ * for a DOM `RequestInit`: the assertion below is only about the two fields this client sets.
+ */
+type FetchInit = { headers?: Record<string, string>; signal?: AbortSignal };
+
+describe('the DEFAULT fetch arm attaches the shared request timeout', () => {
+  // Every other test in this file INJECTS a fetchImpl, so the constructor's default arm — the
+  // only code that ever attaches `signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)`, and the arm
+  // `src/context.ts` actually runs in production — never executed under test at all. Deleting
+  // the signal (and `timeoutSignal` with it) left the whole suite green while `transportReason`
+  // went on telling users "the request timed out after 15s" about a wait that would never end.
+  // The eslint rule over this file pins the constant's NAME and `AbortSignal.timeout`'s
+  // argument, so it catches a renamed or drifting value — it cannot see a request that passes
+  // no signal at all. This can.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('passes AbortSignal.timeout(REQUEST_TIMEOUT_MS) to fetch on a search', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    const fetchSpy = vi.fn((_url: string, _init?: FetchInit) =>
+      Promise.resolve(ok(JSON.stringify({ message: { items: [] } }))),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    // No fetchImpl: this is the arm nothing else in the suite reaches.
+    await new CrossrefService().search('x');
+
+    // Asserting the SPY is the half that pins the DURATION — a timeout cannot be read back off
+    // an AbortSignal, so `toBeInstanceOf(AbortSignal)` alone would pass on any value at all.
+    expect(timeoutSpy).toHaveBeenCalledWith(REQUEST_TIMEOUT_MS);
+    const signal = timeoutSpy.mock.results[0]?.value as AbortSignal | undefined;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    // And asserting the init is the half that pins that the signal is actually ATTACHED: a
+    // `timeoutSignal()` computed and dropped on the floor would satisfy the spy alone.
+    expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBe(signal);
+    // The polite-pool header still rides along on the same init — the signal is added to it,
+    // not substituted for it.
+    expect(fetchSpy.mock.calls[0]?.[1]?.headers?.['User-Agent']).toContain('web-latex-mcp/');
+  });
+});
+
+describe('a 404 addressing a RECORD is Crossref answering, not Crossref being down', () => {
+  // `BackendUnavailableError` is documented as "never thrown for a caller error (e.g. an
+  // invalid record key)", and `httpHint` says in as many words that "a 404 is the backend
+  // answering, not the backend being down" — yet the record path threw the unavailable type for
+  // every non-OK status, 404 included, then explained it with "no record exists under this key".
+  // Harmless only while `ReferenceResolver.fetchBibtex` has no fallback; the moment one is added
+  // the resolver would substitute on it — and substituting is wrong here by design, since a DOI
+  // names one record and there is nothing to substitute to.
+  it('throws a PLAIN Error for a 404 on fetchBibtex', async () => {
+    const missing = new CrossrefService(() => Promise.resolve(fail(404, 'Not Found')));
+    await expect(missing.fetchBibtex('10.1109/CVPR.2016.90')).rejects.not.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+    // Beside the type, so a refactor cannot satisfy the type check while losing the wording.
+    await expect(missing.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(
+      /no record exists under this key/,
+    );
+  });
+
+  it('but a 500 on the same path stays unavailable — the value just outside', async () => {
+    const down = new CrossrefService(() => Promise.resolve(fail(500, 'Server Error')));
+    await expect(down.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+    await expect(down.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(/500 Server Error/);
+  });
+
+  // CONTROL — passes before and after this change, deliberately. A search names no record, so a
+  // 404 there is a wrong base URL or a changed path: the backend genuinely failing to answer,
+  // and substitutable. Kept so the record-path change cannot be over-applied to searches.
+  it('CONTROL: a 404 on a SEARCH stays a substitutable failure', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(fail(404, 'Not Found')));
+    await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
+    await expect(svc.search('x')).rejects.toThrow(/404 Not Found/);
   });
 });
