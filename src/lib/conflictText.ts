@@ -1,9 +1,12 @@
-import type { ConflictReport, RemoteCommit } from '../services/gitService.js';
+import type { ConflictFileDetail, ConflictReport, RemoteCommit } from '../services/gitService.js';
 import type { ConflictHunk } from './conflictParser.js';
 import {
   planConflictPayload,
   renderElidedHunkSpans,
   sideElisionHint,
+  CONFLICT_MAX_COMMITS,
+  CONFLICT_MAX_COMMIT_FILES,
+  type ConflictFilePlan,
   type ConflictHunksPartPlan,
   type ConflictPartPlan,
   type ConflictPayloadPlan,
@@ -31,6 +34,24 @@ function planFor(report: ConflictReport, opts?: { detail?: 'auto' | 'full' }): C
     detail: opts?.detail ?? 'auto',
     refs: refsOf(report),
   });
+}
+
+/**
+ * Guard shared by `renderConflictText` and `buildConflictFilePayload`: both index
+ * `plan.files[i]` alongside `report.files[i]` under the assumption that the plan was built
+ * FROM this exact report (in order) — a caller-supplied `plan` (see `renderConflictText`'s
+ * `opts.plan`) could in principle be stale or built from a different report. Indexing past that
+ * silently would render one file's plan (budget decisions, elision flags) against another
+ * file's content — worse than a crash, since nothing about the output would look wrong. Throws
+ * naming the index and both paths so the mismatch is obvious rather than a subtly wrong render.
+ */
+function assertPlanMatchesFile(i: number, fp: ConflictFilePlan, f: ConflictFileDetail): void {
+  if (fp.path !== f.path) {
+    throw new Error(
+      `conflict payload plan does not match the report at index ${i}: plan path "${fp.path}" ` +
+        `!== report path "${f.path}"`,
+    );
+  }
 }
 
 /**
@@ -106,12 +127,22 @@ export function renderHunksBlock(hunks: ConflictHunk[], part: ConflictHunksPartP
   return `overlap:\n${renderHunkMarkers(hunks)}`;
 }
 
+/**
+ * Render a {@link ConflictReport} into the plain text of the tool result.
+ *
+ * `opts.plan`, when given, is used VERBATIM — no re-planning happens. This exists so `push.ts`
+ * can call `planConflictPayload` exactly once and pass the SAME plan object to both this
+ * function and `buildConflictFilePayload`, making the "both channels are built from one
+ * decision" invariant hold by construction (one plan, two renderers) rather than by relying on
+ * `planConflictPayload` being deterministic across two separate calls. Omit `opts.plan` to plan
+ * from `report` here, exactly as before.
+ */
 export function renderConflictText(
   summary: string,
   report: ConflictReport,
-  opts?: { detail?: 'auto' | 'full' },
+  opts?: { detail?: 'auto' | 'full'; plan?: ConflictPayloadPlan },
 ): string {
-  const plan = planFor(report, opts);
+  const plan = opts?.plan ?? planFor(report, opts);
   const out: string[] = [summary, '', report.guidance, ''];
   out.push(`remoteHead: ${report.remoteHead} (${report.remoteHead.slice(0, 8)})`);
   out.push('Pass remoteHead back as `expectedRemoteHead` when you resolve.');
@@ -119,10 +150,15 @@ export function renderConflictText(
     out.push(`mergeBase: ${report.mergeBase} (${report.mergeBase.slice(0, 8)})`);
   }
   if (report.remoteCommits.length) {
+    // Under conflictDetail: "full", structuredContent.remoteCommits DOES hold every commit (see
+    // push.ts's safePushToolResult), so the default "(see structuredContent)" hint is the more
+    // useful true statement there. Under "auto" (the default, opts.detail unset), that field is
+    // itself capped, so point at status.behindCommits instead — see CONFLICT_COMMITS_MORE_HINT.
+    const moreHint = opts?.detail === 'full' ? undefined : CONFLICT_COMMITS_MORE_HINT;
     out.push(
       '',
       `Landed upstream (${report.remoteCommits.length} commit(s)):`,
-      ...renderCommitLines(report.remoteCommits),
+      ...renderCommitLines(report.remoteCommits, { moreHint }),
     );
   }
   out.push(
@@ -137,6 +173,7 @@ export function renderConflictText(
   for (let i = 0; i < plan.files.length; i++) {
     const f = report.files[i]!;
     const fp = plan.files[i]!;
+    assertPlanMatchesFile(i, fp, f);
     out.push('', fileHeaderLine(f.path));
     if (f.hunks.length || !fp.hunks.included) out.push(renderHunksBlock(f.hunks, fp.hunks));
     // Whether THIS file's hunks block is actually showing full overlap markers right now — see
@@ -226,6 +263,7 @@ export function buildConflictFilePayload(
   // cap gets no entry here at all, only in the report's own (uncapped) `conflictPaths`.
   return plan.files.map((fp, i) => {
     const f = report.files[i]!;
+    assertPlanMatchesFile(i, fp, f);
     // See `renderConflictText`'s identical line — kept in sync with the text channel so both
     // select the same hint for `base` (see `sideElisionHint`'s doc comment).
     const hunksRendered = f.hunks.length > 0 && fp.hunks.included;
@@ -262,19 +300,39 @@ export function buildConflictFilePayload(
   });
 }
 
+/** Default `moreHint` for `renderCommitLines`'s trailing "… N more commit(s)" line — correct for
+ * every caller whose OWN structuredContent field carrying these commits stays uncapped
+ * (`renderRebasedOver`'s `rebasedOver`, `status`'s `behindCommits`/`aheadCommits`). The conflict
+ * text overrides it (see {@link CONFLICT_COMMITS_MORE_HINT}) because that caller's
+ * `structuredContent.remoteCommits` is, unlike those, itself capped — see `push.ts`'s
+ * `capRemoteCommits`. */
+const DEFAULT_COMMITS_MORE_HINT = '(see structuredContent)';
+
+/** `moreHint` for the "Landed upstream" block in `renderConflictText`: pointing at
+ * `structuredContent` would be misleading there, since `structuredContent.remoteCommits` is
+ * ITSELF capped at `CONFLICT_MAX_COMMITS` (`capRemoteCommits` below, applied by `push.ts`) — unlike every other
+ * caller of `renderCommitLines`, whose structured field lists every commit. `status.behindCommits`
+ * is genuinely uncapped: after a conflict aborts the rebase, the clone is back at its pre-push
+ * state, so `status` still sees (and lists) every commit the remote gained. */
+const CONFLICT_COMMITS_MORE_HINT =
+  '(see status.behindCommits — the clone is back at its pre-push state, so status lists them all)';
+
 /**
  * Render commits (newest first) as text lines: `  <sha8> <subject>`, then each file the commit
  * touched as `      +<added>/-<removed> <path>` (capped at `maxFiles`, past which a "… N more
- * file(s)" line stands in), and past `maxCommits` a trailing "… N more commit(s)" line pointing
- * at structuredContent for the rest. Shared by `renderRebasedOver` and the "Landed upstream" block
- * below, and by `status`'s rendering of the same shape.
+ * file(s)" line stands in), and past `maxCommits` a trailing "… N more commit(s) <moreHint>" line.
+ * Shared by `renderRebasedOver` and the "Landed upstream" block below, and by `status`'s rendering
+ * of the same shape. `maxCommits`/`maxFiles` default to `CONFLICT_MAX_COMMITS`/
+ * `CONFLICT_MAX_COMMIT_FILES` (`conflictBudget.ts`) — named there so the structured channel's cap
+ * (`capRemoteCommits` below, applied by `push.ts`) cannot drift from what this text renderer has always capped at.
  */
 export function renderCommitLines(
   commits: RemoteCommit[],
-  opts?: { maxCommits?: number; maxFiles?: number },
+  opts?: { maxCommits?: number; maxFiles?: number; moreHint?: string },
 ): string[] {
-  const maxCommits = opts?.maxCommits ?? 20;
-  const maxFiles = opts?.maxFiles ?? 5;
+  const maxCommits = opts?.maxCommits ?? CONFLICT_MAX_COMMITS;
+  const maxFiles = opts?.maxFiles ?? CONFLICT_MAX_COMMIT_FILES;
+  const moreHint = opts?.moreHint ?? DEFAULT_COMMITS_MORE_HINT;
   const out: string[] = [];
   for (const c of commits.slice(0, maxCommits)) {
     out.push(`  ${c.hash.slice(0, 8)} ${c.message}`);
@@ -286,9 +344,42 @@ export function renderCommitLines(
     }
   }
   if (commits.length > maxCommits) {
-    out.push(`  … ${commits.length - maxCommits} more commit(s) (see structuredContent)`);
+    out.push(`  … ${commits.length - maxCommits} more commit(s) ${moreHint}`);
   }
   return out;
+}
+
+/** One `RemoteCommit` as capped by {@link capRemoteCommits}: `files` truncated to
+ * `CONFLICT_MAX_COMMIT_FILES`, with `filesOmitted` present (and only then) when that cut something. */
+export interface CappedRemoteCommit extends RemoteCommit {
+  filesOmitted?: number;
+}
+
+export interface CappedRemoteCommits {
+  /** At most `CONFLICT_MAX_COMMITS` entries, newest first (same order as the input). */
+  commits: CappedRemoteCommit[];
+  /** How many commits beyond `CONFLICT_MAX_COMMITS` were dropped entirely — 0 when nothing was. */
+  omitted: number;
+}
+
+/**
+ * Cap a conflict's `remoteCommits` for `structuredContent` the same way `renderCommitLines` has
+ * always capped them for the text channel: at most `CONFLICT_MAX_COMMITS` commits, each with at
+ * most `CONFLICT_MAX_COMMIT_FILES` files. Never mutates `commits` or its entries — an untouched
+ * commit is returned as-is; a commit whose files get cut is a fresh object carrying the true
+ * `filesOmitted` count, never a truncated lie about how many files it touched.
+ */
+export function capRemoteCommits(commits: RemoteCommit[]): CappedRemoteCommits {
+  const kept = commits.slice(0, CONFLICT_MAX_COMMITS);
+  const capped: CappedRemoteCommit[] = kept.map((c) => {
+    if (c.files.length <= CONFLICT_MAX_COMMIT_FILES) return c;
+    return {
+      ...c,
+      files: c.files.slice(0, CONFLICT_MAX_COMMIT_FILES),
+      filesOmitted: c.files.length - CONFLICT_MAX_COMMIT_FILES,
+    };
+  });
+  return { commits: capped, omitted: Math.max(0, commits.length - CONFLICT_MAX_COMMITS) };
 }
 
 /** `remote-moved` text: what landed upstream, without calling it "rebased over" — nothing was replayed onto it. */

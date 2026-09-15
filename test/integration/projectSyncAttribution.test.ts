@@ -16,7 +16,7 @@ import type { ServerConfig } from '../../src/types.js';
  * `LocalChangesOverwriteError` names a tracked file blocking the fast-forward, the tool used to
  * attribute EVERY named path to a live peer without first subtracting this session's own edits —
  * so a file this very session had just edited (via `edit_file`) was reported as "not this
- * session's", which is false. The fix mirrors `push.ts`'s `guardPeerWork`: subtract this session's
+ * session's", which is false. The fix mirrors `guardPeerWork` (`src/lib/peerRefusal.ts`): subtract this session's
  * own shadow paths before attributing, and append nothing when nothing foreign remains.
  *
  * Harness copied from test/integration/pushAttribution.test.ts (real MCP clients, a local bare
@@ -164,6 +164,47 @@ describe('project_sync pull-refusal attribution', () => {
     const after = err.slice(peerLineIdx);
     expect(after).toContain('discard');
     expect(after).toMatch(/no ownership guard/);
+  });
+
+  it('decorates the pull-worded untracked refusal too, when a live peer owns the new file', async () => {
+    // `enrichPullRefusal` used to decorate only `LocalChangesOverwriteError` (a tracked file's
+    // local modification). `syncPull` also throws a pull-worded `UntrackedOverwriteError` when the
+    // incoming fast-forward would overwrite a file that already sits untracked in the working
+    // tree — and an untracked file CAN be a live peer's: `write_file` of a brand-new path puts it
+    // straight into that peer's shadow. Before the fix this refusal reached the caller plain, with
+    // no attribution at all.
+    const NEW_REL = 'sections/new.tex';
+    const { remote, session } = await setup();
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // beta writes a brand-new file through the server — its shadow claims it, and it sits
+    // untracked in the shared clone.
+    await call(beta, 'write_file', { path: NEW_REL, content: 'Beta wrote this section.\n' });
+
+    // The remote gains a commit ADDING a file at the same path — the untracked-overwrite
+    // collision `syncPull`'s ff-only merge refuses.
+    await pushCommit(remote, { [NEW_REL]: 'Remote wrote this section.\n' }, 'remote adds new.tex');
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    // The pull-worded UntrackedOverwriteError's own opener and the colliding path.
+    expect(err).toContain('The pull was refused; nothing changed');
+    expect(err).toContain(NEW_REL);
+    // Attributed to the live peer that owns it.
+    expect(err).toContain('beta\\" owns');
+
+    // The composed closing (scope "all" advice with the discard retraction) appears after the
+    // peer-ownership line, worded in project_sync's own (pull) vocabulary.
+    const peerLineIdx = err.indexOf('beta\\" owns');
+    expect(peerLineIdx).toBeGreaterThanOrEqual(0);
+    const after = err.slice(peerLineIdx);
+    expect(after).toContain('scope \\"all\\"');
+    expect(after).toMatch(/no ownership guard/);
+    // Fix 2: the closing no longer tells the caller to "sync again" — a committed collision makes
+    // syncPull report `diverged`, so pull can never land it; push is the route that goes forward.
+    expect(after).toContain('Then push');
+    expect(after).not.toContain('Then sync again.');
   });
 
   it('falls back to the plain typed refusal when the peer-attribution enrichment itself fails', async () => {

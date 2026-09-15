@@ -80,6 +80,25 @@ export const CONFLICT_MAX_FILES = 20;
 export const CONFLICT_MAX_SPANS = 20;
 
 /**
+ * Cap on how many of a conflict's `remoteCommits` ever get a detailed entry in EITHER channel —
+ * `renderCommitLines`'s (`conflictText.ts`) own long-standing default for the text channel,
+ * pulled out and named so `structuredContent.remoteCommits` (`push.ts`, via `capRemoteCommits`)
+ * cannot drift from what the text channel already caps at. Commits beyond this stay uncapped in
+ * `status.behindCommits`, since the clone is back at its pre-push state after a conflict aborts
+ * the rebase — that field lists every one of them.
+ */
+export const CONFLICT_MAX_COMMITS = 20;
+
+/**
+ * Cap on how many files ONE remote commit's `files` list shows in either channel — also
+ * `renderCommitLines`'s existing text-channel default, named for the same reason as
+ * `CONFLICT_MAX_COMMITS`. A commit past this cap still names how many more via `filesOmitted`
+ * (structured) or a "… N more file(s)" line (text); the full list is one `diff` call away
+ * (`ref: "<hash>~1..<hash>"`).
+ */
+export const CONFLICT_MAX_COMMIT_FILES = 5;
+
+/**
  * Literal characters `renderHunkMarkers` (`conflictText.ts`) wraps around ONE hunk's `local`/
  * `remote` content in the text channel — `<<<<<<< ours (lines X-Y)` / `=======` /
  * `>>>>>>> theirs` plus the newlines joining them to the content — EXCLUDING the digits of
@@ -489,6 +508,10 @@ export function planConflictPayload(
   for (const f of cappedFiles) {
     budgetRemaining -= FILE_HEADER_OVERHEAD + f.path.length;
   }
+  // True when the mandatory, unconditional header charge alone already exhausted the budget —
+  // before any hunk or side was even considered. Recorded here (rather than inferred later from
+  // `aggregateBudgetExceeded`) because it names a distinct cause: long paths, not a lot of content.
+  const headersExhaustedBudget = budgetRemaining <= 0;
 
   let sideCapExceeded = false;
   let aggregateBudgetExceeded = false;
@@ -496,29 +519,39 @@ export function planConflictPayload(
   // Pass 1: hunks, in file order, get first claim on the (rendered-size) budget. A file with NO
   // hunks (a pure add/delete conflict) is never "elided" — cost is 0 either way, and there is
   // nothing to report cutting — even once budgetRemaining has already gone negative from mandatory
-  // headers alone.
-  const hunksPlans = new Map<string, ConflictHunksPartPlan>();
+  // headers alone. Indexed by POSITION (not a Map keyed by path) so pass 2 below can pair each
+  // file with its hunks plan without a lookup that could silently miss a duplicate path.
+  const hunksPlans: ConflictHunksPartPlan[] = [];
   for (const f of cappedFiles) {
     const chars = hunksChars(f.hunks);
     const cost = hunksRenderCost(f.hunks);
     const spans = hunkSpans(f.hunks);
     if (f.hunks.length === 0 || cost <= budgetRemaining) {
       budgetRemaining -= cost;
-      hunksPlans.set(f.path, { included: true, chars, count: f.hunks.length, spans });
+      hunksPlans.push({ included: true, chars, count: f.hunks.length, spans });
     } else {
       aggregateBudgetExceeded = true;
       budgetRemaining -= hunksElisionCost(f.hunks.length, chars, spans);
-      hunksPlans.set(f.path, { included: false, chars, count: f.hunks.length, spans });
+      hunksPlans.push({ included: false, chars, count: f.hunks.length, spans });
     }
   }
 
   // Pass 2: sides, in file order and base/ours/theirs order within a file, against what's left.
-  const filePlans: ConflictFilePlan[] = cappedFiles.map((f) => {
+  const filePlans: ConflictFilePlan[] = cappedFiles.map((f, i) => {
+    const hunksPlan = hunksPlans[i];
+    if (!hunksPlan) {
+      // Cannot happen: pass 1 above pushes exactly one entry per cappedFiles element, in order —
+      // this is a programming error, not a runtime input the caller could trigger.
+      throw new Error(
+        `planConflictPayload: no hunks plan recorded for file ${i} (${f.path}) — pass 1 and ` +
+          'pass 2 must iterate the same cappedFiles array in the same order',
+      );
+    }
     // Whether THIS file's hunks block is actually showing full overlap markers on screen — the
     // hunks pass above already decided this, so the no-merge-base hint (base only) can be honest
     // about it instead of guessing. `hunksRendered` is false for an empty `hunks: []` too (that
     // case is always `included: true` trivially, but there is nothing to point at either).
-    const hunksRendered = f.hunks.length > 0 && hunksPlans.get(f.path)!.included;
+    const hunksRendered = f.hunks.length > 0 && hunksPlan.included;
     const sidePlans = {} as Record<ConflictSideKey, ConflictPartPlan>;
     for (const key of SIDE_KEYS) {
       const content = f[key];
@@ -548,7 +581,7 @@ export function planConflictPayload(
     }
     return {
       path: f.path,
-      hunks: hunksPlans.get(f.path)!,
+      hunks: hunksPlan,
       base: sidePlans.base,
       ours: sidePlans.ours,
       theirs: sidePlans.theirs,
@@ -576,6 +609,23 @@ export function planConflictPayload(
   // cut individually by CONFLICT_SIDE_CAP, never touches the aggregate budget at all, and saying
   // it did would send a caller looking for a cause that isn't there.
   const reasons: string[] = [];
+  if (headersExhaustedBudget) {
+    // Distinct cause, named FIRST: the mandatory, unconditional per-file header charge alone
+    // (long paths) already drove the budget to zero or below, before any hunk or side was even
+    // considered — `aggregateBudgetExceeded` below is technically true too in this case (every
+    // subsequent allocation sees a non-positive budget), but blaming only "the aggregate budget
+    // was reached" would hide that the cause here is path length, not content.
+    // Name the charge that actually fired — header boilerplate plus every path — not the path
+    // characters alone, or the number can read as smaller than the budget it claims to have used.
+    const totalHeaderChars = cappedFiles.reduce(
+      (sum, f) => sum + FILE_HEADER_OVERHEAD + f.path.length,
+      0,
+    );
+    reasons.push(
+      `the ${cappedFiles.length}-file headers alone (${totalHeaderChars} chars of headers and paths) ` +
+        `consumed the ${CONFLICT_CONTENT_BUDGET}-char budget, so no content could be inlined`,
+    );
+  }
   if (fileCapExceeded) {
     reasons.push(
       `only the first ${CONFLICT_MAX_FILES} of ${files.length} conflicted files are detailed ` +

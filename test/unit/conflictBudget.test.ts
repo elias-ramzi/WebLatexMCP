@@ -399,4 +399,51 @@ describe('planConflictPayload', () => {
       expect(plan.note!.startsWith('.')).toBe(false);
     });
   });
+
+  describe('a distinct note reason when mandatory headers alone exhaust the budget', () => {
+    const bigPath = (i: number): string => `${'x'.repeat(1100)}-${i}.tex`;
+
+    it('20 files with 1,100-char paths + one small hunk each: note starts with the headers reason and still lists the aggregate reason', () => {
+      const files = Array.from({ length: CONFLICT_MAX_FILES }, (_, i) =>
+        file({ path: bigPath(i), hunks: [hunk(1, 1)], base: null, ours: null, theirs: null }),
+      );
+      const plan = planConflictPayload(files, { detail: 'auto', refs: REFS });
+
+      expect(plan.truncated).toBe(true);
+      expect(plan.note).toBeDefined();
+      // First reason names the real cause (long paths), not just "the budget was reached".
+      expect(plan.note!.startsWith(`the ${CONFLICT_MAX_FILES}-file headers alone`)).toBe(true);
+      expect(plan.note).toMatch(/chars of headers and paths\) consumed the 20000-char budget/);
+      // The aggregate reason still fires too (the hunks genuinely couldn't fit either) and is
+      // still listed — the new reason supplements, it does not replace.
+      expect(plan.note).toMatch(new RegExp(`${CONFLICT_CONTENT_BUDGET}-char aggregate`));
+    });
+
+    it('20 short-path files with a normal budget overrun: note does NOT mention headers', () => {
+      const files = Array.from({ length: 10 }, (_, i) =>
+        file({
+          path: `f${i}.tex`,
+          base: 'b'.repeat(3000),
+          ours: 'o'.repeat(3000),
+          theirs: 't'.repeat(3000),
+          hunks: [],
+        }),
+      );
+      const plan = planConflictPayload(files, { detail: 'auto', refs: REFS });
+
+      expect(plan.truncated).toBe(true);
+      expect(plan.note).toBeDefined();
+      expect(plan.note).not.toMatch(/headers alone/);
+    });
+
+    it('long paths but no content at all (null sides, no hunks): truncated false, no note', () => {
+      const files = Array.from({ length: CONFLICT_MAX_FILES }, (_, i) =>
+        file({ path: bigPath(i), hunks: [], base: null, ours: null, theirs: null }),
+      );
+      const plan = planConflictPayload(files, { detail: 'auto', refs: REFS });
+
+      expect(plan.truncated).toBe(false);
+      expect(plan.note).toBeUndefined();
+    });
+  });
 });

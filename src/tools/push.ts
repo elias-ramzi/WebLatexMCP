@@ -10,54 +10,16 @@ import {
   renderLandedUpstream,
   renderRebasedOver,
   buildConflictFilePayload,
+  capRemoteCommits,
 } from '../lib/conflictText.js';
 import {
   planConflictPayload,
   CONFLICT_MAX_FILES,
   CONFLICT_MAX_SPANS,
+  CONFLICT_MAX_COMMITS,
+  CONFLICT_MAX_COMMIT_FILES,
 } from '../lib/conflictBudget.js';
-import { toPosix } from '../lib/paths.js';
-import { attributePeers, collectPeerShadows, renderPeerRefusal } from '../lib/peerAttribution.js';
-import { foldCase } from '../lib/caseFold.js';
-
-/**
- * Refuse to push while a live sibling session has uncommitted work in the shared clone.
- *
- * A push has to rebase, and a rebase needs a clean tree — so pushing here would mean either
- * sweeping that session's half-finished paragraph into our commit or rewriting the tree
- * underneath it. Neither is ours to do, so we stop and name who to wait for.
- *
- * The refusal attributes each disputed file to whichever live peer's shadow lists it (see
- * `attributePeers` in `src/lib/peerAttribution.ts`) and dates each peer's last write. A file no
- * live peer owns — edited outside this server, or left behind by a session that has since exited
- * — is named as unowned rather than pinned on anyone, but it still blocks the push as long as any
- * live peer exists: this guard is not owner-aware about *whether* to refuse, only about how it
- * explains the refusal.
- */
-async function guardPeerWork(ctx: AppContext, id: string, dir: string): Promise<void> {
-  const peers = await ctx.sessions.livePeers(id);
-  if (peers.length === 0) return;
-
-  const status = await ctx.git.status(dir);
-  const dirty = [...status.unstaged, ...status.untracked].map(toPosix);
-  if (dirty.length === 0) return;
-
-  // On a `core.ignorecase` clone git reports a dirty file in the index's spelling while a shadow
-  // key carries the spelling the session wrote it under; fold both the way git does there, and
-  // compare byte-for-byte everywhere else (the same rule `commit` scope "paths" applies).
-  const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
-  const mine = new Set((await ctx.shadows.changes(id)).map((c) => fold(c.path)));
-  const theirs = dirty.filter((p) => !mine.has(fold(p)));
-  if (theirs.length === 0) return;
-
-  const attribution = attributePeers(
-    theirs,
-    peers,
-    await collectPeerShadows(ctx.shadows, id, peers),
-    fold,
-  );
-  throw new Error(renderPeerRefusal(theirs, attribution, Date.now()));
-}
+import { guardPeerWork } from '../lib/peerRefusal.js';
 
 const conflictHunkSchema = z.object({
   startLine: z.number(),
@@ -140,6 +102,14 @@ const remoteCommitSchema = z.object({
       'Files the commit touched, with added/removed line counts — enough to see what a remote ' +
         '"Update on Overleaf." commit changed without a shell. For the content, use `diff` with ' +
         'ref: "<hash>~1..<hash>".',
+    ),
+  filesOmitted: z
+    .number()
+    .optional()
+    .describe(
+      `Files beyond the first ${CONFLICT_MAX_COMMIT_FILES} of this commit, not listed above — ` +
+        'diff with ref: "<hash>~1..<hash>" for the full list. Only present on a conflict result ' +
+        'with conflictDetail: "auto" (the default) when this commit touched more.',
     ),
 });
 
@@ -229,7 +199,24 @@ const outputSchema = {
   rebasedOnto: z.string().optional(),
   remoteHead: z.string().optional(),
   mergeBase: z.string().nullable().optional(),
-  remoteCommits: z.array(remoteCommitSchema).optional(),
+  remoteCommits: z
+    .array(remoteCommitSchema)
+    .optional()
+    .describe(
+      `On a conflict result with conflictDetail: "auto" (the default), capped at ${CONFLICT_MAX_COMMITS} ` +
+        `commits (each with at most ${CONFLICT_MAX_COMMIT_FILES} files, see \`filesOmitted\`) — see ` +
+        '`remoteCommitsOmitted` for how many more landed. Uncapped for conflictDetail: "full", and ' +
+        'uncapped on a successful push (rebasedOver).',
+    ),
+  remoteCommitsOmitted: z
+    .number()
+    .optional()
+    .describe(
+      `Commits beyond the ${CONFLICT_MAX_COMMITS} listed in \`remoteCommits\`, not present there — ` +
+        'status.behindCommits lists them all, since the clone is back at its pre-push state after a ' +
+        'conflict aborts the rebase. Present only on a conflict result with conflictDetail: "auto" ' +
+        'when something was actually omitted.',
+    ),
   conflictTruncated: z
     .boolean()
     .optional()
@@ -247,9 +234,11 @@ const outputSchema = {
 
 /**
  * Flatten a SafePushResult into the tool's flat structuredContent (remote redacted). A conflict's
- * per-file payload is bounded by `planConflictPayload` and shared verbatim with the text channel
- * (`renderConflictText` computes the same plan from the same `{ detail }`, deterministically) — so
- * `conflictDetail` decides once and both channels agree on what got cut.
+ * per-file payload is bounded by `planConflictPayload`, computed exactly once, and that same plan
+ * object is passed verbatim to both `buildConflictFilePayload` and `renderConflictText` — so
+ * `conflictDetail` decides once and both channels are asserted (`assertPlanMatchesFile`, file by
+ * file) to agree on what got cut, rather than each recomputing its own plan and trusting the two
+ * happen to match.
  */
 function safePushToolResult(
   res: SafePushResult,
@@ -268,8 +257,12 @@ function safePushToolResult(
   if (res.pushedSha) structured.pushedSha = res.pushedSha;
   if (res.rebasedOver) structured.rebasedOver = res.rebasedOver;
   if (res.remoteHead && !res.conflict) structured.remoteHead = res.remoteHead;
+  // Planned once here and passed VERBATIM to renderConflictText below (opts.plan) — the file
+  // payload and the commit list are each decided exactly once, so text and structuredContent can
+  // never disagree about what got cut.
+  let plan: ReturnType<typeof planConflictPayload> | undefined;
   if (res.conflict) {
-    const plan = planConflictPayload(res.conflict.files, {
+    plan = planConflictPayload(res.conflict.files, {
       detail: conflictDetail,
       refs: { mergeBase: res.conflict.mergeBase, rebasedOnto: res.conflict.rebasedOnto },
     });
@@ -278,16 +271,25 @@ function safePushToolResult(
     structured.rebasedOnto = res.conflict.rebasedOnto;
     structured.remoteHead = res.conflict.remoteHead;
     structured.mergeBase = res.conflict.mergeBase;
-    structured.remoteCommits = res.conflict.remoteCommits;
+    // "full" is the escape hatch for a caller that wants the complete payload and can take the
+    // size — lifting the per-file caps but leaving remoteCommits capped would be inconsistent.
+    if (conflictDetail === 'full') {
+      structured.remoteCommits = res.conflict.remoteCommits;
+    } else {
+      const cappedCommits = capRemoteCommits(res.conflict.remoteCommits);
+      structured.remoteCommits = cappedCommits.commits;
+      if (cappedCommits.omitted > 0) structured.remoteCommitsOmitted = cappedCommits.omitted;
+    }
     structured.conflictTruncated = plan.truncated;
   }
   // Put the full resolution payload in the model-visible text, not only structuredContent (which a
   // client may drop): per-file sides, the remote head to echo back, and what landed upstream.
-  const text = res.conflict
-    ? renderConflictText(res.summary, res.conflict, { detail: conflictDetail })
-    : res.status === 'remote-moved'
-      ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
-      : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
+  const text =
+    res.conflict && plan
+      ? renderConflictText(res.summary, res.conflict, { plan, detail: conflictDetail })
+      : res.status === 'remote-moved'
+        ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
+        : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
   return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
@@ -303,8 +305,11 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         'someone touched the same lines: it aborts the rebase (clone back to pre-push state, nothing ' +
         'half-merged) and returns status "conflict" with a per-file base/ours/theirs plus a marker ' +
         '`hunks` view, and top-level conflictPaths (every conflicted path, never capped or elided), ' +
-        'remoteHead, mergeBase, and remoteCommits (all in the result text, not just ' +
-        'structuredContent). By default (conflictDetail: "auto") that per-file payload is budgeted ' +
+        'remoteHead, mergeBase, and remoteCommits (capped by default at ' +
+        `${CONFLICT_MAX_COMMITS} commits/${CONFLICT_MAX_COMMIT_FILES} files each — ` +
+        'remoteCommitsOmitted says how many more landed, and status.behindCommits always lists ' +
+        'every one) (all in the result text, not just structuredContent). By default ' +
+        '(conflictDetail: "auto") that per-file payload is budgeted ' +
         'to fit in one tool result: hunks are allocated first, in file order, since they cannot be ' +
         'cheaply re-derived once the rebase aborts; base/ours/theirs are allocated next, in file ' +
         'order and base-then-ours-then-theirs, each individually capped so one huge side cannot ' +
@@ -354,7 +359,11 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         return await ctx.projectManager.runExclusive(id, async () => {
           await ctx.sessions.touch(id);
           await ctx.shadows.refresh(id, dir);
-          await guardPeerWork(ctx, id, dir);
+          await guardPeerWork(
+            { sessions: ctx.sessions, shadows: ctx.shadows, git: ctx.git },
+            id,
+            dir,
+          );
 
           if (resolutions && resolutions.length > 0) {
             if (mode === 'branch') {

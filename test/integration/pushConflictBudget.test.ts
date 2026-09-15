@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
@@ -9,7 +10,11 @@ import { createContext } from '../../src/context.js';
 import { createServer } from '../../src/server.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
-import { CONFLICT_SIDE_CAP, CONFLICT_MAX_FILES } from '../../src/lib/conflictBudget.js';
+import {
+  CONFLICT_SIDE_CAP,
+  CONFLICT_MAX_FILES,
+  CONFLICT_MAX_COMMITS,
+} from '../../src/lib/conflictBudget.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -30,6 +35,40 @@ function bigContent(lines: number): string {
   return (
     Array.from({ length: lines }, (_, i) => `line ${i} of the document body`).join('\n') + '\n'
   );
+}
+
+/**
+ * Push `count` commits to `remote` from a SINGLE reused clone (unlike `pushCommit`, which clones
+ * fresh per call — too slow for a loop of 25) so the remote gains a real, ordered commit history.
+ * Every commit but the last touches its own new, unique file (so it never overlaps with anything
+ * else); the last rewrites `finalRel` to `finalContent`, which is the one meant to collide with a
+ * local edit on the same file/line.
+ */
+async function pushManyRemoteCommits(
+  remote: FakeRemote,
+  count: number,
+  finalRel: string,
+  finalContent: string,
+): Promise<void> {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'ovl-pushmany-'));
+  try {
+    const git = simpleGit(tmp);
+    await git.clone(remote.url, tmp);
+    await git.addConfig('user.email', 'other@example.com');
+    await git.addConfig('user.name', 'Other');
+    await git.addConfig('core.autocrlf', 'false');
+    for (let i = 0; i < count - 1; i++) {
+      await writeFile(path.join(tmp, `note${i}.tex`), `note ${i}\n`);
+      await git.add('.');
+      await git.commit(`remote note ${i}`);
+    }
+    await writeFile(path.join(tmp, finalRel), finalContent);
+    await git.add('.');
+    await git.commit('remote edits line 10 (conflict)');
+    await git.push('origin', remote.branch);
+  } finally {
+    await rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 }
 
 describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
@@ -231,4 +270,112 @@ describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
     // Every path is still named at the top level, even though only some got a detailed block.
     for (let i = 0; i < TOTAL_FILES; i++) expect(text).toContain(`f${i}.tex`);
   });
+
+  it(
+    'caps structuredContent.remoteCommits at CONFLICT_MAX_COMMITS with remoteCommitsOmitted, ' +
+      'and the text points at status.behindCommits (follow-up to #68: remoteCommits was sent ' +
+      'verbatim, uncapped, on a conflict result)',
+    async () => {
+      // 25 real remote commits — comfortably exercises the cap (20) with 5 left over. Measured at
+      // ~7-8s total for this test on this machine; if it proves flaky-slow in CI, drop to 22 (still
+      // > CONFLICT_MAX_COMMITS) and note it here.
+      const TOTAL_REMOTE_COMMITS = 25;
+      const initial = { [REL]: 'alpha\nline 10 of the document body\nomega\n' };
+      const remote = await createFakeRemote(initial);
+      const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-pushbudget-commits-'));
+      cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
+      const dir = path.join(workspace, 'demo');
+      await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+      const config: ServerConfig = {
+        workspaceRoot: workspace,
+        sessionId: 'alpha',
+        projects: [{ id: 'demo', gitUrl: remote.url }],
+        defaultProject: 'demo',
+      };
+      const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test-commits', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      cleanups.push(() => client.close());
+
+      const editRes = await client.callTool({
+        name: 'edit_file',
+        arguments: {
+          path: REL,
+          edits: [{ oldString: 'line 10 of the document body', newString: 'line 10 LOCAL' }],
+        },
+      });
+      if (editRes.isError) throw new Error(`edit_file failed: ${JSON.stringify(editRes.content)}`);
+      const commitRes = await client.callTool({
+        name: 'commit',
+        arguments: { message: 'local edit line 10' },
+      });
+      if (commitRes.isError) throw new Error(`commit failed: ${JSON.stringify(commitRes.content)}`);
+
+      await pushManyRemoteCommits(
+        remote,
+        TOTAL_REMOTE_COMMITS,
+        REL,
+        'alpha\nline 10 REMOTE\nomega\n',
+      );
+
+      const res = await client.callTool({ name: 'push', arguments: { confirm: true } });
+      expect(res.isError).toBeFalsy();
+      const structured = res.structuredContent as {
+        status: string;
+        conflictPaths: string[];
+        remoteCommits: Array<{ hash: string; message: string; files: unknown[] }>;
+        remoteCommitsOmitted?: number;
+      };
+      expect(structured.status).toBe('conflict');
+      expect(structured.remoteCommits).toHaveLength(CONFLICT_MAX_COMMITS);
+      expect(structured.remoteCommitsOmitted).toBe(TOTAL_REMOTE_COMMITS - CONFLICT_MAX_COMMITS);
+      expect(structured.conflictPaths).toEqual([REL]);
+
+      // Pre-fix (remoteCommits sent verbatim, uncapped), this exact scenario's structuredContent
+      // measured 4100 characters; post-fix it must be smaller — proof the cap actually shrank the
+      // payload here, not just that the field exists.
+      const jsonSize = JSON.stringify(structured).length;
+      expect(jsonSize).toBeLessThan(4100);
+
+      const text = (res.content as Array<{ type: string; text?: string }>)
+        .map((c) => c.text ?? '')
+        .join('\n');
+      expect(text).toContain(
+        '(see status.behindCommits — the clone is back at its pre-push state, so status lists them all)',
+      );
+      expect(text).not.toContain('see structuredContent');
+
+      // The clone is back at its pre-push state after the aborted rebase — retry with
+      // conflictDetail: "full" re-runs the same rebase and re-conflicts, this time with the
+      // commit cap lifted: structuredContent.remoteCommits must hold every one of the 25 commits,
+      // with no remoteCommitsOmitted key and no per-commit filesOmitted, and the text's pointer
+      // must switch to "(see structuredContent)" since that field is now actually complete.
+      const fullRes = await client.callTool({
+        name: 'push',
+        arguments: { confirm: true, conflictDetail: 'full' },
+      });
+      expect(fullRes.isError).toBeFalsy();
+      const fullStructured = fullRes.structuredContent as {
+        status: string;
+        remoteCommits: Array<{ hash: string; message: string; filesOmitted?: number }>;
+        remoteCommitsOmitted?: number;
+      };
+      expect(fullStructured.status).toBe('conflict');
+      expect(fullStructured.remoteCommits).toHaveLength(TOTAL_REMOTE_COMMITS);
+      expect('remoteCommitsOmitted' in fullStructured).toBe(false);
+      for (const c of fullStructured.remoteCommits) {
+        expect('filesOmitted' in c).toBe(false);
+      }
+
+      const fullText = (fullRes.content as Array<{ type: string; text?: string }>)
+        .map((c) => c.text ?? '')
+        .join('\n');
+      expect(fullText).toContain('(see structuredContent)');
+      expect(fullText).not.toContain('status.behindCommits');
+    },
+    15000,
+  );
 });

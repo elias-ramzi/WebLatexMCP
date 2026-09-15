@@ -154,7 +154,8 @@ works and is still isolated, but it shows up to the others under a generated id.
 Every mutating operation takes a lock file beside the clone for the duration, on top
 of the in-process mutex. A session that crashes cannot release its lock, so a lock is
 reclaimed once its owning process is gone, or once it stops being refreshed. Callers
-wait rather than fail; only a genuinely stuck holder produces an error, and it names
+wait rather than fail for up to 30 seconds; a holder still busy past that (a long fetch)
+or a genuinely stuck one produces an error, and it names
 the session holding it.
 
 ### Committing only your own work
@@ -248,9 +249,10 @@ disputed set, each session's `owns`, the unowned line, and the closing's copy of
 The cap costs more here than in the conflict payload, because the refusal is an error
 and so has only a text channel — a dropped path is dropped from the response, not
 merely from one of two renderings of it. `status` is what makes that affordable: its
-`otherChanges` is the same disputed set, and its `activeSessions[].changes` is complete
-per session, both uncapped in `structuredContent` even though its own text shows five
-paths per peer. The refusal names them only when a cap actually fired, never as
+`otherChanges` is the same disputed set — staged, unstaged and untracked alike, so a
+path modified only in the index is not left out — and its `activeSessions[].changes` is
+complete per session, both uncapped in `structuredContent` even though its own text shows
+five paths per peer. The refusal names them only when a cap actually fired, never as
 boilerplate — and names them as a derivation rather than as two fields to go read.
 That is deliberate: there is no `unowned`-shaped field in `status`, and `otherChanges`
 is the whole disputed set, peer-owned files included, so feeding it to
@@ -260,9 +262,14 @@ are `otherChanges` minus every live session's `changes`, a null `changes` claimi
 everything, and the message says so. It also claims no more than that: `status` names
 every omitted path, among more besides, rather than reporting these lists back. The
 stronger claim holds for `push`, whose disputed set is built exactly as `otherChanges`
-is, but not for `project_sync`, whose blocking set is the tracked paths an incoming
-commit would overwrite — a strict subset no `status` field reproduces. A message two
+is, but not for `project_sync`, whose blocking set is the paths an incoming commit
+would overwrite, tracked or untracked — a strict subset no `status` field reproduces. A message two
 tools share may only assert what is true for both.
+
+`project_sync` takes the same per-project lock every mutating tool does, so a peer's
+write never interleaves with a fast-forward pull — and a peer waiting on that lock gives
+up after 30 seconds, so a sync that fetches for longer costs it one refused call rather
+than a silently interleaved one.
 
 Once past that peer guard — no live peer, or every live peer's work is already
 committed — the push still has to rebase, and git itself draws a further line:

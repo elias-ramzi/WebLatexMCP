@@ -153,7 +153,8 @@ function isPeerOwning(s: PeerAttribution): boolean {
 
 /**
  * The calling tool's own vocabulary for a composed closing: `push` is about to rebase and will
- * push again, `project_sync` is about to fast-forward-pull and will sync again. Only the framing
+ * push again; `project_sync` is a fast-forward pull that cannot land a local commit (a sync after
+ * committing only reports the histories as diverged), so it routes the caller to `push`. Only the framing
  * differs — which commit route applies to which group is a property of `commit`'s guards, not of
  * the caller, so that half is shared.
  */
@@ -299,8 +300,8 @@ export function renderPeerRefusal(
   //
   // It does not say `status` reports *these* lists, because that is only true for `push`, whose
   // `theirs` is built exactly as `otherChanges` is. `project_sync` renders the same line over the
-  // tracked paths an incoming commit would overwrite — a strict subset of `otherChanges`, and a
-  // set no `status` field reproduces. So the claim is the weaker true one: every omitted path is
+  // paths an incoming commit would overwrite, tracked or untracked — a strict subset of
+  // `otherChanges`, and a set no `status` field reproduces. So the claim is the weaker true one: every omitted path is
   // in there, among more besides.
   //
   // And it spells out a derivation rather than just naming the two fields, because `status` has

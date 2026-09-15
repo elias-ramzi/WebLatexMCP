@@ -4,7 +4,11 @@ import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
-import { GitService, LocalChangesOverwriteError } from '../../src/services/gitService.js';
+import {
+  GitService,
+  LocalChangesOverwriteError,
+  UntrackedOverwriteError,
+} from '../../src/services/gitService.js';
 
 /**
  * `syncPull` runs `merge --ff-only`, which git refuses (rather than autostashing) when the
@@ -60,6 +64,80 @@ describe('syncPull over a dirty tracked file (bare-repo stand-in)', () => {
     const headAfter = (await simpleGit(dir).revparse(['HEAD'])).trim();
     expect(headAfter).toBe(headBefore);
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('one\ntwo\nLOCAL EDIT\n');
+  });
+
+  it('refuses with a pull-worded typed error when the incoming commit adds a file that already sits untracked locally, leaving the clone untouched', async () => {
+    const { remote, git, dir } = await setup();
+
+    const headBefore = (await simpleGit(dir).revparse(['HEAD'])).trim();
+
+    // An untracked file already sits in the clone; the remote gains a commit ADDING a file at the
+    // same path with different content — the sibling refusal to the tracked-modification case
+    // above, git's "untracked working tree files would be overwritten" wording.
+    await writeFile(path.join(dir, 'new.tex'), 'LOCAL UNTRACKED CONTENT\n');
+    await pushCommit(remote, { 'new.tex': 'REMOTE CONTENT\n' }, 'remote adds new.tex');
+
+    let caught: unknown;
+    try {
+      await git.syncPull(remote.url, dir, { username: 'git' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(UntrackedOverwriteError);
+    const err = caught as UntrackedOverwriteError;
+    expect(err.operation).toBe('pull');
+    expect(err.paths).toEqual(['new.tex']);
+    expect(err.message).toContain('The pull was refused; nothing changed');
+    expect(err.message).toContain('new.tex');
+    expect(err.message).not.toMatch(/move or remove/i);
+
+    // Nothing changed: HEAD didn't move, and the untracked file's content is intact.
+    const headAfter = (await simpleGit(dir).revparse(['HEAD'])).trim();
+    expect(headAfter).toBe(headBefore);
+    expect(await readFile(path.join(dir, 'new.tex'), 'utf8')).toBe('LOCAL UNTRACKED CONTENT\n');
+  });
+
+  // Defect B: real git's `unpack_trees` accumulates rejects per error type and prints EVERY
+  // non-empty block, so a single `merge --ff-only` can refuse over a tracked-modification
+  // collision AND an untracked-file collision at once — confirmed against real git 2.x (a bare
+  // remote, no network) rather than assumed. Pre-fix, `syncPull`'s `??` chain reported only the
+  // untracked group and promised "after which the sync succeeds", which is false: the tracked
+  // group refuses the very next sync too.
+  it('refuses with ONE typed error naming both the tracked and untracked collision when a merge hits both refusal blocks at once, leaving the clone untouched', async () => {
+    const { remote, git, dir } = await setup();
+
+    const headBefore = (await simpleGit(dir).revparse(['HEAD'])).trim();
+
+    // Dirty main.tex (tracked) AND leave new.tex sitting untracked, then have the remote both
+    // modify main.tex and add new.tex — colliding on both at once.
+    await writeFile(path.join(dir, 'main.tex'), 'one\ntwo\nLOCAL EDIT\n');
+    await writeFile(path.join(dir, 'new.tex'), 'LOCAL UNTRACKED CONTENT\n');
+    await pushCommit(
+      remote,
+      { 'main.tex': 'one\ntwo\nREMOTE EDIT\n', 'new.tex': 'REMOTE CONTENT\n' },
+      'remote edits main.tex and adds new.tex',
+    );
+
+    let caught: unknown;
+    try {
+      await git.syncPull(remote.url, dir, { username: 'git' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(LocalChangesOverwriteError);
+    const err = caught as LocalChangesOverwriteError;
+    expect(err.paths).toEqual(['main.tex', 'new.tex']);
+    expect(err.untrackedPaths).toEqual(['new.tex']);
+    expect(err.message).toContain('main.tex');
+    expect(err.message).toContain('new.tex');
+
+    // Nothing changed: HEAD didn't move, and both local files are untouched.
+    const headAfter = (await simpleGit(dir).revparse(['HEAD'])).trim();
+    expect(headAfter).toBe(headBefore);
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('one\ntwo\nLOCAL EDIT\n');
+    expect(await readFile(path.join(dir, 'new.tex'), 'utf8')).toBe('LOCAL UNTRACKED CONTENT\n');
   });
 
   it('still succeeds (no pre-check) when the dirty file and the incoming commit touch different files', async () => {

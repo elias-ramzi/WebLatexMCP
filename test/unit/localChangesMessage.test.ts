@@ -2,8 +2,11 @@ import path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import {
   LocalChangesOverwriteError,
+  UntrackedOverwriteError,
   localChangesOverwriteFromError,
+  pullRefusalFromError,
 } from '../../src/services/gitService.js';
+import { REFUSAL_PATH_CAP } from '../../src/lib/peerAttribution.js';
 
 /**
  * `project_sync`'s pull runs `merge --ff-only`, which refuses (rather than autostashing) when the
@@ -123,6 +126,22 @@ describe('LocalChangesOverwriteError / localChangesOverwriteFromError', () => {
     expect(err.message).not.toMatch(/please stash/i);
   });
 
+  // Replaces a vacuous predecessor that only asserted `REFUSAL_PATH_CAP === 20` — nothing about
+  // gitService. This couples the constant to the actual message/JSON output, so the cap can't
+  // silently drift from what the class renders.
+  it('caps at the shared REFUSAL_PATH_CAP constant — the message and JSON paths track it, not a private literal', () => {
+    const many = Array.from({ length: REFUSAL_PATH_CAP + 1 }, (_, i) => `file${i}.tex`);
+    const err = new LocalChangesOverwriteError(many);
+    expect(err.message).toMatch(/… 1 more/);
+    const jsonMatch = err.message.match(/paths: (\[[^\]]*\])/);
+    expect(jsonMatch).not.toBeNull();
+    const parsed = JSON.parse(jsonMatch![1] ?? '') as string[];
+    expect(parsed).toHaveLength(REFUSAL_PATH_CAP);
+    expect(err.message).toMatch(
+      new RegExp(`the first ${REFUSAL_PATH_CAP} of ${REFUSAL_PATH_CAP + 1}`),
+    );
+  });
+
   it('caps the named paths at 20, appending a "more" count for the 21st', () => {
     const twenty = Array.from({ length: 20 }, (_, i) => `file${i}.tex`);
     const err20 = new LocalChangesOverwriteError(twenty);
@@ -203,5 +222,97 @@ describe('LocalChangesOverwriteError / localChangesOverwriteFromError', () => {
     expect(err.message).not.toMatch(/paths: \["/);
     // It still points at the scoped routes in the abstract, once the caller has found the paths.
     expect(err.message).toContain('scope: "paths"');
+  });
+
+  // Defect A: the commit route used to say "so the next sync succeeds" — false, since committing
+  // moves the clone ahead by one and the next `project_sync` reports `diverged`, not success. The
+  // route that actually goes forward after committing is `push` (its rebase surfaces a proper
+  // conflict if the same lines collided) — the same shape the pull-worded `UntrackedOverwriteError`
+  // sibling already uses correctly.
+  it('prescribes push (not a plain sync) after committing, with the same diverged-histories caveat as the untracked-file sibling', () => {
+    const err = new LocalChangesOverwriteError(['tables/results.tex']);
+    expect(err.message).toContain('then `push`');
+    expect(err.message).toContain('would only report the histories as diverged');
+  });
+
+  it('attaches "so the next sync succeeds" to the discard route only, never the commit route', () => {
+    const err = new LocalChangesOverwriteError(['tables/results.tex']);
+    expect(err.message).not.toContain('so the next sync succeeds');
+    const discardIdx = err.message.indexOf('`discard`');
+    const succeedsIdx = err.message.indexOf('after which the sync succeeds');
+    expect(discardIdx).toBeGreaterThanOrEqual(0);
+    expect(succeedsIdx).toBeGreaterThan(discardIdx);
+  });
+
+  it('keeps the same shape for the zero-path fallback: push after commit, succeeds after discard', () => {
+    const err = new LocalChangesOverwriteError([]);
+    expect(err.message).toContain('then `push`');
+    expect(err.message).toContain('would only report the histories as diverged');
+    expect(err.message).not.toContain('so the next sync succeeds');
+    const discardIdx = err.message.indexOf('`discard`');
+    const succeedsIdx = err.message.indexOf('after which the sync succeeds');
+    expect(discardIdx).toBeGreaterThanOrEqual(0);
+    expect(succeedsIdx).toBeGreaterThan(discardIdx);
+  });
+
+  // Defect B: git's `unpack_trees` accumulates rejects per error type and prints every non-empty
+  // block, so one `merge --ff-only` can refuse over BOTH a tracked-modification collision and an
+  // untracked-file collision at once. `syncPull`'s old `??` chain reported only the untracked
+  // group (checked first) and promised "after which the sync succeeds" — false, since the tracked
+  // group would refuse the very next sync. `pullRefusalFromError` factors that decision out of
+  // `syncPull`'s catch so it's unit-testable without a live git process.
+  describe('pullRefusalFromError — both refusal blocks in one merge', () => {
+    const bothBlocksStderr =
+      'error: Your local changes to the following files would be overwritten by merge:\n' +
+      '\ta.tex\n' +
+      'Please commit your changes or stash them before you merge.\n' +
+      'error: The following untracked working tree files would be overwritten by merge:\n' +
+      '\tnew.tex\n' +
+      '\tb.tex\n' +
+      'Please move or remove them before you merge.\n' +
+      'Aborting\n';
+
+    it('collapses both blocks into one LocalChangesOverwriteError carrying the union, tracked first', () => {
+      const result = pullRefusalFromError(new Error(bothBlocksStderr));
+      expect(result).toBeInstanceOf(LocalChangesOverwriteError);
+      const err = result as LocalChangesOverwriteError;
+      expect(err.paths).toEqual(['a.tex', 'new.tex', 'b.tex']);
+      expect(err.untrackedPaths).toEqual(['new.tex', 'b.tex']);
+      expect(err.message).toContain('a.tex');
+      expect(err.message).toContain('new.tex');
+      expect(err.message).toContain('b.tex');
+      const jsonMatch = err.message.match(/paths: (\[[^\]]*\])/);
+      expect(jsonMatch).not.toBeNull();
+      expect(JSON.parse(jsonMatch![1] ?? '')).toEqual(['a.tex', 'new.tex', 'b.tex']);
+    });
+
+    it('leaves a tracked-only refusal with no untracked paths and no "exist untracked" sentence', () => {
+      const stderr =
+        'error: Your local changes to the following files would be overwritten by merge:\n' +
+        '\ta.tex\n' +
+        'Please commit your changes or stash them before you merge.\n' +
+        'Aborting\n';
+      const result = pullRefusalFromError(new Error(stderr));
+      expect(result).toBeInstanceOf(LocalChangesOverwriteError);
+      const err = result as LocalChangesOverwriteError;
+      expect(err.untrackedPaths).toEqual([]);
+      expect(err.message).not.toMatch(/exist.*untracked rather than modified/);
+    });
+
+    it('returns a pull-worded UntrackedOverwriteError for an untracked-only refusal', () => {
+      const stderr =
+        'error: The following untracked working tree files would be overwritten by merge:\n' +
+        '\tnew.tex\n' +
+        'Please move or remove them before you merge.\n' +
+        'Aborting\n';
+      const result = pullRefusalFromError(new Error(stderr));
+      expect(result).toBeInstanceOf(UntrackedOverwriteError);
+      expect((result as UntrackedOverwriteError).operation).toBe('pull');
+    });
+
+    it('rethrows an unrelated error untouched', () => {
+      const original = new Error('fatal: not a git repository');
+      expect(pullRefusalFromError(original)).toBe(original);
+    });
   });
 });

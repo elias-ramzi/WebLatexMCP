@@ -63,8 +63,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   them before you merge"_ — which prescribes `stash`, a command this server does not expose, and never
   mentions `commit` or `discard`, which it does. Of the two exits git offered, one does not exist here;
   on a client with no shell it cannot be reached at all. The tracked wording now has the typed
-  `LocalChangesOverwriteError` that the untracked wording has had on `push` (`UntrackedOverwriteError`;
-  an untracked file blocking a _pull_ still surfaces git's own wording), carrying
+  `LocalChangesOverwriteError` that the untracked wording has had on `push` (`UntrackedOverwriteError`,
+  which now carries a pull wording too — see the entry below), carrying
   the parsed paths and saying that nothing changed — `merge --ff-only` aborts cleanly, so HEAD did not
   move and the working tree is exactly as it was — then naming the exits this server actually has and
   stating plainly that git's `stash` advice is not available. Because the error knows exactly which
@@ -77,7 +77,7 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   helpers `push`'s refusal uses — but **subtracting this session's own paths first**, exactly as `push`
   does, since `livePeers` excludes self and an unfiltered list would report the caller's own edits as
   belonging to nobody. The closing advice is now the calling tool's own: `push` talks about rebasing and
-  pushing again, `project_sync` about syncing again — but **both compose it from the attribution**
+  pushing again, `project_sync` about a refused pull — but **both compose it from the attribution**
   rather than each carrying a static paragraph, because the files they list fall into two groups needing
   **opposite** advice. A peer-owned file can only be taken with `scope: "all"`, since `scope: "paths"`
   refuses outright any path a live session's shadow lists — so the closing now says that, instead of
@@ -99,6 +99,45 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   stays rejected for the reason already recorded for `push`: a pop is an automatic merge of somebody's
   uncommitted lines, and a pop conflict leaves markers behind.
 
+- **An untracked file blocking a pull is refused in server terms too** (#68 follow-up). `syncPull`
+  translated only git's _tracked_ refusal; its sibling — an incoming commit adding a file that already
+  sits untracked in the clone — still came back as git's own _"Please move or remove them before you
+  merge"_, naming no tool. `UntrackedOverwriteError` now carries an `operation` (`push`, the unchanged
+  default, or `pull`), and `syncPull` throws the pull wording: nothing changed (`merge --ff-only`
+  aborts cleanly), the exits are `commit` with `scope: "paths"` **then `push`** — the rebase a push
+  performs is what surfaces a proper add/add conflict, where a plain sync after committing would only
+  report the histories as diverged — or `discard` with `paths` (which runs `clean -f` over an untracked
+  name), and every path list in both wordings is capped at the shared `REFUSAL_PATH_CAP`, with the
+  same "first N of M — `status` lists them all" note the tracked message carries. `project_sync`
+  attributes its paths to live peers exactly as it does the tracked ones, since a peer's `write_file`
+  of a new file puts that file in the peer's shadow.
+- **The conflict result's `remoteCommits` is bounded too, and text and structured come from one plan
+  object.** The per-file payload was budgeted but `structuredContent.remoteCommits` was passed through
+  verbatim, uncapped in commits and in each commit's file list: 60 conflicted files under 12 upstream
+  commits of 20 files each rendered 80,440 characters — more than the 67k that motivated the budget —
+  with `remoteCommits` 38% of the JSON and `conflictTruncated: true` claiming the job done. On a
+  conflict it is now capped at `CONFLICT_MAX_COMMITS` (20) commits of `CONFLICT_MAX_COMMIT_FILES` (5)
+  files, the caps the text channel already applied, with `remoteCommitsOmitted` and a per-commit
+  `filesOmitted` counting what was cut; the text's "… N more commit(s)" pointer sends the caller to
+  `status.behindCommits` — uncapped, and the same list once the rebase has aborted — instead of to a
+  `structuredContent` that no longer holds it. `rebasedOver` on a successful push and `status`'s own
+  commit lists stay uncapped, so their pointer stays true. `conflictDetail: "full"` lifts this cap
+  with the others. `push` now plans the per-file payload once and hands that one object to both
+  renderers, which assert the plan and report line up file by file, so "same plan" holds by
+  construction rather than by two deterministic calls; and when the mandatory per-file headers alone
+  exhaust the budget (very long paths), the `note` names that first instead of blaming the aggregate
+  cap.
+- **`project_sync` takes the per-project lock.** It cloned and fast-forward-pulled outside
+  `runExclusive`, so a peer session's `write_file` or `commit` could interleave with the pull. The lock
+  file lives outside the clone (`<workspace>/.sessions/<id>/project.lock`), so a first clone takes it
+  too. The cost is the lock's own: a peer waiting on the file lock gives up after 30 s, so a sync that
+  fetches for longer than that now costs a concurrent peer one refused write, where before the two
+  interleaved silently — the trade the lock exists to make. Both refusals from a pull now route the
+  caller forward correctly: after a local commit a plain sync would only report the histories as
+  diverged, so the composed closing and the typed refusals say `push`, and reserve "the next sync
+  succeeds" for the `discard` route. The peer-refusal logic both `push` and `project_sync` run — the live-peer guard and the
+  attribution appended to a refused pull — moved out of the tool layer into `src/lib/peerRefusal.ts`,
+  unchanged in behaviour.
 - **`commit scope: "paths"` — commit exactly the files you name, and nothing else** (#61). A session
   whose work reached the clone without going through `edit_file` / `write_file` — a script's output,
   the client's own file tools — owns nothing in its shadow, so `scope: "session"` had nothing to commit
@@ -435,12 +474,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   helpful. For the same reason the line claims the _weaker_ thing — that `status` names every path
   the lists omit, among more besides — rather than that it reports these lists back: that identity
   holds for `push`, whose disputed set is built exactly as `otherChanges` is, but not for
-  `project_sync`, which renders the same line over the tracked paths an incoming commit would
-  overwrite, a strict subset no `status` field reproduces. One message shared by two tools may only
+  `project_sync`, which renders the same line over the paths an incoming commit would overwrite,
+  tracked or untracked, a strict subset no `status` field reproduces. One message shared by two tools may only
   assert what is true for both, which is the same discipline the shared closing imposed. The unreadable-peer line still lists no paths at
   all — that peer is treated as owning everything precisely because it might own anything, and
   printing a concrete list would read as a claim about which.
 
+- **`status.otherChanges` and `push`'s peer guard see index-only changes.** Both built their dirty set
+  from `unstaged + untracked`, so a path modified only in the index — a hand `git add`, or an
+  interrupted `commitContents` — was invisible to `otherChanges`/`sessionChanges`, and `push` let it
+  through to `GitService`'s own uncommitted-changes refusal, unattributed. That is exactly the group
+  git's _first_ "local changes would be overwritten" block reports, which made the refusal's "`status`
+  names every path omitted here" pointer false for it. Both sets now include `staged` (deduplicated),
+  the way `commit scope: "paths"` already did, so the pointer's superset claim holds and `push`'s
+  disputed set is once again built exactly as `otherChanges` is.
 - **Re-registering a project says which stored fields it dropped.** `register_project` with `gitUrl`
   or `path` on an id already known (in the registry, or held in-process from the env or `project_sync`)
   replaces the stored entry from the arguments given — that

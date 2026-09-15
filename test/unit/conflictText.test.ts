@@ -3,6 +3,7 @@ import {
   renderConflictText,
   renderRebasedOver,
   renderCommitLines,
+  capRemoteCommits,
   buildConflictFilePayload,
   renderHunkMarkers,
   renderHunksBlock,
@@ -17,6 +18,8 @@ import {
   CONFLICT_SIDE_CAP,
   CONFLICT_CONTENT_BUDGET,
   CONFLICT_MAX_FILES,
+  CONFLICT_MAX_COMMITS,
+  CONFLICT_MAX_COMMIT_FILES,
   HUNK_MARKER_OVERHEAD,
   HUNK_JSON_OVERHEAD,
   HUNK_LINE_ELEMENT_OVERHEAD,
@@ -654,4 +657,188 @@ describe('escape-heavy content stays bounded once JSON-encoded (finding 1 regres
     expect(plan.truncated).toBe(true);
     expect(json.length).toBeLessThan(ESCAPE_CEILING);
   });
+});
+
+describe('plan/report mismatch is a guarded programming error, not a silent wrong render', () => {
+  // Both renderers index `plan.files[i]` alongside `report.files[i]`; a plan built from a
+  // DIFFERENT report (or hand-corrupted) must never silently render file i's content under
+  // file j's budget decisions — it must throw, naming the index and both paths, so the mismatch
+  // is caught immediately rather than surfacing as a subtly wrong (but not obviously broken)
+  // conflict payload.
+  function twoFileReport(): ConflictReport {
+    const rep = report();
+    const base = rep.files[0]!;
+    const files: ConflictFileDetail[] = [
+      { ...base, path: 'a.tex', hunks: [] },
+      { ...base, path: 'b.tex', hunks: [] },
+    ];
+    return { ...rep, files, conflictPaths: files.map((f) => f.path) };
+  }
+
+  function planFrom(rep: ConflictReport): ConflictPayloadPlan {
+    return planConflictPayload(rep.files, {
+      detail: 'auto',
+      refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+    });
+  }
+
+  it("renderConflictText throws when the plan's second entry names a different path than the report's", () => {
+    const rep = twoFileReport();
+    const plan = planFrom(rep);
+    const mismatched: ConflictPayloadPlan = {
+      ...plan,
+      files: [plan.files[0]!, { ...plan.files[1]!, path: 'not-b.tex' }],
+    };
+    expect(() => renderConflictText('conflict', rep, { plan: mismatched })).toThrow(/index 1/);
+    expect(() => renderConflictText('conflict', rep, { plan: mismatched })).toThrow(/not-b\.tex/);
+    expect(() => renderConflictText('conflict', rep, { plan: mismatched })).toThrow(/"b\.tex"/);
+  });
+
+  it("buildConflictFilePayload throws when the plan's second entry names a different path than the report's", () => {
+    const rep = twoFileReport();
+    const plan = planFrom(rep);
+    const mismatched: ConflictPayloadPlan = {
+      ...plan,
+      files: [plan.files[0]!, { ...plan.files[1]!, path: 'not-b.tex' }],
+    };
+    expect(() => buildConflictFilePayload(rep, mismatched)).toThrow(/index 1/);
+    expect(() => buildConflictFilePayload(rep, mismatched)).toThrow(/not-b\.tex/);
+    expect(() => buildConflictFilePayload(rep, mismatched)).toThrow(/"b\.tex"/);
+  });
+
+  it('a plan built by planConflictPayload from the SAME report never throws (happy path)', () => {
+    const rep = twoFileReport();
+    const plan = planFrom(rep);
+    expect(() => renderConflictText('conflict', rep, { plan })).not.toThrow();
+    expect(() => buildConflictFilePayload(rep, plan)).not.toThrow();
+  });
+});
+
+describe('renderConflictText accepts a precomputed plan (opts.plan) instead of re-planning', () => {
+  it('a passed plan wins over opts.detail — proves the plan is used verbatim, not re-derived', () => {
+    const huge = 'x'.repeat(20000);
+    const base = report();
+    const rep: ConflictReport = {
+      ...base,
+      files: [{ ...base.files[0]!, theirs: huge, base: huge }],
+    };
+    // Build an 'auto' plan (elides the oversized theirs/base) but pass `detail: 'full'` in opts
+    // too — if the plan were being used verbatim, `detail: 'full'` must NOT restore the elided
+    // content, because no re-planning happens when opts.plan is given.
+    const autoPlan = planConflictPayload(rep.files, {
+      detail: 'auto',
+      refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+    });
+    const text = renderConflictText('conflict', rep, { detail: 'full', plan: autoPlan });
+    expect(text).not.toContain(huge);
+    expect(text).toContain('read_file("sections/04.tex", ref="origin/master")');
+  });
+
+  it('with no plan given, behaviour is unchanged from today (existing tests already cover this)', () => {
+    const text = renderConflictText('Rebase conflicts in 1 file(s).', report());
+    expect(text).toContain('sections/04.tex');
+    expect(text).toContain('<<<<<<< ours');
+  });
+});
+
+describe('capRemoteCommits (structured-channel commit cap, issue #68 follow-up)', () => {
+  function commit(hash: string, message: string, fileCount = 0): RemoteCommit {
+    return {
+      hash,
+      message,
+      files: Array.from({ length: fileCount }, (_, i) => ({
+        path: `f${i}.tex`,
+        added: 1,
+        removed: 0,
+      })),
+    };
+  }
+
+  it('caps at CONFLICT_MAX_COMMITS, and each commit at CONFLICT_MAX_COMMIT_FILES files', () => {
+    const commits = Array.from({ length: 25 }, (_, i) =>
+      i === 0 ? commit(`h${i}`, `commit ${i}`, 8) : commit(`h${i}`, `commit ${i}`, 1),
+    );
+    const { commits: capped, omitted } = capRemoteCommits(commits);
+
+    expect(capped).toHaveLength(CONFLICT_MAX_COMMITS);
+    expect(omitted).toBe(25 - CONFLICT_MAX_COMMITS);
+
+    const first = capped[0]!;
+    expect(first.files).toHaveLength(CONFLICT_MAX_COMMIT_FILES);
+    expect(first.filesOmitted).toBe(8 - CONFLICT_MAX_COMMIT_FILES);
+
+    // Every other capped commit touched only 1 file — well under the per-commit cap — and must
+    // carry NO filesOmitted key at all (not even 0), the same "absent means untouched" convention
+    // the conflict-file elision payload uses.
+    for (const c of capped.slice(1)) {
+      expect(c.files).toHaveLength(1);
+      expect('filesOmitted' in c).toBe(false);
+    }
+  });
+
+  it('does not mutate the input commits or their file arrays', () => {
+    const commits = [commit('h0', 'c0', 8)];
+    const originalFiles = commits[0]!.files;
+    capRemoteCommits(commits);
+    expect(commits[0]!.files).toBe(originalFiles);
+    expect(commits[0]!.files).toHaveLength(8);
+  });
+
+  it('omitted is 0 and every commit passes through untouched when nothing exceeds either cap', () => {
+    const commits = [commit('h0', 'c0', 1), commit('h1', 'c1', 2)];
+    const { commits: capped, omitted } = capRemoteCommits(commits);
+    expect(omitted).toBe(0);
+    expect(capped).toEqual(commits);
+  });
+});
+
+describe('conflict text points at status.behindCommits, not structuredContent, past the commit cap', () => {
+  it('report with 25 remoteCommits: "… 5 more commit(s)" + the status hint, never "see structuredContent"', () => {
+    const commits: RemoteCommit[] = Array.from({ length: 25 }, (_, i) => ({
+      hash: `h${i}`,
+      message: `commit ${i}`,
+      files: [],
+    }));
+    const rep = report({ remoteCommits: commits });
+    const text = renderConflictText('conflict', rep);
+
+    expect(text).toContain('… 5 more commit(s)');
+    expect(text).toContain(
+      '(see status.behindCommits — the clone is back at its pre-push state, so status lists them all)',
+    );
+    expect(text).not.toContain('see structuredContent');
+  });
+
+  it('renderRebasedOver with 25 commits still says "(see structuredContent)" (unchanged)', () => {
+    const commits: RemoteCommit[] = Array.from({ length: 25 }, (_, i) => ({
+      hash: `h${i}`,
+      message: `commit ${i}`,
+      files: [],
+    }));
+    const text = renderRebasedOver(commits);
+    expect(text).toContain('… 5 more commit(s) (see structuredContent)');
+  });
+
+  it(
+    'detail: "full" flips the pointer to "(see structuredContent)": under "full" that field ' +
+      'genuinely holds every commit, so the status.behindCommits hint (which exists only because ' +
+      "auto's structuredContent.remoteCommits is itself capped) is the misleading one there",
+    () => {
+      const commits: RemoteCommit[] = Array.from({ length: 25 }, (_, i) => ({
+        hash: `h${i}`,
+        message: `commit ${i}`,
+        files: [],
+      }));
+      const rep = report({ remoteCommits: commits });
+      const plan = planConflictPayload(rep.files, {
+        detail: 'full',
+        refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+      });
+      const text = renderConflictText('conflict', rep, { detail: 'full', plan });
+
+      expect(text).toContain('… 5 more commit(s)');
+      expect(text).toContain('(see structuredContent)');
+      expect(text).not.toContain('status.behindCommits');
+    },
+  );
 });
