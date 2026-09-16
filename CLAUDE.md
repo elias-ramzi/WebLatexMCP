@@ -193,6 +193,32 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
   reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
   never clear one.
+- **`status` collapses a dead, change-free peer into a count — a report change, never a deletion.**
+  A session record is removed only on a clean shutdown (`SessionRegistry.release()`), so a killed
+  agent process leaves its record behind forever and `activeSessions` grew without bound with peers
+  that hold nothing and are never coming back. `isStalePeer`/`splitStalePeers`
+  (`src/lib/peerSummary.ts`) fold a peer into `staleSessions: N` only when it is `!live` **and** its
+  shadow index read back as a readable **empty** array. The guard that matters is the one it would
+  be easy to get backwards: **`null` from `ShadowStore.peerEntries` means the index was UNREADABLE,
+  never "owns nothing"** — the same fail-closed reading `attributePeers` uses — so a dead peer with
+  an unreadable index stays listed individually with `changes: null`. A live peer is never
+  collapsed either, whatever it currently holds.
+  **Nothing is reaped from disk, and `SessionRegistry.collectGarbage()` must stay uncalled from
+  here.** `status` is read-only and takes no lock, and `live` is _derived_, not authoritative: a pid
+  can be invisible across a pid namespace, and a record only reads stale once its heartbeat is older
+  than `STALE_MS` (30 minutes) — `HEARTBEAT_THROTTLE_MS` (30 seconds) only paces how often a live
+  session rewrites that heartbeat, so do not conflate the two. An idle-but-alive peer therefore
+  reads as dead well inside its own session, and deleting its record while it races its own
+  `record()` would destroy the ownership proof `commit scope: "paths"` and `push` refuse on. An
+  integration test asserts each session's `session.json`, and the `shadow.json` of every session
+  that has one, survives a `status` call — the **files**, not merely the directory, since `release()`
+  removes only the record and leaves the directory standing, so a directory-only assertion lets that
+  shape of "cleanup" land quietly — and that a corrupt index is still corrupt, since "repairing" one
+  turns unreadable into "owns nothing". Records accumulate on disk; only the _report_ is bounded.
+  One accepted cost: a session killed between its working-tree write and `record()` leaves dirty
+  lines with no shadow entry, and now collapses into a bare count instead of surfacing as a named
+  suspect for them. The lines stay in `otherChanges` and no guard changes — `commit`/`push` consult
+  `livePeers()` — so this is diagnostic loss only.
 - **Which bibliography answers a lookup is one decision, and it lives in `ReferenceResolver`.**
   `search_references`/`add_citation` go through `ctx.references`, never a concrete backend.
   Selection is the `CompilerResolver` rule — **an assertion, never an inference**: an unset
@@ -503,6 +529,38 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   not consume the 10-location cap (a log listing ten TeX-tree `.sty` paths first would otherwise starve
   the real error). `ParsedDiagnostic` lives in `logParser`, not `types.ts`: provenance decides what may
   be shown and never reaches a tool's output.
+
+- **`compile`'s `warningsFilter` trims `logTail` and `warnings[]` together, or neither.** An
+  `Overfull \hbox` ships **twice** — structured into `warnings[]`, and again raw in `logTail`, since
+  `KEEP_PATTERNS` keeps box lines and `logTail` is returned on every compile — so a filter narrowing
+  only `warnings[]` would leave every excluded line sitting in the tail: half the feature, reading as
+  though it worked. `filterLog` takes a `keepWarning` predicate for exactly this, and `compile`
+  builds **one** `judgeWarning` and hands it to both `shownWarnings.filter` and `keepWarning`, so the
+  channels cannot disagree. That predicate applies `withoutUnopenableLocation` to its own candidate
+  **first**: `logTail`'s side derives `file` from the log's paren stack, which knows nothing about a
+  withheld path, so judging it directly let a `file` filter naming a withheld path empty
+  `warnings[]` while leaving that warning in the tail. Matching is exact and literal — no globs, no
+  prefixes, no case folding — for the same reason `--literal-pathspecs` is everywhere here: a typo
+  must fail conspicuously. An **empty** array constrains nothing rather than matching nothing.
+  Inside `filterLog`, `ALWAYS_KEEP_PATTERNS` is checked **before** `isWarningLine`/`warningRuleOf`,
+  because a line can be both: the `Label(s) may have changed. Rerun to get cross-references right.`
+  hint matches a warning pattern _and_ the rerun-hint pattern, and the hint must win. It holds
+  `FILE_LINE_ERROR` too, mirroring `parseLog`'s branch order — `parseLog` tests it first and
+  `continue`s, so a `-file-line-error` line is an error whatever its message says, and without it a
+  `./main.tex:12: Package foo Warning: …` was an error to one partition and a filterable warning to
+  the other. Keep the two partitions aligned: a new `KEEP_PATTERNS` entry that is neither
+  always-kept nor a warning line is a bug in waiting. **This is `logTail`-only, deliberately**: a
+  rerun hint is still a structured warning, so `excludeRule: ['LaTeX']` still drops it from
+  `warnings[]` and counts it in `warningsOmitted` — protected in the tail, filterable in the list.
+  Do not "fix" that asymmetry; it changes what `warningsOmitted` means, not just its number.
+  The raw-tail fallback must **never** fire when a _filter_ emptied the kept list: the raw tail is
+  unfiltered and un-de-noised, so falling back hands back the very warnings `keepWarning` rejected
+  plus the font/PDF-statistics noise `filterLog` exists to strip — the feature exactly inverted, and
+  silently. `matchedBeforeFilter` is what tells "nothing diagnostic" from "the filter rejected
+  everything"; keep them on separate branches. And **with `keepWarning` absent the output stays
+  byte-identical and the paren-stack bookkeeping does not run at all** — not merely harmlessly —
+  since this runs on every compile of every session; a differential test over generated logs pins
+  it, in the strong form that a filter accepting everything is a no-op.
 
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic

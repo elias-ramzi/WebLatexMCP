@@ -244,6 +244,26 @@ naming it, and it shows up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
 
+Not every peer `status` lists by name, though. A session that has died — its process gone, its
+heartbeat older than the staleness window — and whose shadow index reads back as a readable, empty
+array (it committed everything before exiting, or never made a server-side edit) is folded into a
+single `staleSessions: N` count instead. Three cases are deliberately NOT collapsed: a **live** peer,
+however little it currently holds, because it may write again any moment; a **dead peer that still
+holds entries**, since those are exactly the changes `status` exists to surface; and a dead peer
+whose shadow index came back **unreadable** (`null`, not empty) — `null` means "cannot tell", never
+"owns nothing", so it stays listed individually with `changes: null` rather than being counted as
+harmless.
+
+The collapse is report-level only — nothing is deleted from `<workspace>/.sessions/<projectId>/`.
+`status` is read-only and takes no lock, and a session that reads as dead by its stale heartbeat can
+still be mid-write (a slow `record()`, a paused process); reaping its files out from under that write
+would destroy the exact ownership proof `push`'s peer guard and `commit scope: "paths"` depend on to
+tell this session's in-flight edits from a peer's. Both of those guards resolve peers through
+`SessionRegistry.livePeers`, which the collapse never touches — a peer folded into `staleSessions`
+was already dead by `livePeers`' own definition, so nothing that used to be refused starts being
+allowed, and nothing that used to be allowed starts being refused. Session records accumulate on disk
+for as long as the workspace exists; only what `status` chooses to print is bounded.
+
 Every path list in that refusal is capped at 20 (`REFUSAL_PATH_CAP`): the header's
 disputed set, each session's `owns`, the unowned line, and the closing's copy of it.
 The cap costs more here than in the conflict payload, because the refusal is an error

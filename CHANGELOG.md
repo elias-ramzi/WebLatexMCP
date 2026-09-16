@@ -11,6 +11,107 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`compile` takes a `warningsFilter`, and it trims both channels or neither** (#73). A warning-heavy
+  paper returned ~127 KB of result, and the reason it was that large is that every `Overfull \hbox`
+  ships **twice**: once structured in `warnings[]`, and once as raw text in `logTail`, because
+  `KEEP_PATTERNS` keeps box lines and `logTail` is returned on every compile. So a filter over
+  `warnings[]` alone — the obvious shape, and the one the report asked for — would have cut barely half
+  of what it claimed to cut, while reading as though it had worked. `warningsFilter` takes `file`,
+  `rule` and `excludeRule` (exact, literal, never globs or prefixes — the house rule that a
+  caller-named path handed downstream is literal, for the same reason: a typo must fail
+  conspicuously rather than match everything), and `filterLog` gained a `keepWarning` predicate so
+  `logTail` drops the same lines `warnings[]` dropped. `warningsOmitted` counts what went, so a
+  filtered list is never silently a subset. Three things it deliberately does not do: it never
+  filters **errors** — a document that fails to compile is not made to look cleaner by a knob meant
+  for box noise; it never filters a **rerun hint** or the `Output written on` summary, even though
+  `LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.` matches both a
+  warning pattern and a hint pattern, so the always-keep list is checked **first**; and it leaves
+  `rawLog: true` alone, because raw means raw — `warnings[]` is still filtered there, and both
+  descriptions say so rather than letting a caller discover the asymmetry. With no filter passed,
+  `filterLog`'s output is pinned two ways, which prove different things: a differential test
+  compares its output against itself under options that must be inert (no filter, an
+  accept-everything `keepWarning`, an inert `baseDir`) across thousands of generated logs, proving
+  the filter is a true no-op absent a caller opting in — but it is structurally blind to a change
+  that perturbs both sides of the comparison identically; a committed sha256 digest of that same
+  corpus's output, at every `maxLines` choice, is what actually pins byte-identical output against
+  a `KEEP_PATTERNS`/`unwrapLines` regression the self-comparison cannot see. The paren-stack
+  bookkeeping `keepWarning` needs is skipped entirely when no filter is given. "Unchanged unless
+  used" is the only thing that makes this safe to add to a tool every session calls. And when a
+  filter rejects _every_ diagnostic line, the tail says so in one sentence rather than falling back
+  to the raw last-15-lines tail it falls back to for a log with no diagnostics at all — that
+  fallback would have returned the excluded warnings plus the font and PDF-statistics noise, the
+  feature exactly inverted, so the two emptinesses are told apart rather than sharing a branch. A
+  fourth thing it deliberately does not do: an **empty filter array constrains nothing** —
+  `{file: []}` is the same as an absent `file`, not a filter that matches nothing — so a filter
+  list built programmatically that comes out empty _widens_ the result to every warning instead of
+  narrowing it to none; the tool schema and the docs both say so.
+
+- **A package name carrying a `.` or a `-` is finally a warning at all** (#73). `PACKAGE_WARNING`'s
+  name class was `\w+`, which matches neither, so `Package pdftex.def Warning: ...` — pdfTeX's own
+  driver file, one of the commonest warning sources in a real log — matched nothing. Not
+  misclassified: **invisible**, missing from `warnings[]` entirely and uncounted by
+  `warningsOmitted`, while `KEEP_PATTERNS`' literal `/Warning:/` still kept the raw line in
+  `logTail` — precisely the ships-twice asymmetry `warningsFilter` exists to remove, on the warning
+  a user is most likely to want filtered. The class is now `[\w.-]+`; the space before `Warning:`
+  stays outside it, so a name can never swallow into it. `filterLog`'s no-filter output is
+  unaffected, since `KEEP_PATTERNS` matches the literal word and never this regex.
+
+- **Review fixes on `warningsFilter`, closed** (#75). The entry above claims `warningsFilter`
+  "never filters errors" and "never filters a rerun hint" — both sentences were **false** when
+  written, and true only after these two fixes. **`filterLog` filtered a line `parseLog` calls an
+  error**: `parseLog` tests `FILE_LINE_ERROR` first and `continue`s, so
+  `./main.tex:12: Package foo Warning: …` is an _error_ to it whatever its message says — but
+  `ALWAYS_KEEP_PATTERNS` had `^!` and `Error:` and not `FILE_LINE_ERROR`, so the identical line was
+  a filterable _warning_ to `filterLog`, and any `warningsFilter` cut the one line reporting the
+  failure out of `logTail`. Fixed by adding `FILE_LINE_ERROR` to the always-keep list, mirroring
+  `parseLog`'s own branch order — `warningRuleOf`'s doc already claimed `filterLog` could never
+  derive a different answer than `parseLog` for the same line, an invariant this gap silently
+  broke. Keep the two classifications one partition; do not let a future always-keep pattern drift
+  from `parseLog`'s branch order again. **biblatex's rerun hint was filterable**: biblatex phrases
+  it `Please (re)run Biber on the file:` — literal parentheses, which the existing `Please rerun`
+  pattern never matched — so on a biblatex paper, the only line saying the bibliography is stale
+  survived a no-op filter but not a real one. Fixed by adding a pattern for it, deliberately
+  `logTail`-only: the structured `warnings[]` entry (rule `biblatex`) stays filterable, exactly as
+  the `Label(s) may have changed` hint's own `warnings[]` entry already was. That asymmetry is
+  intentional — do not "fix" it later by protecting the `warnings[]` entry too, since that would
+  change `warningsOmitted`. The pattern has to stay narrow, not a bare substring match: the log is
+  document-controlled — a `.tex` can emit anything via `\PackageWarning`/`\typeout` — so an
+  unanchored `/\(re\)run/` let a document pin an arbitrary line (an `Overfull \hbox` that merely
+  happens to contain the literal `(re)run`) past every caller's `warningsFilter`,
+  indistinguishable from a real rerun hint. It is narrowed to `Please \(re\)run` instead. That does
+  not make forgery impossible, and the entry should not claim it does: a document phrasing its line
+  as `Please (re)run …` is by definition indistinguishable from biblatex's own hint, exactly as the
+  neighbouring `Please rerun` and `may have changed` patterns already are. What the narrowing buys
+  is the removal of the cheap, accidental case, and the residual is bounded to `logTail` verbosity —
+  it never reaches `warnings[]`, `warningsOmitted`, an error classification, or a snippet-provenance
+  decision. Both fixes are pinned by **hand-written cases only**. The differential corpus and its
+  golden digest are deliberately blind to them: the digest never passes a `keepWarning` at all, and
+  the self-comparison passes `() => true`, which keeps a line whichever side of the always-keep
+  branch it falls on — so neither can observe an `ALWAYS_KEEP_PATTERNS` change. Do not retire a
+  hand-written case here as redundant with the corpus; the corpus does not cover it.
+
+- **`status` collapses sessions that exited holding nothing into a count** (#73). A session record
+  under `<workspace>/.sessions/<projectId>/` is removed only on a clean shutdown
+  (`SessionRegistry.release()` on SIGINT/SIGTERM/beforeExit), so every killed agent process leaves
+  one behind forever and `activeSessions` grew without bound with sessions that own nothing and are
+  never coming back. They are now reported as `staleSessions: N` instead of listed. The tempting fix
+  — wiring up `SessionRegistry.collectGarbage()`, which exists and has never had a caller — is
+  **deliberately not done**, and should stay undone from here: `status` is read-only and takes no
+  lock, and `live` is _derived_ (a pid invisible across pid namespaces, plus a heartbeat that is
+  treated as stale after 30 minutes — `STALE_MS`, not the 30-second `HEARTBEAT_THROTTLE_MS` that
+  paces the writes), so an idle-but-alive peer can read as dead. Reaping its record while it races its own
+  `record()` would destroy the ownership proof `commit scope: "paths"` and `push` refuse on — the
+  exact guarantee the shadow store exists to make. An integration test asserts every session's
+  `session.json` — and the `shadow.json` of each session that has one — is still on disk after a
+  `status` call: the files, not merely the directory, since `release()` removes only the record and
+  leaves the directory standing, so a
+  directory-only assertion would let that shape of "cleanup" land quietly — and that a corrupt
+  index is still corrupt, since "repairing" it would turn unreadable into "owns nothing".
+  What is **not** collapsed matters as much as what is: a dead peer whose shadow index could not be
+  **read** stays listed individually with `changes: null`, because `null` from `peerEntries` means
+  unreadable and never "owns nothing" — counting it as change-free would assert the one thing this
+  codebase refuses to infer. Records still accumulate on disk; only the report is bounded.
+
 - **Crossref and OpenAlex as reference backends, behind a resolver — and a DBLP client that sniffs
   the body instead of trusting the status** (#72). `dblp.org` now sits behind an anti-bot
   proof-of-work wall which it serves with **HTTP 200** and an HTML body, so `res.ok` was true and
@@ -655,7 +756,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   partly on the premise that "at 150 dpi a point is ~2 px" — too coarse to match two table heights. `dpi`
   already accepts up to 1200, bounded by the 4000px cap on the clipped edge, so a narrow clipped band
   resolves at roughly 16.7 px/pt; the tool's description now says so. The tool itself is not built — see
-  the split issue — but the premise it rested on was already false.
+  [#73](https://github.com/elias-ramzi/WebLatexMCP/issues/73) — but the premise it rested on was
+  already false.
 
 - **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
   `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`
