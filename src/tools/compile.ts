@@ -93,7 +93,8 @@ const inputSchema = {
         .describe(
           'Keep only warnings whose rule is exactly one of these — the values warnings[].rule ' +
             'carries: "Overfull \\hbox", "Underfull \\vbox", "LaTeX", or a package/class name ' +
-            'like "hyperref". Matched exactly, never a prefix.',
+            'like "hyperref" — including one carrying a dot or a hyphen, e.g. "pdftex.def" or ' +
+            '"tikz-cd". Matched exactly, never a prefix.',
         ),
       excludeRule: z
         .array(z.string())
@@ -110,7 +111,10 @@ const inputSchema = {
         'an Overfull \\hbox line otherwise ships twice, once structured and once as raw text — ' +
         'except when rawLog: true, where logTail stays whole (see rawLog). Never filters errors, ' +
         'only warnings: a document that fails to compile is not made to look cleaner by a filter ' +
-        'meant for box-warning noise. warningsOmitted reports how many warnings this removed.',
+        'meant for box-warning noise. warningsOmitted reports how many warnings this removed. An ' +
+        'EMPTY array constrains nothing rather than matching nothing — {file: []} returns every ' +
+        'warning, not none — so a list you built programmatically and that came out empty widens ' +
+        'the result instead of narrowing it.',
     ),
 };
 
@@ -406,6 +410,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // withheld path emptied `warnings[]` while leaving that very warning in the tail.
           // Running each candidate through `withoutUnopenableLocation` first makes the question
           // identical on both sides. Idempotent on `shownWarnings`, whose file is already gone.
+          //
+          // One residual, accepted: `withheld.all` is built only from paths the *parsed*
+          // diagnostics named, so a tail-only warning line (a `LaTeX Font Warning:`, a bare
+          // `pdfTeX warning`) under an escaping paren-stack path is still judged on its real
+          // path. That leaks nothing — filtering only ever removes lines, and never emits a path
+          // — it just leaves a weak confirmation oracle for a caller who already knows the
+          // escaping path and watches whether such a line survives naming it. They supply the
+          // path, learn no content, and get nothing openable back.
           const judgeWarning = (w: { file?: string; rule?: string }): boolean =>
             warningMatches(withoutUnopenableLocation(w, withheld.all), warningsFilter);
           const filterEmpty = isEmptyFilter(warningsFilter);

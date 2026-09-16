@@ -194,16 +194,32 @@ const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
  * derive a different `rule` for the same line. Deliberately narrow: "LaTeX Font Warning: ..." does
  * NOT match (there is no bare "Warning:" right after "LaTeX"), so a font warning falls through to
  * `warningRuleOf`'s unmatched case rather than being misclassified as rule "LaTeX".
+ *
+ * The name class is `[\w.-]+`, not `\w+`: real package names carry `.` and `-` (`pdftex.def`,
+ * `tikz-cd`, `biblatex-ext`), and `\w+` matched neither — so `Package pdftex.def Warning: ...`
+ * matched nothing at all. Not misclassified: *invisible*, dropped from `warnings[]` by `parseLog`
+ * and from `warningsOmitted` by `warningRuleOf` (it never reached the filter to be counted), while
+ * `KEEP_PATTERNS`' literal `/Warning:/` still kept the raw line in `logTail` — the one asymmetry
+ * `warningsFilter` exists to remove. The space before `Warning:` is deliberately outside the
+ * class, so a name can never swallow into it.
  */
-const PACKAGE_WARNING = /(?:LaTeX|Package (\w+)|Class (\w+)) Warning: (.+)/;
+const PACKAGE_WARNING = /(?:LaTeX|Package ([\w.-]+)|Class ([\w.-]+)) Warning: (.+)/;
 
 /** An `Overfull \hbox`/`Underfull \vbox` line. Shared the same way as {@link PACKAGE_WARNING}. */
 const BOX_WARNING = /^(Overfull|Underfull) \\([hv])box/;
 
 /**
  * The `{ file, rule }` shape `keepWarning` judges, derived from one log line the same way
- * `parseLog` derives a warning's `rule` — kept as one function so `filterLog` can never compute a
- * different answer than `parseLog` would for the same line.
+ * `parseLog` derives a *warning's* `rule` — kept as one function so the two stay in step.
+ *
+ * It speaks only for lines that reach the filter at all. An *error* line never does: a `! `, an
+ * inline `Error:`, and — because `parseLog` tests {@link FILE_LINE_ERROR} first and `continue`s,
+ * so a `-file-line-error` line is an error whatever its message says — a `-file-line-error` line
+ * are all excluded by {@link ALWAYS_KEEP_PATTERNS} before `warningRuleOf` is ever consulted. That
+ * exclusion is what keeps the two partitions aligned; this function makes no claim about a line
+ * `parseLog` would call an error, and would derive the wrong `rule` for one
+ * (`./main.tex:12: Package foo Warning: …` → `"foo"`, where `parseLog` derives
+ * `"Package foo Warning"` from the whole message).
  *
  * `matched: false` means the line carries no rule this feature understands (a font warning, a bare
  * `pdfTeX warning`, or any other line kept only because it contains the word "Warning:") — it is
@@ -233,21 +249,44 @@ function isWarningLine(line: string): boolean {
  * matched nothing" apart from "this compile said nothing" — which an empty tail would not.
  */
 const NOTHING_MATCHED_FILTER =
-  '(every diagnostic line in the log was excluded by warningsFilter — drop the filter, or see logPath, for the rest)';
+  '(every diagnostic line in the log was excluded by warningsFilter — some may have been log-only ' +
+  'lines that were never structured warnings, so warningsOmitted can read 0 while this line shows; ' +
+  'drop the filter, or see logPath, for the rest)';
 
 /**
  * Lines `filterLog` always keeps, never subject to `keepWarning` — checked *before* the warning
  * test below, because a line can be both (a `LaTeX Warning: Label(s) may have changed. Rerun to
  * get cross-references right.` line matches `Warning:` as well as the rerun-hint pattern), and a
  * rerun hint must survive a filter that would otherwise drop its "LaTeX"-rule warning.
+ *
+ * Accepted cost: a kept line here can outlive the filtered warning it belonged to. A
+ * `Package rerunfilecheck Warning: File 'main.out' has changed.` is filterable, but its
+ * continuation `(rerunfilecheck)   Rerun to get outlines right.` matches the rerun-hint pattern
+ * and stays — a dangling indented fragment with no header. Deliberately not fixed: suppressing it
+ * would mean tracking which header each continuation belongs to, and the half that survives is the
+ * actionable half. Never drop a line from this list to tidy that up.
  */
 const ALWAYS_KEEP_PATTERNS: RegExp[] = [
   /^! /,
+  // A `-file-line-error` line, mirroring `parseLog`'s branch order: it tests this first and
+  // `continue`s, so such a line is an ERROR there whatever its message says. Without it here, a
+  // `./main.tex:12: Package foo Warning: …` (no inline `Error:`) was an error to `parseLog` and a
+  // filterable warning to `filterLog` — the one line reporting the failure, dropped from the tail.
+  // Anchored `^…$`, so it cannot swallow a prose line that merely contains `path:12:`.
+  FILE_LINE_ERROR,
   /^l\.\d+/,
   /^Runaway /,
   /^(Emergency stop|Fatal error|No pages of output)/,
   /Error:/,
   /(may have changed|Rerun to get|Please rerun)/,
+  // biblatex phrases its rerun hint as `Please (re)run Biber on the file:` — literal parentheses,
+  // so `Please rerun` above does not match it. On a biblatex paper it is the only line saying the
+  // bibliography is stale. Deliberately `logTail`-only: the structured `warnings[]` entry (rule
+  // `biblatex`) is still dropped by an include-filter, exactly as the `Label(s) may have changed`
+  // hint's `LaTeX`-rule entry already is — protected in the tail, filterable in `warnings[]`. Do
+  // not "fix" that asymmetry here; making `warnings[]` protect rerun hints is new behaviour and
+  // would change `warningsOmitted`.
+  /\(re\)run/,
   /^Output written on /,
 ];
 

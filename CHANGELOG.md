@@ -36,6 +36,16 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   have returned the excluded warnings plus the font and PDF-statistics noise, the feature exactly
   inverted, so the two emptinesses are told apart rather than sharing a branch.
 
+- **A package name carrying a `.` or a `-` is finally a warning at all** (#73). `PACKAGE_WARNING`'s
+  name class was `\w+`, which matches neither, so `Package pdftex.def Warning: ...` — pdfTeX's own
+  driver file, one of the commonest warning sources in a real log — matched nothing. Not
+  misclassified: **invisible**, missing from `warnings[]` entirely and uncounted by
+  `warningsOmitted`, while `KEEP_PATTERNS`' literal `/Warning:/` still kept the raw line in
+  `logTail` — precisely the ships-twice asymmetry `warningsFilter` exists to remove, on the warning
+  a user is most likely to want filtered. The class is now `[\w.-]+`; the space before `Warning:`
+  stays outside it, so a name can never swallow into it. `filterLog`'s no-filter output is
+  unaffected, since `KEEP_PATTERNS` matches the literal word and never this regex.
+
 - **`status` collapses sessions that exited holding nothing into a count** (#73). A session record
   under `<workspace>/.sessions/<projectId>/` is removed only on a clean shutdown
   (`SessionRegistry.release()` on SIGINT/SIGTERM/beforeExit), so every killed agent process leaves
@@ -43,11 +53,16 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   never coming back. They are now reported as `staleSessions: N` instead of listed. The tempting fix
   — wiring up `SessionRegistry.collectGarbage()`, which exists and has never had a caller — is
   **deliberately not done**, and should stay undone from here: `status` is read-only and takes no
-  lock, and `live` is _derived_ (a pid invisible across pid namespaces, plus a heartbeat throttled to
-  30 minutes), so an idle-but-alive peer can read as dead. Reaping its record while it races its own
+  lock, and `live` is _derived_ (a pid invisible across pid namespaces, plus a heartbeat that is
+  treated as stale after 30 minutes — `STALE_MS`, not the 30-second `HEARTBEAT_THROTTLE_MS` that
+  paces the writes), so an idle-but-alive peer can read as dead. Reaping its record while it races its own
   `record()` would destroy the ownership proof `commit scope: "paths"` and `push` refuse on — the
-  exact guarantee the shadow store exists to make. An integration test asserts the session
-  directories are still on disk after a `status` call, so a later "cleanup" cannot land quietly.
+  exact guarantee the shadow store exists to make. An integration test asserts every session's
+  `session.json` — and the `shadow.json` of each session that has one — is still on disk after a
+  `status` call: the files, not merely the directory, since `release()` removes only the record and
+  leaves the directory standing, so a
+  directory-only assertion would let that shape of "cleanup" land quietly — and that a corrupt
+  index is still corrupt, since "repairing" it would turn unreadable into "owns nothing".
   What is **not** collapsed matters as much as what is: a dead peer whose shadow index could not be
   **read** stays listed individually with `changes: null`, because `null` from `peerEntries` means
   unreadable and never "owns nothing" — counting it as change-free would assert the one thing this

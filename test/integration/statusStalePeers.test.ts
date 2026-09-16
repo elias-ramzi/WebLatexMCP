@@ -186,10 +186,93 @@ describe('status collapses stale, change-free peer sessions', () => {
     const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
     expect(text).toMatch(/1 session exited with no changes/);
 
-    // The guard against "improving" this into a reaper: every session's directory is untouched.
+    // The guard against "improving" this into a reaper. `status` takes no lock and `live` is
+    // merely DERIVED, so deleting a peer's state while it races its own `record()` destroys the
+    // ownership proof `commit scope: "paths"` and `push` refuse on. `SessionRegistry` has two
+    // removal shapes and BOTH must stay uncalled from here — asserting only on the directory
+    // catches one of them:
+    //   - `collectGarbage()` rm's the whole session directory, recursively;
+    //   - `release()` rm's only `session.json` and leaves the directory standing. That is the
+    //     likelier reaper (someone answering "stale records grow without bound" by deleting the
+    //     records `status` already knows are stale), and the more damaging one: the peer then
+    //     vanishes from `peers()` entirely, its `shadow.json` is orphaned, and its dirty
+    //     working-tree lines become unattributable — a peer that was only *derived* dead loses
+    //     its ownership proof, silently.
+    // So assert the files, not just the directory.
     for (const id of ['dead-empty', 'dead-entries', 'dead-unreadable', 'live-empty']) {
-      const st = await stat(sessionDir(workspace, 'demo', id));
-      expect(st.isDirectory()).toBe(true);
+      const dir = sessionDir(workspace, 'demo', id);
+      const st = await stat(dir).catch(() => null);
+      expect(
+        st?.isDirectory() ?? false,
+        `status reaped ${id}'s session directory — it must never reap (collectGarbage-shaped)`,
+      ).toBe(true);
+      const record = await stat(path.join(dir, 'session.json')).catch(() => null);
+      expect(
+        record?.isFile() ?? false,
+        `status deleted ${id}'s session.json — it must never reap (release-shaped): without the ` +
+          'record the peer vanishes from peers(), its shadow is orphaned, and its lines become ' +
+          'unattributable',
+      ).toBe(true);
     }
+    // Only the two sessions that actually have a shadow index are checked: `dead-empty` and
+    // `live-empty` never wrote one (that ENOENT is exactly why they read back as `[]`), so
+    // asserting one for them would be an assertion that can never hold.
+    for (const id of ['dead-entries', 'dead-unreadable']) {
+      const shadow = await stat(path.join(sessionDir(workspace, 'demo', id), 'shadow.json')).catch(
+        () => null,
+      );
+      expect(
+        shadow?.isFile() ?? false,
+        `status deleted ${id}'s shadow.json — a peer's shadow index is its ownership proof and ` +
+          'status must never remove it',
+      ).toBe(true);
+    }
+    // And the corrupt index is left corrupt: a "repair the unreadable index" cleanup would turn
+    // `entries: null` (unreadable) into `[]` (owns nothing), which is the one inference this
+    // codebase refuses to make.
+    expect(
+      await readFile(
+        path.join(sessionDir(workspace, 'demo', 'dead-unreadable'), 'shadow.json'),
+        'utf8',
+      ),
+      'status rewrote dead-unreadable\'s corrupt shadow index — unreadable must stay unreadable, never be "repaired" into "owns nothing"',
+    ).toBe('not json');
+  });
+
+  it('pluralizes the stale count and joins it onto the peers still shown', async () => {
+    const { workspace, session } = await setup();
+    const alpha = await session('alpha');
+
+    // Two peers that register and then die holding nothing: the plural branch of
+    // `session${n === 1 ? '' : 's'}`, which one stale session can never reach.
+    for (const id of ['dead-empty-one', 'dead-empty-two']) {
+      const peer = await session(id);
+      await call(peer, 'status', {});
+    }
+
+    // One peer that stays shown, so the combined ", and N sessions exited with no changes" join
+    // is exercised rather than only the standalone clause.
+    const holder = await session('holder');
+    await call(holder, 'edit_file', {
+      path: REL,
+      edits: [
+        {
+          oldString: 'The first paragraph opens the method.',
+          newString: 'The first paragraph opens the method, per holder.',
+        },
+      ],
+    });
+
+    await killSession(workspace, 'dead-empty-one');
+    await killSession(workspace, 'dead-empty-two');
+    // holder is deliberately left alive — its pid is this very test process.
+
+    const status = await call<StatusOut>(alpha, 'status', {});
+    expect(status.staleSessions).toBe(2);
+    expect(status.activeSessions.map((s) => s.session)).toEqual(['holder']);
+
+    const res = await alpha.client.callTool({ name: 'status', arguments: {} });
+    const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
+    expect(text).toMatch(/other sessions: holder \([^)]*\), and 2 sessions exited with no changes/);
   });
 });

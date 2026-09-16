@@ -170,6 +170,28 @@ describe('parseLog', () => {
     expect(warnings[1]).toMatchObject({ severity: 'warning', rule: 'natbib', line: 12 });
   });
 
+  it('parses a package or class warning whose name carries a dot or a hyphen', () => {
+    // `\w+` matches neither `.` nor `-`, so a warning from `pdftex.def` (pdfTeX's own driver file,
+    // one of the most common warning sources in a real log) or `tikz-cd` matched nothing at all —
+    // not misclassified, just invisible to warnings[], and so to warningsOmitted too.
+    const log = [
+      "Package pdftex.def Warning: Option `width' ignored for bitmap image on input line 7.",
+      'Class foo-bar Warning: something happened on input line 3.',
+    ].join('\n');
+    const { warnings } = parseLog(log);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatchObject({ severity: 'warning', rule: 'pdftex.def', line: 7 });
+    expect(warnings[1]).toMatchObject({ severity: 'warning', rule: 'foo-bar', line: 3 });
+  });
+
+  it('does not let a dotted name swallow the space before "Warning:"', () => {
+    // The space is outside the name class on purpose; pin it, or `[\w.-]+` could drift to `[\S]+`.
+    const { warnings } = parseLog(
+      'Package hyperref Warning: plain names still work on input line 2.',
+    );
+    expect(warnings[0]).toMatchObject({ rule: 'hyperref', line: 2 });
+  });
+
   it('parses overfull boxes', () => {
     const { warnings } = parseLog('Overfull \\hbox (12.0pt too wide) in paragraph at lines 5--6');
     expect(warnings[0]).toMatchObject({ severity: 'warning', line: 5, rule: 'Overfull \\hbox' });

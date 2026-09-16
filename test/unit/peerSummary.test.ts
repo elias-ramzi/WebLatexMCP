@@ -45,6 +45,13 @@ describe('splitStalePeers', () => {
     expect(stale).toBe(2);
   });
 
+  it('returns nothing shown and stale 0 for no peers at all', () => {
+    const peers: Array<{ live: boolean; entries: unknown[] | null }> = [];
+    const { shown, stale } = splitStalePeers(peers, (p) => ({ live: p.live, entries: p.entries }));
+    expect(shown).toEqual([]);
+    expect(stale).toBe(0);
+  });
+
   it('returns everything shown and stale 0 when nothing is stale', () => {
     const peers = [{ id: 'a', live: true, entries: [] as unknown[] | null }];
     const { shown, stale } = splitStalePeers(peers, (p) => ({ live: p.live, entries: p.entries }));
