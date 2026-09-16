@@ -1,7 +1,12 @@
 import path from 'node:path';
 import { mkdir, readdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
-import { currentBootStamp, isSameBoot, writtenSinceProcessStart } from '../lib/bootIdentity.js';
+import {
+  currentBootStamp,
+  isSameBoot,
+  withinLegacyPidGrace,
+  writtenSinceProcessStart,
+} from '../lib/bootIdentity.js';
 
 /** One session's advertisement of itself, as written to disk. */
 export interface SessionRecord {
@@ -167,9 +172,14 @@ export class SessionRegistry {
           //    not hot-reload, so an old-build process heartbeating right now can never write the
           //    field) — such a record used to get no pid grant whatsoever and fell through to the
           //    bounded heartbeat clause alone, stranding it once idle past `STALE_MS`. That rescue
-          //    reaches only as far as the peer goes on heartbeating after *this* process started;
-          //    one quiet for longer still reads dead, which is a residual stated in
-          //    `docs/CONCURRENCY.md`, not something this route closes. When `boot`
+          //    reaches only as far as the peer goes on heartbeating after *this* process started,
+          //    which is why `withinLegacyPidGrace` exists beside it: a stampless record carries no
+          //    evidence either way (unlike a stamp naming another boot, which is evidence
+          //    against), so it keeps the pid grant on the pid alone — but for a bounded 24h, not
+          //    forever, which is the whole difference from the unbounded clause this module was
+          //    written to fix. Without it, an old-build session idle past `STALE_MS` read dead,
+          //    its peer's `guardPeerWork` saw nobody live, and a `push` with a `message`
+          //    (`git add -A`) or a `commit scope: "paths"` took its uncommitted lines. When `boot`
           //    itself is unreadable (`null`, see above) the stamp route is skipped entirely and
           //    the pid clause grants on `pidAlive` alone, same as pre-boot-scoping.
           //  - the heartbeat is recent (bounded grace of STALE_MS), untouched by boot-scoping —
@@ -180,13 +190,17 @@ export class SessionRegistry {
           // wraparound) is still not detected — that needs the OS's per-process start time, which
           // has no portable source across Linux/macOS/Windows. And if *this* process itself started
           // after a clock step, while a peer has been alive since before it and hasn't heartbeated
-          // since, neither route vouches for that peer (see `writtenSinceProcessStart`'s doc).
+          // since, neither route vouches for that peer (see `writtenSinceProcessStart`'s doc) —
+          // that peer has a stamp, so the legacy grace does not reach it either. A stampless
+          // session idle for longer than `LEGACY_PID_GRACE_MS` still reads dead as well; bounded
+          // is the point, so that one is a deliberate expiry rather than an oversight.
           live:
             self ||
             (pidAlive(record.pid) &&
               (boot === null ||
                 isSameBoot(record.bootedAt, boot) ||
-                writtenSinceProcessStart(record.heartbeatAt))) ||
+                writtenSinceProcessStart(record.heartbeatAt) ||
+                withinLegacyPidGrace(record.bootedAt, age))) ||
             (Number.isFinite(age) && age < STALE_MS),
         } satisfies PeerSession;
       }),

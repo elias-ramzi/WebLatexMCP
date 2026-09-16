@@ -973,17 +973,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   record with **no** stamp — written by an older build — earns no pid grant _from the stamp_: the
   stamp is what makes a pid meaningful, and without it reuse cannot be told from the original, which
   is the whole defect. Its one remaining way into the pid clause is the clock-free route described
-  below — a `heartbeatAt` at or after this process's own start — and a record that cannot clear that
-  either falls back to the bounded heartbeat clause, so a ghost already sitting on disk clears itself
-  within the staleness window instead of needing that hand deletion. That second route is doing real
+  below — a `heartbeatAt` at or after this process's own start — together with the bounded 24-hour
+  grace described at the end of this entry, which grants a stampless record the pid clause on the pid
+  alone once it has gone quiet. A ghost already sitting on disk clears itself when that grace expires
+  instead of needing the hand deletion. That second route is doing real
   work here rather than tidying up after the first: a stampless record exists _because its owning
   process runs the old build_ — and that process will never write a `bootedAt` however often it
   heartbeats, since Node does not hot-reload. Denying it the pid clause outright would strand a
   still-running old-build session: idle past the staleness window with uncommitted work, it would read
   dead to a new-build peer, whose `commit scope: "paths"` would then take its lines. So the pid grant
   has a second, independent route, which rescues such a session **for as long as it goes on
-  heartbeating after the judging process started** — one that has been quiet longer than that is
-  stranded anyway, and is stated as a residual below — and which also repairs a worse problem of the
+  heartbeating after the judging process started** — once it has been quiet longer than that, the
+  bounded grace at the end of this entry takes over — and which also repairs a worse problem of the
   same shape.
 
   A derived stamp is only as good as the clock it is derived from, and this is where the first cut of
@@ -1003,7 +1004,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   vouch for records written since we started, so a peer older than this process still needs its stamp
   — and a peer that clears neither is a residual, stated below.
 
-  Four residuals, stated rather than claimed away. Pid reuse **within** one boot (wraparound) is
+  Three residuals, stated rather than claimed away, and one that a review turned from a residual
+  into a fix. Pid reuse **within** one boot (wraparound) is
   still not detected; telling it apart needs the OS's per-process start time, which has no portable
   source across the three platforms. A **clock step** can still strand a live peer, and what decides
   that is not when either process started relative to the step: `isSameBoot` compares the stamp the
@@ -1012,22 +1014,33 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   anywhere inside that span pushes the two stamps past the tolerance — including a step that happens
   well after the judging process started, so long as the peer's last heartbeat predates our module
   load, which is precisely when `writtenSinceProcessStart` cannot vouch for it either. A
-  still-running **old-build** session is stranded by the same shape with no clock step at all, and it
-  is the most reachable of these: its pid is genuinely alive, its record carries no `bootedAt` to
-  match (and never will — Node does not hot-reload), and once its last heartbeat is older than both
-  the staleness window and our own start, the clock-free route cannot speak for it, so it reads dead.
-  That is the ordinary upgrade window, because heartbeats come only from `status`, `commit`, `push`
-  and the mutation recorder, and an agent session waiting on its user goes quiet for exactly that
-  long. It fails **open**: `guardPeerWork` sees no live peer, so a `push` carrying a `message`
-  (`git add -A`) or a `commit scope: "paths"` can take that session's uncommitted lines. And in
+  still-running **old-build** session was stranded by the same shape with no clock step at all, and
+  it was the most reachable of these: its pid is genuinely alive, its record carries no `bootedAt` to
+  match (and never will — Node does not hot-reload), and once its last heartbeat was older than both
+  the staleness window and our own start, the clock-free route could not speak for it either, so it
+  read dead. That is the ordinary upgrade window, because heartbeats come only from `status`,
+  `commit`, `push` and the mutation recorder, and an agent session waiting on its user goes quiet for
+  exactly that long — and it failed **open**: `guardPeerWork` saw no live peer, so a `push` carrying
+  a `message` (`git add -A`) or a `commit scope: "paths"` could take that session's uncommitted
+  lines. That one is now bounded away rather than merely listed — narrowed, not eliminated: a record
+  with **no** stamp keeps its pid grant on
+  the strength of the pid alone for a bounded `LEGACY_PID_GRACE_MS` (24h), long enough to cover a
+  session left open overnight. The bound is the point — an unbounded pid clause is the defect this
+  whole entry is about — so a genuine legacy ghost whose pid has been reused still clears itself
+  within a day instead of needing a hand-deleted file, and a stampless session idle for longer than
+  that does still read dead, by design. The grace deliberately does **not** extend to a record whose
+  stamp merely drifted: that record has a stamp and the stamp says another boot, so granting it
+  anyway would override evidence rather than act in its absence, and would re-grant the boot-reused
+  ghost for a day. And in
   **containers** the two routes part company, in whichever direction the runtime chooses. Under a
   plain runtime `/proc/uptime` is the host's and is not namespaced, so two sessions in separate
   containers derive the same stamp while their pids come from different namespaces where low pids
   always exist — `pidAlive` false-positives survive there, fail-closed, the same family as
   wraparound. Under **LXCFS or gVisor**, though, `/proc/uptime` _is_ virtualised per container, and
   that flips the residual over: each container derives a different stamp, so an idle peer in another
-  container matches neither route and reads dead — fail-open, the same shape as the stranded
-  old-build session. The registry is a single-machine mechanism; a workspace on a network
+  container matches neither route and reads dead — fail-open, the shape the old-build session used to
+  have. The legacy grace does not reach that one either: those records carry a stamp, it is simply
+  the wrong host's. The registry is a single-machine mechanism; a workspace on a network
   share shared between two machines was never something a pid could speak to.
 
 - **Clicking the PDF dismisses the viewer's comment panel** (#71). The panel _overlays_ the page

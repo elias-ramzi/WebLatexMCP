@@ -9,6 +9,7 @@ import {
   bootStampFrom,
   currentBootStamp,
   isSameBoot,
+  LEGACY_PID_GRACE_MS,
   PROCESS_START_MS,
 } from '../../src/lib/bootIdentity.js';
 
@@ -82,21 +83,70 @@ describe('SessionRegistry', () => {
     expect(live.find((p) => p.sessionId === 'current-boot-peer')).toBeDefined();
   });
 
-  it('legacy record with no bootedAt and a stale heartbeat -> not live', async () => {
+  it('legacy record with no bootedAt, idle past the legacy grace -> not live', async () => {
+    // The bounded end of `withinLegacyPidGrace`. A stampless record keeps its pid grant while it
+    // is young enough to be a still-running old-build session, but the grant expires — that bound
+    // is the whole difference from the unbounded pid clause this module was written to fix, so a
+    // legacy ghost whose pid has been reused clears itself within a day rather than blocking
+    // `push` forever with no cure but a hand-deleted file.
     const registry = new SessionRegistry(root, 'me');
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const pastGrace = new Date(Date.now() - (LEGACY_PID_GRACE_MS + 60 * 60 * 1000)).toISOString();
 
     await writePeerRecord('legacy-stale', {
       sessionId: 'legacy-stale',
-      pid: process.pid,
-      startedAt: twoHoursAgo,
-      heartbeatAt: twoHoursAgo,
+      pid: process.pid, // alive, and deliberately so: only the age may decide this one
+      startedAt: pastGrace,
+      heartbeatAt: pastGrace,
       // no bootedAt: predates the field
     });
 
     const peers = await registry.peers(PROJECT);
     const peer = peers.find((p) => p.sessionId === 'legacy-stale');
     expect(peer?.live).toBe(false);
+  });
+
+  it('legacy record with no bootedAt, idle past STALE_MS but inside the legacy grace -> live', async () => {
+    // The fail-open this grace closes. A still-running old-build session (its pid answers, and it
+    // can never write `bootedAt` — Node does not hot-reload) that has simply been waiting on its
+    // user: heartbeats come only from `status`, `commit`, `push` and the mutation recorder, so two
+    // hours of thinking puts it well past `STALE_MS`. Before the grace it read dead, its peer's
+    // `guardPeerWork` saw no live session, and a `push` carrying a `message` (`git add -A`) or a
+    // `commit scope: "paths"` took its uncommitted lines.
+    //
+    // `writtenSinceProcessStart` must not be what grants this, or the test would pin the wrong
+    // route. Anchoring the heartbeat to `PROCESS_START_MS - 1000` makes that provable rather than
+    // incidental: written *before* this process started, so that route is false by construction.
+    // A plain `Date.now() - 2h` would instead be true whenever the vitest worker happened to be
+    // older than two hours — passing for the wrong reason rather than failing, which is the way a
+    // test goes quiet without anyone noticing (the block below this one exists for the same
+    // hazard). The `Date.now` spy then puts "now" two hours past that heartbeat: comfortably
+    // beyond `STALE_MS`, comfortably inside `LEGACY_PID_GRACE_MS`, leaving the grace as the only
+    // clause that can grant.
+    const registry = new SessionRegistry(root, 'me');
+    const heartbeatBeforeStart = new Date(PROCESS_START_MS - 1000).toISOString();
+    const nowSpy = vi
+      .spyOn(Date, 'now')
+      .mockReturnValue(PROCESS_START_MS - 1000 + 2 * 60 * 60 * 1000);
+
+    try {
+      await writePeerRecord('legacy-idle', {
+        sessionId: 'legacy-idle',
+        pid: process.pid, // guaranteed alive: the old-build process is genuinely still running
+        startedAt: heartbeatBeforeStart,
+        heartbeatAt: heartbeatBeforeStart,
+        // no bootedAt: predates the field, and that process will never write one
+      });
+
+      const peers = await registry.peers(PROJECT);
+      const peer = peers.find((p) => p.sessionId === 'legacy-idle');
+      expect(peer?.live).toBe(true);
+
+      // And it is protected where it counts: `livePeers` is what `guardPeerWork` consults.
+      const live = await registry.livePeers(PROJECT);
+      expect(live.find((p) => p.sessionId === 'legacy-idle')).toBeDefined();
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('legacy record with no bootedAt and a fresh heartbeat -> live via the bounded heartbeat clause', async () => {
@@ -291,12 +341,20 @@ describe('SessionRegistry', () => {
   // even against the pre-Finding-A code, because that fallback alone already grants `live: true`
   // — not a real regression test). A `Date.now()` spy moves only the "now" that `peers()` reads
   // forward by 2 hours; `PROCESS_START_MS` and the heartbeat stay at their real, unmodified values.
-  describe('with the judging clock advanced past STALE_MS', () => {
+  describe('with the judging clock advanced past STALE_MS and the legacy grace', () => {
     let nowSpy: ReturnType<typeof vi.spyOn>;
     const heartbeatAfterStart = new Date(PROCESS_START_MS + 1000).toISOString();
 
     beforeEach(() => {
-      nowSpy = vi.spyOn(Date, 'now').mockReturnValue(PROCESS_START_MS + 1000 + 2 * 60 * 60 * 1000);
+      // Advanced past `LEGACY_PID_GRACE_MS`, not merely past `STALE_MS`, so that neither bounded
+      // clause can be the reason these records read live: the stampless case below would otherwise
+      // be granted by `withinLegacyPidGrace` and stop isolating `writtenSinceProcessStart`, which
+      // is the only route either test is here to pin. `writtenSinceProcessStart` compares the
+      // heartbeat against `PROCESS_START_MS` and never against "now", so advancing the clock
+      // leaves it granting while both age-bounded routes die.
+      nowSpy = vi
+        .spyOn(Date, 'now')
+        .mockReturnValue(PROCESS_START_MS + 1000 + LEGACY_PID_GRACE_MS + 2 * 60 * 60 * 1000);
     });
 
     afterEach(() => {

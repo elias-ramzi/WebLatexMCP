@@ -2,10 +2,12 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import {
   BOOT_STAMP_TOLERANCE_MS,
+  LEGACY_PID_GRACE_MS,
   PROCESS_START_MS,
   bootStampFrom,
   currentBootStamp,
   isSameBoot,
+  withinLegacyPidGrace,
   writtenSinceProcessStart,
 } from '../../src/lib/bootIdentity.js';
 
@@ -205,5 +207,49 @@ describe('writtenSinceProcessStart', () => {
 
     const yearAgo = new Date(PROCESS_START_MS - 365 * 24 * 60 * 60 * 1000).toISOString();
     expect(writtenSinceProcessStart(yearAgo)).toBe(false);
+  });
+});
+
+describe('LEGACY_PID_GRACE_MS', () => {
+  it('is 24 hours — the bound that makes the legacy pid grant expire at all', () => {
+    // Pinned for the same reason as BOOT_STAMP_TOLERANCE_MS: the value is the argument. It has to
+    // outlast the idle gap it exists for (a session left open overnight) while still expiring, and
+    // "still expiring" is the entire difference from the unbounded pid clause this module was
+    // written to fix. Changing it is a documentation change too.
+    expect(LEGACY_PID_GRACE_MS).toBe(24 * 60 * 60 * 1000);
+  });
+});
+
+describe('withinLegacyPidGrace', () => {
+  it('grants a stampless record inside the grace', () => {
+    expect(withinLegacyPidGrace(undefined, 2 * 60 * 60 * 1000)).toBe(true);
+  });
+
+  it('refuses a stampless record past the grace', () => {
+    expect(withinLegacyPidGrace(undefined, LEGACY_PID_GRACE_MS + 1)).toBe(false);
+  });
+
+  it('is false at exactly the grace boundary (the check is <, not <=)', () => {
+    expect(withinLegacyPidGrace(undefined, LEGACY_PID_GRACE_MS)).toBe(false);
+    expect(withinLegacyPidGrace(undefined, LEGACY_PID_GRACE_MS - 1)).toBe(true);
+  });
+
+  it('refuses a record that carries a stamp, however young, and whatever the stamp says', () => {
+    // The distinction the whole route rests on: a stamp naming another boot is evidence *against*
+    // the record, and this grace acts only in the absence of evidence. A stamped record is judged
+    // by `isSameBoot`/`writtenSinceProcessStart` and must never reach this route — otherwise the
+    // grace would silently re-grant the boot-reused ghost for a day, which is the defect.
+    const stamp = new Date(Date.UTC(2026, 0, 1, 8, 0, 0)).toISOString();
+    expect(withinLegacyPidGrace(stamp, 0)).toBe(false);
+    expect(withinLegacyPidGrace(stamp, 60 * 1000)).toBe(false);
+  });
+
+  it('refuses a non-finite age (an unparseable heartbeat earns nothing)', () => {
+    expect(withinLegacyPidGrace(undefined, Number.NaN)).toBe(false);
+  });
+
+  it('honors an explicit graceMs argument that overrides the default', () => {
+    expect(withinLegacyPidGrace(undefined, 90 * 60 * 1000, 2 * 60 * 60 * 1000)).toBe(true);
+    expect(withinLegacyPidGrace(undefined, 90 * 60 * 1000, 60 * 60 * 1000)).toBe(false);
   });
 });

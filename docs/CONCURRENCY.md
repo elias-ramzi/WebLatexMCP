@@ -289,14 +289,13 @@ clock NTP can step — so the comparison carries a generous tolerance, deliberat
 is the safe way to be wrong), while calling one boot two would revoke a live session's pid grant and
 let its uncommitted work read as owned by nobody. A record with **no** stamp — written by a build from
 before the field existed — earns no pid grant _from the stamp_, since the stamp is what makes a pid
-meaningful; its one other way into the pid clause is the clock-free route below, and a record that
-cannot clear that either falls back to the bounded heartbeat clause, so a ghost already sitting on
-disk clears itself rather than needing that hand-deleted file. That other route matters here because
-a stampless record exists _because its owning process runs the old build_, and that process will never
-write a stamp however often it heartbeats — so a stamp-only rule would strand a still-running
-old-build session, whose files a new-build peer's `commit scope: "paths"` would then take. The route
-below rescues such a session only while it goes on heartbeating after the judging process started;
-one that has been quiet for longer is stranded regardless, and is stated as a residual below. What
+meaningful; it reaches the pid clause by two other routes instead, both below — the clock-free one
+while it goes on heartbeating after the judging process started, and a bounded 24-hour grace on the
+pid alone once it has gone quiet. Both matter, because a stampless record exists _because its owning
+process runs the old build_, and that process will never write a stamp however often it heartbeats —
+so a stamp-only rule would strand a still-running old-build session, whose files a new-build peer's
+`commit scope: "paths"` would then take. Past the grace it does read dead, which is what keeps a
+genuine legacy ghost clearing itself instead of sitting on disk forever. What
 this does not catch is pid reuse _within_ a single boot (pid wraparound), which would need the OS's
 per-process start time — and that has no portable source across Linux, macOS and Windows.
 
@@ -323,25 +322,34 @@ unbounded pid grant: the original defect, reproduced. It is documented rather th
 fails **closed** — a ghost reading live costs a spurious refusal, exactly the pre-fix behaviour — and
 never in the direction that lets a live peer's lines be swept.
 
-What clears neither route reads dead, and there are two shapes of that — plus a **container**, which
-cuts either way depending on the runtime. A **clock step** strands a
+What clears no route at all reads dead, and there are two shapes of that — plus a **container**,
+which cuts either way depending on the runtime. A **clock step** strands a
 live peer, and the deciding quantity is not when either process started relative to the step:
 `isSameBoot` compares the stamp the peer derived at its last heartbeat against the one we derive now,
 so what matters is the drift accumulated between that heartbeat and the `peers()` call judging it. A
 step anywhere inside that span pushes the two past the tolerance — including one that happens after
 the judging process started, so long as the peer's last heartbeat predates our module load, which is
-exactly when `writtenSinceProcessStart` cannot speak for it either. A still-running **old-build**
-session is the same shape with no clock step at all, and the most reachable of the three: its pid is
-genuinely alive, its record carries no `bootedAt` and never will, and once its last heartbeat is
-older than both the staleness window and our own start, neither route holds. That is the ordinary
-upgrade window — heartbeats come only from `status`, `commit`, `push` and the mutation recorder, so
-an agent session waiting on its user goes quiet for precisely that long — and it fails **open**:
-`guardPeerWork` sees no live peer, so a `push` carrying a `message` (`git add -A`) or a
-`commit scope: "paths"` can take that session's uncommitted lines. And in a **container** the answer
+exactly when `writtenSinceProcessStart` cannot speak for it either.
+
+A still-running **old-build** session was the same shape with no clock step at all, and the most
+reachable of them: its pid is genuinely alive, its record carries no `bootedAt` and never will, and
+once its last heartbeat was older than both the staleness window and our own start, neither route
+held. That is the ordinary upgrade window — heartbeats come only from `status`, `commit`, `push` and
+the mutation recorder, so an agent session waiting on its user goes quiet for precisely that long —
+and it failed **open**: `guardPeerWork` saw no live peer, so a `push` carrying a `message`
+(`git add -A`) or a `commit scope: "paths"` could take that session's uncommitted lines. So a
+stampless record now keeps its pid grant on the pid alone, for a bounded `LEGACY_PID_GRACE_MS` (24
+hours) — "no stamp" is an absence of evidence, unlike a stamp that names another boot, and the grace
+acts only in that absence. The bound is what keeps this from being the original defect again: a
+legacy ghost whose pid has been reused clears itself within a day rather than never, and a stampless
+session idle beyond the grace does read dead, deliberately. A record whose stamp merely drifted gets
+no such grace — it has a stamp, the stamp disagrees, and granting it anyway would re-grant the
+boot-reused ghost for a day. And in a **container** the answer
 depends on the runtime: under a plain one `/proc/uptime` is the host's while pids are namespaced, so
 `pidAlive` false-positives survive there, fail-closed, as wraparound does — but under LXCFS or gVisor
 `/proc/uptime` _is_ virtualised per container, so two containers derive different stamps and an idle
-peer in another one reads dead, fail-open, as the old-build session does.
+peer in another one reads dead, fail-open, the way the old-build session used to. The legacy grace
+does not rescue that one either: those records carry a stamp, it is simply the wrong host's.
 
 Every path list in that refusal is capped at 20 (`REFUSAL_PATH_CAP`): the header's
 disputed set, each session's `owns`, the unowned line, and the closing's copy of it.

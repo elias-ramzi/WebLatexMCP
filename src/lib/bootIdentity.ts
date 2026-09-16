@@ -141,13 +141,14 @@ export function currentBootStamp(): string {
  * What that costs a stampless record is the *caller's* decision, not this function's, and it is
  * less than it once was: `SessionRegistry` grants the unbounded pid clause on `isSameBoot` **or**
  * `writtenSinceProcessStart`, so a stampless record whose heartbeat landed since the reading
- * process started still earns that clause — which is what keeps a still-running legacy session (an
- * old-build process that can never write the field) from being stranded, but only for as long as it
- * goes on heartbeating after the judging process started. One quiet for longer than that is
- * stranded anyway; that is a documented residual, not a case this rescues (see
- * `docs/CONCURRENCY.md`). A stampless *ghost* earns neither route — it has no stamp and its heartbeat predates
- * us — so it falls through to the bounded heartbeat clause and clears itself in time rather than
- * needing a hand-deleted file. Either way, what this function returns for `undefined` is unchanged.
+ * process started still earns that clause — which keeps a still-running legacy session from being
+ * stranded while it is working. A session quiet for longer than that is covered by
+ * `withinLegacyPidGrace` below, which grants a stampless record the same clause on the pid alone
+ * for a bounded 24h: the two together are why a stampless record is no longer stranded by this
+ * function returning false. A stampless *ghost* therefore reads live for that bounded window too,
+ * and then clears itself — where it once did so within the staleness window, and where before any
+ * of this it never cleared at all. Either way, what this function returns for `undefined` is
+ * unchanged, and that is the point: the caller decides what an absent stamp costs.
  */
 export function isSameBoot(
   recorded: string | undefined,
@@ -163,4 +164,59 @@ export function isSameBoot(
     return false;
   }
   return Math.abs(recordedMs - currentMs) <= toleranceMs;
+}
+
+/**
+ * How long a record carrying **no** `bootedAt` keeps its pid grant on the strength of the pid
+ * alone.
+ *
+ * This exists because "no stamp" and "a stamp naming another boot" are not the same evidence, and
+ * treating them alike cost a live session its protection. A stamped record that fails `isSameBoot`
+ * carries positive evidence *against* itself. A stampless one carries none either way. Usually it
+ * was written by a build from before the field existed, and that process — still running, since its
+ * pid answers — can never write the field however often it heartbeats, because Node does not
+ * hot-reload; the other source is `touch()`'s own degradation, which omits the field when
+ * `os.uptime()` throws, and such a process *can* stamp a later heartbeat if uptime recovers. (On
+ * that platform the judging side usually fails the same read, and `peers()` then grants the pid
+ * clause unbounded via its `boot === null` fallback, so this route rarely decides it.) Denying a
+ * stampless record outright made a still-running old-build session read dead the moment it
+ * idled past `STALE_MS`, and heartbeats come only from `status`, `commit`, `push` and the mutation
+ * recorder, so a session waiting on its user goes quiet for exactly that long. Its peer's
+ * `guardPeerWork` then saw no live session at all, and a `push` carrying a `message` (`git add -A`)
+ * or a `commit scope: "paths"` could take its uncommitted lines — the fail-open direction, which
+ * is the one this module exists to stay out of.
+ *
+ * So the grant is restored, but **bounded**, which is the whole difference from the defect that
+ * started all this. The original bug was an *unbounded* pid clause: a reused pid answered forever
+ * and nothing could ever age the record out. Twenty-four hours covers the idle gap this is for — a
+ * session left open overnight — while a genuine legacy ghost whose pid has been reused clears
+ * itself within a day instead of needing a hand-deleted file. Wrong in this direction costs a
+ * spurious refusal that expires on its own; wrong in the other costs someone's uncommitted work.
+ *
+ * Deliberately **not** extended to a record whose stamp merely drifted past
+ * `BOOT_STAMP_TOLERANCE_MS`: that one has a stamp, and the stamp says another boot. Widening the
+ * grace to cover it would mean overriding evidence rather than acting in its absence, and the
+ * honest fix there is `writtenSinceProcessStart` (which needs no clock) or a larger tolerance.
+ * That case stays a documented residual.
+ */
+export const LEGACY_PID_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a **stampless** record is young enough to keep its pid grant — the bounded fallback for
+ * a record written before `bootedAt` existed.
+ *
+ * Returns false for any record that *has* a stamp, whatever that stamp says: a stamped record is
+ * judged by `isSameBoot` and `writtenSinceProcessStart` and never reaches this route. `ageMs` is
+ * the same `Date.now() - Date.parse(heartbeatAt)` the caller already computes; a non-finite age (an
+ * unparseable heartbeat) earns nothing, as everywhere else in this module.
+ */
+export function withinLegacyPidGrace(
+  recorded: string | undefined,
+  ageMs: number,
+  graceMs: number = LEGACY_PID_GRACE_MS,
+): boolean {
+  if (recorded !== undefined) {
+    return false;
+  }
+  return Number.isFinite(ageMs) && ageMs < graceMs;
 }
