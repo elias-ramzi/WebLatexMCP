@@ -40,14 +40,34 @@ verdict, changing nothing.
    check the skip count, since the TeX smokes auto-skip without `latexmk` (`npm run
 test:smoke` if it is installed). The output goes to the reviewer as evidence, not as
    a substitute for reading the code. Then send the diff (or each slice, in parallel) to
-   the `plan-verifier` agent — **always with `isolation: "worktree"`**, so the reviewer
-   gets its own copy and cannot touch the tree under review even by accident; a reviewer
-   that edits the tree silently invalidates the gate you just ran and every later
-   reading of it. Give it the stated intent as the spec and your scope notes:
+   the `plan-verifier` agent — **with `isolation: "worktree"` whenever every byte under
+   review is committed**, so the reviewer works in a throwaway copy and cannot invalidate the
+   gate you just ran by editing the tree under it. The condition is about uncommitted work,
+   not about PR-versus-branch: the no-target case at step 1 includes your uncommitted
+   changes, and those cannot reach an isolated worktree, so dispatch that one onto your own
+   tree exactly as step 4 does. Know what the copy actually is before you lean on it: the
+   worktree is cut from the repo's **default branch** — `main` here, not the `dev` this
+   command diffs against — not from your branch and not from the PR, and it carries none of
+   your uncommitted work; `git status` in it comes back empty. The object store is shared, so
+   give the reviewer the base and head SHAs and tell it to read the code under review with
+   `git show <sha>:<path>` / `git grep <pat> <sha>`, or to put its worktree on the code with
+   `git switch --detach <sha>` — by SHA, since git refuses a branch another worktree already
+   holds, which under `--fix` is exactly what step 1 just did. A plain `Read`/`Grep` in there
+   answers about the default branch, and that looks exactly like a missing guard. Say in the
+   prompt that the worktree is the agent's own and may be written in, and name the tree that
+   may not be: its contract defaults to treating **every** checkout of this repo as
+   off-limits, so an unstated grant reads as no grant and it will refuse the mutation probes
+   its own checklist asks for. Isolation is also not the whole guard: it keys on the primary
+   checkout, so the sibling worktree this repo usually works in is not covered, and the
+   agent's own writes land in gitignored `.claude/worktrees/`, which your `git status` cannot
+   see — it catches a stray write into your checkout, which is the failure that actually
+   happened, and nothing inside the agent's copy. Give it the stated intent as the spec
+   and your scope notes:
    the agent starts with empty context, so restate everything — how to get the diff, the
    intent, which guards matter most for this change, and that new behaviour the intent
    does not claim is itself a finding. Tell it the scratchpad path for any probe files,
-   and that the tree it is given must come back unmodified — then check that yourself
+   and that the tree under review must come back unmodified — your checkout, not the
+   throwaway worktree it may have been handed as its own — then check that yourself
    (`git status`) when it reports, rather than assuming.
    Merge and deduplicate the findings, then triage
    them yourself: confirm each against the code before believing it, drop anything the
@@ -70,10 +90,18 @@ test:smoke` if it is installed). The output goes to the reviewer as evidence, no
    thing — send it back in this round rather than letting step 4 find it.
 
 4. **Verify** (only with `--fix`). Re-run the gate yourself after every fix, then send
-   the fix diff to the `plan-verifier` agent — again with `isolation: "worktree"` — with
-   the findings list from step 2 as the spec: each finding either fixed or explicitly
-   deferred, no weakened guard, and no new
-   behaviour beyond the fixes. If it confirms new problems, loop back to step 2 scoped
+   the fix diff to the `plan-verifier` agent with the findings list from step 2 as the
+   spec: each finding either fixed or explicitly deferred, no weakened guard, and no new
+   behaviour beyond the fixes. **Do not pass `isolation: "worktree"` here** — the fixes are
+   uncommitted at this point, so an isolated worktree would hold none of them and the
+   reviewer would sign off on an empty diff. Dispatch it onto the tree you fixed in, naming
+   that path **as the tree under review** — its contract already treats every checkout of
+   this repo that way by default, so naming it costs nothing and removes the one thing that
+   could be mistaken for a grant — and hold it to read-only by its own contract plus a
+   `git status` of your own when it reports. The structural guarantee is available at this
+   step only at the price of committing the fixes first and reviewing the commit — that is
+   a call to put to me, per step 5, not one to make silently.
+   If it confirms new problems, loop back to step 2 scoped
    to the fix diff. Cap: 3 rounds total; whatever remains after that is reported, not
    iterated.
    A verifier that proposes a fix has done its job; one that _applies_ one has not.
