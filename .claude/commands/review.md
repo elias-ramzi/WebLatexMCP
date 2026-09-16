@@ -40,10 +40,16 @@ verdict, changing nothing.
    check the skip count, since the TeX smokes auto-skip without `latexmk` (`npm run
 test:smoke` if it is installed). The output goes to the reviewer as evidence, not as
    a substitute for reading the code. Then send the diff (or each slice, in parallel) to
-   the `plan-verifier` agent with the stated intent as the spec and your scope notes:
+   the `plan-verifier` agent — **always with `isolation: "worktree"`**, so the reviewer
+   gets its own copy and cannot touch the tree under review even by accident; a reviewer
+   that edits the tree silently invalidates the gate you just ran and every later
+   reading of it. Give it the stated intent as the spec and your scope notes:
    the agent starts with empty context, so restate everything — how to get the diff, the
    intent, which guards matter most for this change, and that new behaviour the intent
-   does not claim is itself a finding. Merge and deduplicate the findings, then triage
+   does not claim is itself a finding. Tell it the scratchpad path for any probe files,
+   and that the tree it is given must come back unmodified — then check that yourself
+   (`git status`) when it reports, rather than assuming.
+   Merge and deduplicate the findings, then triage
    them yourself: confirm each against the code before believing it, drop anything the
    reviewer got wrong (say so), and rank what remains. Report the ranked findings with
    file, symbol, severity, and proposed fix. Without `--fix`, this report plus step 5's
@@ -64,11 +70,17 @@ test:smoke` if it is installed). The output goes to the reviewer as evidence, no
    thing — send it back in this round rather than letting step 4 find it.
 
 4. **Verify** (only with `--fix`). Re-run the gate yourself after every fix, then send
-   the fix diff to the `plan-verifier` agent with the findings list from step 2 as the
-   spec: each finding either fixed or explicitly deferred, no weakened guard, and no new
+   the fix diff to the `plan-verifier` agent — again with `isolation: "worktree"` — with
+   the findings list from step 2 as the spec: each finding either fixed or explicitly
+   deferred, no weakened guard, and no new
    behaviour beyond the fixes. If it confirms new problems, loop back to step 2 scoped
    to the fix diff. Cap: 3 rounds total; whatever remains after that is reported, not
    iterated.
+   A verifier that proposes a fix has done its job; one that _applies_ one has not.
+   If a reviewer comes back having edited anything, treat its report as unreliable for
+   this round — re-verify its claims yourself — and rebuild the fix set from a clean
+   worktree rather than trusting the tree it handed back. Findings it raises that are
+   real are still real: keep them, drop the edits.
 
 5. **Validate.** Deliver the verdict yourself: approve / request-changes, justified by
    the surviving findings and the local proof (gate output tails, skips distinguished
