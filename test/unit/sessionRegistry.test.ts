@@ -28,7 +28,11 @@ describe('SessionRegistry', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  /** Writes a hand-built session record for a peer (never `registry`'s own sessionId). */
+  /**
+   * Writes a hand-built session record for any session — usually a peer, but deliberately also
+   * `registry`'s own sessionId, which is how the `self` case and the `touch()` re-stamping case
+   * seed a record that was already on disk before the registry under test was constructed.
+   */
   async function writePeerRecord(peerSessionId: string, record: SessionRecord): Promise<void> {
     const dir = sessionDir(root, PROJECT, peerSessionId);
     await mkdir(dir, { recursive: true });
@@ -174,6 +178,66 @@ describe('SessionRegistry', () => {
     expect(isSameBoot(second.bootedAt, currentBootStamp())).toBe(true);
   });
 
+  it('touch() re-stamps a record left behind by a previous boot, rather than carrying its bootedAt forward', async () => {
+    // The asymmetry in `touch()` — `startedAt` carried forward from `existing`, `bootedAt`
+    // re-derived on every write — is the whole point of this test. `startedAt` describes the
+    // session and stays true for its life; a process cannot outlive the boot that started it, so
+    // a carried-forward `bootedAt` is stale *by construction* the moment the record survives a
+    // reboot. This is that record: the same session id found again on disk by a new process,
+    // stamped with the boot before last.
+    //
+    // The failure direction is **fail-open**, which is why it is worth a test of its own: a
+    // carried stamp names a previous boot, so `isSameBoot` refuses a session that is genuinely
+    // running right now, it loses its pid grant, and once it idles past `STALE_MS` it reads dead
+    // to its peers — `push` (`git add -A` when given a `message`) and `commit scope: "paths"` are
+    // then free to take its uncommitted lines. It could never reintroduce the ghost, since a
+    // stale stamp only ever revokes a grant.
+    //
+    // Not a duplicate of the neighbouring `touch() stamps bootedAt...` test, which cannot see
+    // this: every record it writes is stamped by `touch()` itself, so its "first" stamp is
+    // already the current boot and carry-forward is indistinguishable from re-stamping. Only a
+    // *hand-seeded* prior-boot stamp separates the two. The `heartbeatAt` pair does its own,
+    // separate work: it pins that `heartbeatAt` is re-stamped rather than carried forward the way
+    // `startedAt` is. (It is not what catches a `touch()` that returns early on an existing
+    // record — the `bootedAt` assertion below throws first under that mutation, since nothing is
+    // written and the seeded stamp survives.)
+    const priorBoot = bootStampFrom(Date.parse(currentBootStamp()) - 24 * 60 * 60 * 1000, 0);
+    const oldStartedAt = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
+    // Seeded in the past rather than at "now": `touch()` stamps `heartbeatAt` from the wall clock,
+    // so a same-millisecond seed would make "rewrote" and "never wrote" look alike again.
+    const oldHeartbeatAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    // `writePeerRecord` writes any session's file; here, deliberately, the registry's **own**
+    // sessionId — the pre-reboot record `touch()` is about to find as `existing`.
+    await writePeerRecord('survivor', {
+      sessionId: 'survivor',
+      pid: DEFINITELY_DEAD_PID, // the pre-reboot process; its pid means nothing now
+      startedAt: oldStartedAt,
+      heartbeatAt: oldHeartbeatAt,
+      bootedAt: priorBoot,
+    });
+
+    // A fresh instance has never written, and HEARTBEAT_THROTTLE_MS is per-instance, so this
+    // `touch()` is not throttled by the seeded record's age.
+    const registry = new SessionRegistry(root, 'survivor');
+    await registry.touch(PROJECT);
+
+    const file = path.join(sessionDir(root, PROJECT, 'survivor'), 'session.json');
+    const written = JSON.parse(await readFile(file, 'utf8')) as SessionRecord;
+
+    // `startedAt` is still carried forward — pinned here so this test cannot be satisfied by
+    // making the *opposite* mutation and re-stamping both fields.
+    expect(written.startedAt).toBe(oldStartedAt);
+
+    // `bootedAt` is re-derived, not carried.
+    expect(written.bootedAt).not.toBe(priorBoot);
+    expect(isSameBoot(written.bootedAt, currentBootStamp())).toBe(true);
+
+    // And a write actually landed, rather than `touch()` short-circuiting on `existing`.
+    expect(written.heartbeatAt).not.toBe(oldHeartbeatAt);
+    expect(Date.parse(written.heartbeatAt)).toBeGreaterThanOrEqual(Date.parse(oldHeartbeatAt));
+  });
+
   it('collectGarbage reaps a boot-reused-pid ghost', async () => {
     const registry = new SessionRegistry(root, 'me');
     const boot = currentBootStamp();
@@ -284,5 +348,82 @@ describe('SessionRegistry', () => {
       const peer = peers.find((p) => p.sessionId === 'legacy-alive');
       expect(peer?.live).toBe(true);
     });
+  });
+
+  // The two degradation paths for an unreadable boot stamp. `currentBootStamp()` reads
+  // `os.uptime()`, which libuv fails where neither `/proc/uptime` nor `CLOCK_BOOTTIME` is
+  // available (a containerised case libuv itself calls out), so both of them are reachable code,
+  // not defensive decoration. `os.uptime()` is a property access made at call time inside
+  // `bootIdentity`, so a spy on the shared `node:os` namespace object intercepts it.
+  it('touch() still writes the record, with bootedAt absent, when the boot stamp is unreadable', async () => {
+    // This registry is advisory — "a missing or stale registry only ever costs visibility" — so a
+    // heartbeat must never fail merely because the boot stamp could not be read. `touch()` goes
+    // through `readBootStamp()`, which degrades to `undefined`, and `JSON.stringify` then drops
+    // the key. Regressing this to a bare `currentBootStamp()` would reject the heartbeat promise
+    // and take `status` / `commit` / `push` down with it on exactly the platform the degradation
+    // exists for — a hard failure, which is worse than either liveness-verdict direction.
+    const uptimeSpy = vi.spyOn(os, 'uptime').mockImplementation(() => {
+      throw new Error('uptime unavailable');
+    });
+    try {
+      const registry = new SessionRegistry(root, 'stampless-writer');
+      await expect(registry.touch(PROJECT)).resolves.toBeUndefined();
+
+      const file = path.join(sessionDir(root, PROJECT, 'stampless-writer'), 'session.json');
+      const parsed = JSON.parse(await readFile(file, 'utf8')) as SessionRecord;
+      expect(parsed.sessionId).toBe('stampless-writer');
+      expect(parsed.pid).toBe(process.pid);
+      expect(typeof parsed.startedAt).toBe('string');
+      expect(typeof parsed.heartbeatAt).toBe('string');
+      // Stronger than `toBeUndefined()`: it pins that the key is *omitted*, not written as `null`
+      // or the string "undefined" — only a genuinely absent key reads back as the legacy,
+      // stampless record that `isSameBoot` and the peers below are written to handle.
+      expect('bootedAt' in parsed).toBe(false);
+    } finally {
+      uptimeSpy.mockRestore();
+    }
+  });
+
+  it('peers() grants the pid clause on pidAlive alone when the boot stamp is unreadable', async () => {
+    // The same record, judged twice, with the only variable being whether `currentBootStamp()`
+    // can be read. It is built to read **dead** under a working stamp: a live pid, a `bootedAt`
+    // from a previous boot (so `isSameBoot` refuses), and a two-hour-old heartbeat (so neither
+    // `writtenSinceProcessStart` nor the bounded `age < STALE_MS` clause can be the reason it
+    // reads live). The first test in this file pins that verdict; the assertion below re-pins it
+    // here so the contrast is visible in one place.
+    //
+    // With the stamp unreadable, `peers()` sets `boot = null` and the whole stamp check
+    // short-circuits to true, so the pid clause grants on `pidAlive` alone — the pre-boot-scoping
+    // behaviour, deliberately fail-closed: it can grant a spurious `live` (a refusal the user can
+    // work around) but can never sweep a live peer's uncommitted work. Regressing it the other
+    // way — denying the pid clause when the stamp cannot be read — is the fail-open direction, on
+    // exactly the platform this fallback exists for: a genuinely live peer would read dead, and
+    // `push` (`git add -A`) or `commit scope: "paths"` would take its uncommitted lines with
+    // nothing failing.
+    const registry = new SessionRegistry(root, 'me');
+    // Computed before the spy is installed: `currentBootStamp()` throws under it.
+    const priorBoot = bootStampFrom(Date.parse(currentBootStamp()) - 24 * 60 * 60 * 1000, 0);
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    await writePeerRecord('stampless-judge', {
+      sessionId: 'stampless-judge',
+      pid: process.pid, // guaranteed alive
+      startedAt: twoHoursAgo,
+      heartbeatAt: twoHoursAgo,
+      bootedAt: priorBoot,
+    });
+
+    const withStamp = await registry.peers(PROJECT);
+    expect(withStamp.find((p) => p.sessionId === 'stampless-judge')?.live).toBe(false);
+
+    const uptimeSpy = vi.spyOn(os, 'uptime').mockImplementation(() => {
+      throw new Error('uptime unavailable');
+    });
+    try {
+      const withoutStamp = await registry.peers(PROJECT);
+      expect(withoutStamp.find((p) => p.sessionId === 'stampless-judge')?.live).toBe(true);
+    } finally {
+      uptimeSpy.mockRestore();
+    }
   });
 });

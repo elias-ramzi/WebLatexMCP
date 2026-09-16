@@ -1,11 +1,26 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import os from 'node:os';
 import {
   BOOT_STAMP_TOLERANCE_MS,
   PROCESS_START_MS,
   bootStampFrom,
+  currentBootStamp,
   isSameBoot,
   writtenSinceProcessStart,
 } from '../../src/lib/bootIdentity.js';
+
+describe('BOOT_STAMP_TOLERANCE_MS', () => {
+  it('is 5 minutes — the calibrated value the surrounding documentation argues from', () => {
+    // Every boundary test below is written relatively (`base + BOOT_STAMP_TOLERANCE_MS`), which is
+    // right for pinning the `<=` and the `Math.abs` but leaves the *value* free: silently widening
+    // it to 37 minutes keeps all of them green. The value is a calibration decision, not an
+    // arbitrary one — CHANGELOG.md and docs/CONCURRENCY.md both reason from a measured 4m32s of
+    // real WSL2 drift being "about 90% of the tolerance", and that is the evidence offered for
+    // adding `writtenSinceProcessStart` instead of simply raising this number. Changing it is
+    // therefore a documentation change too, and this line is what makes the gate say so.
+    expect(BOOT_STAMP_TOLERANCE_MS).toBe(5 * 60 * 1000);
+  });
+});
 
 describe('bootStampFrom', () => {
   it('derives the exact boot instant from a wall-clock time and an uptime', () => {
@@ -27,6 +42,58 @@ describe('bootStampFrom', () => {
     expect(bootStampFrom(nowMs, uptimeSeconds)).toBe(
       new Date(nowMs - 1234.56 * 1000).toISOString(),
     );
+  });
+});
+
+describe('currentBootStamp', () => {
+  // Both spies are on shared globals — a leaked `Date.now` spy would corrupt every later test in
+  // this file and in the suite — so they are restored unconditionally.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('subtracts the live uptime, so the same boot derives the same stamp as time passes', () => {
+    // `os.uptime()` must actually be consulted. Replacing the call with a constant 0 leaves every
+    // other test in this file green — nothing else imports `currentBootStamp`, and in
+    // `SessionRegistry` both sides of every comparison come from it, so a wrong derivation cancels
+    // out. The failure direction is the unsafe one: the derived stamp collapses to "now", so any
+    // record written more than BOOT_STAMP_TOLERANCE_MS ago *in the same boot* stops matching, and
+    // a live peer whose heartbeat is merely stale reads dead — `push` with a `message` then runs
+    // `git add -A` over its lines and `commit scope: "paths"` stops refusing them.
+    //
+    // A real boot advances the wall clock and the uptime by the same amount, so the derived boot
+    // instant is invariant. Spied values are set before each call rather than queued per call, so
+    // an incidental `Date.now()` from the runner cannot shift a queue and make this flaky.
+    const bootMs = Date.UTC(2026, 0, 1, 8, 0, 0);
+    const uptimeSeconds = 3600; // 1 hour into the boot
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(bootMs + uptimeSeconds * 1000);
+    const uptimeSpy = vi.spyOn(os, 'uptime').mockReturnValue(uptimeSeconds);
+
+    const first = currentBootStamp();
+
+    // Ten minutes later in the same boot: +600_000ms of wall clock, +600s of uptime.
+    nowSpy.mockReturnValue(bootMs + (uptimeSeconds + 600) * 1000);
+    uptimeSpy.mockReturnValue(uptimeSeconds + 600);
+    const second = currentBootStamp();
+
+    // The headline claim, asserted first so an uptime-blind derivation fails here and reports the
+    // drift itself. The two readings are 10 minutes apart — twice BOOT_STAMP_TOLERANCE_MS — so
+    // such a derivation is not merely inaccurate, it is past what `isSameBoot` forgives.
+    expect(second).toBe(first);
+    expect(isSameBoot(first, second)).toBe(true);
+    // ...and the invariant stamp is the real boot instant, not merely some stable string.
+    expect(first).toBe(new Date(bootMs).toISOString());
+  });
+
+  it('is exactly bootStampFrom(Date.now(), os.uptime())', () => {
+    // Pins the composition directly: the pure, test-driven derivation is the one the live reader
+    // uses, with both of its inputs read from the system rather than one of them hard-coded.
+    const nowMs = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const uptimeSeconds = 7200;
+    vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+    vi.spyOn(os, 'uptime').mockReturnValue(uptimeSeconds);
+
+    expect(currentBootStamp()).toBe(bootStampFrom(Date.now(), os.uptime()));
   });
 });
 

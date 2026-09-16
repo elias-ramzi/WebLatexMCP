@@ -86,14 +86,22 @@ export class SessionRegistry {
       // Stamped fresh on every write, never carried forward from `existing` the way `startedAt`
       // is: `startedAt` describes the session and stays true for its whole life, but a process
       // cannot outlive the boot that started it, so the current boot is always the right answer.
-      // Carrying a stale one forward would be the bug this field exists to fix, reintroduced.
+      // Carrying a stale one forward would fail in the **fail-open** direction — not the ghost
+      // direction: a stamp naming a previous boot makes `isSameBoot` return false for a session
+      // that is genuinely running right now, so a live peer reads dead, `status` collapses it into
+      // `staleSessions`, and `push` / `commit scope: "paths"` are free to sweep its uncommitted
+      // lines. It could not reintroduce the ghost (a ghost is a *dead* session reading live, and a
+      // stale stamp only ever revokes a grant), which is precisely why it is the worse of the two:
+      // re-stamping is not an optimisation to fold away.
       //
       // `currentBootStamp()` calls `os.uptime()`, which can throw (libuv returns an error on
       // Linux when neither `/proc/uptime` nor `CLOCK_BOOTTIME` is available — a containerised
       // case libuv itself calls out). This registry is advisory: a missing or stale registry only
       // ever costs visibility, so a heartbeat must never fail just because the boot stamp
       // couldn't be read. Write the record with `bootedAt` simply absent rather than failing the
-      // write — the record still falls back to the bounded heartbeat-liveness clause below.
+      // write — such a record earns no stamp route, but a peer whose own process started before
+      // this heartbeat still grants it the pid clause via `writtenSinceProcessStart`, and failing
+      // that it falls back to the bounded heartbeat-liveness clause below.
       bootedAt: readBootStamp(),
     };
     await writeAtomic(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
@@ -158,7 +166,10 @@ export class SessionRegistry {
           //    also rescues a still-running *legacy* session with no `bootedAt` at all (Node does
           //    not hot-reload, so an old-build process heartbeating right now can never write the
           //    field) — such a record used to get no pid grant whatsoever and fell through to the
-          //    bounded heartbeat clause alone, stranding it once idle past `STALE_MS`. When `boot`
+          //    bounded heartbeat clause alone, stranding it once idle past `STALE_MS`. That rescue
+          //    reaches only as far as the peer goes on heartbeating after *this* process started;
+          //    one quiet for longer still reads dead, which is a residual stated in
+          //    `docs/CONCURRENCY.md`, not something this route closes. When `boot`
           //    itself is unreadable (`null`, see above) the stamp route is skipped entirely and
           //    the pid clause grants on `pidAlive` alone, same as pre-boot-scoping.
           //  - the heartbeat is recent (bounded grace of STALE_MS), untouched by boot-scoping —
