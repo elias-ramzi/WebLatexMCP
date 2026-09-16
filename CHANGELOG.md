@@ -11,6 +11,48 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`compile` takes a `warningsFilter`, and it trims both channels or neither** (#73). A warning-heavy
+  paper returned ~127 KB of result, and the reason it was that large is that every `Overfull \hbox`
+  ships **twice**: once structured in `warnings[]`, and once as raw text in `logTail`, because
+  `KEEP_PATTERNS` keeps box lines and `logTail` is returned on every compile. So a filter over
+  `warnings[]` alone — the obvious shape, and the one the report asked for — would have cut barely half
+  of what it claimed to cut, while reading as though it had worked. `warningsFilter` takes `file`,
+  `rule` and `excludeRule` (exact, literal, never globs or prefixes — the house rule that a
+  caller-named path handed downstream is literal, for the same reason: a typo must fail
+  conspicuously rather than match everything), and `filterLog` gained a `keepWarning` predicate so
+  `logTail` drops the same lines `warnings[]` dropped. `warningsOmitted` counts what went, so a
+  filtered list is never silently a subset. Three things it deliberately does not do: it never
+  filters **errors** — a document that fails to compile is not made to look cleaner by a knob meant
+  for box noise; it never filters a **rerun hint** or the `Output written on` summary, even though
+  `LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.` matches both a
+  warning pattern and a hint pattern, so the always-keep list is checked **first**; and it leaves
+  `rawLog: true` alone, because raw means raw — `warnings[]` is still filtered there, and both
+  descriptions say so rather than letting a caller discover the asymmetry. With no filter passed,
+  `filterLog`'s output is byte-identical to before — pinned by a differential test — and the
+  paren-stack bookkeeping `keepWarning` needs is skipped entirely. "Unchanged unless used" is the
+  only thing that makes this safe to add to a tool every session calls. And when a filter rejects
+  _every_ diagnostic line, the tail says so in one sentence rather than falling back to the raw
+  last-15-lines tail it falls back to for a log with no diagnostics at all — that fallback would
+  have returned the excluded warnings plus the font and PDF-statistics noise, the feature exactly
+  inverted, so the two emptinesses are told apart rather than sharing a branch.
+
+- **`status` collapses sessions that exited holding nothing into a count** (#73). A session record
+  under `<workspace>/.sessions/<projectId>/` is removed only on a clean shutdown
+  (`SessionRegistry.release()` on SIGINT/SIGTERM/beforeExit), so every killed agent process leaves
+  one behind forever and `activeSessions` grew without bound with sessions that own nothing and are
+  never coming back. They are now reported as `staleSessions: N` instead of listed. The tempting fix
+  — wiring up `SessionRegistry.collectGarbage()`, which exists and has never had a caller — is
+  **deliberately not done**, and should stay undone from here: `status` is read-only and takes no
+  lock, and `live` is _derived_ (a pid invisible across pid namespaces, plus a heartbeat throttled to
+  30 minutes), so an idle-but-alive peer can read as dead. Reaping its record while it races its own
+  `record()` would destroy the ownership proof `commit scope: "paths"` and `push` refuse on — the
+  exact guarantee the shadow store exists to make. An integration test asserts the session
+  directories are still on disk after a `status` call, so a later "cleanup" cannot land quietly.
+  What is **not** collapsed matters as much as what is: a dead peer whose shadow index could not be
+  **read** stays listed individually with `changes: null`, because `null` from `peerEntries` means
+  unreadable and never "owns nothing" — counting it as change-free would assert the one thing this
+  codebase refuses to infer. Records still accumulate on disk; only the report is bounded.
+
 - **Crossref and OpenAlex as reference backends, behind a resolver — and a DBLP client that sniffs
   the body instead of trusting the status** (#72). `dblp.org` now sits behind an anti-bot
   proof-of-work wall which it serves with **HTTP 200** and an HTML body, so `res.ok` was true and
@@ -655,7 +697,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   partly on the premise that "at 150 dpi a point is ~2 px" — too coarse to match two table heights. `dpi`
   already accepts up to 1200, bounded by the 4000px cap on the clipped edge, so a narrow clipped band
   resolves at roughly 16.7 px/pt; the tool's description now says so. The tool itself is not built — see
-  the split issue — but the premise it rested on was already false.
+  [#73](https://github.com/elias-ramzi/WebLatexMCP/issues/73) — but the premise it rested on was
+  already false.
 
 - **`ASSET_EXT` (moved into `src/lib/assets.ts` for `add_asset`) now also recognizes `.tif` and
   `.ico`, gained along with the move.** Since that set also drives `list_files`'s `assets`

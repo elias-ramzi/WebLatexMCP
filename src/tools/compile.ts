@@ -20,6 +20,7 @@ import {
   needsShellEscape,
   findMissingPackages,
 } from '../services/logParser.js';
+import { warningMatches, isEmptyFilter } from '../lib/warningFilter.js';
 import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -69,7 +70,47 @@ const inputSchema = {
     .describe(
       'Return the raw, unfiltered log tail instead of the de-noised default. Default false: ' +
         'logTail keeps only errors, warnings, and the "Output written on" summary, dropping the ' +
-        'font/memory noise. The full log is always at logPath.',
+        'font/memory noise. The full log is always at logPath. Raw means raw: rawLog: true is ' +
+        'never trimmed by warningsFilter either — only the default, de-noised logTail is. ' +
+        '`warnings[]` is still filtered (and warningsOmitted still counts it) either way.',
+    ),
+  warningsFilter: z
+    .object({
+      file: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Keep only warnings whose file is exactly one of these — project-relative POSIX, ' +
+            'matched EXACTLY as warnings[].file reports it (no globs, no prefixes): the way to ' +
+            'get the spelling right is to read it off a previous compile result. A warning the ' +
+            'log named no file for is dropped when this is set, even though it would otherwise ' +
+            'survive — there is nothing to compare it against, and filtering to one file is not ' +
+            'what you want mixed with warnings of unknown origin.',
+        ),
+      rule: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Keep only warnings whose rule is exactly one of these — the values warnings[].rule ' +
+            'carries: "Overfull \\hbox", "Underfull \\vbox", "LaTeX", or a package/class name ' +
+            'like "hyperref". Matched exactly, never a prefix.',
+        ),
+      excludeRule: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Drop warnings whose rule is exactly one of these. A warning with no rule is never ' +
+            'excluded by this — only rule and file ever drop a rule-less/file-less warning.',
+        ),
+    })
+    .optional()
+    .describe(
+      'Trim warnings[] to the ones you actually want, on a document whose warning-heavy log ' +
+        'otherwise dominates the result. Applies to logTail too, in lockstep with warnings[] — ' +
+        'an Overfull \\hbox line otherwise ships twice, once structured and once as raw text — ' +
+        'except when rawLog: true, where logTail stays whole (see rawLog). Never filters errors, ' +
+        'only warnings: a document that fails to compile is not made to look cleaner by a filter ' +
+        'meant for box-warning noise. warningsOmitted reports how many warnings this removed.',
     ),
 };
 
@@ -185,6 +226,19 @@ const outputSchema = {
     ),
   errors: z.array(errorShape),
   warnings: z.array(warningShape),
+  warningsOmitted: z
+    .number()
+    .describe(
+      'How many entries warningsFilter removed from warnings[] — 0 when no filter was given, or ' +
+        'when it matched everything. Non-zero means the list you are reading is a subset by your ' +
+        'own request: re-run without the filter, or read logPath, to see the rest. It counts ' +
+        'warnings[] entries ONLY, and is deliberately not a line count for logTail: the same ' +
+        'filter runs over the log, but the log carries warning lines that were never structured ' +
+        'warnings (a "LaTeX Font Warning:", a bare "pdfTeX warning") which drop without being ' +
+        'counted here, while a rerun hint ("Label(s) may have changed") is a structured warning ' +
+        'that is kept in the tail regardless. Read this number against warnings[], never against ' +
+        'the size of logTail.',
+    ),
   missingPackages: z
     .array(z.string())
     .describe(
@@ -197,7 +251,15 @@ const outputSchema = {
     .string()
     .describe(
       'De-noised log excerpt: only errors, warnings, and the "Output written on" summary (font ' +
-        'and memory noise stripped). Pass rawLog: true for the unfiltered tail; logPath has the full log.',
+        'and memory noise stripped). warningsFilter runs over this too, by the same rule it ' +
+        'applies to warnings[], so a warning you filtered out does not still ship here as raw ' +
+        'text — that duplication is most of what makes a warning-heavy result large. The two are ' +
+        'not line-for-line equal, and warningsOmitted is not a count of what left here: see that ' +
+        'field. Errors, their l.<n> context, rerun hints and the output summary are never ' +
+        'filtered. When a filter rejects every diagnostic line, this says so in one sentence ' +
+        'rather than falling back to the raw tail, which would hand back the very lines you ' +
+        'excluded. Pass rawLog: true for the unfiltered tail — never trimmed by warningsFilter; ' +
+        'logPath has the full log.',
     ),
   logPath: z.string().optional(),
   omittedSnippetLocations: z
@@ -272,7 +334,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'run ARBITRARY shell commands, so only enable it for a trusted project. Shell escape is ' +
         'never enabled automatically; when a compile fails for lack of it, the result carries a hint. ' +
         'A failure caused by a package the local TeX installation does not have names it in ' +
-        'missingPackages, so you can act on it without parsing the log. Also reports whether the ' +
+        'missingPackages, so you can act on it without parsing the log. On a warning-heavy ' +
+        'document, warningsFilter trims warnings[] AND logTail together (warningsOmitted counts ' +
+        'the removed ones) — never errors. Also reports whether the ' +
         'backend actually wrote a fresh PDF (`rebuilt` — false means a peer session already ' +
         'compiled this shared clone and there was nothing to do) and how long this call waited ' +
         'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended).',
@@ -289,6 +353,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       shellEscape,
       restrictedShellEscape,
       compiler,
+      warningsFilter,
     }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
@@ -328,6 +393,26 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // reachable in the one case that undercounts.
           const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
           const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
+          // Filter AFTER withoutUnopenableLocation, not before: a warning whose path was withheld
+          // (symlink escape, or past the path-check cap) must be judged on the `file` the caller
+          // actually sees — undefined for a withheld one — not the log's original (and possibly
+          // unopenable) path. Never filters errors: a failing document is not made to look
+          // cleaner by a filter meant for warning noise.
+          //
+          // ONE predicate for both channels, and it applies the withholding itself. `logTail`'s
+          // side derives `file` from the log's own paren stack, which knows nothing about what was
+          // withheld — so judging it directly would have the two channels disagree about exactly
+          // the paths the server deliberately refuses to hand back: a `file` filter naming a
+          // withheld path emptied `warnings[]` while leaving that very warning in the tail.
+          // Running each candidate through `withoutUnopenableLocation` first makes the question
+          // identical on both sides. Idempotent on `shownWarnings`, whose file is already gone.
+          const judgeWarning = (w: { file?: string; rule?: string }): boolean =>
+            warningMatches(withoutUnopenableLocation(w, withheld.all), warningsFilter);
+          const filterEmpty = isEmptyFilter(warningsFilter);
+          const shownFilteredWarnings = filterEmpty
+            ? shownWarnings
+            : shownWarnings.filter((w) => judgeWarning(w));
+          const warningsOmitted = shownWarnings.length - shownFilteredWarnings.length;
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
@@ -382,9 +467,20 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             lockWaitSec,
             lockHeldBy,
             errors,
-            warnings: shownWarnings,
+            warnings: shownFilteredWarnings,
+            warningsOmitted,
             missingPackages,
-            logTail: rawLog ? logTail(outcome.log, RAW_TAIL_LINES) : filterLog(outcome.log),
+            logTail: rawLog
+              ? logTail(outcome.log, RAW_TAIL_LINES)
+              : filterLog(
+                  outcome.log,
+                  filterEmpty
+                    ? undefined
+                    : {
+                        baseDir: outcome.logBaseDir,
+                        keepWarning: judgeWarning,
+                      },
+                ),
             logPath: outcome.logPath,
             omittedSnippetLocations,
             hint,
@@ -396,7 +492,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             ? `compile timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
             : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
               `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
-              `${errors.length} error(s), ${warnings.length} warning(s)`;
+              `${errors.length} error(s), ${shownFilteredWarnings.length} warning(s)` +
+              (warningsOmitted > 0 ? ` (${warningsOmitted} filtered out)` : '');
           // A fast "success" right after a peer session compiled the same clone is easy to
           // mistake for a rebuild from this call's own edits — say plainly when it wasn't one.
           if (outcome.success && !outcome.rebuilt) headline += ' (up to date — not rebuilt)';

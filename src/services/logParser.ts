@@ -189,6 +189,69 @@ const CONTEXT_LOOKAHEAD = 8;
 const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
 
 /**
+ * A warning from LaTeX itself, a package, or a class — e.g. "LaTeX Warning: ...", "Package
+ * hyperref Warning: ...". Shared by `parseLog` and `filterLog`'s `keepWarning` so the two never
+ * derive a different `rule` for the same line. Deliberately narrow: "LaTeX Font Warning: ..." does
+ * NOT match (there is no bare "Warning:" right after "LaTeX"), so a font warning falls through to
+ * `warningRuleOf`'s unmatched case rather than being misclassified as rule "LaTeX".
+ */
+const PACKAGE_WARNING = /(?:LaTeX|Package (\w+)|Class (\w+)) Warning: (.+)/;
+
+/** An `Overfull \hbox`/`Underfull \vbox` line. Shared the same way as {@link PACKAGE_WARNING}. */
+const BOX_WARNING = /^(Overfull|Underfull) \\([hv])box/;
+
+/**
+ * The `{ file, rule }` shape `keepWarning` judges, derived from one log line the same way
+ * `parseLog` derives a warning's `rule` — kept as one function so `filterLog` can never compute a
+ * different answer than `parseLog` would for the same line.
+ *
+ * `matched: false` means the line carries no rule this feature understands (a font warning, a bare
+ * `pdfTeX warning`, or any other line kept only because it contains the word "Warning:") — it is
+ * still a warning line, just one with `rule: undefined`.
+ */
+function warningRuleOf(line: string): { matched: boolean; rule?: string } {
+  const warn = PACKAGE_WARNING.exec(line);
+  if (warn && warn[3]) return { matched: true, rule: warn[1] ?? warn[2] ?? 'LaTeX' };
+  const box = BOX_WARNING.exec(line);
+  if (box) return { matched: true, rule: `${box[1]} \\${box[2]}box` };
+  return { matched: false };
+}
+
+/**
+ * Whether a kept log line is a *warning* line at all, as opposed to an error/context/summary line
+ * that `filterLog` always keeps regardless of `keepWarning`. Deliberately broader than
+ * {@link warningRuleOf}'s "matched" case — a bare `pdfTeX warning` or an unrecognised
+ * `... Warning: ...` is still a warning, with no rule this feature understands.
+ */
+function isWarningLine(line: string): boolean {
+  return /Warning:/.test(line) || /pdfTeX warning/.test(line) || BOX_WARNING.test(line);
+}
+
+/**
+ * What `filterLog` returns when every diagnostic line it found was rejected by `keepWarning`. A
+ * sentence rather than an empty string, so a caller reading only `logTail` can tell "your filter
+ * matched nothing" apart from "this compile said nothing" — which an empty tail would not.
+ */
+const NOTHING_MATCHED_FILTER =
+  '(every diagnostic line in the log was excluded by warningsFilter — drop the filter, or see logPath, for the rest)';
+
+/**
+ * Lines `filterLog` always keeps, never subject to `keepWarning` — checked *before* the warning
+ * test below, because a line can be both (a `LaTeX Warning: Label(s) may have changed. Rerun to
+ * get cross-references right.` line matches `Warning:` as well as the rerun-hint pattern), and a
+ * rerun hint must survive a filter that would otherwise drop its "LaTeX"-rule warning.
+ */
+const ALWAYS_KEEP_PATTERNS: RegExp[] = [
+  /^! /,
+  /^l\.\d+/,
+  /^Runaway /,
+  /^(Emergency stop|Fatal error|No pages of output)/,
+  /Error:/,
+  /(may have changed|Rerun to get|Please rerun)/,
+  /^Output written on /,
+];
+
+/**
  * The `l.<n>` context TeX printed for the diagnostic at index `i`, if any.
  *
  * The scan stops at the next diagnostic, because a context line below *that* one belongs to it: a
@@ -308,7 +371,7 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
     }
 
     // Warnings from LaTeX, a package, or a class.
-    const warn = /(?:LaTeX|Package (\w+)|Class (\w+)) Warning: (.+)/.exec(line);
+    const warn = PACKAGE_WARNING.exec(line);
     if (warn && warn[3]) {
       const message = warn[3].trim();
       const onLine =
@@ -324,7 +387,7 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
     }
 
     // Overfull/Underfull boxes.
-    const box = /^(Overfull|Underfull) \\([hv])box/.exec(line);
+    const box = BOX_WARNING.exec(line);
     if (box) {
       const lm = /at lines? (\d+)/.exec(line);
       warnings.push({
@@ -366,13 +429,67 @@ const KEEP_PATTERNS: RegExp[] = [
  * recent, where a fatal error and the output summary sit) and notes any omission. Falls back to a
  * short raw tail if nothing matched, so the caller always sees something. The full log stays on disk
  * at `logPath`; `compile`'s `rawLog: true` returns the unfiltered tail.
+ *
+ * `keepWarning`, when given, additionally drops a *warning* line (an `Overfull \hbox`/
+ * `Underfull \vbox`, or anything else kept only via a `Warning:`/`pdfTeX warning` match — see
+ * {@link isWarningLine}) the predicate rejects, so `compile`'s `warningsFilter` trims `logTail` in
+ * lockstep with `warnings[]` instead of the same lines shipping twice. Applied *before* the
+ * `maxLines` cap, so filtering frees room in the tail rather than being crowded out by lines the
+ * cap would have kept anyway. Every other kept line — errors, their `l.<n>` context, rerun hints,
+ * the `Output written on ` summary — is never filtered (see {@link ALWAYS_KEEP_PATTERNS}).
+ *
+ * **Critical: with `keepWarning` absent, the output is byte-identical to calling this with no
+ * options at all** — pinned by a test — and the paren-stack bookkeeping `keepWarning` needs is
+ * skipped entirely. Only the first half is observable, so only the first half is tested; keep the
+ * bookkeeping behind its `if` anyway, since this runs on every compile of every session. `baseDir` rebases a filtered warning's `file` onto the project root exactly as
+ * `parseLog` does (see {@link rebase}); it is ignored when `keepWarning` is absent.
  */
-export function filterLog(log: string, opts: { maxLines?: number } = {}): string {
+export function filterLog(
+  log: string,
+  opts: {
+    maxLines?: number;
+    baseDir?: string;
+    keepWarning?: (w: { file?: string; rule?: string }) => boolean;
+  } = {},
+): string {
   const maxLines = opts.maxLines ?? 80;
-  const kept = unwrapLines(log)
-    .map((l) => l.replace(/\s+$/, ''))
-    .filter((l) => KEEP_PATTERNS.some((re) => re.test(l)));
-  if (kept.length === 0) return logTail(log, 15);
+  const keepWarning = opts.keepWarning;
+  const baseDir =
+    keepWarning && opts.baseDir ? normalizeFile(opts.baseDir).replace(/\/+$/, '') : '';
+  const stack: Array<string | null> = [];
+  const kept: string[] = [];
+  // Counted separately from `kept` so the "nothing matched" fallback below can tell apart a log
+  // with no diagnostics in it from one whose diagnostics the *filter* removed. They need opposite
+  // answers, and conflating them inverts the feature: see the fallback's own comment.
+  let matchedBeforeFilter = 0;
+  for (const raw of unwrapLines(log)) {
+    const line = raw.replace(/\s+$/, '');
+    // Only maintained when needed: a caller with no `keepWarning` must see byte-identical output,
+    // which this bookkeeping (allocations, `scanParens`' inner loop) must not perturb by running
+    // at all — not merely by not changing the result.
+    const openFile = keepWarning ? currentFile(stack) : undefined;
+    if (keepWarning) scanParens(line, stack);
+
+    if (!KEEP_PATTERNS.some((re) => re.test(line))) continue;
+    matchedBeforeFilter++;
+
+    if (keepWarning && !ALWAYS_KEEP_PATTERNS.some((re) => re.test(line)) && isWarningLine(line)) {
+      const { rule } = warningRuleOf(line);
+      const file = openFile ? rebase(openFile, baseDir) : undefined;
+      if (!keepWarning({ file, rule })) continue;
+    }
+    kept.push(line);
+  }
+  if (kept.length === 0) {
+    // The raw-tail fallback exists for a log with nothing diagnostic in it, so the caller is never
+    // handed an empty string. It must NOT fire when a filter is what emptied the list: the raw
+    // tail is the unfiltered, un-de-noised log, so a filter that rejected every warning would hand
+    // back the very lines it was asked to drop — plus the font/`.pfb`/PDF-statistics noise
+    // `filterLog` exists to strip. That is the feature inverted, and silently, which is why the
+    // two cases are told apart by `matchedBeforeFilter` rather than by `kept` alone.
+    if (matchedBeforeFilter > 0) return NOTHING_MATCHED_FILTER;
+    return logTail(log, 15);
+  }
   if (kept.length > maxLines) {
     const omitted = kept.length - maxLines;
     return [

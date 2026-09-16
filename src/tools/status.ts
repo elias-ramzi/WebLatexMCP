@@ -9,6 +9,7 @@ import { dedupeFolded } from '../lib/peerRefusal.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
 import { latestTouch } from '../services/shadowStore.js';
 import { renderCommitLines } from '../lib/conflictText.js';
+import { splitStalePeers } from '../lib/peerSummary.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -93,7 +94,20 @@ const outputSchema = {
           ),
       }),
     )
-    .describe('Other sessions known to be working on this project.'),
+    .describe(
+      'Other sessions known to be working on this project — except a session that has exited ' +
+        'AND holds no changes, which is left out here and counted in staleSessions instead.',
+    ),
+  staleSessions: z
+    .number()
+    .describe(
+      'How many other sessions have exited and hold no changes, and are therefore left out of ' +
+        'activeSessions rather than listed individually. A session record is only removed on a ' +
+        'clean shutdown, so a killed agent process leaves one behind forever — without this, ' +
+        'activeSessions would grow without bound with sessions that are never coming back. A ' +
+        'session whose shadow index could not be READ is never counted here: unreadable is not ' +
+        '"owns nothing", so it stays listed individually with changes: null.',
+    ),
   conflictedChanges: z
     .array(z.string())
     .describe(
@@ -153,6 +167,15 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         // Read-only, no lock: every peer's shadow index (live or not — a session that exited
         // still gets its last-known changes reported).
         const peerShadows = await collectPeerShadows(ctx.shadows, id, peers);
+        // A dead peer with a readably-empty shadow index holds nothing and is never coming back
+        // (its record is only removed on a clean shutdown, which it did not have) — collapse it
+        // into a count rather than listing it forever. `?? null` matches the lookup everywhere
+        // else in this file: a sessionId missing from the map and one mapped to `null` both mean
+        // "unreadable", which `isStalePeer` refuses to treat as "owns nothing".
+        const { shown: shownPeers, stale: staleSessions } = splitStalePeers(peers, (p) => ({
+          live: p.live,
+          entries: peerShadows.get(p.sessionId) ?? null,
+        }));
         // Flag files a human edited directly (as opposed to changes the tools made), so the
         // agent acknowledges them before writing over them.
         const externalChanges = await ctx.files.externalModifications(dir, [
@@ -185,6 +208,20 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           }
           return `${p.sessionId} (${segments.join('; ')})`;
         };
+        // Stale sessions are counted, never dropped silently — the "and N exited with no changes"
+        // clause survives even when nothing else is shown, so the line still says the sessions
+        // exist rather than vanishing entirely.
+        const staleClause =
+          staleSessions > 0
+            ? `${staleSessions} session${staleSessions === 1 ? '' : 's'} exited with no changes`
+            : '';
+        const otherSessionsLine =
+          shownPeers.length > 0
+            ? `other sessions: ${shownPeers.map(peerDetail).join(', ')}` +
+              (staleClause ? `, and ${staleClause}` : '')
+            : staleClause
+              ? `other sessions: ${staleClause}`
+              : '';
         const text = [
           `branch ${status.branch} — ${syncSummary(status.branch, status.ahead, status.behind)}`,
           status.clean ? 'working tree clean' : 'working tree has changes',
@@ -207,7 +244,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           conflictedChanges.length
             ? `⚠ conflicted (this session vs a commit): ${conflictedChanges.join(', ')}`
             : '',
-          peers.length ? `other sessions: ${peers.map(peerDetail).join(', ')}` : '',
+          otherSessionsLine,
         ]
           .filter(Boolean)
           .join('\n');
@@ -221,7 +258,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
             sessionChanges,
             otherChanges,
             conflictedChanges,
-            activeSessions: peers.map((p) => {
+            activeSessions: shownPeers.map((p) => {
               const entries = peerShadows.get(p.sessionId) ?? null;
               return {
                 session: p.sessionId,
@@ -231,6 +268,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
                 lastWriteAt: entries ? latestTouch(entries) : null,
               };
             }),
+            staleSessions,
           },
         };
       } catch (err) {
