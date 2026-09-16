@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { mkdir, readdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
+import { currentBootStamp, isSameBoot, writtenSinceProcessStart } from '../lib/bootIdentity.js';
 
 /** One session's advertisement of itself, as written to disk. */
 export interface SessionRecord {
@@ -8,6 +9,8 @@ export interface SessionRecord {
   pid: number;
   startedAt: string;
   heartbeatAt: string;
+  /** Approximate instant the machine booted, stamped when the record was written. */
+  bootedAt?: string;
 }
 
 /** A session as seen by a peer, with liveness resolved. */
@@ -34,12 +37,24 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
+ * `currentBootStamp()`, degraded to `undefined` on failure instead of throwing — see the callers'
+ * comments for why a failure here must never propagate.
+ */
+function readBootStamp(): string | undefined {
+  try {
+    return currentBootStamp();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Lets the agent sessions sharing a workspace see each other.
  *
  * Each session advertises itself in its own file, so no two processes ever write the same one and
  * the registry needs no lock of its own. A session that crashes cannot retract its record, so
- * liveness is derived rather than trusted: the owning pid must still exist, or the heartbeat must
- * be recent.
+ * liveness is derived rather than trusted: the owning pid must still exist **and belong to the
+ * same boot that recorded it**, or the heartbeat must be recent.
  *
  * This is deliberately advisory. It exists so `status` can say who else is working and so
  * abandoned state can be cleaned up — nothing here grants or withholds access to anything, and a
@@ -68,6 +83,18 @@ export class SessionRegistry {
       pid: process.pid,
       startedAt: existing?.startedAt ?? new Date(now).toISOString(),
       heartbeatAt: new Date(now).toISOString(),
+      // Stamped fresh on every write, never carried forward from `existing` the way `startedAt`
+      // is: `startedAt` describes the session and stays true for its whole life, but a process
+      // cannot outlive the boot that started it, so the current boot is always the right answer.
+      // Carrying a stale one forward would be the bug this field exists to fix, reintroduced.
+      //
+      // `currentBootStamp()` calls `os.uptime()`, which can throw (libuv returns an error on
+      // Linux when neither `/proc/uptime` nor `CLOCK_BOOTTIME` is available — a containerised
+      // case libuv itself calls out). This registry is advisory: a missing or stale registry only
+      // ever costs visibility, so a heartbeat must never fail just because the boot stamp
+      // couldn't be read. Write the record with `bootedAt` simply absent rather than failing the
+      // write — the record still falls back to the bounded heartbeat-liveness clause below.
+      bootedAt: readBootStamp(),
     };
     await writeAtomic(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
   }
@@ -83,6 +110,20 @@ export class SessionRegistry {
     } catch {
       return []; // nothing has run against this project yet
     }
+    // Read once per call, not once per peer: it's a syscall, and every peer judged in this call
+    // must be judged against the same reading. `os.uptime()` can throw (see `readBootStamp`); when
+    // it does, the stamp comparison cannot be made for *any* peer this call, so fall back to the
+    // pre-boot-scoping behaviour for the pid clause — `pidAlive` alone — rather than letting the
+    // throw propagate out of `peers()` → `livePeers()` → `guardPeerWork` and hard-fail `status`,
+    // `commit` and `push`. That fallback is the module's stated fail-closed bias: it can only grant
+    // a spurious `live` (as it always did before this field existed), never sweep a live peer's
+    // work out from under it.
+    let boot: string | null;
+    try {
+      boot = currentBootStamp();
+    } catch {
+      boot = null;
+    }
     const found = await Promise.all(
       entries.map(async (id) => {
         const record = await this.readRecord(path.join(root, id));
@@ -92,7 +133,50 @@ export class SessionRegistry {
         return {
           ...record,
           self,
-          live: self || pidAlive(record.pid) || (Number.isFinite(age) && age < STALE_MS),
+          // Three ways to be live:
+          //  - it's us: always live.
+          //  - the recorded pid is running AND (belongs to the same boot that recorded it, OR its
+          //    heartbeat was written since this very process started). This used to be
+          //    `pidAlive(record.pid)` alone, with no time bound at all — after a reboot on a
+          //    persisted workspace, a dead session's recorded pid can belong to an unrelated live
+          //    process, so `pidAlive` returned true forever, `live` never went false, `status`
+          //    never collapsed the record into `staleSessions`, and `guardPeerWork`
+          //    (src/lib/peerRefusal.ts) refused every push against a dirty tree with no way to
+          //    clear it but deleting the session file by hand. Boot-scoping is what makes this
+          //    path bounded again: it can only be true while the process genuinely still exists.
+          //
+          //    The `isSameBoot` half is a *derived* stamp (`Date.now() - os.uptime()*1000`) and
+          //    drifts whenever the wall clock is stepped without uptime advancing (VM pause, host
+          //    timesync, a laptop resuming from sleep) — measured to consume ~90% of
+          //    `BOOT_STAMP_TOLERANCE_MS` on one real machine. Left as the only route, that drift
+          //    made a genuinely live peer with a merely-stale heartbeat read as dead (both clauses
+          //    die together), letting `commit scope: "paths"` take its uncommitted lines — a
+          //    regression in the fail-open direction this whole module exists to avoid.
+          //    `writtenSinceProcessStart` is a second, drift-immune route to the same grant: this
+          //    process has been running continuously since it started, so a heartbeat written
+          //    since then was necessarily written during *our* boot, no derived stamp needed. It
+          //    also rescues a still-running *legacy* session with no `bootedAt` at all (Node does
+          //    not hot-reload, so an old-build process heartbeating right now can never write the
+          //    field) — such a record used to get no pid grant whatsoever and fell through to the
+          //    bounded heartbeat clause alone, stranding it once idle past `STALE_MS`. When `boot`
+          //    itself is unreadable (`null`, see above) the stamp route is skipped entirely and
+          //    the pid clause grants on `pidAlive` alone, same as pre-boot-scoping.
+          //  - the heartbeat is recent (bounded grace of STALE_MS), untouched by boot-scoping —
+          //    the fallback once neither pid route grants: a genuinely dead pid, or a live one that
+          //    hasn't heartbeated since a boot the stamp can't vouch for.
+          //
+          // Residual, stated rather than overclaimed: pid reuse *within* a single boot (pid
+          // wraparound) is still not detected — that needs the OS's per-process start time, which
+          // has no portable source across Linux/macOS/Windows. And if *this* process itself started
+          // after a clock step, while a peer has been alive since before it and hasn't heartbeated
+          // since, neither route vouches for that peer (see `writtenSinceProcessStart`'s doc).
+          live:
+            self ||
+            (pidAlive(record.pid) &&
+              (boot === null ||
+                isSameBoot(record.bootedAt, boot) ||
+                writtenSinceProcessStart(record.heartbeatAt))) ||
+            (Number.isFinite(age) && age < STALE_MS),
         } satisfies PeerSession;
       }),
     );

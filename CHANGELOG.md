@@ -940,6 +940,72 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **A reused pid no longer keeps a dead session `live` forever** (#78). `SessionRegistry` derives
+  liveness rather than trusting it — a crashed session cannot retract its record — and a peer counted
+  as live if its recorded pid still named a running process **or** its heartbeat was inside the
+  30-minute staleness window. The second clause is a bounded grace, and deliberately so: a session
+  heartbeats from `status`, `commit` and `push`, and from the mutation recorder on every server-side
+  write, so anything actually _doing_ work stays fresh — but a session that is merely idle, waiting
+  on its user or reading, is still perfectly real and still deserves protection. That is why the pid
+  clause cannot simply be tightened into `pidAlive && age < some outer bound`: it would trade this
+  spurious refusal for the far worse failure of sweeping a live peer's uncommitted lines. The first clause was the only unbounded
+  route to `live`, and a pid is unique only within one boot. On a workspace that survives a reboot —
+  which is the normal case, since `.sessions/` lives beside the clones — a dead session's recorded pid
+  can be handed to an unrelated process, and `pidAlive` then answered true indefinitely. The record
+  never aged into the `staleSessions` count added alongside it, and `guardPeerWork` refuses while any
+  live peer exists **whatever that peer owns** — it is owner-aware only about how it _words_ the
+  refusal, not about whether to refuse at all. So a ghost holding nothing blocked every `push` made
+  while the tree carried a dirty path this session had not itself recorded, permanently, naming a
+  session that did not exist. That last condition sounds like it narrows the blast radius and mostly
+  does not: the dead session's own abandoned edits are still sitting in the working tree, owned by
+  nobody now, and they are precisely such paths. There was no way out through the tools: `status` would not collapse it,
+  `collectGarbage` is deliberately never called from a read-only path, and the only cure was deleting
+  a JSON file by hand — which a user would have to read the source to know about. Each record is now
+  stamped with the boot it was written in (`bootedAt`, derived in the new `src/lib/bootIdentity.ts`
+  from `os.uptime()`), and the pid clause counts only when that stamp matches the current boot, so
+  every route to `live` is bounded again unless the process genuinely still exists. Three things worth
+  keeping straight. The stamp is **approximate** — second-resolution uptime, and a clock NTP can step
+  — so the comparison carries a generous tolerance, biased on purpose toward "same boot": calling two
+  boots one merely leaves the old behaviour in place, a spurious refusal, which is the safe way to be
+  wrong, while calling one boot two would revoke a live session's pid grant and let its uncommitted
+  work read as owned by nobody, which is the direction this codebase does not fall in. `os.uptime()`
+  counts suspended time on all three supported platforms, so a sleeping laptop is not a reboot. And a
+  record with **no** stamp — written by an older build — gets no pid grant at all rather than an
+  assumed one: the stamp is what makes a pid meaningful, and without it reuse cannot be told from the
+  original, which is the whole defect. Such a record falls back to the bounded heartbeat clause, so a
+  ghost already sitting on disk clears itself within the staleness window instead of needing that hand
+  deletion. What that reasoning missed, and a review caught, is that a stampless record exists
+  _because its owning process runs the old build_ — and that process will never write a `bootedAt`
+  however often it heartbeats, since Node does not hot-reload. Denying it outright would strand a
+  still-running old-build session: idle past the staleness window with uncommitted work, it would read
+  dead to a new-build peer, whose `commit scope: "paths"` would then take its lines. So the pid grant
+  has a second, independent route, which also repairs a worse problem of the same shape — see below. The
+  A derived stamp is only as good as the clock it is derived from, and this is where the first cut of
+  the fix was itself unsafe. `Date.now() - os.uptime() * 1000` drifts whenever the wall clock is
+  stepped without uptime advancing, and the drift accumulates over the whole life of a boot rather
+  than being sampling noise at write time. On the WSL2 machine this was developed on, the derived
+  instant had already moved 4m32s — about 90% of the tolerance — inside a single boot, and a laptop
+  sleeping overnight steps it by hours. That is the fail-open direction: a genuinely alive peer
+  holding uncommitted edits would lose its stamp match _and_ have a stale heartbeat, both clauses
+  dying together, and `commit scope: "paths"` would stop refusing its files. Before the fix,
+  `pidAlive` protected it. So the pid clause has a second route that does not depend on the clock at
+  all: a record whose `heartbeatAt` is at or after **this process's own start** was necessarily
+  written during the current boot, because a reboot would have killed us. That proof is immune to
+  drift — a clock step changes future readings, not the two past readings being compared — and it is
+  what rescues both the drifted live peer and the old-build session above. It is a supplement, never
+  a replacement: it can only vouch for records written since we started, so a peer older than this
+  process still needs its stamp.
+
+  Three residuals, stated rather than claimed away. Pid reuse **within** one boot (wraparound) is
+  still not detected; telling it apart needs the OS's per-process start time, which has no portable
+  source across the three platforms. A peer that has been alive since **before** a clock step, judged
+  by a process that started **after** it, is vouched for by neither route and reads dead. And in
+  **containers** the two routes part company: `/proc/uptime` is the host's and is not namespaced, so
+  two sessions in separate containers derive the same stamp while their pids come from different
+  namespaces where low pids always exist — `pidAlive` false-positives survive there, fail-closed, the
+  same family as wraparound. The registry is a single-machine mechanism; a workspace on a network
+  share shared between two machines was never something a pid could speak to.
+
 - **Clicking the PDF dismisses the viewer's comment panel** (#71). The panel _overlays_ the page
   (`position: absolute` over `#viewerContainer`) rather than sitting beside it, so clicking through to
   the document reads as the way out of it — but the only thing that closed it was the 💬 toolbar

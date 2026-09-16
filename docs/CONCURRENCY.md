@@ -244,8 +244,9 @@ naming it, and it shows up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
 without attempting a push.
 
-Not every peer `status` lists by name, though. A session that has died — its process gone, its
-heartbeat older than the staleness window — and whose shadow index reads back as a readable, empty
+Not every peer `status` lists by name, though. A session that has died — no live process _from this
+boot_ behind its recorded pid, and a heartbeat older than the staleness window — and whose shadow
+index reads back as a readable, empty
 array (it committed everything before exiting, or never made a server-side edit) is folded into a
 single `staleSessions: N` count instead. Three cases are deliberately NOT collapsed: a **live** peer,
 however little it currently holds, because it may write again any moment; a **dead peer that still
@@ -263,6 +264,53 @@ tell this session's in-flight edits from a peer's. Both of those guards resolve 
 was already dead by `livePeers`' own definition, so nothing that used to be refused starts being
 allowed, and nothing that used to be allowed starts being refused. Session records accumulate on disk
 for as long as the workspace exists; only what `status` chooses to print is bounded.
+
+Liveness itself is derived, never trusted — a session that crashes cannot retract its record. A peer
+counts as live if its recorded pid still names a running process, **or** its heartbeat is inside the
+30-minute staleness window. The second clause is a bounded grace, which is what lets an idle-but-alive
+session go on being protected: a session heartbeats from `status`, `commit` and `push`, and from the
+mutation recorder on every server-side write, so anything actually doing work stays fresh — but a
+session merely waiting on its user is still perfectly real. The first clause used to be the
+only unbounded route to `live`, and that is exactly where it broke: a pid is unique only within one
+boot, so on a workspace that survives a reboot a dead session's recorded pid can be handed to an
+unrelated process. `pidAlive` then answered true forever. The record never aged into `staleSessions`,
+and — because `guardPeerWork` refuses while any live peer exists **whatever that peer owns**, being
+owner-aware only about how it words the refusal — it blocked every `push` made while the tree carried
+a dirty path this session had not itself recorded, permanently, with no cure but deleting a JSON file
+by hand. In the reboot case that condition is almost always met: the dead session's own abandoned
+edits are still in the tree and are owned by nobody.
+
+So the pid is scoped to its boot. Each record is stamped with the instant the machine booted
+(`bootedAt`, derived in `src/lib/bootIdentity.ts` from `os.uptime()`), and the pid clause only counts
+when that stamp matches the current boot. The stamp is approximate — second-resolution uptime, and a
+clock NTP can step — so the comparison carries a generous tolerance, deliberately biased toward
+"same boot": calling two boots one merely leaves today's behaviour in place (a spurious refusal, which
+is the safe way to be wrong), while calling one boot two would revoke a live session's pid grant and
+let its uncommitted work read as owned by nobody. A record with **no** stamp — written by a build from
+before the field existed — gets no pid grant at all and falls back to the bounded heartbeat clause, so
+a ghost already sitting on disk clears itself rather than needing that hand-deleted file. A stampless
+record, though, exists _because its owning process runs the old build_, and that process will never
+write a stamp however often it heartbeats — so denying it outright would strand a still-running
+old-build session, whose files a new-build peer's `commit scope: "paths"` would then take. The second
+route below is what rescues it. What this does not catch is
+pid reuse _within_ a single boot (pid wraparound), which would need the OS's per-process start time —
+and that has no portable source across Linux, macOS and Windows.
+
+A derived stamp is only as good as its clock, so the pid clause has a second route that needs no clock
+at all. `Date.now() - os.uptime() * 1000` drifts whenever the wall clock is stepped without uptime
+advancing, and that drift accumulates over the life of a boot rather than being write-time jitter: on
+the WSL2 machine this was developed on it had already moved 4m32s, about 90% of the tolerance, inside
+one boot, and an overnight sleep steps it by hours. That is the unsafe direction — a live peer holding
+uncommitted edits loses its stamp match _and_ has a stale heartbeat, both clauses dying at once, and
+`commit scope: "paths"` stops refusing its files. So a record whose `heartbeatAt` is at or after **this
+process's own start** earns the pid grant outright: it must have been written during the current boot,
+because a reboot would have killed us. That proof is immune to drift, since a clock step moves future
+readings and not the two past ones being compared, and it is what rescues both the drifted live peer
+and the stampless old-build session above. It only ever supplements the stamp — it can vouch for
+nothing written before this process started, so an older peer still needs its `bootedAt`. A peer alive
+since before a clock step, judged by a process started after it, is vouched for by neither and reads
+dead; and in a container `/proc/uptime` is the host's while pids are namespaced, so `pidAlive`
+false-positives survive there, fail-closed, as wraparound does.
 
 Every path list in that refusal is capped at 20 (`REFUSAL_PATH_CAP`): the header's
 disputed set, each session's `owns`, the unowned line, and the closing's copy of it.
@@ -327,10 +375,10 @@ so when the others are between edits.
   call that omits `project` resolves to the peer's choice, whether or not this session had a
   default before. Only a session that asserted one through `WEB_LATEX_MCP_DEFAULT_PROJECT`
   keeps its own.
-- **A session that dies leaves its edits behind.** They stay in the working tree; once
-  its process is gone and its heartbeat is stale it stops counting as live, and its
-  files show up as changes no live session owns, committable with `scope: "all"` or
-  `scope: "paths"`.
+- **A session that dies leaves its edits behind.** They stay in the working tree; once its
+  process is gone — or its recorded pid belongs to a different boot — and its heartbeat is
+  stale, it stops counting as live, and its files show up as changes no live session owns,
+  committable with `scope: "all"` or `scope: "paths"`.
 
 ## Optional review flow for larger edits
 
