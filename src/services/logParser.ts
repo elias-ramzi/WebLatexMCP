@@ -185,7 +185,13 @@ function looksLikeFile(token: string): boolean {
  */
 const CONTEXT_LOOKAHEAD = 8;
 
-/** `-file-line-error` form: "./main.tex:12: Undefined control sequence." */
+/**
+ * `-file-line-error` form: "./main.tex:12: Undefined control sequence."
+ *
+ * Shared, via `.exec()` in `parseLog` and `.test()` in `nextContext` and the
+ * `ALWAYS_KEEP_PATTERNS` loop. Flags must stay empty — no `g`/`y` — or `lastIndex` persists across
+ * those call sites and produces alternating misses that look like a parser flake, not a regex bug.
+ */
 const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
 
 /**
@@ -272,7 +278,11 @@ const ALWAYS_KEEP_PATTERNS: RegExp[] = [
   // `continue`s, so such a line is an ERROR there whatever its message says. Without it here, a
   // `./main.tex:12: Package foo Warning: …` (no inline `Error:`) was an error to `parseLog` and a
   // filterable warning to `filterLog` — the one line reporting the failure, dropped from the tail.
-  // Anchored `^…$`, so it cannot swallow a prose line that merely contains `path:12:`.
+  // The anchoring (`^…$`) does NOT keep this from matching a prose line that merely contains
+  // `path:12:` — `[^:]*` admits spaces, so `see ./main.tex:12: for details` matches too, with
+  // group 1 = "see ./main.tex". That is harmless here, not absent: `parseLog` classifies that same
+  // line as an error via this identical regex, so both partitions still agree on it — which is the
+  // real invariant this list preserves, not the anchoring.
   FILE_LINE_ERROR,
   /^l\.\d+/,
   /^Runaway /,
@@ -286,7 +296,14 @@ const ALWAYS_KEEP_PATTERNS: RegExp[] = [
   // hint's `LaTeX`-rule entry already is — protected in the tail, filterable in `warnings[]`. Do
   // not "fix" that asymmetry here; making `warnings[]` protect rerun hints is new behaviour and
   // would change `warningsOmitted`.
-  /\(re\)run/,
+  //
+  // Anchored to `Please `, not a bare `/\(re\)run/`: the log is document-controlled (a `.tex` can
+  // emit anything via `\PackageWarning`/`\typeout`), so an unanchored substring match let any line
+  // containing the literal text "(re)run" pin itself past a caller's filter — an
+  // `Overfull \hbox (re)run (12.0pt too wide) in paragraph at lines 4--5` survived every
+  // `warningsFilter`, indistinguishable from a real rerun hint. Do not widen this back to a bare
+  // `/\(re\)run/` to "simplify" it; match biblatex's actual phrasing instead.
+  /Please \(re\)run/,
   /^Output written on /,
 ];
 

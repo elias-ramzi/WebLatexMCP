@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
 import { filterLog, parseLog } from '../../src/services/logParser.js';
 
@@ -260,31 +261,61 @@ describe('filterLog never filters a rerun hint, including biblatex’s phrasing'
   });
 });
 
+describe('filterLog: a document-forged "(re)run" substring is not an always-keep pin', () => {
+  /**
+   * The log is document-controlled — a `.tex` can emit arbitrary text via `\PackageWarning` or
+   * `\typeout` — so an always-keep pattern matched on a bare substring lets a document pin any line
+   * past a caller's `warningsFilter` simply by including that substring. The rerun-hint pattern used
+   * to be a bare, unanchored `/\(re\)run/`, so an `Overfull \hbox` line that merely happens to
+   * contain the literal text "(re)run" survived every filter, indistinguishable from biblatex's real
+   * `Please (re)run Biber on the file:` hint. Narrowed to `/Please \(re\)run/`, which still matches
+   * biblatex's real phrasing (see the describe block above) but no longer matches an unrelated line
+   * that merely contains the literal `(re)run`.
+   */
+  it('filters an Overfull hbox line that merely contains "(re)run", not a real rerun hint', () => {
+    const log = 'Overfull \\hbox (re)run (12.0pt too wide) in paragraph at lines 4--5';
+    const out = filterLog(log, { keepWarning: (w) => w.rule !== 'Overfull \\hbox' });
+    expect(out).not.toContain(log);
+  });
+});
+
 /**
- * The differential characterization the feature's claim rests on: **with no `keepWarning`,
- * `filterLog`'s output is byte-identical to what it always produced.** One hand-written 11-line log
- * cannot carry that claim — it never reaches the `maxLines` cap, the omission header, or the
- * raw-tail fallback — so this pins it over thousands of generated logs instead.
+ * Two separate claims, proven two separate ways. They used to share one describe title and one
+ * doc comment claiming "byte-identical to before" — which only the second claim below actually
+ * proves; the first is real but narrower, and conflating them let a real regression hide behind a
+ * test that read as though it covered more than it did.
  *
- * Two equivalences are pinned, both of which need **no reference implementation**. Re-deriving
- * `KEEP_PATTERNS`/`unwrapLines`/`logTail` in the test would make this layer structurally unable to
- * catch a regression in them (CLAUDE.md's `String.prototype.replace` incident), so the test only
- * ever compares `filterLog` against itself under options that must not matter:
+ * 1. **Option-insensitivity** (the self-comparison loop): `baseDir` and an accept-everything
+ *    `keepWarning` must be complete no-ops on `filterLog`'s output. This needs **no reference
+ *    implementation** — re-deriving `KEEP_PATTERNS`/`unwrapLines`/`logTail` in the test would make
+ *    this layer structurally unable to catch a regression in them (CLAUDE.md's
+ *    `String.prototype.replace` incident) — so it only ever compares `filterLog` against *itself*
+ *    under options that must not matter:
+ *      a. `{ maxLines }` === `{ maxLines, baseDir }` — `baseDir` is inert without `keepWarning`,
+ *         since the only thing it rebases is a filtered warning's `file`.
+ *      b. `{ maxLines }` === `{ maxLines, keepWarning: () => true }` — **a filter that accepts
+ *         everything is a no-op.** The strong form: (a) only re-walks the bypass path, whereas (b)
+ *         drives the whole `keepWarning` machinery — `scanParens`/`currentFile` bookkeeping,
+ *         `ALWAYS_KEEP_PATTERNS`, `isWarningLine`, `warningRuleOf`, the `matchedBeforeFilter`
+ *         counter — and demands it reproduce the legacy output byte for byte.
+ *    What this half deliberately does NOT reach: it is insensitive to how lines are *classified*
+ *    (a predicate returning `true` keeps a line whichever side of the warning/always-keep
+ *    partition it lands on — the partition itself is pinned by the hand-written cases above), and
+ *    it is blind to anything that perturbs both sides of a comparison identically. Deleting a
+ *    `KEEP_PATTERNS` entry, for instance, changes `legacy` and `acceptEverything` the same way, so
+ *    the two stay equal to each other while both silently stop matching lines they used to — this
+ *    is not a hypothetical, it is a mutant that was run and left every self-comparison here green.
  *
- * 1. `{ maxLines }` === `{ maxLines, baseDir }` — `baseDir` is inert without `keepWarning`, since
- *    the only thing it rebases is a filtered warning's `file`.
- * 2. `{ maxLines }` === `{ maxLines, keepWarning: () => true }` — **a filter that accepts
- *    everything is a no-op.** This is the strong form: (1) only re-walks the bypass path, whereas
- *    (2) drives the whole `keepWarning` machinery — `scanParens`/`currentFile` bookkeeping,
- *    `ALWAYS_KEEP_PATTERNS`, `isWarningLine`, `warningRuleOf`, the `matchedBeforeFilter` counter —
- *    and demands that it reproduce the legacy output byte for byte. Any of that machinery
- *    perturbing a line, an order, the cap accounting or the fallback branch shows up here.
+ * 2. **Byte-identity against regression** (the golden digest): this is what the first half
+ *    structurally cannot prove, since there is nothing else in this file to compare `filterLog`
+ *    against. The digest hashes `filterLog`'s output across thousands of generated logs, at every
+ *    `maxLines` choice, and pins it to a committed constant — so a `KEEP_PATTERNS`/`unwrapLines`/
+ *    cap-or-fallback regression invisible to (1) shows up here as a changed hash.
  *
- * What it deliberately does NOT reach: it is insensitive to how lines are *classified*, because a
- * predicate returning `true` keeps a line whichever side of the warning/always-keep partition it
- * lands on. The partition itself is pinned by the hand-written cases above.
+ * Both halves share the same generated corpus (below); keep the two claims straight when reading
+ * or editing it.
  */
-describe('filterLog differential: legacy output is byte-identical without a filter', () => {
+describe('filterLog differential: option-insensitivity, plus a golden digest against regression', () => {
   /** pdfTeX/latexmk hard-wrap column — a fragment of exactly this length exercises `unwrapLines`. */
   const WRAP_WIDTH = 79;
 
@@ -313,6 +344,11 @@ describe('filterLog differential: legacy output is byte-identical without a filt
     "LaTeX Font Warning: Font shape `OT1/cmr/bx/sc' undefined on input line 9.",
     'pdfTeX warning (ext4): destination with the same identifier (name{page.1}) has been used',
     'Package hyperref Warning: Token not allowed in a PDF string.',
+    // Leading whitespace, unlike the trailing-whitespace fragments above: `Warning:` is unanchored,
+    // so this reaches KEEP_PATTERNS either way, but the *kept text* differs between a correct
+    // trailing-only trim (leading spaces survive into the output) and a buggy full `trim()` (they
+    // don't) — a divergence a trailing-whitespace-only corpus can never exercise.
+    '  Package hyperref Warning: indented package warning line, kept regardless of the indent',
     'Class article Warning: Unused global option(s): [foo].',
     'Emergency stop.',
     'No pages of output.',
@@ -335,7 +371,20 @@ describe('filterLog differential: legacy output is byte-identical without a filt
     '</usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb>',
     'PDF statistics: 40 PDF objects out of 1000 (max. 8388607)',
     "LaTeX Font Info:    Font shape `OT1/cmr/bx/n' will be used on input line 3.",
+    // Indented, as a real continuation of a `LaTeX Font Info:` block reads on the wire. Matches no
+    // KEEP_PATTERNS entry with or without the indent, so it stays noise either way — a control
+    // fragment confirming indentation alone never smuggles a noise line past the filter.
+    "  LaTeX Font Info:    Font shape `OT1/cmr/bx/sc' will be used on input line 11.",
     'Package: hyperref 2022-02-21 v7.00n Hypertext links for LaTeX',
+    // A leading space breaks the *anchored* `^(Overfull|Underfull) \\[hv]box` pattern, so this is
+    // correctly noise under a trailing-only trim. A buggy full `trim()` (applied only on the
+    // `keepWarning` path) strips the leading space first and wrongly revives it as a kept box
+    // warning — this is what actually made mutant 2 ("keepWarning ? raw.trim() : …") pass all 26
+    // tests before this fragment existed: nothing in the corpus had leading whitespace in front of
+    // an otherwise-anchored pattern, so the bug never had a line to misclassify.
+    ' Overfull \\hbox (3.0pt too wide) in paragraph at lines 10--11',
+    // Same idea with a leading tab in front of the anchored `^l\.\d+` context-line pattern.
+    '\tl.12 \\badcommand',
     '  ',
     '',
   ];
@@ -357,59 +406,99 @@ describe('filterLog differential: legacy output is byte-identical without a filt
   const MAX_LINES_CHOICES = [1, 2, 3, 5, 15, 80];
   const ITERATIONS = 3000;
 
+  /**
+   * Committed digest of `filterLog`'s output across every generated log below, at every
+   * `maxLines` choice in {@link MAX_LINES_CHOICES} — the thing that actually pins byte-identity
+   * against regression (see claim 2 in the doc comment above this describe block; claim 1, the
+   * self-comparison, structurally cannot: it is blind to a change that perturbs both sides of the
+   * comparison identically).
+   *
+   * If this test fails: `filterLog`'s unfiltered `logTail` output changed for every compile of
+   * every session. Confirm the change is intentional, then update this constant to the digest the
+   * failure message prints.
+   */
+  const GOLDEN_DIGEST = '8ee6dde04f4a1f938b986dac2542f42de0c710cc12c9ef3b7b50aed202b37474';
+
   it('pins that the 79-column fragment really is wrap width (else unwrapLines goes untested)', () => {
     expect(WRAPPED_LINE).toHaveLength(WRAP_WIDTH);
   });
 
-  it(`reproduces the legacy output for ${ITERATIONS} generated logs, with and without an accept-everything filter`, () => {
-    const rand = makeRandom(20240917);
-    const mismatches: string[] = [];
-    let cappedLogs = 0;
-    let fallbackLogs = 0;
+  it(
+    `is option-insensitive to baseDir/accept-everything over ${ITERATIONS} generated logs, and ` +
+      `matches a committed digest at every maxLines choice`,
+    () => {
+      const rand = makeRandom(20240917);
+      const mismatches: string[] = [];
+      const hash = createHash('sha256');
+      let cappedLogs = 0;
+      let fallbackLogs = 0;
 
-    for (let i = 0; i < ITERATIONS; i++) {
-      // Every eighth log is pure noise, so the `kept.length === 0` raw-tail fallback is reached.
-      const noiseOnly = rand(8) === 0;
-      const pool = noiseOnly ? NOISE_FRAGMENTS : [...DIAGNOSTIC_FRAGMENTS, ...NOISE_FRAGMENTS];
-      const lineCount = rand(40);
-      const lines: string[] = [];
-      for (let j = 0; j < lineCount; j++) lines.push(pool[rand(pool.length)] as string);
-      const log = lines.join('\n');
-      const maxLines = MAX_LINES_CHOICES[rand(MAX_LINES_CHOICES.length)] as number;
+      for (let i = 0; i < ITERATIONS; i++) {
+        // Every eighth log is pure noise, so the `kept.length === 0` raw-tail fallback is reached.
+        const noiseOnly = rand(8) === 0;
+        const pool = noiseOnly ? NOISE_FRAGMENTS : [...DIAGNOSTIC_FRAGMENTS, ...NOISE_FRAGMENTS];
+        const lineCount = rand(40);
+        const lines: string[] = [];
+        for (let j = 0; j < lineCount; j++) lines.push(pool[rand(pool.length)] as string);
+        const log = lines.join('\n');
+        const maxLines = MAX_LINES_CHOICES[rand(MAX_LINES_CHOICES.length)] as number;
 
-      const legacy = filterLog(log, { maxLines });
-      const withBaseDir = filterLog(log, { maxLines, baseDir: 'paper' });
-      const acceptEverything = filterLog(log, { maxLines, keepWarning: () => true });
+        const legacy = filterLog(log, { maxLines });
+        const withBaseDir = filterLog(log, { maxLines, baseDir: 'paper' });
+        const acceptEverything = filterLog(log, { maxLines, keepWarning: () => true });
 
-      if (withBaseDir !== legacy) {
-        mismatches.push(
-          `baseDir changed the output at iteration ${i} (maxLines=${maxLines})\n` +
-            `log: ${JSON.stringify(log)}\n` +
-            `without baseDir: ${JSON.stringify(legacy)}\n` +
-            `with baseDir:    ${JSON.stringify(withBaseDir)}`,
-        );
+        if (withBaseDir !== legacy) {
+          mismatches.push(
+            `baseDir changed the output at iteration ${i} (maxLines=${maxLines})\n` +
+              `log: ${JSON.stringify(log)}\n` +
+              `without baseDir: ${JSON.stringify(legacy)}\n` +
+              `with baseDir:    ${JSON.stringify(withBaseDir)}`,
+          );
+        }
+        if (acceptEverything !== legacy) {
+          mismatches.push(
+            `keepWarning: () => true was not a no-op at iteration ${i} (maxLines=${maxLines})\n` +
+              `log: ${JSON.stringify(log)}\n` +
+              `no filter:          ${JSON.stringify(legacy)}\n` +
+              `accept-everything:  ${JSON.stringify(acceptEverything)}`,
+          );
+        }
+
+        // Branch-coverage counters, asserted below so the generator cannot silently stop reaching
+        // the two branches the single hand-written log never did. "PDF statistics" matches no
+        // KEEP_PATTERN, so it can only appear in the output via the raw-tail fallback.
+        if (legacy.includes('earlier diagnostic line(s) omitted')) cappedLogs++;
+        if (legacy.includes('PDF statistics')) fallbackLogs++;
+
+        // The golden digest: every maxLines choice for this log, not just the one drawn above —
+        // "across all iterations and maxLines values", so a cap/fallback regression that only
+        // shows up at one particular maxLines cannot hide behind the others. A NUL separator
+        // between entries (and after each) keeps concatenation unambiguous; log/tail content is
+        // plain diagnostic text and never contains one. Written as the escape `\0`, never as a raw
+        // NUL byte in this source: a literal one makes git and grep classify this whole file as
+        // BINARY, which silently swallows every match and every diff hunk in it.
+        for (const m of MAX_LINES_CHOICES) {
+          hash.update(filterLog(log, { maxLines: m }));
+          hash.update('\0');
+        }
       }
-      if (acceptEverything !== legacy) {
-        mismatches.push(
-          `keepWarning: () => true was not a no-op at iteration ${i} (maxLines=${maxLines})\n` +
-            `log: ${JSON.stringify(log)}\n` +
-            `no filter:          ${JSON.stringify(legacy)}\n` +
-            `accept-everything:  ${JSON.stringify(acceptEverything)}`,
-        );
-      }
 
-      // Branch-coverage counters, asserted below so the generator cannot silently stop reaching
-      // the two branches the single hand-written log never did. "PDF statistics" matches no
-      // KEEP_PATTERN, so it can only appear in the output via the raw-tail fallback.
-      if (legacy.includes('earlier diagnostic line(s) omitted')) cappedLogs++;
-      if (legacy.includes('PDF statistics')) fallbackLogs++;
-    }
+      expect(mismatches.slice(0, 3).join('\n\n')).toBe('');
+      expect(mismatches).toHaveLength(0);
+      expect(cappedLogs).toBeGreaterThan(0);
+      expect(fallbackLogs).toBeGreaterThan(0);
 
-    expect(mismatches.slice(0, 3).join('\n\n')).toBe('');
-    expect(mismatches).toHaveLength(0);
-    expect(cappedLogs).toBeGreaterThan(0);
-    expect(fallbackLogs).toBeGreaterThan(0);
-  });
+      const digest = hash.digest('hex');
+      expect(
+        digest,
+        `filterLog's output changed across ${ITERATIONS} generated logs × maxLines ` +
+          `${JSON.stringify(MAX_LINES_CHOICES)}. This digest changing means unfiltered logTail ` +
+          'changed for every compile of every session. If you did not edit the corpus fragments in ' +
+          'this file, that is a REGRESSION, not a corpus edit — do not simply update the ' +
+          `constant. Once the change is confirmed intentional, set GOLDEN_DIGEST to ${digest}.`,
+      ).toBe(GOLDEN_DIGEST);
+    },
+  );
 });
 
 describe('filterLog: no filter ever removes a non-warning line the de-noiser kept', () => {

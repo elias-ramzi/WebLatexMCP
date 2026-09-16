@@ -28,13 +28,23 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   warning pattern and a hint pattern, so the always-keep list is checked **first**; and it leaves
   `rawLog: true` alone, because raw means raw — `warnings[]` is still filtered there, and both
   descriptions say so rather than letting a caller discover the asymmetry. With no filter passed,
-  `filterLog`'s output is byte-identical to before — pinned by a differential test — and the
-  paren-stack bookkeeping `keepWarning` needs is skipped entirely. "Unchanged unless used" is the
-  only thing that makes this safe to add to a tool every session calls. And when a filter rejects
-  _every_ diagnostic line, the tail says so in one sentence rather than falling back to the raw
-  last-15-lines tail it falls back to for a log with no diagnostics at all — that fallback would
-  have returned the excluded warnings plus the font and PDF-statistics noise, the feature exactly
-  inverted, so the two emptinesses are told apart rather than sharing a branch.
+  `filterLog`'s output is pinned two ways, which prove different things: a differential test
+  compares its output against itself under options that must be inert (no filter, an
+  accept-everything `keepWarning`, an inert `baseDir`) across thousands of generated logs, proving
+  the filter is a true no-op absent a caller opting in — but it is structurally blind to a change
+  that perturbs both sides of the comparison identically; a committed sha256 digest of that same
+  corpus's output, at every `maxLines` choice, is what actually pins byte-identical output against
+  a `KEEP_PATTERNS`/`unwrapLines` regression the self-comparison cannot see. The paren-stack
+  bookkeeping `keepWarning` needs is skipped entirely when no filter is given. "Unchanged unless
+  used" is the only thing that makes this safe to add to a tool every session calls. And when a
+  filter rejects _every_ diagnostic line, the tail says so in one sentence rather than falling back
+  to the raw last-15-lines tail it falls back to for a log with no diagnostics at all — that
+  fallback would have returned the excluded warnings plus the font and PDF-statistics noise, the
+  feature exactly inverted, so the two emptinesses are told apart rather than sharing a branch. A
+  fourth thing it deliberately does not do: an **empty filter array constrains nothing** —
+  `{file: []}` is the same as an absent `file`, not a filter that matches nothing — so a filter
+  list built programmatically that comes out empty _widens_ the result to every warning instead of
+  narrowing it to none; the tool schema and the docs both say so.
 
 - **A package name carrying a `.` or a `-` is finally a warning at all** (#73). `PACKAGE_WARNING`'s
   name class was `\w+`, which matches neither, so `Package pdftex.def Warning: ...` — pdfTeX's own
@@ -45,6 +55,40 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   a user is most likely to want filtered. The class is now `[\w.-]+`; the space before `Warning:`
   stays outside it, so a name can never swallow into it. `filterLog`'s no-filter output is
   unaffected, since `KEEP_PATTERNS` matches the literal word and never this regex.
+
+- **Review fixes on `warningsFilter`, closed** (#75). The entry above claims `warningsFilter`
+  "never filters errors" and "never filters a rerun hint" — both sentences were **false** when
+  written, and true only after these two fixes. **`filterLog` filtered a line `parseLog` calls an
+  error**: `parseLog` tests `FILE_LINE_ERROR` first and `continue`s, so
+  `./main.tex:12: Package foo Warning: …` is an _error_ to it whatever its message says — but
+  `ALWAYS_KEEP_PATTERNS` had `^!` and `Error:` and not `FILE_LINE_ERROR`, so the identical line was
+  a filterable _warning_ to `filterLog`, and any `warningsFilter` cut the one line reporting the
+  failure out of `logTail`. Fixed by adding `FILE_LINE_ERROR` to the always-keep list, mirroring
+  `parseLog`'s own branch order — `warningRuleOf`'s doc already claimed `filterLog` could never
+  derive a different answer than `parseLog` for the same line, an invariant this gap silently
+  broke. Keep the two classifications one partition; do not let a future always-keep pattern drift
+  from `parseLog`'s branch order again. **biblatex's rerun hint was filterable**: biblatex phrases
+  it `Please (re)run Biber on the file:` — literal parentheses, which the existing `Please rerun`
+  pattern never matched — so on a biblatex paper, the only line saying the bibliography is stale
+  survived a no-op filter but not a real one. Fixed by adding a pattern for it, deliberately
+  `logTail`-only: the structured `warnings[]` entry (rule `biblatex`) stays filterable, exactly as
+  the `Label(s) may have changed` hint's own `warnings[]` entry already was. That asymmetry is
+  intentional — do not "fix" it later by protecting the `warnings[]` entry too, since that would
+  change `warningsOmitted`. The pattern has to stay narrow, not a bare substring match: the log is
+  document-controlled — a `.tex` can emit anything via `\PackageWarning`/`\typeout` — so an
+  unanchored `/\(re\)run/` let a document pin an arbitrary line (an `Overfull \hbox` that merely
+  happens to contain the literal `(re)run`) past every caller's `warningsFilter`,
+  indistinguishable from a real rerun hint. It is narrowed to `Please \(re\)run` instead. That does
+  not make forgery impossible, and the entry should not claim it does: a document phrasing its line
+  as `Please (re)run …` is by definition indistinguishable from biblatex's own hint, exactly as the
+  neighbouring `Please rerun` and `may have changed` patterns already are. What the narrowing buys
+  is the removal of the cheap, accidental case, and the residual is bounded to `logTail` verbosity —
+  it never reaches `warnings[]`, `warningsOmitted`, an error classification, or a snippet-provenance
+  decision. Both fixes are pinned by **hand-written cases only**. The differential corpus and its
+  golden digest are deliberately blind to them: the digest never passes a `keepWarning` at all, and
+  the self-comparison passes `() => true`, which keeps a line whichever side of the always-keep
+  branch it falls on — so neither can observe an `ALWAYS_KEEP_PATTERNS` change. Do not retire a
+  hand-written case here as redundant with the corpus; the corpus does not cover it.
 
 - **`status` collapses sessions that exited holding nothing into a count** (#73). A session record
   under `<workspace>/.sessions/<projectId>/` is removed only on a clean shutdown
