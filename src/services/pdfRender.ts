@@ -1,9 +1,23 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type { Box, Matrix, TextItemLike } from '../lib/pdfGeometry.js';
+import {
+  IDENTITY,
+  multiply,
+  transformedBoxBounds,
+  roundBox,
+  mergeTextLines,
+} from '../lib/pdfGeometry.js';
 
 export const DEFAULT_MAX_EDGE_PX = 1600;
 export const HARD_MAX_EDGE_PX = 4000;
 export const MAX_PAGES_PER_CALL = 8;
+/** Pages per pdf_geometry call. Lower than MAX_PAGES_PER_CALL: a page of text lines is a lot of
+ *  structured output, where a page of PNG is one image. */
+export const MAX_GEOMETRY_PAGES = 4;
+/** Per-page caps, so a dense page cannot produce unbounded output. */
+export const MAX_TEXT_LINES_PER_PAGE = 300;
+export const MAX_IMAGE_RECTS_PER_PAGE = 100;
 
 /** A crop, as fractions of the page box, origin top-left, both ends in [0,1]. */
 export interface ClipFractions {
@@ -57,11 +71,55 @@ export class PdfRenderError extends Error {
   }
 }
 
+export type GeometryKind = 'text' | 'images';
+
+export interface GeometryBox extends Box {
+  /** Present on text boxes only. */
+  text?: string;
+  /** Present on text boxes only: how many pdf.js text items (`mergeTextLines`) were merged into
+   *  this line — a rough signal of merge quality, not part of the box geometry itself. */
+  mergedItems?: number;
+  /** Present on image boxes only: 'image' for an image XObject, 'form' for a form XObject. */
+  source?: 'image' | 'form';
+  /**
+   * Present (and `true`) only on a 'form' box for which no real bounding box could be recovered —
+   * neither the form's own explicit `/BBox` nor a transparency group's — so the walk fell back to
+   * the unit square under the accumulated CTM. This is NOT a measured placement rectangle; it is
+   * frequently far smaller (or otherwise unrelated) than the actual figure, and must never be used
+   * for a collision computation against another box.
+   */
+  approximate?: true;
+}
+
+export interface GeometryPage {
+  page: number;
+  pageWidthPt: number;
+  pageHeightPt: number;
+  text?: GeometryBox[];
+  images?: GeometryBox[];
+  textOmitted: number;
+  imagesOmitted: number;
+}
+
+export interface GeometryRequest {
+  pdfPath: string;
+  pages?: number[];
+  kinds: GeometryKind[];
+}
+
+export interface GeometryResult {
+  pageCount: number;
+  pages: GeometryPage[];
+  skippedPages: number[];
+}
+
 export interface PdfRenderService {
   pageCount(pdfPath: string): Promise<number>;
   render(req: RenderRequest): Promise<RenderResult>;
   /** Whether the native canvas backend rasterization needs is installed and loadable. */
   canRasterize(): Promise<boolean>;
+  /** Text-line and image/form-XObject placement geometry for the requested pages, in PDF points. */
+  geometry(req: GeometryRequest): Promise<GeometryResult>;
 }
 
 /** Throws PdfRenderError unless every edge is finite, within [0,1], and x1>x0, y1>y0. */
@@ -125,11 +183,15 @@ export function effectiveDpi(scale: number): number {
  * Which pages to render and which the cap left out.
  * `undefined` means every page. Throws PdfRenderError naming the page and the page count for a
  * page outside [1, pageCount] or a non-integer. Duplicates are collapsed, first occurrence wins.
- * At most MAX_PAGES_PER_CALL are rendered; the remainder come back as `skipped`.
+ * At most `cap` (default MAX_PAGES_PER_CALL) are selected; the remainder come back as `skipped`.
+ * `cap` is a parameter — not always MAX_PAGES_PER_CALL — because `pdf_geometry` uses the same
+ * dedup/range-check contract at its own, lower MAX_GEOMETRY_PAGES cap; every existing call site
+ * that omits it keeps today's behaviour unchanged.
  */
 export function selectPages(
   requested: number[] | undefined,
   pageCount: number,
+  cap: number = MAX_PAGES_PER_CALL,
 ): { pages: number[]; skipped: number[] } {
   const source = requested ?? Array.from({ length: pageCount }, (_, i) => i + 1);
   const seen = new Set<number>();
@@ -145,8 +207,8 @@ export function selectPages(
       unique.push(p);
     }
   }
-  const pages = unique.slice(0, MAX_PAGES_PER_CALL);
-  const skipped = unique.slice(MAX_PAGES_PER_CALL);
+  const pages = unique.slice(0, cap);
+  const skipped = unique.slice(cap);
   return { pages, skipped };
 }
 
@@ -220,10 +282,39 @@ function nativeCanvasError(cause: unknown): PdfRenderError {
     'Reading the PDF needs the native canvas backend @napi-rs/canvas, which is not installed on ' +
       'this machine (it is an optional dependency, skipped on unsupported platforms or by ' +
       "--omit=optional). Install it with `npm i @napi-rs/canvas` in the server's directory. " +
-      'This affects render_pages and the pageCount compile reports, and nothing else — compiling, ' +
-      'the viewer, editing and the whole git side work without it.',
+      'This affects render_pages, pdf_geometry, and the pageCount compile reports, and nothing ' +
+      'else — compiling, the viewer, editing and the whole git side work without it.',
     { cause },
   );
+}
+
+/**
+ * The operator codes `geometry` walks. Named individually — not a generic `Record<string,
+ * number>` — so a typo in *this file's own* references (`ops.saev`) is a compile error.
+ *
+ * That is NOT the same guarantee as "a renamed op in a future pdf.js surfaces as a type error",
+ * which an earlier version of this comment claimed: `PdfjsOps` is a locally-declared interface
+ * over a module obtained via `PdfjsLoader` and cast from `unknown` (see `PdfjsLike` below), so
+ * nothing here checks these names against the real pdf.js `OPS` table. If pdf.js renamed or
+ * removed one of these, `ops.<name>` would simply be `undefined` at runtime — which never equals
+ * a real `fnArray` entry (always a number), so the walk would silently find nothing for that op
+ * and stay green. See the "pdf.js OPS table" describe block in test/unit/pdfRender.test.ts, which
+ * pins every name here against the real, installed pdf.js module and is the thing that actually
+ * catches a rename.
+ */
+interface PdfjsOps {
+  save: number;
+  restore: number;
+  transform: number;
+  paintImageXObject: number;
+  paintImageMaskXObject: number;
+  paintFormXObjectBegin: number;
+  paintFormXObjectEnd: number;
+  /** Emitted around a form XObject that carries a `/Group` (transparency): the group's own
+   *  `/BBox`/`/Matrix` move here because the form's own `paintFormXObjectBegin` args carry a null
+   *  bbox in that case (see `buildFormXObject` in pdf.js's evaluator). */
+  beginGroup: number;
+  endGroup: number;
 }
 
 /** The slice of pdf.js's runtime API this service uses. */
@@ -232,6 +323,8 @@ interface PdfjsLike {
     promise: Promise<PdfjsDocument>;
     destroy(): Promise<void>;
   };
+  /** Module-level operator-code table, used only by `geometry` to walk a page's operator list. */
+  OPS: PdfjsOps;
 }
 
 /**
@@ -311,6 +404,111 @@ export class PdfRenderer implements PdfRenderService {
       return { pageCount, pages: rendered, skippedPages: skipped };
     } finally {
       await destroy();
+    }
+  }
+
+  /**
+   * Text-line and image/form-XObject placement geometry, in PDF points, origin top-left.
+   *
+   * Deliberately NOT general vector path geometry (`\fbox` rules, TikZ strokes): pdf.js hands
+   * back raw path-construction operators in untransformed space, and replaying them is a graphics-
+   * state interpreter — out of scope, per the tool's own description. A page that fails partway
+   * (a malformed operator list) is rethrown as a PdfRenderError naming the page and the original
+   * cause — a silent empty result would misreport real geometry as absent, which is worse than an
+   * error naming the page.
+   */
+  async geometry(req: GeometryRequest): Promise<GeometryResult> {
+    const { doc, destroy } = await this.openDocument(req.pdfPath);
+    try {
+      // Loaded *after* openDocument, not before: openDocument's catch is what classifies a
+      // missing-backend failure into nativeCanvasError. Calling loadPdfjs() directly first would
+      // let that same failure (pdf.js needs the backend just to import cleanly on some setups)
+      // escape here as a raw "DOMMatrix is not defined" instead. By this point the module is
+      // already loaded (openDocument just used it), so this second call is effectively free.
+      const pdfjs = await this.loadPdfjs();
+      const pageCount = doc.numPages;
+      const { pages: selected, skipped } = selectPages(req.pages, pageCount, MAX_GEOMETRY_PAGES);
+
+      const pages: GeometryPage[] = [];
+      for (const pageNum of selected) {
+        try {
+          pages.push(await this.geometryForPage(doc, pageNum, req.kinds, pdfjs.OPS));
+        } catch (err) {
+          throw new PdfRenderError(
+            `Failed to compute geometry for page ${pageNum}: ${(err as Error).message}`,
+            { cause: err },
+          );
+        }
+      }
+
+      return { pageCount, pages, skippedPages: skipped };
+    } finally {
+      await destroy();
+    }
+  }
+
+  private async geometryForPage(
+    doc: PdfjsDocument,
+    pageNum: number,
+    kinds: GeometryKind[],
+    ops: PdfjsOps,
+  ): Promise<GeometryPage> {
+    const page = await doc.getPage(pageNum);
+    try {
+      const viewport = page.getViewport({ scale: 1 });
+      const pageWidthPt = viewport.width;
+      const pageHeightPt = viewport.height;
+      // pdf.js's own transform: user space -> viewport space, rotation and MediaBox origin
+      // already applied (see PageViewport in the installed pdf.js). Using this instead of a
+      // manual y-flip is what makes a page with a non-zero MediaBox origin or a /Rotate entry
+      // (pdflscape landscape pages, most notably) come out right rather than silently wrong.
+      const viewportTransform = viewport.transform as unknown as Matrix;
+
+      let text: GeometryBox[] | undefined;
+      let textOmitted = 0;
+      if (kinds.includes('text')) {
+        const content = await page.getTextContent();
+        const items: TextItemLike[] = [];
+        for (const raw of content.items) {
+          // Marked-content items (only present when includeMarkedContent is requested, which this
+          // call never does) carry neither field — skip anything that isn't a real text item, and
+          // whitespace-only strings are handled by mergeTextLines itself.
+          if (raw.transform === undefined || typeof raw.str !== 'string') {
+            continue;
+          }
+          items.push({
+            str: raw.str,
+            transform: raw.transform as unknown as Matrix,
+            width: raw.width ?? 0,
+            height: raw.height ?? 0,
+          });
+        }
+        const lines = mergeTextLines(items);
+        const capped = lines.slice(0, MAX_TEXT_LINES_PER_PAGE);
+        textOmitted = lines.length - capped.length;
+        text = capped.map((l) => ({
+          // Bounds of all four corners of the user-space box under the viewport transform, not
+          // just two: under a 90/270 rotation the corners swap axes, and taking only two corners
+          // (as a manual y-flip effectively did) silently mixes up width and height.
+          ...roundBox(transformedBoxBounds(l.box, viewportTransform)),
+          text: l.text,
+          mergedItems: l.items,
+        }));
+      }
+
+      let images: GeometryBox[] | undefined;
+      let imagesOmitted = 0;
+      if (kinds.includes('images')) {
+        const opList = await page.getOperatorList();
+        const boxes = walkImageGeometry(opList, ops, viewportTransform);
+        const capped = boxes.slice(0, MAX_IMAGE_RECTS_PER_PAGE);
+        imagesOmitted = boxes.length - capped.length;
+        images = capped;
+      }
+
+      return { page: pageNum, pageWidthPt, pageHeightPt, text, images, textOmitted, imagesOmitted };
+    } finally {
+      page.cleanup();
     }
   }
 
@@ -471,6 +669,37 @@ export class PdfRenderer implements PdfRenderService {
 interface PdfjsViewport {
   width: number;
   height: number;
+  /**
+   * pdf.js's own user-space -> viewport-space matrix, `[a,b,c,d,e,f]` in the same convention as
+   * `Matrix` in pdfGeometry.ts. Only `geometry` reads this (`render`'s viewport use is limited to
+   * `width`/`height`, since it hands the viewport straight to `page.render`) — rotation- and
+   * MediaBox-origin-aware, which is exactly why `geometryForPage` uses it instead of a manual
+   * y-flip. Verified against the installed pdf.js (`PageViewport` in legacy/build/pdf.mjs): at
+   * scale 1 with no rotation and a MediaBox at the origin it is `[1,0,0,-1,0,pageHeightPt]` —
+   * the same effect the old manual y-flip had — and it changes correctly under `/Rotate` and a
+   * non-zero MediaBox origin, which the manual flip did not.
+   */
+  transform: number[];
+}
+
+/** One item of `getTextContent()`'s `items` array. pdf.js's own type is `TextItem |
+ *  TextMarkedContent`; a marked-content item carries neither `transform` nor `str`, which is why
+ *  both are optional here and `geometry` skips an item missing either. */
+interface PdfjsTextItem {
+  str?: string;
+  transform?: number[];
+  width?: number;
+  height?: number;
+}
+
+interface PdfjsTextContent {
+  items: PdfjsTextItem[];
+}
+
+/** `getOperatorList()`'s result: parallel arrays of op codes and their argument tuples. */
+interface PdfjsOperatorList {
+  fnArray: number[];
+  argsArray: unknown[][];
 }
 
 interface PdfjsPage {
@@ -479,10 +708,165 @@ interface PdfjsPage {
     promise: Promise<void>;
   };
   cleanup(): void;
+  getTextContent(): Promise<PdfjsTextContent>;
+  getOperatorList(): Promise<PdfjsOperatorList>;
 }
 
 interface PdfjsDocument {
   numPages: number;
   canvasFactory: unknown;
   getPage(pageNumber: number): Promise<PdfjsPage>;
+}
+
+/** A form's own bbox, or a pending transparency-group bbox, before either is bounds-checked. */
+function boxOf(b: readonly number[]): Box {
+  return { x0: b[0] as number, y0: b[1] as number, x1: b[2] as number, y1: b[3] as number };
+}
+
+/** The image/form-XObject unit square, in the local space a CTM/bbox maps out of. */
+const UNIT_BOX: Box = { x0: 0, y0: 0, x1: 1, y1: 1 };
+
+/**
+ * A transparency group's bbox/matrix, captured at `OPS.beginGroup` and consumed by the
+ * `paintFormXObjectBegin` that immediately follows it when that form's own bbox arg is null (see
+ * the function doc comment for why the two are equivalent).
+ */
+interface PendingGroupBox {
+  bbox: readonly number[];
+  /** The group's own matrix (`groupOptions.matrix` in pdf.js — the form's `/Matrix`, or null),
+   *  applied to `bbox` before `ctm`. */
+  matrix: Matrix | null;
+  /** The CTM as it stood at `beginGroup` — i.e. *before* the form's own matrix multiply that the
+   *  paired `paintFormXObjectBegin` applies. */
+  ctm: Matrix;
+}
+
+/**
+ * Walk a page's raw operator list to recover image/form XObject placement rectangles, mapped
+ * through the page's own viewport transform (see `geometryForPage`) to top-left viewport space.
+ *
+ * The CTM stack tracked here is our own — it is not fed by pdf.js's `save`/`restore` execution
+ * (that only happens when a page is actually rendered to a canvas). Three things about the stack
+ * are load-bearing:
+ *  - `OPS.restore` on an empty stack must not throw: a malformed/truncated content stream is a
+ *    real condition a document-controlled operator list can produce, and a thrown error here
+ *    would fail the whole page's geometry over one bad operator well past the images already
+ *    found.
+ *  - `paintFormXObjectBegin`/`paintFormXObjectEnd` push/pop their own CTM even though no explicit
+ *    `OPS.save`/`OPS.restore` appears in the operator list around them — pdf.js's own
+ *    `CanvasGraphics.paintFormXObjectBegin` calls `this.save()` internally when executing this op
+ *    against a canvas, and this walk has to reproduce that rather than rely on paired save/restore
+ *    operators that the evaluator never emits here.
+ *  - A form XObject that carries a `/Group` (transparency) — common: pdfTeX copies an included
+ *    PDF page's `/Group` onto the Form XObject, and Inkscape/matplotlib/TikZ output with
+ *    isolation or `opacity` all carry one — reports its own `paintFormXObjectBegin` bbox arg as
+ *    null; the evaluator moves the real bbox onto an `OPS.beginGroup` emitted immediately before
+ *    it instead (`buildFormXObject` in the installed pdf.js's evaluator, confirmed against
+ *    pdfjs-dist 6.1.200). Verified against `CanvasGraphics.beginGroup`/`paintFormXObjectBegin` in
+ *    the same install: at the moment `beginGroup` runs, the ctx's current transform is the CTM
+ *    *before* the form's own matrix has been applied (that happens inside the paired
+ *    `paintFormXObjectBegin`, which runs next), and the group's bbox is clipped by that CTM after
+ *    first being mapped through the group's own `matrix` (`groupOptions.matrix`, which is exactly
+ *    the form's own `/Matrix`) — i.e. group.matrix is applied to the bbox BEFORE the CTM in force
+ *    at `beginGroup` time. That pending bbox/matrix/CTM is captured here and consumed by the very
+ *    next `paintFormXObjectBegin` when its own bbox arg is null, then cleared either way so it
+ *    can never leak onto a later, unrelated form. When neither a form bbox nor a pending group
+ *    bbox is available, the walk falls back to the unit square under the CTM (as before), but now
+ *    flags the box `approximate: true` so a caller cannot mistake a ~1pt fallback rectangle for a
+ *    measured placement.
+ */
+function walkImageGeometry(
+  opList: PdfjsOperatorList,
+  ops: PdfjsOps,
+  viewportTransform: Matrix,
+): GeometryBox[] {
+  const boxes: GeometryBox[] = [];
+  const stack: Matrix[] = [];
+  let current: Matrix = IDENTITY;
+  let pendingGroup: PendingGroupBox | null = null;
+
+  const toViewport = (box: Box, ctm: Matrix): Box =>
+    roundBox(transformedBoxBounds(box, multiply(ctm, viewportTransform)));
+
+  const { fnArray, argsArray } = opList;
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i];
+    const args = argsArray[i];
+
+    if (fn === ops.save) {
+      stack.push(current);
+    } else if (fn === ops.restore) {
+      const prev = stack.pop();
+      if (prev !== undefined) {
+        current = prev;
+      }
+    } else if (fn === ops.transform) {
+      current = multiply(args as unknown as Matrix, current);
+    } else if (fn === ops.paintImageXObject || fn === ops.paintImageMaskXObject) {
+      boxes.push({ ...toViewport(UNIT_BOX, current), source: 'image' });
+    } else if (fn === ops.beginGroup) {
+      const groupOptions = (Array.isArray(args) ? args[0] : undefined) as
+        | { bbox?: ArrayLike<number> | null; matrix?: number[] | null }
+        | undefined;
+      const bbox = groupOptions?.bbox;
+      if (bbox && bbox.length === 4) {
+        const m = groupOptions?.matrix;
+        pendingGroup = {
+          bbox: Array.from(bbox),
+          matrix: Array.isArray(m) && m.length === 6 ? (m as unknown as Matrix) : null,
+          ctm: current,
+        };
+      } else {
+        pendingGroup = null;
+      }
+    } else if (fn === ops.endGroup) {
+      // Cleared unconditionally: normally already consumed by the paired paintFormXObjectBegin,
+      // but a truncated/malformed stream could reach endGroup without one ever running.
+      pendingGroup = null;
+    } else if (fn === ops.paintFormXObjectBegin) {
+      // Implicit save (see the doc comment above) — always pushed, even when the form carries no
+      // matrix of its own, so the matching End always has something to pop.
+      stack.push(current);
+      const [matrix, bbox] = (Array.isArray(args) ? args : [null, null]) as [
+        number[] | null,
+        number[] | null,
+      ];
+      if (matrix) {
+        current = multiply(matrix as unknown as Matrix, current);
+      }
+      // Consume (and clear) any pending group bbox now, whether or not it ends up used below, so
+      // it can never be reused by a later, unrelated form.
+      const pending = pendingGroup;
+      pendingGroup = null;
+
+      let box: Box;
+      let ctm: Matrix;
+      let approximate: true | undefined;
+      if (bbox && bbox.length === 4) {
+        box = boxOf(bbox);
+        ctm = current;
+      } else if (pending) {
+        box = boxOf(pending.bbox);
+        ctm = pending.matrix ? multiply(pending.matrix, pending.ctm) : pending.ctm;
+      } else {
+        box = UNIT_BOX;
+        ctm = current;
+        approximate = true;
+      }
+      boxes.push({
+        ...toViewport(box, ctm),
+        source: 'form',
+        ...(approximate ? { approximate } : {}),
+      });
+    } else if (fn === ops.paintFormXObjectEnd) {
+      const prev = stack.pop();
+      if (prev !== undefined) {
+        current = prev;
+      }
+    }
+    // Everything else (path construction, text, colour, shading, ...) is ignored: general vector
+    // path geometry is explicitly out of scope (see the class method's doc comment).
+  }
+
+  return boxes;
 }

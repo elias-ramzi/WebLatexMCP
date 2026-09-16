@@ -145,6 +145,13 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 
+  it('registers the pdf_geometry tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('pdf_geometry');
+    await client.close();
+  });
+
   it('registers the comment tools', async () => {
     const client = await connect();
     const names = (await client.listTools()).tools.map((t) => t.name);
