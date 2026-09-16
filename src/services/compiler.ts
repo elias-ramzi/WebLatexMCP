@@ -219,6 +219,16 @@ export function buildPdfPath(projectDir: string, rootFile: string): string {
 }
 
 /**
+ * The path a compile would write its `.aux` to (the build-dir `<jobname>.aux`). Lets the
+ * read-only `pdf_geometry` tool locate the last build's float labels without re-compiling, mirroring
+ * `buildPdfPath` exactly.
+ */
+export function buildAuxPath(projectDir: string, rootFile: string): string {
+  const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
+  return path.join(buildDir(projectDir), `${rootBase}.aux`);
+}
+
+/**
  * A PDF's mtime and size — the two cheap markers `collectOutcome` compares from before a run to
  * after, to tell "the backend rewrote this file" from "found nothing to do and left it alone"
  * without any wall-clock assumption.

@@ -13,6 +13,7 @@ import { registerEditFile } from './tools/editFile.js';
 import { registerSetRewriteMode } from './tools/setRewriteMode.js';
 import { registerCompile } from './tools/compile.js';
 import { registerRenderPages } from './tools/renderPages.js';
+import { registerPdfGeometry } from './tools/pdfGeometry.js';
 import { registerViewer } from './tools/viewer.js';
 import { registerListComments } from './tools/listComments.js';
 import { registerResolveComments } from './tools/resolveComments.js';
@@ -80,6 +81,7 @@ export function createServer(
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
   registerRenderPages(server, ctx);
+  registerPdfGeometry(server, ctx);
   registerViewer(server, ctx);
   registerListComments(server, ctx);
   registerResolveComments(server, ctx);

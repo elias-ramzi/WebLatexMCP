@@ -14,7 +14,11 @@ import {
   HARD_MAX_EDGE_PX,
   isNativeCanvasMissing,
   MAX_PAGES_PER_CALL,
+  MAX_GEOMETRY_PAGES,
+  MAX_TEXT_LINES_PER_PAGE,
+  MAX_IMAGE_RECTS_PER_PAGE,
 } from '../../src/services/pdfRender.js';
+import type { PdfjsLoader } from '../../src/services/pdfRender.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47];
@@ -439,5 +443,679 @@ describe('fitScale precedence', () => {
     const { scale, clamped } = fitScale(1000, 500, { dpi: 7200, maxEdgePx: 200 });
     expect(clamped).toBe(true);
     expect(1000 * scale).toBe(HARD_MAX_EDGE_PX);
+  });
+});
+
+// The op codes `geometry` looks for. Arbitrary but distinct numbers, playing the role of pdf.js's
+// real OPS table — the geometry walk never hardcodes these values, only reads them off the loaded
+// module, so a fake with different numbers still proves the walk is driven by the table.
+const FAKE_OPS = {
+  save: 101,
+  restore: 102,
+  transform: 103,
+  paintImageXObject: 104,
+  paintImageMaskXObject: 105,
+  paintFormXObjectBegin: 106,
+  paintFormXObjectEnd: 107,
+  beginGroup: 108,
+  endGroup: 109,
+};
+
+interface FakeTextItem {
+  str: string;
+  transform: number[];
+  width: number;
+  height: number;
+}
+
+interface FakeViewport {
+  width: number;
+  height: number;
+  transform: number[];
+}
+
+interface FakePage {
+  viewport: FakeViewport;
+  textItems?: FakeTextItem[];
+  fnArray?: number[];
+  argsArray?: unknown[][];
+}
+
+/**
+ * A viewport with no rotation and a MediaBox at the origin — the identity case, where the
+ * viewport transform is exactly the old manual y-flip (`[1,0,0,-1,0,height]`; verified against
+ * pdf.js's `PageViewport` constructor). Every pre-existing test in this file uses this, so none of
+ * their expected numbers change under the FIX2 rewrite (geometryForPage/walkImageGeometry now
+ * compose through `viewport.transform` instead of calling a manual `toTopLeft`).
+ */
+function idViewport(width: number, height: number): FakeViewport {
+  return { width, height, transform: [1, 0, 0, -1, 0, height] };
+}
+
+/** Build a PdfjsLoader whose document has one page per entry in `pages`, driven by FAKE_OPS. */
+function fakeGeometryLoader(pages: FakePage[]): PdfjsLoader {
+  return (async () => ({
+    OPS: FAKE_OPS,
+    getDocument: () => ({
+      promise: Promise.resolve({
+        numPages: pages.length,
+        canvasFactory: {},
+        getPage: (n: number) => {
+          const p = pages[n - 1];
+          if (!p) throw new Error(`no such fake page ${n}`);
+          return Promise.resolve({
+            getViewport: () => p.viewport,
+            render: () => ({ promise: Promise.resolve() }),
+            cleanup: () => {},
+            getTextContent: () => Promise.resolve({ items: (p.textItems ?? []) as unknown[] }),
+            getOperatorList: () =>
+              Promise.resolve({ fnArray: p.fnArray ?? [], argsArray: p.argsArray ?? [] }),
+          });
+        },
+      }),
+      destroy: () => Promise.resolve(),
+    }),
+  })) as unknown as PdfjsLoader;
+}
+
+describe('PdfRenderer.geometry', () => {
+  let dir: string;
+  let pdfPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-geom-'));
+    // openDocument reads real bytes off disk before ever calling the injected loader — the fake
+    // loader ignores their content, so any non-empty file works.
+    pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('maps text items to merged, top-left, rounded boxes for the requested page', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          textItems: [
+            { str: 'Hello ', transform: [1, 0, 0, 1, 10, 700], width: 40, height: 10 },
+            { str: 'world', transform: [1, 0, 0, 1, 50, 700], width: 30, height: 10 },
+          ],
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+    expect(result.pages).toHaveLength(1);
+    const page = result.pages[0]!;
+    expect(page.pageWidthPt).toBe(600);
+    expect(page.pageHeightPt).toBe(800);
+    expect(page.images).toBeUndefined();
+    expect(page.imagesOmitted).toBe(0);
+    expect(page.text).toHaveLength(1);
+    // User space box was {x0:10,y0:700,x1:80,y1:710}; flipped to top-left at pageHeight 800:
+    // y0' = 800-710=90, y1'=800-700=100.
+    expect(page.text![0]).toEqual({
+      x0: 10,
+      y0: 90,
+      x1: 80,
+      y1: 100,
+      text: 'Hello world',
+      mergedItems: 2,
+    });
+  });
+
+  it('walks save/transform/paintImageXObject/restore to the right rectangle, and restore pops', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(200, 100),
+          fnArray: [
+            FAKE_OPS.save,
+            FAKE_OPS.transform,
+            FAKE_OPS.paintImageXObject,
+            FAKE_OPS.restore,
+            FAKE_OPS.paintImageXObject,
+          ],
+          argsArray: [
+            [],
+            [2, 0, 0, 2, 0, 0], // scale by 2 inside the save/restore pair
+            ['img1', 10, 10],
+            [],
+            ['img2', 10, 10],
+          ],
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+    const page = result.pages[0]!;
+    expect(page.text).toBeUndefined();
+    expect(page.images).toHaveLength(2);
+    // Inside the save/restore: CTM is scale-by-2, so the unit square -> [0,0]-[2,2] in user
+    // space, flipped to top-left at pageHeight 100: y0'=98, y1'=100.
+    expect(page.images![0]).toEqual({ x0: 0, y0: 98, x1: 2, y1: 100, source: 'image' });
+    // After restore: CTM is back to identity — the outer matrix, NOT the inner scale-by-2. This
+    // is the assertion that pins CTM stack tracking: without a working pop, this would equal the
+    // first box instead of the identity-unit-square box.
+    expect(page.images![1]).toEqual({ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' });
+    expect(page.images![0]).not.toEqual(page.images![1]);
+  });
+
+  it('does not throw when restore runs against an empty CTM stack', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(100, 100),
+          fnArray: [FAKE_OPS.restore, FAKE_OPS.paintImageXObject],
+          argsArray: [[], ['img', 1, 1]],
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+    const page = result.pages[0]!;
+    // The bogus leading restore left the CTM at identity (nothing to pop), so the image still
+    // reports the identity-unit-square box rather than the call throwing.
+    expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+  });
+
+  it('resolves a form XObject placement using its own /BBox when one is given', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(200, 200),
+          fnArray: [FAKE_OPS.paintFormXObjectBegin, FAKE_OPS.paintFormXObjectEnd],
+          argsArray: [[null, [5, 5, 25, 15]], []],
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+    const page = result.pages[0]!;
+    expect(page.images).toEqual([{ x0: 5, y0: 185, x1: 25, y1: 195, source: 'form' }]);
+  });
+
+  // A transparency-group form XObject reports `paintFormXObjectBegin`'s own bbox arg as null —
+  // the real bbox moves onto an `OPS.beginGroup` emitted immediately before it instead (verified
+  // against pdfjs-dist 6.1.200's `buildFormXObject`). Before FIX1 this fell back to the ~1x1
+  // unit-square approximation, silently reporting a figure's placement as a ~2pt box.
+  describe('a transparency-group form XObject (beginGroup/endGroup)', () => {
+    it('uses the group bbox under the CTM, not the unit-square fallback', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(400, 300),
+            fnArray: [
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endGroup,
+            ],
+            argsArray: [
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+              [null, null], // the form's own bbox arg is null — grouped
+              [],
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing on the pre-fix code: it reported the identity-unit-square fallback
+      // ({x0:0,y0:299,x1:1,y1:300}) instead of the real 56x28 group bbox.
+      expect(page.images).toEqual([{ x0: 0, y0: 272, x1: 56, y1: 300, source: 'form' }]);
+    });
+
+    it('still lets an explicit form bbox win over a pending group bbox', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endGroup,
+            ],
+            argsArray: [
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+              [null, [5, 5, 25, 15]], // explicit form bbox present despite a pending group bbox
+              [],
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      expect(page.images).toEqual([{ x0: 5, y0: 185, x1: 25, y1: 195, source: 'form' }]);
+    });
+
+    // Finding 2: every other beginGroup fixture in this file passes `matrix: null`, so
+    // `multiply(pending.matrix, pending.ctm)` is never exercised — a reversed composition
+    // (`multiply(pending.ctm, pending.matrix)`) would silently misplace the box and nothing here
+    // would catch it. This is the discriminating case: a non-null group matrix under a
+    // non-identity CTM at beginGroup time.
+    it('composes a non-null group matrix with the CTM at beginGroup time in the documented order', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.transform, // establishes a non-identity CTM before beginGroup runs
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endGroup,
+            ],
+            argsArray: [
+              [1, 0, 0, 1, 100, 50],
+              [{ bbox: [0, 0, 10, 10], matrix: [2, 0, 0, 3, 5, 7] }],
+              [null, null], // the form's own bbox arg is null — grouped
+              [],
+              [],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // ctm = multiply([2,0,0,3,5,7], [1,0,0,1,100,50]) = [2,0,0,3,105,57]; bbox [0,0,10,10]
+      // under that ctm is user-space [105,57]-[125,87]; through idViewport(200,200)'s
+      // [1,0,0,-1,0,200] that is [105,113]-[125,143]. The reversed composition
+      // multiply([1,0,0,1,100,50], [2,0,0,3,5,7]) = [2,0,0,3,205,157] instead, which would have
+      // produced a box offset by (100,100) from this one.
+      expect(page.images).toEqual([{ x0: 105, y0: 113, x1: 125, y1: 143, source: 'form' }]);
+    });
+
+    it('never lets a pending group bbox leak onto a second, later form that has neither', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(400, 300),
+            fnArray: [
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endGroup,
+              FAKE_OPS.paintFormXObjectBegin, // a second, unrelated, ungrouped form
+              FAKE_OPS.paintFormXObjectEnd,
+            ],
+            argsArray: [
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+              [null, null],
+              [],
+              [{ bbox: [0, 0, 56, 28], matrix: null }],
+              [null, null],
+              [],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      expect(page.images).toHaveLength(2);
+      expect(page.images![0]).toEqual({ x0: 0, y0: 272, x1: 56, y1: 300, source: 'form' });
+      // The second form has no own bbox and no live pending group bbox (consumed by the first
+      // paintFormXObjectBegin, and cleared again defensively at endGroup) — it must fall back to
+      // the flagged unit-square approximation, never reuse the first form's group bbox.
+      expect(page.images![1]).toEqual({
+        x0: 0,
+        y0: 299,
+        x1: 1,
+        y1: 300,
+        source: 'form',
+        approximate: true,
+      });
+    });
+  });
+
+  // Finding 1: a document-controlled operand (a hand-built content stream, not anything pdf.js
+  // itself validates for finiteness) can overflow a `cm`/`/Matrix` multiply to Infinity/NaN. Left
+  // unguarded, that poisons the walk's own CTM for the rest of the page, and any box built from it
+  // fails the tool's zod `z.number()` schema *after* the handler returns — outside its try/catch,
+  // so the error is neither scrubbed nor does it leave the rest of the page's geometry intact.
+  describe('a document-controlled CTM/bbox that overflows to a non-finite value', () => {
+    it('keeps the last good CTM (and emits no non-finite box) when a transform operand overflows', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [FAKE_OPS.transform, FAKE_OPS.paintImageXObject],
+            argsArray: [
+              // Overflows to Infinity; the multiply than mixes in 0*Infinity = NaN in other slots.
+              [Number.MAX_VALUE * 10, 0, 0, 1, 0, 0],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: the poisoned CTM propagated non-finite values into the box, so
+      // the returned rect did not equal the identity-unit-square box below (a NaN component
+      // instead of one of 0/1/99/100).
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      for (const box of page.images ?? []) {
+        expect(Number.isFinite(box.x0)).toBe(true);
+        expect(Number.isFinite(box.y0)).toBe(true);
+        expect(Number.isFinite(box.x1)).toBe(true);
+        expect(Number.isFinite(box.y1)).toBe(true);
+      }
+    });
+
+    it('drops a text line outright (never counted into textOmitted) when an item carries a non-finite width, without dropping an unrelated good line', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            textItems: [
+              { str: 'Good', transform: [1, 0, 0, 1, 0, 100], width: 30, height: 10 },
+              // On its own baseline (far from 'Good'), so it cannot merge into 'Good's line —
+              // isolates the "drop the poisoned line, keep everything else" guarantee.
+              { str: 'Bad', transform: [1, 0, 0, 1, 0, 50], width: Infinity, height: 10 },
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: page.text had 2 entries, and the 'Bad' one carried an Infinity
+      // edge — rejected by the tool's z.number() schema AFTER the handler returns, outside
+      // errorResult, failing the whole call and discarding every other page's geometry with it.
+      expect(page.text).toHaveLength(1);
+      expect(page.text![0]?.text).toBe('Good');
+      // Mirrors imagesOmitted: a dropped non-finite line is never counted as "omitted" — that
+      // count is reserved for lines cut by the per-page cap.
+      expect(page.textOmitted).toBe(0);
+      for (const box of page.text ?? []) {
+        expect(Number.isFinite(box.x0)).toBe(true);
+        expect(Number.isFinite(box.y0)).toBe(true);
+        expect(Number.isFinite(box.x1)).toBe(true);
+        expect(Number.isFinite(box.y1)).toBe(true);
+      }
+    });
+
+    it('drops a text line whose box only overflows to non-finite AFTER the viewport-transform mapping (service-level filter, distinct from the pdfGeometry.ts item guard)', async () => {
+      // Item geometry alone is finite (Number.MAX_VALUE is a finite double), so pdfGeometry.ts's
+      // mergeTextLines never sees a non-finite box here and does not drop it — this isolates the
+      // pdfRender.ts-level filter on the *mapped* box, which is a separate place a finite
+      // user-space box can still overflow: a custom, non-unit-scale viewport transform (a=2 here)
+      // multiplies it past Number.MAX_VALUE to Infinity.
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: { width: 100, height: 200, transform: [2, 0, 0, -1, 0, 200] },
+            textItems: [
+              { str: 'Huge', transform: [1, 0, 0, 1, Number.MAX_VALUE, 7], width: 20, height: 10 },
+              { str: 'Good', transform: [1, 0, 0, 1, 0, 50], width: 20, height: 10 },
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: page.text had 2 entries, the 'Huge' one carrying an Infinity
+      // edge (Number.MAX_VALUE * 2 overflows) that the pdfGeometry.ts-level guard cannot catch,
+      // since it only ever sees the pre-viewport-transform user-space box.
+      expect(page.text).toHaveLength(1);
+      expect(page.text![0]?.text).toBe('Good');
+      expect(page.textOmitted).toBe(0);
+    });
+
+    it('drops a form box outright when its own bbox arg carries a non-finite edge, rather than emitting it', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              [null, [5, 5, Infinity, 15]], // a document-controlled bbox carrying Infinity
+              [],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: the form's box (x1: Infinity) reached the output as a second
+      // entry alongside the image box, instead of being dropped.
+      expect(page.images).toEqual([{ x0: 0, y0: 199, x1: 1, y1: 200, source: 'image' }]);
+    });
+  });
+
+  it('paintFormXObjectBegin/End still push/pop an implicit CTM save with no paired save/restore op', async () => {
+    // pdf.js's own CanvasGraphics.paintFormXObjectBegin calls this.save() internally; the
+    // evaluator emits no OPS.save/OPS.restore pair around the op. This test pins that the walk's
+    // own push/pop reproduces it: deleting both (they look redundant, since nothing in the fake
+    // op lists below ever emits a paired save/restore) would still leave every other geometry
+    // test in this file green — only a form with a non-identity matrix, followed by something
+    // painted after paintFormXObjectEnd, can catch a regression here.
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(100, 100),
+          fnArray: [
+            FAKE_OPS.paintFormXObjectBegin,
+            FAKE_OPS.paintFormXObjectEnd,
+            FAKE_OPS.paintImageXObject,
+          ],
+          argsArray: [
+            [[2, 0, 0, 2, 50, 50], null], // a non-identity form matrix, no bbox of any kind
+            [],
+            ['img', 1, 1],
+          ],
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+    const page = result.pages[0]!;
+    expect(page.images).toHaveLength(2);
+    expect(page.images![0]).toMatchObject({ source: 'form', approximate: true });
+    // The image painted AFTER paintFormXObjectEnd must sit at the OUTER CTM (identity), not the
+    // form's own [2,0,0,2,50,50] matrix — proof that paintFormXObjectEnd popped back to what was
+    // pushed at paintFormXObjectBegin.
+    expect(page.images![1]).toEqual({ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' });
+  });
+
+  it('wraps a per-page failure in a PdfRenderError naming the page number and the original cause', async () => {
+    const cause = new Error('boom: malformed content stream');
+    const okPage = () => ({
+      getViewport: () => idViewport(100, 100),
+      render: () => ({ promise: Promise.resolve() }),
+      cleanup: () => {},
+      getTextContent: () => Promise.resolve({ items: [] }),
+      getOperatorList: () => Promise.resolve({ fnArray: [], argsArray: [] }),
+    });
+    const renderer = new PdfRenderer((async () => ({
+      OPS: FAKE_OPS,
+      getDocument: () => ({
+        promise: Promise.resolve({
+          numPages: 2,
+          canvasFactory: {},
+          getPage: (n: number) =>
+            n === 2
+              ? Promise.resolve({ ...okPage(), getTextContent: () => Promise.reject(cause) })
+              : Promise.resolve(okPage()),
+        }),
+        destroy: () => Promise.resolve(),
+      }),
+    })) as unknown as PdfjsLoader);
+
+    let caught: unknown;
+    try {
+      await renderer.geometry({ pdfPath, kinds: ['text'] });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PdfRenderError);
+    // Watched failing pre-fix: nothing wrapped the per-page call, so the error was the bare
+    // "boom: malformed content stream" with no page number in it at all.
+    expect((caught as Error).message).toContain('page 2');
+    expect((caught as Error).cause).toBe(cause);
+  });
+
+  it('maps a text box through a viewport transform for a non-zero MediaBox origin (no rotation)', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          // pdf.js's own PageViewport.transform for a MediaBox [100 50 300 150] at scale 1,
+          // rotation 0 (verified against the installed pdf.js's PageViewport constructor).
+          viewport: { width: 200, height: 100, transform: [1, 0, 0, -1, -100, 150] },
+          textItems: [{ str: 'x', transform: [1, 0, 0, 1, 120, 70], width: 10, height: 12 }],
+        },
+      ]),
+    );
+    const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+    const page = result.pages[0]!;
+    // Watched failing pre-fix: toTopLeft only flips y and never rebases the MediaBox origin, so
+    // x0 came back unchanged at 120 instead of 20.
+    expect(page.text![0]).toMatchObject({ x0: 20, y0: 68, x1: 30, y1: 80 });
+  });
+
+  it('composes the CTM with the viewport transform in the documented order (image geometry)', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          // A /Rotate-90-style viewport transform (pdf.js's PageViewport for rotation 90).
+          viewport: { width: 150, height: 300, transform: [0, 1, 1, 0, 0, 0] },
+          fnArray: [FAKE_OPS.transform, FAKE_OPS.paintImageXObject],
+          argsArray: [
+            [1, 0, 0, 1, 10, 20],
+            ['img', 1, 1],
+          ],
+        },
+      ]),
+    );
+    const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+    const page = result.pages[0]!;
+    // multiply(current, viewportTransform): the CTM (in the image's own local space) applies
+    // first, then the viewport transform. The reversed composition produces a different, equally
+    // plausible-looking rectangle here — this is the case the task specifically warns looks fine
+    // in an identity-base test but is wrong for anything not at the origin.
+    expect(page.images).toEqual([{ x0: 20, y0: 10, x1: 21, y1: 11, source: 'image' }]);
+  });
+
+  it('kinds: ["text"] leaves images undefined and imagesOmitted at 0', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(100, 100),
+          fnArray: [FAKE_OPS.paintImageXObject],
+          argsArray: [['img', 1, 1]],
+          textItems: [{ str: 'x', transform: [1, 0, 0, 1, 0, 0], width: 5, height: 5 }],
+        },
+      ]),
+    );
+    const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+    const page = result.pages[0]!;
+    expect(page.images).toBeUndefined();
+    expect(page.imagesOmitted).toBe(0);
+    expect(page.text).toHaveLength(1);
+  });
+
+  it('caps text lines and image rects per page, reporting the omitted counts', async () => {
+    const manyLines = Array.from({ length: MAX_TEXT_LINES_PER_PAGE + 5 }, (_, i) => ({
+      str: `line${i}`,
+      // Each on its own baseline, far enough apart never to merge.
+      transform: [1, 0, 0, 1, 0, i * 100],
+      width: 10,
+      height: 5,
+    }));
+    const manyImages = Array.from(
+      { length: MAX_IMAGE_RECTS_PER_PAGE + 3 },
+      () => FAKE_OPS.paintImageXObject,
+    );
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(10000, 10000),
+          textItems: manyLines,
+          fnArray: manyImages,
+          argsArray: manyImages.map(() => ['img', 1, 1]),
+        },
+      ]),
+    );
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['text', 'images'] });
+    const page = result.pages[0]!;
+    expect(page.text).toHaveLength(MAX_TEXT_LINES_PER_PAGE);
+    expect(page.textOmitted).toBe(5);
+    expect(page.images).toHaveLength(MAX_IMAGE_RECTS_PER_PAGE);
+    expect(page.imagesOmitted).toBe(3);
+  });
+
+  it('caps the page list at MAX_GEOMETRY_PAGES and fills skippedPages', async () => {
+    const pages: FakePage[] = Array.from({ length: MAX_GEOMETRY_PAGES + 2 }, () => ({
+      viewport: idViewport(100, 100),
+    }));
+    const renderer = new PdfRenderer(fakeGeometryLoader(pages));
+
+    const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+    expect(result.pageCount).toBe(MAX_GEOMETRY_PAGES + 2);
+    expect(result.pages).toHaveLength(MAX_GEOMETRY_PAGES);
+    expect(result.pages.map((p) => p.page)).toEqual([1, 2, 3, 4]);
+    expect(result.skippedPages).toEqual([5, 6]);
+  });
+
+  it('surfaces the native-canvas message, not a broken-PDF one, when the loader cannot open a document', async () => {
+    const backendMissing: PdfjsLoader = async () => {
+      throw new Error('DOMMatrix is not defined');
+    };
+    const renderer = new PdfRenderer(backendMissing);
+    await expect(renderer.geometry({ pdfPath, kinds: ['text'] })).rejects.toThrow(
+      /@napi-rs\/canvas/,
+    );
+    await expect(renderer.geometry({ pdfPath, kinds: ['text'] })).rejects.not.toThrow(
+      /Failed to open PDF/,
+    );
+  });
+});
+
+describe('pdf.js OPS table', () => {
+  // Every other geometry test in this file drives a hand-rolled FAKE_OPS with arbitrary numbers,
+  // which proves the walk is driven by whatever table it is handed but proves nothing about
+  // whether that table's *names* still exist in the real, installed pdf.js. `PdfjsOps` is a
+  // locally-declared TypeScript interface over a module obtained at runtime and cast from
+  // `unknown` (see the comment on PdfjsOps in pdfRender.ts) — a rename or removal on pdf.js's
+  // side is invisible to the compiler and produces `undefined` at runtime, which silently matches
+  // no `fnArray` entry (always a number). This test is the one thing that actually catches that.
+  it('defines every op the geometry walk uses as a number in the real, installed pdf.js', async () => {
+    const pdfjs = (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as {
+      OPS: Record<string, unknown>;
+    };
+    // Mirrors PdfjsOps in src/services/pdfRender.ts exactly.
+    const names = [
+      'save',
+      'restore',
+      'transform',
+      'paintImageXObject',
+      'paintImageMaskXObject',
+      'paintFormXObjectBegin',
+      'paintFormXObjectEnd',
+      'beginGroup',
+      'endGroup',
+    ];
+    for (const name of names) {
+      expect(typeof pdfjs.OPS[name]).toBe('number');
+    }
   });
 });

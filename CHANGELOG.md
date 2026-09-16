@@ -11,6 +11,140 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **A `pdf_geometry` tool: measure the compiled page in points, instead of eyeballing a PNG** (#73).
+  `render_pages` answers "does this look wrong"; it cannot answer "by how many points does this
+  table's text overlap the figure frame above it". Reading a rasterized page is not measurement, and
+  the reporter's case — twelve table text runs sitting inside a figure's frame — is exactly the kind
+  a human sees instantly and an agent cannot compute from pixels. `pdf_geometry` is read-only over
+  the **last build** (it never compiles) and reports boxes in PostScript points with the origin at
+  the **top-left**, matching `render_pages`' `clip` convention so the two compose: one to look, one
+  to measure. Three kinds: `text` (pdf.js text items merged into per-line boxes by shared baseline
+  and horizontal adjacency — the `text` on each box is a truncated _label_ for it, not the
+  document's content), `images`, and an opt-in `floats` index of `label -> printed page` parsed from
+  the build-dir `.aux`.
+
+  **What `images` is, and what it deliberately is not.** It reports image and form XObject
+  _placement rectangles_ — what an `\includegraphics` figure actually occupies — recovered by
+  walking the page's operator list with our own CTM stack. General **vector path geometry is out of
+  scope**: pdf.js exposes `\fbox` rules and TikZ strokes only as raw path-construction operators in
+  untransformed space, and replaying them correctly is a full graphics-state interpreter, so a frame
+  drawn purely with rules and no embedded image is not reported **at all**. The tool description
+  says so in those words, because the failure mode of a half-built geometry tool is a caller
+  measuring a collision that is not there, or missing one that is — and that is worse than not
+  having the tool. Text-only would have been half the work and would **not** have caught the case
+  the report was filed about, which is why `images` is in and `drawings` is out.
+
+  Three details the CTM walk depends on, each of which was wrong or unguarded in the first cut and
+  each of which fails _silently_ — a plausible rectangle in the wrong place, which is worse here
+  than an error. **A form XObject carrying a `/Group` (transparency) gets `null` where its `/BBox`
+  should be**: pdf.js builds the op as `[matrix, !group && bbox || null]` and moves the real BBox
+  onto the `beginGroup` op emitted just before it. Ignoring `beginGroup` therefore fell back to the
+  unit square and reported a **2.0 × 2.0 pt box for a 113.4 × 56.7 pt figure** — a ~56× area error
+  at the figure's bottom-left corner, indistinguishable from a good measurement. That is not an
+  exotic case: pdfTeX copies an included PDF page's `/Group` onto the Form XObject, so Inkscape
+  exports, matplotlib output with any alpha and TikZ/pgfplots figures using `opacity` all carry
+  one — and it lands precisely on the flagship question ("does this text collide with that figure
+  frame"), producing the exact failure this tool must never produce. The walk now carries a pending
+  group bbox forward, composed with the CTM as it stood at `beginGroup` (which is what pdf.js's own
+  `beginGroup` clips against — implemented literally rather than assuming the group matrix and the
+  form matrix always coincide), consumed by the paired `paintFormXObjectBegin` and cleared so it can
+  never leak onto a later form. Where a form still cannot be bounded, the box is flagged
+  **`approximate: true`** rather than passed off as measured — a fallback a caller must not compute
+  a collision from should say so. Second: an `OPS.restore` on an empty stack must **not** throw — a
+  truncated content stream is a real thing a document-controlled operator list produces, and failing
+  the page over one bad operator would discard the images already found. Third:
+  `paintFormXObjectBegin`/`End` push and pop a CTM of their own even though no paired
+  `save`/`restore` appears around them in the list, because pdf.js saves internally when it executes
+  that op — removing either half broke no test until one was added that paints an image _after_ the
+  form's `End` and checks it sits at the outer CTM. `OPS.paintJpegXObject` does not exist in the
+  installed pdf.js and is not referenced; a test now imports the real `OPS` and asserts every op
+  name the walk uses is a number, because the walk is driven by a hand-rolled fake everywhere else
+  and a renamed op would otherwise yield `images: []` on every page with a fully green gate off-TeX.
+
+  **Coordinates come from the page's own viewport transform, not a hand-rolled y-flip.** The first
+  cut took the page box from `getViewport({scale:1})` — which is rotation- and box-aware — and then
+  flipped y manually, which rebases nothing: a non-zero MediaBox origin shifted every box, and a
+  `/Rotate 90` page transposed the axes and could report an `x1` past `pageWidthPt`. `/Rotate 90` is
+  what `pdflscape` writes, and a landscape page is where a wide table lives, so this was wrong
+  exactly where the tool is most needed — and it made the promise that `pdf_geometry` composes with
+  `render_pages`' `clip` false on those pages, since `clip` _is_ viewport-relative. Every box now
+  maps through `viewport.transform`, taking the bounds of all four transformed corners.
+
+  That fixed `images`, and review found it had done **nothing for `text`**, while two documents
+  asserted the opposite. `lscape`/`pdflscape` rotate the page _content_ 90° as well as setting
+  `/Rotate`, so every text item on such a page carries a rotated matrix — and `itemBox` added the
+  advance along `+x` and the em along `+y` regardless, so a 254 pt horizontal line came back as a
+  10 pt-wide, 254 pt-tall vertical sliver. Mapping an already-transposed box through the viewport
+  cannot repair it. The box is now built from the item's own text matrix — the advance along its
+  text direction, the em along its up direction — which reduces to exactly the previous numbers for
+  unrotated text and is correct for a sideways table cell, a rotated axis label and a `pdflscape`
+  page alike. The smoke test that was meant to prove this asserted only that boxes land _inside_
+  the page box, which a 90°-wrong box also satisfies; it now asserts the landscape heading is wider
+  than it is tall, and that assertion was watched failing (`expected 14.35 to be greater than
+127.72`) before the fix. What is still **not** modelled, and the schema now says so: a sheared
+  text matrix; line _merging_, which keys on the baseline `y` alone, so a rotated line of several
+  items comes back as several correct boxes rather than one merged line; and a text box spans
+  baseline to the **em height**, not the ascent — it overshoots the ink above and excludes
+  descenders below, so a descender touching a figure reads as clearance.
+
+  `mergeTextLines` also merged in one direction only: the adjacency test bounded the gap above but
+  not below, so an item anywhere to the _left_ of the running line joined it — two TikZ nodes 285 pt
+  apart, emitted right-then-left, became one 346 pt box spanning blank paper, in reverse reading
+  order. An item may now overlap the running line by at most its own em (accents are painted back
+  over the preceding glyph); anything further left starts a new line.
+
+  The geometry math (`src/lib/pdfGeometry.ts`) and the `.aux` parser (`src/lib/auxFloats.ts`) are
+  pure and hold no pdf.js import, so both are unit-testable without a PDF; the service work reuses
+  `PdfRenderer`'s existing `openDocument`, which is what turns a missing `@napi-rs/canvas` into a
+  message naming that package rather than a "DOMMatrix is not defined" or a claim that the PDF is
+  broken. pdf.js in Node cannot open a document at all without that backend, so `geometry` needs it
+  exactly as `pageCount` does — and loading pdf.js **after** `openDocument` rather than before is
+  load-bearing for that, which a test pins. The `.aux` is a build artifact written by the document:
+  it is read with a brace-balanced scanner (a naive `\{([^}]*)\}` regex mis-parses hyperref's
+  five-group `\newlabel`), a malformed or half-written entry is skipped rather than thrown on, and
+  **no path or string it names is ever opened, resolved or stat'd** — the same rule the compile log
+  is held to. The first cut bounded the parser's _results_ and not its _work_: the loop guard only
+  advanced on a successful parse, and a failing marker's `readBraceGroup` scanned to end-of-string,
+  so an unbalanced `.aux` was quadratic — 520 KB took 27 s, and a real `latexmk` run was made to
+  produce one. That matters beyond slowness: the parse is synchronous inside `runExclusive`, so it
+  blocks the whole stdio server, and past 60 s `reclaimIfStale` lets a peer delete this session's
+  live lock. The scan is now bounded on two independent axes — a per-group scan budget and an
+  iteration counter that does not depend on how many entries parse — so the worst case is constant
+  per marker and linear in the file. The same scan also never advanced past an entry it had read,
+  so a `\newlabel` inside hyperref's caption group was picked up as a second, fabricated
+  `label -> page` row; it now advances to the end of the outer group. Everything is capped with an
+  accompanying count, so a truncated answer is never a silent one: 4 pages per call (lower than
+  `render_pages`' 8 — a page of boxes is far more output than one PNG), 300 text lines and 100
+  image rects per page, 200 floats — the last counted against every `\newlabel` actually found,
+  exactly, up to the parser's own (much larger) scan bound, with `floatsDropped` counting the
+  entries that were found but could not be reported — an over-long field, or an entry whose own
+  `\newlabel` group ran past the scan budget — rather than discarding them silently. That budget
+  needed a second pass of its own: capping the scan stopped the quadratic blowup but left the
+  scanner re-entering the group it had just abandoned, so a figure with a ~4000-character caption
+  vanished with every counter reading zero, and the fabricated `\newlabel` inside such a caption
+  came back in place of the real entry — strictly worse than the bug the cap was fixing. The
+  scanner now advances past a group whose true end it has located, and counts what it drops. `floats` also drops cleveref's `@cref` shadow entries, whose "page" field is `[1][1][]1` and
+  not a page at all, and which otherwise doubled every document's float budget; the pure parser
+  stays faithful to the file and the filtering sits one layer up. Asking for `floats` alone no
+  longer opens the PDF, so a float index — which is text parsing — does not require the native
+  canvas backend. The tool takes
+  `requireProjectDir`, never `requireGitProject`, so it works on a `mode: 'local'` project like
+  `compile` and `render_pages`; it takes `runExclusive` for the same reason `render_pages` does (a
+  peer session's `compile` can rewrite the build dir mid-read); and it writes nothing into the project
+  directory or the temp build dir — an integration test diffs both across a call, since the project
+  directory alone would not have caught a scratch file written into the build dir, which is exactly
+  what the code this was copied from does. It is not true that it writes nothing _anywhere_: taking
+  the lock creates `<workspace>/.sessions/<id>/` and leaves the directory behind (the lock file
+  itself is removed), exactly as `render_pages` does. A second test now pins that narrower, true
+  statement from an empty workspace root — the original passed only because its fixture called
+  `register_project` first, which had already created the directory.
+
+  Two smaller review fixes: a document-controlled `cm` whose operands overflow no longer emits a
+  `NaN` box — which zod rejected _after_ the handler returned, outside the `errorResult` catch,
+  losing every other page in the call — and `kinds: ["floats"]` alone no longer requires a PDF to
+  _exist_, so a compile that wrote an `.aux` and then died on a missing package still has a
+  readable float index.
+
 - **`compile` takes a `warningsFilter`, and it trims both channels or neither** (#73). A warning-heavy
   paper returned ~127 KB of result, and the reason it was that large is that every `Overfull \hbox`
   ships **twice**: once structured in `warnings[]`, and once as raw text in `logTail`, because

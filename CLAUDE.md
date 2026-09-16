@@ -101,7 +101,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
   read and edit in place, not litter in place.
 - **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/project_sync/add_citation) must run
-  inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't.
+  inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't —
+  with two deliberate exceptions, `render_pages` and `pdf_geometry`, which read the **temp build dir**
+  a peer session's `compile` can rewrite underneath them. That is the whole test for the exception:
+  a read-only tool locks only when what it reads is a build artifact another session rewrites in
+  place, never merely because it reads. The cost is real and belongs in the tool's description —
+  such a tool can wait on, or time out against, a peer holding the lock, and it creates
+  `<workspace>/.sessions/<id>/`, so "writes nothing" is never true of it without that caveat.
   The lock file lives outside the clone (`src/lib/sessionPaths.ts`), so `project_sync` takes it before a
   first clone too. The peer-refusal logic `push` and `project_sync` share (`guardPeerWork`,
   `enrichPullRefusal`) lives in `src/lib/peerRefusal.ts`, not in the tools.
