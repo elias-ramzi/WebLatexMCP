@@ -10,7 +10,7 @@ import {
   MAX_IMAGE_RECTS_PER_PAGE,
 } from '../services/pdfRender.js';
 import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
-import { readAuxFloats, DEFAULT_MAX_FLOATS } from '../lib/auxFloats.js';
+import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -88,13 +88,20 @@ const geometryPageShape = z.object({
     .optional()
     .describe(
       'Per-line text boxes, in drawing order. Absent (not empty) when "text" was not requested. ' +
-        'Each box is [baseline, baseline + height], i.e. from the text baseline UP to the ' +
-        "ascent (pdf.js's height is measured up from the baseline, roughly the font size) — " +
-        'descenders (g, p, y, ...) extend BELOW y1 and are not included, so a descender touching ' +
-        'a figure below it is a real collision this tool reports as clearance. Also: this box is ' +
-        "axis-aligned from the item's origin/width/height alone — text rotated WITHIN an " +
-        'unrotated page (e.g. a sideways table cell or a rotated axis label, as opposed to a ' +
-        "/Rotate'd page, which this tool does handle) ignores that rotation and is simply wrong.",
+        'Each box runs from the text baseline UP by the em size (pdf.js reports height as the ' +
+        'full em, not the ascent), so it OVERSHOOTS the ink at the top by a few points, and ' +
+        'descenders (g, p, y, ...) extend BELOW y1 and are not included — a descender touching a ' +
+        'figure below it is a real collision this tool reports as clearance. The box is built ' +
+        "from the item's own text matrix (advance along its text direction, em along its up " +
+        'direction), so a ROTATED item — a sideways table cell, a rotated axis label, or every ' +
+        'line on a pdflscape landscape page, where the content is rotated inside the page as well ' +
+        'as the page carrying /Rotate — gets a correct axis-aligned box. What is still not ' +
+        'modelled is SHEAR (a slanted, non-orthogonal text matrix), and line MERGING is keyed on ' +
+        'the baseline y alone, so a rotated line made of several text items comes back as several ' +
+        'separate boxes rather than one merged line — correct boxes, just not joined up. As for ' +
+        'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
+        'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
+        'field is the per-page cap alone — since a NaN is not a measurement.',
     ),
   images: z
     .array(geometryBoxShape)
@@ -102,11 +109,20 @@ const geometryPageShape = z.object({
     .describe(
       'Image/form XObject placement rectangles, in drawing order. Absent (not empty) when ' +
         '"images" was not requested. Covers paintImageXObject, paintImageMaskXObject and ' +
-        'paintFormXObjectBegin only — paintInlineImageXObject (plausible from some converters), ' +
-        'paintImageXObjectRepeat, paintImageMaskXObjectGroup, paintImageMaskXObjectRepeat and ' +
-        'paintSolidColorImageMask (the *Repeat/*Group forms only fire at several identical ' +
-        'repeated placements, so unlikely in a paper) produce no rectangle and no count — a gap, ' +
-        'not a zero.',
+        'paintFormXObjectBegin only. These produce no rectangle and no count — a gap, not a ' +
+        'zero: paintInlineImageXObject (plausible from some converters) and ' +
+        "paintSolidColorImageMask; and pdf.js's batching ops, which fire more readily than " +
+        'their names suggest — paintImageXObjectRepeat at 3 repeated placements, ' +
+        'paintInlineImageXObjectGroup and paintImageMaskXObjectGroup at 10 consecutive images ' +
+        '(the *Group forms do NOT require the images to be identical), and ' +
+        'paintImageMaskXObjectRepeat. Two more gaps: an image painted inside an ANNOTATION ' +
+        "appearance stream (pdfcomment, form fields, pdfpages links) is placed against pdf.js's " +
+        'own annotation base transform, which this walk does not model, so its rectangle would ' +
+        'be misplaced; and a box whose coordinates come out non-finite (a content stream whose ' +
+        'cm operands overflow) is dropped rather than reported, since a NaN is not a measurement ' +
+        '— the walk then keeps the last usable transform, so a later box on that same page can be ' +
+        'placed against a transform the document did not ask for. Only a stream with an ' +
+        'overflowing operand reaches this at all; no TeX toolchain emits one.',
     ),
   textOmitted: z
     .number()
@@ -127,7 +143,17 @@ const floatShape = z.object({
 });
 
 const outputSchema = {
-  pdfPath: z.string().describe('The compiled PDF that was inspected.'),
+  pdfPath: z
+    .string()
+    .optional()
+    .describe(
+      'The compiled PDF this call read, when there is one. NOT a claim that it was opened: with ' +
+        'kinds ["floats"] alone only the .aux is read, and this field just names the PDF that ' +
+        'happens to be there. ABSENT when kinds was ["floats"] alone and no PDF ' +
+        'exists: that path never opens the PDF (only the .aux, and only to find labels), so a ' +
+        'compile that produced an .aux but died before a PDF (a missing package, an undefined ' +
+        'control sequence) still lets the float index be read — there is simply no PDF to name.',
+    ),
   pageCount: z
     .number()
     .optional()
@@ -154,15 +180,33 @@ const outputSchema = {
     .describe(
       'Present only when "floats" was requested: labels parsed from the build-dir .aux, ' +
         'excluding cleveref\'s internal `<label>@cref` shadow records (their "page" field is a ' +
-        'bracketed cross-reference code, not a printed page).',
+        'bracketed cross-reference code, not a printed page). Every OTHER \\newlabel is reported, ' +
+        "so this is not a float-only list: varioref's `<n>@vr`/`@xvr` records (empty number) and " +
+        "subcaption's `sub@<label>` duplicates of each subfigure appear here too, as does every " +
+        '\\label on a section or an equation. Match on the label key you care about rather than ' +
+        'assuming a row is a figure or a table.',
     ),
   floatsOmitted: z
     .number()
     .optional()
     .describe(
       `Present only when "floats" was requested: real (non-shadow) labels past the ` +
-        `${DEFAULT_MAX_FLOATS} cap, counted against the true total found — never against a ` +
-        'smaller internal parse cutoff.',
+        `${DEFAULT_MAX_FLOATS} cap. Counted against the true total found, never against a ` +
+        `smaller internal parse cutoff — exact for any .aux holding at most ${PARSE_BOUND} ` +
+        '\\newlabel markers, which is far past any real document; past that the scan stops (the ' +
+        'file is document-controlled, so the work it can cost is bounded) and this count ' +
+        'saturates with it.',
+    ),
+  floatsDropped: z
+    .number()
+    .optional()
+    .describe(
+      'Present only when "floats" was requested: real (non-shadow) \\newlabel entries that were ' +
+        'found in the .aux but could not be reported — either a label/number/page field ran past ' +
+        "the per-field length cap, or the entry's own \\newlabel group was longer than the " +
+        'parser will scan (the .aux is document-controlled, so the work one entry can cost is ' +
+        'bounded). Almost always 0. Counted separately from floatsOmitted, which is the ' +
+        'reporting cap, so neither kind of loss is ever silent.',
     ),
   note: z
     .string()
@@ -188,9 +232,11 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         '"text" reports per-line boxes (pdf.js text items merged by shared baseline and ' +
         'horizontal adjacency); the "text" string on each box is truncated — it is a label for ' +
         "the box, not the document's content, so use read_file for that. A text box runs from " +
-        'the baseline up to the ascent only — a descender (g, p, y) extends below it, and text ' +
-        'rotated within an unrotated page (not the page itself) is not accounted for; see the ' +
-        'schema field description for both caveats. ' +
+        'the baseline up by the em, so it overshoots the ink above and excludes descenders ' +
+        '(g, p, y) below. Rotated text IS accounted for — a sideways table cell, a rotated axis ' +
+        'label and a pdflscape landscape page all get correct boxes — but a rotated line of ' +
+        'several items comes back as several boxes rather than one merged line, and a sheared ' +
+        'text matrix is not modelled; see the schema field description for all of it. ' +
         '"images" reports image and form XObject PLACEMENT RECTANGLES — what an \\includegraphics ' +
         'figure actually occupies — and NOTHING ELSE: general vector path geometry (\\fbox rules, ' +
         'TikZ strokes) is explicitly out of scope, because pdf.js only exposes those as raw ' +
@@ -198,18 +244,26 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         'full graphics-state interpreter. A frame drawn purely with rules or strokes and no ' +
         'embedded image is not reported at all — a caller who assumes otherwise will measure a ' +
         'collision that is not there, or miss one that is. A handful of rarer paint operators ' +
-        '(inline images, and repeated-placement forms) are not handled either — see the schema ' +
-        'field description. A form whose own bounding box could not be recovered is flagged ' +
+        "(inline images, and pdf.js's batched repeated-placement forms), and anything painted " +
+        'inside an annotation appearance stream, are not handled either — see the schema field ' +
+        'description. A form whose own bounding box could not be recovered is flagged ' +
         '"approximate": true and must never be used for a collision computation. ' +
         '"floats" (opt-in, since it is document-wide rather than per-page) reports a label -> ' +
         'printed-page index parsed from the build-dir .aux, so it reflects the LAST COMPILE: a ' +
         'label added since, or one whose reference has not converged yet (LaTeX\'s "may have ' +
-        'changed, rerun" case), is absent until the next compile. Requesting kinds: ["floats"] ' +
-        'alone never opens the compiled PDF at all. ' +
+        'changed, rerun" case), is absent until the next compile. It is every \\newlabel, not ' +
+        'only floats, so section, equation, varioref and subcaption records appear too. ' +
+        'Requesting kinds: ["floats"] alone never opens the compiled PDF at all, and does not ' +
+        'even need one to exist — a compile that wrote an .aux and then died still has a ' +
+        'readable float index. ' +
         `Caps: ${MAX_GEOMETRY_PAGES} pages per call (MAX_GEOMETRY_PAGES, lower than render_pages’ ` +
         `cap — a page of boxes is a lot more output than one PNG), ${MAX_TEXT_LINES_PER_PAGE} text ` +
         `lines and ${MAX_IMAGE_RECTS_PER_PAGE} image rects per page, ${DEFAULT_MAX_FLOATS} floats ` +
         'total — each with its own *Omitted count, so a truncated result is never silent. ' +
+        'Writes nothing into the project or its build directory. It does take the per-project ' +
+        "lock, exactly as render_pages does (a peer session's compile can rewrite the build dir " +
+        'mid-read), so it creates <workspace>/.sessions/<project>/ if that is not already there, ' +
+        'and it can wait on — or time out against — a peer holding that lock. ' +
         'Reading per-page geometry needs the optional native canvas backend @napi-rs/canvas, ' +
         "same as render_pages and compile's pageCount reports — without it this fails naming " +
         'that package, not the PDF as broken (kinds: ["floats"] alone is unaffected).',
@@ -221,7 +275,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         // Invariant: requireProjectDir, NEVER requireGitProject — this tool must work for a
         // mode:'local' project exactly like compile and render_pages. Git-gating it would be wrong.
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
-        // Invariant: runExclusive is taken even though this tool writes nothing at all. It is a
+        // Invariant: runExclusive is taken even though this tool writes no project file. It is a
         // deliberate exception to "read-only tools don't lock", mirroring render_pages: it reads
         // the build-dir PDF (and, for "floats", the build-dir .aux) that a peer session's compile
         // can rewrite mid-read.
@@ -233,38 +287,48 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // it only used to locate a PDF/aux.
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
           const pdfPath = await locateProjectPdf(ctx.config, id, dir, root);
-          if (!pdfPath) {
-            throw new Error(
-              `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
-            );
-          }
 
           const requestedKinds = kinds ?? ['text', 'images'];
           const pageKinds = requestedKinds.filter((k): k is GeometryKind => k !== 'floats');
 
-          // This tool writes nothing, anywhere — no PNGs, no temp files, no output directory. For
-          // a mode:'local' project the whole point is reading in place, not littering in place.
+          // This tool writes nothing into the project or its build directory — no PNGs, no temp
+          // files, no output directory. For a mode:'local' project the whole point is reading in
+          // place, not littering in place. (The one thing it does create is the project lock's
+          // own <workspace>/.sessions/<id>/ directory, via runExclusive above — outside every
+          // clone, and the same directory every other locking tool uses.)
           //
           // Skip opening the PDF entirely when no page-level kind was requested (kinds: ["floats"]
           // alone): geometry() needs the native canvas backend just to open a document at all, so
           // a pure .aux text parse would otherwise fail on a machine without it, or open the
           // document to produce a result that discards text/images either way. pageCount is
           // therefore honestly unknown in this path (see the schema field), not computed and
-          // hidden.
-          const result:
+          // hidden. A page-level request, by contrast, needs the PDF and must fail loudly and
+          // early when there isn't one — nested here (rather than as an earlier standalone guard)
+          // so the throw is what lets TypeScript narrow pdfPath to string for the geometry() call
+          // right below it.
+          let result:
             | GeometryResult
-            | { pageCount: undefined; pages: never[]; skippedPages: never[] } =
-            pageKinds.length > 0
-              ? await ctx.pdfRenderer.geometry({ pdfPath, pages, kinds: pageKinds })
-              : { pageCount: undefined, pages: [], skippedPages: [] };
+            | { pageCount: undefined; pages: never[]; skippedPages: never[] };
+          if (pageKinds.length > 0) {
+            if (!pdfPath) {
+              throw new Error(
+                `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
+              );
+            }
+            result = await ctx.pdfRenderer.geometry({ pdfPath, pages, kinds: pageKinds });
+          } else {
+            result = { pageCount: undefined, pages: [], skippedPages: [] };
+          }
 
           let floats: Array<{ label: string; number: string; page: string }> | undefined;
           let floatsOmitted: number | undefined;
+          let floatsDropped: number | undefined;
           let note: string | undefined;
           if (requestedKinds.includes('floats')) {
             const auxResult = await readAuxFloats(dir, root);
             floats = auxResult.floats;
             floatsOmitted = auxResult.omitted;
+            floatsDropped = auxResult.dropped;
             note = auxResult.note;
           }
 
@@ -275,13 +339,16 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             skippedPages: result.skippedPages,
             floats,
             floatsOmitted,
+            floatsDropped,
             note,
           };
 
           const pageCountText =
             result.pageCount !== undefined
               ? `${result.pages.length} of ${result.pageCount} page(s) from ${pdfPath}`
-              : `${pdfPath} (no page opened — kinds: floats only)`;
+              : pdfPath !== undefined
+                ? `${pdfPath} (no page opened — kinds: floats only)`
+                : 'no PDF (kinds: floats only, and none was ever compiled)';
           const header = `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})`;
           const pageLines = result.pages.map((p) => {
             const parts = [
@@ -305,7 +372,8 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           const floatsLine =
             floats !== undefined
               ? `  floats: ${floats.length} label(s)` +
-                (floatsOmitted ? ` (${floatsOmitted} omitted)` : '')
+                (floatsOmitted ? ` (${floatsOmitted} past the cap)` : '') +
+                (floatsDropped ? ` (${floatsDropped} unreportable)` : '')
               : '';
           const noteLine = note ? `  … ${note}` : '';
           const text = [header, ...pageLines, skippedLine, floatsLine, noteLine]

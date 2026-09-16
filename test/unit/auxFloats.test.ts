@@ -3,7 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm, chmod, writeFile } from 'node:fs/promises';
 import { platform } from 'node:process';
-import { parseAuxLabels, readAuxFloats, DEFAULT_MAX_FLOATS } from '../../src/lib/auxFloats.js';
+import {
+  parseAuxLabels,
+  readAuxFloats,
+  DEFAULT_MAX_FLOATS,
+  PARSE_BOUND,
+  MAX_GROUP_SCAN,
+} from '../../src/lib/auxFloats.js';
 import { buildAuxPath } from '../../src/services/compiler.js';
 
 describe('parseAuxLabels', () => {
@@ -87,6 +93,110 @@ describe('parseAuxLabels', () => {
     expect(parseAuxLabels(aux)).toEqual([{ label: 'sec:my_section-1', number: '2', page: '3' }]);
   });
 
+  it("does not parse a \\newlabel nested inside another entry's argument as a second entry", () => {
+    // hyperref's third group is caption text; a caption that happens to CONTAIN the literal
+    // string "\newlabel{...}" must not be re-entered as its own record once the outer group has
+    // already been consumed. Exact repro from the finding.
+    const aux =
+      '\\newlabel{fig:real}{{1}{7}{A caption saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}';
+    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:real', number: '1', page: '7' }]);
+  });
+
+  it("does not fabricate a \\newlabel found embedded inside another entry's over-budget outer group", () => {
+    // Exact repro from the finding: a ~4200-character caption pushes fig:real's outer group just
+    // past MAX_GROUP_SCAN, and the caption happens to contain literal \newlabel-shaped text later
+    // inside it. Advancing only to MAX_GROUP_SCAN's own limit (rather than the group's true end)
+    // left that text in reach of the next scan, which parsed it as a second, fabricated entry —
+    // losing the real fig:real in the process.
+    const xs = 'x'.repeat(4200);
+    const aux = `\\newlabel{fig:real}{{1}{7}{A caption ${xs} saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}`;
+    const result = parseAuxLabels(aux);
+    expect(result.some((r) => r.label === 'fig:fake')).toBe(false);
+    expect(result).toEqual([]); // fig:real is over budget too, so it is dropped, not parsed
+  });
+
+  it('FINDING 1: an over-long KEY group does not fabricate a row from a \\newlabel-shaped string in its own outer group', () => {
+    // Exact repro from the finding: the KEY (not the outer group) is the part that blows
+    // MAX_GROUP_SCAN. Before the fix, the 'tooLong' key branch advanced searchFrom to only the
+    // KEY's own end and never read/skipped the outer group at all — so the outer group (which
+    // starts right where the scan resumed) was re-entered as ordinary text, and a
+    // \newlabel-shaped string inside its caption was parsed as a second, fabricated, REAL entry
+    // (counted in `total`, not `dropped`).
+    const hugeKey = 'k'.repeat(4146);
+    const aux = [
+      `\\newlabel{${hugeKey}}{{1}{7}{A caption saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}`,
+      '\\newlabel{fig:next}{{2}{8}}',
+    ].join('\n');
+    const result = parseAuxLabels(aux);
+    expect(result.some((r) => r.label === 'fig:fake')).toBe(false);
+    // fig:next is the only genuinely parseable entry; the huge-key entry has no usable label.
+    expect(result).toEqual([{ label: 'fig:next', number: '2', page: '8' }]);
+  });
+
+  it('stays linear (not quadratic) on a large file of unbalanced \\newlabel markers', () => {
+    // Each marker opens a brace that never closes, so an unbounded reader would scan to
+    // end-of-string on every single one of them: O(n) work per marker * O(n) markers = O(n^2).
+    //
+    // This used to assert an absolute wall-clock budget (elapsedMs < 5000). That is exactly the
+    // flake shape this project has already hit on windows-latest (see MEMORY.md), and it barely
+    // discriminated: measured pre-fix (i.e. against the code this test is supposed to catch a
+    // regression back to) on the machine that wrote that budget, 20,000 markers took 6539ms —
+    // against a 5000ms budget, only 1.3x margin. A CI box 1.4x faster than that machine would pass
+    // the absolute assertion against genuinely quadratic code.
+    //
+    // "not quadratic" is actually a claim about the GROWTH RATE, which is machine-speed
+    // independent: doubling the input should roughly double the time (allow real margin either
+    // side of 2x), not quadruple it. n is kept small so the test stays fast even though it now
+    // times two parses instead of one.
+    function parseTimeMs(n: number): number {
+      const aux = Array.from({ length: n }, (_, i) => `\\newlabel{l${i}}{`).join('\n');
+      const start = Date.now();
+      const result = parseAuxLabels(aux, { maxLabels: n });
+      const elapsedMs = Date.now() - start;
+      expect(result).toEqual([]); // every marker is unbalanced — none of them parse
+      return elapsedMs;
+    }
+
+    // A floor under each raw measurement guards against sub-millisecond timer resolution
+    // producing a garbage ratio (e.g. 0ms vs 1ms reading as "infinitely worse").
+    const TIMER_FLOOR_MS = 5;
+
+    // Median of 3 samples, not a single one: this file runs inside a parallel vitest worker
+    // pool, so contention can land on one timed half and not the other. Measured spreads:
+    // cold fresh-process runs (no other work sharing the process) gave 1.685-2.138x; warm
+    // in-process runs — as this file actually executes, back-to-back inside one worker — gave
+    // up to 2.44x, only 2.4% under the old 2.5 threshold. That is thin enough to flake exactly
+    // the way this project has already seen on windows-latest (see MEMORY.md's recorded
+    // pushConflictBudget flake) even though the code is genuinely linear. A median-of-3 absorbs
+    // a single contention-skewed sample rather than asserting on it directly.
+    function medianOf3Ms(n: number): number {
+      const samples = [parseTimeMs(n), parseTimeMs(n), parseTimeMs(n)]
+        .map((ms) => Math.max(ms, TIMER_FLOOR_MS))
+        .sort((a, b) => a - b);
+      const median = samples[1];
+      if (median === undefined) {
+        throw new Error('unreachable: samples always has exactly 3 elements');
+      }
+      return median;
+    }
+
+    const n = 6_000;
+    const tSmall = medianOf3Ms(n);
+    const tLarge = medianOf3Ms(n * 2);
+
+    // A quadratic scan would give ~4x here — confirmed against a standalone reference
+    // implementation with the outer-group read left UNBOUNDED (same input shape as this test:
+    // the KEY group always closes cleanly, only the trailing outer `{` is unbalanced and scans to
+    // end-of-string every time). Repeated runs on a loaded dev machine gave a 3.07-5.42x spread —
+    // noisy, but never below 3.0 — while the bounded (real) implementation is fast enough at this
+    // `n` that its ratio is dominated by `TIMER_FLOOR_MS` noise around 1x, nowhere near 3.0. 3.0
+    // is comfortably below the quadratic floor actually observed (still genuinely falsifiable —
+    // an unbounded scan fails this test) while giving real margin over the ~2x a linear scan
+    // gives and the up-to-2.44x observed for linear code under worker-pool contention, unlike the
+    // previous 2.5 threshold's 2.4% headroom.
+    expect(tLarge / tSmall).toBeLessThan(3.0);
+  });
+
   it('stays faithful to the file: cleveref shadow (@cref) entries are returned verbatim, not filtered', () => {
     // Real values from this repo's own TeX install (pdflatex + cleveref 6.1.200-era .sty),
     // captured with `\cref{fig:a}`/`\cref{sec:intro}` in a probe document. Filtering these belongs
@@ -126,6 +236,8 @@ describe('readAuxFloats', () => {
         { label: 'tab:two', number: '1', page: '4' },
       ],
       omitted: 0,
+      total: 2,
+      dropped: 0,
     });
   });
 
@@ -197,6 +309,153 @@ describe('readAuxFloats', () => {
     expect(result.floats).toHaveLength(DEFAULT_MAX_FLOATS);
     expect(result.omitted).toBe(count - DEFAULT_MAX_FLOATS);
     expect(result.omitted).not.toBe(2000 - DEFAULT_MAX_FLOATS); // the old, wrong undercount
+  });
+
+  it('reports omitted/total honestly at the PARSE_BOUND scan boundary, not against an earlier cutoff', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    // PARSE_BOUND + 1 real, well-formed labels: one more marker than the scan will ever inspect.
+    // The true total is PARSE_BOUND + 1, but this exercises the documented saturation point —
+    // readAuxFloats must report exactly PARSE_BOUND (never silently claim the true, larger
+    // count, and never silently truncate below PARSE_BOUND either).
+    const count = PARSE_BOUND + 1;
+    const many = Array.from({ length: count }, (_, i) => `\\newlabel{l${i}}{{${i}}{${i}}}`).join(
+      '\n',
+    );
+    await writeFile(auxPath, many);
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.total).toBe(PARSE_BOUND);
+    expect(result.floats).toHaveLength(DEFAULT_MAX_FLOATS);
+    expect(result.omitted).toBe(PARSE_BOUND - DEFAULT_MAX_FLOATS);
+  }, 20_000);
+
+  it('counts (rather than silently dropping) a real entry lost to the per-field length cap', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const hugeKey = 'k'.repeat(300);
+    await writeFile(
+      auxPath,
+      [`\\newlabel{${hugeKey}}{{1}{2}}`, '\\newlabel{fig:ok}{{4}{8}}'].join('\n'),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.floats).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    // The dropped entry is never silently absorbed into `total`/`omitted` (there is no valid
+    // AuxLabel for it to represent) — it is surfaced through its own count instead.
+    expect(result.total).toBe(1);
+    expect(result.omitted).toBe(0);
+    expect(result.dropped).toBe(1);
+  });
+
+  it('counts (rather than silently dropping) a well-formed \\newlabel whose outer group exceeds MAX_GROUP_SCAN', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const xs = 'x'.repeat(MAX_GROUP_SCAN + 200);
+    await writeFile(
+      auxPath,
+      [`\\newlabel{fig:long}{{1}{7}{${xs}}{figure.1}{}}`, '\\newlabel{fig:ok}{{4}{8}}'].join('\n'),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: the over-budget entry vanished with total/omitted/dropped all 0
+    // instead of being reported here.
+    expect(result.floats).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    expect(result.total).toBe(1);
+    expect(result.omitted).toBe(0);
+    expect(result.dropped).toBe(1);
+  });
+
+  it('does not fabricate a float from \\newlabel-shaped text embedded in an abandoned over-budget group', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const xs = 'x'.repeat(4200);
+    await writeFile(
+      auxPath,
+      `\\newlabel{fig:real}{{1}{7}{A caption ${xs} saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}`,
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: floats came back as [{"label":"fig:fake","number":"9","page":"999"}]
+    // — the real fig:real entry lost, a fabricated fig:fake returned in its place.
+    expect(result.floats.some((f) => f.label === 'fig:fake')).toBe(false);
+    expect(result.floats).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(result.dropped).toBe(1); // fig:real itself — counted, not vanished
+  });
+
+  it('FINDING 1: an over-long KEY group is counted as dropped, and does not fabricate a row from its own outer group', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const hugeKey = 'k'.repeat(4146);
+    await writeFile(
+      auxPath,
+      [
+        `\\newlabel{${hugeKey}}{{1}{7}{A caption saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}`,
+        '\\newlabel{fig:next}{{2}{8}}',
+      ].join('\n'),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: floats came back as
+    // [{"label":"fig:fake",...},{"label":"fig:next",...}], total: 2, dropped: 0 — the outer group
+    // following the over-long key was never consumed, so the \newlabel-shaped text in its own
+    // caption was re-scanned as a second, fabricated, REAL entry.
+    expect(result.floats.some((f) => f.label === 'fig:fake')).toBe(false);
+    expect(result.floats).toEqual([{ label: 'fig:next', number: '2', page: '8' }]);
+    expect(result.total).toBe(1);
+    expect(result.dropped).toBe(1); // the huge-key entry itself — counted, not fabricated from
+  });
+
+  it('FINDING 2: an outer group beyond even GROUP_SKIP_SCAN is counted as dropped, not silently lost (exhausted boundary)', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    // A ~19KB caption — reachable from an honest latexmk run (a "Dimension too large" overflow
+    // still produces both a PDF and an .aux) — pushes the outer group's TRUE end beyond even the
+    // GROUP_SKIP_SCAN retry, landing on readGroupOrSkip's 'exhausted' outcome.
+    const xs = 'x'.repeat(19_000);
+    await writeFile(
+      auxPath,
+      [`\\newlabel{fig:hugecap}{{1}{7}{${xs}}{figure.1}{}}`, '\\newlabel{fig:ok}{{4}{8}}'].join(
+        '\n',
+      ),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: {"total":1,"omitted":0,"dropped":0,"floats":["fig:ok"]} — fig:hugecap
+    // vanished with every counter at zero, instead of being counted here.
+    expect(result.floats).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    expect(result.total).toBe(1);
+    expect(result.dropped).toBe(1); // fig:hugecap itself — counted, not vanished
+  });
+
+  it('FINDING 2: a fake \\newlabel anywhere within an exhausted group is never fabricated, regardless of its position', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    // Same ~19KB-caption shape as above, but this time the \newlabel-shaped fake sits right near
+    // the START of the caption rather than after it. Pre-fix, the exhausted branch never advanced
+    // searchFrom at all, so the very next scan started essentially where it always had and picked
+    // up whichever "\newlabel" text it hit first — the position of the fake inside the abandoned
+    // group was the only thing that mattered, not the group's total length.
+    const xs = 'x'.repeat(18_900);
+    await writeFile(
+      auxPath,
+      `\\newlabel{fig:real}{{1}{7}{\\newlabel{fig:fake}{{9}{999}} ${xs}}{figure.1}{}}`,
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: floats came back as [{"label":"fig:fake","number":"9","page":"999"}]
+    // — a fabricated entry, regardless of the fake sitting near the very start of the group.
+    expect(result.floats.some((f) => f.label === 'fig:fake')).toBe(false);
+    expect(result.floats).toEqual([]);
+    expect(result.dropped).toBe(1); // fig:real itself — counted, not fabricated from
   });
 
   it('respects an explicit max override', async () => {

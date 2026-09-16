@@ -697,6 +697,44 @@ describe('PdfRenderer.geometry', () => {
       expect(page.images).toEqual([{ x0: 5, y0: 185, x1: 25, y1: 195, source: 'form' }]);
     });
 
+    // Finding 2: every other beginGroup fixture in this file passes `matrix: null`, so
+    // `multiply(pending.matrix, pending.ctm)` is never exercised — a reversed composition
+    // (`multiply(pending.ctm, pending.matrix)`) would silently misplace the box and nothing here
+    // would catch it. This is the discriminating case: a non-null group matrix under a
+    // non-identity CTM at beginGroup time.
+    it('composes a non-null group matrix with the CTM at beginGroup time in the documented order', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.transform, // establishes a non-identity CTM before beginGroup runs
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endGroup,
+            ],
+            argsArray: [
+              [1, 0, 0, 1, 100, 50],
+              [{ bbox: [0, 0, 10, 10], matrix: [2, 0, 0, 3, 5, 7] }],
+              [null, null], // the form's own bbox arg is null — grouped
+              [],
+              [],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // ctm = multiply([2,0,0,3,5,7], [1,0,0,1,100,50]) = [2,0,0,3,105,57]; bbox [0,0,10,10]
+      // under that ctm is user-space [105,57]-[125,87]; through idViewport(200,200)'s
+      // [1,0,0,-1,0,200] that is [105,113]-[125,143]. The reversed composition
+      // multiply([1,0,0,1,100,50], [2,0,0,3,5,7]) = [2,0,0,3,205,157] instead, which would have
+      // produced a box offset by (100,100) from this one.
+      expect(page.images).toEqual([{ x0: 105, y0: 113, x1: 125, y1: 143, source: 'form' }]);
+    });
+
     it('never lets a pending group bbox leak onto a second, later form that has neither', async () => {
       const renderer = new PdfRenderer(
         fakeGeometryLoader([
@@ -737,6 +775,129 @@ describe('PdfRenderer.geometry', () => {
         source: 'form',
         approximate: true,
       });
+    });
+  });
+
+  // Finding 1: a document-controlled operand (a hand-built content stream, not anything pdf.js
+  // itself validates for finiteness) can overflow a `cm`/`/Matrix` multiply to Infinity/NaN. Left
+  // unguarded, that poisons the walk's own CTM for the rest of the page, and any box built from it
+  // fails the tool's zod `z.number()` schema *after* the handler returns — outside its try/catch,
+  // so the error is neither scrubbed nor does it leave the rest of the page's geometry intact.
+  describe('a document-controlled CTM/bbox that overflows to a non-finite value', () => {
+    it('keeps the last good CTM (and emits no non-finite box) when a transform operand overflows', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [FAKE_OPS.transform, FAKE_OPS.paintImageXObject],
+            argsArray: [
+              // Overflows to Infinity; the multiply than mixes in 0*Infinity = NaN in other slots.
+              [Number.MAX_VALUE * 10, 0, 0, 1, 0, 0],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: the poisoned CTM propagated non-finite values into the box, so
+      // the returned rect did not equal the identity-unit-square box below (a NaN component
+      // instead of one of 0/1/99/100).
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      for (const box of page.images ?? []) {
+        expect(Number.isFinite(box.x0)).toBe(true);
+        expect(Number.isFinite(box.y0)).toBe(true);
+        expect(Number.isFinite(box.x1)).toBe(true);
+        expect(Number.isFinite(box.y1)).toBe(true);
+      }
+    });
+
+    it('drops a text line outright (never counted into textOmitted) when an item carries a non-finite width, without dropping an unrelated good line', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            textItems: [
+              { str: 'Good', transform: [1, 0, 0, 1, 0, 100], width: 30, height: 10 },
+              // On its own baseline (far from 'Good'), so it cannot merge into 'Good's line —
+              // isolates the "drop the poisoned line, keep everything else" guarantee.
+              { str: 'Bad', transform: [1, 0, 0, 1, 0, 50], width: Infinity, height: 10 },
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: page.text had 2 entries, and the 'Bad' one carried an Infinity
+      // edge — rejected by the tool's z.number() schema AFTER the handler returns, outside
+      // errorResult, failing the whole call and discarding every other page's geometry with it.
+      expect(page.text).toHaveLength(1);
+      expect(page.text![0]?.text).toBe('Good');
+      // Mirrors imagesOmitted: a dropped non-finite line is never counted as "omitted" — that
+      // count is reserved for lines cut by the per-page cap.
+      expect(page.textOmitted).toBe(0);
+      for (const box of page.text ?? []) {
+        expect(Number.isFinite(box.x0)).toBe(true);
+        expect(Number.isFinite(box.y0)).toBe(true);
+        expect(Number.isFinite(box.x1)).toBe(true);
+        expect(Number.isFinite(box.y1)).toBe(true);
+      }
+    });
+
+    it('drops a text line whose box only overflows to non-finite AFTER the viewport-transform mapping (service-level filter, distinct from the pdfGeometry.ts item guard)', async () => {
+      // Item geometry alone is finite (Number.MAX_VALUE is a finite double), so pdfGeometry.ts's
+      // mergeTextLines never sees a non-finite box here and does not drop it — this isolates the
+      // pdfRender.ts-level filter on the *mapped* box, which is a separate place a finite
+      // user-space box can still overflow: a custom, non-unit-scale viewport transform (a=2 here)
+      // multiplies it past Number.MAX_VALUE to Infinity.
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: { width: 100, height: 200, transform: [2, 0, 0, -1, 0, 200] },
+            textItems: [
+              { str: 'Huge', transform: [1, 0, 0, 1, Number.MAX_VALUE, 7], width: 20, height: 10 },
+              { str: 'Good', transform: [1, 0, 0, 1, 0, 50], width: 20, height: 10 },
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['text'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: page.text had 2 entries, the 'Huge' one carrying an Infinity
+      // edge (Number.MAX_VALUE * 2 overflows) that the pdfGeometry.ts-level guard cannot catch,
+      // since it only ever sees the pre-viewport-transform user-space box.
+      expect(page.text).toHaveLength(1);
+      expect(page.text![0]?.text).toBe('Good');
+      expect(page.textOmitted).toBe(0);
+    });
+
+    it('drops a form box outright when its own bbox arg carries a non-finite edge, rather than emitting it', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              [null, [5, 5, Infinity, 15]], // a document-controlled bbox carrying Infinity
+              [],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: the form's box (x1: Infinity) reached the output as a second
+      // entry alongside the image box, instead of being dropped.
+      expect(page.images).toEqual([{ x0: 0, y0: 199, x1: 1, y1: 200, source: 'image' }]);
     });
   });
 

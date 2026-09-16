@@ -114,7 +114,7 @@ describe.skipIf(!available)('pdf_geometry smoke (real latexmk PDF + .aux)', () =
   }, 30_000);
 
   it.skipIf(!hasPdflscape)(
-    'keeps every reported box within the page box on a real /Rotate 90 (pdflscape) page',
+    'reports the landscape page body text as a horizontal (wider-than-tall) box, not transposed, on a real /Rotate 90 (pdflscape) page',
     async () => {
       const result = await renderer.geometry({ pdfPath, kinds: ['text', 'images'] });
       // pdf.js's viewport width/height are already rotation-aware, so the landscape page (added
@@ -136,6 +136,16 @@ describe.skipIf(!available)('pdf_geometry smoke (real latexmk PDF + .aux)', () =
       // The rotated page's own text is found and stays in bounds, not just earlier portrait pages.
       const landscapeText = landscapePages.flatMap((p) => p.text ?? []);
       expect(landscapeText.some((b) => (b.text ?? '').includes('Landscape'))).toBe(true);
+
+      // Falsifiable check for Finding 1: every assertion above (containment within the page box)
+      // is satisfied equally by a *transposed* box, so none of them actually prove the rotation
+      // was handled correctly. The `\section{Landscape section}` heading is a horizontal line of
+      // printed text, so its reported box must be WIDER than TALL — a transposed box (width and
+      // height swapped onto +x/+y regardless of the text's own rotation) would instead come back
+      // narrow and tall, and this assertion is what catches that.
+      const headingBox = landscapeText.find((b) => (b.text ?? '').includes('Landscape'));
+      expect(headingBox).toBeDefined();
+      expect(headingBox!.x1 - headingBox!.x0).toBeGreaterThan(headingBox!.y1 - headingBox!.y0);
     },
     30_000,
   );

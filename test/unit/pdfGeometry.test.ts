@@ -168,4 +168,132 @@ describe('mergeTextLines', () => {
   it('returns an empty array when every item is whitespace-only', () => {
     expect(mergeTextLines([item('  ', 0, 0, 10), item('\t', 20, 0, 10)])).toEqual([]);
   });
+
+  it('reports a box aligned to the text-direction axis for a 90-degree-rotated item, not transposed onto +x/+y (Finding 1)', () => {
+    // Text-rendering matrix for a 90-degree-CCW-rotated item at fontSize 10, origin (0,0):
+    // direction axis (a,b) = (0,10) i.e. +y, up axis (c,d) = (-10,0) i.e. -x — pdf.js's own
+    // convention for a rotated text matrix (as produced by pdflscape's page-content rotation).
+    const rotated: TextItemLike = {
+      str: 'Rotated',
+      transform: [0, 10, -10, 0, 0, 0],
+      width: 50,
+      height: 8,
+    };
+    const lines = mergeTextLines([rotated]);
+    expect(lines).toHaveLength(1);
+    const box = lines[0]!.box;
+    // A 50pt-long, 8pt-tall run of rotated text must come back TALL and NARROW (8 wide, 50 tall).
+    // The old itemBox added `width` along +x and `height` along +y regardless of rotation, which
+    // for this matrix produced a WIDE, SHORT box (50 wide, 8 tall) instead.
+    expect(box).toEqual({ x0: -8, y0: 0, x1: 0, y1: 50 });
+    expect(box.y1 - box.y0).toBeGreaterThan(box.x1 - box.x0);
+  });
+
+  it('reduces to the exact old axis-aligned box for an unrotated item at a scaled font size (Finding 1 no-op check)', () => {
+    // transform = [fontSize,0,0,fontSize,e,f]: b=c=0, so dir=(1,0) and up=(0,1) exactly — the
+    // fix must not perturb this case by even a rounding step.
+    const items: TextItemLike[] = [
+      { str: 'Hi', transform: [12, 0, 0, 12, 5, 7], width: 20, height: 10 },
+    ];
+    const lines = mergeTextLines(items);
+    expect(lines[0]?.box).toEqual({ x0: 5, y0: 7, x1: 25, y1: 17 });
+  });
+
+  it('does not merge an item whose left edge is far to the left of the running line (Finding 2)', () => {
+    // Same shape as the TikZ right-node/left-node repro: two items on one baseline, emitted
+    // right-then-left, ~260pt apart. The old code bounded the gap only above (gap<=gapTolerancePt),
+    // so a large NEGATIVE gap (item far to the left) always joined the running line.
+    const items = [item('RIGHT', 300, 100, 40), item('LEFT', 0, 100, 40)];
+    const lines = mergeTextLines(items);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.text)).toEqual(['RIGHT', 'LEFT']);
+  });
+
+  it('still merges a small backward overlap within the joining item own height (Finding 2, default per-item rule)', () => {
+    const items = [item('e', 0, 100, 10, 12), item('́', 8, 100, 0, 12)]; // gap = 8-10 = -2, height 12
+    const lines = mergeTextLines(items);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.text).toBe('é');
+  });
+
+  it('floors the default backward-overlap allowance at 1pt for a zero-height item (Finding 2)', () => {
+    const items = [item('A', 0, 100, 10, 0), item('B', 9, 100, 10, 0)]; // gap = 9-10 = -1, item height = 0
+    const lines = mergeTextLines(items);
+    expect(lines).toHaveLength(1);
+  });
+
+  it.each([
+    ['a non-finite text-direction component', [Infinity, 0, 0, 10, 5, 7]],
+    ['a non-finite up component', [10, 0, Infinity, 0, 5, 7]],
+    ['a NaN text matrix', [NaN, NaN, 0, 10, 5, 7]],
+    ['an all-zero text matrix', [0, 0, 0, 0, 5, 7]],
+  ])(
+    'never emits a non-finite box edge for %s — the matrix is document-controlled, and a NaN edge is rejected by the tool schema AFTER the handler returns, outside errorResult',
+    (_name, transform) => {
+      const lines = mergeTextLines([
+        { str: 'x', transform: transform as unknown as Matrix, width: 20, height: 10 },
+      ]);
+      const box = lines[0]?.box;
+      expect(box).toBeDefined();
+      for (const edge of [box!.x0, box!.y0, box!.x1, box!.y1]) {
+        expect(Number.isFinite(edge)).toBe(true);
+      }
+      // Falls back to the unrotated axes rather than to a degenerate point.
+      expect(box).toEqual({ x0: 5, y0: 7, x1: 25, y1: 17 });
+    },
+  );
+
+  it.each([
+    ['a non-finite origin x (transform[4])', [10, 0, 0, 10, Infinity, 7], 20, 10],
+    ['a non-finite origin y (transform[5])', [10, 0, 0, 10, 5, Infinity], 20, 10],
+    ['a NaN origin', [10, 0, 0, 10, NaN, 7], 20, 10],
+    ['a non-finite width', [10, 0, 0, 10, 5, 7], Infinity, 10],
+    ['a non-finite height', [10, 0, 0, 10, 5, 7], 20, Infinity],
+    ['a NaN width', [10, 0, 0, 10, 5, 7], NaN, 10],
+  ])(
+    'drops the item outright for %s — unlike a non-finite AXIS there is no sane fallback ' +
+      'position/extent to fall back to (Finding 1, origin/width/height)',
+    (_name, transform, width, height) => {
+      const lines = mergeTextLines([
+        {
+          str: 'x',
+          transform: transform as unknown as Matrix,
+          width: width as number,
+          height: height as number,
+        },
+      ]);
+      // Unlike the axis-fallback cases above (which stay present with a safe box), there is no
+      // sane default position or extent for a non-finite origin/width/height, so the item — and
+      // any "line" it would have been — is dropped entirely rather than reported with a
+      // NaN/Infinity edge.
+      expect(lines).toEqual([]);
+    },
+  );
+
+  it('drops a poisoned item without corrupting a neighboring good item merged into the same line (Finding 1)', () => {
+    const items: TextItemLike[] = [
+      { str: 'Good', transform: [1, 0, 0, 1, 0, 100], width: 30, height: 10 },
+      // Adjacent to 'Good' on the same baseline (gap = 30-30 = 0, within tolerance), so it would
+      // merge into the same running line under the old code.
+      { str: 'Bad', transform: [1, 0, 0, 1, 30, 100], width: Infinity, height: 10 },
+    ];
+    const lines = mergeTextLines(items);
+    // Before this fix, unionBox('Good' box, 'Bad' box) turned the WHOLE merged line's box into
+    // NaN/Infinity, even though 'Good' on its own is perfectly finite geometry, and the merged
+    // text became "GoodBad" — reporting a line that includes text from an item whose own geometry
+    // was never actually measured.
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.text).toBe('Good');
+    for (const edge of [lines[0]!.box.x0, lines[0]!.box.y0, lines[0]!.box.x1, lines[0]!.box.y1]) {
+      expect(Number.isFinite(edge)).toBe(true);
+    }
+  });
+
+  it('honors an explicit overlapTolerancePt override in place of the default per-item rule (Finding 2)', () => {
+    const items = [item('AB', 20, 100, 10), item('CD', 0, 100, 10)]; // gap = 0-30 = -30
+    const linesDefault = mergeTextLines(items); // default minGap = -10 (item height) -> splits
+    expect(linesDefault).toHaveLength(2);
+    const linesOverride = mergeTextLines(items, { overlapTolerancePt: 40 }); // -30 >= -40 -> merges
+    expect(linesOverride).toHaveLength(1);
+  });
 });

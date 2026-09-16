@@ -10,6 +10,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { toPosix } from '../../src/lib/paths.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const MAIN_TEX = [
@@ -105,12 +106,13 @@ interface GeometryPageOut {
 }
 
 interface GeometryOut {
-  pdfPath: string;
+  pdfPath?: string;
   pageCount?: number;
   pages: GeometryPageOut[];
   skippedPages: number[];
   floats?: Array<{ label: string; number: string; page: string }>;
   floatsOmitted?: number;
+  floatsDropped?: number;
   note?: string;
 }
 
@@ -118,10 +120,19 @@ function structuredOf(res: unknown): GeometryOut {
   return (res as { structuredContent: GeometryOut }).structuredContent;
 }
 
-/** Every entry (file or directory) under `dir`, relative paths, recursively. */
+/**
+ * Every entry (file or directory) under `dir`, relative paths, recursively.
+ *
+ * `fs.readdir(dir, { recursive: true })` builds each nested entry with the platform's own
+ * `path.join`, so on win32 it yields `.sessions\poster`, not `.sessions/poster` — the first
+ * separator-sensitive assertion in this file (the other legs only ever compare two snapshots to
+ * each other, so they were immune). Normalise through `toPosix` — the project's standard helper,
+ * also used for every path this server actually returns to a caller — so every entry here is
+ * POSIX on every OS and the exact-list assertions below stay separator-safe by construction.
+ */
 async function listAllEntries(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { recursive: true });
-  return entries.sort();
+  return entries.map(toPosix).sort();
 }
 
 describe('pdf_geometry', () => {
@@ -187,6 +198,33 @@ describe('pdf_geometry', () => {
     expect(withOut.pageCount).toBeUndefined();
   });
 
+  it('reports floatsDropped through the tool for an .aux entry whose field ran past the cap', async () => {
+    // The lib half (readAuxFloats/AuxFloatsResult.dropped) is covered by
+    // test/unit/auxFloats.test.ts; this exercises the tool's own outputSchema wiring
+    // (structuredContent is validated by the MCP SDK AFTER the handler returns, so a
+    // schema/field mismatch here would not be caught by the handler's try/catch — it would
+    // surface as an opaque "Output validation error" instead of a normal assertion failure).
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 1);
+    // One good \newlabel, and one whose page field runs past the per-field length cap
+    // (MAX_FIELD_LENGTH = 200 in src/lib/auxFloats.ts) — dropped, and counted, never silently
+    // absorbed into `floats` or `floatsOmitted`.
+    const overLongPage = 'p'.repeat(201);
+    await stageAux(
+      userDir,
+      [`\\newlabel{fig:one}{{1}{3}}`, `\\newlabel{fig:toolong}{{1}{${overLongPage}}}`].join('\n'),
+    );
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['floats'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structuredOf(res);
+    expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
+    expect(out.floatsDropped).toBe(1);
+  });
+
   it('kinds: ["floats"] alone never opens the compiled PDF (FIX8)', async () => {
     const { client, userDir } = await setup();
     // Deliberately NOT a real PDF: opening this would fail (no @napi-rs/canvas DOM globals aside,
@@ -215,6 +253,39 @@ describe('pdf_geometry', () => {
       arguments: { project: 'poster', kinds: ['text'] },
     });
     expect(withText.isError).toBe(true);
+  });
+
+  it('kinds: ["floats"] alone succeeds when an .aux exists but no PDF was ever produced (FIX-pdfless-floats)', async () => {
+    // A compile that fails on a missing package or undefined control sequence still lets
+    // pdflatex write main.aux (carrying every \newlabel from the previous converged run) before
+    // it dies without producing a PDF — the exact "help me find which page a float landed on"
+    // moment this path exists for. Deliberately no stagePdf() call here.
+    const { client, userDir } = await setup();
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{3}}\n');
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['floats'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structuredOf(res);
+    expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
+    expect(out.pdfPath).toBeUndefined();
+    expect(out.pageCount).toBeUndefined();
+    expect(out.pages).toEqual([]);
+  });
+
+  it('kinds: ["text"] still fails naming compile when an .aux exists but no PDF was ever produced', async () => {
+    const { client, userDir } = await setup();
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{3}}\n');
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['text'] },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain('compile');
+    expect(textOf(res)).toContain('pdf_geometry');
   });
 
   it('works for a mode: local project (requireProjectDir, not requireGitProject)', async () => {
@@ -258,8 +329,8 @@ describe('pdf_geometry', () => {
     expect(out.pages).toHaveLength(2);
   });
 
-  it('never writes into the project directory, the build dir, or the workspace root (in-place invariant)', async () => {
-    const { client, userDir, workspace } = await setup();
+  it('never writes into the project directory or the build dir (in-place invariant)', async () => {
+    const { client, userDir } = await setup();
     await stagePdf(userDir, 1);
     await stageAux(userDir, '\\newlabel{fig:one}{{1}{3}}\n');
 
@@ -268,7 +339,6 @@ describe('pdf_geometry', () => {
     // the tool this one was copied from, legitimately does — would pass a project-dir-only check.
     const projectBefore = await listAllEntries(userDir);
     const buildBefore = await listAllEntries(buildDir(userDir));
-    const workspaceBefore = await listAllEntries(workspace);
 
     const res = await client.callTool({
       name: 'pdf_geometry',
@@ -279,6 +349,56 @@ describe('pdf_geometry', () => {
     const after = await listAllEntries(userDir);
     expect(after).toEqual(projectBefore);
     expect(await listAllEntries(buildDir(userDir))).toEqual(buildBefore);
-    expect(await listAllEntries(workspace)).toEqual(workspaceBefore);
+  });
+
+  it('writes only the project lock directory under the workspace root, and leaves no lock file behind', async () => {
+    // Deliberately does NOT call register_project before snapshotting: that call itself takes
+    // the project lock (via ProjectManager.runExclusive -> withFileLock's
+    // mkdir(dirname(lockPath), {recursive: true})) and so already creates
+    // <workspace>/.sessions/<id>/ before this test's "before" snapshot would ever see it empty.
+    // Supplying the project via server config instead means the workspace root is genuinely
+    // untouched at the start, so this test can prove what pdf_geometry itself creates rather
+    // than reusing a directory the test harness happened to create first.
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-geomws-lock-'));
+    const localUserDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-geomdir-lock-'));
+    cleanups.push(
+      () => rm(workspace, { recursive: true, force: true }),
+      () => rm(localUserDir, { recursive: true, force: true }),
+      () => rm(buildDir(localUserDir), { recursive: true, force: true }),
+    );
+    await writeFile(path.join(localUserDir, 'main.tex'), MAIN_TEX);
+    await stagePdf(localUserDir, 1);
+
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: 'test',
+      projects: [{ id: 'poster', mode: 'local', path: localUserDir }],
+    };
+    const ctx = createContext(
+      config,
+      new CredentialResolver({}),
+      { name: 'Test', email: 'test@example.com' },
+      new ProjectRegistry(workspace),
+    );
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+
+    const workspaceBefore = await listAllEntries(workspace);
+    expect(workspaceBefore).toEqual([]);
+
+    const res = await client.callTool({ name: 'pdf_geometry', arguments: { project: 'poster' } });
+    expect(res.isError ?? false).toBe(false);
+
+    // pdf_geometry takes the project lock like render_pages (see the handler's own comment), and
+    // withFileLock's mkdir(dirname(lockPath), {recursive: true}) leaves that directory behind
+    // even though the lock FILE inside it is removed on release. The true invariant is therefore
+    // narrower than "writes nothing, anywhere": it creates exactly
+    // <workspace>/.sessions/<id>/ (and its .sessions parent) and nothing else, and the lock file
+    // itself is gone once the call returns.
+    const workspaceAfter = await listAllEntries(workspace);
+    expect(workspaceAfter).toEqual(['.sessions', '.sessions/poster']);
   });
 });

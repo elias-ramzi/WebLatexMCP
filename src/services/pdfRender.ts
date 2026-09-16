@@ -7,6 +7,7 @@ import {
   transformedBoxBounds,
   roundBox,
   mergeTextLines,
+  hasNonFiniteEdge,
 } from '../lib/pdfGeometry.js';
 
 export const DEFAULT_MAX_EDGE_PX = 1600;
@@ -484,9 +485,7 @@ export class PdfRenderer implements PdfRenderService {
           });
         }
         const lines = mergeTextLines(items);
-        const capped = lines.slice(0, MAX_TEXT_LINES_PER_PAGE);
-        textOmitted = lines.length - capped.length;
-        text = capped.map((l) => ({
+        const mapped = lines.map((l) => ({
           // Bounds of all four corners of the user-space box under the viewport transform, not
           // just two: under a 90/270 rotation the corners swap axes, and taking only two corners
           // (as a manual y-flip effectively did) silently mixes up width and height.
@@ -494,6 +493,20 @@ export class PdfRenderer implements PdfRenderService {
           text: l.text,
           mergedItems: l.items,
         }));
+        // Mirrors the image/form push sites below: a box whose edges come out non-finite is
+        // dropped outright rather than reported, since a NaN/Infinity is not a measurement and
+        // the tool's z.number() schema would otherwise reject it AFTER the handler returns —
+        // outside errorResult, failing the whole call. mergeTextLines already drops a poisoned
+        // item before it can contaminate a merged line's box (see pdfGeometry.ts), but the
+        // viewport-transform multiply just above is a second place a finite user-space box can
+        // still overflow (an item near the edge of the representable range, under a non-trivial
+        // scale) — so this filter is defence in depth, not a duplicate of that guard. As with
+        // imagesOmitted, a dropped non-finite line is never counted into textOmitted, which is
+        // reserved for lines cut by the per-page cap below.
+        const finite = mapped.filter((b) => !hasNonFiniteEdge(b));
+        const capped = finite.slice(0, MAX_TEXT_LINES_PER_PAGE);
+        textOmitted = finite.length - capped.length;
+        text = capped;
       }
 
       let images: GeometryBox[] | undefined;
@@ -727,6 +740,22 @@ function boxOf(b: readonly number[]): Box {
 const UNIT_BOX: Box = { x0: 0, y0: 0, x1: 1, y1: 1 };
 
 /**
+ * `multiply(m, current)`, but conservatively keeps `current` unchanged when the result carries a
+ * non-finite entry. `m` is document-controlled (a `cm` operator's operands, or a form XObject's
+ * own `/Matrix`) and pdf.js checks its arity but not its finiteness — a hand-built content stream
+ * carrying an oversized number overflows to `Infinity`, and `0 * Infinity` is `NaN`, so one bad
+ * operand can turn `current` into a matrix full of non-finite entries. Left alone, that poisoned
+ * CTM would apply to *every subsequent operator on the page*, not just the one that produced it —
+ * turning one bad `cm` into wall-to-wall NaN boxes. Keeping the last known-good CTM instead is the
+ * conservative choice: the page's remaining geometry stays usable, at the cost of one region that
+ * is under-reported rather than reported as garbage.
+ */
+function applyCtm(m: Matrix, current: Matrix): Matrix {
+  const next = multiply(m, current);
+  return next.every((v) => Number.isFinite(v)) ? next : current;
+}
+
+/**
  * A transparency group's bbox/matrix, captured at `OPS.beginGroup` and consumed by the
  * `paintFormXObjectBegin` that immediately follows it when that form's own bbox arg is null (see
  * the function doc comment for why the two are equivalent).
@@ -752,6 +781,14 @@ interface PendingGroupBox {
  *    real condition a document-controlled operator list can produce, and a thrown error here
  *    would fail the whole page's geometry over one bad operator well past the images already
  *    found.
+ *  - A `cm` operand (or a form's own `/Matrix`) is document-controlled and pdf.js checks its
+ *    arity, not its finiteness — an oversized number overflows to `Infinity`/`NaN` (see
+ *    `applyCtm`'s doc comment). Applying it anyway would poison the CTM for the rest of the page,
+ *    so the update is skipped and the last known-good CTM is kept instead, and any box that still
+ *    ends up with a non-finite edge (`hasNonFiniteEdge`) — e.g. from a directly non-finite bbox
+ *    arg — is dropped rather than emitted, since a zod `z.number()` in the tool schema rejects
+ *    both and the MCP SDK's post-handler output validation would otherwise fail the *whole* call
+ *    with an unscrubbed, un-caught `McpError`, discarding every other page's geometry with it.
  *  - `paintFormXObjectBegin`/`paintFormXObjectEnd` push/pop their own CTM even though no explicit
  *    `OPS.save`/`OPS.restore` appears in the operator list around them — pdf.js's own
  *    `CanvasGraphics.paintFormXObjectBegin` calls `this.save()` internally when executing this op
@@ -801,9 +838,17 @@ function walkImageGeometry(
         current = prev;
       }
     } else if (fn === ops.transform) {
-      current = multiply(args as unknown as Matrix, current);
+      // Guarded, not a bare multiply: see applyCtm's doc comment — a document-controlled operand
+      // here must not poison every box drawn for the rest of the page.
+      current = applyCtm(args as unknown as Matrix, current);
     } else if (fn === ops.paintImageXObject || fn === ops.paintImageMaskXObject) {
-      boxes.push({ ...toViewport(UNIT_BOX, current), source: 'image' });
+      const box = toViewport(UNIT_BOX, current);
+      // A non-finite edge here means this operator list is not something we can measure — never
+      // something we approximated — so, unlike the `approximate` fallback below, the box is
+      // dropped outright rather than emitted flagged.
+      if (!hasNonFiniteEdge(box)) {
+        boxes.push({ ...box, source: 'image' });
+      }
     } else if (fn === ops.beginGroup) {
       const groupOptions = (Array.isArray(args) ? args[0] : undefined) as
         | { bbox?: ArrayLike<number> | null; matrix?: number[] | null }
@@ -832,7 +877,8 @@ function walkImageGeometry(
         number[] | null,
       ];
       if (matrix) {
-        current = multiply(matrix as unknown as Matrix, current);
+        // Same guard as OPS.transform: the form's own /Matrix is document-controlled too.
+        current = applyCtm(matrix as unknown as Matrix, current);
       }
       // Consume (and clear) any pending group bbox now, whether or not it ends up used below, so
       // it can never be reused by a later, unrelated form.
@@ -853,11 +899,18 @@ function walkImageGeometry(
         ctm = current;
         approximate = true;
       }
-      boxes.push({
-        ...toViewport(box, ctm),
-        source: 'form',
-        ...(approximate ? { approximate } : {}),
-      });
+      const viewportBox = toViewport(box, ctm);
+      // As above: a NaN/Infinity edge here (a poisoned bbox arg, or a group bbox mapped through a
+      // non-finite matrix) means "not measurable", so the box is dropped rather than flagged
+      // approximate — approximate is documented as a real placement the walk could not bound,
+      // which a non-finite box is not.
+      if (!hasNonFiniteEdge(viewportBox)) {
+        boxes.push({
+          ...viewportBox,
+          source: 'form',
+          ...(approximate ? { approximate } : {}),
+        });
+      }
     } else if (fn === ops.paintFormXObjectEnd) {
       const prev = stack.pop();
       if (prev !== undefined) {
