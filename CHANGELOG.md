@@ -898,6 +898,39 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The conflict-budget cap test stops taking 25 `edit_file` round trips to set itself up.** It was
+  the slowest test in the suite (~4.6s locally, 4x its siblings in the same file) and had timed out
+  three times on `windows-latest` against the 30s budget, blocking three unrelated PRs in one
+  afternoon. The seam it asserts is `push`'s conflict payload — that `conflictFiles` is capped at
+  `CONFLICT_MAX_FILES` while `conflictPaths` stays complete — and how the local commit came to
+  exist is not part of that claim, so the setup now writes the working tree directly and commits
+  with `scope: "all"`. Each round trip it dropped took the project lock (in-process mutex + lock
+  file), recorded a shadow entry and rendered a confirmation diff. Same commit, same conflict, same
+  assertions: ~1.5s. What did **not** change is `TOTAL_FILES = 25`, which must stay above
+  `CONFLICT_MAX_FILES` or the cap assertion goes vacuous — raising the cap to 50 still fails the
+  test, which is the property that makes it worth keeping.
+
+- **The per-test timeout is now per-platform: 90s on Windows, 30s everywhere else.** Trimming the
+  one expensive test above was necessary and is not sufficient, and the run that proved it was the
+  one validating that trim: on the very commit that made `pushConflictBudget` 3x cheaper, the
+  `windows-latest` job failed on two _different_ tests in `safePush.test.ts`, both at exactly
+  30 000 ms — while a concurrent job over the identical tree passed. Same content, same platform,
+  opposite outcomes is the signature of a budget, not of a hang.
+
+  The numbers say the budget was mis-set rather than the tests being expensive. Those two cost
+  1.6s and 1.4s locally, in a file whose slowest test is 2.3s; nothing in it is remotely near 30s.
+  Windows runs this suite at roughly 10x Linux (~50s of test time on ubuntu, ~460s on
+  `windows-latest`) because every assertion shells out to real `git`, and 10x is the _median_ — a
+  20x tail is what a 1.6s test hitting a 30s wall means. A single global number chosen for the
+  slowest platform will keep being crossed by whichever git-heavy test the tail happens to land
+  on, which is why this flake has already moved once.
+
+  So Windows gets ~40x headroom over the slowest integration test's local cost, and every other
+  platform stays at 30s — deliberately, so a test that genuinely hangs still surfaces in 30s in
+  the jobs that finish first, rather than the whole suite trading diagnosis time for tail
+  tolerance. This buys headroom against a platform factor; it is not licence to make a fixture
+  expensive, and the comment in `vitest.config.ts` says so.
+
 - **The settle policy leaves the `commit` tool handler for `src/lib/commitSettle.ts`** (#70). Which
   shadow records a deliberate `scope: "all"`/`"paths"` take drops — everything vs. the named paths,
   the `hasChanges` guard, the rethrow when a request covered nothing this session tracks — was
