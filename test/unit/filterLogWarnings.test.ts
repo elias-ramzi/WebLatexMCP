@@ -414,10 +414,13 @@ describe('filterLog differential: option-insensitivity, plus a golden digest aga
    * comparison identically).
    *
    * If this test fails: `filterLog`'s unfiltered `logTail` output changed for every compile of
-   * every session. Confirm the change is intentional, then update this constant to the digest the
+   * every session. A `KEEP_PATTERNS`/`ALWAYS_KEEP_PATTERNS` edit moves this digest whether it added
+   * a kept line or silently dropped one, and claim 2 above is the reason nothing else here can tell
+   * those apart — so "I meant to change that list" is not evidence. Diff the old and new output and
+   * be able to name every added and removed line; only then update this constant to the digest the
    * failure message prints.
    */
-  const GOLDEN_DIGEST = '8ee6dde04f4a1f938b986dac2542f42de0c710cc12c9ef3b7b50aed202b37474';
+  const GOLDEN_DIGEST = '47ff800af27ad36495cf020c4a8e0c16d4149d99ca8004a0dfc8d94a0f4ef65d';
 
   it('pins that the 79-column fragment really is wrap width (else unwrapLines goes untested)', () => {
     expect(WRAPPED_LINE).toHaveLength(WRAP_WIDTH);
@@ -493,9 +496,14 @@ describe('filterLog differential: option-insensitivity, plus a golden digest aga
         digest,
         `filterLog's output changed across ${ITERATIONS} generated logs × maxLines ` +
           `${JSON.stringify(MAX_LINES_CHOICES)}. This digest changing means unfiltered logTail ` +
-          'changed for every compile of every session. If you did not edit the corpus fragments in ' +
-          'this file, that is a REGRESSION, not a corpus edit — do not simply update the ' +
-          `constant. Once the change is confirmed intentional, set GOLDEN_DIGEST to ${digest}.`,
+          'changed for every compile of every session. If you did not edit the corpus fragments ' +
+          'in this file, that is a REGRESSION until proven otherwise — do not simply update the ' +
+          'constant. Note what "deliberate" is worth here: a KEEP_PATTERNS / ALWAYS_KEEP_PATTERNS ' +
+          'edit moves this digest whether it ADDED a kept line (issue #78 finding 4, which let a ' +
+          '-file-line-error message line reach the tail) or silently DROPPED one, and this digest ' +
+          'is the only thing in this file that tells those apart — the self-comparisons above stay ' +
+          'green for both. So prove which one you did: diff the old and new output line by line ' +
+          `and be able to name every added and removed line. Only then set GOLDEN_DIGEST to ${digest}.`,
       ).toBe(GOLDEN_DIGEST);
     },
   );
@@ -512,11 +520,18 @@ describe('filterLog: no filter ever removes a non-warning line the de-noiser kep
    * fell down the wrong side. This pins the partition itself rather than that one line, so a future
    * `KEEP_PATTERNS` entry that is neither always-kept nor a warning is caught here.
    *
-   * Note the conditional form. It is deliberately NOT "every error appears in the tail": a
-   * `-file-line-error` line with no `Error:`/`Warning:` in its message matches no `KEEP_PATTERN` at
-   * all, so the de-noiser drops it whether or not a filter is set (a real, pre-existing gap, out of
-   * scope here — fixing it would break the byte-identity guarantee). What must hold is the weaker,
-   * exactly-right claim: whatever the unfiltered tail kept, a filter must not take away.
+   * Note the conditional form, and that it survives the gap it used to describe being closed. A
+   * `-file-line-error` line with no `Error:`/`Warning:` in its message once matched no
+   * `KEEP_PATTERN` at all, so the de-noiser dropped it whether or not a filter was set; issue #78,
+   * finding 4 added `FILE_LINE_ERROR` to `KEEP_PATTERNS`, and the line naming *what* failed now
+   * reaches the tail alongside the `l.<n>` naming *where*. The caveat that used to sit here called
+   * that fix a byte-identity break, which it is not: that guarantee is about `keepWarning`-absent
+   * output matching a no-options call — preserved exactly — never about the tail's *content*.
+   * The conditional stays regardless, because the claim worth pinning is still the weaker,
+   * exactly-right one: whatever the unfiltered tail kept, a filter must not take away. This block
+   * is about what `keepWarning` may remove, not about what the de-noiser chooses to keep, and
+   * writing it as "every error appears in the tail" would quietly make it both. The vacuity counter
+   * below is what keeps the conditional from going silent if the de-noiser stops keeping one.
    *
    * The corpus is `NEVER_FILTERABLE_LINES`, not "error lines": most are errors, but `Runaway
    * argument?` and `No pages of output.` are context/summary lines `parseLog` reports as neither
@@ -533,6 +548,16 @@ describe('filterLog: no filter ever removes a non-warning line the de-noiser kep
     '! Missing $ inserted.',
     './main.tex:12: Package foo Warning: something is badly wrong',
     "./main.tex:7: LaTeX Error: File `nope.sty' not found.",
+    // The bare `-file-line-error` form — neither `Error:` nor `Warning:` in the message — which no
+    // `KEEP_PATTERNS` entry matched until issue #78, finding 4 added `FILE_LINE_ERROR` to the list.
+    './sections/method.tex:88: Undefined control sequence.',
+    // The same form raised inside a package rather than the document, which is what latexmk prints
+    // when a `.sty` throws. Here because every other `-file-line-error` literal in this file names a
+    // `.tex`: replacing the shared `FILE_LINE_ERROR` in `KEEP_PATTERNS` with a narrower `\.tex`-only
+    // rewrite of it — a plausible "don't reuse the const" simplification — passes every one of them
+    // and leaves the golden digest unmoved, while the tail silently goes back to naming only *where*
+    // for every error raised in a package or class file. This line is what fails on that.
+    '/usr/share/texlive/tex/latex/foo.sty:9: Undefined control sequence.',
     'Runaway argument?',
     'No pages of output.',
   ];

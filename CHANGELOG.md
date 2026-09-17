@@ -1479,6 +1479,36 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `FileService.externalModifications` read every file as UTF-8, so a figure's bytes never matched
   their own recorded baseline and `status` reported it under `externalChanges` forever.
 
+- **`compile`'s `logTail` now carries the line that says _what_ failed, not only the one that says
+  _where_** (#78, finding 4). latexmk is passed `-file-line-error`, so the error a real compile
+  prints is `./main.tex:5: Undefined control sequence.` — no leading `! `, no inline `Error:`. That
+  matched no `KEEP_PATTERNS` entry, so the de-noiser had never once carried a latexmk error
+  _message_; it kept the `l.5 \bad` echo beneath it and dropped the sentence naming the failure.
+  `structuredContent.errors` was always right (`parseLog` tests the same regex first and treats such
+  a line as an error whatever its message says), so the gap hit exactly one audience: a client
+  reading `logTail`, which is the audience the text channel exists for — and on a bad compile it was
+  handed a position with nothing to attribute it to. The fix is to add `FILE_LINE_ERROR` to
+  `KEEP_PATTERNS`; because the same regex already sits in `ALWAYS_KEEP_PATTERNS`, the line is
+  filter-exempt for free and the two partitions stay aligned, which is the standing rule that a
+  `KEEP_PATTERNS` entry which is neither always-kept nor a warning line is a bug in waiting. This
+  legitimately changes unfiltered `logTail` output, so `GOLDEN_DIGEST` in
+  `test/unit/filterLogWarnings.test.ts` was **deliberately regenerated**
+  (`8ee6dde0…` → `47ff800a…`) and the delta verified line by line rather than rebaselined on faith:
+  across the 18000 generated outputs the only new content is the `-file-line-error` line itself
+  (sometimes glued to the preceding 79-column fragment by `unwrapLines`), plus shifted omission
+  counts where the cap now elides one more line; no kind of line disappeared; and three short logs
+  (18 of those 18000 outputs) that used to fall through to the raw tail because nothing matched now
+  de-noise to their single error line, which is the fallback correctly ceasing to fire for a log
+  that does have a diagnostic in it. That digest's failure message and its doc comment were
+  **tightened** rather than relaxed while regenerating it: a `KEEP_PATTERNS` edit moves the digest
+  whether it adds a kept line or silently drops one, and this digest is the only thing that tells
+  those apart, so "I meant to change that list" is explicitly called insufficient — the constant may
+  be updated only once the old and new output have been diffed and every added and removed line can
+  be named. A `.sty`-path case was added alongside, because every other `-file-line-error` literal
+  in the tests names a `.tex` and a narrower `\.tex`-only rewrite of the new entry passed all of
+  them with the digest unmoved, while silently losing the message line for every error raised inside
+  a package.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
