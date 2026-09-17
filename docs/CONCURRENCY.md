@@ -245,15 +245,35 @@ naming it, and it shows up as owned by nobody.
 without attempting a push.
 
 Not every peer `status` lists by name, though. A session that has died — no live process _from this
-boot_ behind its recorded pid, and a heartbeat older than the staleness window — and whose shadow
-index reads back as a readable, empty
-array (it committed everything before exiting, or never made a server-side edit) is folded into a
-single `staleSessions: N` count instead. Three cases are deliberately NOT collapsed: a **live** peer,
+boot_ behind its recorded pid, and a heartbeat older than the staleness window — whose heartbeat is
+older still, by at least two hours, and whose shadow index reads back as a readable, empty
+array (usually because it committed everything before exiting, or never made a server-side edit —
+but not only, which is what the two-hour clause is about) is folded into a
+single `staleSessions: N` count instead. Four cases are deliberately NOT collapsed: a **live** peer,
 however little it currently holds, because it may write again any moment; a **dead peer that still
-holds entries**, since those are exactly the changes `status` exists to surface; and a dead peer
+holds entries**, since those are exactly the changes `status` exists to surface; a dead peer
 whose shadow index came back **unreadable** (`null`, not empty) — `null` means "cannot tell", never
 "owns nothing", so it stays listed individually with `changes: null` rather than being counted as
-harmless.
+harmless; and a dead peer that went quiet **only recently**.
+
+That last one is the narrower of the two claims the count could make, and it is the only one that is
+true. `ShadowStore.peerEntries` maps ENOENT — no index file at all — and a successfully-read empty
+index to the same `[]`, so an empty index says "nothing is recorded here", not "this session changed
+nothing". The gap between those is exactly the failure the section above ends on: a write that
+reached the working tree while the index write itself failed leaves lines in the tree with no entry
+naming them. Collapsing such a peer removes the only named suspect for them. So the collapse also
+requires the peer to have been quiet for `RECENT_HEARTBEAT_GRACE_MS` (two hours,
+`src/lib/peerSummary.ts`). What that window buys is worth stating precisely, because the obvious
+reading is wrong: elapsed time is not evidence about the write: it either failed or it did not, and
+that does not become less likely as the record ages. What two hours buys is that a human still
+looking at those dirty lines, in the same working period as the death, gets a name for them. It is
+a usefulness window, not an evidence window — and it is comfortably above the 30-minute staleness
+window a peer must already have crossed to read dead
+at all (a grace at or below that window could never fire, and would sit in the code reading like a
+working guard). Being bounded is what keeps the original problem fixed: only the last two hours'
+worth of dead, empty sessions stay listed, not every one the workspace has ever seen. A peer whose
+`heartbeatAt` does not parse at all is never collapsed either — the same fail-closed bias as the
+`null` rule, since an unusable reading is not evidence of harmlessness.
 
 The collapse is report-level only — nothing is deleted from `<workspace>/.sessions/<projectId>/`.
 `status` is read-only and takes no lock, and a session that reads as dead by its stale heartbeat can

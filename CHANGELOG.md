@@ -1131,6 +1131,57 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`status` no longer reports a killed session as holding no changes on the strength of an empty
+  shadow index alone** (#78, finding 3). `ShadowStore.peerEntries` maps ENOENT — no index file at
+  all — and a successfully-read empty index to the same `[]`, deliberately: every ownership guard
+  only ever asks whether a peer _owns_ a path, and an absent claim is never permission for
+  something it would otherwise refuse. But since the stale-peer collapse landed, one caller reads
+  that value as a positive fact: a dead peer with `[]` is folded into a bare `staleSessions: N`,
+  and `docs/tools.md` stated as fact that those sessions "hold no changes". `[]` does not say
+  that. It also covers the session whose write reached the working tree while its own index write
+  failed (a full or unwritable `.sessions/`) before the path could be marked `unrecorded` — its
+  lines are in the tree with nothing naming them, and collapsing it deletes the only named suspect
+  for exactly the paths a human is staring at in `otherChanges`.
+
+  Both halves of the fix are needed and neither is sufficient. `isStalePeer`
+  (`src/lib/peerSummary.ts`) now also requires the peer's heartbeat to be at least
+  `RECENT_HEARTBEAT_GRACE_MS` (2 hours) old, so a recently-dead peer stays listed by name; and the
+  `staleSessions` wording in `docs/tools.md`, in `status`'s own output schema **and in the text
+  `status` actually prints** now says the index records no changes rather than that the session
+  made none. That last channel is the one a human reads, and it is where a first pass at this got
+  caught: the schema and the docs had been narrowed while the rendered line still said `2 sessions
+exited with no changes` — and, worse, rendered the newly-preserved peer as
+  `just-quiet (gone; no changes)`, cancelling the feature in the only place most clients display. The wording change alone leaves a real session invisible; the
+  code change alone still overstates what the count knows about the sessions it _does_ collapse.
+
+  The window's floor is load-bearing rather than a taste call, and it is the part that would be
+  easy to "tidy" into a dead guard: `isStalePeer` only ever weighs a heartbeat for a peer that is
+  already `!live`, and `SessionRegistry` grants `live` to anything inside its 30-minute
+  `STALE_MS`, so `!live` already implies a heartbeat at least that old. Any grace at or below 30
+  minutes could never keep a single peer listed while reading exactly like a working guard — a
+  unit test pins the constant above that floor and says why. What the window is _for_ is stated
+  carefully in the same place, because the intuitive reading is wrong: elapsed time is not evidence
+  about a write that either failed or did not at the time it ran. It is a **usefulness** window —
+  long enough that a human still looking at those dirty lines in the same working period gets a
+  name for them — which is also why the residual is documented rather than sized away: the lines
+  outlive the suspect, so an agent killed overnight is already collapsed by morning. Matching the
+  harm exactly needs a state-based condition (do not collapse while the tree holds dirty paths no
+  live session owns), which is a larger change and deliberately not made here. (`HEARTBEAT_THROTTLE_MS`, 30 seconds,
+  is a different thing entirely: it paces how often a _live_ session rewrites its heartbeat.) An
+  unparseable `heartbeatAt` is never collapsed either, which is the opposite convention from
+  `bootIdentity.ts`'s "a non-finite age earns nothing" — the sign flips because the grant does:
+  there, granting calls a peer live; here, collapsing asserts it holds nothing.
+
+  What did **not** change, deliberately: `peerEntries` still maps ENOENT and an empty index to the
+  same `[]` (its doc comment now names the ambiguity and points at the one caller that must not
+  believe it), and the `null` rule is untouched — `null` means the index was UNREADABLE, never
+  "owns nothing", and a dead peer with an unreadable index still stays listed with `changes: null`.
+  `isStalePeer` remains one conjunction with `entries !== null` ahead of the new clauses precisely
+  so that this cannot drift: every clause only narrows, so the change can collapse fewer peers than
+  before and never more. `status` still reaps nothing from disk, takes no lock, and calls no
+  `collectGarbage()`. Being bounded is still the point — only the last two hours' worth of dead,
+  empty sessions stay listed, not every one the workspace has ever seen.
+
 - **`review-round.js` no longer tells every review agent that lint cannot see `.claude/`** (#81).
   Narrowing the eslint ignore falsified two sentences inside the script that narrows it: the house
   rules injected into _every_ agent of _every_ round said "`npm run lint` does NOT cover .claude/\*\*

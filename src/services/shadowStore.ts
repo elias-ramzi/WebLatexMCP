@@ -446,6 +446,19 @@ export class ShadowStore {
    * **`null` means unreadable, not "owns nothing".** Callers must fail closed: treat a `null`
    * result the same as if the session owned every file in question, exactly as an unrecoverable
    * shadow already refuses to let `commit` proceed. Never coerce `null` to `[]`.
+   *
+   * **And `[]` means "nothing is recorded here", which is weaker than "this session changed
+   * nothing".** ENOENT and a successfully-read empty index deliberately collapse to the same
+   * value, so `[]` also covers the session whose write reached the working tree while the index
+   * write itself failed (a full or unwritable `.sessions/`) before it could be marked
+   * `unrecorded` — its dirty lines are in the tree with no entry naming them. That is safe for
+   * every ownership guard, which only ever asks whether a peer owns a path and must not treat an
+   * absent claim as permission for anything it would refuse otherwise; it is *not* safe for a
+   * caller that wants to report "this session holds no changes" as a fact. The one such caller is
+   * `status`'s stale-peer collapse, which is why `isStalePeer` (`src/lib/peerSummary.ts`) also
+   * requires the peer to have been quiet past `RECENT_HEARTBEAT_GRACE_MS` before it believes an
+   * empty index. A new caller that wants to distinguish the two must teach this method to say so
+   * — never infer it from `[]`.
    */
   async peerEntries(projectId: string, sessionId: string): Promise<PeerShadowEntry[] | null> {
     const file = path.join(sessionDir(this.workspaceRoot, projectId, sessionId), 'shadow.json');
