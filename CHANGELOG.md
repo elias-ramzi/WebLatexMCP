@@ -1131,6 +1131,38 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`review-round.js` no longer tells every review agent that lint cannot see `.claude/`** (#81).
+  Narrowing the eslint ignore falsified two sentences inside the script that narrows it: the house
+  rules injected into _every_ agent of _every_ round said "`npm run lint` does NOT cover .claude/\*\*
+  — eslint ignores it globally", and the sign-off step repeated it. Both were true when written and
+  stopped being true in the same release. A stale rule in a prompt is worse than a missing one: an
+  agent reviewing a diff under `.claude/workflows/` was instructed, with the authority of its own
+  system context, to disregard the one automated signal that now covers it — and the instruction is
+  invisible to a reader of the diff, because the prose lives in a template literal nothing executes.
+  Both sentences now name what lint actually reaches (`.claude/workflows/`, with the Workflow
+  globals declared, plus `test/unit/workflowScripts.test.ts` over every script there) and what it
+  still does not (every other child — `skills/`, `agents/`, `commands/` — where prettier remains the
+  only check).
+
+  The prose is now pinned to the config rather than to a reviewer's memory. A new
+  `eslint.config.js reach` tier asserts through the real `ESLint` API that each workflow script is
+  **not** ignored, that the other children of `.claude/` and a nested `.claude/worktrees/` checkout
+  still are, and that a workflow script resolves to a config carrying all eight Workflow globals as
+  `readonly`, `allowReturnOutsideFunction`, and `no-undef` on. Nothing else in the repo could catch a
+  drift here: the existing tier reads the scripts off disk itself and never invokes eslint, so a
+  config that silently lints one file fewer leaves it green. That is not hypothetical — the failure
+  mode has a trap shaped exactly like the fix. Flat config skips a directory ignored with `/**`
+  **whole**, so the natural-looking `['.claude/**', '!.claude/workflows']` unignores nothing; the
+  tier is mutation-checked against precisely that spelling, and against the pre-#81 wholesale ignore
+  and a single dropped global.
+
+- **`.gitignore` now excludes a `node_modules` symlink, not only a `node_modules` directory.** The
+  pattern was `node_modules/`, and a trailing slash matches directories only. Sharing one install
+  across git worktrees by symlinking `node_modules` into each is the obvious way to avoid an
+  `npm ci` per worktree, and git saw that link as an ordinary untracked file: a `git add -A` in such
+  a worktree committed it as a mode-120000 blob whose content is an absolute path on one machine.
+  This was found by it happening during this change.
+
 - **A reused pid no longer keeps a dead session `live` forever** (#78). `SessionRegistry` derives
   liveness rather than trusting it — a crashed session cannot retract its record — and a peer counted
   as live if its recorded pid still named a running process **or** its heartbeat was inside the

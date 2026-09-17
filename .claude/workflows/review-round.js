@@ -117,8 +117,11 @@ and do not ask another agent for its rules. These are the things it does not tel
   from main and for a PR labelled no-changelog), plus lint/typecheck/test on ubuntu + windows +
   macos and a LaTeX compile smoke. A round whose diff is user-facing and adds no [Unreleased]
   entry goes red on a check no local command runs.
-- \`npm run lint\` does NOT cover .claude/** — eslint ignores it globally. For a diff under
-  .claude/ the only automated check is prettier. Do not report a green lint as coverage there.
+- \`npm run lint\` covers exactly one thing under .claude/: \`.claude/workflows/\` (#81). Every
+  other child — skills/, agents/, commands/ — is still ignored, so there the only automated check
+  is prettier and a green lint is not coverage. A diff under .claude/workflows/ IS linted, with
+  the Workflow globals (\`agent\`, \`phase\`, \`log\`, ...) declared, and test/unit/workflowScripts.test.ts
+  runs over every script in that directory — judge a gap there as you would one in src/.
 - The canonical tool reference is docs/tools.md, not just README — with docs/configuration.md,
   docs/CONCURRENCY.md and docs/skills.md alongside it. A behaviour change that leaves those
   describing the old behaviour is a finding.
@@ -576,8 +579,9 @@ Batch outcomes: ${JSON.stringify(results)}
    Then run the complete gate. Fix trivial gate failures (a prettier reflow, a lint autofix,
    an import) yourself, but ONLY in the paths this round's batches claim — a repo-wide
    \`npm run format\` reflows a peer's in-flight file, which is their work, not yours.
-   Anything substantive gets reported, not patched. Remember that \`npm run lint\` does not
-   read .claude/**, so for a diff there a green lint says nothing.
+   Anything substantive gets reported, not patched. Remember that \`npm run lint\` reads
+   \`.claude/workflows/\` and nothing else under .claude/, so for a diff in a skill, an agent or
+   a command file a green lint says nothing.
 3. Self-review for the boundary class: for every guard in the diff, name the value just
    outside it and confirm a test covers it — in the right tier (a TeX-gated smoke does not
    count as coverage on machines without latexmk).
