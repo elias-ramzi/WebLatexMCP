@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolveInside, samePath, toFileUrl, toPosix } from '../../src/lib/paths.js';
+import { resolveInside, samePath, toFileUrl, toPosix, toPosixOut } from '../../src/lib/paths.js';
 
 describe('resolveInside', () => {
   const root = '/tmp/project';
@@ -103,5 +103,59 @@ describe('toFileUrl', () => {
   it('percent-encodes spaces so the URL stays valid', () => {
     const abs = path.resolve('/tmp/my project/main.pdf');
     expect(toFileUrl(abs)).toContain('my%20project');
+  });
+});
+
+describe('toPosixOut', () => {
+  // Every case that asserts a *conversion* passes the separator explicitly. path.sep is '/' on
+  // the Linux and macOS runners, so leaning on the platform to produce a backslash would make
+  // the assertion vacuous on two of the three CI legs — a toPosixOut that returned its input
+  // untouched would still pass there. Same reasoning as the stubbed-platform samePath block
+  // above: drive the branch, don't hope the runner happens to exercise it.
+  it('converts a Windows-shaped path when driven with a backslash separator', () => {
+    expect(toPosixOut({ pdfPath: 'C:\\Users\\me\\build\\main.pdf' }, '\\')).toEqual({
+      pdfPath: 'C:/Users/me/build/main.pdf',
+    });
+  });
+
+  it('converts several keys in one call and keeps every key name', () => {
+    const out = toPosixOut(
+      { pdfPath: 'C:\\build\\main.pdf', outDir: 'C:\\build', logPath: 'C:\\build\\main.log' },
+      '\\',
+    );
+    expect(out).toEqual({
+      pdfPath: 'C:/build/main.pdf',
+      outDir: 'C:/build',
+      logPath: 'C:/build/main.log',
+    });
+    expect(Object.keys(out)).toEqual(['pdfPath', 'outDir', 'logPath']);
+  });
+
+  it('keeps an undefined value present and undefined while converting its sibling', () => {
+    // An absent PDF must stay absent in structuredContent: the key is present with the value
+    // undefined, never dropped and never the string "undefined" (which would read as a real
+    // path to a client). Assert the key's presence explicitly, not merely that it is falsy.
+    const out = toPosixOut({ pdfPath: undefined, outDir: 'C:\\build' }, '\\');
+    expect(Object.keys(out)).toEqual(['pdfPath', 'outDir']);
+    expect(out).toHaveProperty('pdfPath');
+    expect(out.pdfPath).toBeUndefined();
+    expect(out.pdfPath).not.toBe('undefined');
+    expect(out.outDir).toBe('C:/build');
+  });
+
+  it('agrees with toPosix on the host separator when the argument is omitted', () => {
+    const p = path.join('a', 'b', 'c.pdf');
+    expect(toPosixOut({ p }).p).toBe(toPosix(p));
+  });
+
+  it('does not mutate its argument', () => {
+    const input = { pdfPath: 'C:\\build\\main.pdf', outDir: undefined };
+    const out = toPosixOut(input, '\\');
+    expect(input).toEqual({ pdfPath: 'C:\\build\\main.pdf', outDir: undefined });
+    expect(out).not.toBe(input);
+  });
+
+  it('leaves an already-POSIX path unchanged', () => {
+    expect(toPosixOut({ p: 'a/b/c.pdf' }, '\\')).toEqual({ p: 'a/b/c.pdf' });
   });
 });

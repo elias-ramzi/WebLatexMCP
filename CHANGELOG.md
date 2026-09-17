@@ -1214,6 +1214,53 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   `collectGarbage()`. Being bounded is still the point — only the last two hours' worth of dead,
   empty sessions stay listed, not every one the workspace has ever seen.
 
+- **Absolute paths in `compile`, `render_pages` and `pdf_geometry` results are POSIX on Windows
+  too, which is what the docs have always said** (#80, §4). `docs/tools.md` opens with "File paths
+  are always POSIX (`/`-separated), on every OS" and CLAUDE.md repeats it, but `pdfPath` reached
+  `structuredContent` straight from `locateProjectPdf` → `buildPdfPath` → `path.join`, and so did
+  `compile`'s `logPath` and `render_pages`' `outDir` and per-page `pngPath`. On Windows a single
+  result object contradicted itself — a `toPosix`'d `note` sitting beside a backslashed `pdfPath`
+  — and the result **text** disagreed with `structuredContent` about the spelling of the same
+  file.
+
+  The conversion goes through one boundary helper (`toPosixOut`, `src/lib/paths.ts`) applied where
+  each result is assembled, rather than a `toPosix` sprinkled at each emission site, so both
+  channels are rendered from the same converted value and cannot drift: `render_pages`' page lines
+  now map over `pagesOut` (which holds the converted `pngPath`) instead of over the native
+  `rendered`, and `compile`'s `… N more error(s) — see structuredContent or <logPath>` line names
+  the same spelling `structuredContent` does.
+
+  **Placement is the load-bearing part.** The boundary sits _below_ `ctx.pdfRenderer.pageCount()`
+  and `toFileUrl()` in `compile`, below `render()` in `render_pages` and below `geometry()` in
+  `pdf_geometry`. Three of those open a file and need the host's own spelling; tests pin
+  `compile`'s `pageCount`, and assert `render_pages`' PNGs really are on disk where the result says
+  they are, so converting one line too early fails rather than silently returning `undefined` or
+  writing to a second directory. `toFileUrl` is the exception worth stating precisely, because the
+  obvious rationale for it is wrong: `pathToFileURL` resolves through `path.win32.resolve` and
+  accepts either spelling — `C:\a\b` and `C:/a/b` produce the identical, valid URL (measured, UNC
+  included) — so the viewer link would NOT have broken. It is kept above the line because it takes
+  a filesystem path rather than a string chosen for a reader, and a test pins that it still gets
+  one.
+
+  The tests do not rely on the platform to produce a backslash, which would make every assertion
+  vacuous on the Linux and macOS CI legs (`path.sep` is already `/`, so the conversion is the
+  identity there). `toPosixOut` takes the separator as an injectable seam so a unit test can drive
+  it with `'\\'` anywhere, and the integration suite builds its project under a directory whose
+  name contains a literal backslash — legal on POSIX — with `path.sep` stubbed for the duration of
+  the tool call, so the server's own conversion genuinely runs and every assertion fails against
+  the unfixed code on any host. (`path.sep` is a writable, configurable data property and
+  `path.join`/`resolve`/`relative`/`basename` do not read it; `internal/fs/rimraf` _does_ capture
+  it at module load, so the suite warms that module with the real separator before stubbing
+  anything — otherwise a lazily-loaded rimraf holding a backslash breaks recursive `fs.rm` for
+  every test sharing the worker.)
+
+  Not covered: `errors[].file` needs nothing — `logParser` already rebases it with
+  `path.posix.join` — and `logTail` is the log verbatim, whatever TeX wrote into it. Two absolute
+  paths elsewhere are still native and are now named as a known gap in `docs/tools.md` rather than
+  papered over by the sentence above them: `list_projects`' `path` (which `register_project`
+  converts, so on Windows the same directory comes back spelled two ways one call apart) and the
+  directories `doctor` renders into its check details.
+
 - **`review-round.js` no longer tells every review agent that lint cannot see `.claude/`** (#81).
   Narrowing the eslint ignore falsified two sentences inside the script that narrows it: the house
   rules injected into _every_ agent of _every_ round said "`npm run lint` does NOT cover .claude/\*\*

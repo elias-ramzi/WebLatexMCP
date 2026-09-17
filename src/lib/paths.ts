@@ -49,3 +49,43 @@ export function resolveInside(root: string, relPath: string): string {
   }
   return resolved;
 }
+
+/**
+ * Convert every path in one response object to POSIX separators, in a single call at the
+ * response boundary.
+ *
+ * Why one call rather than a `toPosix` at each emission site: a tool's result **text** and its
+ * `structuredContent` are then rendered from the same converted value, so the two channels
+ * cannot disagree about a separator. That disagreement is the actual bug shape — a `toPosix`'d
+ * `note` sitting beside a backslashed `pdfPath` inside one result object, on a server that
+ * documents "file paths are always POSIX, on every OS".
+ *
+ * The values this returns are for **display** only. Convert here and nowhere earlier: a path
+ * still headed for a filesystem call must stay native, and so must one headed for `toFileUrl`,
+ * which takes a filesystem path and owns its own encoding rather than a spelling chosen for a
+ * reader. `pathToFileURL` does in fact accept either — it resolves through `path.win32.resolve`
+ * first, so `C:\a\b` and `C:/a/b` produce the same URL — so that half is a discipline about what
+ * a value is FOR, not a bug being dodged. Do not relax it on the strength of that: the page count
+ * just above the boundary in `compile` really does open the file, and the moment a converted
+ * value reaches something that opens one, the distinction stops being cosmetic. Converting
+ * upstream and passing the result on is the trap this helper sits next to.
+ *
+ * `sep` is a test seam, not a knob: `toPosix` splits on `path.sep`, which is `/` on a POSIX
+ * host, where the conversion is the identity and every assertion about it is vacuous. Passing
+ * `'\\'` lets a test drive the conversion wherever it runs. Production code always omits it.
+ *
+ * Keys and their order are preserved, an `undefined` value stays `undefined` (an absent PDF
+ * must stay absent in `structuredContent`, never present as the string `"undefined"`), the
+ * argument is never mutated, and nothing else is normalised — no `path.resolve`, no
+ * trailing-slash trimming, no case folding.
+ */
+export function toPosixOut<T extends Record<string, string | undefined>>(
+  paths: T,
+  sep: string = path.sep,
+): T {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(paths)) {
+    out[key] = value === undefined ? undefined : value.split(sep).join('/');
+  }
+  return out as T;
+}
