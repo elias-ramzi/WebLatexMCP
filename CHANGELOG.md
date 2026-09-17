@@ -898,6 +898,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The conflict-budget cap test stops taking 25 `edit_file` round trips to set itself up.** It was
+  the slowest test in the suite (~4.6s locally, 4x its siblings in the same file) and had timed out
+  three times on `windows-latest` against the 30s budget, blocking three unrelated PRs in one
+  afternoon. The seam it asserts is `push`'s conflict payload — that `conflictFiles` is capped at
+  `CONFLICT_MAX_FILES` while `conflictPaths` stays complete — and how the local commit came to
+  exist is not part of that claim, so the setup now writes the working tree directly and commits
+  with `scope: "all"`. Each round trip it dropped took the project lock (in-process mutex + lock
+  file), recorded a shadow entry and rendered a confirmation diff. Same commit, same conflict, same
+  assertions: ~1.5s. What did **not** change is `TOTAL_FILES = 25`, which must stay above
+  `CONFLICT_MAX_FILES` or the cap assertion goes vacuous — raising the cap to 50 still fails the
+  test, which is the property that makes it worth keeping.
+
 - **The settle policy leaves the `commit` tool handler for `src/lib/commitSettle.ts`** (#70). Which
   shadow records a deliberate `scope: "all"`/`"paths"` take drops — everything vs. the named paths,
   the `hasChanges` guard, the rethrow when a request covered nothing this session tracks — was

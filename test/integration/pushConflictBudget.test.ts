@@ -229,19 +229,24 @@ describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     cleanups.push(() => client.close());
 
-    for (let i = 0; i < TOTAL_FILES; i++) {
-      const editRes = await client.callTool({
-        name: 'edit_file',
-        arguments: {
-          path: `f${i}.tex`,
-          edits: [{ oldString: 'b', newString: 'b-local' }],
-        },
-      });
-      if (editRes.isError) throw new Error(`edit_file failed: ${JSON.stringify(editRes.content)}`);
-    }
+    // Setup writes the working tree directly and commits with scope "all", rather than making
+    // TOTAL_FILES round trips through `edit_file`. The seam under test is `push`'s conflict
+    // payload; how the local commit came to exist is not part of the claim, and either route
+    // produces the same commit. The round trips were: each one takes the project lock (in-process
+    // mutex + lock file), records a shadow entry and renders a confirmation diff, which made this
+    // the slowest test in the suite (~4.6s on Linux) and a repeat timeout on `windows-latest`,
+    // where it tripped the 30s budget and blocked three unrelated PRs in one afternoon. If you
+    // need this test to go through `edit_file`, restore the loop AND give the test its own
+    // timeout — do not quietly shrink TOTAL_FILES below CONFLICT_MAX_FILES + 1, which would make
+    // the cap assertion vacuous.
+    await Promise.all(
+      Array.from({ length: TOTAL_FILES }, (_, i) =>
+        writeFile(path.join(dir, `f${i}.tex`), 'a\nb-local\nc\n'),
+      ),
+    );
     const commitRes = await client.callTool({
       name: 'commit',
-      arguments: { message: 'local edits every file' },
+      arguments: { message: 'local edits every file', scope: 'all' },
     });
     if (commitRes.isError) throw new Error(`commit failed: ${JSON.stringify(commitRes.content)}`);
 
