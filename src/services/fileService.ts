@@ -12,7 +12,7 @@ import {
 import { resolveInside, samePath, toPosix } from '../lib/paths.js';
 import { splitLines, sliceLineRange } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
-import { ASSET_EXT } from '../lib/assets.js';
+import { ASSET_EXT, MAX_BINARY_READ_BYTES } from '../lib/assets.js';
 import { changedPath } from '../lib/changeDiff.js';
 
 /** Error thrown when a mutating op would overwrite a file changed on disk since it was last seen. */
@@ -95,6 +95,17 @@ export interface EditTransform {
  */
 const DOC_EXT = new Set(['.md', '.markdown', '.txt', '.rst', '.org']);
 
+/**
+ * The TEXT read cap. It governs `read`, which returns a note instead of the content above it, and
+ * so is the limit the snippet readers over `read` live under: it stays small enough that a whole
+ * file at the cap is still something a caller can be handed. (`readText` is deliberately uncapped —
+ * it is the append/whole-file helper, and `list_references` reads through it, so neither is bounded
+ * by this. Nothing here changes that either way.)
+ *
+ * Binary reads are capped separately and far more generously by `MAX_BINARY_READ_BYTES`
+ * (`src/lib/assets.ts`), because anything `add_asset` was allowed to import has to be readable
+ * back out again. The two are different limits, and a refusal names which one fired.
+ */
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 /**
@@ -648,7 +659,9 @@ export class FileService {
 
   /**
    * Read a file's raw bytes, returning null when it does not exist. The binary counterpart of
-   * {@link readText}. `recordBaseline` carries the same meaning — and the same false default —
+   * {@link readText}, and capped at the binary cap `MAX_BINARY_READ_BYTES` — not the much smaller
+   * text {@link MAX_READ_BYTES} — so a figure `add_asset` was allowed to import can always be read
+   * back out again. `recordBaseline` carries the same meaning — and the same false default —
    * as elsewhere: it is a claim that the caller could now base a write on this file.
    */
   async readBytes(
@@ -667,9 +680,16 @@ export class FileService {
     if (!info.isFile()) {
       throw new Error(`Not a file: "${opts.path}"`);
     }
-    if (info.size > MAX_READ_BYTES) {
+    // Deliberately a PRE-read `stat`, not a post-read `buf.length`: the point of a size cap on a
+    // binary reader is that the oversized file is never pulled into memory at all, so the refusal
+    // has to happen before `readFile`. And it names WHICH cap fired — `readBytes` is capped at the
+    // binary cap, the text reader `read` at the much smaller `MAX_READ_BYTES` — so a caller can
+    // tell the two refusals apart instead of guessing which limit it just hit.
+    if (info.size > MAX_BINARY_READ_BYTES) {
       throw new Error(
-        `"${opts.path}" is ${info.size} bytes, over the ${MAX_READ_BYTES}-byte read cap.`,
+        `"${opts.path}" is ${info.size} bytes, over the ${MAX_BINARY_READ_BYTES}-byte binary read ` +
+          `cap (the text read cap, ${MAX_READ_BYTES} bytes, is a separate and smaller limit). ` +
+          `Open it directly at ${abs}.`,
       );
     }
     const buf = await readFile(abs);

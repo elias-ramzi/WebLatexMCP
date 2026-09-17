@@ -12,6 +12,8 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import type { ServerConfig } from '../../src/types.js';
+import { MAX_BINARY_READ_BYTES } from '../../src/lib/assets.js';
+import { MAX_READ_BYTES } from '../../src/services/fileService.js';
 
 /**
  * `revert` undoes one or more commits INTO THE WORKING TREE and commits nothing
@@ -632,22 +634,51 @@ describe('revert and merge commits', () => {
   });
 });
 
-// 12. A revert that lands MORE than `FileService`'s 2 MiB read cap must still succeed. The
-//     shadow record reads each reverted path back to attribute it to this session, and that read
-//     throws over the cap — which a revert restoring a figure hits routinely. By then the revert
-//     is already on disk, so failing the call would report an error for a change that landed and
+// 12. A revert whose read-back throws AT ALL must still succeed. The shadow record reads each
+//     reverted path back through `FileService.readBytes` to attribute it to this session, and
+//     that read throws above the BINARY cap (`MAX_BINARY_READ_BYTES` — the cap that exists so
+//     every figure `add_asset` may import can be read back out again). By then the revert is
+//     already on disk, so failing the call would report an error for a change that landed and
 //     abandon every remaining path unrecorded. The tool logs, flags the path unrecorded (fail
 //     closed, so a peer's `commit scope: "paths"` refuses it rather than treating it as owned by
 //     nobody) and reports the revert it actually performed.
+//
+//     The cap is the ONLY route to this branch, which is why the fixture pays for an oversized
+//     file at all. The obvious cheap alternative — a tracked link out of the project, which
+//     `guardLinks(strictLinks: true)` refuses — never reaches it: `revertPreflight`'s `linksAmong`
+//     scans HEAD, every reverted commit AND every parent for a mode-120000 entry among the
+//     touched paths, and `revert` refuses on a non-empty `linkPaths` before `revertApply` runs.
+//     A link the revert would RESTORE is in the parent tree by definition, so it is always in
+//     that set. Probed, not assumed: the call comes back as an errorResult ("is a symbolic link
+//     (or lies under one)"), with no shadow entry and no attribution failure to observe.
+//
+//     Exceeding the binary cap is pathological, not routine — which is exactly what the second
+//     case pins. A 3 MiB figure is over the TEXT cap (`MAX_READ_BYTES`) and under the binary one,
+//     and it used to land in the fail-closed branch above on every revert that restored a figure;
+//     it must now be reverted AND attributed normally. The two cases are the two sides of that
+//     boundary: the branch still fires when the read genuinely throws, and no longer fires for a
+//     file the server itself was allowed to import.
 describe('revert past the file read cap', () => {
   it('still reports success when a reverted file is too big to read back for attribution', async () => {
-    const big = 'x'.repeat(3 * 1024 * 1024) + '\n'; // over MAX_READ_BYTES (2 MiB)
-    const h = await setup({ 'main.tex': 'alpha\n', 'big.dat': big });
-    const sha = await commitInClone(h, { 'big.dat': `${big}appended\n` }, 'grow the big file');
+    const big = 'x'.repeat(MAX_BINARY_READ_BYTES + 1); // one byte over the binary read cap
+    // The fixture is shaped to touch the oversized blob as few times as possible, because
+    // `vitest.config.ts` is explicit that the per-platform timeout "buys tail headroom, not a
+    // licence to make a fixture expensive". Seeding `big.dat` into the REMOTE would write it,
+    // hash it, and then check it out again through `project_sync`; committing it in the clone
+    // and having the reverted commit DELETE it costs one write, one hash, and the revert's own
+    // checkout — for the same throw, since the revert restores the file either way. Note the cost
+    // is tied to the constant: raising `MAX_ASSET_BYTES` for a genuine figure format raises this
+    // fixture with it, silently and on the slowest runner. Re-measure this case if you do.
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const added = await commitInClone(h, { 'big.dat': big }, 'add the big file');
+    await unlink(path.join(h.clone, 'big.dat'));
+    const sha = await commitInClone(h, {}, 'drop the big file');
 
     const res = await h.client.callTool({
       name: 'revert',
-      arguments: { project: 'demo', commits: [sha], confirm: true, expectRef: h.base },
+      // `added`, not `h.base`: reverting the deletion returns the tree to the commit that added
+      // the file, which is one commit ahead of the clone's starting point.
+      arguments: { project: 'demo', commits: [sha], confirm: true, expectRef: added },
     });
 
     // The revert landed and is reported as landed — not an errorResult over a reverted tree.
@@ -674,6 +705,42 @@ describe('revert past the file read cap', () => {
     };
     expect(index.entries['big.dat']?.unrecorded).toBe(true);
     expect(index.entries['big.dat']?.conflicted).toBe(true);
+  });
+
+  it('reverts and normally attributes a 3 MiB file — over the text cap, under the binary cap', async () => {
+    // Issue #66 §7's actual case: `readBytes` was capped at the 2 MiB TEXT cap, so reverting a
+    // 3 MiB figure this server itself imported threw on the attribution read and left the path
+    // flagged `conflicted` + `unrecorded` for good. It must now be attributed like any other.
+    const mid = 'y'.repeat(3 * 1024 * 1024) + '\n';
+    expect(mid.length).toBeGreaterThan(MAX_READ_BYTES);
+    expect(mid.length).toBeLessThan(MAX_BINARY_READ_BYTES);
+    const h = await setup({ 'main.tex': 'alpha\n', 'mid.dat': mid });
+    const sha = await commitInClone(h, { 'mid.dat': `${mid}appended\n` }, 'grow the mid file');
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true, expectRef: h.base },
+    });
+
+    expect(isError(res)).toBe(false);
+    expect(structured(res).status).toBe('reverted');
+    expect(structured(res).matchesRef).toBe(true);
+    expect(await readFile(path.join(h.clone, 'mid.dat'), 'utf8')).toBe(mid);
+
+    // Attributed, not abandoned: the session owns the path, with neither fail-closed flag set.
+    const shadowIndex = path.join(
+      path.dirname(h.clone),
+      '.sessions',
+      'demo',
+      'test',
+      'shadow.json',
+    );
+    const index = JSON.parse(await readFile(shadowIndex, 'utf8')) as {
+      entries: Record<string, { unrecorded?: boolean; conflicted?: boolean }>;
+    };
+    expect(index.entries['mid.dat']).toBeDefined();
+    expect(index.entries['mid.dat']?.unrecorded).toBeFalsy();
+    expect(index.entries['mid.dat']?.conflicted).toBeFalsy();
   });
 });
 

@@ -299,9 +299,13 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
               // The revert is ALREADY on disk by now, so this must never fail the call — the same
               // rule `FileService.notify` follows: losing attribution is a far smaller problem
               // than reporting an error for a change that actually landed, and a thrown error
-              // here would also abandon every remaining path in the loop unrecorded. This is not
-              // hypothetical: `readBytes` throws above its 2 MiB cap, which a revert that
-              // restores a figure hits routinely.
+              // here would also abandon every remaining path in the loop unrecorded. Until #66
+              // §7 this was not hypothetical but ROUTINE: `readBytes` was capped at the 2 MiB
+              // *text* cap, so any revert restoring a figure this server had itself imported
+              // landed here and left the path flagged for good. It now has its own
+              // `MAX_BINARY_READ_BYTES` (derived from `MAX_ASSET_BYTES`), so that case is gone.
+              // The branch is not decorative without it: an unreadable file, a permission
+              // change, or a blob genuinely past the binary cap still reach it.
               //
               // Fail closed instead, exactly as `createSessionRecorder` does: flag the path
               // `conflicted` + `unrecorded` so a peer's `commit scope: "paths"` REFUSES it rather
