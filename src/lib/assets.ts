@@ -39,6 +39,21 @@ export const ASSET_EXT: ReadonlySet<string> = new Set([
 export const MAX_ASSET_BYTES = 25 * 1024 * 1024;
 
 /**
+ * Cap for a binary read back OUT of a project (`FileService.readBytes`). Deliberately derived from
+ * {@link MAX_ASSET_BYTES} rather than restating the number, because the invariant is "anything
+ * `add_asset` was allowed to import can be read back again": a 3 MiB figure this server itself
+ * wrote must not hit a hard throw on the way out (`revert`'s shadow attribution reads every
+ * touched path back, and a throw there flags the path `conflicted` + `unrecorded` for good).
+ *
+ * It is its own constant rather than a `maxBytes` option on `readBytes` on purpose: a per-call
+ * option would make every future caller choose a security-shaped number, where one constant
+ * sitting next to the cap it has to stay >= does not. Distinct from `MAX_READ_BYTES` in
+ * `FileService`, which is the much smaller TEXT cap governing the text reader `read` — the two are
+ * separate limits, and a refusal says which one it is.
+ */
+export const MAX_BINARY_READ_BYTES = MAX_ASSET_BYTES;
+
+/**
  * Cap for base64-supplied bytes, measured as the DECODED size. Lower than {@link MAX_ASSET_BYTES}
  * because inline bytes cross the model's context window — the cost is paid per token, not per byte
  * on disk, so the limit has to be much tighter than what the filesystem could otherwise hold.

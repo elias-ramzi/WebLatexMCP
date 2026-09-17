@@ -1261,6 +1261,51 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   converts, so on Windows the same directory comes back spelled two ways one call apart) and the
   directories `doctor` renders into its check details.
 
+- **`FileService.readBytes` gets its own binary cap, instead of borrowing the text one** (#66, item
+  7). The binary reader refused anything over `MAX_READ_BYTES` (2 MiB) — the cap that exists for
+  **text**, where it governs `read` and the snippet readers over it — while `add_asset` imports
+  figures up to `MAX_ASSET_BYTES` (25 MiB). Reading back a 3 MiB PNG **this server itself wrote**
+  was therefore a hard throw. That stopped being hypothetical when `revert` landed (#85): it reads
+  every touched path back in order to attribute the reverted lines to this session, and its own
+  comment said the 2 MiB throw was what "a revert that restores a figure hits routinely". The throw
+  is caught there, so the cost was silent rather than loud — the path was flagged `conflicted` +
+  `unrecorded`, a state only a deliberate take or a discard ends.
+
+  `MAX_BINARY_READ_BYTES` (`src/lib/assets.ts`, beside `MAX_ASSET_BYTES` and derived from it) is
+  now that cap, so "anything `add_asset` was allowed to import can be read back again" holds by
+  construction rather than by two numbers being kept in step by hand. It is a **constant, not a
+  `maxBytes` option** on `readBytes`, deliberately: a per-call option would make every future caller
+  choose a security-shaped number, where one constant sitting next to the cap it has to stay at or
+  above does not.
+
+  Two properties are deliberate, and both are pinned by tests rather than left to a comment. The
+  check stays a **pre-read `stat`**, never a post-read `buf.length`: the point of a size cap on a
+  binary reader is that the oversized file is never pulled into memory at all, so the refusal has to
+  happen before `readFile` — a posix-only case proves the ordering by chmod-ing an over-cap file to
+  `0o000` and asserting the refusal is still the cap's and not `EACCES`. And the message **names
+  which cap fired**, quoting the binary cap as the limit that was hit and the smaller text cap only
+  as the separate limit it is not, so a caller can tell a binary-cap refusal from a text-cap one.
+  Both sides of the new boundary are covered — exactly `MAX_BINARY_READ_BYTES` reads back, one byte
+  over refuses — using sparse files, so the unit cases pay no multi-MiB write for either.
+
+  `revert`'s own integration case moved with the cap, and had to: it provoked the fail-closed branch
+  with a 3 MiB file, which is precisely what this change makes legal, so it would have gone on
+  passing while testing nothing. Its provocation is now one byte over the binary cap, and a second
+  case pins the other side — a 3 MiB revert is attributed normally, with neither flag set. The cap
+  is the only route to that branch: the cheaper-looking one, a tracked link out of the project, is
+  refused by `revertPreflight` before the attribution loop runs, which was probed rather than
+  assumed. The fixture is shaped to touch the oversized blob once (committed in the clone and
+  deleted by the reverted commit, not seeded into the remote), which keeps the case at ~1.8s against
+  the ~1.5s it cost before — `vitest.config.ts` is explicit that its per-platform timeout buys tail
+  headroom and is "not a licence to make a fixture expensive".
+
+  One consequence worth naming rather than discovering later: the old throw was incidentally capping
+  what a binary shadow entry could hold. Reverting a 25 MiB asset now writes both sides of it into
+  `<workspace>/.sessions/<id>/` and holds them in memory while recording. That is the right trade —
+  a path stuck `conflicted` + `unrecorded` forever is far worse than the disk — and it weakens no
+  guard, since binary entries are still never three-way merged and the `before` side came from the
+  already-uncapped `readAtRefBytes`.
+
 - **`review-round.js` no longer tells every review agent that lint cannot see `.claude/`** (#81).
   Narrowing the eslint ignore falsified two sentences inside the script that narrows it: the house
   rules injected into _every_ agent of _every_ round said "`npm run lint` does NOT cover .claude/\*\*

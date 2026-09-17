@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, truncate, chmod } from 'node:fs/promises';
 import { FileService, MAX_READ_BYTES } from '../../src/services/fileService.js';
+import { MAX_ASSET_BYTES, MAX_BINARY_READ_BYTES } from '../../src/lib/assets.js';
 
 describe('FileService', () => {
   let dir: string;
@@ -382,36 +383,113 @@ describe('FileService out-of-band guard: byte vs string baseline agreement', () 
 });
 
 describe('FileService readBytes size cap', () => {
-  // readBytes had no size cap at all — unlike read(), which refuses over MAX_READ_BYTES and
-  // returns a note instead of the content. Nothing in src/ calls readBytes yet, but the missing
-  // cap means a future caller (or MCP argument) could slurp an arbitrarily large file into memory.
+  // `readBytes` is the BINARY reader, and it is capped at MAX_BINARY_READ_BYTES — its own,
+  // much larger cap — not at MAX_READ_BYTES, which is the TEXT cap `read`/`readText` live under.
+  // The two limits have to differ because `add_asset` imports figures up to MAX_ASSET_BYTES and
+  // `src/tools/revert.ts` reads every touched path back through `readBytes` to attribute a
+  // revert: under the text cap, reading back a 3 MiB PNG this server itself wrote threw, and the
+  // throw left the path flagged `conflicted` + `unrecorded` for good (issue #66 §7).
   let dir: string;
   let files: FileService;
+  /** Paths chmod'd unreadable by a test, restored before `rm` so cleanup itself cannot fail. */
+  let locked: string[];
 
   beforeEach(async () => {
     dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-fs-readcap-'));
     await mkdir(path.join(dir, '.git'), { recursive: true });
     files = new FileService();
+    locked = [];
   });
 
   afterEach(async () => {
+    for (const p of locked) await chmod(p, 0o600).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('reads a file of exactly MAX_READ_BYTES fine', async () => {
-    const bytes = Buffer.alloc(MAX_READ_BYTES, 0x41);
-    await writeFile(path.join(dir, 'at-cap.bin'), bytes);
+  /** A file whose `stat` size is `size` but which costs no real bytes — the guard reads `stat`. */
+  async function sized(rel: string, size: number): Promise<string> {
+    const p = path.join(dir, rel);
+    await writeFile(p, '');
+    await truncate(p, size);
+    return p;
+  }
+
+  it('reads back a 3 MiB binary file — over the text cap, under the binary cap', async () => {
+    // The actual case from issue #66 §7: a 3 MiB PNG `add_asset` imported and `revert` reads back
+    // to attribute the change. Under the old MAX_READ_BYTES guard this was a hard throw.
+    const size = 3 * 1024 * 1024;
+    expect(size).toBeGreaterThan(MAX_READ_BYTES);
+    expect(size).toBeLessThan(MAX_BINARY_READ_BYTES);
+    await sized('figure.png', size);
+
+    const read = await files.readBytes(dir, { path: 'figure.png' });
+    expect(read).not.toBeNull();
+    expect((read as Buffer).length).toBe(size);
+  });
+
+  it('reads a file of exactly MAX_BINARY_READ_BYTES fine', async () => {
+    await sized('at-cap.bin', MAX_BINARY_READ_BYTES);
 
     const read = await files.readBytes(dir, { path: 'at-cap.bin' });
     expect(read).not.toBeNull();
-    expect((read as Buffer).length).toBe(MAX_READ_BYTES);
+    expect((read as Buffer).length).toBe(MAX_BINARY_READ_BYTES);
   });
 
-  it('throws over the cap by one byte, naming the read cap', async () => {
-    const bytes = Buffer.alloc(MAX_READ_BYTES + 1, 0x41);
-    await writeFile(path.join(dir, 'over-cap.bin'), bytes);
+  it('throws one byte over MAX_BINARY_READ_BYTES, naming the cap and the actual size', async () => {
+    // The mandatory just-outside case: a security-shaped limit is only pinned by testing both
+    // sides of its exact boundary, so this pairs with the exactly-at-cap case above.
+    await sized('over-cap.bin', MAX_BINARY_READ_BYTES + 1);
 
-    await expect(files.readBytes(dir, { path: 'over-cap.bin' })).rejects.toThrow(/read cap/);
+    const err = await files
+      .readBytes(dir, { path: 'over-cap.bin' })
+      .then(() => null)
+      .catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toMatch(/binary read cap/);
+    expect(msg).toContain(String(MAX_BINARY_READ_BYTES));
+    expect(msg).toContain(String(MAX_BINARY_READ_BYTES + 1));
+  });
+
+  it('names the binary cap as the one that fired, with the text cap only as the other limit', async () => {
+    await sized('over-cap2.bin', MAX_BINARY_READ_BYTES + 1);
+
+    const err = await files
+      .readBytes(dir, { path: 'over-cap2.bin' })
+      .then(() => null)
+      .catch((e: unknown) => e as Error);
+    const msg = (err as Error).message;
+    // The number attached to "binary read cap" is the binary one, never the text one.
+    expect(msg).toContain(`${MAX_BINARY_READ_BYTES}-byte binary read cap`);
+    expect(msg).not.toContain(`${MAX_READ_BYTES}-byte binary read cap`);
+    // The text cap is still reported, but explicitly as the separate, smaller limit.
+    expect(msg).toContain(String(MAX_READ_BYTES));
+    expect(msg).toContain(`the text read cap, ${MAX_READ_BYTES} bytes, is a separate`);
+  });
+
+  // Skipped rather than early-returned where it cannot prove anything, so it reports as skipped
+  // instead of green: chmod 0o000 does not reliably block reads for the owning user on Windows,
+  // and root reads straight through mode 000, so in both cases the read would succeed either way
+  // and the assertion below would pass without discriminating. Both are knowable here.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses on the pre-read stat, before the file is ever opened',
+    async () => {
+      const p = await sized('unreadable.bin', MAX_BINARY_READ_BYTES + 1);
+      await chmod(p, 0o000);
+      locked.push(p);
+
+      // `stat` works on an unreadable file; `readFile` does not. Getting the cap message rather
+      // than EACCES is what proves the size guard ran before `readFile` was attempted.
+      await expect(files.readBytes(dir, { path: 'unreadable.bin' })).rejects.toThrow(
+        /binary read cap/,
+      );
+    },
+  );
+
+  it('keeps the binary cap at or above what add_asset may import, and above the text cap', async () => {
+    // The invariant: anything `add_asset` was allowed to write in can be read back out.
+    expect(MAX_BINARY_READ_BYTES).toBeGreaterThanOrEqual(MAX_ASSET_BYTES);
+    expect(MAX_BINARY_READ_BYTES).toBeGreaterThan(MAX_READ_BYTES);
   });
 
   it('still returns null for a missing file', async () => {
