@@ -26,8 +26,19 @@ export interface PeerSession extends SessionRecord {
   self: boolean;
 }
 
-/** Heartbeat older than this, with no visible process, means the session is gone. */
-const STALE_MS = 30 * 60 * 1000;
+/**
+ * Heartbeat older than this, with no visible process, means the session is gone.
+ *
+ * Exported because `src/lib/peerSummary.ts`'s `RECENT_HEARTBEAT_GRACE_MS` is only meaningful
+ * ABOVE it: `isStalePeer` weighs a heartbeat only for a peer already found `!live`, and `!live`
+ * already implies an age of at least `STALE_MS`, so a grace at or below this is vacuous — a dead
+ * guard that reads as a working one. `test/unit/peerSummary.test.ts` asserts that ordering against
+ * this constant rather than against a copy of its literal, so raising this value fails that test
+ * instead of silently emptying the exemption.
+ *
+ * Not to be confused with `HEARTBEAT_THROTTLE_MS` below, which bounds nothing about death.
+ */
+export const STALE_MS = 30 * 60 * 1000;
 /** Don't rewrite the record more often than this — a heartbeat costs a disk write. */
 const HEARTBEAT_THROTTLE_MS = 30_000;
 

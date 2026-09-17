@@ -1236,6 +1236,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **The assertion that keeps `status`'s stale-peer exemption non-vacuous now compares against the
+  real constant.** `RECENT_HEARTBEAT_GRACE_MS` only does anything above `SessionRegistry`'s
+  `STALE_MS`: `isStalePeer` weighs a heartbeat solely for a peer already found `!live`, and `!live`
+  already implies an age of at least `STALE_MS`, so a grace at or below it could never keep one peer
+  listed. A unit test guards that ordering — but it guarded it against a hand-copied `30 * 60 * 1000`,
+  because `STALE_MS` was module-private. Raising `STALE_MS` past two hours would therefore have
+  emptied the exemption completely while its own guard stayed green, which is the one failure mode
+  the guard exists to catch. `STALE_MS` is now exported and the test compares against it; raising
+  either constant past the other fails the test. Verified by mutation: with `STALE_MS` at three
+  hours the assertion fails, where before it passed. No behaviour changes — the two values are
+  unmoved, and the prose around them stops restating the literal it can no longer be checked against.
+
 - **`status` no longer reports a killed session as holding no changes on the strength of an empty
   shadow index alone** (#78, finding 3). `ShadowStore.peerEntries` maps ENOENT — no index file at
   all — and a successfully-read empty index to the same `[]`, deliberately: every ownership guard
