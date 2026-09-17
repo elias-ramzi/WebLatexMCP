@@ -6,8 +6,17 @@ import prettier from 'eslint-config-prettier';
 export default tseslint.config(
   {
     // `.claude/` holds agent scratch space and worktrees (a nested checkout of this repo), which
-    // must not be linted — a second tsconfig root there breaks typed linting.
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**', '.claude/**'],
+    // must not be linted — a second tsconfig root there breaks typed linting. That stays true of
+    // everything under `.claude/` EXCEPT `workflows/`, which holds the Workflow scripts that
+    // review, commit and push this repo unattended and had no automated check but prettier.
+    //
+    // The pattern is `.claude/*`, not `.claude/**`, and that distinction is load-bearing rather
+    // than cosmetic: in flat config a directory ignored with `/**` is skipped whole, and nothing
+    // inside it can be unignored afterwards — `['.claude/**', '!.claude/workflows']` silently
+    // lints nothing. `.claude/*` ignores each direct child instead, so the negation can take one
+    // of them back. Every other child, a nested worktree included, is still skipped as a
+    // directory before eslint descends into it.
+    ignores: ['dist/**', 'node_modules/**', 'coverage/**', '.claude/*', '!.claude/workflows'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
@@ -80,6 +89,59 @@ export default tseslint.config(
             'timer.',
         },
       ],
+    },
+  },
+  {
+    // The Workflow scripts unignored above. They are plain JavaScript, but they are not modules
+    // and they are not scripts either: the Workflow tool wraps each file body in an async
+    // function and calls it with its own globals injected. So two things have to be told to
+    // eslint before `no-undef` says anything true about them.
+    //
+    // Do NOT reach for un-ignoring `.claude/**` wholesale instead. Measured on this config,
+    // forced over review-round.js that way, eslint reports **32 problems, every one of them
+    // `no-undef`** on these very globals — noise that buries the findings this block exists for.
+    // Those findings are real: a review of review-round.js shipped a `const` declared inside a
+    // retry loop and read after it, and a typo'd hook name, and neither was caught by anything
+    // in CI. `no-undef` with the globals declared catches both and reports nothing else.
+    //
+    // `allowReturnOutsideFunction` is defence in depth, not load-bearing today, and the
+    // difference matters if you are tempted to delete it as dead config. `#81` predicted a parse
+    // error on the top-level `return`; there is none, because `tseslint.configs.recommended`
+    // carries no `files:` restriction and so claims `.js` too, making
+    // `typescript-eslint/parser` the effective parser here — and it accepts a top-level `return`
+    // silently. Under espree the same file is a single `Parsing error: 'return' outside of
+    // function` and NO rule messages at all, since a parse error suppresses them. So the option
+    // buys nothing now and everything if the parser is ever swapped back.
+    //
+    // The scope is `**/*.js` rather than `*.js` because the ignore above hands back the whole
+    // `workflows/` directory: a file in a subdirectory of it would otherwise be linted by
+    // eslint:recommended's own `no-undef` with none of these globals declared, and report every
+    // `agent`/`phase` call as undefined. The honest cost of that widening: anything ever placed
+    // under `.claude/workflows/` is linted, and linted with `agent`/`phase`/`log` declared as
+    // globals, which is wrong for ordinary code — so a nested checkout belongs in
+    // `.claude/worktrees/` (still ignored) or outside `.claude/` entirely, never here.
+    files: ['.claude/workflows/**/*.js'],
+    languageOptions: {
+      sourceType: 'module',
+      globals: {
+        args: 'readonly',
+        agent: 'readonly',
+        parallel: 'readonly',
+        pipeline: 'readonly',
+        phase: 'readonly',
+        log: 'readonly',
+        workflow: 'readonly',
+        budget: 'readonly',
+      },
+      // A Workflow script's body IS a function body, so its top-level `return` is legal and
+      // must not be reported as a parse error.
+      parserOptions: { allowReturnOutsideFunction: true },
+    },
+    rules: {
+      // Already on via eslint:recommended; named here because it is the entire point of the
+      // block, and because a future edit to the shared rule set must not be able to switch it
+      // off here by accident.
+      'no-undef': 'error',
     },
   },
   prettier,
