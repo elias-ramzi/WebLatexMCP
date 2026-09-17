@@ -896,6 +896,38 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   and an unrelated dirty file untouched — returning the conflicted paths plus the two refs to read
   each side from with `read_file`.
 
+- **One of the two untested case-fold twins now has tests, and the three fixes whose tests came
+  after them have been watched failing** (#70, coverage gaps). `uncoveredPaths` — which decides, for
+  `commit scope: "paths"`, whether a requested path covers anything dirty — takes the same optional
+  ASCII case fold every other by-name comparison does, and nothing exercised it. A unit twin pair in
+  `test/unit/commitPaths.test.ts` pins folded against byte-exact (including the directory branch, a
+  differently-named directory sharing a prefix, U+212A KELVIN SIGN staying unfolded, and the fact
+  that what comes back is the caller's own spelling, since it is interpolated into the refusal), and
+  a new `test/integration/rescueCaseFold.test.ts` drives the whole `scope: "paths"` path against a
+  real clone with `core.ignorecase` forced explicitly — never inherited from the host filesystem,
+  the clone's git config being the single source of truth on all three CI platforms. The bullet's
+  _other_ twin, `ignoredUnderRequestedDirs`, is **not** closed: the new test runs it folded, but it
+  only widens the `ignored` report and its result is `[]` either way here, so nothing would fail if
+  its fold were dropped. It and `mergeIgnored` beside it stay open under #70, and the file header
+  says so rather than letting the next reader assume otherwise.
+
+  What that integration test had to be careful about is worth recording, because the obvious version
+  of it is vacuous: without the fold the call is **not** an error. The requested `notes.txt` covers
+  nothing dirty byte-exact, so it falls into the _rescue_ branch — whose own `coversPath` call does
+  fold, and so finds this session's `Notes.txt` shadow entry — and a rescued path is deliberately
+  excluded from `stageable`. The result is a reassuring `committed: false`, "settled your stale
+  record", while the edit sits uncommitted in the working tree. So the assertions are a true
+  `committed` plus real git state (HEAD moved, `git show HEAD:<path>` holds the edited bytes under
+  HEAD's spelling, working tree clean), not merely "no error". Both folded cases were watched
+  failing with the fold argument dropped, and every byte-exact twin — the one `ignorecase=false`
+  integration case, and the unit twins beside each folded assertion — passes either way, as it must.
+
+  No behaviour changed. Separately, the three tests from `c2d919c` that were written _after_ the
+  fixes they cover — the `status` session/other split fold, the session-scope refusal naming the
+  caller's spelling rather than the folded one, and `./` stripping in `ShadowStore.settle` — were
+  each put through a deliberate revert-and-watch: the fix reverted by hand, the test run, the source
+  restored byte-identically. All three fail against their reverted fix. None was vacuous.
+
 ### Changed
 
 - **The conflict-budget cap test stops taking 25 `edit_file` round trips to set itself up.** It was

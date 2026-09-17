@@ -69,6 +69,42 @@ describe('uncoveredPaths', () => {
   it('returns nothing when every requested path is covered', () => {
     expect(uncoveredPaths(['a.tex'], ['a.tex', 'b.tex'])).toEqual([]);
   });
+
+  describe('with a fold function (case-insensitive repository)', () => {
+    // `commit`'s `scope: "paths"` asks this which requested paths cover nothing dirty, and a
+    // path it reports uncovered either lands in `rescued` (staging nothing) or is refused
+    // outright. On a `core.ignorecase` clone git reports the dirty file under the index's
+    // spelling, which need not be the spelling the caller typed — so without the fold a real,
+    // dirty, committable file reads as "not changed in the working tree".
+    it('is byte-exact by default — a differently-cased dirty entry does NOT cover the request', () => {
+      expect(uncoveredPaths(['notes.txt'], ['Notes.txt'])).toEqual(['notes.txt']);
+    });
+
+    it('a differently-cased dirty entry covers the request when folded', () => {
+      expect(uncoveredPaths(['notes.txt'], ['Notes.txt'], foldCase)).toEqual([]);
+    });
+
+    it("folds through coversPath's directory branch too", () => {
+      expect(uncoveredPaths(['sub'], ['Sub/x.tex'], foldCase)).toEqual([]);
+      expect(uncoveredPaths(['sub'], ['Sub/x.tex'])).toEqual(['sub']);
+    });
+
+    it('still reports a differently-named directory sharing a prefix as uncovered, even folded', () => {
+      expect(uncoveredPaths(['sub'], ['Subx/x.tex'], foldCase)).toEqual(['sub']);
+    });
+
+    it('never folds a Kelvin sign onto ASCII k — git itself would not', () => {
+      // U+212A KELVIN SIGN is outside foldCase's deliberately ASCII-only A-Z range, so `aK.tex`
+      // and `ak.tex` stay two names even folded.
+      expect(uncoveredPaths(['aK.tex'], ['ak.tex'], foldCase)).toEqual(['aK.tex']);
+    });
+
+    it("returns the caller's own spelling, never the folded one", () => {
+      // What comes back is interpolated straight into `commit`'s "Nothing to commit at: …"
+      // refusal, so it must name the path the caller typed — a folded form may name no file.
+      expect(uncoveredPaths(['NOPE.tex'], ['a.tex'], foldCase)).toEqual(['NOPE.tex']);
+    });
+  });
 });
 
 describe('peerOwnership', () => {
