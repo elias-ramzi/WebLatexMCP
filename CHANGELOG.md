@@ -839,6 +839,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `GitService.isCaseInsensitive` rather than anything the new module infers, and nothing here clears
   a `conflicted`/`unrecorded` flag — the entry goes because the session took the tree deliberately.
 
+- **The warning judge moves out of the tool layer, and the two channels can no longer be handed
+  different predicates** (#78, finding 1). `compile` composed
+  `withoutUnopenableLocation ∘ warningMatches` inline in `src/tools/compile.ts` — the load-bearing
+  invariant of the whole `warningsFilter` feature, and the one thing stopping a `file` filter that
+  names a symlink-escaping path from emptying `warnings[]` while leaving that very warning sitting
+  in `logTail`. It lived exactly where CLAUDE.md says logic must not: in a tool, unreachable from a
+  unit test, so the composition was pinned only indirectly — through an integration test driving a
+  real MCP client over a stub compiler. It is now `makeWarningJudge(withheld, filter)` in
+  `src/lib/warningFilter.ts`, and the unit layer asserts directly what the integration test could
+  only imply: a withheld path is judged on the `file` the caller actually sees (`undefined`), not
+  the log's original. With it, a case just outside every clause (a fileless warning against a
+  `file` filter, a rule-less one against `excludeRule`) and one for the predicate's idempotence —
+  a single judge, asked about the structured side's already-stripped candidate and about the tail
+  side's paren-stack candidate still carrying the real path, must answer the same, since that
+  equality is what "both channels or neither" means.
+
+  The factory returns **`undefined`** when the filter constrains nothing, deliberately, rather than
+  an always-true predicate. That is the part to keep: `compile` used to carry a separate
+  `filterEmpty` boolean beside the judge, so "skip the machinery — and, in `filterLog`, the
+  paren-stack bookkeeping — entirely" was a second derived value that could drift from the
+  predicate it was meant to match. Now there is one value and both channels branch on it. Claim no
+  more than that: the emptiness decision can no longer disagree with the judge, but `compile` still
+  branches on that one value twice, once per channel, so a one-sided edit remains possible and
+  remains something to review for — the doc comment on `makeWarningJudge` says so in those words
+  rather than advertising a guarantee the shape does not give. No behaviour change:
+  `test/integration/compileWarningsFilter.test.ts` is untouched and still green, and that is the
+  proof.
+
 - **`SessionRegistry`'s lifecycle methods are covered, and one of the tests found that `touch()`'s
   statement order is load-bearing** (#78, item 2's neighbours). The boot-scoping fix landed with
   `peers()` well covered and the rest of the class barely touched, so this closes the gaps around it:

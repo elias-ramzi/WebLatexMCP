@@ -20,7 +20,7 @@ import {
   needsShellEscape,
   findMissingPackages,
 } from '../services/logParser.js';
-import { warningMatches, isEmptyFilter } from '../lib/warningFilter.js';
+import { makeWarningJudge } from '../lib/warningFilter.js';
 import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -397,33 +397,16 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // reachable in the one case that undercounts.
           const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
           const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
-          // Filter AFTER withoutUnopenableLocation, not before: a warning whose path was withheld
-          // (symlink escape, or past the path-check cap) must be judged on the `file` the caller
-          // actually sees — undefined for a withheld one — not the log's original (and possibly
-          // unopenable) path. Never filters errors: a failing document is not made to look
+          // One judge, built once and handed to both channels — `warnings[]` here and `logTail`'s
+          // `keepWarning` below — so they can never disagree about a warning. `undefined` means
+          // the filter constrains nothing, and both channels skip the machinery entirely. See
+          // `makeWarningJudge` for why the withholding is applied inside the predicate rather
+          // than by the caller. Never filters errors: a failing document is not made to look
           // cleaner by a filter meant for warning noise.
-          //
-          // ONE predicate for both channels, and it applies the withholding itself. `logTail`'s
-          // side derives `file` from the log's own paren stack, which knows nothing about what was
-          // withheld — so judging it directly would have the two channels disagree about exactly
-          // the paths the server deliberately refuses to hand back: a `file` filter naming a
-          // withheld path emptied `warnings[]` while leaving that very warning in the tail.
-          // Running each candidate through `withoutUnopenableLocation` first makes the question
-          // identical on both sides. Idempotent on `shownWarnings`, whose file is already gone.
-          //
-          // One residual, accepted: `withheld.all` is built only from paths the *parsed*
-          // diagnostics named, so a tail-only warning line (a `LaTeX Font Warning:`, a bare
-          // `pdfTeX warning`) under an escaping paren-stack path is still judged on its real
-          // path. That leaks nothing — filtering only ever removes lines, and never emits a path
-          // — it just leaves a weak confirmation oracle for a caller who already knows the
-          // escaping path and watches whether such a line survives naming it. They supply the
-          // path, learn no content, and get nothing openable back.
-          const judgeWarning = (w: { file?: string; rule?: string }): boolean =>
-            warningMatches(withoutUnopenableLocation(w, withheld.all), warningsFilter);
-          const filterEmpty = isEmptyFilter(warningsFilter);
-          const shownFilteredWarnings = filterEmpty
-            ? shownWarnings
-            : shownWarnings.filter((w) => judgeWarning(w));
+          const judgeWarning = makeWarningJudge(withheld.all, warningsFilter);
+          const shownFilteredWarnings = judgeWarning
+            ? shownWarnings.filter(judgeWarning)
+            : shownWarnings;
           const warningsOmitted = shownWarnings.length - shownFilteredWarnings.length;
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
@@ -486,12 +469,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               ? logTail(outcome.log, RAW_TAIL_LINES)
               : filterLog(
                   outcome.log,
-                  filterEmpty
-                    ? undefined
-                    : {
-                        baseDir: outcome.logBaseDir,
-                        keepWarning: judgeWarning,
-                      },
+                  judgeWarning
+                    ? { baseDir: outcome.logBaseDir, keepWarning: judgeWarning }
+                    : undefined,
                 ),
             logPath: outcome.logPath,
             omittedSnippetLocations,
