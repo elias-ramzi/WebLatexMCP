@@ -930,6 +930,79 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The review round no longer concentrates every irreversible act in its cheapest phase** (#81,
+  findings 1 and 2, and a partial mitigation of finding 3). `.claude/workflows/review-round.js`
+  ran `Verify` on opus and `Sign-off` on **fable** — and `Sign-off` is the phase that reads the
+  whole multi-batch diff for the cross-batch interactions no per-batch verifier can see, runs the
+  gate, fixes "trivial" gate failures itself, audits the session-isolation and credential
+  invariants, and then **commits and pushes unattended**. Every action of the round that cannot be
+  undone from inside it sat on the cheapest model in it.
+
+  The one `FABLE` knob that set both the planner's and the auditor's model is now two. Its old
+  justification — that the two are ends of the same whole-round view, so a plan written at one
+  altitude should not be audited at another — is a good argument about the _planner_, and says
+  nothing about an auditor whose job is adversarial reading plus git surgery. So `fable: false` /
+  `fable_model:` now govern the `Plan` phase alone, `signoff_model:` governs the auditor, and the
+  auditor defaults to **opus**.
+
+  That default is the smaller half. A default is flipped back by a future edit that means no harm,
+  so the part that matters is a **hard floor**: while `commit: true`, the sign-off may not run
+  below the tier of the agent that verified what it is committing. It refuses synchronously,
+  before a single agent spawns, like every other input refusal in that file, and it fails closed
+  in three separate ways — the comparison is by **rank** against a `MODEL_TIER` map rather than an
+  `=== 'opus'` equality (so `sonnet` between the two ends is refused, which an equality check would
+  have let through); the rank lookup uses `hasOwnProperty` rather than `in`, because
+  `'toString' in MODEL_TIER` is `true` through the prototype chain and would rank a model that is
+  not in the map; and an unranked `signoff_model` is refused **on its own terms before** the floor
+  compares anything, since `null < 2` is `true` in JavaScript and would otherwise report "too
+  cheap" for a value nobody could rank. The verifier's own model is now a single `VERIFIER_MODEL`
+  constant that the floor and the verifying `agent()` call both read, and the script refuses to run
+  at all — whatever `commit` says — if that constant is missing from `MODEL_TIER`: with an unranked
+  verifier the comparison silently becomes `x < null`, false for every rank, and the guard would
+  still be there, no longer guarding anything. `{commit: false}` remains the way to run an advisory round on a
+  cheaper auditor, and a completed round now records which model actually held the commit.
+
+  Second, the per-batch done-list names **files** now, not just outcomes. The planner orders
+  batches "so earlier ones don't invalidate later specs", but it computes that ordering before any
+  batch runs: once a batch is rejected and reworked, the code can move away from what a later
+  spec assumes, and `"b1: landed"` named no file, so a spec written against moved code was
+  invisible to the agent executing it. Each entry now carries the files that batch reported
+  changing (and says `(no files reported)` when an implementer returned nothing, which is not the
+  same claim as "touched nothing"), and the prompt tells the implementer to read those files as
+  they are now rather than as its spec describes them. Deliberately **not** a re-plan after a
+  rework: that would be a second opus round per rework, and this is one string and costs no agent.
+
+  Third — and this one is **explicitly not a fix** — the sign-off re-measures
+  `git status --porcelain` immediately before its by-path `git add`, is handed the deduplicated
+  set of claimed paths from the script rather than from its own memory of the round, and stops if any claimed path has
+  gone quiet since the batch reported it — absent from a fresh status, whatever letter it would
+  have carried (reverted by a later batch, or committed by someone else) — the same shape as the branch re-check already sitting
+  beside it, where the measurement that decides is the one taken immediately before the commit.
+  **Finding 3 stays open.** The unit of ownership is a path and `git add <path>` takes the whole
+  file, so a peer session that edited a different region of a path this round legitimately claims
+  still has its lines committed with the round's: the honest fix is to commit through the server's
+  own `ShadowStore`/`commitContents` machinery, at line granularity, which is a much larger design
+  question. What landed turns the silent version of that into a stop, which is the right direction
+  and nothing more; the prompt says so in those words, so that no later reader mistakes the
+  mitigation for a closure.
+
+  Two smaller things fell out of verifying the above. The sign-off's "you have NO authority to
+  change the tree with git" paragraph carved out "plus the one `git add`/`commit`/`push` sequence
+  in step 5" **unconditionally**, while step 5 itself renders as `DO NOT COMMIT` on a round that
+  is not committing — so the only sentence in that prompt granting git write authority survived on
+  exactly the rounds that must not use it, and `{commit: false}` is what the new floor tells a
+  user to pass in order to run a cheaper auditor. Both now read one `MAY_COMMIT` expression. And
+  the re-measure's stop rule said "no longer listed as **modified**", which a test-first round's
+  most characteristic artifact — a brand-new test file, reported by porcelain as `??` — is not:
+  the rule is about a claimed path going quiet, whatever status letter it carries. That one
+  needed two flags as well as words, neither of them git's default and both now spelled out in
+  the prompt (and in the preflight, so the two ends of the comparison are measured the same
+  way): `-uall`, because a wholly new directory otherwise collapses to a single `?? dir/` line
+  and a claimed path inside it never appears — a round creating a fixture directory is the
+  ordinary case, not an exotic one — and `core.quotePath=false`, because a path with a
+  non-ASCII byte otherwise comes back C-quoted and matches nothing, which is the rule CLAUDE.md
+  already applies to every path-returning git call in the server itself.
+
 - **The conflict-budget cap test stops taking 25 `edit_file` round trips to set itself up.** It was
   the slowest test in the suite (~4.6s locally, 4x its siblings in the same file) and had timed out
   three times on `windows-latest` against the 30s budget, blocking three unrelated PRs in one

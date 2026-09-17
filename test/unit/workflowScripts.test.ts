@@ -593,9 +593,10 @@ describe('review-round.js', () => {
       expect(outcome.calls).toEqual([]);
     });
 
-    // The planner's model tier is asserted on the `plan` label ONLY, never on `sign-off`:
-    // a separate lane is deliberately changing the sign-off's tier, and pinning it here would
-    // hand them a spurious failure for a change this test has no opinion about.
+    // These two assert the `plan` label only, because #81 split the knob: {fable}/{fable_model}
+    // governs the PLANNER alone now. The sign-off's own tier is pinned — it is not left
+    // unasserted any more — in the `sign-off` block below ('signs off on opus by default'),
+    // and the floor that keeps it there is the group of tests immediately after these.
     it('plans on fable by default', async () => {
       const outcome = await runRound();
       expect(oneCallFor(outcome, 'plan').opts.model).toBe('fable');
@@ -605,6 +606,60 @@ describe('review-round.js', () => {
       const outcome = await runRound({ fable: false });
       expect(oneCallFor(outcome, 'plan').opts.model).toBe('opus');
     });
+
+    it('refuses a committing round whose sign-off runs below the verifier tier', async () => {
+      const outcome = await runRound({ signoff_model: 'fable' });
+      const message = expectThrown(outcome);
+      // The refusal names the tier it is measured against, why the sign-off may not go below
+      // it, and both routes out — a reader who only sees this message can act on it.
+      expect(message).toMatch(/below the verifier's tier \(opus\)/);
+      expect(message).toMatch(/commits and pushes unattended/);
+      expect(message).toMatch(/\{commit: false\}/);
+      expect(message).toMatch(/signoff_model/);
+      // And, like every other input refusal in this script, it fires before an agent spawns.
+      expect(outcome.calls).toEqual([]);
+    });
+
+    it('refuses the middle rank, sonnet, while committing', async () => {
+      // sonnet is the rank that tells a real comparison from an `=== 'opus'` equality check:
+      // every other case here passes under either implementation.
+      const outcome = await runRound({ signoff_model: 'sonnet' });
+      expect(expectThrown(outcome)).toMatch(/below the verifier's tier/);
+      expect(outcome.calls).toEqual([]);
+    });
+
+    it.each([['fable'], ['sonnet']])(
+      'accepts signoff_model %s for a non-committing round, and really runs it there',
+      async (signoff_model) => {
+        // The boundary just outside the floor: it is scoped to a COMMITTING round, so an
+        // advisory one may audit on any ranked tier — and the model really reaches the call.
+        const outcome = await runRound({ signoff_model, commit: false });
+        expect(oneCallFor(outcome, 'sign-off').opts.model).toBe(signoff_model);
+        expect(expectCompleted(outcome).auditor).toBe(signoff_model);
+      },
+    );
+
+    it('accepts the value at the floor for a committing round', async () => {
+      // The boundary just inside: equal to the verifier's tier is allowed, not only above it.
+      const outcome = await runRound({ signoff_model: 'opus' });
+      expect(oneCallFor(outcome, 'sign-off').opts.model).toBe('opus');
+      expect(expectCompleted(outcome).auditor).toBe('opus');
+    });
+
+    it.each([['haiku'], ['toString'], [2]])(
+      'refuses an unranked signoff_model %o on its own terms',
+      async (signoff_model) => {
+        // 'toString' is the prototype-chain case: `'toString' in MODEL_TIER` is true, so an
+        // `in`-based tierOf would rank it and every other test here would still pass.
+        const outcome = await runRound({ signoff_model, commit: false });
+        const message = expectThrown(outcome);
+        expect(message).toMatch(/signoff_model must be one of fable, sonnet, opus/);
+        // Refused as unknown, never absorbed by the floor (`null < 2` is true in JS), and
+        // refused even for a round that does not commit, where the floor does not apply.
+        expect(message).not.toMatch(/below the verifier's tier/);
+        expect(outcome.calls).toEqual([]);
+      },
+    );
 
     it.each([[0], [-3], [1.5]])('refuses pr: %o', async (pr) => {
       const outcome = await runRound({ pr });
@@ -732,7 +787,12 @@ describe('review-round.js', () => {
       const result = expectCompleted(outcome);
       expect(result.preexisting_dirty).toEqual(['peer.ts']);
       expect(outcome.logs.join('\n')).toContain('already modified before this round');
-      expect(oneCallFor(outcome, 'sign-off').prompt).toContain('must NOT be committed: peer.ts');
+      const prompt = oneCallFor(outcome, 'sign-off').prompt;
+      expect(prompt).toContain('must NOT be committed: peer.ts');
+      // The claimed list added for #81 finding 3 would otherwise contradict this rule outright
+      // when a batch touches a path a peer already had in flight — both lines are rendered, and
+      // only this sentence says which one wins.
+      expect(prompt).toContain('leave it uncommitted anyway');
     });
   });
 
@@ -832,7 +892,15 @@ describe('review-round.js', () => {
       expect(impls).toHaveLength(2);
       expect(impls[0]?.prompt).toContain('Batches already implemented this run');
       expect(impls[0]?.prompt).toContain('none yet');
+      // The read-the-tree paragraph is about earlier batches' files, so on the first batch —
+      // where the list is 'none yet' — "those files" would refer to nothing at all.
+      expect(impls[0]?.prompt).not.toContain('Read those files as they are NOW');
+      expect(impls[1]?.prompt).toContain('Read those files as they are NOW');
       expect(impls[1]?.prompt).toContain('b1: landed');
+      // The files b1 reported, rendered INTO that entry (#81): the plan's ordering was computed
+      // before any batch ran, so a later spec can describe code an earlier reworked batch has
+      // moved. A done-list that names no file makes that invisible to the agent executing it.
+      expect(impls[1]?.prompt).toContain('b1: landed — files: src/a.ts');
       expect(batchResults(outcome).map((b) => b.batch)).toEqual(['b1', 'b2']);
     });
 
@@ -859,6 +927,39 @@ describe('review-round.js', () => {
       expect(callsFor(outcome, 'impl')[1]?.prompt).toContain('b1: landed unapproved');
     });
 
+    it('renders a batch that reported no files as such to the next one', async () => {
+      // A batch whose implementer returned nothing carries `files: []`, and the happy path
+      // never produces that. An empty tail there would read as "touched nothing", which is not
+      // what it means — it means nobody said (#81).
+      let impls = 0;
+      const outcome = await runRound(
+        {},
+        {
+          plan: () => ({
+            shared_context: 'ctx',
+            batches: [
+              { name: 'b1', spec: 'SPEC ONE' },
+              { name: 'b2', spec: 'SPEC TWO' },
+            ],
+          }),
+          impl: () => {
+            impls += 1;
+            return impls === 1
+              ? null
+              : {
+                  files_changed: ['src/b.ts'],
+                  tests_added: ['t'],
+                  tests_watched_failing: ['t'],
+                  gate: 'green',
+                };
+          },
+        },
+      );
+      const prompt = callsFor(outcome, 'impl')[1]?.prompt;
+      expect(prompt).toContain('b1: landed unapproved');
+      expect(prompt).toContain('(no files reported)');
+    });
+
     it('wires each label to the intended agent type and model', async () => {
       const outcome = await runRound();
       expect(oneCallFor(outcome, 'preflight').opts.agentType).toBe('plan-verifier');
@@ -874,6 +975,32 @@ describe('review-round.js', () => {
   });
 
   describe('sign-off', () => {
+    it('signs off on opus by default', async () => {
+      // Every irreversible act of the round lives in this phase — the whole-diff read, the
+      // gate, the trivial-failure fixes and the unattended add/commit/push — so it does not
+      // run on the cheapest tier in the round (#81).
+      const outcome = await runRound();
+      expect(oneCallFor(outcome, 'sign-off').opts.model).toBe('opus');
+      expect(expectCompleted(outcome).auditor).toBe('opus');
+    });
+
+    it('keeps the sign-off on opus when {fable_model: "fable"} pins the planner to fable', async () => {
+      // The discriminating half of the split: the planner knob no longer reaches the auditor.
+      const outcome = await runRound({ fable_model: 'fable' });
+      expect(oneCallFor(outcome, 'plan').opts.model).toBe('fable');
+      expect(oneCallFor(outcome, 'sign-off').opts.model).toBe('opus');
+    });
+
+    it('does not lower the sign-off when {fable: false} raises the planner', async () => {
+      // The other direction of the same split, and deliberately the WEAK one: it held before
+      // #81 too, and a full re-coupling (SIGNOFF = PLANNER) would still pass it, because
+      // {fable: false} raises both ends at once. The test above it is the discriminating pin;
+      // this one only says the no-op direction stayed a no-op.
+      const outcome = await runRound({ fable: false });
+      expect(oneCallFor(outcome, 'plan').opts.model).toBe('opus');
+      expect(oneCallFor(outcome, 'sign-off').opts.model).toBe('opus');
+    });
+
     it('instructs a by-path commit and a re-checked branch when everything is approved', async () => {
       const outcome = await runRound();
       const prompt = oneCallFor(outcome, 'sign-off').prompt;
@@ -883,6 +1010,90 @@ describe('review-round.js', () => {
       expect(prompt).toContain('Never `git add -A`');
       expect(prompt).toContain('`git branch --show-current`');
       expect(prompt).toContain('Stop unless it is exactly feature/x');
+      // The other side of the carve-out pinned in 'forbids committing when commit is disabled
+      // by args': a round that DOES commit keeps step 2's exception, or step 5 asks for a
+      // sequence step 2 forbade.
+      expect(prompt).toContain('sequence in step 5');
+    });
+
+    it('re-measures the tree against the claimed paths immediately before `git add`', async () => {
+      // The branch is re-checked immediately before the commit; the TREE was not (#81,
+      // finding 3). `git status --porcelain` and `src/a.ts` both already appear elsewhere in
+      // this prompt, so the literal prefix is what is pinned, never the bare path.
+      const prompt = oneCallFor(await runRound(), 'sign-off').prompt;
+      expect(prompt).toContain('SECOND, still before `git add`, re-measure the tree: run');
+      // Neither flag is the default, and both decide whether a claimed path is found at all:
+      // `-uall` because a wholly new directory otherwise collapses to one `?? dir/` line (a
+      // test-first round creating a fixture directory is the ordinary case), and
+      // core.quotePath=false because a non-ASCII path is otherwise C-quoted and matches
+      // nothing — the rule CLAUDE.md already applies to every path-returning git call.
+      expect(prompt).toContain('`git -c core.quotePath=false status --porcelain -uall`');
+      expect(prompt).toContain('Claimed paths (the exact set this round may add): src/a.ts');
+      expect(prompt).toContain('stop and report the round rather than committing');
+      // A TEST-FIRST round's most common artifact is a NEW file, which porcelain reports as
+      // `??` — untracked, not modified. "no longer listed as modified" read literally would
+      // abort every such round at the commit step, so the rule is about a path going quiet.
+      expect(prompt).toContain('no longer appears in that fresh status AT ALL');
+      expect(prompt).toContain('any status code counts as');
+    });
+
+    it('states plainly that the re-measure does not make the commit line-accurate', async () => {
+      // The caveat is the point of the check: `git add <path>` takes the whole file, so a peer
+      // editing another region of a claimed path still ships with the round. This assertion is
+      // what stops a later edit from quietly reading as a fix for finding 3.
+      const prompt = oneCallFor(await runRound(), 'sign-off').prompt;
+      expect(prompt).toContain('#81, finding 3');
+      expect(prompt).toContain('takes the whole file');
+    });
+
+    it('says so loudly when no batch claimed a single path', async () => {
+      // The value just outside the normal case: nothing to `git add` by path at all. Silence
+      // here would read as "add nothing and carry on", which is a commit of nobody's work.
+      const outcome = await runRound(
+        {},
+        {
+          impl: () => ({
+            files_changed: [],
+            tests_added: ['t'],
+            tests_watched_failing: ['t'],
+            gate: 'green',
+          }),
+        },
+      );
+      expect(oneCallFor(outcome, 'sign-off').prompt).toContain(
+        'Claimed paths (the exact set this round may add): (none — no batch reported a file',
+      );
+    });
+
+    it('deduplicates the claimed set across batches', async () => {
+      // Two batches touching one file must not claim it twice — a future edit dropping the Set
+      // would render it twice and go unnoticed by a `toContain`, so the whole line is compared.
+      const outcome = await runRound(
+        {},
+        {
+          plan: () => ({
+            shared_context: 'ctx',
+            batches: [
+              { name: 'b1', spec: 'SPEC ONE' },
+              { name: 'b2', spec: 'SPEC TWO' },
+            ],
+          }),
+          impl: (call) => ({
+            files_changed: String(call.opts.label).startsWith('impl:b1')
+              ? ['src/a.ts', 'src/b.ts']
+              : ['src/b.ts'],
+            tests_added: ['t'],
+            tests_watched_failing: ['t'],
+            gate: 'green',
+          }),
+        },
+      );
+      const line = oneCallFor(outcome, 'sign-off')
+        .prompt.split('\n')
+        .find((l) => l.includes('Claimed paths ('));
+      expect(line?.trim()).toBe(
+        'Claimed paths (the exact set this round may add): src/a.ts, src/b.ts',
+      );
     });
 
     it('forbids committing when a batch was not approved', async () => {
@@ -893,6 +1104,10 @@ describe('review-round.js', () => {
       const prompt = oneCallFor(outcome, 'sign-off').prompt;
       expect(prompt).toContain('DO NOT COMMIT');
       expect(prompt).toMatch(/batches not approved: b1/);
+      // Both halves of MAY_COMMIT, not just the args one: an unapproved batch withdraws the
+      // write authority too.
+      expect(prompt).not.toContain('sequence in step 5');
+      expect(prompt).not.toContain('Claimed paths (');
     });
 
     it('forbids committing when commit is disabled by args', async () => {
@@ -900,6 +1115,17 @@ describe('review-round.js', () => {
       const prompt = oneCallFor(outcome, 'sign-off').prompt;
       expect(prompt).toContain('DO NOT COMMIT');
       expect(prompt).toContain('commit disabled by args');
+      // Step 2's "you have NO authority to change the tree" paragraph used to carve out "plus
+      // the one git add/commit/push sequence in step 5" unconditionally — pointing at a step
+      // that, on this branch, says DO NOT COMMIT. It was the only sentence in the prompt
+      // granting write authority, and {commit: false} is exactly what the sign-off tier floor
+      // tells a user to pass to run a cheaper auditor, so an advisory round was handing the
+      // cheapest model in the repo a licence to push.
+      expect(prompt).not.toContain('sequence in step 5');
+      expect(prompt).toContain('no other git command at all: this round does not');
+      // The re-measure belongs to the branch that actually commits; an advisory round that is
+      // told what it may `git add` is one edit away from doing it.
+      expect(prompt).not.toContain('Claimed paths (');
     });
 
     it.each([[null], [undefined]])(
