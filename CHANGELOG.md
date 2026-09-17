@@ -11,6 +11,51 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **CI finally says something about `.claude/workflows/*.js` beyond "the whitespace is tidy"** (#81,
+  finding 4). `eslint.config.js` ignored `.claude/**` wholesale, `tsc --noEmit` never saw those files
+  and nothing imported them, so the only automated statement about 626 lines of JavaScript that
+  reviews, **commits and pushes this repo unattended** came from `prettier --check`. That is not a
+  hypothetical gap: reviewing `review-round.js` shipped a `const` declared inside a retry loop and
+  read after it, and backticks that closed a template literal early — the second caught only because
+  it happened to be a parse error prettier tripped over, the first caught only by a human reading it,
+  and neither by anything that runs in CI.
+
+  A flat-config block scoped to `.claude/workflows/**/*.js` now declares the Workflow globals
+  (`args`, `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `budget`) readonly, allows
+  the top-level `return` that is legal in a body the host wraps in an async function, and turns
+  `no-undef` on — which catches both defect shapes above. Un-ignoring `.claude/**` instead is **not**
+  the same change and is worse: measured on this config, forced over the file that way eslint reports
+  32 problems, every one of them `no-undef` on those very globals, burying the findings the block
+  exists for. (#81 predicted a parse objection to the legal `return` as well; there is none, because
+  `tseslint.configs.recommended` carries no `files:` restriction and so claims `.js` too, making
+  `typescript-eslint/parser` the effective parser here — and it accepts a top-level `return`
+  silently. `allowReturnOutsideFunction` is therefore defence in depth against a future parser swap
+  rather than load-bearing today, and the comment beside it says so, so that nobody deletes it as
+  dead config on the strength of a claim that never held.) The ignore is now `.claude/*` rather than
+  `.claude/**`, and that distinction
+  is load-bearing rather than cosmetic: in flat config a directory ignored with `/**` is skipped
+  whole and nothing inside it can be unignored afterwards, so the obvious spelling lints nothing at
+  all while reading as though it works. Every other child of `.claude/`, a nested worktree included,
+  is still skipped before eslint descends into it.
+
+  And `test/unit/workflowScripts.test.ts`, a tier that is **generic over the directory** — a second
+  workflow script added later is checked for free. A Workflow script cannot be imported (its
+  top-level `return` is a SyntaxError in an ES module), so the tier wraps each body in an async
+  function and injects stubbed globals exactly as the host does, which is what lets the guards be
+  executed rather than merely read. Per script it asserts `meta` is well-formed and cross-checks the
+  `meta.phases` titles against the `phase()` / `opts.phase` strings the body actually uses, **in both
+  directions** — a phase declared and never used, and one used and never declared, are both failures.
+  Then 48 scenarios pin `review-round.js`'s guards by running them: every input refusal firing before
+  a single agent spawns, `max_attempts: 0` as the legitimate plan-only value just outside that
+  refusal, the preflight's fail-closed normalization of `refs/heads/dev` and `  dev  ` into the
+  protected-branch refusal, the detached-HEAD refusal proven scoped to a committing round, a peer's
+  pre-existing dirty paths reaching the sign-off as must-not-commit, the `done` string that is the
+  only channel telling one batch what earlier ones landed, and the sign-off's by-path commit
+  instruction. The checks are themselves tested against deliberately broken in-memory sources, and
+  discovery asserts the script list is non-empty, because a tier that would pass over broken input
+  states nothing — a mutation campaign over copies of the script confirmed each guard's removal is
+  caught by exactly the one scenario that claims to pin it.
+
 - **A `pdf_geometry` tool: measure the compiled page in points, instead of eyeballing a PNG** (#73).
   `render_pages` answers "does this look wrong"; it cannot answer "by how many points does this
   table's text overlap the figure frame above it". Reading a rasterized page is not measurement, and
