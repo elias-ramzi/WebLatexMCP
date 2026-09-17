@@ -819,6 +819,37 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **`SessionRegistry`'s lifecycle methods are covered, and one of the tests found that `touch()`'s
+  statement order is load-bearing** (#78, item 2's neighbours). The boot-scoping fix landed with
+  `peers()` well covered and the rest of the class barely touched, so this closes the gaps around it:
+  `release()` (removes the record **only** — a sibling `shadow.json` and `shadow/<rel>` come back
+  byte-identical, and a release for a project with no directory at all resolves rather than
+  rejecting, which is what the shutdown loop in `index.ts` leans on), `trackedProjects()` (shutdown
+  releases exactly what it returns, and the heartbeat throttle is keyed per project — a shared one
+  would starve a project's heartbeat, and a starved heartbeat is the fail-open direction: a live
+  session reads dead to its peers), corrupt and absent records, `peers()` sort order, and
+  `collectGarbage()`.
+
+  Two of those are worth stating as guarantees rather than as tests. **`collectGarbage()` must never
+  reap a directory whose record it could not read**: an unreadable record means UNREADABLE, never
+  "owns nothing" — the same fail-closed reading `attributePeers`/`isStalePeer` use for a `null`
+  shadow index — and reaping one would delete a shadow index that `commit scope: "paths"` and `push`
+  refuse on, turning a visible refusal into vanished evidence. And it **must reap the whole
+  directory**, not just the record: narrowing that `rm` fails closed (it leaks a dead session's
+  shadow bytes rather than destroying a live peer's proof) but leaks _silently_, since `peers()` goes
+  on reporting nothing for the directory.
+
+  The find: inside `touch()`, the synchronous `lastHeartbeat.set` **before the first `await`** is what
+  makes the throttle dedupe _concurrent_ callers and not merely sequential ones. `writeAtomic` names
+  its temp file `${target}.${process.pid}.tmp` — unique per process, not per call — so two touches
+  racing on one project fight over one temp file, the first `rename` consumes it, and the rest reject
+  with `ENOENT`. `touch()` is uncaught at three of its four call sites (`status`, `commit`, `push`),
+  so that is a hard tool failure out of a registry whose whole contract is that "a missing or stale
+  registry only ever costs visibility". The race is reachable: `status` takes no `runExclusive` lock,
+  so it can be in flight against a `commit` on the same project in one process. A test now pins the
+  ordering. Making `writeAtomic`'s temp name unique per call is the real repair and is deliberately
+  **not** done here — it is a source change, and this entry is the record that it is owed.
+
 - **Every path list in the peer refusal is bounded, and the message says where the whole one is**
   (#68). `push` and `project_sync` refuse while a live peer session has in-flight work, and the
   refusal names the disputed files three times over: the header's full list, each live session's
