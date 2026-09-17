@@ -151,12 +151,16 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             throw new Error(
               `Staged changes at: ${pre.stagedPaths.join(', ')}. If this revert conflicted it ` +
                 "would have to be aborted, and git's abort resets the whole index — that staged " +
-                "work (possibly another session's) would be lost. Commit it, or unstage it with " +
-                '`git reset`, then retry.',
+                "work (possibly another session's) would be lost. Land it with `commit` and " +
+                'scope: "all" (or scope: "paths" naming them) — the DEFAULT session scope stages ' +
+                "this session's own shadow, not a hand-staged index, so it would not land that " +
+                'work at all. Every scope resets the index to HEAD first, so either way the ' +
+                'staged state is cleared; `git reset` does it directly if you have a shell. Then ' +
+                'retry.',
             );
           }
 
-          const res = await ctx.git.revertApply(dir, pre.commits, pre.touchedPaths);
+          const res = await ctx.git.revertApply(dir, pre.commits, pre.touchedPaths, expectRef);
 
           if (res.status === 'conflict') {
             // `revertApply` aborted: the tree is exactly as it was, so there is nothing to
@@ -206,24 +210,67 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
           // one `discard` takes.
           ctx.files.resetBaselines(dir);
 
-          // Settle the reverted paths in EVERY session's record — never `clearAll`, which would
-          // drop peers' records for files nothing happened to and let a later
-          // `commit scope: "paths"` sweep up those peers' lines as if nobody owned them. Across
-          // sessions because a peer holding a stale shadow entry for a reverted path would, at
-          // its next session-scoped commit, stage that shadow's content through `commitContents`
-          // and re-install the very lines just reverted. Folded exactly when git folds
-          // (`core.ignorecase`), like `commit`/`discard`: a session's entry can be keyed under a
-          // different spelling than the one the revert named.
           // Register this session as live BEFORE claiming any lines. `SessionRegistry.touch` is
           // what creates `session.json`, and `runExclusive`'s lock file does not — so a session
           // whose first mutation is a revert (`project_sync` -> `diff` -> `revert` touches
           // nothing else) would own a `shadow.json` with no session record, `peers()` would drop
           // it, and a peer's `commit scope: "paths"` or `push` would sweep up the reverted lines
           // as owned by nobody. Same order as `createSessionRecorder`: touch, then record.
-          await ctx.sessions.touch(id);
-
-          const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : undefined;
-          await ctx.shadows.settleAll(id, pre.touchedPaths, fold);
+          //
+          // Then settle the reverted paths in EVERY session's record — never `clearAll`, which
+          // would drop peers' records for files nothing happened to and let a later
+          // `commit scope: "paths"` sweep up those peers' lines as if nobody owned them. Across
+          // sessions because a peer holding a stale shadow entry for a reverted path would, at
+          // its next session-scoped commit, stage that shadow's content through `commitContents`
+          // and re-install the very lines just reverted. Folded exactly when git folds
+          // (`core.ignorecase`), like `commit`/`discard`: a session's entry can be keyed under a
+          // different spelling than the one the revert named.
+          //
+          // Both steps run AFTER the revert is on disk, so neither may fail the call: the record
+          // loop below already follows that rule, and a throw here would report "the revert
+          // failed" over a revert that landed — inviting a retry that reverts twice. Log instead;
+          // the cost is attribution, which is what the loop's own failure path also trades away.
+          //
+          // They are caught SEPARATELY, and that separation is the point. The heartbeat and the
+          // settle are independent, and only the settle protects a PEER: under one `try` a failed
+          // `touch` skips `settleAll` entirely, leaving every peer's stale entry standing — which
+          // is precisely the silent re-install this block exists to prevent, now reachable through
+          // an unrelated disk error. `createSessionRecorder` splits them for the same reason, in
+          // its own words: its failure "says nothing about the shadow".
+          let touchErr: unknown;
+          try {
+            await ctx.sessions.touch(id);
+          } catch (err) {
+            touchErr = err;
+          }
+          try {
+            // A clone whose `core.ignorecase` cannot be read is settled BYTE-EXACT rather than not
+            // at all: missing a peer entry that differs only in ASCII case is a far smaller loss
+            // than leaving every peer's entry for every reverted path standing, and byte-exact is
+            // what the rest of the server falls back to anyway.
+            let fold: ((p: string) => string) | undefined;
+            try {
+              if (await ctx.git.isCaseInsensitive(dir)) fold = foldCase;
+            } catch (err) {
+              console.error(
+                '[web-latex-mcp] could not read core.ignorecase after the revert; settling the ' +
+                  `reverted paths byte-exact: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+            await ctx.shadows.settleAll(id, pre.touchedPaths, fold);
+          } catch (err) {
+            console.error(
+              '[web-latex-mcp] the revert landed, but settling the reverted paths across ' +
+                `sessions failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          if (touchErr !== undefined) {
+            console.error(
+              '[web-latex-mcp] the revert landed, but registering this session as live failed, ' +
+                'so its lines may read as owned by nobody: ' +
+                `${touchErr instanceof Error ? touchErr.message : String(touchErr)}`,
+            );
+          }
 
           // Own the reverted lines. `before` is HEAD's bytes, and that is correct rather than a
           // shortcut: the dirty-path refusal above proved the working tree equalled HEAD for
@@ -232,9 +279,18 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
           // stage nothing, and the "review with diff, land with commit" story would not work.
           // No `recordBaseline`: the default false is right, since a path that writes nothing
           // must claim nothing. `strictLinks` because these paths come from git, not the caller.
+          // Paths the revert RESTORED — see the text below for why they are collected here.
+          const restored: string[] = [];
           for (const rel of pre.touchedPaths) {
             try {
-              const before = asShadowContent(await ctx.git.readAtRefBytes(dir, 'HEAD', rel));
+              const beforeBytes = await ctx.git.readAtRefBytes(dir, 'HEAD', rel);
+              // No blob at HEAD means the revert restored this path (it undid a deletion). The
+              // scoped unstage drops from the index every path HEAD does not have, so such a file
+              // ends up UNTRACKED — and `git diff` ignores untracked files entirely, so the
+              // `diff` this tool points the caller at shows nothing for it. Collected so the text
+              // can say so; an empty diff must not read as "the revert did nothing".
+              if (beforeBytes === null) restored.push(rel);
+              const before = asShadowContent(beforeBytes);
               const after = asShadowContent(
                 await ctx.files.readBytes(dir, { path: rel, strictLinks: true }),
               );
@@ -266,19 +322,20 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             }
           }
 
-          let matchesRef: boolean | null = null;
-          let mismatchedFiles: DiffFile[] = [];
-          // Scoped to the reverted paths, never the whole tree, or a peer's unrelated dirty file
-          // would make an exact revert report `false`. With NO reverted paths there is nothing to
-          // compare and `matchesRef` stays `null`: `true` over an empty set is the one answer an
-          // assertion must never give, since it would read as "verified exact" having verified
-          // nothing.
-          if (expectRef !== undefined && pre.touchedPaths.length > 0) {
-            mismatchedFiles = (await ctx.git.diffAgainstRef(dir, expectRef, pre.touchedPaths)).map(
-              (f) => ({ ...f, path: toPosix(f.path) }),
-            );
-            matchesRef = mismatchedFiles.length === 0;
-          }
+          // Measured by `revertApply` itself, against the index while the revert still sat in it —
+          // a comparison made out here, after the unstage, cannot see a file the revert RESTORED
+          // (it is untracked by then, and `git diff <ref>` ignores untracked files), and reported
+          // an exactly-correct revert as a mismatch. Scoped to the reverted paths, never the whole
+          // tree, or a peer's unrelated dirty file would make an exact revert report `false`. With
+          // NO reverted paths, or no `expectRef`, `revertApply` returns `null` and `matchesRef`
+          // stays `null`: `true` over an empty set is the one answer an assertion must never give,
+          // since it would read as "verified exact" having verified nothing.
+          const mismatchedFiles: DiffFile[] = (res.mismatchedFiles ?? []).map((f) => ({
+            ...f,
+            path: toPosix(f.path),
+          }));
+          const matchesRef: boolean | null =
+            res.mismatchedFiles === null ? null : mismatchedFiles.length === 0;
 
           const added = res.files.reduce((sum, f) => sum + f.added, 0);
           const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
@@ -293,6 +350,12 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
                 ? `the reverted paths now match "${expectRef ?? ''}"`
                 : `the reverted paths do NOT match "${expectRef ?? ''}": ` +
                   mismatchedFiles.map((f) => `${f.path} +${f.added} -${f.removed}`).join(', '),
+            restored.length === 0
+              ? ''
+              : `restored, and therefore untracked — \`diff\` does NOT show ` +
+                `${restored.length === 1 ? 'it' : 'them'} (git diff ignores untracked files); ` +
+                `read ${restored.length === 1 ? 'it' : 'them'} with \`read_file\` or see ` +
+                `\`status\`: ${restored.join(', ')}`,
             'Nothing is committed — review with `diff`, then land it with `commit`.',
           ]
             .filter(Boolean)

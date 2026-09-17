@@ -510,6 +510,61 @@ describe('revert, staged peer work, and session attribution', () => {
     expect(await h.git.raw(['show', 'HEAD:main.tex'])).toBe('alpha\n');
     expect(await readFile(path.join(h.clone, 'main.tex'), 'utf8')).toBe('alpha\nNOT-MINE\n');
   });
+  // 9b. The mirror image, and the case the reporting used to get wrong: reverting a DELETION.
+  //     The scoped `git reset HEAD -- <paths>` that unstages the revert drops from the index
+  //     every path HEAD does not have — and a restored file is exactly such a path, so it ends up
+  //     untracked. `git diff <ref> -- <path>` ignores untracked files, so measuring after the
+  //     unstage reported `files: []` ("reverted — 0 file(s)") over a file that HAD been restored,
+  //     and reported `matchesRef: false` for a revert that was byte-exact. Both numbers are
+  //     measured against the index now, while the revert still sits in it.
+  it('reverting a deletion restores the file, and reports it as an addition that matches', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n', 'sec.tex': 'section one\nsection two\n' });
+    await h.git.rm(['sec.tex']);
+    await h.git.commit('drop the section');
+    const sha = (await h.git.revparse(['HEAD'])).trim();
+    expect(await exists(path.join(h.clone, 'sec.tex'))).toBe(false);
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true, expectRef: h.base },
+    });
+
+    expect(isError(res)).toBe(false);
+    const sc = structured(res);
+    expect(sc.status).toBe('reverted');
+    // Asymmetric on purpose, as in test 1: restoring the file ADDS two lines and removes none.
+    expect(sc.files).toEqual([{ path: 'sec.tex', added: 2, removed: 0 }]);
+    expect(sc.filesChanged).toBe(1);
+    // The revert IS exact, so the headline assertion must say so.
+    expect(sc.matchesRef).toBe(true);
+    expect(sc.mismatchedFiles).toEqual([]);
+    // ...and the text the caller reads must not claim nothing happened.
+    expect(plainText(res)).toContain('1 file(s)');
+    expect(plainText(res)).toContain('sec.tex');
+    // ...and it must not send the caller to `diff`, alone, for a file `diff` cannot show: a
+    // restored path is untracked, and `git diff` ignores untracked files, so an empty diff would
+    // read as "the revert did nothing" for exactly the case this test covers.
+    expect(plainText(res)).toMatch(/untracked/i);
+    expect(plainText(res)).toMatch(/read_file|status/);
+
+    // On disk, byte-identical to the content before the deletion, and still uncommitted/unstaged.
+    expect(await readFile(path.join(h.clone, 'sec.tex'), 'utf8')).toBe(
+      'section one\nsection two\n',
+    );
+    expect((await staged(h.git)).trim()).toBe('');
+    expect((await h.git.revparse(['HEAD'])).trim()).toBe(sha);
+    expect(await exists(revertHeadPath(h.clone))).toBe(false);
+
+    // And the session owns it: a session-scoped commit lands the restoration.
+    const committed = await h.client.callTool({
+      name: 'commit',
+      arguments: { project: 'demo', message: 'restore the section', scope: 'session' },
+    });
+    expect(isError(committed)).toBe(false);
+    expect(structured(committed).committed).toBe(true);
+    expect(await h.git.raw(['show', 'HEAD:sec.tex'])).toBe('section one\nsection two\n');
+  });
+
   // 10. A touched path with UNSTAGED local changes is refused. This is the guard that keeps a
   //     revert off another session's in-flight lines: git would refuse to overwrite them anyway
   //     ("Your local changes to the following files would be overwritten by merge"), and catching
@@ -730,5 +785,96 @@ describe('revert of several commits', () => {
     expect((await h.git.revparse(['HEAD'])).trim()).toBe(second);
     expect((await staged(h.git)).trim()).toBe('');
     expect(await exists(revertHeadPath(h.clone))).toBe(false);
+  });
+});
+// 15. The two post-revert bookkeeping steps are INDEPENDENT, and a failure of the first must not
+//     skip the second. `sessions.touch` is this session's liveness heartbeat;
+//     `shadows.settleAll` is what stops a PEER's stale shadow re-installing the reverted lines at
+//     its next session-scoped commit (`commitContents` stages shadow CONTENT, and a `--no-commit`
+//     revert never moves HEAD, so `refresh` cannot catch it either). Running both under one
+//     try/catch made an unrelated heartbeat failure silently skip the settle — the exact hazard
+//     the cross-session settle exists for. `createSessionRecorder` separates them for the same
+//     reason, in its own words: "its own failure says nothing about the shadow".
+//
+//     The heartbeat is broken by injection rather than by breaking the filesystem, because
+//     `SessionRegistry.touch` throttles itself (HEARTBEAT_THROTTLE_MS) and a filesystem break
+//     would be silently skipped instead of failing — leaving the branch untested while the suite
+//     stayed green.
+describe('revert when the session heartbeat fails', () => {
+  async function connectWithBrokenHeartbeat(
+    config: ServerConfig,
+    workspace: string,
+  ): Promise<Client> {
+    const ctx = createContext(
+      config,
+      new CredentialResolver({}),
+      { name: 'Test', email: 'test@example.com' },
+      new ProjectRegistry(workspace),
+    );
+    ctx.sessions.touch = (): Promise<void> => {
+      throw new Error('injected: session heartbeat write failed');
+    };
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+    return client;
+  }
+
+  it("still settles the peer's stale record, and still reports the revert it performed", async () => {
+    const remote = await createFakeRemote({ 'main.tex': 'alpha\n' });
+    cleanups.push(remote.cleanup);
+    const workspace = await tmp('ovl-revert-hb-');
+    const base = {
+      workspaceRoot: workspace,
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const peer = await connect({ ...base, sessionId: 'peer' } as ServerConfig, workspace);
+    await peer.callTool({ name: 'project_sync', arguments: { project: 'demo', mode: 'clone' } });
+
+    const clone = path.join(workspace, 'demo');
+    const git = simpleGit(clone);
+    await git.addConfig('user.email', 'local@example.com');
+    await git.addConfig('user.name', 'Local');
+
+    // The peer edits main.tex (so it owns a shadow entry for it) and lands that edit, leaving the
+    // tree clean and its now-stale record behind.
+    await peer.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'alpha\nPEER-LINE\n' },
+    });
+    await git.raw(['--literal-pathspecs', 'commit', '-am', 'peer line']);
+    const landed = (await git.revparse(['HEAD'])).trim();
+
+    const peerShadow = path.join(workspace, '.sessions', 'demo', 'peer', 'shadow.json');
+    const before = JSON.parse(await readFile(peerShadow, 'utf8')) as {
+      entries: Record<string, unknown>;
+    };
+    // The precondition, asserted rather than assumed: without a stale entry to settle there is
+    // nothing for this test to prove.
+    expect(Object.keys(before.entries)).toContain('main.tex');
+
+    const mine = await connectWithBrokenHeartbeat(
+      { ...base, sessionId: 'mine' } as ServerConfig,
+      workspace,
+    );
+    const res = await mine.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [landed], confirm: true },
+    });
+
+    // The heartbeat failure must not fail a revert that landed...
+    expect(isError(res)).toBe(false);
+    expect(structured(res).status).toBe('reverted');
+    expect(await readFile(path.join(clone, 'main.tex'), 'utf8')).toBe('alpha\n');
+
+    // ...and the settle must have run anyway. This is THE assertion: coupled to the heartbeat,
+    // the peer's stale entry is still here and its next commit puts PEER-LINE back.
+    const after = JSON.parse(await readFile(peerShadow, 'utf8')) as {
+      entries: Record<string, unknown>;
+    };
+    expect(Object.keys(after.entries)).not.toContain('main.tex');
   });
 });

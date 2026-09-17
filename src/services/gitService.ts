@@ -517,6 +517,12 @@ export interface RevertResult {
   /** Per-file added/removed of the revert as it now sits in the working tree, vs HEAD. Empty on conflict. */
   files: DiffFile[];
   filesChanged: number;
+  /**
+   * Per-file added/removed between `expectRef` and the reverted tree, over the reverted paths —
+   * empty means they match it exactly. `null` when no `expectRef` was given (and on a conflict),
+   * which is what keeps `matchesRef` from claiming `true` having compared nothing.
+   */
+  mismatchedFiles: DiffFile[] | null;
   /** Every path git reported conflicted. Uncapped. Empty unless status === 'conflict'. */
   conflictPaths: string[];
 }
@@ -2335,8 +2341,16 @@ export class GitService {
    * aborted (which rolls back shas that had already applied cleanly and leaves an unrelated dirty
    * file alone — which is why a whole-tree `reset --hard` is forbidden here: it would destroy a
    * peer session's uncommitted work), and the caller gets the paths to act on.
+   *
+   * `expectRef` (already validated by {@link revertPreflight}) is measured here rather than by the
+   * caller afterwards, and that placement is load-bearing — see the `--cached` comment below.
    */
-  async revertApply(dir: string, commits: string[], touchedPaths: string[]): Promise<RevertResult> {
+  async revertApply(
+    dir: string,
+    commits: string[],
+    touchedPaths: string[],
+    expectRef?: string,
+  ): Promise<RevertResult> {
     if (commits.length === 0) throw new BadCommitError('No commits to revert.');
     // These are the preflight's own shas, but `git revert` has no `--` to separate revisions from
     // options, so a leading `-` would be read as one. Fail closed rather than trust the caller.
@@ -2344,6 +2358,11 @@ export class GitService {
       if (sha.startsWith('-')) throw new BadCommitError(`Invalid commit "${sha}".`);
     }
     const git = simpleGit(dir);
+    // Resolved BEFORE the revert runs, so a ref this clone cannot answer for is a refusal that
+    // costs nothing rather than an error over a revert that has already landed. The preflight
+    // validated it too; doing it again here is the same fail-closed stance `commits` gets above.
+    const expectSha =
+      expectRef === undefined ? undefined : await this.resolveCommitish(git, expectRef);
     try {
       // `execCapture`, not `git.raw`: a conflict IS a non-zero exit, and simple-git turns that
       // into a rejection that loses the exit code the two branches below turn on. Same seam, and
@@ -2364,33 +2383,68 @@ export class GitService {
           throw new Error(`git revert failed: ${res.stderr.trim() || res.stdout.trim()}`);
         }
         await git.raw(['revert', '--abort']);
-        return { status: 'conflict', commits, files: [], filesChanged: 0, conflictPaths };
+        return {
+          status: 'conflict',
+          commits,
+          files: [],
+          filesChanged: 0,
+          mismatchedFiles: null,
+          conflictPaths,
+        };
       }
       // `revert --no-commit` leaves `.git/REVERT_HEAD` behind EVEN ON SUCCESS (verified against
       // real git), so without this the clone sits mid-revert and a later `commit` would silently
       // pick up git's own revert message. Not obvious, and not optional.
       await git.raw(['revert', '--quit']);
+      // MEASURE BEFORE UNSTAGING, and measure the INDEX (`--cached`), not the working tree.
+      //
+      // The unstage below scopes `git reset HEAD -- <paths>`, which drops from the index every
+      // path HEAD does not have — and reverting a commit that DELETED a file restores exactly
+      // such a path. Afterwards the restored file is untracked, and `git diff <ref> -- <path>`
+      // ignores untracked files entirely: `git diff HEAD` reported nothing (so `files` came back
+      // empty and the tool said "reverted — 0 file(s)" over a file it had just restored), and
+      // `git diff <expectRef>` reported it as a DELETION (so `matchesRef` came back `false`, with
+      // a bogus `mismatchedFiles` entry, for a revert that was exactly right).
+      //
+      // The index at this point is precisely the reverted tree — `revert -n` wrote the index and
+      // the working tree together, and the tool's dirty-path preflight proved they agreed with
+      // HEAD beforehand — so `--cached` answers both questions correctly for added, deleted and
+      // modified paths alike.
+      //
+      // An empty `touchedPaths` means the reverted commits changed no file at all; an unscoped
+      // diff would then report the whole dirty tree as this revert's doing.
+      const files =
+        touchedPaths.length > 0
+          ? await this.landedOrExplain(git, touchedPaths, () =>
+              this.numstat(git, ['--cached', 'HEAD', '--', ...touchedPaths]),
+            )
+          : [];
+      const mismatchedFiles =
+        expectSha !== undefined && touchedPaths.length > 0
+          ? await this.landedOrExplain(git, touchedPaths, () =>
+              this.numstat(git, ['--cached', expectSha, '--', ...touchedPaths]),
+            )
+          : null;
       // `revert -n` STAGES what it reverted. Unstage it so the change sits in the working tree
       // only — what this tool promises, and what every other write in this server looks like.
       // Scoped to `touchedPaths`, never a whole-index reset: a hand `git add` elsewhere survives.
+      //
+      // NEVER run that reset on a conflicted path: it silently clears the unmerged state and
+      // leaves the `<<<<<<<` markers sitting in the file as an ordinary edit. The conflict branch
+      // above therefore aborts and returns; it never reaches here.
       if (touchedPaths.length > 0) {
         await this.landedOrExplain(git, touchedPaths, () =>
           git.raw(['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...touchedPaths]),
         );
       }
-      // NEVER run that reset on a conflicted path: it silently clears the unmerged state and
-      // leaves the `<<<<<<<` markers sitting in the file as an ordinary edit. The conflict branch
-      // above therefore aborts and returns; it never reaches here.
-      //
-      // An empty `touchedPaths` means the reverted commits changed no file at all; an unscoped
-      // `diff HEAD --` would then report the whole dirty tree as this revert's doing.
-      const files =
-        touchedPaths.length > 0
-          ? await this.landedOrExplain(git, touchedPaths, () =>
-              this.numstat(git, ['HEAD', '--', ...touchedPaths]),
-            )
-          : [];
-      return { status: 'reverted', commits, files, filesChanged: files.length, conflictPaths: [] };
+      return {
+        status: 'reverted',
+        commits,
+        files,
+        filesChanged: files.length,
+        mismatchedFiles,
+        conflictPaths: [],
+      };
     } catch (err) {
       // ABORT ON ANYTHING — a failed spawn, `unmergedPaths` throwing, the deliberate throw above.
       // Never leave the clone mid-revert, the rule `runRebaseStep`/`tryRebase` already follow.
@@ -2560,30 +2614,6 @@ export class GitService {
       .filter(Boolean)
       .map((rel) => toPosix(rel))
       .sort();
-  }
-
-  /**
-   * Per-file added/removed between `ref` and the WORKING TREE, restricted to `paths` — the
-   * comparison behind `revert`'s `matchesRef`. An empty result means those paths match `ref`
-   * exactly.
-   *
-   * It lives here, not in the tool, because "do these paths match this ref" is a git question:
-   * the tool formats the answer. One `diff --numstat` spawn for the whole set, deliberately —
-   * asking {@link diff} per path re-validates the ref and builds a full unified patch that is
-   * then thrown away, three spawns a path, so a 200-file revert cost ~600 of them.
-   *
-   * `paths` must be non-empty: a numstat with no pathspec diffs the WHOLE tree, which would
-   * answer a question nobody asked (and, for `matchesRef`, silently fold a peer's unrelated
-   * dirty file into this revert's verdict). Callers with nothing to compare have no assertion
-   * to make and must not call this.
-   */
-  async diffAgainstRef(dir: string, ref: string, paths: string[]): Promise<DiffFile[]> {
-    if (paths.length === 0) throw new Error('diffAgainstRef requires at least one path.');
-    const git = simpleGit(dir);
-    // Validated, not interpolated blind: an unknown ref (or a leading `-`) is named here rather
-    // than surfacing as a raw git error, exactly as `resolveDiffRef` does for `diff`.
-    const resolved = await this.resolveCommitish(git, ref);
-    return this.numstat(git, [resolved, '--', ...paths]);
   }
 
   /**
