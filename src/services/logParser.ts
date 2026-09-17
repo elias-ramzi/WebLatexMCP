@@ -188,9 +188,11 @@ const CONTEXT_LOOKAHEAD = 8;
 /**
  * `-file-line-error` form: "./main.tex:12: Undefined control sequence."
  *
- * Shared, via `.exec()` in `parseLog` and `.test()` in `nextContext` and the
- * `ALWAYS_KEEP_PATTERNS` loop. Flags must stay empty — no `g`/`y` — or `lastIndex` persists across
- * those call sites and produces alternating misses that look like a parser flake, not a regex bug.
+ * Shared, via `.exec()` in `parseLog` and `.test()` in `nextContext` and both of `filterLog`'s
+ * pattern loops — {@link KEEP_PATTERNS} (it is the line naming what failed) and
+ * {@link ALWAYS_KEEP_PATTERNS} (so no warning filter can take it away). Flags must stay empty — no
+ * `g`/`y` — or `lastIndex` persists across those call sites and produces alternating misses that
+ * look like a parser flake, not a regex bug.
  */
 const FILE_LINE_ERROR = /^(?:\.\/)?([^:\s][^:]*\.\w+):(\d+): (.+)$/;
 
@@ -473,6 +475,14 @@ const KEEP_PATTERNS: RegExp[] = [
   /Warning:/, // LaTeX / package / class / font warnings, incl. "Label(s) may have changed"
   /pdfTeX warning/,
   /Error:/, // LaTeX / package errors printed inline (no leading "! ")
+  // The `-file-line-error` form latexmk asks for: `./main.tex:5: Undefined control sequence.` — no
+  // leading `! `, no inline `Error:`, so nothing above matched it and the de-noiser kept only the
+  // `l.<n>` echo below it. The tail said *where* the compile failed and never *what* failed, which
+  // is the whole message. (`parseLog` was always right about these — it tests this same regex first
+  // — so the gap hit only a client reading `logTail`.) Filter-exempt for free: the same regex sits
+  // in {@link ALWAYS_KEEP_PATTERNS}, mirroring `parseLog`'s branch order, so the two partitions
+  // stay aligned rather than this becoming a kept line a warning filter could take away.
+  FILE_LINE_ERROR,
   /^(Overfull|Underfull) \\[hv]box/,
   /(may have changed|Rerun to get|Please rerun)/, // cross-reference rerun hints
   /^Output written on /, // the "(N pages, … bytes)" summary
