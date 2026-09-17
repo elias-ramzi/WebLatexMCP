@@ -1,12 +1,15 @@
 export const meta = {
   name: 'review-round',
   description:
-    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, fable signs off (fable swappable for opus)',
+    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, opus signs off (planner and sign-off models are separate knobs)',
   whenToUse:
     'To review-and-fix a branch or PR in one pass: Workflow({name: "review-round"}) reviews the current branch ' +
     'against origin/dev itself. Optional args: {review: "<posted review-comment URL>" to fix an existing review ' +
     'instead of producing one, pr: <number>, branch: "<name>", base: "origin/dev", max_attempts: 2, commit: true, ' +
-    'fable: false — or fable_model: "opus" — to run the planner and sign-off on opus instead}. ' +
+    'fable: false — or fable_model: "opus" — to run the PLANNER on opus instead (it no longer governs the ' +
+    'sign-off), signoff_model: "fable" | "sonnet" | "opus" for the sign-off auditor, which defaults to opus}. ' +
+    "While commit: true, the sign-off may not run below the verifier's tier (opus) — it reads the whole diff, " +
+    'runs the gate and commits and pushes unattended — so a cheaper auditor needs {commit: false}. ' +
     'Batches run sequentially (shared files), so wall-clock is the sum of batches.',
   phases: [
     {
@@ -17,7 +20,8 @@ export const meta = {
     },
     {
       title: 'Plan',
-      detail: 'fable (or opus, with args.fable === false) batches the findings into coherent fixes',
+      detail:
+        'fable (or opus, with args.fable === false / args.fable_model) batches the findings into coherent fixes — that knob governs this phase only',
       model: 'fable',
     },
     {
@@ -33,8 +37,8 @@ export const meta = {
     {
       title: 'Sign-off',
       detail:
-        'fable (or opus, with args.fable === false) audits the whole diff, runs the gate, commits',
-      model: 'fable',
+        'opus audits the whole diff, runs the gate, commits and pushes (args.signoff_model, which a committing round may not set below the verifier tier)',
+      model: 'opus',
     },
   ],
 };
@@ -64,13 +68,56 @@ const BASE = (args && args.base) ?? 'origin/dev';
 if (typeof BASE !== 'string' || !BASE.trim()) {
   throw new Error(`base must be a non-empty string, got ${JSON.stringify(BASE)}`);
 }
-// The planner and the sign-off auditor both run on fable by default. Pass {fable: false} — or
-// name one outright with {fable_model: 'opus'} — to run both on opus instead. One knob for both:
-// they are the two ends of the same whole-round view, and splitting them invites a plan written
-// at one altitude being audited at another.
-const FABLE = args && args.fable === false ? 'opus' : (args && args.fable_model) || 'fable';
-if (FABLE !== 'fable' && FABLE !== 'opus') {
-  throw new Error(`fable_model must be "fable" or "opus", got ${JSON.stringify(FABLE)}`);
+// The planner runs on fable by default: it re-batches findings another agent has already
+// written down. Pass {fable: false} — or name one outright with {fable_model: 'opus'} — to plan
+// on opus instead. This knob governs the PLANNER ONLY (#81). One knob used to set both ends, on
+// the argument that they are two halves of the same whole-round view — but that argument is
+// about planning. The auditor's job is adversarial reading of the whole diff plus git surgery,
+// and every unrecoverable act of the round lives there: the gate, the "trivial" gate fixes, and
+// the unattended `git add`/`commit`/`push`. It gets its own knob, below, and its own floor.
+const PLANNER = args && args.fable === false ? 'opus' : (args && args.fable_model) || 'fable';
+if (PLANNER !== 'fable' && PLANNER !== 'opus') {
+  throw new Error(`fable_model must be "fable" or "opus", got ${JSON.stringify(PLANNER)}`);
+}
+// The auditor's own knob. `??`, not `||`, like every other input above.
+const SIGNOFF = (args && args.signoff_model) ?? 'opus';
+// Cheapest first. The floor below compares by RANK — an `=== 'opus'` equality check would read
+// the same on the two ends and say nothing about anything in between.
+const MODEL_TIER = { fable: 0, sonnet: 1, opus: 2 };
+// The model the per-batch verifier ACTUALLY runs on: the floor is compared against this
+// constant, and the agent() call below uses it too, so the two cannot drift apart.
+const VERIFIER_MODEL = 'opus';
+// `hasOwnProperty`, not `in`: `'toString' in MODEL_TIER` is true through the prototype chain,
+// which would rank a model that is not in the map. Unknown ranks as null, never as a number.
+const tierOf = (model) =>
+  typeof model === 'string' && Object.prototype.hasOwnProperty.call(MODEL_TIER, model)
+    ? MODEL_TIER[model]
+    : null;
+// Unranked is refused on its own terms, BEFORE the floor: `null < 2` is true in JS, so an
+// unranked value would otherwise be absorbed by the floor and reported as too cheap when the
+// truth is that nobody here knows what it is.
+if (tierOf(SIGNOFF) === null) {
+  throw new Error(
+    `signoff_model must be one of ${Object.keys(MODEL_TIER).join(', ')}, got ${JSON.stringify(SIGNOFF)}`,
+  );
+}
+// Fail closed on this script's OWN configuration, whatever the round asked for: if the verifier
+// model is not in the map, `tierOf(SIGNOFF) < null` is false and the floor would pass silently
+// for every value — the guard still present, no longer guarding anything.
+if (tierOf(VERIFIER_MODEL) === null) {
+  throw new Error(
+    `verifier model ${JSON.stringify(VERIFIER_MODEL)} is not ranked in MODEL_TIER — an unranked verifier model makes the sign-off floor unenforceable; add it to MODEL_TIER`,
+  );
+}
+// The floor, and deliberately NOT a default: a default is flipped back by an edit that means no
+// harm, and the cost here is an unattended commit and push audited more cheaply than the agent
+// whose verdict it is shipping. This is the one thing in the round that cannot be undone from
+// inside the round, so it refuses out loud — synchronously, before an agent spawns — rather
+// than being a value someone may quietly lower.
+if (COMMIT && tierOf(SIGNOFF) < tierOf(VERIFIER_MODEL)) {
+  throw new Error(
+    `signoff_model ${JSON.stringify(SIGNOFF)} is below the verifier's tier (${VERIFIER_MODEL}): the sign-off reads the whole diff, runs the gate, and commits and pushes unattended, so it may not run below the tier of the agent that verified what it is committing. Pass {commit: false} for an advisory round, or raise signoff_model to ${VERIFIER_MODEL}.`,
+  );
 }
 
 const prFromUrl = review ? (review.match(/\/pull\/(\d+)/) || [])[1] : null;
@@ -172,7 +219,11 @@ print. Change nothing: no commit, no checkout, no stash, no edit — this is a m
 acting on what you find is not your job.
 - git branch --show-current
 ${PR ? `- gh pr view ${PR} --json headRefName --jq .headRefName` : '- (no PR this round — report head_branch as "")'}
-- git status --porcelain
+- git -c core.quotePath=false status --porcelain -uall
+  (both flags matter: without \`-uall\` a wholly new directory collapses to one \`?? dir/\` line
+  and the files inside it are never reported, and without \`core.quotePath=false\` a non-ASCII
+  path comes back C-quoted. The sign-off compares this list against the paths the round claims,
+  so the two measurements have to be taken the same way.)
 For dirty_paths, report the paths alone — strip the leading status characters (\`cut -c4-\`),
 and for a rename line report the path after the "->". A raw status line is not a path.`,
   { label: 'preflight', phase: 'Review', schema: PREFLIGHT_SCHEMA, agentType: 'plan-verifier' },
@@ -275,7 +326,7 @@ fix, and read the cited code yourself:
 ${reviewText}`;
 }
 
-// ---- Phase 1: fable plans ----------------------------------------------
+// ---- Phase 1: the planner plans -----------------------------------------
 phase('Plan');
 const PLAN_SCHEMA = {
   type: 'object',
@@ -327,7 +378,7 @@ explicitly any batch that touches guard code, runExclusive/lock paths, the shado
 credential handling — those need the invariant-preservation treatment. Note in each spec which
 findings interact with fixes from earlier batches in this same run. If the review genuinely
 found nothing to fix, return zero batches and shared_context "NOTHING_TO_FIX".`,
-  { model: FABLE, label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
+  { model: PLANNER, label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA },
 );
 if (!plan) {
   throw new Error('planner returned nothing — refusing to implement an unplanned round');
@@ -336,7 +387,7 @@ if (!plan.batches.length) {
   log('review found nothing to fix — done');
   return {
     review: review || 'produced in-run',
-    planner: FABLE,
+    planner: PLANNER,
     batches: [],
     preexisting_dirty: PRE_DIRTY,
     signoff: 'nothing to fix',
@@ -404,14 +455,34 @@ for (const batch of plan.batches) {
   let verdict = { approved: false, feedback: 'never ran', boundary_probes: '' };
   while (attempt < MAX_ATTEMPTS) {
     attempt += 1;
+    // Each entry names the FILES that batch reported changing (#81). The planner ordered the
+    // batches so earlier ones would not invalidate later specs, but it did that before any
+    // batch ran: a batch reworked since can have moved the very code a later spec describes,
+    // and a done-list naming no file left that invisible to the agent executing it. `files` is
+    // [] when an implementer returned nothing, which is not the same claim as "touched
+    // nothing" — say so rather than trailing off.
     const done =
-      results.map((r) => `${r.batch}: ${r.approved ? 'landed' : 'landed unapproved'}`).join('; ') ||
-      'none yet';
+      results
+        .map((r) => {
+          const outcome = r.approved ? 'landed' : 'landed unapproved';
+          const files = r.files || [];
+          return `${r.batch}: ${outcome} — ${files.length ? `files: ${files.join(', ')}` : '(no files reported)'}`;
+        })
+        .join('\n') || 'none yet';
     implReport = await agent(
       `You are the implementer. ${HOUSE}
 
 Shared context from the planner: ${plan.shared_context}
-Batches already implemented this run (their changes are in the working tree): ${done}
+Batches already implemented this run (their changes are in the working tree), with the files
+each one reported changing:
+${done}${
+        results.length
+          ? `
+The plan's batch ordering was computed before any batch ran, so a batch reworked since may have
+moved the code your own spec describes. Read those files as they are NOW, not as the spec
+describes them. Where the two disagree, the tree is what is true.`
+          : ''
+      }
 
 Implement this batch spec, TEST FIRST (write the failing regression tests, watch them fail on
 the pre-fix code, then fix until green). Do not commit — a later sign-off step commits. Do not
@@ -519,7 +590,7 @@ Verify adversarially, in this order:
    batch's defect pattern elsewhere in src/? Grep.
 Approve ONLY if all pass. If rejecting, give file:symbol-precise rework instructions.`,
       {
-        model: 'opus',
+        model: VERIFIER_MODEL,
         label: `verify:${batch.name}#${attempt}`,
         phase: 'Verify',
         schema: VERDICT_SCHEMA,
@@ -548,9 +619,20 @@ Approve ONLY if all pass. If rejecting, give file:symbol-precise rework instruct
   );
 }
 
-// ---- Phase 4: fable signs off -------------------------------------------
+// ---- Phase 4: the auditor signs off --------------------------------------
 phase('Sign-off');
 const unapproved = results.filter((r) => !r.approved);
+// The one condition under which this round's auditor may touch the tree at all. Step 2 grants
+// the write authority and step 5 spends it, so they read the SAME expression: a `{commit:false}`
+// round whose step 2 still carved out "plus the one git add/commit/push sequence in step 5" was
+// handing an advisory auditor the exception while step 5 told it not to commit — and `{commit:
+// false}` is precisely the escape hatch the sign-off tier floor (#81) points a cheaper auditor at.
+const MAY_COMMIT = COMMIT && unapproved.length === 0;
+// The exact set this round may `git add` (#81, finding 3), deduplicated: two batches touching
+// one file claim it once. `files` is [] when an implementer returned nothing and absent on any
+// shape we did not write, so it is guarded the way PRE_DIRTY is — an unguarded field access
+// here would turn an unreadable report into an empty claim, which reads as "commit nothing".
+const CLAIMED = [...new Set(results.flatMap((r) => r.files || []))];
 const signoff = await agent(
   `You are the final auditor. ${HOUSE}
 
@@ -573,8 +655,13 @@ Batch outcomes: ${JSON.stringify(results)}
    is exactly what that rule forbids.
    You have NO authority to change the tree with git, for any purpose: no \`stash\`,
    \`reset\`, \`checkout\`, \`restore\`, \`clean\`, \`switch\`, \`worktree\`, \`rebase\`
-   or \`merge\` — \`git diff\`/\`log\`/\`show\`/\`status\` only, plus the one
-   \`git add\`/\`commit\`/\`push\` sequence in step 5. The stash stack is repo-global: a stash
+   or \`merge\` — \`git diff\`/\`log\`/\`show\`/\`status\` only${
+     MAY_COMMIT
+       ? `, plus the one
+   \`git add\`/\`commit\`/\`push\` sequence in step 5`
+       : ` — and no other git command at all: this round does not
+   commit, as step 5 says`
+   }. The stash stack is repo-global: a stash
    here surfaces in sibling worktrees and discards the round.
    Then run the complete gate. Fix trivial gate failures (a prettier reflow, a lint autofix,
    an import) yourself, but ONLY in the paths this round's batches claim — a repo-wide
@@ -589,7 +676,7 @@ Batch outcomes: ${JSON.stringify(results)}
    (shadow store / commitContents untouched or deliberately changed), no credential can reach
    disk or a result message, and errors stay token-scrubbed.
 ${
-  COMMIT && unapproved.length === 0
+  MAY_COMMIT
     ? `5. If and only if the gate is green and you found no substantive problem: commit and push.
    FIRST, before \`git add\` and before anything else in this step, re-check the branch: run
    \`git branch --show-current\`. Stop unless it is exactly ${currentBranch} — the branch a
@@ -597,20 +684,47 @@ ${
    The preflight already refused those, but this checkout is shared and a peer session can
    switch branches while a round is in flight; the measurement that decides is the one taken
    immediately before the commit, not the one taken before the first batch.
+   SECOND, still before \`git add\`, re-measure the tree: run
+   \`git -c core.quotePath=false status --porcelain -uall\`. Both flags are load-bearing for the
+   comparison below, and neither is the default: without \`-uall\` an entirely new directory
+   collapses to one \`?? dir/\` line and a claimed path inside it never appears at all (a
+   test-first round creating a fixture directory is the ordinary case), and without
+   \`core.quotePath=false\` a path with a non-ASCII byte comes back C-quoted as
+   \`"caf\\303\\251.tex"\` and matches nothing — the same reason CLAUDE.md puts that flag on every
+   path-returning git call in the server.
+   Claimed paths (the exact set this round may add): ${CLAIMED.length ? CLAIMED.join(', ') : '(none — no batch reported a file, so there is nothing to commit by path; stop and report)'}
+   If any claimed path no longer appears in that fresh status AT ALL — any status code counts as
+   present, the \`??\` of a file this round created and the \` D\` of one it deleted on purpose
+   included, so this is about a path that has gone quiet, not about which letter it carries —
+   stop and report the round rather than committing: something moved it after the batch reported
+   it — a later batch reverted it, or someone else committed it — and adding it now
+   would commit whatever moved it, not what this round verified. (A rename is not on that list
+   on purpose: unstaged, it is \` D old\` plus \`?? new\`, both of which count as present. If a
+   claimed path shows \` D\` and no batch says it deleted that file, that is a substantive
+   finding to report, not something the letter alone decides.) As with the
+   branch, the measurement that decides is the one you take immediately before \`git add\`, not
+   the one a batch reported earlier. Read that same status the other way round too: one
+   measurement, two directions — a claimed path that has vanished from it, and an unclaimed
+   path that has appeared. Do BOTH readings before you add anything, even though the second is
+   spelled out below, after the commit instruction.
+   Honest limit (#81, finding 3): \`git add <path>\` takes the whole file, so a peer session that
+   edited a different region of a path this round legitimately claims still has its lines
+   committed with the round's. This check turns the silent version of that into a stop; it does
+   NOT make the commit line-accurate, and the hole is still open. Report anything it catches.
    Then commit BY PATH — \`git add\` exactly the paths this round's batches reported changing, listed
    above, and nothing else. Never \`git add -A\`, never \`git commit -a\`, never "commit
    everything": this checkout is shared with other agent sessions, and CLAUDE.md's longest
    section exists to guarantee that a commit contains one session's lines and nobody else's —
    do not break by hand the invariant this repo builds a shadow store to keep.${
      PRE_DIRTY.length
-       ? ` These paths were already modified before the round began and are a peer's in-flight work — they must NOT be committed: ${PRE_DIRTY.join(', ')}.`
+       ? ` These paths were already modified before the round began and are a peer's in-flight work — they must NOT be committed: ${PRE_DIRTY.join(', ')}. If one of them is also a claimed path, this round edited a file a peer already had in flight: leave it uncommitted anyway. The claimed list says which paths this round MAY add, never which it must.`
        : ''
    }
-   If \`git status --porcelain\` shows a modified path that no batch claims AND that was not in
-   the pre-existing list above, stop and report it rather than committing it — it appeared
-   during the round and nobody here owns it. A path already in that list is expected: leave it
-   uncommitted and carry on. Write a message describing the round, with the Co-Authored-By
-   trailer per house style.
+   The other direction of that same fresh \`git status --porcelain\`: if it shows a modified path
+   that no batch claims AND that was not in the pre-existing list above, stop and report it
+   rather than committing it — it appeared during the round and nobody here owns it. A path
+   already in that list is expected: leave it uncommitted and carry on.
+   Write a message describing the round, with the Co-Authored-By trailer per house style.
    Then \`git push\` plainly. Never \`--force\` and never \`--force-with-lease\`: nothing in
    this round rewrites history, so a rejected push means the remote moved under you — stop and
    report it for a human, exactly as step 2 does.`
@@ -618,12 +732,15 @@ ${
 }
 
 Your final text: gate result, whether you committed (and the SHA), unresolved concerns.`,
-  { model: FABLE, label: 'sign-off', phase: 'Sign-off' },
+  { model: SIGNOFF, label: 'sign-off', phase: 'Sign-off' },
 );
 
 return {
   review: review || 'produced in-run',
-  planner: FABLE,
+  planner: PLANNER,
+  // Which model actually held the diff, the gate and the push — a completed round records it,
+  // because after the fact the prompt is gone and the commit is not.
+  auditor: SIGNOFF,
   batches: results,
   preexisting_dirty: PRE_DIRTY,
   signoff: signoff ?? 'sign-off returned nothing — tree left uncommitted for a human',
