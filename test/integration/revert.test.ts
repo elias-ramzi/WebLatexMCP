@@ -878,3 +878,258 @@ describe('revert when the session heartbeat fails', () => {
     expect(Object.keys(after.entries)).not.toContain('main.tex');
   });
 });
+
+// 17. `matchesRef` must be `null`, never `true`, on a SUCCESSFUL revert with no `expectRef`.
+//     Test 3 looks like it covers this and cannot: the conflict branch returns its own hard-coded
+//     `matchesRef: null`, so dropping the null check on the success path left every test green
+//     while a revert that compared nothing started reporting "verified exact".
+describe('revert without an expectRef', () => {
+  it('reports matchesRef null, never true, when there was nothing to compare', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\n' }, 'add beta');
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true },
+    });
+
+    expect(isError(res)).toBe(false);
+    const sc = structured(res);
+    // The SUCCESS branch, not the conflict one — otherwise this passes for the wrong reason.
+    expect(sc.status).toBe('reverted');
+    expect(sc.reverted).toBe(true);
+    expect(await readFile(path.join(h.clone, 'main.tex'), 'utf8')).toBe('alpha\n');
+
+    expect(sc).toHaveProperty('matchesRef');
+    expect(sc.matchesRef).toBeNull();
+    expect(sc.expectRef).toBeNull();
+    expect(sc.mismatchedFiles).toEqual([]);
+    // ...and the text claims no verdict either way.
+    expect(plainText(res)).not.toMatch(/now match|do NOT match/);
+  });
+});
+
+// 18. A reverted `.tex` must be recorded as TEXT. `ShadowStore.record` flags an entry `binary`
+//     when either side arrives as a Buffer, stickily and for the life of the entry, and a binary
+//     entry is never three-way merged — so handing it Buffers unconditionally wedges every
+//     reverted `.tex` out of `scope: "session"` the moment a peer commit moves HEAD. Nothing
+//     pinned `asShadowContent`: returning the Buffer unconditionally left the whole suite green.
+describe('revert and the shadow content type', () => {
+  it('records a reverted .tex as text, so it is never stickily flagged binary', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\n' }, 'add beta');
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true },
+    });
+    expect(isError(res)).toBe(false);
+
+    const shadowIndex = path.join(
+      path.dirname(h.clone),
+      '.sessions',
+      'demo',
+      'test',
+      'shadow.json',
+    );
+    const index = JSON.parse(await readFile(shadowIndex, 'utf8')) as {
+      entries: Record<string, { binary?: boolean; conflicted?: boolean }>;
+    };
+    // The entry exists at all (the record loop ran)...
+    expect(index.entries['main.tex']).toBeDefined();
+    // ...and is text, and not already wedged.
+    expect(index.entries['main.tex']?.binary).not.toBe(true);
+    expect(index.entries['main.tex']?.conflicted).not.toBe(true);
+  });
+});
+
+// 19. `ctx.files.resetBaselines(dir)` — the revert rewrites files the server itself has read, so
+//     without the reset the next `edit_file` on a reverted path is refused with
+//     `ExternalChangeError` for a change the SERVER made. Deleting the call left every test green.
+describe('revert and the out-of-band-edit baselines', () => {
+  it('lets an edit_file on a reverted path through, instead of refusing the server’s own change', async () => {
+    const h = await setup({ 'main.tex': 'alpha\nbeta\n' });
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\ngamma\n' }, 'add gamma');
+    // `read_file` is what ARMS the guard: it records "the bytes the server last saw" for this
+    // path — the post-commit ones, which the revert is about to change underneath it.
+    const read = await h.client.callTool({
+      name: 'read_file',
+      arguments: { project: 'demo', path: 'main.tex' },
+    });
+    expect(isError(read)).toBe(false);
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true },
+    });
+    expect(isError(res)).toBe(false);
+    expect(await readFile(path.join(h.clone, 'main.tex'), 'utf8')).toBe('alpha\nbeta\n');
+
+    const edited = await h.client.callTool({
+      name: 'edit_file',
+      arguments: {
+        project: 'demo',
+        path: 'main.tex',
+        edits: [{ oldString: 'alpha', newString: 'ALPHA' }],
+      },
+    });
+    expect(isError(edited)).toBe(false);
+    expect(plainText(edited)).not.toMatch(/changed on disk|externally/i);
+    expect(await readFile(path.join(h.clone, 'main.tex'), 'utf8')).toBe('ALPHA\nbeta\n');
+  });
+});
+
+// 20-23. `GitService.linksAmong` finds a link FOUR ways — mode 120000 in HEAD's tree, in a
+//     reverted commit's tree or its parent's, an `lstat` on the path itself, and `linkedAncestor`
+//     over its parent directories. The existing symlink test uses a path that is a link in all of
+//     them at once, so each source could be deleted on its own with the suite still green. These
+//     isolate them: in each case exactly ONE source can see the link.
+describe.skipIf(process.platform === 'win32')('revert and each symlink source (posix only)', () => {
+  it('refuses a link that only a reverted commit’s tree knows about', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n', 'real.tex': 'real\n' });
+    // Commit A adds the link; commit B removes it again. At HEAD (= B) there is no `link.tex`,
+    // A's parent has none, and the working tree has none — the only place it is mode 120000 is
+    // A's own tree, so the `ls-tree` source is the only one that can fire.
+    await symlink('real.tex', path.join(h.clone, 'link.tex'));
+    await h.git.add('.');
+    await h.git.commit('add link.tex -> real.tex');
+    const addedLink = (await h.git.revparse(['HEAD'])).trim();
+    await h.git.rm(['link.tex']);
+    await h.git.commit('drop link.tex');
+    expect(await exists(path.join(h.clone, 'link.tex'))).toBe(false);
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [addedLink],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toContain('link.tex');
+    expect(outcome.message).toMatch(/symbolic link/i);
+    expect(outcome.message).not.toMatch(/not found/i);
+    // Nothing was restored, and the clone is untouched.
+    expect(await exists(path.join(h.clone, 'link.tex'))).toBe(false);
+    expect((await porcelain(h.git)).trim()).toBe('');
+  });
+
+  it('refuses a link planted on disk where every tree has a regular file', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const outside = await tmp('ovl-revert-outside-');
+    const target = path.join(outside, 'target.txt');
+    await writeFile(target, 'outside\n');
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\n' }, 'add beta');
+
+    // No tree anywhere calls `main.tex` a link, so only the path's own `lstat` can catch this —
+    // and it must, because writing the reverted content here would write outside the project.
+    await unlink(path.join(h.clone, 'main.tex'));
+    await symlink(target, path.join(h.clone, 'main.tex'));
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toContain('main.tex');
+    expect(outcome.message).toMatch(/symbolic link/i);
+    // The LINK refusal, not the dirty-path one: precedence matters, because the dirty check would
+    // send the caller to `discard`, which is not the problem here.
+    expect(outcome.message).not.toMatch(/uncommitted changes/i);
+    // The file outside the project was never written through.
+    expect(await readFile(target, 'utf8')).toBe('outside\n');
+    expect(await readlink(path.join(h.clone, 'main.tex'))).toBe(target);
+  });
+
+  it('refuses a path under a symlinked directory, which is a link nowhere itself', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    await commitInClone(h, { 'sub/a.tex': 'a\n' }, 'add sub/a.tex');
+    const sha = await commitInClone(h, { 'sub/a.tex': 'a\nb\n' }, 'edit sub/a.tex');
+
+    const outside = await tmp('ovl-revert-linkdir-');
+    await mkdir(path.join(outside, 'real'), { recursive: true });
+    await writeFile(path.join(outside, 'real', 'a.tex'), 'a\nb\n');
+    // `sub/a.tex` is a regular file in every tree AND through the link on disk, so neither the
+    // tree-mode check nor its own `lstat` fires. `linkedAncestor` is the only thing standing
+    // between the revert and a write into a directory outside the project.
+    await rm(path.join(h.clone, 'sub'), { recursive: true, force: true });
+    await symlink(path.join(outside, 'real'), path.join(h.clone, 'sub'));
+    expect((await lstat(path.join(h.clone, 'sub'))).isSymbolicLink()).toBe(true);
+    expect((await lstat(path.join(h.clone, 'sub', 'a.tex'))).isSymbolicLink()).toBe(false);
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toContain('sub/a.tex');
+    expect(outcome.message).toMatch(/symbolic link|lies under/i);
+    // Byte-identical outside the project.
+    expect(await readFile(path.join(outside, 'real', 'a.tex'), 'utf8')).toBe('a\nb\n');
+  });
+
+  it('refuses a .bib reached through an in-project link the literal name gate cannot see', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n', 'refs.bib': '@article{a, title={A}}\n' });
+    // `notes.tex` points at the bibliography, and the reverted commit REPOINTS it — so the
+    // touched set is `notes.tex` alone. `refs.bib` never appears in it, so the literal
+    // `isBibFile` gate cannot see the bibliography at the far end at all: unlike
+    // `write_file`/`edit_file`, `revert`'s .bib gate does not link-resolve. What protects the
+    // bibliography here is the link refusal, and nothing else — so it is pinned here.
+    await symlink('refs.bib', path.join(h.clone, 'notes.tex'));
+    await h.git.add('.');
+    await h.git.commit('add notes.tex -> refs.bib');
+    await unlink(path.join(h.clone, 'notes.tex'));
+    await symlink('main.tex', path.join(h.clone, 'notes.tex'));
+    await h.git.add('.');
+    await h.git.commit('repoint notes.tex -> main.tex');
+    const sha = (await h.git.revparse(['HEAD'])).trim();
+
+    // confirmBibEdit is deliberately NOT passed: it must not be what saves the bibliography, and
+    // it must not be what the caller is told to set either.
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toContain('notes.tex');
+    expect(outcome.message).toMatch(/symbolic link/i);
+    // The bibliography is byte-unchanged and the link still points where it did.
+    expect(await readFile(path.join(h.clone, 'refs.bib'), 'utf8')).toBe('@article{a, title={A}}\n');
+    expect(await readlink(path.join(h.clone, 'notes.tex'))).toBe('main.tex');
+    expect((await porcelain(h.git)).trim()).toBe('');
+  });
+});
+
+// 24. A revert may be a session's FIRST mutation (`project_sync` -> `diff` -> `revert` touches
+//     nothing else), and `SessionRegistry.touch` is the only thing that creates `session.json`
+//     — `runExclusive`'s lock file does not. Without it this session owns a `shadow.json` with no
+//     session record, `peers()` drops it, and a peer's `commit scope: "paths"` or `push` sweeps
+//     up the reverted lines as owned by nobody. Deleting the `touch` call left every other test
+//     green, including the heartbeat one, which injects a THROWING touch and so proves only the
+//     decoupling, never that the call happens at all.
+describe('revert as a session’s first mutation', () => {
+  it('registers the session as live, so its reverted lines are not owned by nobody', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\n' }, 'add beta');
+    const record = path.join(path.dirname(h.clone), '.sessions', 'demo', 'test', 'session.json');
+    // The precondition, asserted rather than assumed: `project_sync` does not touch the registry,
+    // so nothing has registered this session yet and the revert is genuinely its first mutation.
+    expect(await exists(record)).toBe(false);
+
+    const res = await h.client.callTool({
+      name: 'revert',
+      arguments: { project: 'demo', commits: [sha], confirm: true },
+    });
+
+    expect(isError(res)).toBe(false);
+    expect(structured(res).status).toBe('reverted');
+    expect(await exists(record)).toBe(true);
+    const parsed = JSON.parse(await readFile(record, 'utf8')) as { sessionId?: string };
+    expect(parsed.sessionId).toBe('test');
+  });
+});
