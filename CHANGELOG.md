@@ -862,6 +862,40 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   remote like two people would. Verified rather than asserted: this repo's TeX smoke suite, real
   `latexmk` compiles and `render_pages` rasterization included, passes unmodified in that VM.
 
+- **A `revert` tool: walk a commit back without a shell** (#85). `discard` resets the working tree to
+  HEAD; nothing could reach past it, so undoing a change that had already been committed meant
+  leaving the server entirely. On a manuscript that is a normal round of review — prose gets written,
+  pushed, read in the Overleaf editor and rejected — and it is the one git operation that must not be
+  improvised, because a shell-less client's alternatives (re-editing the file from the model's memory
+  of it, or `discard` after a reset) either drift from the real prior state or destroy work.
+  `revert` takes one or more shas, requires `confirm: true`, and reverts **into the working tree
+  without committing** (`git revert --no-commit`, then unstaged), leaving the caller to review with
+  `diff` and land it with `commit` — the same two-step separation `commit`/`push` already enforces,
+  and it keeps the revert's message in the caller's hands.
+
+  The field that makes it a tool rather than a shortcut is **`matchesRef`**: given an `expectRef`
+  (normally the commit before the one being reverted), it answers whether the reverted files now
+  equal it — turning "I ran a revert" into "the revert is exact", which `diff` cannot do because it
+  returns a unified diff for a human to read rather than an assertion a caller can branch on. It is
+  compared over the **reverted paths only**, deliberately: a peer session's unrelated dirty file must
+  not make an exact revert report false. A `false` comes back with the mismatching per-file counts,
+  so it is actionable rather than a bare boolean.
+
+  Refusals happen before anything is written, in a fixed precedence: a **merge commit** (named, since
+  `revert` takes no mainline parameter), a **symlinked path** on either side or under a linked
+  directory (a revert writing through a link would write outside the project — refused, never
+  followed), a **`.bib`** in the reverted set without `confirmBibEdit`, a **dirty touched path**,
+  which is what keeps the revert off another session's in-flight lines and makes the abort exact,
+  and **anything staged anywhere in the clone**. That last one is not fastidiousness: a conflicting
+  revert can only be undone with `git revert --abort`, which is a `reset --merge` to the stored head
+  and resets the _whole_ index — verified against real git, a peer session's `git add`ed file on a
+  path the revert never touches comes back at HEAD with its staged work destroyed. Refusing up front
+  is what makes the abort provably safe rather than usually safe, and it has to be up front, because
+  once the conflict is known the loss is already unavoidable. A
+  **conflicting revert aborts** and leaves nothing behind — no markers, no partly-applied commits,
+  and an unrelated dirty file untouched — returning the conflicted paths plus the two refs to read
+  each side from with `read_file`.
+
 ### Changed
 
 - **The settle policy leaves the `commit` tool handler for `src/lib/commitSettle.ts`** (#70). Which

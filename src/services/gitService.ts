@@ -473,6 +473,74 @@ export async function linkedAncestor(dir: string, rel: string): Promise<string |
 }
 
 /**
+ * What the reverted commits touch, and every reason a revert of them would be refused. Read-only:
+ * {@link GitService.revertPreflight} produces it without writing an index, a working-tree file or
+ * a `.git` state file, so the tool layer can decide and refuse before anything is mutated.
+ */
+export interface RevertPreflight {
+  /** Full 40-char shas, in the order given by the caller (the order they will be applied). */
+  commits: string[];
+  /** Repo-relative POSIX paths the reverted commits touch, deduplicated, sorted. */
+  touchedPaths: string[];
+  /** Touched paths with uncommitted working-tree, index or untracked state. Empty when clean. */
+  dirtyPaths: string[];
+  /** Touched paths that are a symlink in HEAD, in a reverted commit or its parent, or on disk, or that lie under a symlinked directory. */
+  linkPaths: string[];
+  /**
+   * Every path in the clone whose INDEX differs from HEAD — staged content, anywhere, not only
+   * under `touchedPaths`. It is here because of how a conflicting revert has to be undone:
+   * `git revert --abort` is a `reset --merge` to the stored head, and it silently resets the
+   * whole index. Verified against real git: a peer session's `git add`ed file on a path the
+   * revert never touches comes back at HEAD's content, its staged work gone — the same class of
+   * destruction that makes a whole-tree `reset --hard` forbidden here. The tool refuses while
+   * anything is staged, which makes the abort provably safe (with an index equal to HEAD there is
+   * nothing for it to destroy) rather than merely usually safe.
+   */
+  stagedPaths: string[];
+  /** Of `commits`, those that are merge commits (git revert needs -m for these; we refuse them). */
+  mergeCommits: string[];
+  /**
+   * The ref holding what the revert would RESTORE — the sole parent of the sole reverted commit.
+   * `null` for a multi-commit revert (each commit restores its own parent, so no single ref names
+   * "their side" for every conflicted path) and for a root commit (which has no parent, so
+   * `<sha>^` would not resolve and a caller told to read it would just get "Unknown git ref").
+   * Reported to the caller as `theirsRef` on a conflict; naming the wrong side is worse than
+   * naming none.
+   */
+  restoreRef: string | null;
+}
+
+export interface RevertResult {
+  status: 'reverted' | 'conflict';
+  /** Full shas, in applied order. */
+  commits: string[];
+  /** Per-file added/removed of the revert as it now sits in the working tree, vs HEAD. Empty on conflict. */
+  files: DiffFile[];
+  filesChanged: number;
+  /**
+   * Per-file added/removed between `expectRef` and the reverted tree, over the reverted paths —
+   * empty means they match it exactly. `null` when no `expectRef` was given (and on a conflict),
+   * which is what keeps `matchesRef` from claiming `true` having compared nothing.
+   */
+  mismatchedFiles: DiffFile[] | null;
+  /** Every path git reported conflicted. Uncapped. Empty unless status === 'conflict'. */
+  conflictPaths: string[];
+}
+
+/**
+ * A commit-ish the caller named that git cannot resolve, or that is refused outright. A class,
+ * not a message, for the same reason {@link NothingToCommitError} is one: the tool layer decides
+ * how to word a bad-commit refusal, and that decision must hang on the error's type rather than
+ * on its prose.
+ */
+export class BadCommitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BadCommitError';
+  }
+}
+
+/**
  * Wraps git operations via the system `git` CLI (through simple-git). Auth is injected
  * in-memory per network call and never persisted to .git/config.
  */
@@ -2188,6 +2256,401 @@ export class GitService {
       await fn();
     } finally {
       await git.remote(['set-url', 'origin', gitUrl]);
+    }
+  }
+
+  /**
+   * Everything the tool layer needs to decide whether reverting `commits` may proceed. Pure
+   * inspection: this writes NOTHING — no index, no working-tree file, no `.git` state — so a
+   * refusal costs the clone nothing and the caller can report every reason at once instead of
+   * discovering the second one after the first has already been undone.
+   *
+   * `expectRef`, when given, is validated on exactly the same terms as each commit (leading `-`
+   * refused, must resolve to a commit here). It has no field on {@link RevertPreflight} to be
+   * reported in — validating it is its whole effect, so a caller naming a ref that does not exist
+   * in this clone is told so here rather than by a raw git error later.
+   *
+   * Every refusal reason is collected, never acted on: the decision is the tool's.
+   */
+  async revertPreflight(
+    dir: string,
+    commits: string[],
+    expectRef?: string,
+  ): Promise<RevertPreflight> {
+    const git = simpleGit(dir);
+    const shas: string[] = [];
+    for (const ref of commits) shas.push(await this.resolveCommitish(git, ref));
+    if (expectRef !== undefined) await this.resolveCommitish(git, expectRef);
+
+    const lineage = await this.commitLineage(git, shas);
+    // `git revert` of a merge needs `-m <parent>` to say which side is "the change". We refuse
+    // such a commit by name rather than growing a `mainline` parameter and guessing for the user.
+    const mergeCommits = lineage.filter((c) => c.parents.length > 1).map((c) => c.sha);
+
+    const touched = new Set<string>();
+    for (const sha of shas) {
+      // `show`, not `diff <sha>^ <sha>`: a root commit has no `^`, and `show` handles it.
+      // `--no-renames` keeps a move as a delete plus an add, so both names are guarded (the
+      // same reason `numstat`/`logCommits` carry it); `core.quotePath=false` keeps a non-ASCII
+      // path as UTF-8 rather than `"r\303\251sum\303\251.tex"`, which no later call could match.
+      const out = await git.raw([
+        '-c',
+        'core.quotePath=false',
+        '--literal-pathspecs',
+        'show',
+        '--no-renames',
+        '--name-only',
+        '--format=',
+        sha,
+      ]);
+      for (const line of out.split('\n')) {
+        const rel = line.trim();
+        if (rel) touched.add(toPosix(rel));
+      }
+    }
+    const touchedPaths = [...touched].sort();
+
+    const [dirtyPaths, linkPaths, stagedPaths] = await Promise.all([
+      this.dirtyAmong(git, touchedPaths),
+      this.linksAmong(dir, git, lineage, touchedPaths),
+      this.stagedAnywhere(git),
+    ]);
+    const only = lineage.length === 1 ? lineage[0] : undefined;
+    const restoreRef = only && only.parents.length === 1 ? (only.parents[0] ?? null) : null;
+    return {
+      commits: shas,
+      touchedPaths,
+      dirtyPaths,
+      linkPaths,
+      stagedPaths,
+      mergeCommits,
+      restoreRef,
+    };
+  }
+
+  /**
+   * Apply the revert of `commits` (full shas from {@link revertPreflight}, in that order) into the
+   * WORKING TREE only — nothing is committed and nothing is left staged. `touchedPaths` is the
+   * preflight's list; it scopes the unstaging and the diffstat, so a `git add` this session made
+   * elsewhere survives untouched.
+   *
+   * Preconditions the tool guarantees: every preflight guard came back clean (no merge commit, no
+   * dirty touched path, no link) and the whole call runs inside `runExclusive`.
+   *
+   * On a conflict nothing is left behind: the conflicted paths are collected, the revert is
+   * aborted (which rolls back shas that had already applied cleanly and leaves an unrelated dirty
+   * file alone — which is why a whole-tree `reset --hard` is forbidden here: it would destroy a
+   * peer session's uncommitted work), and the caller gets the paths to act on.
+   *
+   * `expectRef` (already validated by {@link revertPreflight}) is measured here rather than by the
+   * caller afterwards, and that placement is load-bearing — see the `--cached` comment below.
+   */
+  async revertApply(
+    dir: string,
+    commits: string[],
+    touchedPaths: string[],
+    expectRef?: string,
+  ): Promise<RevertResult> {
+    if (commits.length === 0) throw new BadCommitError('No commits to revert.');
+    // These are the preflight's own shas, but `git revert` has no `--` to separate revisions from
+    // options, so a leading `-` would be read as one. Fail closed rather than trust the caller.
+    for (const sha of commits) {
+      if (sha.startsWith('-')) throw new BadCommitError(`Invalid commit "${sha}".`);
+    }
+    const git = simpleGit(dir);
+    // Resolved BEFORE the revert runs, so a ref this clone cannot answer for is a refusal that
+    // costs nothing rather than an error over a revert that has already landed. The preflight
+    // validated it too; doing it again here is the same fail-closed stance `commits` gets above.
+    const expectSha =
+      expectRef === undefined ? undefined : await this.resolveCommitish(git, expectRef);
+    try {
+      // `execCapture`, not `git.raw`: a conflict IS a non-zero exit, and simple-git turns that
+      // into a rejection that loses the exit code the two branches below turn on. Same seam, and
+      // the same reason, as `resetIndexToHead`'s direct shell-out.
+      const res = await execCapture(
+        'git',
+        ['--literal-pathspecs', 'revert', '--no-commit', ...commits],
+        { cwd: dir },
+      );
+      if (res.code !== 0) {
+        // Collect the conflicted paths BEFORE aborting — the abort erases them.
+        const conflictPaths = await this.unmergedPaths(git);
+        if (conflictPaths.length === 0) {
+          // Non-zero with nothing unmerged is not a conflict (a refused merge commit, a dirty
+          // tree, a bad sha). Reporting it as `status: 'conflict'` with no paths would hand the
+          // caller a conflict they cannot resolve; surface git's own words instead. The catch
+          // below aborts any dangling revert before this propagates, exactly as `tryRebase` does.
+          throw new Error(`git revert failed: ${res.stderr.trim() || res.stdout.trim()}`);
+        }
+        await git.raw(['revert', '--abort']);
+        return {
+          status: 'conflict',
+          commits,
+          files: [],
+          filesChanged: 0,
+          mismatchedFiles: null,
+          conflictPaths,
+        };
+      }
+      // `revert --no-commit` leaves `.git/REVERT_HEAD` behind EVEN ON SUCCESS (verified against
+      // real git), so without this the clone sits mid-revert and a later `commit` would silently
+      // pick up git's own revert message. Not obvious, and not optional.
+      await git.raw(['revert', '--quit']);
+      // MEASURE BEFORE UNSTAGING, and measure the INDEX (`--cached`), not the working tree.
+      //
+      // The unstage below scopes `git reset HEAD -- <paths>`, which drops from the index every
+      // path HEAD does not have — and reverting a commit that DELETED a file restores exactly
+      // such a path. Afterwards the restored file is untracked, and `git diff <ref> -- <path>`
+      // ignores untracked files entirely: `git diff HEAD` reported nothing (so `files` came back
+      // empty and the tool said "reverted — 0 file(s)" over a file it had just restored), and
+      // `git diff <expectRef>` reported it as a DELETION (so `matchesRef` came back `false`, with
+      // a bogus `mismatchedFiles` entry, for a revert that was exactly right).
+      //
+      // The index at this point is precisely the reverted tree — `revert -n` wrote the index and
+      // the working tree together, and the tool's dirty-path preflight proved they agreed with
+      // HEAD beforehand — so `--cached` answers both questions correctly for added, deleted and
+      // modified paths alike.
+      //
+      // An empty `touchedPaths` means the reverted commits changed no file at all; an unscoped
+      // diff would then report the whole dirty tree as this revert's doing.
+      const files =
+        touchedPaths.length > 0
+          ? await this.landedOrExplain(git, touchedPaths, () =>
+              this.numstat(git, ['--cached', 'HEAD', '--', ...touchedPaths]),
+            )
+          : [];
+      const mismatchedFiles =
+        expectSha !== undefined && touchedPaths.length > 0
+          ? await this.landedOrExplain(git, touchedPaths, () =>
+              this.numstat(git, ['--cached', expectSha, '--', ...touchedPaths]),
+            )
+          : null;
+      // `revert -n` STAGES what it reverted. Unstage it so the change sits in the working tree
+      // only — what this tool promises, and what every other write in this server looks like.
+      // Scoped to `touchedPaths`, never a whole-index reset: a hand `git add` elsewhere survives.
+      //
+      // NEVER run that reset on a conflicted path: it silently clears the unmerged state and
+      // leaves the `<<<<<<<` markers sitting in the file as an ordinary edit. The conflict branch
+      // above therefore aborts and returns; it never reaches here.
+      if (touchedPaths.length > 0) {
+        await this.landedOrExplain(git, touchedPaths, () =>
+          git.raw(['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...touchedPaths]),
+        );
+      }
+      return {
+        status: 'reverted',
+        commits,
+        files,
+        filesChanged: files.length,
+        mismatchedFiles,
+        conflictPaths: [],
+      };
+    } catch (err) {
+      // ABORT ON ANYTHING — a failed spawn, `unmergedPaths` throwing, the deliberate throw above.
+      // Never leave the clone mid-revert, the rule `runRebaseStep`/`tryRebase` already follow.
+      // (After `revert --quit` there is nothing left to abort and this is a no-op: the reverted
+      // change is already in the tree, and undoing it would need the whole-tree reset that is
+      // forbidden here.)
+      await this.abortRevertIfInProgress(git);
+      throw err;
+    }
+  }
+
+  /**
+   * Resolve one caller-named commit-ish to its full sha, refusing a leading `-` (git would read it
+   * as an option). Same idiom, and the same two refusals, as {@link resolveDiffRef} — which
+   * returns the caller's spelling because its error messages read better that way; a revert needs
+   * the sha itself, since the tool reports which commits it applied.
+   */
+  private async resolveCommitish(git: SimpleGit, ref: string): Promise<string> {
+    if (ref.startsWith('-')) throw new BadCommitError(`Invalid commit "${ref}".`);
+    const sha = await this.revParseOrNull(git, `${ref}^{commit}`);
+    if (sha === null) {
+      throw new BadCommitError(
+        `Unknown git commit "${ref}" — it does not resolve to a commit in this clone. ` +
+          'Use a commit sha or "HEAD~N" from `status`/`diff` (run project_sync first if the ' +
+          'commit is only on the remote).',
+      );
+    }
+    return sha;
+  }
+
+  /**
+   * Each sha with its parent shas, from `git rev-list --parents -n 1 <sha>`, whose single output
+   * line is `<sha> <parent>...` — so more than two fields means a merge, and no parent at all
+   * means a root commit (nothing to inspect a parent tree of).
+   */
+  private async commitLineage(
+    git: SimpleGit,
+    shas: string[],
+  ): Promise<{ sha: string; parents: string[] }[]> {
+    const lineage: { sha: string; parents: string[] }[] = [];
+    for (const sha of shas) {
+      const fields = (await git.raw(['rev-list', '--parents', '-n', '1', sha]))
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      lineage.push({ sha: fields[0] ?? sha, parents: fields.slice(1) });
+    }
+    return lineage;
+  }
+
+  /**
+   * Which of `touchedPaths` have uncommitted working-tree, index or untracked state. An UNTRACKED
+   * file at a path the revert would restore counts, and must: git itself refuses to clobber one.
+   *
+   * `-z` (as `trackedAtHead` uses it) so a path holding a newline comes back verbatim; porcelain
+   * v1's `-z` form is `XY <path>\0`, with a rename/copy's ORIGINAL path following as its own
+   * record. Both sides of such a pair are checked against `touchedPaths`, so a rename away from a
+   * touched path counts as dirt on it, while a path outside the set never enters the result.
+   */
+  private async dirtyAmong(git: SimpleGit, touchedPaths: string[]): Promise<string[]> {
+    if (touchedPaths.length === 0) return [];
+    const out = await git.raw([
+      '-c',
+      'core.quotePath=false',
+      '--literal-pathspecs',
+      'status',
+      '--porcelain',
+      '-z',
+      '--',
+      ...touchedPaths,
+    ]);
+    const records = out.split('\0').filter(Boolean);
+    const wanted = new Set(touchedPaths);
+    const dirty = new Set<string>();
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i] ?? '';
+      const code = record.slice(0, 2);
+      const named = [toPosix(record.slice(3))];
+      if (code.includes('R') || code.includes('C')) {
+        const original = records[++i];
+        if (original !== undefined) named.push(toPosix(original));
+      }
+      for (const rel of named) if (wanted.has(rel)) dirty.add(rel);
+    }
+    return [...dirty].sort();
+  }
+
+  /**
+   * Which of `touchedPaths` are a symlink anywhere the revert would touch them: mode `120000` in
+   * HEAD's tree, in a reverted commit's tree or in its parent's (a root commit has no parent to
+   * look at), an actual link on disk, or an ancestor directory that is a link
+   * ({@link linkedAncestor}). Same reasoning as {@link hasLinkOnConflictSide}: a revert restores
+   * file CONTENT, so writing it through a link writes outside the project — the tool refuses
+   * rather than follows.
+   *
+   * `ls-tree -z` because the entry carries the path (`<mode> <type> <sha>\t<path>`) and a name
+   * with a newline would otherwise split a record in two; `core.quotePath=false` alongside it for
+   * the same rule every path-returning call here follows.
+   */
+  private async linksAmong(
+    dir: string,
+    git: SimpleGit,
+    lineage: { sha: string; parents: string[] }[],
+    touchedPaths: string[],
+  ): Promise<string[]> {
+    if (touchedPaths.length === 0) return [];
+    const refs = new Set<string>(['HEAD']);
+    for (const { sha, parents } of lineage) {
+      refs.add(sha);
+      for (const parent of parents) refs.add(parent);
+    }
+    const links = new Set<string>();
+    for (const ref of refs) {
+      const out = await git.raw([
+        '-c',
+        'core.quotePath=false',
+        '--literal-pathspecs',
+        'ls-tree',
+        '-z',
+        ref,
+        '--',
+        ...touchedPaths,
+      ]);
+      for (const entry of out.split('\0')) {
+        const tab = entry.indexOf('\t');
+        if (tab < 0) continue;
+        if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
+        links.add(toPosix(entry.slice(tab + 1)));
+      }
+    }
+    for (const rel of touchedPaths) {
+      if (links.has(rel)) continue;
+      try {
+        if ((await lstat(path.join(dir, rel))).isSymbolicLink()) {
+          links.add(rel);
+          continue;
+        }
+      } catch {
+        // Absent from the working tree — not a link there. The tree checks above still apply.
+      }
+      if ((await linkedAncestor(dir, rel)) !== null) links.add(rel);
+    }
+    return [...links].sort();
+  }
+
+  /**
+   * Every path whose index entry differs from HEAD — staged content anywhere in the clone, NOT
+   * scoped to the reverted paths. Deliberately unscoped: see {@link RevertPreflight.stagedPaths}.
+   * A conflicting revert can only be undone with `git revert --abort`, which resets the whole
+   * index, so staged work anywhere is at risk and the tool refuses while any exists.
+   *
+   * `-z` for a path holding a newline, `core.quotePath=false` like every path-returning call
+   * here. No pathspec is passed, so there is nothing for `--literal-pathspecs` to protect.
+   */
+  private async stagedAnywhere(git: SimpleGit): Promise<string[]> {
+    const out = await git.raw([
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--cached',
+      '--no-renames',
+      '--name-only',
+      '-z',
+    ]);
+    return out
+      .split('\0')
+      .filter(Boolean)
+      .map((rel) => toPosix(rel))
+      .sort();
+  }
+
+  /**
+   * Run a step that happens AFTER `git revert --quit`, when the revert is already in the working
+   * tree and can no longer be undone by an abort (undoing it would need the whole-tree
+   * `reset --hard` that is forbidden here — it would destroy a peer session's uncommitted work).
+   *
+   * If such a step fails, the caller must not be told "the revert failed": it did not, and a
+   * caller who retries will revert twice. So the failure is re-thrown with the truth attached.
+   * The realistic trigger is a long path list on Windows, whose ~32 KB command line the
+   * server-derived `touchedPaths` can exceed on a large reverted commit.
+   */
+  private async landedOrExplain<T>(
+    git: SimpleGit,
+    touchedPaths: string[],
+    step: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await step();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `The revert WAS applied to the working tree (${touchedPaths.length} path(s)), but ` +
+          `finishing it failed: ${reason}. The change is on disk and may still be staged — ` +
+          'review it with `status`/`diff` and either `commit` it or `discard` those paths. ' +
+          'Do NOT simply retry, or the revert would be applied a second time.',
+        { cause: err },
+      );
+    }
+  }
+
+  /** Abort a paused revert, tolerating "no revert in progress". Mirrors `abortRebaseIfInProgress`. */
+  private async abortRevertIfInProgress(git: SimpleGit): Promise<void> {
+    try {
+      await git.raw(['revert', '--abort']);
+    } catch {
+      // No revert in progress — nothing to abort.
     }
   }
 }
