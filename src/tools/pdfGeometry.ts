@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { locateProjectPdf } from '../lib/pdfLocate.js';
+import { toPosixOut } from '../lib/paths.js';
 import {
   MAX_GEOMETRY_PAGES,
   MAX_TEXT_LINES_PER_PAGE,
@@ -152,7 +153,8 @@ const outputSchema = {
         'happens to be there. ABSENT when kinds was ["floats"] alone and no PDF ' +
         'exists: that path never opens the PDF (only the .aux, and only to find labels), so a ' +
         'compile that produced an .aux but died before a PDF (a missing package, an undefined ' +
-        'control sequence) still lets the float index be read — there is simply no PDF to name.',
+        'control sequence) still lets the float index be read — there is simply no PDF to name. ' +
+        'POSIX (`/`-separated) on every OS.',
     ),
   pageCount: z
     .number()
@@ -332,8 +334,12 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             note = auxResult.note;
           }
 
+          // The response boundary. It sits below the geometry() call deliberately: that call reads
+          // the PDF off the real filesystem and needs the native spelling, and the `!pdfPath` throw
+          // inside it is what narrows the type. From here the path is a display value only.
+          const { pdfPath: outPdfPath } = toPosixOut({ pdfPath });
           const structuredContent = {
-            pdfPath,
+            pdfPath: outPdfPath,
             pageCount: result.pageCount,
             pages: result.pages,
             skippedPages: result.skippedPages,
@@ -345,9 +351,9 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
 
           const pageCountText =
             result.pageCount !== undefined
-              ? `${result.pages.length} of ${result.pageCount} page(s) from ${pdfPath}`
-              : pdfPath !== undefined
-                ? `${pdfPath} (no page opened — kinds: floats only)`
+              ? `${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}`
+              : outPdfPath !== undefined
+                ? `${outPdfPath} (no page opened — kinds: floats only)`
                 : 'no PDF (kinds: floats only, and none was ever compiled)';
           const header = `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})`;
           const pageLines = result.pages.map((p) => {

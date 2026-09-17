@@ -5,6 +5,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { locateProjectPdf } from '../lib/pdfLocate.js';
+import { toPosixOut } from '../lib/paths.js';
 import { buildDir } from '../services/compiler.js';
 import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL } from '../services/pdfRender.js';
 import { planInlining } from '../lib/inlineBudget.js';
@@ -73,7 +74,9 @@ const inputSchema = {
 
 const pageShape = z.object({
   page: z.number().describe('1-based page number.'),
-  pngPath: z.string().describe('Absolute path to the rendered PNG on disk.'),
+  pngPath: z
+    .string()
+    .describe('Absolute path to the rendered PNG on disk. POSIX (`/`-separated) on every OS.'),
   widthPx: z.number().describe('Rendered image width in pixels.'),
   heightPx: z.number().describe('Rendered image height in pixels.'),
   dpi: z.number().describe('Resolution actually rendered at, one decimal place.'),
@@ -97,11 +100,16 @@ const pageShape = z.object({
 });
 
 const outputSchema = {
-  pdfPath: z.string().describe('The compiled PDF that was rasterized.'),
+  pdfPath: z
+    .string()
+    .describe('The compiled PDF that was rasterized. POSIX (`/`-separated) on every OS.'),
   pageCount: z.number().describe('Pages in the PDF — not the number of pages rendered.'),
   outDir: z
     .string()
-    .describe('Directory the PNGs were written to (a temp build dir, never inside the project).'),
+    .describe(
+      'Directory the PNGs were written to (a temp build dir, never inside the project). ' +
+        'POSIX (`/`-separated) on every OS.',
+    ),
   pages: z.array(pageShape).describe('One entry per page actually rendered, in page order.'),
   skippedPages: z
     .array(z.number())
@@ -183,9 +191,14 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           );
           const rendered = result.pages.map((p, i) => ({ ...p, inlined: inlinePlan[i] ?? false }));
 
+          // The response boundary: everything above needed the native spelling (the renderer wrote
+          // these very paths on the real filesystem), and nothing below touches a disk. Converting
+          // here, once, is what keeps the result text and structuredContent rendered from the same
+          // value instead of one being native and the other POSIX.
+          const { pdfPath: outPdfPath, outDir: outOutDir } = toPosixOut({ pdfPath, outDir });
           const pagesOut = rendered.map((p) => ({
             page: p.page,
-            pngPath: p.pngPath,
+            ...toPosixOut({ pngPath: p.pngPath }),
             widthPx: p.widthPx,
             heightPx: p.heightPx,
             dpi: p.dpi,
@@ -199,16 +212,19 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // structuredContent must never carry base64 (it would double the payload) — the image
           // bytes only ever reach `content`, below.
           const structuredContent = {
-            pdfPath,
+            pdfPath: outPdfPath,
             pageCount: result.pageCount,
-            outDir,
+            outDir: outOutDir,
             pages: pagesOut,
             skippedPages: result.skippedPages,
             note,
           };
 
-          const header = `rendered ${rendered.length} of ${result.pageCount} page(s) from ${pdfPath}`;
-          const pageLines = rendered.map((p) => {
+          const header = `rendered ${rendered.length} of ${result.pageCount} page(s) from ${outPdfPath}`;
+          // Mapped over pagesOut, not `rendered`: the line must name the same pngPath
+          // structuredContent reports, and pagesOut is where the converted one lives. The base64
+          // loop below stays on `rendered`, which is the only side carrying the image bytes.
+          const pageLines = pagesOut.map((p) => {
             const clampedTag = p.clamped ? ' (clamped)' : '';
             return (
               `  page ${p.page}: ${p.widthPx}x${p.heightPx} px @${p.dpi} dpi${clampedTag} — ` +

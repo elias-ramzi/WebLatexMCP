@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
-import { toFileUrl } from '../lib/paths.js';
+import { toFileUrl, toPosixOut } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
 import { attachErrorSnippets } from '../lib/errorSnippets.js';
@@ -179,7 +179,8 @@ const outputSchema = {
     .optional()
     .describe(
       'Path to the compiled PDF. For workspace-local clones this is <workspace>/.web_latex_mcp/' +
-        '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path.',
+        '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path. ' +
+        'POSIX (`/`-separated) on every OS.',
     ),
   pdfUrl: z
     .string()
@@ -265,7 +266,10 @@ const outputSchema = {
         'excluded. Pass rawLog: true for the unfiltered tail — never trimmed by warningsFilter; ' +
         'logPath has the full log.',
     ),
-  logPath: z.string().optional(),
+  logPath: z
+    .string()
+    .optional()
+    .describe('Path to the full compile log. POSIX (`/`-separated) on every OS.'),
   omittedSnippetLocations: z
     .number()
     .describe(
@@ -447,13 +451,25 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               pageCount = undefined;
             }
           }
+          // The response boundary, and it sits below everything above rather than one line
+          // earlier. `ctx.pdfRenderer.pageCount` opens the PDF off the real filesystem, so it needs
+          // the host's own spelling — that half is load-bearing. `toFileUrl` would accept either
+          // (`pathToFileURL` resolves through `path.win32.resolve`, so `C:\a\b` and `C:/a/b` give
+          // the same URL); it stays above the line because it takes a filesystem path rather than a
+          // string chosen for a reader, not because the URL would otherwise break. Past this point
+          // nothing touches a disk, and the paths are converted in one call so the text channel and
+          // structuredContent cannot disagree about a separator.
+          const { pdfPath: outPdfPath, logPath: outLogPath } = toPosixOut({
+            pdfPath,
+            logPath: outcome.logPath,
+          });
           const lockWaitSec = Math.round(lock.waitedMs / 100) / 10;
           const lockHeldBy = lock.waitedOn;
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
             compiler: backend.kind,
-            pdfPath,
+            pdfPath: outPdfPath,
             pdfUrl,
             pageCount,
             durationSec: outcome.durationSec,
@@ -473,7 +489,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                     ? { baseDir: outcome.logBaseDir, keepWarning: judgeWarning }
                     : undefined,
                 ),
-            logPath: outcome.logPath,
+            logPath: outLogPath,
             omittedSnippetLocations,
             hint,
           };
@@ -519,7 +535,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             .join('\n');
           const dropped = [
             errors.length > printable.length
-              ? `  … ${errors.length - printable.length} more error(s) — see structuredContent or ${outcome.logPath ?? 'the log'}`
+              ? `  … ${errors.length - printable.length} more error(s) — see structuredContent or ${outLogPath ?? 'the log'}`
               : '',
             omittedSnippetLocations > 0
               ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
