@@ -1,14 +1,16 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { ESLint } from 'eslint';
 import { describe, expect, it } from 'vitest';
 
 /**
  * A tier over `.claude/workflows/*.js`.
  *
  * Those scripts commit and push unattended, and until this file existed the only automated
- * statement CI made about them was that prettier liked their whitespace: eslint ignores
- * `.claude/**`, tsc never sees them, and nothing imported them. A Workflow script is not
+ * statement CI made about them was that prettier liked their whitespace: eslint ignored
+ * `.claude/**`, tsc never saw them, and nothing imported them. The ignore is what #81 narrowed,
+ * and `eslint.config.js reach` below is what keeps it narrowed. A Workflow script is not
  * importable — it has a top-level `return`, a SyntaxError in an ES module — so the host wraps
  * the body in an async function and injects its globals. This file does the same, which is what
  * lets the guards be executed rather than merely read.
@@ -399,6 +401,83 @@ describe('.claude/workflows discovery', () => {
     // Without this, emptying or renaming the directory would make every describe.each below
     // expand to zero tests and the whole tier would go green over nothing.
     expect(scriptNames).toContain(REVIEW_ROUND);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. What `npm run lint` actually reaches.
+//
+// #81 narrowed the global ignore from `.claude/**` to `.claude/*` + `!.claude/workflows`, and
+// that distinction is one character wide and silent when wrong: in flat config a directory
+// ignored with `/**` is skipped WHOLE, and nothing inside it can be unignored afterwards, so
+// the obvious-looking `['.claude/**', '!.claude/workflows']` lints nothing at all and every
+// test below still passes — this tier reads the scripts off disk itself, it does not run
+// eslint. Nothing else in the repo would notice either: a config that lints one file fewer
+// goes green.
+//
+// It is not only a config detail. review-round.js states the reach of `npm run lint` twice in
+// prose that is injected into every agent of every round, so a config drift here turns those
+// two sentences into instructions to disregard a real signal (or to trust an absent one).
+// These assertions are the only thing that ties the two together.
+// ---------------------------------------------------------------------------
+
+describe('eslint.config.js reach', () => {
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
+  const eslint = new ESLint({ cwd: repoRoot });
+
+  it('lints the workflow scripts', async () => {
+    for (const name of scriptNames) {
+      const file = path.join(workflowsDir, name);
+      expect(await eslint.isPathIgnored(file), `${name} is ignored by eslint`).toBe(false);
+    }
+  });
+
+  it('still ignores every other child of .claude/', async () => {
+    // Paths that need not exist — `isPathIgnored` answers from the config, not the disk, which
+    // is the point: it holds for a file a future round adds, not merely for today's tree.
+    for (const rel of [
+      '.claude/agents/implementer.js',
+      '.claude/commands/implement.js',
+      '.claude/skills/whatever/helper.js',
+      // The hazard the ignore exists for: a nested checkout of this repo, whose own src/ must
+      // never be pulled into this one's typed lint.
+      '.claude/worktrees/wt-x/src/index.ts',
+      '.claude/worktrees/wt-x/eslint.config.js',
+    ]) {
+      expect(await eslint.isPathIgnored(path.join(repoRoot, rel)), `${rel} is linted`).toBe(true);
+    }
+  });
+
+  it('gives a workflow script the Workflow globals, and no-undef to use them', async () => {
+    // Without these the block is decorative: eslint:recommended's own `no-undef` reports every
+    // `agent`/`phase` call in a script as undefined, which buries real findings under 30-odd
+    // false ones and is why un-ignoring `.claude/**` wholesale was rejected.
+    const config = (await eslint.calculateConfigForFile(path.join(workflowsDir, REVIEW_ROUND))) as {
+      languageOptions?: {
+        globals?: Record<string, unknown>;
+        parserOptions?: Record<string, unknown>;
+      };
+      rules?: Record<string, unknown>;
+    };
+    const globals = config.languageOptions?.globals ?? {};
+    for (const name of [
+      'args',
+      'agent',
+      'parallel',
+      'pipeline',
+      'phase',
+      'log',
+      'workflow',
+      'budget',
+    ]) {
+      expect(globals[name], `global ${name} not declared for a workflow script`).toBe('readonly');
+    }
+    // A Workflow body's top-level `return` is legal; without this it is a parse error and the
+    // file is never linted at all — which reads exactly like a clean lint.
+    expect(config.languageOptions?.parserOptions?.allowReturnOutsideFunction).toBe(true);
+    const noUndef = config.rules?.['no-undef'];
+    expect(Array.isArray(noUndef) ? noUndef[0] : noUndef, 'no-undef is off').not.toBe('off');
+    expect(Array.isArray(noUndef) ? noUndef[0] : noUndef).not.toBe(0);
   });
 });
 
