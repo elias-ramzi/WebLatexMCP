@@ -225,12 +225,29 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   A session record is removed only on a clean shutdown (`SessionRegistry.release()`), so a killed
   agent process leaves its record behind forever and `activeSessions` grew without bound with peers
   that hold nothing and are never coming back. `isStalePeer`/`splitStalePeers`
-  (`src/lib/peerSummary.ts`) fold a peer into `staleSessions: N` only when it is `!live` **and** its
-  shadow index read back as a readable **empty** array. The guard that matters is the one it would
+  (`src/lib/peerSummary.ts`) fold a peer into `staleSessions: N` only when it is `!live`, its
+  shadow index read back as a readable **empty** array, **and** its heartbeat is at least
+  `RECENT_HEARTBEAT_GRACE_MS` (2 hours) old. The guard that matters is the one it would
   be easy to get backwards: **`null` from `ShadowStore.peerEntries` means the index was UNREADABLE,
   never "owns nothing"** — the same fail-closed reading `attributePeers` uses — so a dead peer with
   an unreadable index stays listed individually with `changes: null`. A live peer is never
-  collapsed either, whatever it currently holds.
+  collapsed either, whatever it currently holds. The heartbeat clause is the same refusal applied
+  to the _other_ ambiguous value: `peerEntries` maps ENOENT and a readable-empty index to the same
+  `[]`, so `[]` means "nothing is recorded", not "nothing was changed" — a session whose write
+  landed in the tree while its own index write failed is `[]` too, and collapsing it removes the
+  only named suspect for lines sitting in `otherChanges`. So the collapse waits. The window is a
+  **usefulness** window, not an evidence one — elapsed time says nothing about whether a write
+  failed, it only bounds how long someone is still looking at those lines — and saying otherwise
+  in a comment is the overclaim to avoid when re-deriving the number. Two sizing rules hold that
+  clause up and are both
+  easy to lose: the window must **exceed `STALE_MS`**, because `!live` already implies a heartbeat
+  at least that old, so anything at or below 30 minutes is vacuous and reads like a working guard
+  while firing never; and a **non-finite** age (an unparseable `heartbeatAt`) is never collapsed —
+  the opposite sign from `bootIdentity.ts`, where a non-finite age earns nothing, because there
+  granting means calling a peer _live_ while here collapsing means asserting it holds nothing.
+  `isStalePeer` stays **one conjunction** for the same reason: every clause only narrows, so the
+  age clause can only ever collapse fewer peers and is structurally incapable of weakening the
+  `null` guard ahead of it.
   **Nothing is reaped from disk, and `SessionRegistry.collectGarbage()` must stay uncalled from
   here.** `status` is read-only and takes no lock, and `live` is _derived_, not authoritative: a pid
   can be invisible across a pid namespace, and a record only reads stale once its heartbeat is older

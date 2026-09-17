@@ -95,18 +95,22 @@ const outputSchema = {
       }),
     )
     .describe(
-      'Other sessions known to be working on this project — except a session that has exited ' +
-        'AND holds no changes, which is left out here and counted in staleSessions instead.',
+      'Other sessions known to be working on this project — except a session that has exited, ' +
+        'has been quiet for hours, AND whose shadow index records no changes, which is left out ' +
+        'here and counted in staleSessions instead.',
     ),
   staleSessions: z
     .number()
     .describe(
-      'How many other sessions have exited and hold no changes, and are therefore left out of ' +
-        'activeSessions rather than listed individually. A session record is only removed on a ' +
-        'clean shutdown, so a killed agent process leaves one behind forever — without this, ' +
-        'activeSessions would grow without bound with sessions that are never coming back. A ' +
-        'session whose shadow index could not be READ is never counted here: unreadable is not ' +
-        '"owns nothing", so it stays listed individually with changes: null.',
+      'How many other sessions have exited, gone quiet for hours, and left a shadow index that ' +
+        'records no changes, and are therefore left out of activeSessions rather than listed ' +
+        'individually. An empty index cannot distinguish "this session recorded nothing" from ' +
+        '"the index write itself failed", which is why a session that went quiet only recently ' +
+        'stays listed instead. A session record is only removed on a clean shutdown, so a killed ' +
+        'agent process leaves one behind forever — without this, activeSessions would grow ' +
+        'without bound with sessions that are never coming back. A session whose shadow index ' +
+        'could not be READ is never counted here: unreadable is not "owns nothing", so it stays ' +
+        'listed individually with changes: null.',
     ),
   conflictedChanges: z
     .array(z.string())
@@ -171,10 +175,14 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         // (its record is only removed on a clean shutdown, which it did not have) — collapse it
         // into a count rather than listing it forever. `?? null` matches the lookup everywhere
         // else in this file: a sessionId missing from the map and one mapped to `null` both mean
-        // "unreadable", which `isStalePeer` refuses to treat as "owns nothing".
+        // "unreadable", which `isStalePeer` refuses to treat as "owns nothing". A dead peer that
+        // went quiet only recently stays listed as well, because an empty index can also mean the
+        // index write failed — see `RECENT_HEARTBEAT_GRACE_MS`.
+        const now = Date.now();
         const { shown: shownPeers, stale: staleSessions } = splitStalePeers(peers, (p) => ({
           live: p.live,
           entries: peerShadows.get(p.sessionId) ?? null,
+          heartbeatAgeMs: now - Date.parse(p.heartbeatAt),
         }));
         // Flag files a human edited directly (as opposed to changes the tools made), so the
         // agent acknowledges them before writing over them.
@@ -189,7 +197,12 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           if (entries === null) {
             segments.push('index unreadable');
           } else if (entries.length === 0) {
-            segments.push('no changes');
+            // "nothing recorded", never "no changes": an empty index also covers a session whose
+            // own index write failed, whose dirty lines are in the tree unowned. This line is the
+            // channel a human actually reads, so it must not assert what the schema and the docs
+            // deliberately stop short of — least of all about the recently-dead peer the grace in
+            // `isStalePeer` keeps listed precisely so it stays a named suspect for those lines.
+            segments.push('nothing recorded');
           } else {
             // Cap what the text shows — a peer with a long-running session can list dozens of
             // touched paths, and this line is meant to be skimmed, not to duplicate the structured
@@ -208,12 +221,14 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           }
           return `${p.sessionId} (${segments.join('; ')})`;
         };
-        // Stale sessions are counted, never dropped silently — the "and N exited with no changes"
-        // clause survives even when nothing else is shown, so the line still says the sessions
-        // exist rather than vanishing entirely.
+        // Stale sessions are counted, never dropped silently — the "and N exited with nothing
+        // recorded" clause survives even when nothing else is shown, so the line still says the
+        // sessions exist rather than vanishing entirely. Same wording rule as `peerDetail` above:
+        // what was collapsed is an empty *index*, which is not the same claim as a session that
+        // changed nothing.
         const staleClause =
           staleSessions > 0
-            ? `${staleSessions} session${staleSessions === 1 ? '' : 's'} exited with no changes`
+            ? `${staleSessions} session${staleSessions === 1 ? '' : 's'} exited with nothing recorded`
             : '';
         const otherSessionsLine =
           shownPeers.length > 0

@@ -10,6 +10,7 @@ import { createServer } from '../../src/server.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
+import { RECENT_HEARTBEAT_GRACE_MS } from '../../src/lib/peerSummary.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -85,8 +86,23 @@ describe('status collapses stale, change-free peer sessions', () => {
     return res.structuredContent as T;
   }
 
-  /** Overwrites a session's own `session.json` so it reads as dead: no live pid, stale heartbeat. */
-  async function killSession(workspace: string, sessionId: string): Promise<void> {
+  /**
+   * Overwrites a session's own `session.json` so it reads as dead: no live pid, stale heartbeat.
+   *
+   * `ageMs` is how long ago it last heartbeated, and it is load-bearing for every collapse
+   * assertion in this file. Dead is not enough: `status` only collapses a dead, empty peer once it
+   * has ALSO been quiet for `RECENT_HEARTBEAT_GRACE_MS`, because an empty shadow index cannot
+   * distinguish "recorded nothing" from "the index write failed". The 60 minutes this helper used
+   * to hardcode is dead (past `SessionRegistry`'s 30-minute `STALE_MS`) but comfortably INSIDE
+   * that grace, so it would keep every such peer listed. The default is derived from the constant
+   * rather than spelled out, so this file cannot drift out from under it if the window changes;
+   * a caller that wants a dead-but-recent peer passes something strictly under it.
+   */
+  async function killSession(
+    workspace: string,
+    sessionId: string,
+    ageMs: number = RECENT_HEARTBEAT_GRACE_MS * 2,
+  ): Promise<void> {
     const recordPath = path.join(sessionDir(workspace, 'demo', sessionId), 'session.json');
     const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>;
     await writeFile(
@@ -95,7 +111,7 @@ describe('status collapses stale, change-free peer sessions', () => {
         {
           ...record,
           pid: 999999999,
-          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+          heartbeatAt: new Date(Date.now() - ageMs).toISOString(),
         },
         null,
         2,
@@ -131,7 +147,7 @@ describe('status collapses stale, change-free peer sessions', () => {
 
     const res = await alpha.client.callTool({ name: 'status', arguments: { project: 'demo' } });
     const text = (res.content as Array<{ type: string; text: string }>)[0]?.text ?? '';
-    expect(text).toMatch(/other sessions: 1 session exited with no changes/);
+    expect(text).toMatch(/other sessions: 1 session exited with nothing recorded/);
   });
 
   it('drops a dead+empty peer into staleSessions, keeps a dead-with-entries and an unreadable peer listed, and keeps a live-empty peer listed', async () => {
@@ -184,7 +200,7 @@ describe('status collapses stale, change-free peer sessions', () => {
 
     const res = await alpha.client.callTool({ name: 'status', arguments: {} });
     const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
-    expect(text).toMatch(/1 session exited with no changes/);
+    expect(text).toMatch(/1 session exited with nothing recorded/);
 
     // The guard against "improving" this into a reaper. `status` takes no lock and `live` is
     // merely DERIVED, so deleting a peer's state while it races its own `record()` destroys the
@@ -239,6 +255,60 @@ describe('status collapses stale, change-free peer sessions', () => {
     ).toBe('not json');
   });
 
+  /**
+   * The recent-heartbeat exemption (issue #78, finding 3).
+   *
+   * `ShadowStore.peerEntries` maps ENOENT and a readable-but-empty index to the same `[]`, so an
+   * empty index cannot distinguish "this session recorded nothing" from "this session's index
+   * write failed and its dirty lines are sitting in the working tree unattributed". While the
+   * death is recent the peer therefore stays NAMED in `activeSessions`, so a human reading
+   * `otherChanges` still has a suspect for those lines; once it has been quiet past
+   * `RECENT_HEARTBEAT_GRACE_MS` the collapse from #75 takes over again, which is what keeps
+   * `activeSessions` bounded. Both halves are asserted here so the test discriminates rather than
+   * merely showing that nothing ever collapses.
+   */
+  it('keeps a dead peer listed while its heartbeat is recent, and collapses one past the grace', async () => {
+    const { workspace, session } = await setup();
+    const alpha = await session('alpha');
+
+    // Dead, holding nothing, but quiet for only half the grace — dead by `STALE_MS` (30 minutes),
+    // not yet old enough for "holds no changes" to be a safe claim.
+    const justQuiet = await session('just-quiet');
+    await call(justQuiet, 'status', {});
+    await killSession(workspace, 'just-quiet', RECENT_HEARTBEAT_GRACE_MS / 2);
+
+    const first = await call<StatusOut>(alpha, 'status', {});
+    expect(
+      new Map(first.activeSessions.map((s) => [s.session, s])).get('just-quiet'),
+    ).toMatchObject({ live: false, changes: [] });
+    expect(first.staleSessions).toBe(0);
+
+    const firstRes = await alpha.client.callTool({ name: 'status', arguments: {} });
+    const firstText = (firstRes.content as Array<{ text?: string }>)
+      .map((c) => c.text ?? '')
+      .join('\n');
+    expect(firstText).not.toMatch(/exited with nothing recorded/);
+    // And POSITIVELY: the preserved peer must be rendered as holding nothing *recorded*, not as
+    // holding no changes. A negative assertion alone passes while the text channel says the very
+    // thing the schema and the docs were narrowed to stop asserting — which is exactly how this
+    // gap survived the first round: `peerDetail` spelled the same claim differently, so the
+    // `not.toMatch` above was satisfied by a line reading `just-quiet (gone; no changes)`. Keeping
+    // the two channels pinned together is the whole point.
+    expect(firstText).toMatch(/just-quiet \(gone; nothing recorded\)/);
+    expect(firstText).not.toMatch(/no changes/);
+
+    // Same shape of peer, but long dead: the collapse #75 exists for still happens.
+    const longDead = await session('long-dead');
+    await call(longDead, 'status', {});
+    await killSession(workspace, 'long-dead');
+
+    const second = await call<StatusOut>(alpha, 'status', {});
+    const byId = new Map(second.activeSessions.map((s) => [s.session, s]));
+    expect(byId.has('long-dead')).toBe(false);
+    expect(byId.get('just-quiet')).toMatchObject({ live: false, changes: [] });
+    expect(second.staleSessions).toBe(1);
+  });
+
   it('pluralizes the stale count and joins it onto the peers still shown', async () => {
     const { workspace, session } = await setup();
     const alpha = await session('alpha');
@@ -250,7 +320,7 @@ describe('status collapses stale, change-free peer sessions', () => {
       await call(peer, 'status', {});
     }
 
-    // One peer that stays shown, so the combined ", and N sessions exited with no changes" join
+    // One peer that stays shown, so the combined ", and N sessions exited with nothing recorded" join
     // is exercised rather than only the standalone clause.
     const holder = await session('holder');
     await call(holder, 'edit_file', {
@@ -273,6 +343,8 @@ describe('status collapses stale, change-free peer sessions', () => {
 
     const res = await alpha.client.callTool({ name: 'status', arguments: {} });
     const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
-    expect(text).toMatch(/other sessions: holder \([^)]*\), and 2 sessions exited with no changes/);
+    expect(text).toMatch(
+      /other sessions: holder \([^)]*\), and 2 sessions exited with nothing recorded/,
+    );
   });
 });
