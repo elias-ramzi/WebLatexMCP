@@ -11,6 +11,7 @@ import { createServer } from '../../src/server.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
 import { sessionDir } from '../../src/lib/sessionPaths.js';
+import { bootStampFrom, currentBootStamp } from '../../src/lib/bootIdentity.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -474,6 +475,60 @@ describe('two sessions sharing one clone', () => {
         {
           ...record,
           pid: 999999999,
+          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    // Alpha edits and commits only its own paragraph; beta's untracked file stays in the clone,
+    // owned by nobody live.
+    await editA(a);
+    await call(a, 'commit', { message: 'A: revise the assumption' });
+
+    const pushed = await call<{ status: string }>(a, 'push', { confirm: true });
+    expect(pushed.status).toBe('pushed');
+
+    // Beta's file rides through untouched and was never pushed.
+    expect(await readFile(path.join(dir, 'sections', 'extra.tex'), 'utf8')).toBe(
+      'A stray section beta never committed.\n',
+    );
+    const verify = await mkdtemp(path.join(os.tmpdir(), 'wlm-verify-'));
+    cleanups.push(() => rm(verify, { recursive: true, force: true }));
+    await simpleGit().clone(remote.url, verify);
+    await expect(readFile(path.join(verify, 'sections', 'extra.tex'), 'utf8')).rejects.toThrow();
+  });
+
+  it('pushes over untracked files left by a boot-reused-pid ghost (a pid that is alive again, but not the same process)', async () => {
+    const { remote, dir, workspace, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+
+    // Beta registers itself (a heartbeat) and writes a new file, but never commits it.
+    await call(b, 'status', {});
+    await call(b, 'write_file', {
+      path: 'sections/extra.tex',
+      content: 'A stray section beta never committed.\n',
+    });
+
+    // Simulate beta's process having exited across a reboot: its pid is alive again (reused by an
+    // unrelated process — here, this very test process, which is guaranteed alive), the boot that
+    // recorded it is not the current one, and its heartbeat is well past stale. Before boot-scoping
+    // this was the exact defect (#pid-reuse): `pidAlive` alone stayed true forever and `push`
+    // refused indefinitely with no way to clear it but deleting the session file by hand.
+    const boot = currentBootStamp();
+    const priorBoot = bootStampFrom(Date.parse(boot) - 24 * 60 * 60 * 1000, 0);
+    const recordPath = path.join(sessionDir(workspace, 'demo', 'beta'), 'session.json');
+    const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(
+      recordPath,
+      JSON.stringify(
+        {
+          ...record,
+          pid: process.pid,
+          bootedAt: priorBoot,
           heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
         },
         null,
