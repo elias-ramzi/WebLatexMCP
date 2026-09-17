@@ -6,8 +6,12 @@ import { toPosix, resolveInside } from '../lib/paths.js';
 import { uncoveredPaths, peerOwnership, coversPath } from '../lib/commitPaths.js';
 import { collectPeerShadows } from '../lib/peerAttribution.js';
 import { foldCase } from '../lib/caseFold.js';
+import { settleTakenPaths, settleNothingToCommit } from '../lib/commitSettle.js';
 import { NothingToCommitError } from '../services/gitService.js';
 import type { ShadowChange } from '../services/shadowStore.js';
+
+// The settle policy now lives in `src/lib/commitSettle.ts`; re-exported here for its callers.
+export { settlePaths } from '../lib/commitSettle.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -145,22 +149,16 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               if (!(err instanceof NothingToCommitError)) {
                 throw err;
               }
-              const taken = settlePaths(paths);
-              if (taken === 'everything') {
-                // Only reachable for scope "all" (commitPaths always requires a non-empty list).
-                // Settle only if this session actually tracks something — an empty-tree "all" with
-                // no shadow entries at all is a plain "nothing to commit", not a wedge to clear.
-                if (!(await ctx.shadows.hasChanges(id))) throw err;
-                const before = await ctx.shadows.changes(id);
-                await ctx.shadows.clear(id);
-                settled = before.map((c) => c.path);
-              } else {
-                const dropped = await ctx.shadows.settle(id, taken, fold);
-                // Named paths this session never tracked and that were not dirty either: a genuine
-                // "nothing to commit", not a wedge — rethrow rather than claim a settlement.
-                if (dropped.length === 0) throw err;
-                settled = dropped;
-              }
+              const rescued = await settleNothingToCommit(ctx.shadows, id, {
+                scope: effective,
+                paths,
+                fold,
+              });
+              // Named paths this session never tracked and that were not dirty either (or an "all"
+              // with no shadow entries at all): a genuine "nothing to commit", not a wedge —
+              // rethrow rather than claim a settlement.
+              if (rescued === null) throw err;
+              settled = rescued;
               const status = await ctx.git.status(dir);
               const leftUncommitted =
                 effective === 'paths'
@@ -190,21 +188,15 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // left nothing settled and rethrew) — running this again would be harmless (nothing left
           // to settle) but wasteful.
           if (res.committed && (effective === 'all' || effective === 'paths')) {
-            const taken = settlePaths(paths);
-            if (taken === 'everything') {
-              // "all" with no paths: the whole tree was taken. Unreachable for "paths" (commitPaths
-              // refuses an empty or "."-shaped list before anything is committed) — and even then
-              // never widened to `clear`: a "paths" commit must not settle what it did not name,
-              // and the commit has already landed, so throwing here would report an error for a
-              // commit that happened.
-              if (effective === 'all') {
-                const before = await ctx.shadows.changes(id);
-                await ctx.shadows.clear(id);
-                settled = before.map((c) => c.path);
-              }
-            } else {
-              settled = await ctx.shadows.settle(id, taken, fold);
-            }
+            // `requireTracked: false`: this call site has never guarded on `hasChanges` — the
+            // commit has already landed and the tree was taken deliberately, so an "all" take
+            // clears unconditionally, `shadow.json` unlinked and all. See `settleTakenPaths`.
+            settled = await settleTakenPaths(
+              ctx.shadows,
+              id,
+              { scope: effective, paths, fold },
+              { requireTracked: false },
+            );
           }
 
           // The commit moved HEAD (or the store was settled directly above): carry forward
@@ -300,20 +292,6 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
       }
     },
   );
-}
-
-/**
- * What a `scope: "all"` commit took, in the spelling `ShadowStore.settle` matches on. `git add`
- * accepts `"."`, `""` and a leading `"./"` as "the whole tree" / "this directory", but
- * `coversPath` deliberately covers nothing for `"."`/`""`, so those spellings must map to
- * `clear` — otherwise an entry the caller just committed as it stands would linger and keep the
- * default scope refusing (the wedge `settle` exists to end). Exported for the unit test.
- */
-export function settlePaths(paths: string[] | undefined): string[] | 'everything' {
-  if (!paths || paths.length === 0) return 'everything';
-  const normalized = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
-  if (normalized.some((p) => p === '' || p === '.')) return 'everything';
-  return normalized;
 }
 
 /**

@@ -819,6 +819,26 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The settle policy leaves the `commit` tool handler for `src/lib/commitSettle.ts`** (#70). Which
+  shadow records a deliberate `scope: "all"`/`"paths"` take drops — everything vs. the named paths,
+  the `hasChanges` guard, the rethrow when a request covered nothing this session tracks — was
+  decided twice inside the handler, once in the `NothingToCommitError` rescue and once after a
+  commit landed, and so could only be exercised through an MCP round trip against a real clone. It
+  is now `settleTakenPaths` and `settleNothingToCommit` over a structural `SettleStore` port, unit
+  tested against a temp-dir `ShadowStore`. Pure refactor: every existing integration test passes
+  untouched, and `settlePaths` keeps its name and its export from `src/tools/commit.ts`.
+
+  What the move is careful **not** to change is the part that reads like a bug and is the whole
+  point: **a take settles by requested-path coverage, never by what git actually staged** (#66,
+  finding 5). A `scope: "paths"` commit naming a directory drops every entry under it, including one
+  git skipped because it is ignored or because its content already equals HEAD — which is exactly
+  what un-wedges an already-reconciled entry, and is why `settle` is handed the requested paths and
+  never `res.files`. The two halves of the #66 item-2 rescue survive together (nothing to stage for a
+  request covering a tracked entry settles it and returns `committed: false`; a request covering
+  nothing this session tracks still refuses), `fold` stays a parameter the caller decides from
+  `GitService.isCaseInsensitive` rather than anything the new module infers, and nothing here clears
+  a `conflicted`/`unrecorded` flag — the entry goes because the session took the tree deliberately.
+
 - **`SessionRegistry`'s lifecycle methods are covered, and one of the tests found that `touch()`'s
   statement order is load-bearing** (#78, item 2's neighbours). The boot-scoping fix landed with
   `peers()` well covered and the rest of the class barely touched, so this closes the gaps around it:
