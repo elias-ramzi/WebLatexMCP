@@ -93,15 +93,15 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
   so messages are token-scrubbed across every configured host.
-- **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`project_sync`/
+- **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`revert`/`project_sync`/
   `reset_to_remote`, and `read_file` with a `ref`, all guard with `requireGitProject`. The confirmation
   diff in `write_file`/`edit_file`/`add_citation` goes through `changeDiff` (`src/lib/changeDiff.ts`),
   which returns `''` for a local project rather than diffing the user's own repo. The shadow/session
   recorder in `context.ts` skips them too (no HEAD of ours to three-way merge against). Compiled PDFs
   are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
   read and edit in place, not litter in place.
-- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/project_sync/add_citation) must run
-  inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't —
+- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/revert/project_sync/add_citation)
+  must run inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't —
   with two deliberate exceptions, `render_pages` and `pdf_geometry`, which read the **temp build dir**
   a peer session's `compile` can rewrite underneath them. That is the whole test for the exception:
   a read-only tool locks only when what it reads is a build artifact another session rewrites in
@@ -199,6 +199,28 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
   reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
   never clear one.
+- **`revert` settles the reverted paths in every session, then records them as this session's.**
+  A revert lands changes in the working tree that no session authored, so it is the one write whose
+  ownership has to be decided rather than observed. It is **not** `clearAll`: a revert is inherently
+  path-limited (it touches only what the reverted commits touch), and dropping a peer's record for a
+  file nothing happened to is exactly what lets a later `commit scope: "paths"` take that peer's
+  lines — the same reasoning that makes path-limited `discard` a `settleAll` rather than a
+  `clearAll`. So `revert` calls `ShadowStore.settleAll(id, touchedPaths, fold)`, folded on an
+  ignorecase clone like every other by-name comparison. Settling those paths across **every** session
+  is the load-bearing half: a peer holding a stale entry for a reverted path still has the
+  _pre-revert_ bytes as its shadow content, and `commit scope: "session"` stages shadow content
+  through `commitContents` — so that peer's next commit would silently re-install the very lines the
+  revert just undid, and no `refresh` would catch it, since a `--no-commit` revert never moves HEAD.
+  Settling alone would then leave the reverted lines owned by nobody and a session-scoped `commit`
+  staging nothing, which breaks the review-with-`diff`, land-with-`commit` separation the tool exists
+  to provide — so `revert` also `record`s each touched path into **this** session's shadow, the
+  session that asked for the revert. The recorded `before` is HEAD's bytes, and that is exact rather
+  than convenient: the dirty-path preflight refuses the whole call unless the working tree already
+  equals HEAD for every touched path, so HEAD's bytes _are_ the pre-revert content. Baselines are
+  reset the way `discard` resets them (`ctx.files.resetBaselines(dir)`), or the next `edit_file` on a
+  reverted path would throw `ExternalChangeError` for a change the server itself made; that call is
+  dir-wide, so it also drops the out-of-band-edit claim for files the revert never touched — an
+  accepted over-reset, not an oversight, since `FileService` has no per-path variant.
 - **`status` collapses a dead, change-free peer into a count — a report change, never a deletion.**
   A session record is removed only on a clean shutdown (`SessionRegistry.release()`), so a killed
   agent process leaves its record behind forever and `activeSessions` grew without bound with peers
