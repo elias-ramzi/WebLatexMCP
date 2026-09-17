@@ -4,6 +4,7 @@ import {
   splitStalePeers,
   RECENT_HEARTBEAT_GRACE_MS,
 } from '../../src/lib/peerSummary.js';
+import { STALE_MS } from '../../src/services/sessionRegistry.js';
 
 /**
  * A heartbeat age comfortably past any grace window — the ordinary "died long ago" peer, which is
@@ -123,19 +124,19 @@ describe('isStalePeer', () => {
   it('sizes the grace above SessionRegistry.STALE_MS, or the exemption could never fire', () => {
     // The vacuity trap, and the reason this assertion exists rather than the constant just being
     // "some reasonable number": in `SessionRegistry.peers()`, `live` is true when the session is
-    // us, or its pid clause grants, or `Number.isFinite(age) && age < STALE_MS` with
-    // `STALE_MS = 30 * 60 * 1000`. So `!live` ALREADY implies a heartbeat at least 30 minutes old
-    // (or unparseable). `isStalePeer` only ever sees `heartbeatAgeMs` for a peer it has already
-    // found `!live`, so any grace window at or below 30 minutes could never keep one listed — the
-    // exemption would be dead code that reads as a working guard, which is the worst way for a
-    // guard to be wrong.
+    // us, or its pid clause grants, or `Number.isFinite(age) && age < STALE_MS`. So `!live`
+    // ALREADY implies a heartbeat at least `STALE_MS` old (or unparseable). `isStalePeer` only
+    // ever sees `heartbeatAgeMs` for a peer it has already found `!live`, so any grace window at
+    // or below `STALE_MS` could never keep one listed — the exemption would be dead code that
+    // reads as a working guard, which is the worst way for a guard to be wrong.
     //
-    // Do not confuse that 30 minutes with `HEARTBEAT_THROTTLE_MS` (30 seconds), which only paces
+    // Do not confuse `STALE_MS` with `HEARTBEAT_THROTTLE_MS` (30 seconds), which only paces
     // how often a LIVE session rewrites its heartbeat and bounds nothing about death.
     //
-    // `STALE_MS` is not exported and `src/services/sessionRegistry.ts` is out of scope here, so
-    // the literal is spelled out with this comment instead of imported.
-    expect(RECENT_HEARTBEAT_GRACE_MS).toBeGreaterThan(30 * 60 * 1000);
+    // Compared against the imported constant, never a copy of its literal: a copy keeps this
+    // assertion green while the thing it guards goes vacuous, which is precisely the failure the
+    // assertion exists to catch.
+    expect(RECENT_HEARTBEAT_GRACE_MS).toBeGreaterThan(STALE_MS);
   });
 });
 

@@ -23,14 +23,17 @@
  * staring at `otherChanges` wondering who wrote them. While the death is recent, the peer stays
  * named.
  *
- * **Why it must exceed 30 minutes.** In `SessionRegistry.peers()`, `live` is true when the record
- * is this session, or its pid clause grants, or `Number.isFinite(age) && age < STALE_MS`, with
- * `STALE_MS = 30 * 60 * 1000`. `isStalePeer` only ever weighs a heartbeat for a peer that is
- * already `!live`, so `!live` ALREADY implies a heartbeat at least `STALE_MS` old (or
+ * **Why it must exceed `SessionRegistry.STALE_MS`.** In `SessionRegistry.peers()`, `live` is true
+ * when the record is this session, or its pid clause grants, or
+ * `Number.isFinite(age) && age < STALE_MS`. `isStalePeer` only ever weighs a heartbeat for a peer
+ * that is already `!live`, so `!live` ALREADY implies a heartbeat at least `STALE_MS` old (or
  * unparseable). Any grace window at or below `STALE_MS` is therefore **vacuous** — it could never
- * keep a single peer listed, and would sit here reading like a working guard. Do not size this
- * against `HEARTBEAT_THROTTLE_MS` (30 seconds): that only paces how often a *live* session
- * rewrites its heartbeat, and bounds nothing about how long a dead one has been quiet.
+ * keep a single peer listed, and would sit here reading like a working guard. That ordering is not
+ * left to this comment: `STALE_MS` is exported, and `test/unit/peerSummary.test.ts` asserts this
+ * constant exceeds it, so raising either one past the other fails a test rather than quietly
+ * emptying the exemption. Do not size this against `HEARTBEAT_THROTTLE_MS` (30 seconds): that only
+ * paces how often a *live* session rewrites its heartbeat, and bounds nothing about how long a
+ * dead one has been quiet.
  *
  * **Why two hours, and what the window is actually for.** Not "long enough that a failed index
  * write is no longer plausible" — that reading is wrong and worth refuting here, because it is the
@@ -39,8 +42,9 @@
  * *evidence* about it. What the window buys is that a human still looking at those dirty lines, in
  * the same working period as the death, gets a name for them. It is a usefulness window, not an
  * evidence window — which is why it is sized by how long someone stays with a problem rather than
- * by any property of the failure. Two hours is 4x `STALE_MS`, so the guard is comfortably
- * non-vacuous rather than sitting one clock skew away from firing never, and it is the boundary
+ * by any property of the failure. Two hours sits well clear of `STALE_MS`, so the guard is
+ * comfortably non-vacuous rather than sitting one clock skew away from firing never, and it is the
+ * boundary
  * `docs/tools.md` already uses when it explains `push`'s peer refusal — "a 30-second-old write
  * means wait; a two-hour-old one is a judgement call". The same instinct applies here, so the same
  * number does. Being *bounded* is the point: #75's unbounded growth of `activeSessions` over the
