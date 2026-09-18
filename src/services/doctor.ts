@@ -2,6 +2,7 @@ import { access, constants, stat } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
+import { toPosix } from '../lib/paths.js';
 import { COMPILER_KINDS } from './compilerResolver.js';
 import { PdfRenderer } from './pdfRender.js';
 import type { CompilerKind } from '../types.js';
@@ -311,20 +312,30 @@ export class DoctorService {
 
     // 5/6. Where a missing package could actually be installed. System texmf normally needs root,
     // which is why the no-root answer (TEXMFHOME, or tlmgr --usermode) is worth stating up front.
+    //
+    // These are the only three `detail`s in a diagnosis that carry a PATH, so they are the only
+    // ones converted for display ("File paths are always POSIX, on every OS" — docs/tools.md).
+    // Everything else here that looks path-ish is not a path: `compiler` and `git` hold
+    // `--version` banner output and `package-manager`'s repository is a URL, and converting
+    // either would be a regression. The conversion sits strictly BELOW `this.canWrite`, which is
+    // `isWritablePath` in production and `stat`s the real filesystem: that probe is handed the
+    // host's own spelling, always.
     const homeWritable = texmfHome ? await this.canWrite(texmfHome) : false;
     if (texmfHome) {
+      const shownHome = toPosix(texmfHome);
       checks.push({
         name: 'texmf-home',
         status: homeWritable ? 'ok' : 'warn',
-        detail: `${texmfHome}${homeWritable ? ' (writable)' : ' (not writable)'}`,
+        detail: `${shownHome}${homeWritable ? ' (writable)' : ' (not writable)'}`,
       });
     }
     if (texmfLocal) {
       const localWritable = await this.canWrite(texmfLocal);
+      const shownLocal = toPosix(texmfLocal);
       checks.push({
         name: 'system-texmf',
         status: 'ok', // not writable is the normal, safe state — never a problem in itself
-        detail: `${texmfLocal}${localWritable ? ' (writable)' : ' (not writable — needs root)'}`,
+        detail: `${shownLocal}${localWritable ? ' (writable)' : ' (not writable — needs root)'}`,
       });
       if (!localWritable && homeWritable && tlmgr) {
         hints.push(
@@ -345,14 +356,17 @@ export class DoctorService {
     // 8. The workspace itself: clones and build artifacts have to land somewhere.
     if (opts.workspaceRoot) {
       const ok = await this.canWrite(opts.workspaceRoot);
+      // One displayed spelling, computed below the probe and used in BOTH channels it appears in
+      // — the check detail and the hint — so a reader is never told two different paths.
+      const shownWorkspace = toPosix(opts.workspaceRoot);
       checks.push({
         name: 'workspace',
         status: ok ? 'ok' : 'fail',
-        detail: `${opts.workspaceRoot}${ok ? ' (writable)' : ' (not writable)'}`,
+        detail: `${shownWorkspace}${ok ? ' (writable)' : ' (not writable)'}`,
       });
       if (!ok) {
         hints.push(
-          `The workspace root (${opts.workspaceRoot}) is not writable — set ` +
+          `The workspace root (${shownWorkspace}) is not writable — set ` +
             'WEB_LATEX_MCP_WORKSPACE to a directory you own.',
         );
       }

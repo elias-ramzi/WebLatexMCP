@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { toPosixOut } from '../lib/paths.js';
 import {
   REWRITE_MODES,
   resolveRewriteMode,
@@ -87,6 +88,13 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
             });
             return {
               ...p,
+              // The response boundary. `ProjectStatus.path` is native by contract — it comes
+              // straight from `ProjectManager.projectPath`, which every service resolves against —
+              // so the conversion belongs here, in the one production consumer, and not in the
+              // manager. Converting inside the map means this ONE array feeds both
+              // `structuredContent.projects` and the rendered text lines below, which therefore
+              // cannot disagree about a separator.
+              ...toPosixOut({ path: p.path }),
               rewriteMode: resolved.mode,
               rewriteModeSource: resolved.source,
               envConfigured,

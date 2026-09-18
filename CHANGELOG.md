@@ -1236,6 +1236,38 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **The POSIX path guarantee now holds for `register_project`, `list_projects` and `doctor`** (#99).
+  `docs/tools.md` opens with "File paths are always POSIX (`/`-separated), on every OS" and CLAUDE.md
+  repeats it; #98 made that true for `compile`, `render_pages` and `pdf_geometry` and left three
+  emitters behind. (Reviewing this change turned up a fourth, `project_sync`, which returns a native
+  `path` too. It is outside this lane's allocated files and carries no test here, so it is
+  **disclosed** as the remaining known gap in `docs/tools.md` rather than fixed silently alongside
+  work it was never scoped into.) The sharpest case contradicted itself inside a single expression:
+  `registerProject.ts` read `path: local ? toPosix(dir) : dir`, so **the same field of the same tool
+  came back POSIX for a local project and native for a git one** — a ternary nobody decided, not a
+  rule. On Windows, registering a git project yielded `C:\Users\me\.web_latex_mcp\demo` beside a
+  `toPosix`'d `note` in the same result.
+
+  Converted at the response boundary, `toPosixOut` once per result feeding the payload **and** the
+  text, so a result cannot spell one path two ways. What the conversion is kept _below_ is the part
+  worth preserving: `ctx.git.clone` and `ctx.files.resetBaselines` in `register_project` (the first
+  spawns git at that directory, the second keys the revision tracker natively), the persisted
+  `ProjectConfig.path` (read back into `fs` calls in every later session), and `DoctorService`'s
+  `canWrite` probes, which `stat` the real filesystem. The POSIX form is what the caller is shown and
+  nothing else. `ProjectManager.listProjects()` is untouched — `ProjectStatus.path` is native by
+  contract, so the conversion belongs in its one production consumer.
+
+  Only three `detail`s in a diagnosis carry a path (`TEXMFHOME`, `TEXMFLOCAL`, the workspace root, the
+  last shared between its check and its hint from one converted const). Everything else in `doctor`
+  that looks path-ish is not one: the `compiler`, `git` and `distribution` details hold `--version`
+  banner output and `package-manager`'s `repository` is a URL, and converting either would have been
+  a regression.
+
+  Proved where it can actually bite: on Linux `path.sep` is already `/`, so an assertion not driven
+  through a `path.sep` stub passes against unfixed code. The tests stub the separator and assert the
+  **consumers** still receive the host's own spelling — `canWrite`'s recorded arguments, and the
+  persisted registry JSON read back off disk — rather than only checking that the output looks right.
+
 - **The assertion that keeps `status`'s stale-peer exemption non-vacuous now compares against the
   real constant.** `RECENT_HEARTBEAT_GRACE_MS` only does anything above `SessionRegistry`'s
   `STALE_MS`: `isStalePeer` weighs a heartbeat solely for a peer already found `!live`, and `!live`

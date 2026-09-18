@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { toPosixOut } from '../lib/paths.js';
 import type { SyncResult } from '../services/gitService.js';
 import { enrichPullRefusal } from '../lib/peerRefusal.js';
 
@@ -93,7 +94,13 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           return result;
         });
 
-        const payload = { project: cfg.id, path: dir, ...result };
+        // The response boundary, below `runExclusive` and every git/fs use of `dir` inside it
+        // (`clone`, `syncPull`, `resetBaselines`, `shadows.refresh`), all of which need the host's
+        // own spelling. Converted once here: this tool reports the SAME directory
+        // `register_project` does, so a native `path` meant one server spelling one project's
+        // directory two ways across two calls — the defect #99 is about (#99 names three emitters;
+        // this is a fourth, found reviewing that fix).
+        const payload = { project: cfg.id, ...toPosixOut({ path: dir }), ...result };
         return {
           content: [
             {

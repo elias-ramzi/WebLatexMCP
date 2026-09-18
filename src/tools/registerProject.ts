@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { toPosix } from '../lib/paths.js';
+import { toPosix, toPosixOut } from '../lib/paths.js';
 import { isLocalProject } from '../lib/projectMode.js';
 import type { ProjectConfig } from '../types.js';
 
@@ -326,9 +326,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           const local = isLocalProject(cfg);
           const dir = ctx.projectManager.projectPath(cfg.id);
           const cloned = await ctx.projectManager.hasClone(cfg.id);
+          // The response boundary. `dir` is reported and nothing else here, so the conversion can
+          // sit at the top of the payload — but it is one call for the whole result all the same,
+          // and it is unconditional: the same field of the same tool came back POSIX for a local
+          // project and native for a git one, which is a ternary nobody decided, not a rule.
+          const { path: outPath } = toPosixOut({ path: dir });
           const payload = {
             project: cfg.id,
-            path: local ? toPosix(dir) : dir,
+            path: outPath,
             mode: local ? ('local' as const) : ('git' as const),
             persisted: true,
             cloned,
@@ -361,9 +366,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             };
             const dropped = droppedRegistrationFields(previous, cfg);
             await ctx.projectManager.registerAndPersist(cfg, { makeDefault });
+            // The response boundary, and it sits BELOW `cfg` and `registerAndPersist` on purpose:
+            // the config is persisted to the workspace registry and read back into `fs` calls in
+            // every later session, so its `path` stays the host's own spelling. One converted
+            // value from here on, so the payload and the result text cannot disagree.
+            const { path: outPath } = toPosixOut({ path: dir });
             const payload = {
               project,
-              path: toPosix(dir),
+              path: outPath,
               mode: 'local' as const,
               persisted: true,
               cloned: true,
@@ -383,7 +393,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               : ' A symlink pointing out of that folder is not followed (re-register with ' +
                 'followSymlinks: true if the links in it are yours).';
             const text =
-              `Registered "${project}" -> ${toPosix(dir)} (local, persisted to the workspace ` +
+              `Registered "${project}" -> ${outPath} (local, persisted to the workspace ` +
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
@@ -422,9 +432,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             cloned = true;
           }
 
+          // The response boundary. It sits below `ctx.git.clone` and `ctx.files.resetBaselines`
+          // deliberately: the first spawns git at that directory and the second resolves against
+          // the revision tracker's own native keys, so both need the host's spelling. Past this
+          // point the path is a display value, converted once for both channels.
+          const { path: outPath } = toPosixOut({ path: dir });
           const payload = {
             project: cfg.id,
-            path: dir,
+            path: outPath,
             mode: 'git' as const,
             persisted: true,
             cloned,
@@ -441,7 +456,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           const text =
             `Registered "${cfg.id}" -> ${gitUrl} (persisted to the workspace registry). ` +
             (cloned
-              ? `Cloned at ${dir}.`
+              ? `Cloned at ${outPath}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
             defaultRegistrationNote(ctx, makeDefault) +
