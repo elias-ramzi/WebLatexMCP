@@ -1236,6 +1236,65 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **The POSIX path guarantee now holds for `register_project`, `list_projects` and `doctor`** (#99).
+  `docs/tools.md` opens with "File paths are always POSIX (`/`-separated), on every OS" and CLAUDE.md
+  repeats it; #98 made that true for `compile`, `render_pages` and `pdf_geometry` and left three
+  emitters behind. (Reviewing this change turned up a fourth, `project_sync`, which returns a native
+  `path` too. It is outside this lane's allocated files and carries no test here, so it is
+  **disclosed** as the remaining known gap in `docs/tools.md` rather than fixed silently alongside
+  work it was never scoped into.) The sharpest case contradicted itself inside a single expression:
+  `registerProject.ts` read `path: local ? toPosix(dir) : dir`, so **the same field of the same tool
+  came back POSIX for a local project and native for a git one** — a ternary nobody decided, not a
+  rule. On Windows, registering a git project yielded `C:\Users\me\.web_latex_mcp\demo` beside a
+  `toPosix`'d `note` in the same result.
+
+  Converted at the response boundary, `toPosixOut` once per result feeding the payload **and** the
+  text, so a result cannot spell one path two ways. What the conversion is kept _below_ is the part
+  worth preserving: `ctx.git.clone` and `ctx.files.resetBaselines` in `register_project` (the first
+  spawns git at that directory, the second keys the revision tracker natively), the persisted
+  `ProjectConfig.path` (read back into `fs` calls in every later session), and `DoctorService`'s
+  `canWrite` probes, which `stat` the real filesystem. The POSIX form is what the caller is shown and
+  nothing else. `ProjectManager.listProjects()` is untouched — `ProjectStatus.path` is native by
+  contract, so the conversion belongs in its one production consumer.
+
+  Only three `detail`s in a diagnosis carry a path (`TEXMFHOME`, `TEXMFLOCAL`, the workspace root, the
+  last shared between its check and its hint from one converted const). Everything else in `doctor`
+  that looks path-ish is not one: the `compiler`, `git` and `distribution` details hold `--version`
+  banner output and `package-manager`'s `repository` is a URL, and converting either would have been
+  a regression.
+
+  Proved where it can actually bite: on Linux `path.sep` is already `/`, so an assertion not driven
+  through a `path.sep` stub passes against unfixed code. The tests stub the separator and assert the
+  **consumers** still receive the host's own spelling — `canWrite`'s recorded arguments, and the
+  persisted registry JSON read back off disk — rather than only checking that the output looks right.
+
+- **`commit` resolves the case fold once per call, as its own comment already claimed** (#93).
+  The handler computes `nameFold` once under a comment saying exactly that, but `commitEverything`'s
+  `paths` branch re-derived it twice more. Behaviour was identical — the answer cannot change within
+  one commit — so what this fixes is a comment that lied about where the ignorecase decision comes
+  from, and the structural invitation for a second, differently-derived answer to appear later.
+
+  **The cost is smaller than #93 states, and the issue is wrong about it**: `GitService`
+  keeps a per-dir promise cache of `isCaseInsensitive`, populated by the handler's own `nameFold`
+  before `commitEverything` ever runs, so the two extra calls were map lookups and the
+  `git config core.ignorecase` spawn had already happened exactly once. Three _method calls_ become
+  one; no subprocess is saved. Recorded plainly because a performance claim the code contradicts is
+  worse than no claim.
+  The handler's `fold` is threaded in instead; the comment is now true. **Note the route: this is
+  `scope: "all"` _with_ `paths`, not `scope: "paths"` as the issue's text says** — `commitEverything`
+  is the `scope: "all"` handler, so a test written against the issue's wording would measure the wrong
+  branch. And the fix is scoped to what the issue named: `commitSession` and `commitPaths` each still
+  resolve their own fold, so the handler's comment now says "once for this handler", not "once per
+  call" — the overclaim this entry exists to remove is not worth re-introducing one line higher.
+
+  Asserting on the output would prove nothing here, so the test counts the calls, attributing them by
+  stack frame because `GitService` asks itself the same question internally; it keeps the real
+  implementation and its answer, so a "fix" that stopped resolving the fold at all still fails. A
+  control case (`scope: "all"` without `paths`, already one call before) pins that the assertion
+  discriminates the branch that changed, and a separate case proves the _right_ fold is threaded — on
+  an ignorecase clone, requesting `Notes` must still report the nested ignored `notes/ig.md`, which a
+  byte-exact `undefined` fold would silently drop and no call count would catch.
+
 - **The assertion that keeps `status`'s stale-peer exemption non-vacuous now compares against the
   real constant.** `RECENT_HEARTBEAT_GRACE_MS` only does anything above `SessionRegistry`'s
   `STALE_MS`: `isStalePeer` weighs a heartbeat solely for a peer already found `!live`, and `!live`
