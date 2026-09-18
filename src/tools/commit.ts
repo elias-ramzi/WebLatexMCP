@@ -115,10 +115,14 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // landed), so carry its shadow forward before deciding what to commit.
           await ctx.shadows.refresh(id, dir);
           const effective = scope ?? ((await ctx.shadows.hasChanges(id)) ? 'session' : 'all');
-          // Computed once and reused by both `ctx.shadows.settle` call sites below: on an
-          // ignorecase clone a taken path can be keyed differently in this session's shadow than
-          // the spelling `commit` was given (or than HEAD's own spelling, which staging folds
-          // onto) — see `nameFold`.
+          // Computed once for this handler and reused by both `ctx.shadows.settle` call sites and,
+          // threaded in, `commitEverything`'s own by-name comparisons: on an ignorecase clone a
+          // taken path can be keyed differently in this session's shadow than the spelling
+          // `commit` was given (or than HEAD's own spelling, which staging folds onto) — see
+          // `nameFold`. Deliberately NOT "once per call": `commitSession` and `commitPaths` each
+          // still resolve their own (issue #93 named `commitEverything` only, and widening a
+          // no-behaviour-change fix is how it stops being one). Say what is true here — the whole
+          // point of #93 was a comment that claimed more than the code did.
           const fold = await nameFold(ctx, dir);
 
           let res: CommitOutcome;
@@ -135,7 +139,7 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               res =
                 effective === 'paths'
                   ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
-                  : await commitEverything(ctx, id, dir, { message, paths, allowEmpty });
+                  : await commitEverything(ctx, id, dir, { message, paths, allowEmpty, fold });
             } catch (err) {
               // `GitService.commit`/`commitContents` throw `NothingToCommitError` (a type, not a
               // message to match on) when there was nothing to stage for the paths in scope,
@@ -538,12 +542,24 @@ async function ignoredUnderRequestedDirs(
   return ctx.git.ignoredPaths(dir, candidates, { tracked });
 }
 
-/** Commit every change in the clone — the pre-session behaviour, now opt-in. */
+/**
+ * Commit every change in the clone — the pre-session behaviour, now opt-in.
+ *
+ * `opts.fold` is the handler's already-resolved name fold (see `nameFold`), passed in rather than
+ * re-derived here: the answer cannot change within one call, and deriving it per branch is what
+ * lets a second, differently-derived answer appear (issue #93). Only the `paths` branch uses it;
+ * `git add -A` compares no names of its own.
+ */
 async function commitEverything(
   ctx: AppContext,
   id: string,
   dir: string,
-  opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+  opts: {
+    message: string;
+    paths?: string[];
+    allowEmpty?: boolean;
+    fold?: (p: string) => string;
+  },
 ): Promise<CommitOutcome> {
   let paths = opts.paths;
   let ignored: string[] = [];
@@ -562,21 +578,20 @@ async function commitEverything(
     paths = filtered.paths;
     // Finding 2: a requested directory can itself be stageable while silently swallowing a
     // nested ignored entry this session tracks — name it too.
-    const nested = await ignoredUnderRequestedDirs(
-      ctx,
-      dir,
-      id,
-      paths,
-      'index',
-      await nameFold(ctx, dir),
-    );
-    mergeIgnored(ignored, nested, await nameFold(ctx, dir));
+    const nested = await ignoredUnderRequestedDirs(ctx, dir, id, paths, 'index', opts.fold);
+    mergeIgnored(ignored, nested, opts.fold);
   }
   // Without `paths` this is a plain `git add -A`, which already honours .gitignore/
   // .git/info/exclude on its own — nothing is ever taken here that `ignoredPaths` would flag.
   let res;
   try {
-    res = await ctx.git.commit(dir, { ...opts, paths });
+    // Spelled out rather than spread: `opts` now also carries the handler's `fold`, which is the
+    // tool layer's own concern and never a `GitService.commit` option.
+    res = await ctx.git.commit(dir, {
+      message: opts.message,
+      paths,
+      allowEmpty: opts.allowEmpty,
+    });
   } catch (err) {
     // `GitService.commit` itself throws a bare `NothingToCommitError()` (no `ignored`) when
     // staging the filtered set adds nothing — e.g. every non-ignored requested path already

@@ -1268,6 +1268,33 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   **consumers** still receive the host's own spelling — `canWrite`'s recorded arguments, and the
   persisted registry JSON read back off disk — rather than only checking that the output looks right.
 
+- **`commit` resolves the case fold once per call, as its own comment already claimed** (#93).
+  The handler computes `nameFold` once under a comment saying exactly that, but `commitEverything`'s
+  `paths` branch re-derived it twice more. Behaviour was identical — the answer cannot change within
+  one commit — so what this fixes is a comment that lied about where the ignorecase decision comes
+  from, and the structural invitation for a second, differently-derived answer to appear later.
+
+  **The cost is smaller than #93 states, and the issue is wrong about it**: `GitService`
+  keeps a per-dir promise cache of `isCaseInsensitive`, populated by the handler's own `nameFold`
+  before `commitEverything` ever runs, so the two extra calls were map lookups and the
+  `git config core.ignorecase` spawn had already happened exactly once. Three _method calls_ become
+  one; no subprocess is saved. Recorded plainly because a performance claim the code contradicts is
+  worse than no claim.
+  The handler's `fold` is threaded in instead; the comment is now true. **Note the route: this is
+  `scope: "all"` _with_ `paths`, not `scope: "paths"` as the issue's text says** — `commitEverything`
+  is the `scope: "all"` handler, so a test written against the issue's wording would measure the wrong
+  branch. And the fix is scoped to what the issue named: `commitSession` and `commitPaths` each still
+  resolve their own fold, so the handler's comment now says "once for this handler", not "once per
+  call" — the overclaim this entry exists to remove is not worth re-introducing one line higher.
+
+  Asserting on the output would prove nothing here, so the test counts the calls, attributing them by
+  stack frame because `GitService` asks itself the same question internally; it keeps the real
+  implementation and its answer, so a "fix" that stopped resolving the fold at all still fails. A
+  control case (`scope: "all"` without `paths`, already one call before) pins that the assertion
+  discriminates the branch that changed, and a separate case proves the _right_ fold is threaded — on
+  an ignorecase clone, requesting `Notes` must still report the nested ignored `notes/ig.md`, which a
+  byte-exact `undefined` fold would silently drop and no call count would catch.
+
 - **The assertion that keeps `status`'s stale-peer exemption non-vacuous now compares against the
   real constant.** `RECENT_HEARTBEAT_GRACE_MS` only does anything above `SessionRegistry`'s
   `STALE_MS`: `isStalePeer` weighs a heartbeat solely for a peer already found `!live`, and `!live`
