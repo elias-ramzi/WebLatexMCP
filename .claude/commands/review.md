@@ -1,5 +1,5 @@
 ---
-description: Review a PR, branch, or the working tree by orchestrating — scope the diff, review adversarially with the plan-verifier agent, and with --fix loop implement (implementer) → verify until clean (cap 3), then validate the PR.
+description: Review a PR, branch, or the working tree by orchestrating — scope the diff, review adversarially with the plan-verifier agent, and with --fix loop implement (implementer) → verify (cap 3 rounds), close with one verify-only pass when fixes landed after the last verification, then validate the PR.
 argument-hint: <PR# | branch | empty for current branch> [--fix]
 ---
 
@@ -103,22 +103,62 @@ test:smoke` if it is installed). The output goes to the reviewer as evidence, no
    a call to put to me, per step 5, not one to make silently.
    If it confirms new problems, loop back to step 2 scoped
    to the fix diff. Cap: 3 rounds total; whatever remains after that is reported, not
-   iterated.
+   iterated — but the cap bounds **wall-clock**, and is not a claim that the loop
+   converged. The finding rate here has not decayed across rounds: each round has turned
+   up fewer but more consequential things, several of them introduced by the previous
+   round's own fix. So a round count is not a convergence signal and must never be
+   reported as one — "3 rounds" means the budget ran out, not that the diff is clean.
    A verifier that proposes a fix has done its job; one that _applies_ one has not.
    If a reviewer comes back having edited anything, treat its report as unreliable for
    this round — re-verify its claims yourself — and rebuild the fix set from a clean
    worktree rather than trusting the tree it handed back. Findings it raises that are
    real are still real: keep them, drop the edits.
 
+   **Terminating pass — verify-only, no fix step.** The cap leaves a tail: the fixes
+   written in answer to the final round go out with no adversarial pass over them. So
+   whenever any fix was applied _after_ the most recent verification pass, run exactly one
+   more `plan-verifier` pass before step 5. The trigger is "fixes exist that no
+   verification has seen", not "three rounds elapsed" — that is always true when the cap
+   is reached, and it is false when the loop exits because a verification came back clean
+   and nothing changed after it. In that second case there is no tail: skip the pass, and
+   say so in step 5's required line. Scope it **only** to "did the last round's fixes
+   introduce anything" — the fix diff and the findings it was answering, not a general
+   re-review of the target, which step 2 already did. **No fix step is permitted from it.**
+   Its findings go to the step 5 verdict and the step 5 PR comment; they never re-enter the
+   loop. That is what makes this terminate **by construction** rather than by another
+   counter — nothing it finds gets fixed in this invocation, so there is nothing for it to
+   loop over. Isolation is step 4's rule for step 4's reason: **do not pass
+   `isolation: "worktree"`** — the fixes are still uncommitted, so an isolated worktree
+   would hold none of them and the reviewer would sign off on an empty diff. Dispatch it
+   onto the tree you fixed in, naming that path as the tree under review (its contract
+   already treats every checkout of this repo that way by default, so naming it costs
+   nothing and removes the one thing that could be mistaken for a grant), and hold it
+   read-only by that contract plus a `git status` of your own when it reports.
+
 5. **Validate.** Deliver the verdict yourself: approve / request-changes, justified by
    the surviving findings and the local proof (gate output tails, skips distinguished
    from passes, formatting clean, cross-platform concerns named — paths POSIX via
-   `toPosix`, separator-agnostic tests). Then, **each gated on my explicit go, one at a
+   `toPosix`, separator-agnostic tests). One line of that verdict is **required**, with
+   the same standing the command gives "skips distinguished from passes" — a verdict
+   missing it is incomplete, not merely thinner: **the unreviewed tail.** Write it on its own line, opening with
+   the literal token `Unreviewed tail:` — a property a reader has to infer is one step 6 can drop
+   and nobody can grep a posted PR comment for; a fixed prefix makes the requirement checkable. Name which
+   findings were fixed after the final verification round and are therefore unreviewed;
+   when the step 4 terminating pass ran, report what it found, flagged as findings that
+   are **unfixed in this invocation by construction**; and when there is no tail — the
+   last verification pass covered every fix, or the run was report-only and changed
+   nothing — write "none" and say which of those it is. An absent line and a "none" line
+   must not look the same. A verdict of "3 rounds, clean" whose third round's fixes no
+   reviewer ever attacked is the exact overclaim this line removes.
+   Then, **each gated on my explicit go, one at a
    time**: (a) post the findings/verdict as a single PR comment via `gh` — show me the
    exact comment text first; (b) commit the fixes onto the PR branch and push — show me
    the diff summary and commit message first, and sync with the remote per CLAUDE.md
    (re-running the gate after resolving any conflicts) before committing. Never post or
    push without the go.
 
-6. **Close.** Summarize: the verdict, findings fixed vs deferred vs dropped (with
-   reasons), the proof, and the exact next command for anything left.
+6. **Close.** Summarize: the verdict, the unreviewed tail (step 5's required line,
+   carried verbatim — including its "none"), findings fixed vs deferred vs dropped (with
+   reasons), the proof, and the exact next command for anything left. Anything the
+   terminating pass raised is "deferred", never "fixed": it is unfixed by construction,
+   and a summary that files it anywhere else re-creates the overclaim.

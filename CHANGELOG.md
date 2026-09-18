@@ -1236,13 +1236,77 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`/review --fix` no longer ships its last round's fixes unreviewed** (#82). The implement/verify
+  loop caps at three rounds, so the fixes written in answer to the final round went out with no
+  adversarial pass over them — and in both #77 and #79 the later rounds were where the real defects
+  were, several of them introduced _by the fixes_. The finding rate did not decay across rounds, so
+  the cap is a **wall-clock bound, not a convergence claim**, and the command read as though it were
+  the latter. A verdict of "3 rounds, clean" whose third round's fixes no reviewer ever attacked is
+  the overclaim this closes.
+
+  Two changes, per the issue's own proposals (1) and (2). The step 5 verdict gains a **required**
+  line — with the same standing the command already gives "skips distinguished from passes" — naming
+  which findings were fixed after the final verification round and are therefore unreviewed; a
+  verdict missing it is incomplete, not merely thinner, and an absent line and a `"none"` line must
+  not look the same. And `review-round.js` gains a **`Tail audit` phase**: one verify-only
+  `plan-verifier` pass over the whole accumulated diff, between the last batch verifier and the
+  sign-off.
+
+  It terminates **by construction** rather than by another counter — no implementer runs after it,
+  nothing loops back, so there is nothing for it to iterate over.
+
+  **The two tails are different shapes, and conflating them is the trap.** In `/review` the loop caps
+  at three rounds and the final round's fixes ship with nothing having looked at them, so its trigger
+  is _"fixes exist that no verification has seen"_, not "three rounds elapsed" — on a run that exits
+  because a verification came back clean and nothing changed after it there is no tail, the pass is
+  skipped, and the required line says so. In `review-round.js` no batch ever ships unverified: every
+  `impl` is followed by a `verify` in the same loop, which breaks only after one. Its phase is
+  therefore unconditional, and it exists for what a per-batch verifier structurally cannot see —
+  cross-batch staleness (batches run sequentially in a shared tree, so an early approval describes
+  code a later batch may since have moved), rework approved in a single reading, and independence
+  from the agent that commits. Telling that auditor "the last batch was never reviewed" would be
+  exactly the overclaim this entry exists to delete, one layer down.
+
+  Two properties are load-bearing and easy to lose. **It has no knob and takes the verifier's model
+  directly.** A cheaper tail auditor that finds nothing, feeding a sign-off merely told "nothing
+  blocking", buys the same unattended push the #81 sign-off floor refuses to sell directly — reusing
+  the constant makes that _unenforceable by construction_ rather than enforced by a second check
+  someone can forget to write. And **a blocking verdict withholds the commit**, folded into
+  `MAY_COMMIT` beside the batch verdicts. That is not a fourth fix round and needs no loop: the fixes
+  stay in the tree for a human exactly as an unapproved batch already leaves them. It would be
+  incoherent for the round's one independent pass to find a defect and then commit it unattended.
+
+  The verdict is read **fail-closed** in every shape a free-text answer can arrive in — nothing at
+  all, a non-object, or a `blocking` that is not a boolean (`"false"`, `0`, `null`, absent) all read
+  as blocking, because an unguarded read would turn an unreadable verdict into a clean bill of
+  health. **Both** required schema fields gate it, not just `blocking`: an answer carrying
+  `blocking: false` whose `findings` is absent, empty or a non-string violated the shape it was asked
+  for, and an answer that broke the schema in one required field is not evidence about the other — a
+  reply truncated after the first field would otherwise commit on a clean bill of health nothing
+  vouched for. The do-not-commit reason became a list rather than a one-reason ternary: a round that
+  was both unapproved _and_ tail-blocked previously reported only the batches, which reads as though
+  the tail audit had passed.
+
+  The auditor is also told which paths were **already dirty** before the round began. This checkout is
+  shared with peer agent sessions, and the tail audit is the one phase whose verdict withholds the
+  commit by itself — so without that, a peer's half-written file could block a round whose own work is
+  finished and correct, and land in the record attributed to it.
+
+  What this does **not** do: it is not the issue's proposal (3), a budget that extends by a round when
+  the fixes introduce a blocker — the cap is unchanged and no fourth fix round exists. And one
+  residual, stated rather than glossed: the sign-off may still fix a trivial gate failure (a prettier
+  reflow, a lint autofix) in a claimed path _after_ the tail audit has run, and then commit it. Those
+  bytes get no adversarial pass and their only reader is the agent that pushes them. This phase
+  narrows the unreviewed surface; it does not reduce it to zero, and saying otherwise would re-create
+  the overclaim at a smaller scale.
+
 - **The POSIX path guarantee now holds for `register_project`, `list_projects` and `doctor`** (#99).
   `docs/tools.md` opens with "File paths are always POSIX (`/`-separated), on every OS" and CLAUDE.md
   repeats it; #98 made that true for `compile`, `render_pages` and `pdf_geometry` and left three
-  emitters behind. (Reviewing this change turned up a fourth, `project_sync`, which returns a native
-  `path` too. It is outside this lane's allocated files and carries no test here, so it is
-  **disclosed** as the remaining known gap in `docs/tools.md` rather than fixed silently alongside
-  work it was never scoped into.) The sharpest case contradicted itself inside a single expression:
+  emitters behind. (Reviewing this change turned up a fourth, `project_sync`, and it is fixed
+  here too — it reports the SAME directory `register_project` does, so a native `path` meant one
+  server spelling one project's directory two ways across two calls, which is the defect #99 is
+  about rather than an adjacent one.) The sharpest case contradicted itself inside a single expression:
   `registerProject.ts` read `path: local ? toPosix(dir) : dir`, so **the same field of the same tool
   came back POSIX for a local project and native for a git one** — a ternary nobody decided, not a
   rule. On Windows, registering a git project yielded `C:\Users\me\.web_latex_mcp\demo` beside a

@@ -347,7 +347,16 @@ function onlyBatch(outcome: RunOutcome): Record<string, unknown> {
 // Stubbed agent answers for review-round.js, keyed on opts.label.
 // ---------------------------------------------------------------------------
 
-type ResponderKey = 'preflight' | 'review' | 'plan' | 'impl' | 'verify' | 'sign-off';
+type ResponderKey =
+  | 'preflight'
+  | 'review'
+  | 'plan'
+  | 'impl'
+  | 'verify'
+  // A bare, constant label, so `labelKey` needs no branch for it — unlike `impl:`/`verify:`,
+  // which carry a batch name and an attempt number. The tail audit runs exactly once.
+  | 'tail-audit'
+  | 'sign-off';
 type ResponderMap = Partial<Record<ResponderKey, Responder>>;
 
 function defaultRespond(overrides: ResponderMap = {}): Responder {
@@ -372,6 +381,8 @@ function defaultRespond(overrides: ResponderMap = {}): Responder {
         };
       case 'verify':
         return { approved: true, feedback: '', boundary_probes: 'probed' };
+      case 'tail-audit':
+        return { blocking: false, findings: 'none' };
       case 'sign-off':
         return 'SIGNED OFF';
       default:
@@ -971,6 +982,189 @@ describe('review-round.js', () => {
       // The adversarial check is itself a guard: it runs on opus.
       expect(verify.opts.model).toBe('opus');
       expect(verify.opts.agentType).toBe('plan-verifier');
+    });
+  });
+
+  describe('tail audit (#82)', () => {
+    // The phase the per-batch verifiers structurally could not do: they each saw ONE batch, at
+    // the moment it landed, and the last batch's fixes had no adversarial pass at all. Before
+    // this, the only agent that read the whole accumulated diff was the sign-off — the same
+    // agent that commits and pushes it.
+    const twoBatches = () => ({
+      shared_context: 'ctx',
+      batches: [
+        { name: 'b1', spec: 'SPEC ONE' },
+        { name: 'b2', spec: 'SPEC TWO' },
+      ],
+    });
+
+    it('declares its phase in meta and uses it in the body', async () => {
+      // The generic both-directions check ('declares every phase its body uses...') would catch
+      // a mismatch, but not the phase being absent from BOTH sides — which is the shape this
+      // feature regresses to if the phase is deleted wholesale.
+      const declared = metaPhaseTitles(await loadMeta(sourceOf(REVIEW_ROUND)));
+      expect(declared).toContain('Tail audit');
+      expect(phasesUsedInSource(sourceOf(REVIEW_ROUND))).toContain('Tail audit');
+      const outcome = await runRound();
+      expect(outcome.phases).toContain('Tail audit');
+      expect(oneCallFor(outcome, 'tail-audit').opts.phase).toBe('Tail audit');
+    });
+
+    it('runs on the same model as the per-batch verifier, as a plan-verifier', async () => {
+      // Asserted against the verify call's model, never a hardcoded 'opus': the point of
+      // reusing VERIFIER_MODEL is that no edit can lower the tail audit without lowering the
+      // verifier too. A literal here would go green on exactly the drift it exists to stop.
+      const outcome = await runRound();
+      const tail = oneCallFor(outcome, 'tail-audit');
+      expect(tail.opts.model).toBe(oneCallFor(outcome, 'verify').opts.model);
+      expect(tail.opts.agentType).toBe('plan-verifier');
+    });
+
+    it('runs once, after the last verify and before the sign-off, with no implementer after it', async () => {
+      // Asserted on the label SEQUENCE, not on counts: "no fix step may follow" is a statement
+      // about order, and a count of impl calls is satisfied by a loop that ran them afterwards.
+      const outcome = await runRound({}, { plan: twoBatches });
+      const labels = labelsOf(outcome);
+      const keys = labels.map(labelKey);
+      const tail = labels.indexOf('tail-audit');
+      const lastVerify = keys.lastIndexOf('verify');
+      const signoff = labels.indexOf('sign-off');
+      expect(tail, `no tail-audit call (labels: ${labels.join(', ')})`).toBeGreaterThan(-1);
+      expect(callsFor(outcome, 'tail-audit')).toHaveLength(1);
+      expect(lastVerify).toBeGreaterThan(-1);
+      expect(tail).toBeGreaterThan(lastVerify);
+      expect(signoff).toBeGreaterThan(tail);
+      expect(keys.slice(tail)).not.toContain('impl');
+    });
+
+    it('gives the tail auditor no write authority and tells it nothing will be fixed', async () => {
+      const prompt = oneCallFor(await runRound(), 'tail-audit').prompt;
+      expect(prompt).toContain('NO authority to change the tree');
+      expect(prompt).toContain('`git diff`');
+      expect(prompt).toContain('edit-and-revert');
+      // The half a prompt cannot be trusted to infer: with no fix step behind it, a hedged
+      // finding is a finding nobody acts on.
+      expect(prompt).toContain('Nothing you find will be fixed in this invocation');
+    });
+
+    it('withholds the commit on a blocking verdict even when every batch is approved', async () => {
+      const outcome = await runRound(
+        {},
+        { 'tail-audit': () => ({ blocking: true, findings: 'F' }) },
+      );
+      expect(onlyBatch(outcome).approved).toBe(true);
+      const prompt = oneCallFor(outcome, 'sign-off').prompt;
+      expect(prompt).toContain('DO NOT COMMIT');
+      expect(prompt).toMatch(/tail audit/i);
+      // The write-authority carve-out and the by-path commit instructions belong to the branch
+      // that commits; either one surviving here hands an auditor a licence the guard withdrew.
+      expect(prompt).not.toContain('commit BY PATH');
+      expect(prompt).not.toContain('Claimed paths (');
+      expect(prompt).not.toContain('sequence in step 5');
+      const result = expectCompleted(outcome);
+      expect((result.tail_audit as Record<string, unknown>).blocking).toBe(true);
+    });
+
+    it('treats a tail auditor that returned nothing as blocking, and records it', async () => {
+      // Fail CLOSED: an unaudited tail is exactly what this phase exists to stop shipping, so
+      // `undefined` must never read as "not blocking".
+      const outcome = await runRound({}, { 'tail-audit': () => null });
+      const result = expectCompleted(outcome);
+      const audit = result.tail_audit as Record<string, unknown>;
+      expect(audit.blocking).toBe(true);
+      expect(String(audit.findings)).toMatch(/returned nothing/);
+      expect(oneCallFor(outcome, 'sign-off').prompt).toContain('DO NOT COMMIT');
+      expect(outcome.logs.join('\n')).toMatch(/tail audit: returned nothing/);
+    });
+
+    it.each([
+      ['a string "false"', { blocking: 'false', findings: 'f' }],
+      ['a falsy non-boolean', { blocking: 0, findings: 'f' }],
+      ['the key absent', { findings: 'f' }],
+      ['null', { blocking: null, findings: 'f' }],
+    ])('treats %s where the boolean belongs as blocking', async (_label, verdict) => {
+      // The value just outside the guard: every one of these is falsy or absent, so a
+      // `!verdict.blocking` reading would let all four through as a clean bill of health.
+      const outcome = await runRound({}, { 'tail-audit': () => verdict });
+      const result = expectCompleted(outcome);
+      expect((result.tail_audit as Record<string, unknown>).blocking).toBe(true);
+      expect(oneCallFor(outcome, 'sign-off').prompt).toContain('DO NOT COMMIT');
+    });
+
+    it.each([
+      ['findings absent', { blocking: false }],
+      ['findings a non-string', { blocking: false, findings: 42 }],
+      ['findings empty', { blocking: false, findings: '' }],
+      ['findings whitespace only', { blocking: false, findings: '   ' }],
+    ])(
+      'treats an explicit blocking:false with %s as blocking — a broken schema is not a clean bill',
+      async (_label, verdict) => {
+        // `findings` is `required` in TAIL_SCHEMA exactly as `blocking` is, so an answer missing
+        // it violated the shape that was asked for — and an answer that broke the schema in one
+        // required field is not evidence about the other. The shape that makes this bite: a reply
+        // truncated after `blocking: false`, or a host that dropped an oversized findings string.
+        // Reading it permissively would commit and push on a verdict nothing vouched for, which
+        // is the exact outcome this phase exists to prevent.
+        const outcome = await runRound({}, { 'tail-audit': () => verdict });
+        const result = expectCompleted(outcome);
+        expect((result.tail_audit as Record<string, unknown>).blocking).toBe(true);
+        expect(oneCallFor(outcome, 'sign-off').prompt).toContain('DO NOT COMMIT');
+      },
+    );
+
+    it('still instructs the by-path commit on a non-blocking verdict', async () => {
+      // The boundary just inside: an explicit `blocking: false` is the ONLY value that leaves
+      // the commit authority standing, so it has to really leave it standing.
+      const outcome = await runRound();
+      const prompt = oneCallFor(outcome, 'sign-off').prompt;
+      expect(prompt).toContain('commit BY PATH');
+      expect(prompt).toContain('sequence in step 5');
+      expect(prompt).not.toContain('DO NOT COMMIT');
+      expect((expectCompleted(outcome).tail_audit as Record<string, unknown>).blocking).toBe(false);
+    });
+
+    it('runs even when a batch was not approved, and the round still does not commit', async () => {
+      // The findings are the deliverable either way, and the round is not committing regardless
+      // — skipping the audit on an unapproved batch would drop the audit exactly where the tree
+      // is least reviewed.
+      const outcome = await runRound(
+        {},
+        { verify: () => ({ approved: false, feedback: 'nope', boundary_probes: '' }) },
+      );
+      expect(callsFor(outcome, 'tail-audit')).toHaveLength(1);
+      const prompt = oneCallFor(outcome, 'sign-off').prompt;
+      expect(prompt).toContain('DO NOT COMMIT');
+      expect(prompt).toMatch(/batches not approved: b1/);
+    });
+
+    it('carries its findings into the sign-off prompt and into the result', async () => {
+      // After the fact the prompt is gone and the commit is not, so the findings have to land
+      // in both channels — the same argument the `auditor` key carries.
+      const outcome = await runRound(
+        {},
+        {
+          'tail-audit': () => ({
+            blocking: false,
+            findings: 'src/lib/thing.ts:doThing — b2 moved the helper b1 verified',
+          }),
+        },
+      );
+      const prompt = oneCallFor(outcome, 'sign-off').prompt;
+      expect(prompt).toContain('src/lib/thing.ts:doThing — b2 moved the helper b1 verified');
+      const audit = expectCompleted(outcome).tail_audit as Record<string, unknown>;
+      expect(audit.findings).toBe('src/lib/thing.ts:doThing — b2 moved the helper b1 verified');
+      expect(audit.model).toBe(oneCallFor(outcome, 'verify').opts.model);
+    });
+
+    it('spawns no tail audit at all when the plan has no batches', async () => {
+      // There is no tail to audit when nothing was implemented, and `blocking: false` there
+      // would claim an audit ran and cleared the round. `null` says no audit ran.
+      const outcome = await runRound(
+        {},
+        { plan: () => ({ shared_context: 'NOTHING_TO_FIX', batches: [] }) },
+      );
+      expect(callsFor(outcome, 'tail-audit')).toEqual([]);
+      expect(expectCompleted(outcome).tail_audit).toBeNull();
     });
   });
 
