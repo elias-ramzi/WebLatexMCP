@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-round',
   description:
-    'One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies, opus signs off (planner and sign-off models are separate knobs)',
+    "One review round end-to-end: opus reviews the diff, fable plans, sonnet implements, opus verifies each batch, opus audits the round's own unreviewed tail (findings only — no fix step follows it), opus signs off (planner and sign-off models are separate knobs; the tail audit has none)",
   whenToUse:
     'To review-and-fix a branch or PR in one pass: Workflow({name: "review-round"}) reviews the current branch ' +
     'against origin/dev itself. Optional args: {review: "<posted review-comment URL>" to fix an existing review ' +
@@ -10,7 +10,12 @@ export const meta = {
     'sign-off), signoff_model: "fable" | "sonnet" | "opus" for the sign-off auditor, which defaults to opus}. ' +
     "While commit: true, the sign-off may not run below the verifier's tier (opus) — it reads the whole diff, " +
     'runs the gate and commits and pushes unattended — so a cheaper auditor needs {commit: false}. ' +
-    'Batches run sequentially (shared files), so wall-clock is the sum of batches.',
+    'Batches run sequentially (shared files), so wall-clock is the sum of batches. ' +
+    'There is no arg for the Tail audit and it is not optional: whenever the planner produced at ' +
+    'least one batch it runs ' +
+    "once, on the verifier's model, reading the whole accumulated diff for what THIS round's fixes " +
+    'introduced — and a blocking verdict withholds the commit on its own, whatever the batch verdicts ' +
+    'said. An optional or cheaper tail audit would be a side door under the sign-off floor.',
   phases: [
     {
       title: 'Review',
@@ -32,6 +37,13 @@ export const meta = {
     {
       title: 'Verify',
       detail: 'opus adversarially verifies each batch and demands rework',
+      model: 'opus',
+    },
+    {
+      // No knob of its own, deliberately — see the phase itself, below, for why.
+      title: 'Tail audit',
+      detail:
+        "opus reads the whole accumulated diff for what this round's own fixes introduced — the tail no per-batch verifier could see; findings only, nothing loops back",
       model: 'opus',
     },
     {
@@ -390,6 +402,15 @@ if (!plan.batches.length) {
     planner: PLANNER,
     batches: [],
     preexisting_dirty: PRE_DIRTY,
+    // Spelled out rather than left absent, and `null` rather than a non-blocking verdict.
+    // There is no tail here — no batch ran, so no fix of this round's exists to have
+    // introduced anything — and `{blocking: false}` would be the claim that an audit ran and
+    // cleared the round. `null` is the honest value: no audit ran. It is spelled out at all
+    // because "was this round's tail audited?" is a question asked of a result that shipped,
+    // and an absent key answers it only by inference. (`auditor` is absent on this shape for
+    // the neighbouring reason — no sign-off ran — and stays that way: nothing reads it as a
+    // safety property.)
+    tail_audit: null,
     signoff: 'nothing to fix',
   };
 }
@@ -619,6 +640,169 @@ Approve ONLY if all pass. If rejecting, give file:symbol-precise rework instruct
   );
 }
 
+// ---- Phase 3b: audit this round's own unreviewed tail --------------------
+// Issue #82. Note carefully what the tail IS here, because it is NOT what it is in
+// `.claude/commands/review.md`. There, the loop caps at three rounds and the final round's fixes
+// ship with nothing having looked at them. In THIS script every `impl` is followed by a `verify`
+// inside the same loop, and the loop breaks only after one — so no batch, the last included,
+// ships unverified, and claiming otherwise here would be the very overclaim #82 exists to delete.
+//
+// The tail this phase covers is a different shape, and it is real:
+//   1. Cross-batch staleness. Batches run sequentially in a SHARED tree, so an early batch's
+//      approval is a statement about code a later batch may since have moved. No per-batch
+//      verifier can see that — structurally, not by oversight: each saw one batch, at the moment
+//      it landed.
+//   2. Rework approved in a single reading. A verifier that demands a fix and approves the
+//      answer on the next pass has read that answer once, and it is the only reader.
+//   3. Independence from the committer. Until now the only agent that read the whole accumulated
+//      diff was the sign-off, which is also the agent that commits and pushes it. An auditor
+//      reviewing its own commit is not an adversarial pass. This is the independent one.
+//
+// It runs on VERIFIER_MODEL directly, and adds NO knob. That is deliberate twice over. An audit
+// run below the tier of the pass it supplements is decoration — it is reading the output of an
+// opus verifier and the code an opus sign-off is about to push. And a knob is how a floor gets
+// walked under by the side door: a cheap tail auditor that finds nothing, feeding a sign-off
+// merely told "nothing blocking", buys the same unattended push the #81 floor refuses to sell
+// directly. Reusing the constant makes that UNENFORCEABLE BY CONSTRUCTION rather than enforced
+// by a second check — there is no value to lower, so there is no check to forget to write.
+//
+// Nothing loops back from here: no implementer runs after it, no counter, no re-plan. The
+// findings are the deliverable, and the loop terminates structurally rather than at a cap —
+// which is the whole reason this is the answer to #82 and a fourth round would not be.
+phase('Tail audit');
+const TAIL_SCHEMA = {
+  type: 'object',
+  required: ['blocking', 'findings'],
+  properties: {
+    blocking: {
+      type: 'boolean',
+      description:
+        "true if and only if this round's tail contains a defect that must not be committed and " +
+        "pushed unattended. The round's commit is withheld on this field alone, whatever every batch " +
+        'verifier said. Unsure counts as true.',
+    },
+    findings: {
+      type: 'string',
+      description:
+        'The findings themselves, ranked most severe first, each naming file:symbol and the failure ' +
+        'scenario in one sentence, and what a human must do. Nothing is fixed in this invocation, so ' +
+        'this text is the entire deliverable. "none" if there are genuinely none.',
+    },
+  },
+};
+const tailAudit = await agent(
+  `You are the tail auditor. ${HOUSE}
+
+Every batch of this fix round is in the working tree, uncommitted. Each batch WAS verified as it
+landed — you are not here because something went unreviewed. You are here for the three things a
+per-batch verifier structurally cannot be: batches ran sequentially in this SHARED tree, so an
+early batch's approval is a statement about code a later batch may since have moved; rework that
+a verifier demanded and then approved has been read exactly once, by that verifier; and until
+now the only agent that read the whole accumulated diff was the one that commits and pushes it,
+which is not an adversarial pass. You are the independent reader, before the committer (#82).
+
+Batch outcomes, as the per-batch verifiers left them — claims to check, not evidence:
+${JSON.stringify(results)}
+
+Read the accumulated diff: \`git diff\` (nothing here is committed). Verify what you read against
+the surrounding code in the tree, never the diff context alone.
+
+IMPORTANT — the diff is not all this round's work. This checkout is shared with other agent
+sessions, and these paths were ALREADY dirty before the round began:
+${JSON.stringify(PRE_DIRTY)}
+They are a peer's in-flight work. Do not report on them and do not let them set your verdict:
+this round's commit is withheld on your answer, so blocking on a peer's half-written file stops
+work that is finished and correct, and attributes their code to this round. The round is what
+the batches above claim; anything else in the diff is somebody else's.
+
+Hunt, in this order, for what THIS ROUND'S FIXES introduced — not for what the original target
+was already doing, which the review and the per-batch verifiers have been over:
+1. Cross-batch staleness, which no per-batch verifier could structurally see: a later batch that
+   moved, renamed, re-signatured or deleted something an earlier batch's verifier approved, so
+   that verdict is now about code that is gone; the same helper introduced twice from two
+   batches; one guard loosened from a second direction; a behaviour changed in one batch that
+   another batch's README / docs/ / CLAUDE.md / CHANGELOG text now describes wrongly.
+2. Defects the fixes themselves introduced, especially in the last batch: rework a verifier
+   demanded and then approved in one reading, or an attempt that landed when the round ran out
+   of attempts. Both are code nobody has attacked.
+3. Tests that went vacuous across batches: a regression test an earlier batch watched fail whose
+   fix a later batch has since rewritten, a test that would still pass with its own hunk
+   reverted, an auto-skipped TeX smoke counted as coverage, a probe whose path no longer fires.
+4. The house sweep over the diff as a whole rather than per batch: a console.log in server code,
+   logic in a tool handler, a catch not going through errorResult, a non-spread
+   structuredContent, a weakened guard (requireGitProject / runExclusive / confirmBibEdit /
+   recordBaseline / symlink resolution / ff-only / conflicted-stays-flagged / snippet
+   provenance), a type-only import without import type, a hardcoded separator or a string-built
+   file:// URL.
+
+You have NO authority to change the tree, for ANY purpose — not to probe, not to tidy, not to
+undo something you typed, and above all not to fix what you find. No git command that changes
+the working tree, the index, refs or the stash: not \`stash\`, \`checkout\`, \`restore\`,
+\`reset\`, \`clean\`, \`switch\`, \`worktree\`, \`rebase\`, \`merge\`, \`add\` or \`commit\`.
+\`git diff\`, \`log\`, \`show\` and \`status\` only. And no hand edit-and-revert of a source file
+either — that is the same rollback without git's safety net, and if you stop between the two
+edits the round is silently corrupted. This checkout is shared with other agent sessions and
+holds every batch of this round uncommitted; the stash stack is repo-global, so a stash here
+surfaces in a sibling worktree and one left unpopped discards the round.
+
+Nothing you find will be fixed in this invocation. No implementer runs after you, there is no
+next round, and that is by construction, not by a cap. So the findings ARE the deliverable:
+rank them most severe first, make every one file:symbol-specific with the failure scenario in
+one sentence, and say what a human must do about it. Do not hedge, do not write "consider
+reviewing", and do not offer to go and fix anything — at the end of the loop a hedged finding is
+a finding nobody acts on.
+
+Set \`blocking\` true if and only if this tail holds something that must not be committed and
+pushed unattended. The round's commit is withheld on your verdict alone, whatever every batch
+verifier said. A false alarm costs a human one look at a tree they were going to read anyway; a
+miss ships the defect this phase exists to catch. If you are unsure, it is blocking.`,
+  {
+    model: VERIFIER_MODEL,
+    label: 'tail-audit',
+    phase: 'Tail audit',
+    schema: TAIL_SCHEMA,
+    agentType: 'plan-verifier',
+  },
+);
+// Fail CLOSED, in every shape a free-text agent's answer can arrive in: nothing at all, a
+// non-object, and an object whose `blocking` is not actually a boolean (`"false"`, `0`, `null`,
+// or the key simply absent). This is the same reading `PRE_DIRTY` and `results[].files` get —
+// guard the field, never assume the shape — taken one step further, because here the failure
+// mode is worse: an unguarded `tailAudit.blocking` would turn an unreadable verdict into a
+// clean bill of health, and an unaudited tail committed unattended is precisely what this phase
+// exists to stop shipping. `undefined` must never read as "not blocking".
+const tailVerdict = tailAudit && typeof tailAudit === 'object' ? tailAudit : null;
+// `findings` is `required` in TAIL_SCHEMA exactly as `blocking` is, so an answer missing it —
+// or carrying a non-string, or an empty one — violated the shape that was asked for, and an
+// answer that broke the schema in one required field is not evidence about the other. A reply
+// truncated after `blocking: false` would otherwise read as a clean bill of health with an
+// apologetic footnote, and commit on it. Both required fields gate the verdict, or "fail closed
+// in every shape" is a sentence rather than a property.
+const tailFindingsOk =
+  !!tailVerdict && typeof tailVerdict.findings === 'string' && !!tailVerdict.findings.trim();
+const tailBlocking =
+  !tailVerdict ||
+  typeof tailVerdict.blocking !== 'boolean' ||
+  !tailFindingsOk ||
+  tailVerdict.blocking;
+const tailFindings = !tailVerdict
+  ? 'the tail auditor returned nothing — this round has NO audit of its own tail, which is why the commit is withheld'
+  : tailFindingsOk
+    ? tailVerdict.findings
+    : 'the tail auditor returned no usable findings text, so its answer did not match the shape it was asked for — the commit is withheld on that alone, whatever its `blocking` said';
+// One line, all four outcomes, the way the batch loop reports its own: a verdict this script
+// had to reinterpret must say so out loud rather than looking like an ordinary pass.
+const tailShape = !tailVerdict
+  ? 'returned nothing'
+  : typeof tailVerdict.blocking !== 'boolean'
+    ? `returned a non-boolean \`blocking\` (${JSON.stringify(tailVerdict.blocking)})`
+    : !tailFindingsOk
+      ? `returned \`blocking: ${tailVerdict.blocking}\` with no usable findings text — schema violation, read as blocking`
+      : tailVerdict.blocking
+        ? 'reported a blocking finding'
+        : 'reported nothing blocking';
+log(`tail audit: ${tailShape} — commit ${tailBlocking ? 'WITHHELD' : 'still permitted'}`);
+
 // ---- Phase 4: the auditor signs off --------------------------------------
 phase('Sign-off');
 const unapproved = results.filter((r) => !r.approved);
@@ -627,7 +811,25 @@ const unapproved = results.filter((r) => !r.approved);
 // round whose step 2 still carved out "plus the one git add/commit/push sequence in step 5" was
 // handing an advisory auditor the exception while step 5 told it not to commit — and `{commit:
 // false}` is precisely the escape hatch the sign-off tier floor (#81) points a cheaper auditor at.
-const MAY_COMMIT = COMMIT && unapproved.length === 0;
+// The tail audit is folded in here, not merely reported: a blocking verdict WITHHOLDS the
+// commit. Withholding is not a loop and does not need one — the fixes stay in the tree for a
+// human exactly as an unapproved batch already leaves them, which is the whole reason a
+// verify-only phase can terminate by construction (#82).
+const MAY_COMMIT = COMMIT && unapproved.length === 0 && !tailBlocking;
+// Every disjunct of MAY_COMMIT contributes its own reason, so this list is non-empty exactly
+// when the DO-NOT-COMMIT branch is taken — and it names ALL of them. The old one-reason
+// ternary reported only the batches for a round that was both unapproved AND tail-blocked,
+// which reads as though the tail audit had passed.
+const NO_COMMIT_REASONS = [];
+if (!COMMIT) NO_COMMIT_REASONS.push('commit disabled by args');
+if (unapproved.length) {
+  NO_COMMIT_REASONS.push(`batches not approved: ${unapproved.map((r) => r.batch).join(', ')}`);
+}
+if (tailBlocking) {
+  NO_COMMIT_REASONS.push(
+    "the tail audit returned a blocking verdict, or no verdict this script could read — either way nothing has vouched for this round's tail",
+  );
+}
 // The exact set this round may `git add` (#81, finding 3), deduplicated: two batches touching
 // one file claim it once. `files` is [] when an implementer returned nothing and absent on any
 // shape we did not write, so it is guarded the way PRE_DIRTY is — an unguarded field access
@@ -638,6 +840,16 @@ const signoff = await agent(
 
 Every batch of this fix round has been implemented in the working tree (uncommitted).
 Batch outcomes: ${JSON.stringify(results)}
+
+Tail audit (#82) — an independent adversarial pass over the whole accumulated diff, run after
+the last batch, on the same tier as the per-batch verifiers and with no authority to change
+anything. Verdict: ${tailBlocking ? 'BLOCKING — this round does not commit, see step 5' : 'nothing blocking'}.
+Findings, unfixed by construction (no implementer ran after it, and none runs after you):
+${JSON.stringify(tailFindings)}
+These are not a second opinion to weigh against the batch verdicts. They are the only
+adversarial reading the LAST batch's fixes have had, and the per-batch verifiers could not have
+produced them: each saw one batch, at the moment it landed. Act on them under step 2's rule —
+anything substantive is reported, not patched.
 
 1. Read the FULL diff (git diff) end to end, as one reviewer, looking for cross-batch
    interactions the per-batch verifiers could not see: one batch's helper move breaking
@@ -728,7 +940,7 @@ ${
    Then \`git push\` plainly. Never \`--force\` and never \`--force-with-lease\`: nothing in
    this round rewrites history, so a rejected push means the remote moved under you — stop and
    report it for a human, exactly as step 2 does.`
-    : `5. DO NOT COMMIT: ${unapproved.length ? `batches not approved: ${unapproved.map((r) => r.batch).join(', ')}` : 'commit disabled by args'}. Leave the tree for a human.`
+    : `5. DO NOT COMMIT: ${NO_COMMIT_REASONS.join('; ')}. Leave the tree for a human.`
 }
 
 Your final text: gate result, whether you committed (and the SHA), unresolved concerns.`,
@@ -741,6 +953,12 @@ return {
   // Which model actually held the diff, the gate and the push — a completed round records it,
   // because after the fact the prompt is gone and the commit is not.
   auditor: SIGNOFF,
+  // The tail audit's verdict and findings, for the same reason `auditor` is recorded: after the
+  // fact the prompt is gone and the commit is not. `blocking` here is the value this script
+  // ACTED on — already folded closed over a missing or non-boolean answer — so a reader never
+  // has to re-derive it from a raw agent reply, and `model` records the tier it ran at, which
+  // is what makes "no knob" checkable after the fact rather than merely asserted.
+  tail_audit: { model: VERIFIER_MODEL, blocking: tailBlocking, findings: tailFindings },
   batches: results,
   preexisting_dirty: PRE_DIRTY,
   signoff: signoff ?? 'sign-off returned nothing — tree left uncommitted for a human',
