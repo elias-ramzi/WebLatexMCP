@@ -128,6 +128,112 @@ export function commentOut(text: string): string {
 }
 
 /**
+ * Where a LaTeX line comment starts between `lineStart` and `lineEnd` (exclusive of `lineEnd`,
+ * which must be the offset of the line's terminator or end-of-file), or `-1` when that line
+ * carries no comment.
+ *
+ * The escaping rule is TeX's own, and it is a **parity** rule on the run of backslashes
+ * immediately before the `%`, not "is the previous character a backslash":
+ *
+ *  - `%`      -> a comment (zero backslashes, even).
+ *  - `\%`     -> NOT a comment: an escaped, literal percent sign.
+ *  - `\\%`    -> a comment. `\\` is a complete control sequence (a line break, in LaTeX) that
+ *                consumes both backslashes, so the `%` that follows is unescaped. This is the
+ *                boundary case worth stating out loud, because "a backslash appears before the
+ *                `%`" gets it exactly backwards.
+ *  - `\\\%`   -> NOT a comment (`\\` then `\%`).
+ *
+ * The loop implements that parity by skipping the character after every backslash it consumes,
+ * which is the same thing TeX's tokenizer does and needs no counter.
+ *
+ * Known, accepted limitation, the same one `LINE_COMMENT_EXTENSIONS` documents: this has no idea
+ * whether the line sits inside a `verbatim`/`lstlisting`/`minted` environment, where `%` is
+ * ordinary printed text rather than a comment. Deciding that needs real LaTeX parsing. The cost
+ * here is in the safe direction — a match inside such an environment is reported as commented and
+ * therefore *skipped* by `excludeComments`, so the caller does less than it asked rather than
+ * silently rewriting text it meant to protect.
+ */
+function commentStartOnLine(content: string, lineStart: number, lineEnd: number): number {
+  for (let i = lineStart; i < lineEnd; i++) {
+    const ch = content[i];
+    // The next character is escaped, whatever it is — which is exactly why `\\%` IS a comment:
+    // the second backslash is consumed here as the escaped character, leaving the `%` live.
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (ch === '%') return i;
+  }
+  return -1;
+}
+
+/** Offset of the first character of the line containing `index`. */
+function lineStartAt(content: string, index: number): number {
+  for (let i = index - 1; i >= 0; i--) {
+    const ch = content[i];
+    if (ch === '\n' || ch === '\r') return i + 1;
+  }
+  return 0;
+}
+
+/**
+ * For the line beginning at `lineStart`: `end` is the offset of its terminator (or end-of-file),
+ * `next` the offset the following line begins at. `\r\n`, bare `\n` and bare `\r` all count as
+ * terminators, matching `splitLines` — clones force `core.autocrlf=false`, so CRLF bytes are
+ * genuinely on disk and a `\r` left inside a "line" would make the comment scan below run past
+ * the end of the line it is judging.
+ */
+function lineBoundsFrom(content: string, lineStart: number): { end: number; next: number } {
+  for (let i = lineStart; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '\r') return { end: i, next: content[i + 1] === '\n' ? i + 2 : i + 1 };
+    if (ch === '\n') return { end: i, next: i + 1 };
+  }
+  return { end: content.length, next: content.length };
+}
+
+/**
+ * Whether the match occupying `[start, end)` in `content` touches a LaTeX comment — the predicate
+ * behind `edit_file`'s per-edit `excludeComments`, passed to `FileService.applyEdits` as its
+ * `excludeMatch` hook so the service itself never learns what a comment is (the same ignorance
+ * boundary `EditTransform` keeps for preservation: the service sees a callback and integer
+ * offsets, nothing about `%`).
+ *
+ * It lives here, next to `commentOut` and `LINE_COMMENT_EXTENSIONS`, because this module is
+ * already the one home of `%`-comment knowledge in the server, and a second copy of "what counts
+ * as a comment" is exactly how the transform that *writes* comments and the filter that *reads*
+ * them end up disagreeing.
+ *
+ * Comment state is **line-local** — a `%` comment ends at the line terminator and nothing carries
+ * over to the next line — so this needs no whole-file scan and, more importantly, stays correct
+ * when the caller re-asks after every splice of a `replaceAll` run: a replacement that itself
+ * introduces a `%` changes only its own line's answer, and that answer is recomputed from the
+ * current content each time rather than read from a precomputed map that went stale.
+ *
+ * A match that **straddles** the boundary — part live, part inside a comment, which a multi-line
+ * `oldString` easily does — counts as commented. That is the fail-safe direction and the whole
+ * point of the option: replacing such a match would rewrite bytes inside the commented block the
+ * caller asked to protect. Callers are told (in `excludeComments`'s description) that a straddling
+ * match is reported under `skippedInComments`, so "live + commented" still accounts for every
+ * occurrence.
+ */
+export function matchIsCommented(content: string, start: number, end: number): boolean {
+  let lineStart = lineStartAt(content, start);
+  for (;;) {
+    const { end: lineEnd, next } = lineBoundsFrom(content, lineStart);
+    const commentAt = commentStartOnLine(content, lineStart, lineEnd);
+    // `commentAt < end`: the comment begins before the match ends. `start < lineEnd`: the match
+    // begins before this line's comment region ends. Together they are "the two spans overlap"
+    // for the line currently under the cursor.
+    if (commentAt !== -1 && commentAt < end && start < lineEnd) return true;
+    // Stop once the next line starts at or after the match's end — no later line can intersect
+    // it. `next === lineStart` only happens at end-of-file and guards against spinning there.
+    if (next >= end || next === lineStart) return false;
+    lineStart = next;
+  }
+}
+
+/**
  * Overlap threshold for "near-identical" in `classifyEdit`, below the docstring there.
  *
  * Measured as the fraction of `oldString`'s **adjacent-token bigrams** (by exact string match,

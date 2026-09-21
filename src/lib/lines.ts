@@ -54,3 +54,56 @@ export function sliceLineRange(text: string, startLine?: number, endLine?: numbe
   }
   return text.slice(from, to);
 }
+
+/**
+ * The `[start, end)` offsets of lines `startLine..endLine` (1-based, `endLine` inclusive), or
+ * `null` when the range is not entirely inside `text`.
+ *
+ * This is the write-side counterpart of `sliceLineRange` (`src/lib/lines.ts`), which `read_file`
+ * uses, and `text.slice(start, end)` equals `sliceLineRange(text, startLine, endLine)` for every
+ * in-range pair but one — a differential unit test pins that, since the two scans are separate
+ * code and drifting apart silently would make a caller's `read_file` range and their `edit_file`
+ * range mean different things.
+ *
+ * The one deliberate divergence: `sliceLineRange` returns the **whole file including its trailing
+ * newline** when the range covers every line, while this returns the span that stops before that
+ * final terminator, exactly as it does for every other range. A read may hand back the trailing
+ * newline harmlessly; an *edit* that consumed it would strip the file's final newline as a side
+ * effect of a whole-file range edit — a change the caller never asked for, in a file format where
+ * the missing newline is a real defect. Consistency inside `edit_file` wins over matching a read
+ * quirk, and the divergence is one line of one shape, named here rather than discovered later.
+ *
+ * Out of range (`startLine < 1`, `endLine < startLine`, or `endLine` past the last line) returns
+ * `null` rather than clamping the way `sliceLineRange` does: clamping a read shows the caller
+ * fewer lines than they asked for, which they can see; clamping a *write* silently rewrites a
+ * different region than the one named, which they cannot.
+ */
+/** Half-open `[start, end)` character span of the text it was computed from. */
+export interface Span {
+  start: number;
+  end: number;
+}
+
+export function lineSpan(text: string, startLine: number, endLine: number): Span | null {
+  const total = splitLines(text).length;
+  if (startLine < 1 || endLine < startLine || endLine > total) return null;
+  const terminator = /\r\n|\n|\r/g;
+  let line = 1;
+  let start = startLine === 1 ? 0 : -1;
+  let end = text.length;
+  let match: RegExpExecArray | null;
+  while ((match = terminator.exec(text)) !== null) {
+    // `line` is the number of the line this terminator ends.
+    if (line === startLine - 1) start = match.index + match[0].length;
+    if (line === endLine) {
+      end = match.index; // up to, not including, the terminator that ends the last line
+      break;
+    }
+    line++;
+  }
+  // Unreachable for an in-range pair (the bounds check above already rejected an `endLine` past
+  // the last line, and line 1 always starts at 0), but a negative `start` would splice from the
+  // end of the string, so fail rather than trust the scan.
+  if (start < 0) return null;
+  return { start, end };
+}

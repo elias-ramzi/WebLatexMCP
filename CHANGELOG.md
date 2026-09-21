@@ -11,6 +11,46 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`edit_file` takes line ranges, and `replaceAll` can skip LaTeX comments** (#105, findings 3
+  and 4). Two changes to the same machinery, both about edits a manuscript actually needs.
+
+  **Line ranges.** `read_file` takes `startLine`/`endLine`; `edit_file` had no counterpart, so a
+  change defined by _where_ it is rather than _what it says_ had no cheap expression — commenting
+  out two tables of 328 and 361 lines meant one `oldString` holding all 689 and a `newString`
+  holding all 689 again. An edit may now be `{startLine, endLine, newString}` instead, 1-based and
+  inclusive exactly as `read_file` is.
+
+  Line numbers refer to the file **as it was before the call**. Every range is resolved up front
+  and kept in step as earlier edits shift the text, so a range means the same thing wherever it
+  sits in the `edits` array; two edits that would touch the same bytes are **refused**, because
+  the only other outcome is a range quietly sliding onto text nobody named. Out of range refuses
+  rather than clamping, for the same asymmetry: a clamped read shows you fewer lines, which you
+  can see, while a clamped write rewrites a region you did not ask for, which you cannot.
+
+  One deliberate divergence from `read_file`, now visible because both scans live in
+  `src/lib/lines.ts`: a whole-file _read_ hands back the trailing newline, and a whole-file range
+  _edit_ must not consume it, or it strips the file's final newline as a side effect. A
+  differential test asserts the two agree everywhere else.
+
+  **`excludeComments`.** `replaceAll` was textual with no notion of `%`, which made it unusable on
+  a manuscript that keeps its history in comments — the very convention this server's
+  rewrite-preservation mode encourages. Measured in one real file: 192 occurrences of a method
+  name, **10 live**; `replaceAll: true` would have silently rewritten the other 182, which are the
+  audit trail for the numbers in its tables. The flag skips matches inside comments, escape-aware
+  by backslash parity (`%` is a comment, `\%` is not, and `\\%` **is** — the naive "previous
+  character is a backslash" rule gets that last one backwards), and re-judges each occurrence
+  against the current text, since a replacement can introduce a `%` that comments its own line.
+
+  Silence is refused throughout: an edit whose every match is commented is an error rather than a
+  success that changed nothing, and the flag is refused outright on a file whose comment character
+  is not `%` — filtering a `.md` against `%` would find no comments and rewrite every match the
+  caller asked to protect. Each flagged edit reports `replaced` and `skippedInComments`, in
+  `structuredContent` and in the text, or an MCP-only client would read "applied 1 edit(s)" for a
+  rename that deliberately left 182 alone.
+
+  Note for existing callers: an edit object is now validated strictly, so a typo'd key is refused
+  where it used to be ignored.
+
 - **`render_pages` takes `labels`, so you can render the page a float actually landed on**
   (#105, finding 2). `render_pages` took page numbers, but after moving a float its page is
   exactly what is unknown — the question is never "page 8", it is "the page the table I just
