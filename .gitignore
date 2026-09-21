@@ -10,6 +10,9 @@ coverage/
 
 # Agent worktrees (nested checkouts of this repo); .claude/settings.json + skills stay tracked
 .claude/worktrees/
+# Wave/lane specs written for the implementer agents — scratch for one run, not a record of
+# the repo; the reasoning that outlives a wave belongs in CHANGELOG.md and the issues.
+.claude/plans/
 
 # Editor / OS
 .DS_Store
