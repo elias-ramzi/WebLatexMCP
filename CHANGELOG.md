@@ -2462,6 +2462,28 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   them with the digest unmoved, while silently losing the message line for every error raised inside
   a package.
 
+- **A legacy shadow key beyond a symlink now fails in server words, not git's** (#70, accepted
+  trade-off). `GitService.ignoredPaths` runs `git check-ignore` once per `commit` over every path
+  the call considers. A path that runs through a symbolic link — a record a pre-`4c8bba3`
+  `delete_file` filed under a linked directory's own name rather than the real directory's — makes
+  git die: exit 128, `fatal: pathspec '<path>' is beyond a symbolic link`, verbatim out of every
+  `commit`, naming no route out of a state that failed the whole call including the files that were
+  fine. That one failure is now recognised and re-thrown as `PathBeyondSymlinkError`, which names
+  the offending path and the way out (`discard` with `paths` naming just it — verified: `discard`'s
+  own `ls-files`/`clean -f` accept such a pathspec as a no-op, so the route really is open).
+
+  **Still a throw, never an empty set.** Answering "nothing is ignored" here would let the commit
+  stage a file git means to exclude — and git dies at the _first_ offending path, so the partial
+  stdout it had already written is a plausible-looking wrong answer, not a usable one.
+
+  **Narrow on purpose.** The branch requires exit 128 _and_ git's exact wording; the path is named
+  by reconstructing git's own quoted form per requested path rather than by capturing it out of the
+  message, which a path containing a quote or a newline defeats. Any other `check-ignore` failure —
+  a corrupt repository, a missing git — keeps reporting exactly what happened, and a translated git
+  falls through to the raw text the same way `pullRefusalFromError` already does. What
+  `ignoredPaths` returns on success, its `tracked: 'head' | 'index'` split and its case folding are
+  untouched, with a differential test pinning the success answers.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
