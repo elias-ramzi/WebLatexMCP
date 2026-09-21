@@ -1382,6 +1382,36 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`revert` batches its pathspec lists, so a large reverted commit no longer blows Windows'
+  command line** (#94). `revert` handed git one pathspec list — in the preflight (`ls-tree`,
+  the link probes, the dirty scan), in the scoped unstage, and in the numstat comparisons. On a
+  commit touching enough files that argument vector exceeds Windows' ~32 KB `CreateProcessW`
+  limit and the spawn simply fails.
+
+  Chunked by **accumulated argument length, never by a fixed count**: `sections/a.tex` and a
+  200-character nested figure path cost the command line wildly different amounts, so a count is
+  not a bound on argv at all. `MAX_PATHSPEC_ARGV_CHARS` is 8000 — a quarter of the real limit,
+  because the accounting cannot see the fixed part of the line, the environment block that shares
+  `ARG_MAX` on POSIX, or Windows' own argument quoting, which is applied _after_ this count and
+  can nearly double the rendered length. The derivation is in the doc comment and the headroom
+  inequality is asserted by a test, so the number cannot drift loose from its reasoning.
+
+  Combining is the part that had to be got right: every chunk keeps `--literal-pathspecs` and
+  `-c core.quotePath=false`, the link probe stays fail-closed (a throwing chunk propagates rather
+  than reading as "no links here"), and rename/copy record pairs are emitted together by whichever
+  chunk matched either side so a pairing never straddles a boundary.
+
+  **Batching adds a failure mode the single call did not have** — a step can now fail part way,
+  leaving earlier chunks applied and later ones not. The unstage loop therefore sits _inside_
+  `revert`'s existing wrapper, which already reports that the revert landed and warns against
+  retrying; its comment no longer claims the Windows-argv case as its trigger, since that case is
+  now batched away, and names the partial-failure case instead.
+
+  The regression test puts a recording `git` shim on `PATH` and asserts the argv each invocation
+  actually receives, because on Linux a 40 KB argv is perfectly legal — a behavioural test alone
+  passes against the unbatched code on the platform this gate runs on. The same sites exist
+  outside `revert` and are filed as #110 rather than widened into this fix.
+
 - **`commit` resolves the case fold once per call, in every scope** (#106). Follow-up to #93,
   which fixed `commitEverything` and said in terms that it was leaving the other two alone.
   `commitSession` and `commitPaths` each still called `GitService.isCaseInsensitive` for
