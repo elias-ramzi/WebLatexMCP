@@ -1313,6 +1313,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`commit` resolves the case fold once per call, in every scope** (#106). Follow-up to #93,
+  which fixed `commitEverything` and said in terms that it was leaving the other two alone.
+  `commitSession` and `commitPaths` each still called `GitService.isCaseInsensitive` for
+  themselves; the handler's already-resolved fold is now threaded into both.
+
+  **This is not a performance fix and the entry #93 shipped was wrong to imply otherwise.**
+  `isCaseInsensitive` is promise-memoised per directory, so a second ask is a `Map` lookup, not a
+  `git config` spawn. What the threading buys is that the fold is a _decision_ and one call now
+  makes it in exactly one place — the ownership check, the rescue, the path filter and the settle
+  cannot be handed two separately-derived answers. Today they agree because of the memo; now they
+  agree by construction. CLAUDE.md's rule for this is explicit: the fold is a parameter, the
+  decision is the caller's, and the source of truth is one method.
+
+  No behaviour change was intended and none was found — checked rather than assumed, by relaxing
+  the new call-count assertions and confirming the value assertions still pass against the
+  unfixed code. The tests pin the invariant two ways, because a count alone would accept a "fix"
+  that threads `undefined`: they assert one resolution per call, _and_ that an ignorecase clone
+  still selects a case-differing entry. `core.ignorecase` is forced explicitly in each, since it
+  is false by default on the Linux box the gate runs on and an unforced assertion passes against
+  unfixed code.
+
 - **`pdf_geometry` now measures two more paint operators, and says what it deliberately does not
   measure** (#80 §1, §2, §5, §6). Four changes, one theme — a rectangle nobody can vouch for is
   worse than an admitted gap. That is the standard each gap below is now held to; it is **not** a

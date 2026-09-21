@@ -115,14 +115,17 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // landed), so carry its shadow forward before deciding what to commit.
           await ctx.shadows.refresh(id, dir);
           const effective = scope ?? ((await ctx.shadows.hasChanges(id)) ? 'session' : 'all');
-          // Computed once for this handler and reused by both `ctx.shadows.settle` call sites and,
-          // threaded in, `commitEverything`'s own by-name comparisons: on an ignorecase clone a
-          // taken path can be keyed differently in this session's shadow than the spelling
-          // `commit` was given (or than HEAD's own spelling, which staging folds onto) — see
-          // `nameFold`. Deliberately NOT "once per call": `commitSession` and `commitPaths` each
-          // still resolve their own (issue #93 named `commitEverything` only, and widening a
-          // no-behaviour-change fix is how it stops being one). Say what is true here — the whole
-          // point of #93 was a comment that claimed more than the code did.
+          // Resolved once per call and threaded into every by-name comparison this call makes:
+          // both `ctx.shadows.settle` call sites, and all three scope functions
+          // (`commitSession`/`commitEverything`/`commitPaths`), none of which resolve their own.
+          // On an ignorecase clone a taken path can be keyed differently in this session's shadow
+          // than the spelling `commit` was given (or than HEAD's own spelling, which staging folds
+          // onto) — see `nameFold`. The point is not cost: `GitService.isCaseInsensitive` is
+          // promise-memoised per directory, so a second ask is a `Map` lookup, not a `git config`
+          // spawn (issue #93's text claimed otherwise and was wrong). The point is that the fold
+          // is a decision, and this call makes it in exactly one place — so the ownership check,
+          // the rescue, the path filter and the settle cannot be handed two separately-derived
+          // answers, today by memo and tomorrow by construction (issue #106).
           const fold = await nameFold(ctx, dir);
 
           let res: CommitOutcome;
@@ -133,12 +136,12 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // scope "session".
           let settled: string[] = [];
           if (effective === 'session') {
-            res = await commitSession(ctx, id, dir, { message, paths, allowEmpty });
+            res = await commitSession(ctx, id, dir, { message, paths, allowEmpty, fold });
           } else {
             try {
               res =
                 effective === 'paths'
-                  ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty })
+                  ? await commitPaths(ctx, id, dir, { message, paths, allowEmpty, fold })
                   : await commitEverything(ctx, id, dir, { message, paths, allowEmpty, fold });
             } catch (err) {
               // `GitService.commit`/`commitContents` throw `NothingToCommitError` (a type, not a
@@ -340,17 +343,28 @@ interface CommitOutcome {
   ignored: string[];
 }
 
-/** Commit only the changes this session made, from its shadow — peers' edits stay on disk. */
+/**
+ * Commit only the changes this session made, from its shadow — peers' edits stay on disk.
+ *
+ * `opts.fold` is the handler's already-resolved name fold (see `nameFold`), passed in rather than
+ * re-derived here: on a `core.ignorecase` clone a caller naming HEAD's `Notes.txt` means this
+ * session's entry keyed `notes.txt`, and that answer cannot change within one call — deriving it
+ * again here is a second place the decision is made, which is the drift issue #106 closes.
+ * Absent (a case-sensitive clone), comparisons stay byte-exact.
+ */
 async function commitSession(
   ctx: AppContext,
   id: string,
   dir: string,
-  opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+  opts: {
+    message: string;
+    paths?: string[];
+    allowEmpty?: boolean;
+    fold?: (p: string) => string;
+  },
 ): Promise<CommitOutcome> {
   const all = await ctx.shadows.changes(id);
-  // The same fold `commit`'s other scopes apply: on a `core.ignorecase` clone a caller naming
-  // HEAD's `Notes.txt` means this session's entry keyed `notes.txt`; byte-exact elsewhere.
-  const fold = (await nameFold(ctx, dir)) ?? ((p: string) => p);
+  const fold = opts.fold ?? ((p: string) => p);
   // Keyed by the folded name, valued by the caller's own spelling, so a refusal names what the
   // caller typed and never a folded form that may name no file.
   const wanted = opts.paths?.length
@@ -618,12 +632,20 @@ async function commitEverything(
  *
  * The coverage/ownership policy itself is pure and lives in `src/lib/commitPaths.ts` so it is
  * unit-testable without a git clone; this function stays thin plumbing around it.
+ *
+ * `opts.fold` is the handler's already-resolved name fold (see `nameFold`), passed in rather than
+ * re-derived here, for the reason given on `commitSession`: one call, one decision (issue #106).
  */
 async function commitPaths(
   ctx: AppContext,
   id: string,
   dir: string,
-  opts: { message: string; paths?: string[]; allowEmpty?: boolean },
+  opts: {
+    message: string;
+    paths?: string[];
+    allowEmpty?: boolean;
+    fold?: (p: string) => string;
+  },
 ): Promise<CommitOutcome> {
   if (!opts.paths || opts.paths.length === 0) {
     throw new Error(
@@ -668,8 +690,8 @@ async function commitPaths(
   // handler settles every originally-requested path regardless (`settlePaths(paths)` over the
   // tool's own input, not this function's `stageable`).
   // Every by-name comparison below folds case exactly when git does (`core.ignorecase`), and
-  // stays byte-exact otherwise — see `nameFold`.
-  const fold = await nameFold(ctx, dir);
+  // stays byte-exact otherwise — the handler's own resolution, threaded in (see `nameFold`).
+  const fold = opts.fold;
   const uncoveredInitial = uncoveredPaths(normalized, dirty, fold);
   let rescued: string[] = [];
   if (uncoveredInitial.length > 0) {

@@ -20,9 +20,19 @@ import type { ServerConfig } from '../../src/types.js';
  * COUNT, which is the only thing that changes — plus, in the last case below, that the value
  * threaded into the branch is still the RIGHT one.
  *
+ * Issue #106 extends the same probe to the other two scopes. `commitSession` and `commitPaths`
+ * each resolved their own fold as well, so a `scope: "session"` or `scope: "paths"` commit asked
+ * twice. This is NOT a cost argument — `GitService.isCaseInsensitive` is promise-memoised per
+ * directory, so a re-derivation is a `Map` lookup and no `git config` spawn. What the count pins
+ * is the invariant CLAUDE.md states: the fold is decided in one place and threaded, so the
+ * ownership check, the rescue, the path filter and the settle within one `commit` cannot be given
+ * two separately-derived answers. The memo is what currently makes them agree; the threading is
+ * what makes them unable to disagree.
+ *
  * `core.ignorecase` is forced explicitly on the clone in each test — as in
  * `caseFoldCommit.test.ts`, so the result is deterministic on Linux CI too, where git would
- * otherwise leave it unset.
+ * otherwise leave it unset. That matters here: on Linux git leaves it false, and a fold assertion
+ * not driven through a forced `true` passes against unfixed code for want of anything to fold.
  */
 
 const IDENTITY = { name: 'Test', email: 'test@example.com' };
@@ -125,7 +135,7 @@ function spyOnFold(ctx: AppContext): FoldSpy {
   return spy;
 }
 
-describe('commit resolves the case fold once per call (issue #93)', () => {
+describe('commit resolves the case fold once per call (issues #93, #106)', () => {
   for (const ignorecase of [true, false]) {
     it(`scope "all" WITH paths resolves core.ignorecase exactly once (ignorecase=${ignorecase})`, async () => {
       const { client, ctx, dir } = await setup({ 'main.tex': 'one\n', 'other.tex': 'two\n' });
@@ -175,6 +185,60 @@ describe('commit resolves the case fold once per call (issue #93)', () => {
       expect(structured(res).committed).toBe(true);
       expect(committedPaths(res)).toEqual(['main.tex', 'other.tex']);
     });
+
+    it(`scope "session" resolves core.ignorecase exactly once (ignorecase=${ignorecase})`, async () => {
+      const { client, ctx, dir } = await setup({ 'main.tex': 'one\n', 'other.tex': 'two\n' });
+      await simpleGit(dir).raw(['config', 'core.ignorecase', String(ignorecase)]);
+      await write(client, 'main.tex', 'main changed\n');
+      await write(client, 'other.tex', 'other changed\n');
+
+      const spy = spyOnFold(ctx);
+      const res = await client.callTool({
+        name: 'commit',
+        arguments: {
+          project: 'demo',
+          message: 'commit this session, main only',
+          scope: 'session',
+          paths: ['main.tex'],
+        },
+      });
+
+      // Pre-fix this is 2: the handler's own `nameFold`, plus `commitSession`'s.
+      expect(spy.fromNameFold, `total isCaseInsensitive calls: ${spy.total}`).toEqual([ignorecase]);
+      // The commit still did the work — a "fix" that stopped selecting by name would either fail
+      // here or sweep `other.tex` in with it.
+      expect(isError(res), textOf(res)).toBe(false);
+      expect(structured(res).committed).toBe(true);
+      expect(committedPaths(res)).toEqual(['main.tex']);
+      expect(await simpleGit(dir).show(['HEAD:main.tex'])).toBe('main changed\n');
+      expect((await simpleGit(dir).status()).modified).toEqual(['other.tex']);
+    });
+
+    it(`scope "paths" resolves core.ignorecase exactly once (ignorecase=${ignorecase})`, async () => {
+      const { client, ctx, dir } = await setup({ 'main.tex': 'one\n', 'other.tex': 'two\n' });
+      await simpleGit(dir).raw(['config', 'core.ignorecase', String(ignorecase)]);
+      await write(client, 'main.tex', 'main changed\n');
+      await write(client, 'other.tex', 'other changed\n');
+
+      const spy = spyOnFold(ctx);
+      const res = await client.callTool({
+        name: 'commit',
+        arguments: {
+          project: 'demo',
+          message: 'commit the named path',
+          scope: 'paths',
+          paths: ['main.tex'],
+        },
+      });
+
+      // Pre-fix this is 2: the handler's own `nameFold`, plus `commitPaths`'s.
+      expect(spy.fromNameFold, `total isCaseInsensitive calls: ${spy.total}`).toEqual([ignorecase]);
+      expect(isError(res), textOf(res)).toBe(false);
+      expect(structured(res).committed).toBe(true);
+      expect(committedPaths(res)).toEqual(['main.tex']);
+      expect(await simpleGit(dir).show(['HEAD:main.tex'])).toBe('main changed\n');
+      expect((await simpleGit(dir).status()).modified).toEqual(['other.tex']);
+    });
   }
 
   /**
@@ -202,6 +266,75 @@ describe('commit resolves the case fold once per call (issue #93)', () => {
         project: 'demo',
         message: 'commit the Notes directory',
         scope: 'all',
+        paths: ['Notes'],
+      },
+    });
+
+    expect(spy.fromNameFold, `total isCaseInsensitive calls: ${spy.total}`).toEqual([true]);
+    expect(isError(res), textOf(res)).toBe(false);
+    const sc = structured(res);
+    expect(sc.committed).toBe(true);
+    expect(committedPaths(res)).toEqual(['Notes/keep.tex']);
+    expect(sc.ignored).toEqual(['notes/ig.md']);
+  });
+
+  /**
+   * The value, not just the count, for `scope: "session"` (issue #106). `commitSession` matches
+   * the caller's `paths` against this session's shadow keys through the fold: with
+   * `core.ignorecase = true`, a caller naming `notes.txt` means the entry keyed `Notes.txt`.
+   * Threading a byte-exact (`undefined`) fold instead would refuse the call outright with
+   * "Not changed by this session", which the call count alone could never catch.
+   */
+  it('scope "session" threads the RIGHT fold: a case-differing requested path still selects the entry', async () => {
+    const { client, ctx, dir } = await setup({ 'Notes.txt': 'one\n', 'other.tex': 'two\n' });
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+    await write(client, 'Notes.txt', 'notes changed\n');
+    await write(client, 'other.tex', 'other changed\n');
+
+    const spy = spyOnFold(ctx);
+    const res = await client.callTool({
+      name: 'commit',
+      arguments: {
+        project: 'demo',
+        message: 'commit the notes',
+        scope: 'session',
+        paths: ['notes.txt'],
+      },
+    });
+
+    expect(spy.fromNameFold, `total isCaseInsensitive calls: ${spy.total}`).toEqual([true]);
+    expect(isError(res), textOf(res)).toBe(false);
+    expect(structured(res).committed).toBe(true);
+    // Staged under the shadow's own spelling, which is HEAD's — never a second tree entry.
+    expect(committedPaths(res)).toEqual(['Notes.txt']);
+    expect(await simpleGit(dir).show(['HEAD:Notes.txt'])).toBe('notes changed\n');
+    expect((await simpleGit(dir).status()).modified).toEqual(['other.tex']);
+  });
+
+  /**
+   * The value, not just the count, for `scope: "paths"` (issue #106) — the same nested-ignored
+   * case as the `scope: "all"` test above, which `commitPaths` reaches through its own
+   * `ignoredUnderRequestedDirs` → `coversPath` call. With `core.ignorecase = true`, requesting
+   * `Notes` must cover the session's `notes/ig.md` and report it as ignored; a byte-exact fold
+   * would silently drop it from `ignored`.
+   */
+  it('scope "paths" threads the RIGHT fold: a case-differing nested ignored entry is still reported', async () => {
+    const { client, ctx, dir } = await setup({
+      'Notes/keep.tex': 'keep\n',
+      'notes/other.tex': 'other\n',
+    });
+    await simpleGit(dir).raw(['config', 'core.ignorecase', 'true']);
+    await appendFile(path.join(dir, '.git', 'info', 'exclude'), 'notes/ig.md\n');
+    await write(client, 'Notes/keep.tex', 'keep changed\n');
+    await write(client, 'notes/ig.md', 'ignored note\n');
+
+    const spy = spyOnFold(ctx);
+    const res = await client.callTool({
+      name: 'commit',
+      arguments: {
+        project: 'demo',
+        message: 'commit the Notes directory by name',
+        scope: 'paths',
         paths: ['Notes'],
       },
     });
