@@ -2484,6 +2484,38 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   `ignoredPaths` returns on success, its `tracked: 'head' | 'index'` split and its case folding are
   untouched, with a differential test pinning the success answers.
 
+### Tests
+
+- **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"
+  checkbox — a measurement, not a fix; no `src/` file changes). `GitService.discard` resolves
+  tracked paths onto the index's spelling but must run `clean -f` over the caller's **raw**
+  spelling, because an untracked file has no index entry to resolve against. Whether git then
+  removes a `Scratch.txt` the caller named as `scratch.txt` was neither proven nor disproven:
+  nothing in the suite touched it, and "on a real case-insensitive filesystem git should match"
+  was doing the load-bearing work.
+
+  **It does not, and `core.ignorecase` is not what decides.** Pathspec folding is a separate
+  opt-in knob (`:(icase)`, `--icase-pathspecs`, `GIT_ICASE_PATHSPECS`) that
+  `--literal-pathspecs` — which every path-taking git call here carries — is mutually exclusive
+  with. `clean` enumerates untracked entries from the directory, which on a case-preserving
+  filesystem hands it `Scratch.txt`, and compares byte-exactly. Measured on ext4 with
+  `core.ignorecase` forced true, and again against a genuinely case-insensitive, case-preserving
+  filesystem (NTFS via WSL2 DrvFs, where git auto-detects `core.ignorecase`): the file survives
+  both times, and only the disk's own spelling removes it. The consequence worth knowing is that
+  `discard` returns `discarded: true` either way — `clean` matching nothing is a silent no-op —
+  so a caller is told the discard happened while the file is still there.
+
+  `test/integration/discardCaseFold.test.ts` pins that, plus the contrast that a **tracked** path
+  named in the other case IS restored (`canonicalNames` resolves it onto the index spelling) and
+  is not once `core.ignorecase=false` says the clone is case-sensitive, whatever the filesystem
+  underneath thinks. **Nothing in the file skips**: the one case a case-insensitive filesystem
+  cannot express — two files differing only in case — branches on what the disk actually did,
+  never on `process.platform`, and asserts in both regimes, because under the reporter `npm test`
+  uses a skipped test prints neither a `console.error` from its body nor a `skip()` note and would
+  collapse to "1 skipped" on exactly the two legs the checkbox was filed about. Every survival
+  assertion is followed by a discard under the disk's own spelling that must remove the file, so
+  "it did not fold" can never be a `clean` that reached nothing.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
