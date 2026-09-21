@@ -409,6 +409,100 @@ export class NothingToCommitError extends Error {
 }
 
 /**
+ * The two halves of git's own wording when a pathspec runs through a symbolic link:
+ * `fatal: pathspec '<path>' is beyond a symbolic link`, on stderr, exit **128**. Verified
+ * against git 2.46.0 for `check-ignore -z --stdin` with and without `--no-index`, for a link
+ * that is tracked, untracked, dangling, or points outside the repository — the wording and the
+ * exit code are the same in every case.
+ *
+ * Split into a prefix and a suffix rather than written as one regex on purpose: the path is
+ * interpolated **verbatim**, so it may itself contain a quote or a newline, which makes a
+ * single-line capture wrong (git prints `linkdir/a\nb.tex` across two lines, un-quoted) and a
+ * multi-line one ambiguous. Detection uses both halves; naming reconstructs the exact needle
+ * per requested path, which needs no escaping and cannot mis-split.
+ *
+ * Git's `die()` is translated, so under a non-English locale neither half matches and the
+ * caller falls through to reporting git's raw text — the same degradation
+ * {@link pullRefusalFromError} already accepts for the messages it parses.
+ */
+const BEYOND_SYMLINK_PREFIX = "fatal: pathspec '";
+const BEYOND_SYMLINK_SUFFIX = "' is beyond a symbolic link";
+
+/**
+ * Which of `requested` git named in `stderr` as being beyond a symbolic link, or `null` when
+ * this is not that failure at all — in which case the caller must keep reporting whatever
+ * actually happened (a corrupt repository, a missing git) rather than relabelling it.
+ *
+ * An **empty array** is not `null`: it means the failure IS this one but the offending path
+ * could not be tied back to anything we asked about (a translated-looking hybrid, or a path
+ * whose own bytes contain a newline). Keep the two apart — `null` licenses the raw-text throw,
+ * `[]` does not, because the condition was still recognised.
+ *
+ * At most one entry in practice: `check-ignore` `die()`s at the first offending path, so the
+ * rest of the batch is never judged (verified — a batch of two beyond-link paths names only the
+ * first, and any earlier ignored path's stdout is discarded along with the call).
+ */
+export function beyondSymlinkPaths(stderr: string, requested: readonly string[]): string[] | null {
+  if (!stderr.includes(BEYOND_SYMLINK_PREFIX) || !stderr.includes(BEYOND_SYMLINK_SUFFIX)) {
+    return null;
+  }
+  return requested.filter((p) =>
+    stderr.includes(BEYOND_SYMLINK_PREFIX + p + BEYOND_SYMLINK_SUFFIX),
+  );
+}
+
+/**
+ * A path handed to `git check-ignore` runs through a symbolic link, so git refuses to judge it
+ * and {@link GitService.ignoredPaths} cannot answer. Raised in place of git's raw
+ * `fatal: pathspec …` text, which named no route out of a state that fails **every** `commit`:
+ * the ignore check runs once per commit over every path the call considers, so one such path
+ * stops the whole call, unrelated files included.
+ *
+ * The state this exists for is a **legacy shadow key** (#70): a pre-`4c8bba3` `delete_file`
+ * under a linked directory filed the record under the link's name rather than the real
+ * directory's. No such key is written any more (`attributedDeletePath`), and `discard` clears
+ * one — `discard`'s own git calls (`ls-files`, `clean -f`) accept such a pathspec without
+ * complaint, so the route out really is open, which is why it is safe to name here.
+ *
+ * A class, not a bare message, for the same reason as {@link NothingToCommitError}: the type is
+ * what a caller should branch on. Never swallowed into an empty result — reporting "nothing is
+ * ignored" would let the commit stage a file git means to exclude.
+ */
+export class PathBeyondSymlinkError extends Error {
+  readonly paths: string[];
+
+  constructor(paths: string[], requested: number) {
+    super(PathBeyondSymlinkError.buildMessage(paths, requested));
+    this.name = 'PathBeyondSymlinkError';
+    this.paths = paths;
+  }
+
+  private static buildMessage(paths: string[], requested: number): string {
+    // Count-neutral phrasing, so there is no singular/plural branch to leave untested for a
+    // shape git does not produce (it names exactly one path before dying).
+    const named = paths.map((p) => `\`${p}\``).join(', ');
+    const refusal =
+      paths.length === 0
+        ? `one of the ${requested} paths this call asked about lies beyond a symbolic link, ` +
+          'and git did not name which — check `status` for a recorded path under a linked ' +
+          'directory'
+        : `${named} ${paths.length === 1 ? 'lies' : 'lie'} beyond a symbolic link`;
+    return (
+      'Nothing was committed. Before staging anything, a commit asks git which of the paths it ' +
+      `is about to consider are ignored, and git refused: ${refusal}. One of its parent ` +
+      'directories is a link, and git will not judge a path through one — which stops the ' +
+      'whole call, the files that are fine included. ' +
+      'This is almost always a stale record left by an older version of this server, which ' +
+      "filed a file deleted under a linked directory under the link's name instead of the real " +
+      "directory's; no such record is written any more. Clear the record with `discard` " +
+      '(`confirm: true`, and `paths` naming just that path, so nothing else is thrown ' +
+      'away), then commit again. If you named the path yourself, name it through the real ' +
+      'directory rather than through the link.'
+    );
+  }
+}
+
+/**
  * Whether `git ls-files -s` output for one conflicted path shows a symlink (mode 120000) on OUR
  * (stage 2) or THEIR (stage 3) side. During a conflict the index lists one line per stage,
  * `<mode> <object> <stage>\t<name>`. The BASE stage (1) is deliberately not a side: when both
@@ -888,6 +982,10 @@ export class GitService {
    *   `*.txt`-matched `notes.txt` from being reported ignored, even though `git add -- notes.txt`
    *   would stage it as `Notes.txt` — so this route folds the matches against `git ls-files -z`
    *   itself (exact-first, ASCII fold otherwise) when the repository is case-insensitive.
+   *
+   * Throws on any exit other than 0/1 — never an empty result, which would report "nothing is
+   * ignored" and let the commit stage a file git means to exclude. One such failure gets server
+   * words instead of git's raw text: see {@link PathBeyondSymlinkError}.
    */
   async ignoredPaths(
     dir: string,
@@ -906,6 +1004,13 @@ export class GitService {
     // Exit code 1 means "none of the given paths are ignored" — not an error. Anything other
     // than 0/1 (typically 128) is a real failure.
     if (res.code !== 0 && res.code !== 1) {
+      // One such failure is reachable from ordinary use and has a route out git's own text does
+      // not mention: a path beyond a symbolic link (a legacy shadow key, #70). Recognised
+      // narrowly — exit 128 AND git's exact wording — so every other failure keeps reporting
+      // what actually happened. Never `return []`: saying "nothing is ignored" here would let
+      // the commit stage a file git means to exclude.
+      const beyond = res.code === 128 ? beyondSymlinkPaths(res.stderr, rels) : null;
+      if (beyond) throw new PathBeyondSymlinkError(beyond, rels.length);
       throw new Error(`git check-ignore failed: ${res.stderr.trim()}`);
     }
     const matched = res.stdout
