@@ -110,7 +110,9 @@ export function createServer(
   registerCheckCitations(server, ctx);
   registerServerInfo(server, ctx);
   registerAddWritingConvention(server, ctx);
-  registerListSkills(server, skills);
+  registerListSkills(server, skills, {
+    isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
+  });
   registerDoctor(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);

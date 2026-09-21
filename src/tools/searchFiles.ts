@@ -171,8 +171,8 @@ export function registerSearchFiles(server: McpServer, ctx: AppContext): void {
         // mode:'local' project has exactly as a clone does. Git-gating it would refuse the
         // draft-with-no-remote case the tool is most useful for.
         const { dir } = await ctx.projectManager.requireProjectDir(project);
-        // No runExclusive. Read-only tools do not lock; the two deliberate exceptions
-        // (render_pages, pdf_geometry) lock because they read the TEMP BUILD DIR a peer
+        // No runExclusive. Read-only tools do not lock; the three deliberate exceptions
+        // (render_pages, pdf_geometry, extract_text) lock because they read the TEMP BUILD DIR a peer
         // session's compile rewrites in place. This reads project source files, where the worst
         // a concurrent write can do is have a line read before or after an edit — the same race
         // any read_file already runs, and not worth making a search wait on (or time out

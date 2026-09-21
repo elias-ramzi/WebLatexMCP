@@ -542,7 +542,17 @@ describe('DoctorService', () => {
       const result = await doctor.diagnose({ compiler: 'latexmk' });
 
       expect(statusOf(result.checks, 'pdf-render')).toBe('warn');
-      expect(result.hints.join('\n')).toContain('npm i @napi-rs/canvas');
+      const hint = result.hints.join('\n');
+      expect(hint).toContain('npm i @napi-rs/canvas');
+      // Every tool the missing backend actually disables has to be named, or the hint quietly
+      // rots each time another one joins the set — which is how it came to list `render_pages`
+      // alone while `pdf_geometry` and then `extract_text` had joined it.
+      for (const tool of ['render_pages', 'pdf_geometry', 'extract_text']) {
+        expect(hint).toContain(tool);
+      }
+      // ...and the one capability that survives without it stays called out, since `floats`
+      // reads the .aux rather than the PDF.
+      expect(hint).toContain('floats');
     });
 
     it('never fails the whole toolchain just because rasterization is missing', async () => {

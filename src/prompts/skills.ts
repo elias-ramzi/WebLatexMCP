@@ -39,7 +39,7 @@ function projectArgsSchema(use: Exclude<SkillProjectUse, 'none'>) {
  * prompt. A prompt that errors is worse than one that asks a question, so a throwing lookup
  * becomes `unverified` (and a stderr line), never an exception out of prompt rendering.
  */
-function judgeProject(id: string, isRegisteredProject?: ProjectLookup): ProjectVerdict {
+export function judgeProject(id: string, isRegisteredProject?: ProjectLookup): ProjectVerdict {
   if (!isRegisteredProject) return 'known';
   try {
     return isRegisteredProject(id) ? 'known' : 'unknown';
