@@ -17,6 +17,8 @@ import {
   MAX_GEOMETRY_PAGES,
   MAX_TEXT_LINES_PER_PAGE,
   MAX_IMAGE_RECTS_PER_PAGE,
+  MAX_TEXT_PAGES,
+  MAX_TEXT_CHARS_PER_PAGE,
 } from '../../src/services/pdfRender.js';
 import type { PdfjsLoader } from '../../src/services/pdfRender.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
@@ -1689,5 +1691,176 @@ describe('pdf.js OPS table', () => {
     ]) {
       expect(typeof pdfjs.OPS[name]).toBe('number');
     }
+  });
+});
+
+describe('PdfRenderer.pageLabels', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-pagelabels-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('reads the /PageLabels tree, whatever scheme the labels imitate', async () => {
+    // The point of reading the tree at all: a roman front matter and an appendix scheme come
+    // back verbatim, where the .aux alone gives no way to turn either into a page index.
+    const pdfPath = path.join(dir, 'labelled.pdf');
+    await writeFile(pdfPath, minimalPdf(5, 200, 100, { pageLabels: ['i', 'ii', '1', '2', 'A-1'] }));
+    await expect(new PdfRenderer().pageLabels(pdfPath)).resolves.toEqual([
+      'i',
+      'ii',
+      '1',
+      '2',
+      'A-1',
+    ]);
+  });
+
+  it('answers null — not an error — for a PDF with no tree, which is the common case', async () => {
+    // A plain `article` has no /PageLabels. Treating that as a failure would break every
+    // label-resolved render on the documents this server exists for.
+    const pdfPath = path.join(dir, 'plain.pdf');
+    await writeFile(pdfPath, minimalPdf(3));
+    await expect(new PdfRenderer().pageLabels(pdfPath)).resolves.toBeNull();
+  });
+
+  it('refuses a pdf.js with no getPageLabels rather than calling it "no page labels"', async () => {
+    // fakeGeometryLoader's document deliberately does not implement the method. Answering null
+    // here would silently downgrade every renumbered document back to the inferred route this
+    // lookup replaces — a wrong page reported as a resolved one.
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const renderer = new PdfRenderer(fakeGeometryLoader([{ viewport: idViewport(100, 100) }]));
+    await expect(renderer.pageLabels(pdfPath)).rejects.toThrow(/getPageLabels/);
+  });
+
+  it('tells the caller to install the native backend rather than blaming the PDF', async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const renderer = new PdfRenderer(() => {
+      throw new Error('DOMMatrix is not defined');
+    });
+    await expect(renderer.pageLabels(pdfPath)).rejects.toThrow(/@napi-rs\/canvas/);
+    await expect(renderer.pageLabels(pdfPath)).rejects.not.toThrow(/Failed to open PDF/);
+  });
+});
+
+describe('PdfRenderer.text', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-text-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('returns each page’s text layer as merged lines, in drawing order', async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(
+      pdfPath,
+      minimalPdf(2, 300, 200, { text: (n) => `page ${n} first line\npage ${n} second line` }),
+    );
+
+    const result = await new PdfRenderer().text({ pdfPath });
+    expect(result.pageCount).toBe(2);
+    expect(result.pages.map((p) => p.page)).toEqual([1, 2]);
+    expect(result.pages[0]?.lines).toEqual(['page 1 first line', 'page 1 second line']);
+    expect(result.pages[1]?.lines).toEqual(['page 2 first line', 'page 2 second line']);
+    expect(result.pages[0]?.linesOmitted).toBe(0);
+    expect(result.pages[0]?.charsOmitted).toBe(0);
+  });
+
+  it('reports a page with no text layer as no lines rather than failing', async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const result = await new PdfRenderer().text({ pdfPath });
+    expect(result.pages[0]?.lines).toEqual([]);
+  });
+
+  it(`caps the call at ${MAX_TEXT_PAGES} pages and names the rest in skippedPages`, async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(MAX_TEXT_PAGES + 2, 200, 100, { text: (n) => `p${n}` }));
+    const result = await new PdfRenderer().text({ pdfPath });
+    expect(result.pages).toHaveLength(MAX_TEXT_PAGES);
+    expect(result.skippedPages).toEqual([MAX_TEXT_PAGES + 1, MAX_TEXT_PAGES + 2]);
+  });
+
+  it('throws the same out-of-range message selectPages gives every other caller', async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(2));
+    await expect(new PdfRenderer().text({ pdfPath, pages: [9] })).rejects.toThrow(
+      /Page 9 is out of range/,
+    );
+  });
+
+  it('cuts a SUFFIX at the per-page character budget and counts exactly what it cut', async () => {
+    // Document-controlled and unbounded: a PDF can carry arbitrarily much text (an OCR layer, a
+    // \phantom block). The cut must be a contiguous prefix — a budget-PACKED selection of
+    // scattered lines reads as a page that says something it does not — and it must be counted,
+    // never silent.
+    //
+    // The line lengths are deliberately UNEQUAL, and that is what makes this test able to fail:
+    // with every line the same size a greedy filter and a suffix cut produce byte-identical
+    // output, so an equal-length version of this test passes against either and proves neither.
+    // Here the oversized line lands with 5000 characters of budget left, and the short lines
+    // behind it would each still fit — a filter keeps them and reports 1 line omitted, a suffix
+    // cut stops dead and reports 6.
+    const fifteen = Array.from({ length: 15 }, () => 'x'.repeat(1000));
+    const lineTexts = [
+      ...fifteen,
+      'y'.repeat(6000),
+      ...Array.from({ length: 5 }, () => 'z'.repeat(100)),
+    ];
+    const items = lineTexts.map((str, i) => ({
+      str,
+      transform: [1, 0, 0, 1, 10, 2000 - i * 20],
+      width: 100,
+      height: 10,
+    }));
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([{ viewport: idViewport(600, 2200), textItems: items }]),
+    );
+
+    const page = (await renderer.text({ pdfPath })).pages[0]!;
+    expect(page.lines).toEqual(fifteen);
+    // 15000 characters kept out of a 20000 budget — the cut is NOT "the budget ran out", it is
+    // "the next line did not fit", and nothing behind it may be promoted past it.
+    expect(page.lines.join('')).toHaveLength(15_000);
+    expect(MAX_TEXT_CHARS_PER_PAGE - 15_000).toBeGreaterThan(100);
+    expect(page.linesOmitted).toBe(6);
+    expect(page.charsOmitted).toBe(6000 + 5 * 100);
+  });
+
+  it('does not apply pdf_geometry’s 160-character line label cap to the content', async () => {
+    // The one place the two text paths deliberately differ: geometry truncates a line to a short
+    // LABEL for a box, which would silently mangle the text this tool exists to return.
+    const long = 'y'.repeat(500);
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          textItems: [{ str: long, transform: [1, 0, 0, 1, 10, 700], width: 100, height: 10 }],
+        },
+      ]),
+    );
+    expect((await renderer.text({ pdfPath })).pages[0]?.lines).toEqual([long]);
+  });
+
+  it('tells the caller to install the native backend rather than blaming the PDF', async () => {
+    const pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+    const renderer = new PdfRenderer(() => {
+      throw new Error('DOMMatrix is not defined');
+    });
+    await expect(renderer.text({ pdfPath })).rejects.toThrow(/@napi-rs\/canvas/);
   });
 });

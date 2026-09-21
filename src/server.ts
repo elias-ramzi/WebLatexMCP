@@ -15,6 +15,7 @@ import { registerSetRewriteMode } from './tools/setRewriteMode.js';
 import { registerCompile } from './tools/compile.js';
 import { registerRenderPages } from './tools/renderPages.js';
 import { registerPdfGeometry } from './tools/pdfGeometry.js';
+import { registerExtractText } from './tools/extractText.js';
 import { registerViewer } from './tools/viewer.js';
 import { registerListComments } from './tools/listComments.js';
 import { registerResolveComments } from './tools/resolveComments.js';
@@ -86,6 +87,7 @@ export function createServer(
   registerCompile(server, ctx);
   registerRenderPages(server, ctx);
   registerPdfGeometry(server, ctx);
+  registerExtractText(server, ctx);
   registerViewer(server, ctx);
   registerListComments(server, ctx);
   registerResolveComments(server, ctx);

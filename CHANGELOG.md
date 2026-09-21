@@ -1104,6 +1104,37 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   each put through a deliberate revert-and-watch: the fix reverted by hand, the test run, the source
   restored byte-identically. All three fail against their reverted fix. None was vacuous.
 
+- **`extract_text`: read the compiled page's text layer** (#105, finding 5). `render_pages`
+  returns pixels, so verifying _typeset text_ meant reading an image — and some questions are a
+  few pixels wide. The case that filed this one: an `\xspace`-defined macro next to a
+  `\textsubscript{}` risks a spurious space, and with no text extraction the check became
+  comparing the PDF's byte size across compiles, which is a coincidence that would not survive a
+  reflow. `extract_text` returns the requested pages' text layer, line by line, and takes
+  `labels` exactly as `render_pages` does — so "read the page my table landed on" is one call.
+  It is also the way to read a compiled page at all on a client that cannot display images.
+
+  **One text extractor, not two.** It reuses `mergeTextLines` and the walk `pdf_geometry`'s
+  `text` kind already runs, with the boxes dropped and that kind's 160-character per-line label
+  cap lifted. The finding was smaller than filed for exactly that reason — `pdf_geometry
+kinds: ["text"]` already carries each merged line's string — and what was missing was a cheap
+  whole-page _reading_ answer rather than geometry to wade through. That remaining gap is real:
+  `pdf_geometry` caps at 4 pages and 300 lines, truncates each line to a box label, takes no
+  `labels`, and costs several times the tokens for the same words. Its row in `docs/tools.md`
+  now says outright that its `text` carries the line's string, and points here for reading it.
+
+  **Budgets that say what they cut.** 4 pages per call (the rest in `skippedPages`), 20000
+  characters per page. The per-page cut is a **suffix** — the first line that does not fit ends
+  the page — so what comes back is a contiguous prefix in drawing order rather than a
+  budget-packed sample of scattered lines, and `linesOmitted`/`charsOmitted` count it. Lines are
+  never re-sorted: the order is the order the PDF draws them, which is reading order for
+  ordinary LaTeX output and is not claimed to be in general.
+
+  **It takes the per-project lock**, the third deliberate exception to "a read-only tool does not
+  lock" after `render_pages` and `pdf_geometry`, and for the same single reason: what it reads is
+  the temp build dir, which a peer session's `compile` rewrites in place. Its description says so,
+  including that it can wait on or time out against a peer and that it creates
+  `<workspace>/.sessions/<id>/` — so "writes nothing" is never stated without the caveat.
+
 ### Changed
 
 - **One home for LaTeX's comment rule.** `edit_file`'s `excludeComments` and `search_files`'
@@ -1507,6 +1538,45 @@ Harmless only because no project is named `please` — the first word matching a
   the unbatched code on this gate's platform. Each behavioural body also runs at one-chunk and
   several-chunk sizes against ground truth from a single unscoped git call, and both new failure
   messages are asserted together with the clone state they claim.
+
+- **`render_pages` resolves a label through the PDF's own `/PageLabels`, instead of inferring
+  whether the document renumbered** (#112). The `.aux` records what a label _printed_, never how
+  many pages preceded it, so a printed page is usable as a PDF page index only when nothing
+  renumbered — and the code had to guess whether anything had. It refused a printed page that was
+  not a decimal integer, and refused every label in a document where _any_ label printed roman.
+  That covers `\frontmatter`; it does not cover a scheme that is neither decimal nor roman
+  (`\pagenumbering{alph}`, a thesis-style `A-3`), which is caught for its own label but is not
+  evidence the document-wide verdict recognised — so an **arabic** label in the same document
+  still resolved to an offset page and rendered silently wrong. The failure the feature exists to
+  prevent, surviving in a narrow case.
+
+  A PDF carries a `/PageLabels` number tree mapping page index to printed label exactly, whatever
+  the scheme, and pdf.js exposes it as `getPageLabels()`. Resolution is now a lookup — printed
+  page from the `.aux`, page index from that array — with nothing inferred. `PdfRenderService`
+  gained `pageLabels()`; `src/lib/labelPages.ts` stays pure over plain data and receives the array
+  as a parameter, which is what keeps every refusal unit-testable without pdf.js or a TeX install.
+
+  **`getPageLabels()` returning `null` is the common case, not an error** — a plain `article` has
+  no such tree — so the printed-page-as-index fallback stays, with both heuristic refusals live on
+  it, because it is correct precisely when nothing renumbered. An empty or all-blank tree counts
+  as "no tree" for the same reason: believing a degenerate one would refuse every label in the
+  document, replacing a working heuristic with a wrong certainty.
+
+  **Two new refusals, so the lookup does not become a new way to be wrong.** A printed page the
+  tree prints on **no** page is a stale `.aux` (`printedPageAbsent`), not an unknown label — the
+  `\newlabel` is right there, and calling it missing sends the caller hunting for a typo instead
+  of recompiling. A printed page the tree maps to **several** pages (`ambiguousPrintedPage`) is
+  legitimate — a restarted `\pagenumbering`, an unnumbered front page — so both candidates are
+  named and nothing is rendered; taking the first match would re-create the wrong-page failure by
+  another route.
+
+  Verified rather than assumed: the issue's claim that reading `/PageLabels` needs the native
+  canvas backend is **correct**, but not because anything rasterizes. pdfjs-dist 6.1.200 evaluates
+  `new DOMMatrix()` at module scope, and `@napi-rs/canvas` is what supplies that global in Node, so
+  the `import` itself throws `DOMMatrix is not defined` — measured by running the installed build
+  with the backend removed from the module graph. Given stub globals the same build reads
+  `/PageLabels` and extracts text with no canvas at all, so the dependency is incidental, not
+  intrinsic; `isNativeCanvasMissing`'s comment now says which of the two it is.
 
 - **`revert` batches its pathspec lists, so a large reverted commit no longer blows Windows'
   command line** (#94). `revert` handed git one pathspec list — in the preflight (`ls-tree`,

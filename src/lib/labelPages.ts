@@ -9,7 +9,7 @@
  * and this file is not a second one), hands the parsed result here, and maps the plan onto
  * response shapes. Everything below is pure over plain data: no fs, no clock, no process.
  *
- * Three facts govern the whole design, and each of them is a place where guessing would be worse
+ * Four facts govern the whole design, and each of them is a place where guessing would be worse
  * than refusing:
  *
  *  1. **The `.aux` reflects the last compile, never the working tree.** A label added since, one
@@ -21,26 +21,41 @@
  *     {@link labelPageRangeMessage} rather than as a bare renderer range error.
  *
  *  2. **The `.aux` records the PRINTED page, and `render_pages` wants a 1-based PDF page index.**
- *     They coincide for a document with one arabic numbering scheme, which is every paper this
- *     tool was built for, and they do NOT coincide the moment `\pagenumbering{roman}` front
- *     matter (or `\frontmatter`) shifts the arabic run later into the file. There is no offset to
- *     compute from the `.aux` alone: it records what was printed, never how many pages preceded
- *     it. So a printed page that is not a decimal integer is refused outright
- *     (`'notAPageNumber'`), and a document that shows POSITIVE EVIDENCE of renumbering — any
- *     label in its own index printing as a roman numeral — refuses even its arabic labels
- *     (`'renumbered'`), because those are precisely the ones whose printed number would render
- *     the wrong page while looking perfectly reasonable. Both refusals name the escape hatch: read
- *     the index with `pdf_geometry kinds: ["floats"]` and pass `pages:` explicitly.
+ *     The PDF itself can settle that conversion exactly: a `/PageLabels` number tree maps page
+ *     index -> printed label for every page, whatever the numbering scheme, and pdf.js hands it
+ *     over as `getPageLabels()`. When the render service supplies that array
+ *     ({@link planLabelPages}'s third argument), resolution is a LOOKUP — printed page from the
+ *     `.aux`, page index from the array — and nothing about renumbering is inferred at all. This
+ *     file never reaches for it: the map arrives as plain data, which is what keeps every refusal
+ *     below unit-testable without pdf.js, a compiled PDF or a TeX install.
  *
- *     The residual, stated rather than hidden: a scheme that is neither decimal nor roman
- *     (`\pagenumbering{alph}`, or a `thesis`-style `A-3`) is caught for the requested label itself
- *     (it is not a decimal integer) but is NOT evidence this code recognizes for the
- *     document-wide `'renumbered'` refusal, so an arabic label in such a document can still
- *     resolve to an offset page. Closing that properly means reading the PDF's own `/PageLabels`
- *     tree (pdf.js exposes it as `getPageLabels()`), which is a change to the render service, not
- *     to this file.
+ *     Two refusals belong to that path, and both are cases where a number IS available and using
+ *     it would be wrong. A printed page **absent** from `/PageLabels` (`'printedPageAbsent'`) is
+ *     the `.aux` being stale relative to the PDF on disk, NOT an undefined label — the label was
+ *     found, its page just is not printed anywhere in this document any more. And a printed page
+ *     that `/PageLabels` maps to **more than one** page (`'ambiguousPrintedPage'`) is legitimate —
+ *     a restarted `\pagenumbering`, or an unnumbered front page — so taking the first match would
+ *     re-create the wrong-page failure by another route; both candidates are named instead.
  *
- *  3. **An assertion, never an inference.** If a label cannot be resolved, the whole call refuses
+ *  3. **Without `/PageLabels` the conversion is inferred, and the inference refuses rather than
+ *     guesses.** `getPageLabels()` returning `null` is the COMMON case, not an error: a plain
+ *     `article` carries no such tree, and there the printed page IS the page index — precisely
+ *     because nothing renumbered. So the fallback keeps the two heuristic refusals it always had:
+ *     a printed page that is not a decimal integer is refused outright (`'notAPageNumber'`), and a
+ *     document that shows POSITIVE EVIDENCE of renumbering — any label in its own index printing
+ *     as a roman numeral — refuses even its arabic labels (`'renumbered'`), because those are
+ *     precisely the ones whose printed number would render the wrong page while looking perfectly
+ *     reasonable. Both refusals name the escape hatch: read the index with
+ *     `pdf_geometry kinds: ["floats"]` and pass `pages:` explicitly.
+ *
+ *     The residual this fallback still carries, stated rather than hidden: a scheme that is
+ *     neither decimal nor roman (`\pagenumbering{alph}`, a `thesis`-style `A-3`) is caught for the
+ *     requested label itself but is not evidence the `'renumbered'` verdict recognizes, so an
+ *     arabic label in such a document can still resolve to an offset page. That is why a document
+ *     numbered that way should carry `/PageLabels` — `hyperref` writes one — and why fact 2 is the
+ *     real answer and this one only the floor under it.
+ *
+ *  4. **An assertion, never an inference.** If a label cannot be resolved, the whole call refuses
  *     ({@link labelRefusalMessage}) — it never renders the labels it did resolve and quietly drops
  *     the rest, and it never falls back to page 1. A partially-honoured request would be read as
  *     "here is your table" while showing a different page's table, which is the exact failure this
@@ -73,29 +88,63 @@ export const MAX_LABELS_PER_CALL = 16;
  */
 export const LABEL_LOOKUP_MAX = 20_000;
 
+/**
+ * How many PDF pages an `'ambiguousPrintedPage'` failure names before it starts counting instead.
+ * Bounded because the candidate list comes out of a document-controlled `/PageLabels` tree, where
+ * nothing stops every page of a long document from printing the same string; two candidates are
+ * already enough to prove the lookup is ambiguous, and the rest are a count.
+ */
+export const MAX_AMBIGUOUS_CANDIDATES = 8;
+
 export interface ResolvedLabel {
   /** The `\label{...}` key, exactly as the caller named it. */
   label: string;
   /** The printed page the `.aux` records for it, verbatim (e.g. `"3"`). */
   printedPage: string;
-  /** The 1-based PDF page index rendered for it — the printed page read as a decimal integer. */
+  /**
+   * The 1-based PDF page index resolved for it: the page the PDF's own `/PageLabels` tree prints
+   * `printedPage` on, or — when the document carries no such tree — the printed page read as a
+   * decimal integer. {@link LabelPagePlan.labelSource} says which of the two it was.
+   */
   page: number;
 }
 
 /**
  * Why one label could not be turned into a page. Counted apart rather than collapsed into one
- * "unresolved", because the caller's next move differs: `'notFound'` usually means "compile
- * again", while the other two mean "this document's printed pages are not PDF page indices — pass
- * `pages:` yourself".
+ * "unresolved", because the caller's next move differs: `'notFound'` and `'printedPageAbsent'`
+ * both mean "compile again" (the label is missing from the `.aux`, or the `.aux` is stale
+ * relative to the PDF), while `'notAPageNumber'`, `'renumbered'` and `'ambiguousPrintedPage'`
+ * mean "this document's printed pages are not usable as PDF page indices — pass `pages:`
+ * yourself".
+ *
+ * Which reasons are even reachable depends on how the plan was resolved: `'notAPageNumber'` and
+ * `'renumbered'` belong to the inferred fallback, `'printedPageAbsent'` and
+ * `'ambiguousPrintedPage'` to the `/PageLabels` lookup. `'notFound'` belongs to both.
  */
-export type LabelFailureReason = 'notFound' | 'notAPageNumber' | 'renumbered';
+export type LabelFailureReason =
+  | 'notFound'
+  | 'notAPageNumber'
+  | 'renumbered'
+  | 'printedPageAbsent'
+  | 'ambiguousPrintedPage';
 
 export interface LabelFailure {
   label: string;
   reason: LabelFailureReason;
-  /** The printed page the `.aux` recorded, for the two reasons that HAVE one. */
+  /** The printed page the `.aux` recorded, for every reason except `'notFound'`. */
   printedPage?: string;
+  /**
+   * `'ambiguousPrintedPage'` only: the 1-based PDF pages that print `printedPage`, in page order,
+   * at most {@link MAX_AMBIGUOUS_CANDIDATES} of them.
+   */
+  candidatePages?: number[];
+  /** `'ambiguousPrintedPage'` only: how many further candidates the cap left out of the list. */
+  candidatePagesOmitted?: number;
 }
+
+/** Where a plan's page numbers came from — reported rather than implied, because the two routes
+ *  carry different caveats and {@link labelResolutionNote} has to state the right one. */
+export type LabelSource = 'pageLabels' | 'printedPage';
 
 export interface LabelPagePlan {
   /** One entry per distinct label that resolved, in request order. Empty when anything failed. */
@@ -104,8 +153,57 @@ export interface LabelPagePlan {
   failed: LabelFailure[];
   /** The pages to render: `resolved`'s pages, deduplicated, in request order. */
   pages: number[];
-  /** The label whose roman printed page is the evidence behind a `'renumbered'` failure. */
+  /**
+   * Which route was taken: `'pageLabels'` when the PDF's own `/PageLabels` tree settled the
+   * conversion, `'printedPage'` when there was no usable tree and the printed page was used as
+   * the index directly (with the two heuristic refusals live).
+   */
+  labelSource: LabelSource;
+  /** The label whose roman printed page is the evidence behind a `'renumbered'` failure. Only
+   *  ever set on the `'printedPage'` route, which is the only one that infers anything. */
   renumberedBy?: AuxLabel;
+}
+
+/**
+ * `printed label -> the 1-based PDF pages printing it`, built from pdf.js's `getPageLabels()`
+ * array (0-based page index -> printed label), or `undefined` when there is nothing usable to
+ * look anything up in.
+ *
+ * Three inputs collapse to `undefined`, and the caller must treat all three the same — as "this
+ * document has no page-label tree", falling back to the inferred route rather than refusing every
+ * label: `null`/`undefined` (pdf.js's own answer for a PDF with no `/PageLabels`, or one whose
+ * tree it could not read), an empty array, and an array whose entries are ALL blank. That last
+ * one is not hypothetical — a `/Nums` entry carrying neither `/S` nor `/P` yields `""` — and
+ * treating a document labelled `["", "", ""]` as authoritative would refuse every label in it
+ * with `'printedPageAbsent'`, replacing a working heuristic with a wrong certainty.
+ *
+ * Individual blank entries are dropped for the same reason in miniature: a blank label can never
+ * be the printed page of a resolved `\newlabel` worth rendering, and letting one match would map
+ * a label to a page on the strength of two empty strings being equal.
+ *
+ * Matching is exact and literal — no trimming, no case folding, no numeric coercion — the same
+ * rule `--literal-pathspecs` follows everywhere else here: `"3"` and `" 3"` are different printed
+ * pages, and a near-miss must fail conspicuously rather than resolve to a plausible page.
+ */
+export function buildPageLabelIndex(
+  pageLabels: readonly string[] | null | undefined,
+): Map<string, number[]> | undefined {
+  if (!pageLabels || pageLabels.length === 0) {
+    return undefined;
+  }
+  const index = new Map<string, number[]>();
+  for (const [i, label] of pageLabels.entries()) {
+    if (typeof label !== 'string' || label === '') {
+      continue;
+    }
+    const pages = index.get(label);
+    if (pages) {
+      pages.push(i + 1);
+    } else {
+      index.set(label, [i + 1]);
+    }
+  }
+  return index.size > 0 ? index : undefined;
 }
 
 /** A printed page usable as a 1-based PDF page index. Bounded in width so a hostile `.aux` cannot
@@ -143,15 +241,32 @@ export function parsePrintedPage(page: string): number | undefined {
  * which is the one `\ref` would print.
  *
  * `resolved` is emptied when anything failed: a caller must never receive a half-honoured render.
+ *
+ * `pageLabels` is the PDF's own `/PageLabels` array as pdf.js's `getPageLabels()` returns it —
+ * one printed label per page, indexed by 0-based page index — and supplying it switches the
+ * whole plan from the inferred route to an exact lookup (see this file's header, fact 2). It is
+ * optional, and `null` is the common answer rather than an error: see
+ * {@link buildPageLabelIndex} for what counts as "no usable tree".
  */
-export function planLabelPages(labels: string[], aux: AuxFloatsResult): LabelPagePlan {
+export function planLabelPages(
+  labels: string[],
+  aux: AuxFloatsResult,
+  pageLabels?: readonly string[] | null,
+): LabelPagePlan {
   const index = new Map<string, AuxLabel>();
   for (const entry of aux.floats) {
     if (!index.has(entry.label)) {
       index.set(entry.label, entry);
     }
   }
-  const renumberedBy = aux.floats.find((entry) => isRomanPage(entry.page));
+  const byPrintedPage = buildPageLabelIndex(pageLabels);
+  const labelSource: LabelSource = byPrintedPage ? 'pageLabels' : 'printedPage';
+  // Only ever evidence on the inferred route. On the `/PageLabels` route a roman printed page is
+  // an ordinary lookup key, not a symptom, so computing a verdict from it would be noise at best
+  // and, if it ever reached a refusal, a refusal of a label this route resolves exactly.
+  const renumberedBy = byPrintedPage
+    ? undefined
+    : aux.floats.find((entry) => isRomanPage(entry.page));
 
   const resolved: ResolvedLabel[] = [];
   const failed: LabelFailure[] = [];
@@ -170,18 +285,51 @@ export function planLabelPages(labels: string[], aux: AuxFloatsResult): LabelPag
       failed.push({ label, reason: 'notFound' });
       continue;
     }
-    const page = parsePrintedPage(entry.page);
-    if (page === undefined) {
-      // Checked BEFORE the document-wide renumbering verdict: this label's own printed page is
-      // the more specific fact, and naming it ("prints as iv") tells the caller more than the
-      // evidence label would.
-      failed.push({ label, reason: 'notAPageNumber', printedPage: entry.page });
-      continue;
+
+    let page: number | undefined;
+    if (byPrintedPage) {
+      const candidates = byPrintedPage.get(entry.page) ?? [];
+      // Exactly one candidate is the only resolvable case; `only` is `undefined` for both of the
+      // other two, which the branches below then tell apart. Written this way rather than
+      // indexing after a length check so the element's type carries the guarantee.
+      const only = candidates.length === 1 ? candidates[0] : undefined;
+      if (candidates.length === 0) {
+        // NOT 'notFound': the label is in the .aux, so "no \newlabel for it" would be a lie and
+        // would send the caller looking for a typo in a label that is plainly defined. What is
+        // missing is the PAGE — this document does not print that number anywhere — which is the
+        // .aux being older than the PDF beside it.
+        failed.push({ label, reason: 'printedPageAbsent', printedPage: entry.page });
+        continue;
+      }
+      if (only === undefined) {
+        // Never the first match. A document that restarts \pagenumbering prints "1" twice, and
+        // taking the lower index renders the front matter when the caller meant the body — the
+        // exact silently-wrong page this whole feature exists to refuse.
+        failed.push({
+          label,
+          reason: 'ambiguousPrintedPage',
+          printedPage: entry.page,
+          candidatePages: candidates.slice(0, MAX_AMBIGUOUS_CANDIDATES),
+          candidatePagesOmitted: Math.max(0, candidates.length - MAX_AMBIGUOUS_CANDIDATES),
+        });
+        continue;
+      }
+      page = only;
+    } else {
+      page = parsePrintedPage(entry.page);
+      if (page === undefined) {
+        // Checked BEFORE the document-wide renumbering verdict: this label's own printed page is
+        // the more specific fact, and naming it ("prints as iv") tells the caller more than the
+        // evidence label would.
+        failed.push({ label, reason: 'notAPageNumber', printedPage: entry.page });
+        continue;
+      }
+      if (renumberedBy) {
+        failed.push({ label, reason: 'renumbered', printedPage: entry.page });
+        continue;
+      }
     }
-    if (renumberedBy) {
-      failed.push({ label, reason: 'renumbered', printedPage: entry.page });
-      continue;
-    }
+
     resolved.push({ label, printedPage: entry.page, page });
     if (!seenPage.has(page)) {
       seenPage.add(page);
@@ -190,9 +338,9 @@ export function planLabelPages(labels: string[], aux: AuxFloatsResult): LabelPag
   }
 
   if (failed.length > 0) {
-    return { resolved: [], failed, pages: [], renumberedBy };
+    return { resolved: [], failed, pages: [], labelSource, renumberedBy };
   }
-  return { resolved, failed, pages, renumberedBy };
+  return { resolved, failed, pages, labelSource, renumberedBy };
 }
 
 function quoteLabel(label: string): string {
@@ -218,6 +366,29 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
         `  - ${quoteLabel(failure.label)}: the .aux records its printed page as ` +
           `${quoteLabel(failure.printedPage ?? '')}, which is not a decimal page number, so it ` +
           'cannot be used as a 1-based PDF page index.',
+      );
+      continue;
+    }
+    if (failure.reason === 'printedPageAbsent') {
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: the .aux records its printed page as ` +
+          `${quoteLabel(failure.printedPage ?? '')}, but the PDF's own /PageLabels tree prints ` +
+          'that on no page at all — the label IS defined, so this is that .aux being stale ' +
+          'relative to the PDF beside it (the page moved or went away since the last compile), ' +
+          'not an unknown label. Compile again, then retry.',
+      );
+      continue;
+    }
+    if (failure.reason === 'ambiguousPrintedPage') {
+      const candidates = failure.candidatePages ?? [];
+      const omitted = failure.candidatePagesOmitted ?? 0;
+      const more = omitted > 0 ? `, and ${omitted} more` : '';
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: the .aux records its printed page as ` +
+          `${quoteLabel(failure.printedPage ?? '')}, and the PDF prints that on ` +
+          `${candidates.length + omitted} different pages (PDF pages ${candidates.join(', ')}` +
+          `${more}) — a document that restarts \\pagenumbering legitimately prints one number ` +
+          'twice, so there is no single page to render and picking one would be a coin flip.',
       );
       continue;
     }
@@ -269,13 +440,19 @@ export function describeResolvedLabels(resolved: ResolvedLabel[]): string {
  * moved since, so the result must say so rather than presenting a live page.
  */
 export function labelResolutionNote(plan: LabelPagePlan): string {
+  const conversion =
+    plan.labelSource === 'pageLabels'
+      ? "which records each label's PRINTED page; that printed page was then looked up in the " +
+        "PDF's own /PageLabels tree to get the page index, so a renumbered document (roman " +
+        'front matter, an appendix scheme) resolves exactly rather than being refused'
+      : "which records each label's PRINTED page. This PDF carries no /PageLabels tree, so the " +
+        'printed page was used as the page index directly — correct precisely because nothing ' +
+        'renumbered the document, and a document that shows signs of renumbering is refused ' +
+        'rather than guessed';
   return (
     `Pages resolved from labels through the build-directory .aux of the LAST COMPILE ` +
-    `(${describeResolvedLabels(plan.resolved)}), which records each label's PRINTED page. That ` +
-    'is the PDF page index only while the document numbers its pages in one arabic run — a ' +
-    'renumbered document (roman front matter) is refused rather than guessed. Edits since that ' +
-    'compile, and references that have not converged, are not reflected: recompile if the page ' +
-    'looks wrong.'
+    `(${describeResolvedLabels(plan.resolved)}), ${conversion}. Edits since that compile, and ` +
+    'references that have not converged, are not reflected: recompile if the page looks wrong.'
   );
 }
 

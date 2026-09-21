@@ -152,6 +152,13 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 
+  it('registers the extract_text tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('extract_text');
+    await client.close();
+  });
+
   it('registers the comment tools', async () => {
     const client = await connect();
     const names = (await client.listTools()).tools.map((t) => t.name);
