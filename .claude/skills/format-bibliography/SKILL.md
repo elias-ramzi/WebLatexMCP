@@ -1,6 +1,7 @@
 ---
 name: format-bibliography
 description: Normalize and reformat a project's .bib bibliography — find and merge duplicate entries, rename cite keys to a consistent firstauthorYEARtag scheme (e.g. smith2024fastnet), harmonize venue names (CVPR ↔ "Computer Vision and Pattern Recognition"), and apply one consistent field policy (strip or add url/doi/pages, etc.). Use when the user asks to "format", "reformat", "normalize", "tidy", "clean up", "harmonize", or "deduplicate" the bibliography / .bib / bibtex / citation keys. This skill EDITS the .bib (and the \cite keys in the .tex): it is permission-gated and uses compile as a guardrail. Operates on projects served by the web-latex-mcp MCP server.
+project: optional
 ---
 
 # Normalize and reformat a project's `.bib` bibliography

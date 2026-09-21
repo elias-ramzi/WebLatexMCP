@@ -29,8 +29,10 @@ and claude.ai.
 server registers every bundled skill as a prompt under the same name, carrying the same instructions, so
 clients that don't read `.claude/skills` can still run them. You pick it from the client's prompt menu
 (the `+` in Claude Desktop's composer; `/web-latex-mcp:…` in Claude Code) — the model will **not** reach
-for it on its own. Each prompt takes an optional `project` argument, so you can scope the run up front
-instead of being asked. Because prompts are flat text, a skill that grows bundled scripts or reference
+for it on its own. A prompt whose procedure acts on a project takes an optional `project` argument, so
+you can scope the run up front instead of being asked; one that does not — `session-feedback` reports on
+the server, never on a paper — takes no argument at all, so a client that binds what you type after the
+prompt name positionally cannot turn the first word into a project id. Because prompts are flat text, a skill that grows bundled scripts or reference
 files would only be partially conveyed — the `SKILL.md` body is what ships. All six current skills are
 self-contained, so nothing is lost today.
 
@@ -92,6 +94,11 @@ having.
 Set `WEB_LATEX_MCP_SKILLS_DIR` to expose a different directory as prompts — one subdirectory per skill,
 each with a `SKILL.md` whose frontmatter carries a `name` and a `description`. The default is the bundled
 `.claude/skills`.
+
+The frontmatter may also carry `project: none | optional | required`, which decides whether that prompt
+advertises a `project` argument at all — `none` for a procedure that acts on no project. Leave it out and
+the skill behaves as it always did (`optional`); an unrecognised value logs a line to stderr and falls
+back to the same default rather than dropping the skill.
 
 ## `format-latex-project` — reformat an existing project
 

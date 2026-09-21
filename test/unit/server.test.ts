@@ -323,8 +323,18 @@ describe('add_writing_convention confirmGuideEdit gate', () => {
 
 describe('createServer skill prompts', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('advertises each skill as a prompt carrying its description', async () => {
@@ -673,8 +683,18 @@ describe('doctor', () => {
 
 describe('list_skills', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('lists every bundled skill with its description', async () => {
@@ -726,6 +746,49 @@ describe('list_skills', () => {
     const res = await client.callTool({ name: 'list_skills', arguments: {} });
     expect((res.structuredContent as { skills: unknown[] }).skills).toEqual([]);
     expect((res.content as Array<{ text: string }>)[0]?.text).toContain('No skills are bundled');
+
+    await client.close();
+  });
+});
+
+describe('createServer wires the registered-project lookup into the skill prompts', () => {
+  const skills: Skill[] = [
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+  ];
+
+  // A context whose ProjectManager actually answers, unlike `fakeCtx` above (which throws and so
+  // only ever exercises the `unverified` branch). Without `createServer` passing
+  // `isRegisteredProject` through, every id renders as known and the second case below turns back
+  // into a confident instruction to act on a project that does not exist — the #105 finding 6 bug
+  // one layer in. This test is what makes dropping that argument fail rather than go quiet.
+  async function connectWithProjects(known: string[]): Promise<Client> {
+    const ctx = { projectManager: { knownIds: () => known } } as unknown as AppContext;
+    const server = createServer(ctx, undefined, undefined, skills);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return client;
+  }
+
+  async function promptText(client: Client, project: string): Promise<string | undefined> {
+    const got = await client.getPrompt({ name: 'verify-citations', arguments: { project } });
+    const message = got.messages[0];
+    return message && 'text' in message.content ? message.content.text : undefined;
+  }
+
+  it('asserts a registered project and refuses to assert an unregistered one', async () => {
+    const client = await connectWithProjects(['pictura']);
+
+    expect(await promptText(client, 'pictura')).toContain('Apply it to the project `pictura`');
+
+    const unknown = await promptText(client, 'please');
+    expect(unknown).not.toContain('Apply it to the project `please`');
+    expect(unknown).toContain('No project named `please` is registered');
 
     await client.close();
   });

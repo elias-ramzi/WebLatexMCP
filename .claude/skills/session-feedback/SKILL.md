@@ -1,6 +1,7 @@
 ---
 name: session-feedback
 description: Close a working session by turning what actually happened into a feedback report for WebLatexMCP itself — what broke, what was clumsy, what is missing, what the docs did not say — ranked by impact and emitted as ready-to-file GitHub issue bodies that match the repo's issue forms field for field, stamped with a measured environment (server version, OS, client, model, install method, toolchain) and scrubbed of anything private. Use at the end of a session, or when the user asks to "give feedback", "write a retrospective", "what should I report", "how did this session go", or "file an issue about the MCP server". Reports on the *server and its skills*, never on the paper: it changes no file in the project, commits nothing, and pushes nothing.
+project: none
 ---
 
 # End a session with a feedback report for the server
