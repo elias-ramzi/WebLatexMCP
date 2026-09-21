@@ -7,8 +7,20 @@ import { detectRootFile } from '../lib/rootFile.js';
 import { locateProjectPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import { buildDir } from '../services/compiler.js';
-import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL } from '../services/pdfRender.js';
+import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL, PdfRenderError } from '../services/pdfRender.js';
+import type { RenderResult } from '../services/pdfRender.js';
 import { planInlining } from '../lib/inlineBudget.js';
+import { readAuxFloats } from '../lib/auxFloats.js';
+import {
+  planLabelPages,
+  labelRefusalMessage,
+  labelResolutionNote,
+  labelPageRangeMessage,
+  describeResolvedLabels,
+  LABEL_LOOKUP_MAX,
+  MAX_LABELS_PER_CALL,
+} from '../lib/labelPages.js';
+import type { LabelPagePlan } from '../lib/labelPages.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -27,7 +39,30 @@ const inputSchema = {
     .describe(
       '1-based page numbers, in the order given. Defaults to every page, capped at ' +
         `${MAX_PAGES_PER_CALL} (MAX_PAGES_PER_CALL) per call. Omit the field for every page; an ` +
-        'empty array is rejected rather than silently rendering nothing.',
+        'empty array is rejected rather than silently rendering nothing. Cannot be combined with ' +
+        '`labels`.',
+    ),
+  labels: z
+    .array(z.string().min(1))
+    .min(1, 'Omit labels rather than passing an empty array — it selects nothing, not "all".')
+    .max(MAX_LABELS_PER_CALL)
+    .optional()
+    .describe(
+      'Render the page each \\label{...} landed on, instead of naming page numbers — the actual ' +
+        'question after moving a float ("which page did the restructured table end up on?"), ' +
+        'where the page number is exactly what is unknown. Resolved through the build-directory ' +
+        '.aux of the LAST COMPILE (the same index pdf_geometry kinds: ["floats"] reports), so a ' +
+        'label added since, one that moved, or one whose reference has not converged yet ' +
+        '(LaTeX\'s "Label(s) may have changed. Rerun to get cross-references right.") resolves ' +
+        'to a STALE page or not at all — compile first, and the result echoes every label -> ' +
+        "page it used so you can see what was actually rendered. The .aux records each label's " +
+        'PRINTED page, which is the PDF page index only while the document numbers its pages in ' +
+        'one arabic run: a label printing as "iv", and every label in a document that renumbers ' +
+        '(roman front matter, \\frontmatter), is REFUSED rather than mapped onto a page that ' +
+        'would be wrong. Any label that cannot be resolved refuses the whole call — no page is ' +
+        'ever guessed, and nothing partial is rendered. Cannot be combined with `pages`; two ' +
+        'labels on one page render it once and both are echoed. At most ' +
+        `${MAX_LABELS_PER_CALL} per call.`,
     ),
   dpi: z
     .number()
@@ -117,13 +152,40 @@ const outputSchema = {
       `Pages asked for (or implied by the default) that the ${MAX_PAGES_PER_CALL}-per-call cap ` +
         'left out.',
     ),
+  resolvedLabels: z
+    .array(
+      z.object({
+        label: z.string().describe('The \\label{...} key, as it was passed in.'),
+        printedPage: z
+          .string()
+          .describe(
+            'The printed page the .aux records for it, verbatim — what \\pageref would print.',
+          ),
+        page: z
+          .number()
+          .describe(
+            'The 1-based PDF page index actually rendered for it: the printed page read as a ' +
+              'decimal integer. Equal to printedPage for a document with one arabic numbering ' +
+              'run; a document where they could differ is refused rather than reported here.',
+          ),
+      }),
+    )
+    .optional()
+    .describe(
+      'Present only when `labels` was used: what each label resolved to, in request order, so ' +
+        'the page that was rendered is visible rather than implied. Two labels on one page both ' +
+        'appear here while `pages` holds that page once. These numbers come from the LAST ' +
+        "COMPILE's .aux (see `note`), not from the source on disk.",
+    ),
   note: z
     .string()
     .optional()
     .describe(
       'Explains the inline situation when it is not the default: nothing inlined because ' +
         'inline was false, or which later pages the 5 MB inline budget (on the base64-encoded ' +
-        'payload) left as paths-only.',
+        'payload) left as paths-only. When `labels` was used it also carries the provenance of ' +
+        'the page numbers: they came from the build-directory .aux the LAST COMPILE wrote, so ' +
+        'they are as stale as that compile is.',
     ),
 };
 
@@ -143,12 +205,26 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
         'For sub-point measurement (matching two table heights, checking rule alignment), clip a ' +
         'narrow band and push dpi toward its 1200 cap instead of rendering a whole page — a tight ' +
         'clip at high dpi resolves well under a point per pixel. ' +
+        'Pass `labels` instead of `pages` when the question is "which page did this float land ' +
+        'on?": each \\label is resolved through the build-directory .aux of the LAST COMPILE and ' +
+        'the label -> page mapping comes back in the result. A label that cannot be resolved — ' +
+        'absent from that .aux, or printing on a page that is not a PDF page index (roman front ' +
+        'matter) — refuses the call rather than rendering a guessed page. ' +
         'Fails with a message to run compile first when nothing has been compiled yet.',
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, dpi, maxEdgePx, clip, inline }) => {
+    async ({ project, rootFile, pages, labels, dpi, maxEdgePx, clip, inline }) => {
       try {
+        // Rejected, never silently resolved — the house rule `diff` already applies to
+        // `ref` + `staged`. Either one could be made to win, and whichever were chosen would
+        // silently render something the caller did not ask for half the time they hit it.
+        if (labels && pages) {
+          throw new Error(
+            'Pass either `pages` or `labels`, not both: `labels` resolves to page numbers, so ' +
+              'combining them would mean silently ignoring one of the two.',
+          );
+        }
         // Invariant: requireProjectDir, NEVER requireGitProject — this tool must work for a
         // mode:'local' project exactly like compile and viewer. Git-gating it would be wrong.
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
@@ -175,17 +251,57 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // temp build dir's own "render" subdirectory — for a local (in-place) project this is
           // the difference between reading/editing in place and littering it with PNGs.
           const outDir = path.join(buildDir(dir), 'render');
-          const result = await ctx.pdfRenderer.render({
-            pdfPath,
-            outDir,
-            pages,
-            dpi,
-            maxEdgePx,
-            clip,
-          });
+
+          // Label resolution reads the build-dir .aux, which is the very file a peer session's
+          // compile rewrites in place — so it belongs INSIDE this runExclusive closure, alongside
+          // the PDF read it feeds, not before the lock. Reading it outside would let a peer's
+          // compile land between the lookup and the render, and the page rendered would then be
+          // from a different build than the page number was.
+          //
+          // No baseline is recorded for it either: readAuxFloats goes through node:fs directly,
+          // never FileService, and the .aux is not a caller-named project file the caller could
+          // base a write on. Same reasoning as pdf_geometry's "floats" kind.
+          let labelPlan: LabelPagePlan | undefined;
+          if (labels) {
+            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
+            labelPlan = planLabelPages(labels, aux);
+            // An assertion, never an inference: one unresolvable label refuses the whole call.
+            // Rendering the labels that did resolve would hand back images the caller reads as
+            // the answer to every label they asked about.
+            if (labelPlan.failed.length > 0) {
+              throw new Error(labelRefusalMessage(labelPlan, aux));
+            }
+          }
+          const effectivePages = labelPlan ? labelPlan.pages : pages;
+
+          let result: RenderResult;
+          try {
+            result = await ctx.pdfRenderer.render({
+              pdfPath,
+              outDir,
+              pages: effectivePages,
+              dpi,
+              maxEdgePx,
+              clip,
+            });
+          } catch (err) {
+            // A page resolved from a label that the PDF on disk does not have is the one stale-
+            // .aux symptom that IS detectable, and the renderer's own message ("Page 9 is out of
+            // range: this document has 3 page(s).") blames the caller for a number they never
+            // chose. Narrowed to that one message from selectPages — a backend or canvas failure
+            // must not collect a "your .aux is stale" suffix it did not earn.
+            if (
+              labelPlan &&
+              err instanceof PdfRenderError &&
+              err.message.includes('out of range')
+            ) {
+              throw new Error(labelPageRangeMessage(labelPlan, err.message), { cause: err });
+            }
+            throw err;
+          }
 
           const inlineRequested = inline ?? true;
-          const { inlined: inlinePlan, note } = planInlining(
+          const { inlined: inlinePlan, note: inlineNote } = planInlining(
             result.pages.map((p) => ({ page: p.page, bytes: p.bytes })),
             { inline: inlineRequested },
           );
@@ -209,6 +325,15 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             inlined: p.inlined,
           }));
 
+          // Joined, never overwritten — the two notes answer different questions (what was
+          // inlined, and where the page numbers came from) and both can hold at once: a
+          // label-resolved render of several pages can also hit the inline budget. Same shape as
+          // pdf_geometry's note joining.
+          const note =
+            [labelPlan ? labelResolutionNote(labelPlan) : undefined, inlineNote]
+              .filter(Boolean)
+              .join(' ') || undefined;
+
           // structuredContent must never carry base64 (it would double the payload) — the image
           // bytes only ever reach `content`, below.
           const structuredContent = {
@@ -217,6 +342,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             outDir: outOutDir,
             pages: pagesOut,
             skippedPages: result.skippedPages,
+            resolvedLabels: labelPlan ? labelPlan.resolved : undefined,
             note,
           };
 
@@ -236,8 +362,16 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
               ? `  … ${result.skippedPages.length} page(s) not rendered (at most ` +
                 `${MAX_PAGES_PER_CALL} per call): ${result.skippedPages.join(', ')}`
               : '';
+          // The resolved mapping goes in the TEXT channel as well as structuredContent: a client
+          // that only reads the text would otherwise see "page 3" with no way to know which label
+          // asked for it, which is the whole point of resolving one.
+          const labelLine = labelPlan
+            ? `  labels (from the last compile's .aux): ${describeResolvedLabels(labelPlan.resolved)}`
+            : '';
           const noteLine = note ? `  … ${note}` : '';
-          const text = [header, ...pageLines, skippedLine, noteLine].filter(Boolean).join('\n');
+          const text = [header, labelLine, ...pageLines, skippedLine, noteLine]
+            .filter(Boolean)
+            .join('\n');
 
           const content: Array<
             { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: 'image/png' }

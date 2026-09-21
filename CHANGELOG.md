@@ -11,6 +11,35 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`render_pages` takes `labels`, so you can render the page a float actually landed on**
+  (#105, finding 2). `render_pages` took page numbers, but after moving a float its page is
+  exactly what is unknown — the question is never "page 8", it is "the page the table I just
+  restructured landed on". Resolving that meant grepping the server's own build directory from a
+  shell (`grep newlabel ... /tmp/web-latex-mcp-build/<project>-<hash>/main.aux`): a private,
+  hash-named internal path that nothing in the tool surface points at, and that a client with no
+  shell cannot reach at all.
+
+  Labels resolve through the same `readAuxFloats` `pdf_geometry` already uses — no second `.aux`
+  parser — and the result echoes the `label -> page` mapping it used, in `structuredContent`, in
+  the text channel and in `note`, so a caller can see what was actually rendered. `labels` and
+  `pages` together are rejected rather than one silently winning, following `diff`'s `ref` +
+  `staged` precedent.
+
+  **A label is refused, never guessed at.** The `.aux` records the _printed_ page, which is the
+  PDF page index only while nothing has renumbered the document — and the `.aux` cannot reveal
+  the offset, because it records what was printed and never how many pages preceded it. So a
+  printed page that is not a decimal integer is refused, and so is an _arabic_ label in a
+  document where any label prints as a roman numeral: those are precisely the ones whose number
+  would render the wrong page while looking perfectly reasonable. Both refusals name the way
+  round (`pdf_geometry kinds: ["floats"]` plus explicit `pages`). One residual is stated in the
+  code rather than hidden — a scheme that is neither decimal nor roman does not count as
+  document-wide evidence — and closing it properly means reading the PDF's own `/PageLabels`,
+  filed as #112.
+
+  Lookups use their own bound rather than `readAuxFloats`' 200-entry _reporting_ cap: a real
+  manuscript clears 200 `\newlabel`s easily, and reusing a report cap for a search answers "no
+  such label" for a label plainly in the file — a wrong answer, not a truncated one.
+
 - **`shelve` / `unshelve` / `list_shelves`: set uncommitted work aside without publishing or
   destroying it** (#86). `push` refuses to rebase over an uncommitted tracked file, and every
   exit it offered either **published** that file (`commit`, or a `message` on `push`) or
