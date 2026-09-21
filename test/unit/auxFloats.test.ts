@@ -9,6 +9,7 @@ import {
   DEFAULT_MAX_FLOATS,
   PARSE_BOUND,
   MAX_GROUP_SCAN,
+  GROUP_SKIP_SCAN,
 } from '../../src/lib/auxFloats.js';
 import { buildAuxPath } from '../../src/services/compiler.js';
 
@@ -133,6 +134,91 @@ describe('parseAuxLabels', () => {
     expect(result).toEqual([{ label: 'fig:next', number: '2', page: '8' }]);
   });
 
+  it('#80 §3: refuses a \\newlabel more than GROUP_SKIP_SCAN chars inside an unclosed group, and still parses a real one after it', () => {
+    // The residual #76 left open and #80 §3 filed. The outer group is longer than even the
+    // GROUP_SKIP_SCAN retry will scan, so its true end is never located and searchFrom advances
+    // only as far as that retry read. Everything past that point is still INSIDE the group — and
+    // the fake sits there, so the next indexOf found it and it came back as a real label off a
+    // document-controlled .aux, which render_pages would resolve to a page and render.
+    //
+    // Both directions in one input, because either alone is passable by a wrong fix: refusing
+    // everything after an unclosed group would "pass" the first assertion while destroying the
+    // index, and the old behaviour passes the second while fabricating.
+    const pad = 'x'.repeat(GROUP_SKIP_SCAN + 2000);
+    const aux = [
+      `\\newlabel{fig:real}{{1}{7}{${pad}\\newlabel{fig:fake}{{9}{999}} tail}{figure.1}{}}`,
+      '\\newlabel{fig:after}{{4}{8}}',
+    ].join('\n');
+
+    const result = parseAuxLabels(aux);
+    // Watched failing pre-fix: [{"label":"fig:fake","number":"9","page":"999"},
+    // {"label":"fig:after","number":"4","page":"8"}] — the fake fabricated as a real row.
+    expect(result.some((r) => r.label === 'fig:fake')).toBe(false);
+    // fig:real's own group is past the accept budget, so it is dropped (counted in readAuxFloats'
+    // `dropped`); fig:after sits after the group's true close and is an ordinary entry.
+    expect(result).toEqual([{ label: 'fig:after', number: '4', page: '8' }]);
+  });
+
+  it('#80 §3: keeps the truncated outcome distinct — a group unbalanced to the TRUE end of the file still lets later markers through', () => {
+    // The three outcomes must not collapse into one policy. Here the outer group blows the
+    // MAX_GROUP_SCAN budget but the GROUP_SKIP_SCAN retry reaches the real end of the string
+    // without ever balancing (readGroupOrSkip's 'exhausted' + reason 'truncated'), which PROVES
+    // no closing brace exists anywhere. There is no cheap check left to make and nothing to walk
+    // forward over, so parseAuxLabels' long-standing recall contract for a corrupt tail stands:
+    // the markers that follow are treated as entries of their own, exactly as before this fix.
+    // Contrast the test above, where the file continues past the budget and the walk can go on.
+    const pad = 'x'.repeat(MAX_GROUP_SCAN + 2000);
+    const aux = `\\newlabel{fig:broken}{{1}{7}{${pad}\n\\newlabel{fig:ok}{{4}{8}}`;
+    expect(pad.length + 80).toBeLessThan(GROUP_SKIP_SCAN); // the retry really does reach EOF
+
+    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+  });
+
+  it('stays linear on a file of markers buried in ONE unclosed group (the #80 §3 open-span path)', () => {
+    // The span bookkeeping added for #80 §3 is the obvious place to walk straight back into the
+    // 27-second blowup: "is this marker inside the unclosed group?" is a question whose naive
+    // answer re-walks the group from its start for every marker, i.e. O(n) per marker over
+    // O(n) markers. It is answered instead by a cursor that only moves forward, so every
+    // character of the file is walked at most once across all the continuations.
+    //
+    // Same growth-ratio shape as the test above, and for the same reason: an absolute wall-clock
+    // budget is machine-speed dependent and flakes (see the note there), while "doubling the
+    // input roughly doubles the time" is not.
+    function parseTimeMs(n: number): number {
+      // One group that never closes, holding n well-formed \newlabel markers. Every one of them
+      // is inside it, so every one is refused — and each refusal must cost only the characters
+      // between it and the marker before it.
+      const buried = Array.from({ length: n }, (_, i) => `\\newlabel{l${i}}{{${i}}{${i}}}`).join(
+        '\n',
+      );
+      const aux = `\\newlabel{fig:real}{{1}{7}{${'x'.repeat(GROUP_SKIP_SCAN + 100)}\n${buried}`;
+      const start = Date.now();
+      const result = parseAuxLabels(aux, { maxLabels: n });
+      const elapsedMs = Date.now() - start;
+      // Nothing is reported: fig:real's group is over budget, and every buried marker is inside
+      // it. Pre-fix every one of them came back as a fabricated row instead.
+      expect(result).toEqual([]);
+      return elapsedMs;
+    }
+
+    const TIMER_FLOOR_MS = 5;
+    function medianOf3Ms(n: number): number {
+      const samples = [parseTimeMs(n), parseTimeMs(n), parseTimeMs(n)]
+        .map((ms) => Math.max(ms, TIMER_FLOOR_MS))
+        .sort((a, b) => a - b);
+      const median = samples[1];
+      if (median === undefined) {
+        throw new Error('unreachable: samples always has exactly 3 elements');
+      }
+      return median;
+    }
+
+    const n = 6_000;
+    const tSmall = medianOf3Ms(n);
+    const tLarge = medianOf3Ms(n * 2);
+    expect(tLarge / tSmall).toBeLessThan(3.0);
+  });
+
   it('stays linear (not quadratic) on a large file of unbalanced \\newlabel markers', () => {
     // Each marker opens a brace that never closes, so an unbounded reader would scan to
     // end-of-string on every single one of them: O(n) work per marker * O(n) markers = O(n^2).
@@ -238,6 +324,7 @@ describe('readAuxFloats', () => {
       omitted: 0,
       total: 2,
       dropped: 0,
+      refused: 0,
     });
   });
 
@@ -456,6 +543,33 @@ describe('readAuxFloats', () => {
     expect(result.floats.some((f) => f.label === 'fig:fake')).toBe(false);
     expect(result.floats).toEqual([]);
     expect(result.dropped).toBe(1); // fig:real itself — counted, not fabricated from
+  });
+
+  it('#80 §3: counts a refused marker apart from a dropped entry, and never as one', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    // Same hostile shape as the parseAuxLabels test: the fake sits past the GROUP_SKIP_SCAN
+    // retry's reach, inside a group whose end is never located.
+    const pad = 'x'.repeat(GROUP_SKIP_SCAN + 2000);
+    await writeFile(
+      auxPath,
+      [
+        `\\newlabel{fig:real}{{1}{7}{${pad}\\newlabel{fig:fake}{{9}{999}} tail}{figure.1}{}}`,
+        '\\newlabel{fig:after}{{4}{8}}',
+      ].join('\n'),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Watched failing pre-fix: floats came back as [fig:fake, fig:after] with refused undefined
+    // — the fabricated row indistinguishable from the real one.
+    expect(result.floats).toEqual([{ label: 'fig:after', number: '4', page: '8' }]);
+    expect(result.total).toBe(1);
+    // The two counters say different things and must not be merged: `dropped` is fig:real, a real
+    // entry the caller is not getting; `refused` is fig:fake, a fabrication declined. Calling the
+    // refusal a drop would claim an entry was lost that never existed.
+    expect(result.dropped).toBe(1);
+    expect(result.refused).toBe(1);
   });
 
   it('respects an explicit max override', async () => {

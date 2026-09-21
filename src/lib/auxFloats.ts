@@ -69,8 +69,19 @@ export const MAX_GROUP_SCAN = 4096;
  * every character up to there was read looking for the closing brace. Total work across a whole
  * file stays bounded by `PARSE_BOUND * (MAX_GROUP_SCAN + GROUP_SKIP_SCAN)` — a small constant —
  * never by the number of markers squared, regardless of which of the two paths above is taken.
+ *
+ * Advancing to `start + GROUP_SKIP_SCAN` is where this constant stops being enough on its own,
+ * and why `scanAuxEntries` also keeps an OPEN SPAN (see `OpenSpan` below) for the `'tooLong'`
+ * case. Jumping there says nothing about the text BEYOND it: the group is still open, so a
+ * `\newlabel`-shaped string sitting further inside it than this budget reaches is the next thing
+ * `indexOf` finds, and used to be reported as a real label — issue #80 §3. Raising the constant
+ * only moves that boundary; nothing finite removes it. What removes it is continuing the same
+ * brace walk past the budget, one stretch at a time, and that is what the open span does.
+ *
+ * Exported for the same reason `MAX_GROUP_SCAN` is: so a test can build an input that lands
+ * exactly on this boundary rather than re-deriving the number and silently drifting off it.
  */
-const GROUP_SKIP_SCAN = MAX_GROUP_SCAN * 4;
+export const GROUP_SKIP_SCAN = MAX_GROUP_SCAN * 4;
 
 /**
  * Hard cap on how many `\newlabel` markers a single scan (`parseAuxLabels` or `readAuxFloats`)
@@ -91,29 +102,35 @@ const GROUP_SKIP_SCAN = MAX_GROUP_SCAN * 4;
 export const PARSE_BOUND = 50_000;
 
 /**
- * A brace-balanced reader over `s` starting just after an opening `{` at `start` (i.e. `s[start]`
- * must be `{`). On success, returns the group's raw content (excluding the outer braces) and the
- * index just past the matching closing `}`. On failure, reports WHY, because the two reasons
- * demand different handling from the caller (see `readGroupOrSkip`/`scanAuxEntries` below):
- * `'unbalanced'` means the scan reached the true end of `s` (or of the caller-supplied window)
- * without ever balancing — a truncated or malformed marker, and there is nothing more to find no
- * matter how far we looked; `'budgetExhausted'` means the scan hit `maxScan` characters with MORE
- * of `s` still unscanned — the group may still be perfectly well-formed, just longer than this
- * call was willing to accept. `scannedTo` is the index the scan actually reached, either way.
+ * The one home of the brace-balance rules — `{` opens, `}` closes, and a backslash escapes
+ * whatever follows it so a literal `\{`/`\}` never perturbs the count — factored out of
+ * `readBraceGroup` so a walk can be RESUMED rather than restarted. `readBraceGroup` runs it over
+ * one budgeted window; `scanAuxEntries` continues that very same walk over the text after a
+ * window that ran out (see `OpenSpan`). Two properties make resuming safe and cheap, and both
+ * come from this being one function rather than two implementations of the same rules:
+ *
+ * - `next` is the index to resume at, which is one PAST `to` when an escape straddled the
+ *   boundary (the `\` was consumed at `to - 1`, so the character it escapes must not be re-read
+ *   as a brace). A second, independent scanner would get this wrong in exactly the way that turns
+ *   an escaped brace into a real one.
+ * - `next` only ever moves forward, so continuing a walk reads each character of the file at most
+ *   once no matter how many times it is continued.
+ *
+ * Scans `[from, to)` (clamped to `s.length`) starting at brace depth `depth`. `'closed'` means the
+ * depth reached 0 and `end` is the index just past the closing `}`; `'open'` means the window ran
+ * out first, and carries the state to pick the walk up again. An `'open'` depth is always >= 1: a
+ * depth reaching 0 returns `'closed'` instead, and it can never step below 0 without passing
+ * through it.
  */
-function readBraceGroup(
+function scanBalance(
   s: string,
-  start: number,
-  maxScan: number,
-):
-  | { kind: 'ok'; content: string; end: number }
-  | { kind: 'fail'; reason: 'unbalanced' | 'budgetExhausted'; scannedTo: number } {
-  if (s[start] !== '{') {
-    return { kind: 'fail', reason: 'unbalanced', scannedTo: start };
-  }
-  let depth = 0;
-  let i = start;
-  const limit = Math.min(s.length, start + maxScan);
+  from: number,
+  to: number,
+  depth: number,
+): { kind: 'closed'; end: number } | { kind: 'open'; depth: number; next: number } {
+  let d = depth;
+  let i = from;
+  const limit = Math.min(s.length, to);
   for (; i < limit; i++) {
     const ch = s[i];
     if (ch === '\\') {
@@ -122,18 +139,56 @@ function readBraceGroup(
       continue;
     }
     if (ch === '{') {
-      depth++;
+      d++;
     } else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        return { kind: 'ok', content: s.slice(start + 1, i), end: i + 1 };
+      d--;
+      if (d === 0) {
+        return { kind: 'closed', end: i + 1 };
       }
     }
+  }
+  return { kind: 'open', depth: d, next: i };
+}
+
+/**
+ * A brace-balanced reader over `s` starting just after an opening `{` at `start` (i.e. `s[start]`
+ * must be `{`). On success, returns the group's raw content (excluding the outer braces) and the
+ * index just past the matching closing `}`. On failure, reports WHY, because the two reasons
+ * demand different handling from the caller (see `readGroupOrSkip`/`scanAuxEntries` below):
+ * `'unbalanced'` means the scan reached the true end of `s` (or of the caller-supplied window)
+ * without ever balancing — a truncated or malformed marker, and there is nothing more to find no
+ * matter how far we looked; `'budgetExhausted'` means the scan hit `maxScan` characters with MORE
+ * of `s` still unscanned — the group may still be perfectly well-formed, just longer than this
+ * call was willing to accept. `scannedTo` is the index the scan actually reached, either way, and
+ * `depth`/`next` are the underlying walk's resume state (see `scanBalance`) so a caller that has
+ * to keep tracking this group past the budget continues the same walk rather than starting a
+ * second one over text it has already read.
+ */
+function readBraceGroup(
+  s: string,
+  start: number,
+  maxScan: number,
+):
+  | { kind: 'ok'; content: string; end: number }
+  | {
+      kind: 'fail';
+      reason: 'unbalanced' | 'budgetExhausted';
+      scannedTo: number;
+      depth: number;
+      next: number;
+    } {
+  if (s[start] !== '{') {
+    return { kind: 'fail', reason: 'unbalanced', scannedTo: start, depth: 0, next: start };
+  }
+  const limit = Math.min(s.length, start + maxScan);
+  const walk = scanBalance(s, start, limit, 0);
+  if (walk.kind === 'closed') {
+    return { kind: 'ok', content: s.slice(start + 1, walk.end - 1), end: walk.end };
   }
   // Ran out of scan room without balancing. `limit < s.length` means more of `s` remains beyond
   // where we gave up — this call's budget was the limiting factor, not the input itself.
   const reason = limit < s.length ? 'budgetExhausted' : 'unbalanced';
-  return { kind: 'fail', reason, scannedTo: limit };
+  return { kind: 'fail', reason, scannedTo: limit, depth: walk.depth, next: walk.next };
 }
 
 /**
@@ -169,6 +224,13 @@ function readBraceGroup(
  *       `[start, scannedTo)` is unexplored text — advancing the search there (rather than leaving
  *       it at `start`) skips only text this call already looked at, never a guess. See
  *       `scanAuxEntries`'s own doc for how the two are used differently.
+ *
+ * `'exhausted'` also carries `depth`/`next`, the retry walk's resume state, which only the
+ * `'tooLong'` reason has any use for: the group is still open at `scannedTo` and the file
+ * continues past it, so `scanAuxEntries` keeps walking the SAME group from there (see
+ * `OpenSpan`) rather than treating everything past the budget as text outside it. Under
+ * `'truncated'` the retry already reached the true end of `s`, so there is nothing to resume
+ * over.
  */
 function readGroupOrSkip(
   s: string,
@@ -177,7 +239,13 @@ function readGroupOrSkip(
   | { kind: 'ok'; content: string; end: number }
   | { kind: 'tooLong'; content: string; end: number }
   | { kind: 'unbalanced' }
-  | { kind: 'exhausted'; reason: 'truncated' | 'tooLong'; scannedTo: number } {
+  | {
+      kind: 'exhausted';
+      reason: 'truncated' | 'tooLong';
+      scannedTo: number;
+      depth: number;
+      next: number;
+    } {
   const primary = readBraceGroup(s, start, MAX_GROUP_SCAN);
   if (primary.kind === 'ok') {
     return primary;
@@ -193,7 +261,43 @@ function readGroupOrSkip(
     kind: 'exhausted',
     reason: retry.reason === 'unbalanced' ? 'truncated' : 'tooLong',
     scannedTo: retry.scannedTo,
+    depth: retry.depth,
+    next: retry.next,
   };
+}
+
+/**
+ * A group `readGroupOrSkip` left OPEN: neither budget found its closing brace, and the file
+ * continues past where the retry gave up (`'exhausted'` + `reason: 'tooLong'`). It holds the
+ * brace walk's resume state, so `scanAuxEntries` can keep walking that one group forward instead
+ * of guessing where it ends.
+ *
+ * Why this is needed at all: advancing `searchFrom` to `start + GROUP_SKIP_SCAN` protects only
+ * the text the retry actually read. Everything past it is still inside the group, and a
+ * `\newlabel`-shaped string there was the next thing `indexOf` found — reported as a real label,
+ * off a `.aux` that is document-controlled, which `render_pages` would then resolve to a page and
+ * render with confidence (issue #80 §3). It cannot be closed by skipping ahead: the group's end
+ * is genuinely unknown, and skipping on a guess would swallow a legitimate separate `\newlabel`
+ * in text nobody ever scanned. So the span is carried instead of jumped.
+ *
+ * Cost, which is the whole reason this is a resumable cursor and not a re-scan: the walk is
+ * continued only as far as the NEXT marker, and `next` never moves backwards, so every character
+ * of the file is walked at most once across all continuations — one extra linear pass at worst,
+ * on top of the `indexOf` pass `scanAuxEntries` already makes. Continuing to end-of-file instead,
+ * to prove up front whether the group ever closes, is the obvious alternative and is exactly the
+ * quadratic blowup `MAX_GROUP_SCAN` exists to prevent (520KB of unbalanced markers took 27s of
+ * blocked event loop inside `runExclusive`): each of `PARSE_BOUND`-many markers would pay a
+ * scan over the whole remaining file.
+ *
+ * At most one span is ever open: it is set only on the branches that `continue` immediately, and
+ * the next marker either closes it or is refused under it, so a new group is never read while one
+ * is outstanding.
+ */
+interface OpenSpan {
+  /** Brace depth the walk had reached at `next`. Always >= 1 — see `scanBalance`. */
+  depth: number;
+  /** Where to resume the walk; may be one past the budget when an escape straddled it. */
+  next: number;
 }
 
 /** Skip whitespace (including newlines — a `\newlabel` can be wrapped across lines) from `i`. */
@@ -228,10 +332,22 @@ function skipWs(s: string, i: number): number {
  * a real `\newlabel` marker the caller is choosing not to report, which is a different thing from
  * a marker that never parsed at all (a key or outer group that never closes at all, e.g. inside a
  * truncated file, has no located label to report and stays a silent skip, same as always).
+ *
+ * `'refused'` is a THIRD thing, and deliberately not a `'dropped'` with another reason. A
+ * `'dropped'` says "there was a real `\newlabel` entry here and you are not getting it" — a loss
+ * the caller suffers. A `'refused'` says the opposite: a `\newlabel`-shaped string was found
+ * inside a group whose end could not be verified (see `OpenSpan`), so it is almost certainly not
+ * an entry at all but text inside another entry's group, and it was declined rather than
+ * believed. Counting the two together would report a fabrication we refused as an entry the
+ * caller lost — naming a cause that did not fire, which is the overclaim this file's comments
+ * guard against, and the same reason `pdf_geometry` keeps `floatsOmittedBySize` apart from
+ * `floatsOmitted` and `floatsDropped`. It carries no label, because nothing about it was parsed:
+ * treating its bytes as a label would be the very fabrication being refused.
  */
 type ScanOutcome =
   | { kind: 'entry'; entry: AuxLabel }
-  | { kind: 'dropped'; label: string; reason: 'fieldTooLong' | 'groupTooLong' | 'keyTooLong' };
+  | { kind: 'dropped'; label: string; reason: 'fieldTooLong' | 'groupTooLong' | 'keyTooLong' }
+  | { kind: 'refused' };
 
 /**
  * The shared scan behind both `parseAuxLabels` and `readAuxFloats`: walks `aux` for `\newlabel`
@@ -253,10 +369,11 @@ type ScanOutcome =
  *     either, it only skips text this call already read. This closes the fabrication risk for any
  *     `\newlabel`-shaped substring located anywhere within that scanned span, not merely near its
  *     start — before this, not advancing at all left the WHOLE remaining group vulnerable
- *     regardless of where inside it a fake marker sat. A fake beyond `GROUP_SKIP_SCAN` characters
- *     into the group is a residual this cannot close (its position is never scanned at all), but
- *     that is now the full extent of the risk: a `\newlabel`-shaped string appearing more than
- *     `GROUP_SKIP_SCAN` (16384) characters into a single still-unclosed group.
+ *     regardless of where inside it a fake marker sat. Advancing says nothing about the text
+ *     BEYOND the budget, though, which is why the same branch also opens an `OpenSpan`: the group
+ *     is still open there, and the walk is carried forward marker by marker rather than the group
+ *     being declared over (issue #80 §3 — this used to be the residual, and a `\newlabel`-shaped
+ *     string more than `GROUP_SKIP_SCAN` characters into the group came back as a real label).
  *   - `'exhausted'` with `reason: 'truncated'`, or plain `'unbalanced'`: the retry (or the primary
  *     attempt) ran off the TRUE end of `aux` without ever finding a closing brace — there is
  *     provably nothing left to find no matter how far we looked, so `searchFrom` is left wherever
@@ -265,13 +382,30 @@ type ScanOutcome =
  *     genuinely unbalanced group may still hold an entirely separate, legitimate `\newlabel` of
  *     its own, and an existing test depends on it not being skipped over.
  *
- * Every `readGroupOrSkip` call is itself O(1)-bounded regardless of outcome, so none of this
- * touches the linearity guarantee — it only decides, per outcome, exactly how far it is SAFE to
- * jump, never whether to.
+ * While an `OpenSpan` is outstanding, every marker is first resolved AGAINST it: the brace walk
+ * is continued from where it stopped to the marker's own index, which either finds the group's
+ * close first (the span is over, the marker is ordinary text after it, and it is parsed
+ * normally) or does not (the marker is inside the group, and is `'refused'` — never reported,
+ * always counted). The asymmetry with `'truncated'`/`'unbalanced'` is deliberate, not an
+ * oversight: there the scan reached the TRUE end of the file and proved no closing brace exists
+ * anywhere, so there is no cheap check left to make and the long-standing recall contract above
+ * stands. Here the file continues and the check costs only the characters between two markers,
+ * so the fabrication is refusable — and a marker is refused even though the walk may later turn
+ * out never to close at all, because the `.aux` is document-controlled and a fabricated label
+ * becomes a page `render_pages` renders with confidence, whereas a refused one is a counted gap.
+ *
+ * Every `readGroupOrSkip` call is itself O(1)-bounded regardless of outcome, and the open-span
+ * walk reads each character of `aux` at most once across all of its continuations (`next` never
+ * moves backwards), so total work stays `O(aux.length) + PARSE_BOUND * (MAX_GROUP_SCAN +
+ * GROUP_SKIP_SCAN)` — the same linear bound as before, a pass over `aux` being what `indexOf`
+ * already costs. Per marker the span check is amortized O(1) rather than worst-case O(1): a
+ * marker far from the previous one pays for the gap, and the markers that gap contains do not
+ * exist to pay for it.
  */
 function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
   let searchFrom = 0;
   let scans = 0;
+  let openSpan: OpenSpan | null = null;
   while (scans < PARSE_BOUND) {
     const markerIdx = aux.indexOf(NEWLABEL_MARKER, searchFrom);
     if (markerIdx === -1) {
@@ -282,6 +416,23 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     // wedge the scan in place.
     searchFrom = markerIdx + NEWLABEL_MARKER.length;
 
+    if (openSpan) {
+      // Carry the abandoned group's own brace walk forward to this marker — never past it, so
+      // the cost is the gap between two markers and each character is walked at most once.
+      const walk = scanBalance(aux, openSpan.next, markerIdx, openSpan.depth);
+      if (walk.kind === 'closed') {
+        // The group ended before this marker, so the marker is ordinary text that follows it:
+        // the span is over and the marker gets the normal treatment below.
+        openSpan = null;
+      } else {
+        // Still inside the group. This is `\newlabel`-shaped text sitting in another entry's
+        // argument, not an entry — refuse it rather than fabricate a label (and a page) from it.
+        openSpan = { depth: walk.depth, next: walk.next };
+        yield { kind: 'refused' };
+        continue;
+      }
+    }
+
     let i = skipWs(aux, searchFrom);
     const keyGroup = readGroupOrSkip(aux, i);
     if (keyGroup.kind === 'unbalanced') {
@@ -290,8 +441,11 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     if (keyGroup.kind === 'exhausted') {
       if (keyGroup.reason === 'tooLong') {
         // Not a guess — scannedTo is exactly how far this call already read; see this function's
-        // own doc for why that makes advancing here safe rather than a risk.
+        // own doc for why that makes advancing here safe rather than a risk. The group is still
+        // open there and the file continues, so keep walking it rather than treating whatever
+        // follows the budget as text outside it.
         searchFrom = keyGroup.scannedTo;
+        openSpan = { depth: keyGroup.depth, next: keyGroup.next };
       }
       // reason 'truncated': genuinely ran off the true end of the file — nothing more to find, so
       // leave searchFrom where it is, same contract as the plain 'unbalanced' case below.
@@ -314,6 +468,7 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     if (outerGroup.kind === 'exhausted') {
       if (outerGroup.reason === 'tooLong') {
         searchFrom = outerGroup.scannedTo;
+        openSpan = { depth: outerGroup.depth, next: outerGroup.next };
       }
       // reason 'truncated': stays at keyGroup.end, same reasoning as the key's own case above.
       //
@@ -448,6 +603,15 @@ export interface AuxFloatsResult {
    *  are, from a caller's point of view, the same fact: "there was a real `\newlabel` marker here
    *  we could not give you a usable entry for." */
   dropped: number;
+  /** `\newlabel`-shaped strings found INSIDE a group whose closing brace neither scan budget
+   *  could locate (see `OpenSpan`), refused rather than reported. Deliberately its own count and
+   *  never folded into `dropped`: `dropped` means "a real entry you are not getting", while this
+   *  means the opposite — text inside another entry's argument that we declined to believe was
+   *  an entry at all. Reporting a refused fabrication as a dropped entry would name a cause that
+   *  did not fire. Almost always 0; a non-zero value means the `.aux` is malformed or hostile,
+   *  not that the index is incomplete. Optional only so that object literals of this type
+   *  written elsewhere keep compiling — `readAuxFloats` always sets it. */
+  refused?: number;
   /** Present only when no `.aux` was found in the build directory. */
   note?: string;
 }
@@ -455,9 +619,9 @@ export interface AuxFloatsResult {
 /**
  * Read and parse the build-dir `.aux` for a project/root file, for `pdf_geometry`'s "floats" kind.
  * Never throws for a missing `.aux` (nothing compiled yet, or a backend that doesn't write one) —
- * that comes back as `{ floats: [], omitted: 0, total: 0, dropped: 0, note }`. Any other read
- * failure (e.g. unreadable permissions) propagates, since that is a real problem the caller should
- * see, not a normal "not compiled yet" state.
+ * that comes back as `{ floats: [], omitted: 0, total: 0, dropped: 0, refused: 0, note }`. Any
+ * other read failure (e.g. unreadable permissions) propagates, since that is a real problem the
+ * caller should see, not a normal "not compiled yet" state.
  */
 export async function readAuxFloats(
   projectDir: string,
@@ -477,6 +641,7 @@ export async function readAuxFloats(
         omitted: 0,
         total: 0,
         dropped: 0,
+        refused: 0,
         note:
           `No .aux found in the build directory (${toPosix(auxPath)}) — nothing has been ` +
           'compiled with this root file yet, or the compile backend in use did not write one.',
@@ -492,7 +657,14 @@ export async function readAuxFloats(
   const floats: AuxLabel[] = [];
   let total = 0;
   let dropped = 0;
+  let refused = 0;
   for (const outcome of scanAuxEntries(auxContent)) {
+    if (outcome.kind === 'refused') {
+      // No label was parsed, so there is nothing to test for a cleveref shadow — and nothing to
+      // test it against, since the point is that these bytes are not an entry. Counted in full.
+      refused++;
+      continue;
+    }
     if (outcome.kind === 'dropped') {
       if (!isCleverefShadow(outcome.label)) {
         dropped++;
@@ -508,5 +680,5 @@ export async function readAuxFloats(
     }
   }
 
-  return { floats, omitted: total - floats.length, total, dropped };
+  return { floats, omitted: total - floats.length, total, dropped, refused };
 }
