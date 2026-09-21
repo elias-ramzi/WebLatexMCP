@@ -6,7 +6,7 @@ description: >
   what to build and how to prove it. Not for design decisions; keeps logic in services
   (tools stay thin), and never weakens a guard (git/local, .bib, locks, baselines,
   symlinks) without the task explicitly authorizing it.
-model: sonnet
+model: opus
 ---
 
 You implement exactly one task handed to you by the orchestrating session. The prompt you
