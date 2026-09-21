@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { errorResult } from '../lib/errors.js';
-import { buildSkillMessage } from '../prompts/skills.js';
+import { buildSkillMessage, judgeProject } from '../prompts/skills.js';
+import type { SkillPromptOptions } from '../prompts/skills.js';
 import type { Skill } from '../lib/skills.js';
 
 const inputSchema = {
@@ -45,7 +46,11 @@ const outputSchema = {
  * without the user knowing to ask. `.claude/skills` itself is read only by Claude Code, and only
  * for the *user's* project, never for a server's bundled directory.
  */
-export function registerListSkills(server: McpServer, skills: Skill[]): void {
+export function registerListSkills(
+  server: McpServer,
+  skills: Skill[],
+  { isRegisteredProject }: SkillPromptOptions = {},
+): void {
   server.registerTool(
     'list_skills',
     {
@@ -86,8 +91,17 @@ export function registerListSkills(server: McpServer, skills: Skill[]): void {
         }
 
         // Same framing the prompt uses, so a skill reads as an instruction to follow now rather
-        // than as reference material that happens to describe a procedure.
-        const instructions = buildSkillMessage(found, project);
+        // than as reference material that happens to describe a procedure — and the same
+        // registered-project verdict, so an id naming nothing is reported rather than asserted.
+        // The positional mis-binding that motivated the prompt-side fix cannot happen here (a
+        // tool receives named arguments), but a caller can still pass an id that does not
+        // resolve, and `Apply it to the project X` would be just as wrong a claim.
+        const id = project?.trim();
+        const instructions = buildSkillMessage(
+          found,
+          project,
+          id ? judgeProject(id, isRegisteredProject) : 'known',
+        );
         return {
           content: [{ type: 'text', text: instructions }],
           structuredContent: { skills: catalogue, instructions },

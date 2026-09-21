@@ -102,7 +102,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   read and edit in place, not litter in place.
 - **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/revert/project_sync/add_citation)
   must run inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't —
-  with two deliberate exceptions, `render_pages` and `pdf_geometry`, which read the **temp build dir**
+  with three deliberate exceptions, `render_pages`, `pdf_geometry` and `extract_text`, which read
+  the **temp build dir**
   a peer session's `compile` can rewrite underneath them. That is the whole test for the exception:
   a read-only tool locks only when what it reads is a build artifact another session rewrites in
   place, never merely because it reads. The cost is real and belongs in the tool's description —

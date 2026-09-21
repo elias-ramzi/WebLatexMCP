@@ -1450,6 +1450,23 @@ kinds: ["text"]` already carries each merged line's string — and what was miss
 
 ### Fixed
 
+- **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
+  read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
+  `list_skills` renders the same instruction text as the skill prompts but was still calling
+  `buildSkillMessage` without a verdict, so a `project` naming nothing came back as
+  `Apply it to the project \`ghost\``. The positional mis-binding behind finding 6 cannot happen
+on this route — a tool receives named arguments, not a positionally-bound first word — but the
+claim is just as false, so it now takes the same `isRegisteredProject`lookup the prompts do.
+And with`extract_text`joining them,`render_pages`and`pdf_geometry`are no longer "the two
+deliberate exceptions" that take the per-project lock while reading the temp build dir: CLAUDE.md
+and the comment in`search_files`said two, and`doctor`'s missing-canvas hint named only
+`render_pages`— it now names every tool the missing backend disables, and says that`pdf_geometry`'s `floats`index still works because it reads the`.aux`rather than the PDF. A
+test asserts the hint names each of them, so the next tool to join the set cannot go unlisted the
+way these two did. The same hint also said pdf.js "cannot even open a PDF" without the backend;
+measured, it cannot be **imported** —`pdf.mjs`evaluates`new DOMMatrix()`at module scope and
+reaches for`@napi-rs/canvas` to install that global, so the failure is one step earlier than
+  described.
+
 - **`pdf_geometry`'s `floats` index no longer fabricates a label out of `\newlabel`-shaped text
   buried deep inside an unclosed group** (#80 §3). The `.aux` is document-controlled, so one
   entry must not be able to cost unbounded work: `MAX_GROUP_SCAN` (4096) caps a group read and

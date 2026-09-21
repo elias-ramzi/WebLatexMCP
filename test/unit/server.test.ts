@@ -800,3 +800,42 @@ describe('createServer wires the registered-project lookup into the skill prompt
     await client.close();
   });
 });
+
+describe('list_skills reports an unregistered project rather than asserting it', () => {
+  const skills: Skill[] = [
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+  ];
+
+  // `list_skills` renders the same instruction text as the prompt path, so it needs the same
+  // verdict. The positional mis-binding behind #105 finding 6 cannot happen here — a tool gets
+  // named arguments — but a caller can still name a project that does not exist, and
+  // "Apply it to the project `X`" is just as false a claim on this route as on the other one.
+  async function callWithProjects(known: string[], project: string): Promise<string> {
+    const ctx = { projectManager: { knownIds: () => known } } as unknown as AppContext;
+    const server = createServer(ctx, undefined, undefined, skills);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const res = await client.callTool({
+      name: 'list_skills',
+      arguments: { skill: 'verify-citations', project },
+    });
+    await client.close();
+    return (res.structuredContent as { instructions: string }).instructions;
+  }
+
+  it('asserts a registered project and refuses to assert an unregistered one', async () => {
+    expect(await callWithProjects(['pictura'], 'pictura')).toContain(
+      'Apply it to the project `pictura`',
+    );
+
+    const unknown = await callWithProjects(['pictura'], 'ghost');
+    expect(unknown).not.toContain('Apply it to the project `ghost`');
+    expect(unknown).toContain('No project named `ghost` is registered');
+  });
+});

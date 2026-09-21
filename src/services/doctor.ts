@@ -387,12 +387,17 @@ export class DoctorService {
       checks.push({
         name: 'pdf-render',
         status: 'warn',
-        detail: 'no native canvas backend — no render_pages, and no pageCount from compile',
+        detail:
+          'no native canvas backend — no render_pages or extract_text, pdf_geometry limited to ' +
+          'floats, and no pageCount from compile',
       });
       hints.push(
         'No native canvas backend is installed, so render_pages cannot rasterize pages to PNG, ' +
-          'and compile cannot report a pageCount — pdf.js needs this backend for the DOM geometry ' +
-          'globals it uses in Node, so it cannot even open a PDF without it. Install it with ' +
+          'pdf_geometry cannot measure one (its `floats` index still works — that reads the .aux, ' +
+          'not the PDF), extract_text cannot read one, and compile cannot ' +
+          'report a pageCount — pdf.js reaches for this backend to install the DOM geometry ' +
+          'globals it evaluates at import time, so without it the module cannot even be loaded. ' +
+          'Install it with ' +
           "`npm i @napi-rs/canvas` in the server's directory. Nothing else is affected: compiling, " +
           'the viewer, editing and the whole git side work without it.',
       );
