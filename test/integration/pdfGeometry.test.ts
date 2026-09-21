@@ -11,6 +11,7 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import { toPosix } from '../../src/lib/paths.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
 import { GROUP_SKIP_SCAN } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 import type { AppContext } from '../../src/context.js';
@@ -36,12 +37,17 @@ interface Harness {
   userDir: string;
   /** Exposed so a test can swap `ctx.pdfRenderer` for a stub. The point of doing that is narrow:
    *  what the walk measures is already pinned by test/unit/pdfRender.test.ts against hand-built
-   *  operator lists, and what is NOT covered there is the boundary — whether the tool's zod
-   *  outputSchema actually carries those measurements out. A field the service computes and the
-   *  schema does not declare is stripped silently, which is how `annotationImagesSkipped` and
-   *  `unreliableCtm` were computed and then thrown away. A stub is the right instrument for that
-   *  question: it makes the service's output the test's own input, so a failure can only be the
-   *  schema. */
+   *  operator lists, and what is NOT covered there is the boundary — whether the tool carries
+   *  those measurements out and declares them. A stub is the right instrument for the first half:
+   *  it makes the service's output the test's own input, so a failure can only be the tool.
+   *
+   *  It says nothing about the second half. A field the service computes and the schema does not
+   *  declare is NOT stripped and NOT rejected (#130): the SDK validates `structuredContent` and
+   *  then forwards the handler's own object, so an undeclared key reaches the caller verbatim
+   *  while `tools/list` — the only place a caller can learn the field exists — never mentions it.
+   *  That was the defect in `annotationImagesSkipped` and `unreliableCtm`: computed, transmitted,
+   *  undeclared. So the schema half is asserted off a real `listTools()` round trip
+   *  (test/helpers/outputSchema.ts), never off `structuredContent`. */
   ctx: AppContext;
 }
 
@@ -217,10 +223,16 @@ describe('pdf_geometry', () => {
 
   it('reports floatsDropped through the tool for an .aux entry whose field ran past the cap', async () => {
     // The lib half (readAuxFloats/AuxFloatsResult.dropped) is covered by
-    // test/unit/auxFloats.test.ts; this exercises the tool's own outputSchema wiring
-    // (structuredContent is validated by the MCP SDK AFTER the handler returns, so a
-    // schema/field mismatch here would not be caught by the handler's try/catch — it would
-    // surface as an opaque "Output validation error" instead of a normal assertion failure).
+    // test/unit/auxFloats.test.ts; this is the tool's own boundary — that the count reaches the
+    // caller AND is advertised.
+    //
+    // Those are two different assertions and only one of them is about `structuredContent`. The
+    // MCP SDK validates the result against the outputSchema after the handler returns and then
+    // discards the parsed value (#130), so the direction that a `structuredContent` assertion
+    // catches is a REQUIRED field going missing — the parse fails and `callTool` surfaces an
+    // opaque "Output validation error". The other direction is invisible to it: a key the schema
+    // does not declare is neither stripped nor rejected, it is forwarded as-is. So the declaration
+    // is asserted off `listTools()` below.
     const { client, userDir } = await setup();
     await stagePdf(userDir, 1);
     // One good \newlabel, and one whose page field runs past the per-field length cap
@@ -240,13 +252,17 @@ describe('pdf_geometry', () => {
     const out = structuredOf(res);
     expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
     expect(out.floatsDropped).toBe(1);
+    // Declared, not merely emitted: a caller decides whether to look for a dropped count by
+    // reading the published schema, and an undeclared key is one nothing is ever told about.
+    await expectDeclaredField(client, 'pdf_geometry', 'floatsDropped');
   });
 
   it('reports floatsRefused through the tool, apart from floatsDropped and never folded into it', async () => {
     // The lib half is covered by test/unit/auxFloats.test.ts ("#80 §3: counts a refused marker
-    // apart from a dropped entry"); this is the tool boundary, which until now computed the
-    // count and dropped it on the floor — a field the outputSchema does not declare is stripped
-    // silently by the MCP SDK, so only a round trip through a real client can catch that.
+    // apart from a dropped entry"); this is the tool boundary, which until now computed the count
+    // and dropped it on the floor. The undeclared-field half needs its own assertion: the MCP SDK
+    // neither strips nor rejects a key the outputSchema omits (#130), so only the schema from a
+    // real `listTools()` round trip can say whether the field is in the contract.
     const { client, userDir } = await setup();
     // The same hostile .aux as the lib test: fig:real's group never closes within the scan
     // budget, so the \newlabel-shaped text buried inside it is REFUSED (not an entry), while
@@ -276,14 +292,11 @@ describe('pdf_geometry', () => {
 
     // The field also has to be DECLARED, not merely present in the payload: the MCP SDK passes
     // an undeclared key through, so a caller (a model reading the schema) would never learn the
-    // count exists. Asserted off the advertised outputSchema rather than off the result.
-    const advertised = (await client.listTools()).tools.find((t) => t.name === 'pdf_geometry');
-    const props = (
-      advertised?.outputSchema as { properties?: Record<string, { description?: string }> }
-    )?.properties;
-    expect(props?.floatsRefused).toBeDefined();
-    // And declared as the thing it is: not a second floatsDropped.
-    expect(props?.floatsRefused?.description ?? '').toMatch(/NOT a second floatsDropped/);
+    // count exists. Asserted off the advertised outputSchema rather than off the result — and
+    // declared as the thing it is, not as a second floatsDropped.
+    await expectDeclaredField(client, 'pdf_geometry', 'floatsRefused', {
+      description: /NOT a second floatsDropped/,
+    });
   });
 
   it('kinds: ["floats"] alone never opens the compiled PDF (FIX8)', async () => {
@@ -572,40 +585,26 @@ describe('the response boundary carries what the walk measured', () => {
 
   it('declares both fields in the outputSchema it publishes to clients', async () => {
     const { client } = await setup();
-    const tools = await client.listTools();
-    const tool = tools.tools.find((x) => x.name === 'pdf_geometry');
-    expect(tool).toBeDefined();
-
-    // Walk the published JSON Schema rather than the zod object: this is the document a client
-    // actually receives, and the conversion is the SDK's, not ours.
-    const schema = tool!.outputSchema as unknown as {
-      properties: {
-        pages: { items: { properties: Record<string, unknown>; required?: string[] } };
-      };
-    };
-    const pageShape = schema.properties.pages.items;
+    // Walked off the published JSON Schema rather than the zod object: this is the document a
+    // client actually receives, and the conversion is the SDK's, not ours.
+    //
     // Required, not merely present: absent must never be a caller's only clue that a page had
     // nothing skipped, because absent is also what a server that never counted would send.
-    expect(pageShape.properties).toHaveProperty('annotationImagesSkipped');
-    expect(pageShape.required).toContain('annotationImagesSkipped');
-
-    const boxShape = (
-      pageShape.properties.images as { items: { properties: Record<string, unknown> } }
-    ).items;
+    await expectDeclaredField(client, 'pdf_geometry', 'pages[].annotationImagesSkipped', {
+      required: true,
+    });
     // Optional, and correctly so: the flag is an exception, and a box without it is the norm.
-    expect(boxShape.properties).toHaveProperty('unreliableCtm');
+    await expectDeclaredField(client, 'pdf_geometry', 'pages[].images[].unreliableCtm', {
+      required: false,
+    });
     // It appears on the text boxes too, because both arrays share geometryBoxShape — but that is
     // a fact about the shape, NOT a guarantee about text boxes: the text path has no CTM latch
     // and never sets the flag. Assert the consequence and pin the description that says so, or
     // the shared shape silently advertises a safety property nothing provides ("no unreliableCtm,
     // therefore safe to collide") over a whole kind of box.
-    const textShape = (
-      pageShape.properties.text as {
-        items: { properties: Record<string, { description?: string }> };
-      }
-    ).items;
-    expect(textShape.properties).toHaveProperty('unreliableCtm');
-    expect(textShape.properties.unreliableCtm!.description).toContain('IMAGE OR FORM box only');
+    await expectDeclaredField(client, 'pdf_geometry', 'pages[].text[].unreliableCtm', {
+      description: 'IMAGE OR FORM box only',
+    });
   });
 
   it('reports annotationImagesSkipped in structuredContent AND in the text', async () => {
@@ -668,10 +667,16 @@ describe('the response boundary carries what the walk measured', () => {
       arguments: { project: 'poster', kinds: ['images'] },
     });
     const page = structuredOf(res).pages[0]!;
-    // Required in the schema, not optional: a caller must never have to guess whether a missing
-    // field means "none were skipped" or "this server does not report it".
+    // Two halves of the same promise, and `structuredContent` can only show one of them. What the
+    // handler sent: the key is present and zero, not omitted.
     expect(Object.hasOwn(page, 'annotationImagesSkipped')).toBe(true);
     expect(page.annotationImagesSkipped).toBe(0);
+    // What the contract says: required, not optional — a caller must never have to guess whether
+    // a missing field means "none were skipped" or "this server does not report it", and a schema
+    // marking it optional licenses exactly that guess however faithfully this handler behaves.
+    await expectDeclaredField(client, 'pdf_geometry', 'pages[].annotationImagesSkipped', {
+      required: true,
+    });
     // And a zero stays out of the text, which reports exceptions, not every counter at rest.
     expect(textOf(res)).not.toContain('not measured');
   });

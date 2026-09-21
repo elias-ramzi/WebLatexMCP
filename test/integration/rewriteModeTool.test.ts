@@ -10,6 +10,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
 import { DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
 
 const DOC = ['\\documentclass{article}', '\\begin{document}', 'Hello', '\\end{document}', ''].join(
   '\n',
@@ -294,6 +295,20 @@ describe('set_rewrite_mode concurrency', () => {
       await client.callTool({ name: 'set_rewrite_mode', arguments: { project: 'draft' } }),
     );
     expect(finalReport.mode).toBe(chain[chain.length - 1]);
+
+    // The guarantee this test protects is one the SCHEMA makes, so pin it where a caller reads
+    // it. `previous` reaching `structuredContent` is not evidence that `tools/list` declares it:
+    // the MCP SDK forwards the handler's own object and never strips an undeclared key (#130),
+    // so a `previous` dropped from the outputSchema would leave every assertion above green
+    // while no client is told the field — or the promise attached to it — exists at all.
+    //
+    // Required, not optional: a caller reading `previous` as "absent means unchanged" would read
+    // a no-op transition into every report-only call, which is the one case the description says
+    // returns the current mode.
+    await expectDeclaredField(client, 'set_rewrite_mode', 'previous', {
+      required: true,
+      description: /same lock as the write/,
+    });
   });
 });
 

@@ -15,6 +15,7 @@ import {
   CONFLICT_MAX_FILES,
   CONFLICT_MAX_COMMITS,
 } from '../../src/lib/conflictBudget.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -22,10 +23,19 @@ import type { ServerConfig } from '../../src/types.js';
  * `planConflictPayload`/`renderConflictText`/`buildConflictFilePayload` called directly the way
  * `safePush.test.ts` does) — the seam finding 8 asked for. This is the only test that exercises
  * `safePushToolResult`, the `conflictDetail: 'auto'` default actually applying when the caller
- * passes nothing, `conflictTruncated`, and — implicitly — that `structuredContent` validates
- * against the tool's declared `outputSchema` (the MCP SDK validates every non-error tool result
- * against it server-side before it reaches the client; a schema-shape bug here would surface as a
- * thrown error from `callTool`, not as a passing test).
+ * passes nothing, and `conflictTruncated`.
+ *
+ * It also reaches the tool's declared `outputSchema`, but only halfway on its own, and the halves
+ * are worth keeping apart (#130). The MCP SDK validates every non-error tool result against the
+ * schema server-side before it reaches the client, so a **required field going missing** here
+ * surfaces as a thrown error from `callTool` rather than as a passing test — that much a
+ * `structuredContent` assertion does get for free. The other direction it does not get at all:
+ * the SDK discards the parsed value and forwards the handler's own object, and a zod object
+ * strips rather than rejects, so a key the schema never declared is transmitted verbatim and
+ * nothing fails. `push` builds its conflict payload by assigning onto a plain object
+ * (`structured.conflictTruncated = …`), which is exactly the shape that slips through, so the
+ * budget's own reporting fields are asserted off a `listTools()` round trip below
+ * (test/helpers/outputSchema.ts).
  */
 
 const REL = 'main.tex';
@@ -158,6 +168,13 @@ describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
     expect(entry!.elided?.ours?.chars).toBeGreaterThan(CONFLICT_SIDE_CAP);
     expect(entry!.elided?.theirs?.chars).toBeGreaterThan(CONFLICT_SIDE_CAP);
     expect(entry!.elided?.base?.ref).toContain('read_file');
+
+    // Both fields are what tells a caller the payload was cut — so both have to be in the
+    // published contract, not merely in this response. Optional on purpose: absent is the
+    // ordinary case (nothing was cut), and `conflictTruncated` is documented as absent unless
+    // the result is a conflict at all.
+    await expectDeclaredField(client, 'push', 'conflictTruncated', { required: false });
+    await expectDeclaredField(client, 'push', 'conflictFiles[].elided', { required: false });
 
     // The text channel agrees — it's what a client without structuredContent support sees.
     const text = (res.content as Array<{ type: string; text?: string }>)
@@ -338,6 +355,14 @@ describe('push tool end-to-end: conflict payload budget (finding 8)', () => {
       expect(structured.remoteCommits).toHaveLength(CONFLICT_MAX_COMMITS);
       expect(structured.remoteCommitsOmitted).toBe(TOTAL_REMOTE_COMMITS - CONFLICT_MAX_COMMITS);
       expect(structured.conflictPaths).toEqual([REL]);
+
+      // Declared, not just emitted: a count of what was cut is useless to a caller who is never
+      // told to look for it, and an undeclared key reaches the client without `tools/list` ever
+      // mentioning it.
+      await expectDeclaredField(client, 'push', 'remoteCommitsOmitted', { required: false });
+      await expectDeclaredField(client, 'push', 'remoteCommits[].filesOmitted', {
+        required: false,
+      });
 
       // Pre-fix (remoteCommits sent verbatim, uncapped), this exact scenario's structuredContent
       // measured 4100 characters; post-fix it must be smaller — proof the cap actually shrank the

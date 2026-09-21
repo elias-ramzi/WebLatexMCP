@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
+import { expectUndeclaredField } from '../helpers/outputSchema.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe, 0xfd]);
@@ -217,6 +218,15 @@ describe('add_asset result shape', () => {
 
     const sc = structured(res);
     expect(sc).not.toHaveProperty('diff');
+    // And the PUBLISHED contract must not promise one either. This assertion is not a duplicate
+    // of the line above: the MCP SDK never rejects a declared-but-unsent optional field (it
+    // validates `structuredContent` and discards the parsed value — #130), so "this call sent no
+    // diff" says nothing about whether `tools/list` advertises one. It has to say nothing,
+    // because the reason there is no diff is a security property: `add_asset` reads a file from
+    // outside every project sandbox, and echoing its contents back is the arbitrary-file-read
+    // primitive the extension allowlist exists to close. A schema promising a diff invites a
+    // caller to ask why it is missing, and invites the next implementer to supply it.
+    await expectUndeclaredField(client, 'add_asset', 'diff');
     expect(sc.source).toBe(srcFile);
     expect(sc.bytesWritten).toBe(PNG.length);
     expect(typeof sc.sha256).toBe('string');
