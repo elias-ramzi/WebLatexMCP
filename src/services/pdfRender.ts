@@ -20,6 +20,18 @@ export const MAX_GEOMETRY_PAGES = 4;
 export const MAX_TEXT_LINES_PER_PAGE = 300;
 export const MAX_IMAGE_RECTS_PER_PAGE = 100;
 
+/** Pages per extract_text call. Matches MAX_GEOMETRY_PAGES rather than MAX_PAGES_PER_CALL for the
+ *  same reason: a page of text is a lot of output where a page of PNG is one image. */
+export const MAX_TEXT_PAGES = 4;
+/**
+ * The character budget for one page's extracted text, counted over the line strings themselves.
+ * A page of a dense two-column paper is roughly 5000 characters, so this leaves headroom for a
+ * poster or a wide table while still bounding what a document-controlled text layer can spend:
+ * a PDF can carry arbitrarily much invisible text (an OCR layer, a `\phantom` block), and the
+ * line cap alone bounds the number of strings, never their length.
+ */
+export const MAX_TEXT_CHARS_PER_PAGE = 20_000;
+
 /** A crop, as fractions of the page box, origin top-left, both ends in [0,1]. */
 export interface ClipFractions {
   x0: number;
@@ -143,6 +155,34 @@ export interface GeometryResult {
   skippedPages: number[];
 }
 
+export interface TextRequest {
+  pdfPath: string;
+  /** 1-based page numbers, in the order given. Defaults to every page, capped at MAX_TEXT_PAGES. */
+  pages?: number[];
+}
+
+export interface TextPage {
+  page: number;
+  /**
+   * The page's text layer, one entry per merged line, in the order the document DRAWS them.
+   * That is reading order for ordinary LaTeX output and is not guaranteed to be — two interleaved
+   * columns, or a figure's labels emitted after the body, come back in the content stream's
+   * order, never re-sorted, since sorting would invent a reading order the PDF does not state.
+   */
+  lines: string[];
+  /** Lines the per-page character budget left out. They are always a SUFFIX of the page, so what
+   *  comes back is a contiguous prefix in drawing order rather than a filtered selection. */
+  linesOmitted: number;
+  /** How many characters those omitted lines held — the size of the gap, not just its length. */
+  charsOmitted: number;
+}
+
+export interface TextResult {
+  pageCount: number;
+  pages: TextPage[];
+  skippedPages: number[];
+}
+
 export interface PdfRenderService {
   pageCount(pdfPath: string): Promise<number>;
   render(req: RenderRequest): Promise<RenderResult>;
@@ -150,6 +190,14 @@ export interface PdfRenderService {
   canRasterize(): Promise<boolean>;
   /** Text-line and image/form-XObject placement geometry for the requested pages, in PDF points. */
   geometry(req: GeometryRequest): Promise<GeometryResult>;
+  /**
+   * The PDF's own `/PageLabels` number tree as `printed label per 0-based page index`, or `null`
+   * when the document carries no such tree — which is the common case for a plain `article` and
+   * is an answer, never an error.
+   */
+  pageLabels(pdfPath: string): Promise<string[] | null>;
+  /** The requested pages' text layer, as merged lines. */
+  text(req: TextRequest): Promise<TextResult>;
 }
 
 /** Throws PdfRenderError unless every edge is finite, within [0,1], and x1>x0, y1>y0. */
@@ -278,11 +326,19 @@ interface CanvasFactoryLike {
  *
  * Two shapes, because the backend is load-bearing in two different places. The obvious one is the
  * `require('@napi-rs/canvas')` inside pdf.js's `NodeCanvasFactory`, which fails with
- * MODULE_NOT_FOUND when a page is rendered. The non-obvious one is that **opening** a document
- * fails too: pdf.js expects DOM geometry globals in Node, and it is `@napi-rs/canvas` that
- * installs them — so with the backend absent, `getDocument` dies on `DOMMatrix is not defined`
- * long before any canvas is asked for. That is why `pageCount` needs the backend as much as
- * `render` does, and why neither may report the failure as a broken PDF.
+ * MODULE_NOT_FOUND when a page is rendered. The non-obvious one is that **importing pdf.js at
+ * all** fails: it evaluates `const SCALE_MATRIX = new DOMMatrix();` at module scope, and
+ * `@napi-rs/canvas` is what installs `DOMMatrix` in Node — so with the backend absent the very
+ * `await import('pdfjs-dist/...')` throws `DOMMatrix is not defined`, long before any document is
+ * opened or any canvas asked for. Measured against the installed pdfjs-dist 6.1.200 by running it
+ * with the backend removed from the module graph, not inferred.
+ *
+ * That is why `pageCount`, `pageLabels` and `text` need the backend exactly as much as `render`
+ * does even though none of them rasterizes anything, and why none of them may report the failure
+ * as a broken PDF. The dependency is incidental rather than intrinsic — given stub `DOMMatrix` /
+ * `Path2D` globals the same build opens documents, reads `/PageLabels` and extracts text with no
+ * canvas anywhere — but shipping a polyfill for someone else's module-scope global is a separate
+ * decision from this file's, so what the code does today is report it accurately.
  */
 export function isNativeCanvasMissing(err: unknown): boolean {
   if (!(err instanceof Error)) {
@@ -312,8 +368,12 @@ function nativeCanvasError(cause: unknown): PdfRenderError {
     'Reading the PDF needs the native canvas backend @napi-rs/canvas, which is not installed on ' +
       'this machine (it is an optional dependency, skipped on unsupported platforms or by ' +
       "--omit=optional). Install it with `npm i @napi-rs/canvas` in the server's directory. " +
-      'This affects render_pages, pdf_geometry, and the pageCount compile reports, and nothing ' +
-      'else — compiling, the viewer, editing and the whole git side work without it.',
+      'This affects render_pages, pdf_geometry, extract_text, and the pageCount compile ' +
+      'reports, and nothing else — compiling, the viewer, editing and the whole git side work ' +
+      'without it. extract_text and /PageLabels reading need it too even though neither ' +
+      'rasterizes anything: pdfjs-dist evaluates `new DOMMatrix()` at module scope, and this ' +
+      'backend is what supplies that global in Node, so the module cannot even be imported ' +
+      'without it.',
     { cause },
   );
 }
@@ -499,6 +559,115 @@ export class PdfRenderer implements PdfRenderService {
       return { pageCount, pages, skippedPages: skipped };
     } finally {
       await destroy();
+    }
+  }
+
+  /**
+   * The PDF's own `/PageLabels` tree, or `null` when it has none.
+   *
+   * `null` is the COMMON answer, not a failure: a plain `article` carries no such tree, and
+   * `labelPages.ts` falls back to using the printed page as the index — which is correct
+   * precisely because nothing renumbered. So nothing here turns a missing tree into an error.
+   *
+   * What IS an error is a document object with no `getPageLabels` at all: that means the pdf.js
+   * this loader produced does not have the API, and reporting that as "no page labels" would
+   * silently downgrade every renumbered document back to the inferred route it is here to
+   * replace. A `getPageLabels()` that throws is not swallowed either, for the same reason.
+   */
+  async pageLabels(pdfPath: string): Promise<string[] | null> {
+    const { doc, destroy } = await this.openDocument(pdfPath);
+    try {
+      if (typeof doc.getPageLabels !== 'function') {
+        throw new PdfRenderError(
+          `Cannot read /PageLabels from ${pdfPath}: this pdf.js build exposes no ` +
+            'getPageLabels(). Nothing was guessed.',
+        );
+      }
+      return await doc.getPageLabels();
+    } finally {
+      await destroy();
+    }
+  }
+
+  /**
+   * The requested pages' text layer, as merged lines.
+   *
+   * Deliberately the SAME walk `geometry`'s "text" kind uses — `getTextContent()` fed through
+   * `mergeTextLines` — with the boxes dropped and the per-line character cap raised: a second
+   * text extractor in this codebase would be a defect, since the two would then disagree about
+   * what one line is. The only differences are budgets, and they are budgets because the two
+   * answer different questions: geometry labels a box (160 characters is plenty to identify one),
+   * while this returns the content itself.
+   */
+  async text(req: TextRequest): Promise<TextResult> {
+    const { doc, destroy } = await this.openDocument(req.pdfPath);
+    try {
+      const pageCount = doc.numPages;
+      const { pages: selected, skipped } = selectPages(req.pages, pageCount, MAX_TEXT_PAGES);
+
+      const pages: TextPage[] = [];
+      for (const pageNum of selected) {
+        try {
+          pages.push(await this.textForPage(doc, pageNum));
+        } catch (err) {
+          // Named rather than silently empty, exactly as `geometry` does: a page that failed
+          // partway reported as "no text" reads as a page with no text on it.
+          throw new PdfRenderError(
+            `Failed to extract text from page ${pageNum}: ${(err as Error).message}`,
+            { cause: err },
+          );
+        }
+      }
+
+      return { pageCount, pages, skippedPages: skipped };
+    } finally {
+      await destroy();
+    }
+  }
+
+  private async textForPage(doc: PdfjsDocument, pageNum: number): Promise<TextPage> {
+    const page = await doc.getPage(pageNum);
+    try {
+      const content = await page.getTextContent();
+      const items: TextItemLike[] = [];
+      for (const raw of content.items) {
+        // Same skip as geometryForPage: a marked-content item carries neither field.
+        if (raw.transform === undefined || typeof raw.str !== 'string') {
+          continue;
+        }
+        items.push({
+          str: raw.str,
+          transform: raw.transform as unknown as Matrix,
+          width: raw.width ?? 0,
+          height: raw.height ?? 0,
+        });
+      }
+      // The per-line cap is the page budget, so `mergeTextLines`' own truncation can only fire on
+      // a single line that already exhausts the page — at which point the budget below reports
+      // every following line as omitted anyway, and the cut is never silent either way.
+      const lines = mergeTextLines(items, { maxTextChars: MAX_TEXT_CHARS_PER_PAGE });
+
+      // Cut a SUFFIX, not a subset: the caller is reading, and a prefix of the page in drawing
+      // order is readable where a budget-packed selection of scattered lines is not. So the
+      // first line that does not fit ends the page, rather than being skipped in favour of a
+      // shorter one behind it.
+      const kept: string[] = [];
+      let chars = 0;
+      let cut = 0;
+      let charsOmitted = 0;
+      for (const line of lines) {
+        if (cut === 0 && chars + line.text.length <= MAX_TEXT_CHARS_PER_PAGE) {
+          kept.push(line.text);
+          chars += line.text.length;
+          continue;
+        }
+        cut += 1;
+        charsOmitted += line.text.length;
+      }
+
+      return { page: pageNum, lines: kept, linesOmitted: cut, charsOmitted };
+    } finally {
+      page.cleanup();
     }
   }
 
@@ -797,6 +966,18 @@ interface PdfjsDocument {
   numPages: number;
   canvasFactory: unknown;
   getPage(pageNumber: number): Promise<PdfjsPage>;
+  /**
+   * The `/PageLabels` number tree, one printed label per page indexed by 0-based page index, or
+   * `null` when the document has none (or pdf.js could not read the tree). Verified against the
+   * installed pdfjs-dist 6.1.200 — `getPageLabels(): Promise<Array<string> | null>` in
+   * `types/src/display/api.d.ts`.
+   *
+   * Optional here, unlike every other member: a test's fake document is cast from a literal, and
+   * a fake built before this method existed must keep failing loudly at the call site rather than
+   * being silently treated as "this PDF has no labels" — see `pageLabels` below, which refuses a
+   * document that does not implement it instead of returning `null`.
+   */
+  getPageLabels?: () => Promise<string[] | null>;
 }
 
 /** A form's own bbox, or a pending transparency-group bbox, before either is bounds-checked. */

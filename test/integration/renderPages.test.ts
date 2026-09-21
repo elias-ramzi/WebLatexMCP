@@ -63,11 +63,15 @@ async function setup(): Promise<Harness> {
   return { client, workspace, userDir };
 }
 
-/** Stage a "compiled" PDF at the path `compile` would have left one, without running latexmk. */
-async function stagePdf(userDir: string, pages: number): Promise<void> {
+/**
+ * Stage a "compiled" PDF at the path `compile` would have left one, without running latexmk.
+ * `pageLabels` writes a `/PageLabels` tree with that printed label per page — the thing a real
+ * `\frontmatter` document (or any `hyperref` document) carries and a plain `article` does not.
+ */
+async function stagePdf(userDir: string, pages: number, pageLabels?: string[]): Promise<void> {
   const pdfPath = buildPdfPath(userDir, 'main.tex');
   await mkdir(path.dirname(pdfPath), { recursive: true });
-  await writeFile(pdfPath, minimalPdf(pages));
+  await writeFile(pdfPath, minimalPdf(pages, 200, 100, { pageLabels }));
 }
 
 /** Stage the `.aux` the last compile would have left, without running latexmk. */
@@ -502,6 +506,82 @@ describe('render_pages', () => {
     });
     expect(res.isError ?? false).toBe(false);
     expect(structuredOf(res).pages.map((p) => p.page)).toEqual([3]);
+  });
+
+  it("renders a roman front-matter label through the PDF's own /PageLabels instead of refusing", async () => {
+    // #112: with the tree in hand there is nothing to infer. The same .aux against a PDF with no
+    // tree is refused two tests above ("refuses a roman printed page…") — that pair is the whole
+    // change, and neither half is redundant.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 6, ['i', 'ii', 'iii', 'iv', '1', '2']);
+    await stageAux(userDir, '\\newlabel{sec:preface}{{1}{iv}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['sec:preface'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+
+    const out = structuredOf(res);
+    expect(out.pages.map((p) => p.page)).toEqual([4]);
+    expect(out.resolvedLabels).toEqual([{ label: 'sec:preface', printedPage: 'iv', page: 4 }]);
+    expect(out.note).toContain('/PageLabels');
+  });
+
+  it('renders the OFFSET page for an arabic label in a renumbered document', async () => {
+    // The silently-wrong-page case issue #112 filed, end to end: a thesis scheme prints "A-3",
+    // which is no evidence the inferred route recognises, so printed page "2" resolved to PDF
+    // page 2 and rendered a plausible wrong page. The tree puts it on page 5.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 6, ['A-1', 'A-2', 'A-3', '1', '2', '3']);
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:appendix}{{1}{A-3}}\n\\newlabel{tab:results}{{1}{2}}\n',
+    );
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect(structuredOf(res).pages.map((p) => p.page)).toEqual([5]);
+    expect(textOf(res)).toContain('tab:results -> page 5');
+  });
+
+  it('refuses a printed page the PDF prints twice rather than rendering the first one', async () => {
+    // A restarted \pagenumbering prints "1" on two pages. Rendering the lower index shows the
+    // front matter for a body-text label — a coin flip presented as an answer.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 4, ['1', '2', '1', '2']);
+    await stageAux(userDir, '\\newlabel{tab:results}{{1}{1}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('PDF pages 1, 3');
+    expect(text).toMatch(/pagenumbering/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('calls a printed page the PDF never prints a stale .aux, not an unknown label', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3, ['1', '2', '3']);
+    await stageAux(userDir, '\\newlabel{tab:results}{{1}{9}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('/PageLabels');
+    expect(text).toMatch(/stale/);
+    // The wrong diagnosis it must not give: the \newlabel is right there in the .aux.
+    expect(text).not.toContain('no \\newlabel');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
   });
 
   it('never writes inside the project directory when resolving labels', async () => {

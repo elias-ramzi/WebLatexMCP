@@ -56,13 +56,18 @@ const inputSchema = {
         '(LaTeX\'s "Label(s) may have changed. Rerun to get cross-references right.") resolves ' +
         'to a STALE page or not at all — compile first, and the result echoes every label -> ' +
         "page it used so you can see what was actually rendered. The .aux records each label's " +
-        'PRINTED page, which is the PDF page index only while the document numbers its pages in ' +
-        'one arabic run: a label printing as "iv", and every label in a document that renumbers ' +
-        '(roman front matter, \\frontmatter), is REFUSED rather than mapped onto a page that ' +
-        'would be wrong. Any label that cannot be resolved refuses the whole call — no page is ' +
-        'ever guessed, and nothing partial is rendered. Cannot be combined with `pages`; two ' +
-        'labels on one page render it once and both are echoed. At most ' +
-        `${MAX_LABELS_PER_CALL} per call.`,
+        "PRINTED page; that is turned into a PDF page index through the PDF's own /PageLabels " +
+        'tree when it has one, so a renumbered document (roman front matter, \\frontmatter, an ' +
+        'appendix scheme) resolves EXACTLY. A printed page that tree prints on no page is ' +
+        'reported as a stale .aux, and one it prints on several pages (a restarted ' +
+        '\\pagenumbering) is refused with both candidates named rather than resolved to the ' +
+        'first. A PDF with no /PageLabels — the usual `article` — falls back to using the ' +
+        'printed page as the index, which is correct exactly because nothing renumbered; there, ' +
+        'a label printing as "iv", and every label in a document any of whose labels print ' +
+        'roman, is REFUSED rather than mapped onto a page that would be wrong. Any label that ' +
+        'cannot be resolved refuses the whole call — no page is ever guessed, and nothing ' +
+        'partial is rendered. Cannot be combined with `pages`; two labels on one page render it ' +
+        `once and both are echoed. At most ${MAX_LABELS_PER_CALL} per call.`,
     ),
   dpi: z
     .number()
@@ -164,9 +169,11 @@ const outputSchema = {
         page: z
           .number()
           .describe(
-            'The 1-based PDF page index actually rendered for it: the printed page read as a ' +
-              'decimal integer. Equal to printedPage for a document with one arabic numbering ' +
-              'run; a document where they could differ is refused rather than reported here.',
+            "The 1-based PDF page index actually rendered for it: the page the PDF's own " +
+              '/PageLabels tree prints `printedPage` on, or — for a PDF with no such tree — the ' +
+              'printed page read as a decimal integer. It differs from printedPage exactly when ' +
+              'the document renumbers and says so in /PageLabels; without that tree a document ' +
+              'where they could differ is refused rather than reported here.',
           ),
       }),
     )
@@ -207,9 +214,12 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
         'clip at high dpi resolves well under a point per pixel. ' +
         'Pass `labels` instead of `pages` when the question is "which page did this float land ' +
         'on?": each \\label is resolved through the build-directory .aux of the LAST COMPILE and ' +
-        'the label -> page mapping comes back in the result. A label that cannot be resolved — ' +
-        'absent from that .aux, or printing on a page that is not a PDF page index (roman front ' +
-        'matter) — refuses the call rather than rendering a guessed page. ' +
+        "the label -> page mapping comes back in the result (through the PDF's own /PageLabels " +
+        'tree when it has one, so a renumbered document resolves exactly). A label that cannot ' +
+        'be resolved — absent from that .aux, printing on a page the PDF does not print, ' +
+        'printing on several pages at once, or printing a number that is not a PDF page index ' +
+        'in a document with no /PageLabels — refuses the call rather than rendering a guessed ' +
+        'page. ' +
         'Fails with a message to run compile first when nothing has been compiled yet.',
       inputSchema,
       outputSchema,
@@ -264,7 +274,14 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
             const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
-            labelPlan = planLabelPages(labels, aux);
+            // The PDF's own /PageLabels tree, which turns "printed page -> page index" from an
+            // inference into a lookup. `null` is the common answer (a plain `article` has no
+            // such tree) and planLabelPages falls back to the printed page as the index, with
+            // its two heuristic refusals live. This opens the document a second time — render
+            // opens it again below — which is one extra open on a labelled call only, and it
+            // happens under the same lock, so both reads see the same build.
+            const pageLabels = await ctx.pdfRenderer.pageLabels(pdfPath);
+            labelPlan = planLabelPages(labels, aux, pageLabels);
             // An assertion, never an inference: one unresolvable label refuses the whole call.
             // Rendering the labels that did resolve would hand back images the caller reads as
             // the answer to every label they asked about.
