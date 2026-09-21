@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile, readFile, chmod, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, writeFile, readFile, chmod, stat } from 'node:fs/promises';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import {
   GitService,
@@ -258,17 +258,24 @@ describe('revert pathspec batching', () => {
       const realGit = which.stdout.trim();
 
       const shimDir = await tmp('ovl-git-shim-');
-      const logFile = path.join(shimDir, 'argv.log');
+      // ONE FILE PER INVOCATION, never a shared append log. The preflight's three probes run
+      // concurrently (`Promise.all`), so several shims are alive at once, and `printf` of an
+      // ~8 KB argv is not one `write()` on every libc — two records interleaved on macOS and
+      // the merged record read as a single 16 KB spawn, failing the budget assertion for a
+      // chunker that had split correctly. A distinct `mktemp` file per shim removes the race
+      // rather than assuming an append is atomic.
+      const logDir = path.join(shimDir, 'argv');
+      await mkdir(logDir, { recursive: true });
       await writeFile(
         path.join(shimDir, 'git'),
-        // Records this invocation's argv (NUL-separated, RS-terminated) and then runs the real
-        // git, so the service under test still talks to real git and real results still hold.
-        `#!/bin/sh\nprintf '%s\\0' "$@" >> "$WLM_ARGV_LOG"\nprintf '\\036' >> "$WLM_ARGV_LOG"\nexec "$WLM_REAL_GIT" "$@"\n`,
+        // Records this invocation's argv (NUL-separated) into its own file and then runs the
+        // real git, so the service under test still talks to real git and real results hold.
+        `#!/bin/sh\nprintf '%s\\0' "$@" > "$(mktemp "$WLM_ARGV_DIR/argv.XXXXXXXX")"\nexec "$WLM_REAL_GIT" "$@"\n`,
       );
       await chmod(path.join(shimDir, 'git'), 0o755);
 
       const prevPath = process.env.PATH;
-      process.env.WLM_ARGV_LOG = logFile;
+      process.env.WLM_ARGV_DIR = logDir;
       process.env.WLM_REAL_GIT = realGit;
       process.env.PATH = `${shimDir}${path.delimiter}${prevPath ?? ''}`;
       let pre;
@@ -276,16 +283,18 @@ describe('revert pathspec batching', () => {
         pre = await new GitService().revertPreflight(dir, [bulk]);
       } finally {
         process.env.PATH = prevPath;
-        delete process.env.WLM_ARGV_LOG;
+        delete process.env.WLM_ARGV_DIR;
         delete process.env.WLM_REAL_GIT;
       }
       expect(pre.touchedPaths).toHaveLength(300);
 
-      const log = await readFile(logFile, 'utf8');
-      const invocations = log
-        .split('\u001e')
-        .filter((rec) => rec.length > 0)
-        .map((rec) => rec.split('\0').filter(Boolean));
+      const invocations = await Promise.all(
+        (await readdir(logDir))
+          .sort()
+          .map(async (name) =>
+            (await readFile(path.join(logDir, name), 'utf8')).split('\0').filter(Boolean),
+          ),
+      );
       expect(invocations.length).toBeGreaterThan(0);
 
       /** The pathspec tail of an invocation: everything after its `--` separator. */
