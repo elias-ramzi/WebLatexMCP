@@ -572,6 +572,40 @@ describe('readAuxFloats', () => {
     expect(result.refused).toBe(1);
   });
 
+  it('#80 §3 RESIDUAL (characterization, not an endorsement): a fake inside a group that closes NOWHERE is still reported', async () => {
+    // What is closed and what is not, measured rather than reasoned about. The sibling test
+    // above covers the sub-case issue #80 §3 actually names — a fake more than GROUP_SKIP_SCAN
+    // characters into a group the file continues past — and it is refused. THIS is the sub-case
+    // that is left: the group closes nowhere at all, so `readGroupOrSkip` answers 'exhausted' +
+    // reason 'truncated' (or plain 'unbalanced'), no OpenSpan is opened, and the next indexOf
+    // picks the fake up as a real entry.
+    //
+    // It is pinned here deliberately, ugly result and all, for two reasons. It is the only
+    // fabrication path left in this file and a report is easy to lose, whereas a test is not.
+    // And closing it is a one-line change (open a span on those branches too, leaving searchFrom
+    // exactly where it is — the walk has already proven the group is open at every position to
+    // end-of-file, so the check costs nothing) which would REVERSE the recall contract the test
+    // 'keeps the truncated outcome distinct' pins, so whoever closes it has to change that test
+    // in the same breath. Failing here is the intended way to find that out.
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const pad = 'x'.repeat(MAX_GROUP_SCAN + 100);
+    await writeFile(auxPath, `\\newlabel{fig:real}{{1}{7}{${pad}\\newlabel{fig:fake}{{9}{999}}`);
+    // The whole file is shorter than the retry's reach, which is what makes the outcome
+    // 'truncated' rather than the 'tooLong' the sibling test exercises.
+    expect(pad.length + 100).toBeLessThan(GROUP_SKIP_SCAN);
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // Reported as an ordinary float, indistinguishable from a real one, with refused at 0 — so
+    // nothing in the payload tells a caller this row was invented by the .aux's own bytes.
+    expect(result.floats).toEqual([{ label: 'fig:fake', number: '9', page: '999' }]);
+    expect(result.total).toBe(1);
+    expect(result.refused).toBe(0);
+    // fig:real itself is still counted, so the loss half of #80 §3 is closed even here.
+    expect(result.dropped).toBe(1);
+  });
+
   it('respects an explicit max override', async () => {
     dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
     const auxPath = buildAuxPath(dir, 'main.tex');

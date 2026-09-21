@@ -386,13 +386,30 @@ type ScanOutcome =
  * is continued from where it stopped to the marker's own index, which either finds the group's
  * close first (the span is over, the marker is ordinary text after it, and it is parsed
  * normally) or does not (the marker is inside the group, and is `'refused'` — never reported,
- * always counted). The asymmetry with `'truncated'`/`'unbalanced'` is deliberate, not an
- * oversight: there the scan reached the TRUE end of the file and proved no closing brace exists
- * anywhere, so there is no cheap check left to make and the long-standing recall contract above
- * stands. Here the file continues and the check costs only the characters between two markers,
- * so the fabrication is refusable — and a marker is refused even though the walk may later turn
- * out never to close at all, because the `.aux` is document-controlled and a fabricated label
- * becomes a page `render_pages` renders with confidence, whereas a refused one is a counted gap.
+ * always counted). Here the file continues and the check costs only the characters between two
+ * markers, so the fabrication is refusable — and a marker is refused even though the walk may
+ * later turn out never to close at all, because the `.aux` is document-controlled and a
+ * fabricated label becomes a page `render_pages` renders with confidence, whereas a refused one
+ * is a counted gap.
+ *
+ * The asymmetry with `'truncated'`/`'unbalanced'` is deliberate, but the reason originally
+ * recorded here — "there is no cheap check left to make" — was wrong, and the correction matters
+ * to whoever re-derives this. On those branches the retry reached the TRUE end of `aux` without
+ * the depth ever touching 0, which (see `scanBalance`: a depth reaching 0 returns `'closed'`)
+ * proves the group is open at EVERY position from `start` to end-of-file. So every later marker
+ * is provably inside it, and establishing that costs nothing at all — the walk has already been
+ * paid for. What keeps those markers reportable is therefore a deliberate RECALL choice, not an
+ * absence of evidence: a corrupt `.aux` whose tail still holds legitimate `\newlabel` records is
+ * judged the likelier case, and `parseAuxLabels`' long-standing contract for a truncated file
+ * (pinned by its own test) turns on it.
+ *
+ * That choice has a measured cost, and it is the one sub-case of issue #80 §3 still open: a
+ * `\newlabel`-shaped string inside a group that closes NOWHERE in the file is still reported as
+ * a real entry (`test/unit/auxFloats.test.ts` pins the exact input, deliberately, as a
+ * characterization of current behaviour rather than an endorsement). Closing it is a one-line
+ * change — open an `OpenSpan` on these branches too, leaving `searchFrom` exactly where it is —
+ * but it reverses the recall contract above and breaks the test that pins it, so it is an
+ * owner's call about precision versus recall on a corrupt file, not a bug fix to slip in.
  *
  * Every `readGroupOrSkip` call is itself O(1)-bounded regardless of outcome, and the open-span
  * walk reads each character of `aux` at most once across all of its continuations (`next` never
