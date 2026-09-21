@@ -6,6 +6,7 @@ import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 import { changeDiff, changedPath } from '../lib/changeDiff.js';
 import {
   createPreserveTransform,
+  matchIsCommented,
   resolveRewriteMode,
   supportsLineComments,
   DEFAULT_REWRITE_MODE,
@@ -55,16 +56,71 @@ const inputSchema = {
     ),
   edits: z
     .array(
-      z.object({
-        oldString: z
-          .string()
-          .describe('Exact text to replace (include enough context to be unique).'),
-        newString: z.string().describe('Replacement text.'),
-        replaceAll: z.boolean().optional().describe('Replace every occurrence (default false).'),
-      }),
+      z.union([
+        z
+          .object({
+            oldString: z
+              .string()
+              .describe('Exact text to replace (include enough context to be unique).'),
+            newString: z.string().describe('Replacement text.'),
+            replaceAll: z
+              .boolean()
+              .optional()
+              .describe('Replace every occurrence (default false).'),
+            excludeComments: z
+              .boolean()
+              .optional()
+              .describe(
+                'Skip matches that sit in a LaTeX comment (default false, so existing callers ' +
+                  'are unaffected). A comment runs from an unescaped % to the end of that line: ' +
+                  '\\% is a literal percent and is NOT a comment, while \\\\% IS one (the \\\\ ' +
+                  'consumes both backslashes). Both a whole commented-out line and the commented ' +
+                  'tail of a live line are excluded, and a match that straddles the boundary ' +
+                  'counts as commented — it is skipped, never half-replaced. With replaceAll, ' +
+                  'only the live occurrences are rewritten; without it, uniqueness is judged over ' +
+                  'the live occurrences alone, so a string with one live and 182 commented ' +
+                  'occurrences is a unique match. Either way the result reports, per edit, how ' +
+                  'many were replaced and how many were skipped (commentMatches), and a request ' +
+                  'whose every match is commented is refused rather than silently doing nothing. ' +
+                  'Only for a file whose comment character is % (.tex/.sty/.cls/.bbl/.latex/.ltx); ' +
+                  'anywhere else the call is refused rather than pretending to filter.',
+              ),
+          })
+          .strict(),
+        z
+          .object({
+            startLine: z
+              .number()
+              .int()
+              .positive()
+              .describe('1-based first line to replace, inclusive — the numbering read_file uses.'),
+            endLine: z
+              .number()
+              .int()
+              .positive()
+              .describe('1-based last line to replace, inclusive.'),
+            newString: z
+              .string()
+              .describe(
+                'Text those lines become. Empty deletes them (or, under a rewrite-preservation ' +
+                  'mode, leaves them %-commented in place).',
+              ),
+          })
+          .strict(),
+      ]),
     )
     .min(1)
-    .describe('Surgical string replacements, applied in order and atomically.'),
+    .describe(
+      'Edits applied in order and atomically. Each is EITHER a string replacement ' +
+        '{oldString, newString} OR a line range {startLine, endLine, newString} — never both in ' +
+        'one object. A line range replaces those lines whatever they say, for a change defined ' +
+        'by where it is rather than what it says (1-based, endLine inclusive, exactly like ' +
+        "read_file; the line terminator after endLine is not part of the range, so the file's " +
+        'last newline survives a whole-file range). Line numbers always refer to the file as it ' +
+        'was BEFORE this call — the content read_file returned — never to the state an earlier ' +
+        'edit in this same array left behind; if two edits in one call would touch the same ' +
+        'text, the whole call is refused rather than applied to shifted lines.',
+    ),
 };
 
 const outputSchema = {
@@ -75,6 +131,19 @@ const outputSchema = {
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
     .describe('The mode that actually applied for this call.'),
   preservedEdits: z.number(),
+  commentMatches: z
+    .array(
+      z.object({
+        edit: z.number().describe('1-based index into `edits`.'),
+        replaced: z.number(),
+        skippedInComments: z.number(),
+      }),
+    )
+    .optional()
+    .describe(
+      'One entry per edit that set excludeComments, so a skipped match is never silent. Absent ' +
+        'when no edit did.',
+    ),
 };
 
 export function registerEditFile(server: McpServer, ctx: AppContext): void {
@@ -83,8 +152,11 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
     {
       title: 'Edit a project file',
       description:
-        'Apply surgical string-replacement edits to a file. Each oldString must match ' +
-        'uniquely unless replaceAll is set. Edits apply atomically — if any fails, the file ' +
+        'Apply surgical edits to a file: string replacements {oldString, newString} and/or line ' +
+        'ranges {startLine, endLine, newString}, in one array. Each oldString must match ' +
+        'uniquely unless replaceAll is set; a line range replaces those lines whatever they say ' +
+        '(1-based and inclusive, the numbering read_file uses), so a block only identified by ' +
+        'where it is need not be shipped twice. Edits apply atomically — if any fails, the file ' +
         'is left untouched. Preferred over write_file for existing files.',
       inputSchema,
       outputSchema,
@@ -127,16 +199,32 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           // extension check below already excludes it — kept so the exemption does not depend
           // on that list.
           const anyBib = isBib || targetIsBib;
-          const eligible =
-            !anyBib &&
-            supportsLineComments(relPath) &&
-            (target === null || supportsLineComments(target));
+          const commentSyntax =
+            supportsLineComments(relPath) && (target === null || supportsLineComments(target));
+          const eligible = !anyBib && commentSyntax;
           const effectiveMode: RewriteMode = eligible ? resolved.mode : 'off';
+
+          // `excludeComments` is an assertion about which matches must be left alone, so a file
+          // with no % comment syntax is refused here rather than filtered against a comment
+          // character it does not have — which would silently rewrite every match the caller
+          // asked to protect. Judged on the link-resolved name too (as the .bib gate is): the
+          // bytes land in the target, so the target's syntax is the one that decides. Same
+          // shape as the .bib guard, and deliberately in the tool layer for the same reason.
+          const commentFiltered = edits.findIndex(
+            (e) => 'excludeComments' in e && e.excludeComments,
+          );
+          if (commentFiltered !== -1 && !commentSyntax) {
+            const named = target !== null && !supportsLineComments(target) ? target : relPath;
+            throw new Error(
+              `Edit ${commentFiltered + 1} sets excludeComments, but ${named} has no %-line-comment syntax, so there are no comments to exclude. Drop excludeComments, or target a .tex-family file.`,
+            );
+          }
 
           const preserve = createPreserveTransform(effectiveMode);
           const res = await ctx.files.applyEdits(dir, relPath, edits, {
             overrideExternalChanges,
             preserve,
+            excludeMatch: matchIsCommented,
           });
           const preservedEdits = preserve.preservedEdits();
           // A write through an in-project link changed the target, so that is the path to diff.
@@ -162,6 +250,14 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
               ? `${targetIsBib && !isBib ? target : res.path} is a .bib file`
               : `${named} has no %-line-comment syntax, so nothing can be preserved there`;
             headline += ` — preserveOriginal was ignored: ${reason}`;
+          }
+          // Skipped matches are reported in the text channel too, not only in structuredContent:
+          // an MCP client that shows only the text would otherwise see "applied 1 edit(s)" for a
+          // rename that deliberately left 182 occurrences alone.
+          for (const m of res.commentMatches ?? []) {
+            headline +=
+              `\nedit ${m.edit}: replaced ${m.replaced} occurrence(s), ` +
+              `skipped ${m.skippedInComments} inside comments`;
           }
           return {
             content: [

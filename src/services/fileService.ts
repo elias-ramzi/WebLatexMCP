@@ -10,7 +10,7 @@ import {
   readlink,
 } from 'node:fs/promises';
 import { resolveInside, samePath, toPosix } from '../lib/paths.js';
-import { splitLines, sliceLineRange } from '../lib/lines.js';
+import { splitLines, sliceLineRange, lineSpan, type Span } from '../lib/lines.js';
 import { FileRevisionTracker } from './fileRevisions.js';
 import { ASSET_EXT, MAX_BINARY_READ_BYTES } from '../lib/assets.js';
 import { changedPath } from '../lib/changeDiff.js';
@@ -54,6 +54,60 @@ export interface EditOp {
   oldString: string;
   newString: string;
   replaceAll?: boolean;
+  /**
+   * Skip matches that sit in a comment. `applyEdits` itself has no idea what a comment is — it
+   * consults `opts.excludeMatch` for every candidate match of an edit carrying this flag, and
+   * **refuses the call outright** when the flag is set and no such filter was supplied, rather
+   * than silently replacing the matches the caller asked to be left alone.
+   */
+  excludeComments?: boolean;
+}
+
+/**
+ * The other shape an edit can take: replace lines `startLine..endLine` outright, whatever they
+ * say. The counterpart to `read_file`'s `startLine`/`endLine`, for a change defined by *where* it
+ * is rather than *what* it says — otherwise the caller has to ship the whole block twice, once as
+ * `oldString` and once as `newString`.
+ *
+ * Numbering matches `read_file` exactly: **1-based, `endLine` inclusive**. The replaced span runs
+ * from the first character of `startLine` to the last character of `endLine`, and **excludes the
+ * line terminator that ends `endLine`** — the range is those lines, not the newline after them
+ * (see `lineSpan`, which also notes the one place this differs from `sliceLineRange`).
+ *
+ * Line numbers are resolved against the file **as it was when the call began** — the content
+ * `read_file` handed the caller — never against the intermediate state left by an earlier edit in
+ * the same `edits` array. See `applyEdits` for how an overlap between the two is refused instead
+ * of applied to shifted text.
+ */
+export interface RangeEditOp {
+  startLine: number;
+  endLine: number;
+  newString: string;
+}
+
+/** Either shape of edit, as `applyEdits` accepts them in one array. */
+export type AnyEditOp = EditOp | RangeEditOp;
+
+/** Narrow an edit to the line-range shape. The two shapes share no required field, and the tool
+ * layer's schema rejects an object carrying both, so the presence of `startLine` decides. */
+export function isRangeEdit(edit: AnyEditOp): edit is RangeEditOp {
+  return 'startLine' in edit;
+}
+
+/** Per-edit accounting for an edit that set `excludeComments`, so a caller is always told when
+ * the server did less than the edit literally asked for. `edit` is 1-based, matching the numbers
+ * in this method's error messages. */
+export interface CommentMatchReport {
+  edit: number;
+  replaced: number;
+  skippedInComments: number;
+}
+
+export interface ApplyEditsResult {
+  path: string;
+  appliedEdits: number;
+  /** One entry per edit that set `excludeComments`, in edit order; absent when no edit did. */
+  commentMatches?: CommentMatchReport[];
 }
 
 /**
@@ -746,17 +800,30 @@ export class FileService {
   }
 
   /**
-   * Apply surgical string-replacement edits. Each oldString must match uniquely unless
-   * replaceAll is set. All edits are applied in memory and only written if every edit
-   * succeeds (atomic) — so a failure leaves the file untouched.
+   * Apply surgical edits. Each is either a string replacement (whose `oldString` must match
+   * uniquely unless `replaceAll` is set) or a line range (`startLine`/`endLine`, 1-based and
+   * inclusive — see `RangeEditOp`). All edits are applied in memory and only written if every
+   * edit succeeds (atomic) — so a failure leaves the file untouched.
    */
   async applyEdits(
     projectDir: string,
     relPath: string,
-    edits: EditOp[],
+    edits: AnyEditOp[],
     opts: {
       overrideExternalChanges?: boolean;
       strictLinks?: boolean;
+      /**
+       * Consulted for every candidate match of an edit that set `excludeComments`: `true` means
+       * "this match is inside a comment — skip it". Same ignorance boundary as `preserve`: this
+       * method sees a predicate over integer offsets and never learns what a comment is
+       * (`src/lib/rewriteMode.ts`'s `matchIsCommented` is what `edit_file` passes). It is
+       * re-asked against the *current* content for every occurrence, not once per edit, because
+       * a replacement can change its own line's comment state.
+       *
+       * An edit setting `excludeComments` with no filter supplied here is a wiring error and is
+       * refused, never silently applied as if the flag were absent.
+       */
+      excludeMatch?: (content: string, start: number, end: number) => boolean;
       /**
        * Optional hook letting a caller rewrite the replacement text for each edit, given the
        * position of the (unique, non-`replaceAll`) match in the file's *current* content. Used by
@@ -776,7 +843,7 @@ export class FileService {
        */
       preserve?: EditTransform;
     } = {},
-  ): Promise<{ path: string; appliedEdits: number }> {
+  ): Promise<ApplyEditsResult> {
     if (edits.length === 0) {
       throw new Error('No edits provided.');
     }
@@ -846,15 +913,127 @@ export class FileService {
       preserved.length = 0;
       preserved.push(...next);
     };
+    /**
+     * Every line range in this call, resolved **up front against the content as the call found
+     * it** — the bytes `read_file` handed the caller — and thereafter kept in `content`'s current
+     * coordinate space by `splice` below, exactly like the preserved-block ledger.
+     *
+     * Resolving up front is what makes a range mean the same thing wherever it sits in the
+     * `edits` array: the caller's line numbers came from a read of the file before this call, so
+     * an earlier edit that adds or removes lines must not silently slide a later range onto
+     * different text. Keeping the resolved spans shifted (rather than re-deriving line numbers
+     * against the mutated content) means a range still covers exactly the original bytes it
+     * named, and an earlier edit that *touches* those bytes is refused outright — see `splice`.
+     */
+    const pendingRanges = new Map<number, Span>();
     edits.forEach((edit, i) => {
+      if (!isRangeEdit(edit)) return;
+      if (edit.endLine < edit.startLine) {
+        throw new Error(
+          `Edit ${i + 1}: startLine ${edit.startLine} is after endLine ${edit.endLine}; the range is 1-based and endLine is inclusive.`,
+        );
+      }
+      const span = lineSpan(content, edit.startLine, edit.endLine);
+      if (span === null) {
+        throw new Error(
+          `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} are outside ${relPath}, which has ${splitLines(content).length} line(s). Line numbers are 1-based and endLine is inclusive.`,
+        );
+      }
+      pendingRanges.set(i, span);
+    });
+    /**
+     * The one place content is ever spliced, so both ledgers move on **every** splice — the
+     * preserved-comment ranges and the not-yet-applied line ranges alike. A `replaceAll` edit
+     * runs no preservation hook but still changes the file's length at every occurrence, and a
+     * ledger that only moved for the edits that went through the hook was exactly the bug that
+     * made preserved ranges go stale; routing every splice through one function is what keeps
+     * that structural rather than remembered.
+     *
+     * It also enforces the no-silent-overlap rule: if this splice would touch bytes some *other*
+     * edit's line range covers, the whole call fails. The alternative — applying it and letting
+     * the range shift — would rewrite lines the caller never named, which is precisely the
+     * silent corruption a range edit invites.
+     */
+    const splice = (editIndex: number, start: number, end: number, replacement: string) => {
+      for (const [j, range] of pendingRanges) {
+        if (j === editIndex) continue;
+        if (start < range.end && end > range.start) {
+          throw new Error(
+            `Edit ${editIndex + 1} changes text that edit ${j + 1}'s line range covers. Line numbers refer to ${relPath} as it was before this call, so two edits in one call may not touch the same text; split them into separate calls (and re-read the file in between, since the line numbers move).`,
+          );
+        }
+      }
+      content = content.slice(0, start) + replacement + content.slice(end);
+      const delta = replacement.length - (end - start);
+      shiftPreserved(start, end, delta);
+      if (delta !== 0) {
+        for (const [j, range] of pendingRanges) {
+          // Only a range entirely *after* the splice moves; one entirely before is unaffected,
+          // and an overlapping one already threw above, so there is no third case.
+          if (j !== editIndex && end <= range.start) {
+            pendingRanges.set(j, { start: range.start + delta, end: range.end + delta });
+          }
+        }
+      }
+    };
+    const commentMatches: CommentMatchReport[] = [];
+    edits.forEach((edit, i) => {
+      if (isRangeEdit(edit)) {
+        // Resolved above and shifted by every splice since, so it still covers exactly the lines
+        // the caller named in the file they read. Drop it from the ledger first: it is about to
+        // be consumed, and `splice` must not refuse this edit for overlapping its own range.
+        const span = pendingRanges.get(i);
+        /* c8 ignore next 3 -- unreachable: every range edit got an entry in the pass above. */
+        if (span === undefined) {
+          throw new Error(`Edit ${i + 1}: internal error — line range was never resolved.`);
+        }
+        pendingRanges.delete(i);
+        const oldString = content.slice(span.start, span.end);
+        if (oldString === edit.newString) {
+          throw new Error(
+            `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} and newString are identical.`,
+          );
+        }
+        // A range edit is line-aligned by construction, is never a `replaceAll`, and has exactly
+        // one position — so it is preserved through the *same* hook as a unique string edit,
+        // with the `oldString` the file actually holds there. Nothing about preservation is
+        // re-decided here; `createPreserveTransform` still owns the whole judgment, and this
+        // synthesized edit reaches it only after the identical-text guard above, so the hook
+        // still never sees a no-op.
+        const synthesized: EditOp = { oldString, newString: edit.newString };
+        const replacement = opts.preserve
+          ? opts.preserve.transform(synthesized, span.start, content)
+          : edit.newString;
+        const commentedLength = opts.preserve ? opts.preserve.lastInsertion() : undefined;
+        splice(i, span.start, span.end, replacement);
+        if (commentedLength !== undefined) {
+          // No intersection check is needed against `preserved` here: an earlier splice that
+          // overlapped this range would have thrown, and one entirely before it inserted its
+          // whole replacement (preserved block included) before this range's shifted start.
+          preserved.push({ start: span.start, end: span.start + commentedLength });
+        }
+        return;
+      }
       if (edit.oldString === edit.newString) {
         throw new Error(`Edit ${i + 1}: oldString and newString are identical.`);
+      }
+      // A filter is only consulted for an edit that asked for it. Asking for it with no filter
+      // wired in is refused rather than quietly downgraded to "replace everything" — the flag
+      // exists to protect text, so ignoring it is the one failure mode that must never be silent.
+      let excludeMatch: ((content: string, start: number, end: number) => boolean) | undefined;
+      if (edit.excludeComments) {
+        if (!opts.excludeMatch) {
+          throw new Error(
+            `Edit ${i + 1}: excludeComments was requested but this call supplied no comment filter.`,
+          );
+        }
+        excludeMatch = opts.excludeMatch;
       }
       const count = countOccurrences(content, edit.oldString);
       if (count === 0) {
         throw new Error(`Edit ${i + 1}: oldString not found in ${relPath}.`);
       }
-      if (count > 1 && !edit.replaceAll) {
+      if (count > 1 && !edit.replaceAll && !excludeMatch) {
         // "set replaceAll" is fine advice for plain ambiguity, but if one of the K occurrences
         // sits inside a block an earlier edit in this same call already preserved (commented
         // out), it is the one piece of advice that would silently rewrite that byte-exact block.
@@ -883,16 +1062,63 @@ export class FileService {
         // (there is no single match position to comment above, and rewriting inside an earlier
         // preserved comment is documented, intended behaviour), but it still changes the file's
         // length at every occurrence, so the ledger must move regardless.
-        let idx = content.indexOf(edit.oldString);
-        while (idx !== -1) {
+        let replaced = 0;
+        let skippedInComments = 0;
+        let from = 0;
+        for (;;) {
+          const idx = content.indexOf(edit.oldString, from);
+          if (idx === -1) break;
           const spliceEnd = idx + edit.oldString.length;
-          content = content.slice(0, idx) + edit.newString + content.slice(spliceEnd);
-          shiftPreserved(idx, spliceEnd, edit.newString.length - edit.oldString.length);
-          idx = content.indexOf(edit.oldString, idx + edit.newString.length);
+          // Asked per occurrence against the *current* content, not from a mask computed once:
+          // an earlier replacement on the same line can introduce (or remove) a comment, and a
+          // stale mask would then decide this occurrence on bytes that are no longer there.
+          if (excludeMatch?.(content, idx, spliceEnd)) {
+            skippedInComments++;
+            from = spliceEnd;
+            continue;
+          }
+          splice(i, idx, spliceEnd, edit.newString);
+          replaced++;
+          from = idx + edit.newString.length;
+        }
+        if (excludeMatch) {
+          if (replaced === 0) {
+            throw new Error(
+              `Edit ${i + 1}: all ${skippedInComments} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
+            );
+          }
+          commentMatches.push({ edit: i + 1, replaced, skippedInComments });
         }
         return;
       }
-      const matchIndex = content.indexOf(edit.oldString);
+      let matchIndex: number;
+      if (excludeMatch) {
+        // Uniqueness is judged over the *live* occurrences only — the whole point of the flag is
+        // that the commented ones are not candidates. Enumerated the same way `countOccurrences`
+        // counts: non-overlapping, left to right.
+        const live: number[] = [];
+        let idx = content.indexOf(edit.oldString);
+        while (idx !== -1) {
+          const end = idx + edit.oldString.length;
+          if (!excludeMatch(content, idx, end)) live.push(idx);
+          idx = content.indexOf(edit.oldString, end);
+        }
+        const inComments = count - live.length;
+        if (live.length === 0) {
+          throw new Error(
+            `Edit ${i + 1}: all ${count} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
+          );
+        }
+        if (live.length > 1) {
+          throw new Error(
+            `Edit ${i + 1}: oldString matches ${live.length} times outside comments in ${relPath} (${inComments} further match(es) are inside comments and were not counted); add more surrounding context for a unique match, or set replaceAll.`,
+          );
+        }
+        matchIndex = live[0] as number;
+        commentMatches.push({ edit: i + 1, replaced: 1, skippedInComments: inComments });
+      } else {
+        matchIndex = content.indexOf(edit.oldString);
+      }
       const matchEnd = matchIndex + edit.oldString.length;
       if (opts.preserve) {
         const intersectsPreserved = preserved.some(
@@ -914,8 +1140,7 @@ export class FileService {
       // caller-supplied newString containing e.g. `$$100$$` and, since preservation generates
       // the replacement text server-side, text the user never typed at all. Splice at the
       // already-computed matchIndex instead so newString lands byte-exact, unconditionally.
-      content = content.slice(0, matchIndex) + newString + content.slice(matchEnd);
-      shiftPreserved(matchIndex, matchEnd, newString.length - edit.oldString.length);
+      splice(i, matchIndex, matchEnd, newString);
       if (commentedLength !== undefined) {
         preserved.push({ start: matchIndex, end: matchIndex + commentedLength });
       }
@@ -928,7 +1153,11 @@ export class FileService {
       original,
       content,
     );
-    return { path: relPath, appliedEdits: edits.length };
+    return {
+      path: relPath,
+      appliedEdits: edits.length,
+      ...(commentMatches.length > 0 ? { commentMatches } : {}),
+    };
   }
 
   /** Delete a file (not a directory) from the project. */
