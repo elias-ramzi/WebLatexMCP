@@ -1044,6 +1044,121 @@ export class GitService {
   }
 
   /**
+   * Which of `paths` (POSIX, project-relative) are a symbolic link on ANY side the caller could
+   * write through: mode `120000` in HEAD's tree, mode `120000` in the index, an actual link on
+   * disk (`lstat`), or an ancestor directory that is a link ({@link linkedAncestor}). Returns the
+   * matches, deduplicated and sorted, POSIX.
+   *
+   * Why all four: an operation that restores file CONTENT at a path writes through whatever that
+   * path currently is. HEAD's mode is what a checkout would put back, the index's is what a
+   * `read-tree`/`commitContents` sees, the on-disk one is what `writeFile` would follow, and a
+   * linked ANCESTOR lands the bytes outside the project even though the final component is an
+   * ordinary name. Same reasoning as {@link hasLinkOnConflictSide}: refuse rather than follow.
+   *
+   * This is the generalisation of the private `linksAmong` that `revert` uses — minus its
+   * commit-lineage refs (a revert has commits to look at; a caller-named path set does not) and
+   * plus the index. `linksAmong` is deliberately NOT refactored to call this: `revert`'s refusal
+   * set is its own, and widening or narrowing it is not this method's business.
+   *
+   * Two deliberate differences from `linksAmong`'s body, both load-bearing:
+   * - **An unstattable path counts as a link — fail closed.** ENOENT means "not a link there" and
+   *   falls through to the tree/index checks, but any other `lstat` failure (EACCES on the parent,
+   *   ELOOP) means the path could NOT be judged, and an unjudged path must not be handed back as
+   *   safe to write through. `linksAmong` swallows every error here; this one does not.
+   * - **An unborn HEAD is skipped, not thrown on.** A freshly-initialised clone has no HEAD tree
+   *   to probe; the index and working-tree checks still apply.
+   *
+   * Every git call carries `--literal-pathspecs` (the GLOBAL option, before the subcommand) so
+   * `a[1].tex` never also means `a1.tex`, `-c core.quotePath=false` so a non-ASCII path comes back
+   * verbatim rather than C-quoted, and `-z` so a path holding a newline does not split a record.
+   */
+  async linkPathsAmong(dir: string, paths: string[]): Promise<string[]> {
+    if (paths.length === 0) return [];
+    const git = simpleGit(dir);
+    const links = new Set<string>();
+
+    // HEAD's tree: `<mode> <type> <sha>\t<path>`. Skipped entirely on an unborn HEAD.
+    if ((await this.revParseOrNull(git, 'HEAD')) !== null) {
+      const out = await git.raw([
+        '-c',
+        'core.quotePath=false',
+        '--literal-pathspecs',
+        'ls-tree',
+        '-z',
+        'HEAD',
+        '--',
+        ...paths,
+      ]);
+      for (const entry of out.split('\0')) {
+        const tab = entry.indexOf('\t');
+        if (tab < 0) continue;
+        if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
+        links.add(toPosix(entry.slice(tab + 1)));
+      }
+    }
+
+    // The index: `<mode> <sha> <stage>\t<path>` — a different record shape from `ls-tree`'s, but
+    // the mode is still the leading field.
+    const staged = await git.raw([
+      '-c',
+      'core.quotePath=false',
+      '--literal-pathspecs',
+      'ls-files',
+      '-s',
+      '-z',
+      '--',
+      ...paths,
+    ]);
+    for (const entry of staged.split('\0')) {
+      const tab = entry.indexOf('\t');
+      if (tab < 0) continue;
+      if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
+      links.add(toPosix(entry.slice(tab + 1)));
+    }
+
+    for (const raw of paths) {
+      const rel = toPosix(raw);
+      if (links.has(rel)) continue;
+      let onDisk: boolean;
+      try {
+        onDisk = (await lstat(path.join(dir, rel))).isSymbolicLink();
+      } catch (err) {
+        // Fail closed: only a verifiably absent path (ENOENT) clears this check.
+        onDisk = (err as NodeJS.ErrnoException).code !== 'ENOENT';
+      }
+      if (onDisk) {
+        links.add(rel);
+        continue;
+      }
+      if ((await linkedAncestor(dir, rel)) !== null) links.add(rel);
+    }
+    return [...links].sort();
+  }
+
+  /**
+   * Per-file added/removed line counts for `paths` against HEAD — `git diff HEAD -- <paths>`, for
+   * the TRACKED paths among them.
+   *
+   * A thin public wrapper over the private {@link numstat}, which already carries
+   * `--literal-pathspecs` and `core.quotePath=false`; the flags are deliberately not repeated
+   * here.
+   *
+   * **Untracked files never appear in `git diff HEAD` at all.** That is expected, not a gap: the
+   * caller (`shelve`) counts an untracked file's lines itself, from the bytes it is taking. Do not
+   * "fix" this by widening the diff — an untracked path has no HEAD side to diff against, and
+   * making one up would report a file as modified that git considers absent.
+   *
+   * Empty `paths` → `[]` with no git call. An unborn HEAD → `[]`: there is no HEAD to diff
+   * against, and every path is untracked by definition.
+   */
+  async statAgainstHead(dir: string, paths: string[]): Promise<DiffFile[]> {
+    if (paths.length === 0) return [];
+    const git = simpleGit(dir);
+    if ((await this.revParseOrNull(git, 'HEAD')) === null) return [];
+    return this.numstat(git, ['HEAD', '--', ...paths.map((p) => toPosix(p))]);
+  }
+
+  /**
    * The blob id `content` would get if committed at `relPath` — `git hash-object --stdin --path`
    * WITHOUT `-w`, so nothing is written. `--path` applies the path's gitattributes clean filter
    * (`* text=auto` turns CRLF into LF), which is exactly the point: two byte strings with the same
@@ -2722,8 +2837,19 @@ function untrackedCollisionNote(untrackedPaths: string[], capped: string[]): str
  * modifications blocking the rebase, and separately reassures that any untracked files present
  * are not why — they ride through a push untouched. Each list is capped (20 modified, 10
  * untracked) so a working tree with hundreds of dirty files doesn't blow up the error text.
+ *
+ * Four exits are offered, in order: `commit` and a `message` to push both PUBLISH the blocking
+ * file, `discard` DESTROYS it, and `shelve` (between them) does neither — it sets the content
+ * aside outside the clone and `unshelve` brings it back. That middle route exists because the
+ * ordinary case ("push section A while section B is mid-sentence") otherwise has no safe way out,
+ * so the refusal the caller actually reads has to name it. Keep the order: `shelve` after the two
+ * publishing routes and before the destructive one.
+ *
+ * Exported solely as a test seam — the same one `untrackedOverwriteFromError` and
+ * `localChangesOverwriteFromError` already expose — so the wording can be asserted without
+ * standing up a remote and driving a real push. Both call sites are unchanged.
  */
-function uncommittedModificationsMessage(modified: string[], untracked: string[]): string {
+export function uncommittedModificationsMessage(modified: string[], untracked: string[]): string {
   const untrackedNote =
     untracked.length > 0
       ? `Untracked file(s) never block a push — ${capList(untracked, 10)} will ride along untouched.`
@@ -2733,7 +2859,10 @@ function uncommittedModificationsMessage(modified: string[], untracked: string[]
     'the latest remote, and git cannot rebase over uncommitted modifications to files it already ' +
     "tracks. Commit them first (`commit` takes this session's edits by default, or " +
     '`scope: "all"` for the whole working tree), pass a `message` to push to commit the WHOLE ' +
-    "working tree instead (peers' work included, so prefer commit first), or `discard` them. " +
+    "working tree instead (peers' work included, so prefer commit first), `shelve` them " +
+    '(`shelve { paths: [...] }`) to set them aside outside the clone — the only exit here that ' +
+    'neither publishes them nor destroys them — and bring them back with `unshelve` after the ' +
+    'push, or `discard` them. ' +
     untrackedNote
   );
 }
