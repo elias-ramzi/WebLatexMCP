@@ -2568,6 +2568,39 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   across rotated, sheared, horizontal and vertical runs, with a per-mode merge count asserted
   alongside it so the property cannot pass vacuously on a rule that never merges.
 
+- **`pdf_geometry`: the claim that pdf.js never batches paint operators here is now pinned by a
+  test, and the last `.aux` fabrication path is pinned by another** (#80 §5 and §3; no behaviour
+  change in either).
+
+  **§5.** `walkImageGeometry` has no branch for pdf.js's four batched paint operators
+  (`paintImageXObjectRepeat`, `paintInlineImageXObjectGroup`, `paintImageMaskXObjectGroup`,
+  `paintImageMaskXObjectRepeat`), because `page.getOperatorList()` sets the OPLIST rendering
+  intent, which selects `NullOptimizer`, and only `QueueOptimizer` ever emits them. That was
+  stated as fact in three places and guarded only by a version assertion whose own comment
+  admitted it "does not detect the change". If it ever stopped being true the failure would be
+  silent — a page full of figures coming back with a fraction of its rectangles and every counter
+  reading zero, which for a collision question is the dangerous direction. A hand-built one-page
+  PDF now repeats the exact quad pattern the optimizer matches (three runs of twelve: a
+  referenced image XObject, a referenced image mask, an inline image), asserts through the real
+  `getOperatorList()` that the batching preconditions are genuinely present — measured run
+  lengths of 11, 11 and 12 consecutive quads against pdf.js's own thresholds of 3, 10 and 10 —
+  and that none of the four opcodes appears. A second test drives the same page through the real
+  walk and pins 36 placements to 36 boxes, so a future batching fails loudly instead of quietly
+  dropping rectangles. Verified capable of failing: reintroducing a gap in the walk collapses the
+  count to 24.
+
+  **§3.** The residual the issue names — a `\newlabel`-shaped string more than `GROUP_SKIP_SCAN`
+  characters into a group the file continues past — was already closed by #119's open-span walk,
+  and is refused and counted today. One sub-case remains and is now pinned as a characterization
+  test rather than left in a comment: when the group closes **nowhere** in the file, no span is
+  opened and the fake is still reported as a real float, indistinguishable from a measured entry.
+  The justification recorded for that asymmetry ("there is no cheap check left to make") was
+  wrong and has been corrected: the retry reaching end-of-file without the depth touching zero
+  _proves_ the group is open at every position to the end, so the check costs nothing at all —
+  what keeps those markers reportable is a deliberate recall choice about a corrupt `.aux`, not
+  an absence of evidence. Closing it reverses that contract and the test that pins it, so it is
+  left as an owner's call with the cost written down.
+
 ### Tests
 
 - **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"

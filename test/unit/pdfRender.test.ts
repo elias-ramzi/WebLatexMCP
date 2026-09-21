@@ -1693,7 +1693,10 @@ describe('pdf.js OPS table', () => {
     //
     // This does not detect the change; it forces a human to re-derive the claim on a major bump,
     // which is the cheap half. The four opcodes are asserted to exist so that "we are talking
-    // about the same table" stays true, and so a rename does not read as a fix.
+    // about the same table" stays true, and so a rename does not read as a fix. The other half —
+    // an actual detector, driving a real batchable page through the real getOperatorList() — is
+    // the describe block below; keep both, since a rename defeats the detector (the opcode it
+    // counts stops existing) and a behaviour change defeats this one.
     const pkg = (await import('pdfjs-dist/package.json', {
       with: { type: 'json' },
     })) as unknown as {
@@ -1712,6 +1715,215 @@ describe('pdf.js OPS table', () => {
     ]) {
       expect(typeof pdfjs.OPS[name]).toBe('number');
     }
+  });
+});
+
+/**
+ * The exact number of `q <cm> <paint> Q` quads `batchableImagePdf` writes per paint operator.
+ *
+ * Above every threshold pdf.js's `QueueOptimizer` batches at (3 for `paintImageXObjectRepeat`,
+ * 10 for the two `*Group` forms and for `paintImageMaskXObjectRepeat`), with room to spare — the
+ * spare matters, because pdf.js emits a one-off `OPS.dependency` INSIDE the first quad of each
+ * run, so only 11 of the 12 are consecutive and a fixture sized exactly 10 would miss the
+ * 10-thresholds by one and pass for the wrong reason.
+ */
+const BATCHABLE_QUADS = 12;
+
+/**
+ * A one-page PDF whose content stream is nothing but the quad pattern pdf.js's `QueueOptimizer`
+ * matches on — `q <cm> <paint> Q`, repeated — in three runs, one per paint operator that has a
+ * batched form: a referenced image XObject (`paintImageXObject`), a referenced image mask
+ * (`paintImageMaskXObject`) and an inline image (`paintInlineImageXObject`). Between them those
+ * three runs are the trigger for all four batched opcodes.
+ *
+ * Details that are load-bearing rather than arbitrary, all read off the installed pdf.js 6.1.200:
+ *  - The image run keeps `b`/`c` at 0 and `a`/`d` identical across placements, varying only the
+ *    translation, because `iterateImageGroup`'s `checkFn` requires exactly that (and the same
+ *    objId) before `paintImageXObjectRepeat` is even considered.
+ *  - The mask run uses `b !== c` (0.1 vs 0.2) so that `foundImageMaskGroup` takes its
+ *    `isSameImage === false` branch and would produce `paintImageMaskXObjectGroup`. The
+ *    `paintImageMaskXObjectRepeat` sibling is covered by the image run's shape being asserted
+ *    absent too — both opcodes come out of the same state, and the test counts all four.
+ *  - The images are 8x8, not 1x1: a referenced XObject is never turned into an inline image (the
+ *    `SMALL_IMAGE_DIMENSIONS` shortcut in the evaluator is gated on `isInline`), but a
+ *    single-pixel mask takes a `constructPath` shortcut instead of emitting a mask op at all.
+ *
+ * Hand-written rather than compiled so this needs no TeX, and kept local rather than folded into
+ * `test/helpers/minimalPdf.ts` because nothing else wants a page of 36 images.
+ */
+function batchableImagePdf(): Buffer {
+  const imgData = '\xff'.repeat(64); // 8x8 DeviceGray, 8 bits per component
+  const maskData = '\x00'.repeat(8); // 8x8 image mask, 1 bit per component
+  const inlineData = '\xaa'.repeat(16); // 4x4 DeviceGray, 8 bits per component
+
+  const quads: string[] = [];
+  for (let i = 0; i < BATCHABLE_QUADS; i++) {
+    quads.push(`q 10 0 0 10 ${10 + i * 12} 20 cm /Im0 Do Q`);
+  }
+  for (let i = 0; i < BATCHABLE_QUADS; i++) {
+    quads.push(`q 10 0.1 0.2 10 ${10 + i * 12} 40 cm /Msk Do Q`);
+  }
+  for (let i = 0; i < BATCHABLE_QUADS; i++) {
+    quads.push(`q 5 0 0 5 ${10 + i * 12} 60 cm BI /W 4 /H 4 /CS /G /BPC 8 ID ${inlineData} EI Q`);
+  }
+  const stream = quads.join('\n');
+
+  const objs = new Map<number, string>([
+    [1, '<< /Type /Catalog /Pages 2 0 R >>'],
+    [2, '<< /Type /Pages /Kids [5 0 R] /Count 1 >>'],
+    [
+      3,
+      `<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray ` +
+        `/BitsPerComponent 8 /Length ${imgData.length} >>\nstream\n${imgData}\nendstream`,
+    ],
+    [
+      4,
+      `<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ImageMask true /Decode [0 1] ` +
+        `/Length ${maskData.length} >>\nstream\n${maskData}\nendstream`,
+    ],
+    [
+      5,
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 6 0 R ' +
+        '/Resources << /XObject << /Im0 3 0 R /Msk 4 0 R >> >> >>',
+    ],
+    [6, `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`],
+  ]);
+
+  let out = '%PDF-1.4\n';
+  const offsets = new Map<number, number>();
+  const maxObjNum = Math.max(...objs.keys());
+  for (let i = 1; i <= maxObjNum; i++) {
+    offsets.set(i, out.length);
+    out += `${i} 0 obj\n${objs.get(i)}\nendobj\n`;
+  }
+  const xref = out.length;
+  out += `xref\n0 ${maxObjNum + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= maxObjNum; i++) {
+    out += `${String(offsets.get(i) ?? 0).padStart(10, '0')} 00000 n \n`;
+  }
+  out += `trailer\n<< /Size ${maxObjNum + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
+}
+
+/**
+ * The longest run of CONSECUTIVE `save, transform, <paint>, restore` quads in an operator list —
+ * the shape `QueueOptimizer`'s state machine matches on and splices out. Counting this rather
+ * than counting `paint` operators is what makes the assertion below non-vacuous: twelve paint
+ * ops scattered among other operators would not be batchable in the first place, so finding no
+ * batched opcode over them would prove nothing.
+ */
+function longestQuadRun(
+  fnArray: readonly number[],
+  ops: Record<string, number>,
+  paint: number,
+): number {
+  let best = 0;
+  let i = 0;
+  while (i < fnArray.length) {
+    let run = 0;
+    let j = i;
+    while (
+      fnArray[j] === ops.save &&
+      fnArray[j + 1] === ops.transform &&
+      fnArray[j + 2] === paint &&
+      fnArray[j + 3] === ops.restore
+    ) {
+      run++;
+      j += 4;
+    }
+    best = Math.max(best, run);
+    i = run > 0 ? j : i + 1;
+  }
+  return best;
+}
+
+describe('pdf.js operator-list batching (#80 §5)', () => {
+  // Why this block exists at all. `walkImageGeometry` has no branch for pdf.js's four BATCHED
+  // paint operators, on the grounds that `page.getOperatorList()` selects `NullOptimizer` (the
+  // OPLIST rendering-intent flag) and only `QueueOptimizer` ever emits them. That claim is now
+  // stated as fact in the `PdfjsOps` doc comment, in the tool's schema and in docs/tools.md, and
+  // the failure mode if it ever stops being true is silent: a page full of figures would come
+  // back with a fraction of its rectangles and every counter reading zero, which for a collision
+  // question is the dangerous direction. The sibling "pdf.js OPS table" block pins the version
+  // and the opcode names; this one pins the BEHAVIOUR, against a page pdf.js would batch.
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-batch-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('yields one paint op per placement — never a batched opcode — over a page built to be batched', async () => {
+    // Driven through the very module `PdfRenderer`'s default loader imports, and through
+    // `page.getOperatorList()` with no arguments, because the claim is about that exact call:
+    // it is what sets RenderingIntentFlag.OPLIST, and a `render()` of the same page WOULD batch.
+    const pdfjs = (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as {
+      OPS: Record<string, number>;
+      getDocument(src: { data: Uint8Array; verbosity?: number }): {
+        promise: Promise<{
+          getPage(n: number): Promise<{
+            getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[] }>;
+            cleanup(): void;
+          }>;
+        }>;
+      };
+    };
+    const { OPS } = pdfjs;
+    const doc = await pdfjs.getDocument({
+      data: new Uint8Array(batchableImagePdf()),
+      verbosity: 0,
+    }).promise;
+    const page = await doc.getPage(1);
+    const { fnArray } = await page.getOperatorList();
+    page.cleanup();
+
+    // Anti-vacuity first, and it is the half that actually rots: if a future pdf.js stopped
+    // emitting one of these three per-placement ops for this fixture (an evaluator shortcut, a
+    // changed inline-image threshold), the "no batched opcode" assertion below would still pass
+    // while testing nothing. These minimums are pdf.js's own thresholds, read off the installed
+    // worker's optimizer states: MIN_IMAGES_IN_BLOCK = 3 for the image-XObject state,
+    // MIN_IMAGES_IN_MASKS_BLOCK = 10 and MIN_IMAGES_IN_INLINE_IMAGES_BLOCK = 10.
+    expect(longestQuadRun(fnArray, OPS, OPS.paintImageXObject!)).toBeGreaterThanOrEqual(3);
+    expect(longestQuadRun(fnArray, OPS, OPS.paintImageMaskXObject!)).toBeGreaterThanOrEqual(10);
+    expect(longestQuadRun(fnArray, OPS, OPS.paintInlineImageXObject!)).toBeGreaterThanOrEqual(10);
+
+    // The claim itself. Counted, not merely `toContain`-negated, so a partial batching (one run
+    // collapsed, two left alone) fails as loudly as a total one.
+    for (const name of [
+      'paintImageXObjectRepeat',
+      'paintInlineImageXObjectGroup',
+      'paintImageMaskXObjectGroup',
+      'paintImageMaskXObjectRepeat',
+    ] as const) {
+      const code = OPS[name];
+      expect(typeof code).toBe('number');
+      expect({ [name]: fnArray.filter((fn) => fn === code).length }).toEqual({ [name]: 0 });
+    }
+  });
+
+  it('measures every placement on that page, so a future batching shows up as missing rectangles', async () => {
+    // The consequence, asserted end to end through the real walk with the real loader rather
+    // than inferred from the operator list above: 36 placements, 36 boxes. This is the assertion
+    // that would actually FAIL (not merely stop proving anything) the day pdf.js batches here —
+    // the count would collapse to the number of un-batched runs, which is the silent gap the
+    // deferral in #80 §5 was originally filed about.
+    const pdfPath = path.join(dir, 'batchable.pdf');
+    await writeFile(pdfPath, batchableImagePdf());
+
+    const result = await new PdfRenderer().geometry({ pdfPath, kinds: ['images'] });
+    const geomPage = result.pages[0]!;
+    expect(geomPage.images).toHaveLength(BATCHABLE_QUADS * 3);
+    expect(geomPage.imagesOmitted).toBe(0);
+    expect(geomPage.annotationImagesSkipped).toBe(0);
+    // Every box is a real measurement: nothing here is drawn under a refused CTM, and the walk
+    // never falls back to a unit square for an image op. A batched opcode arriving unhandled
+    // would not trip these — it would simply remove boxes — which is why the length above is the
+    // load-bearing assertion and these two are the corroboration.
+    expect(geomPage.images!.some((b) => b.unreliableCtm)).toBe(false);
+    expect(geomPage.images!.some((b) => b.approximate)).toBe(false);
   });
 });
 
