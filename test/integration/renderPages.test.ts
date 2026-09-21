@@ -8,7 +8,7 @@ import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
-import { buildDir, buildPdfPath } from '../../src/services/compiler.js';
+import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -70,6 +70,13 @@ async function stagePdf(userDir: string, pages: number): Promise<void> {
   await writeFile(pdfPath, minimalPdf(pages));
 }
 
+/** Stage the `.aux` the last compile would have left, without running latexmk. */
+async function stageAux(userDir: string, content: string): Promise<void> {
+  const auxPath = buildAuxPath(userDir, 'main.tex');
+  await mkdir(path.dirname(auxPath), { recursive: true });
+  await writeFile(auxPath, content);
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -106,6 +113,7 @@ interface RenderPagesOut {
   outDir: string;
   pages: RenderedPageOut[];
   skippedPages: number[];
+  resolvedLabels?: Array<{ label: string; printedPage: string; page: number }>;
   note?: string;
 }
 
@@ -294,5 +302,219 @@ describe('render_pages', () => {
     expect(halfWidth).toBeDefined();
 
     expect(Math.abs((halfWidth as number) - (fullWidth as number) / 2)).toBeLessThanOrEqual(1);
+  });
+  it('labels: renders the page the .aux records and echoes the label -> page mapping', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5);
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{2}}\n\\newlabel{tab:results}{{2}{4}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+
+    const out = structuredOf(res);
+    expect(out.pages.map((p) => p.page)).toEqual([4]);
+    // The echo is the point of the feature: the caller asked about a label, not a number, and
+    // must be able to see which page it actually got.
+    expect(out.resolvedLabels).toEqual([{ label: 'tab:results', printedPage: '4', page: 4 }]);
+    expect(out.note).toContain('LAST COMPILE');
+    // Pinned as its own line, not merely somewhere in the text: the provenance note also names
+    // the mapping, so a looser assertion passes with the scannable summary line deleted.
+    expect(textOf(res)).toMatch(/labels \(from the last compile's \.aux\): tab:results -> page 4/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(1);
+  });
+
+  it('labels: two labels on one page render it once, and both are echoed', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n\\newlabel{fig:b}{{1}{2}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:a', 'fig:b'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+
+    const out = structuredOf(res);
+    expect(out.pages.map((p) => p.page)).toEqual([2]);
+    expect(out.resolvedLabels?.map((r) => r.label)).toEqual(['tab:a', 'fig:b']);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(1);
+  });
+
+  it('rejects labels and pages together instead of letting one silently win', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:a'], pages: [1] },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/either `pages` or `labels`/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses an unresolvable label rather than rendering page 1', async () => {
+    // The failure this feature exists to prevent: a label the last compile never saw must not
+    // quietly become "here is a page" — of all the wrong answers, the default first page is the
+    // most plausible-looking one.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{fig:known}{{1}{2}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:brand-new'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('tab:brand-new');
+    expect(text).toMatch(/Rerun to get cross-references right/);
+    expect(text).toContain('pdf_geometry');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses the whole call when only one of several labels is unresolvable', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{fig:known}{{1}{2}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['fig:known', 'tab:brand-new'] },
+    });
+    expect(res.isError).toBe(true);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses a roman printed page instead of rendering PDF page "iv" as page 4', async () => {
+    // \pagenumbering{roman} front matter: the .aux records "iv", which is not an offset into the
+    // PDF at all. Mapping it onto page 4 would render a plausible page that is not the one asked
+    // for — silently.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5);
+    await stageAux(userDir, '\\newlabel{sec:preface}{{1}{iv}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['sec:preface'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('"iv"');
+    expect(text).toContain('not a decimal page number');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses a printed page that is neither decimal nor roman, rather than falling back', async () => {
+    // A thesis/report scheme (\pagenumbering via \renewcommand{\thepage}{A-\arabic{page}}) prints
+    // "A-3". There is no roman evidence to fall back on here, so this test is what stands between
+    // a non-decimal printed page and a silently-rendered wrong page.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5);
+    await stageAux(userDir, '\\newlabel{tab:appendix}{{1}{A-3}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:appendix'] },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain('"A-3"');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses an arabic label too once the same .aux shows roman pages', async () => {
+    // The subtler half: in a document with roman front matter, printed arabic page 3 is NOT PDF
+    // page 3, and nothing in the .aux says by how much it is offset.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 8);
+    await stageAux(userDir, '\\newlabel{sec:preface}{{1}{iii}}\n\\newlabel{tab:results}{{1}{3}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('renumbers its pages');
+    expect(text).toContain('sec:preface');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('names the stale .aux when a resolved page is past the end of the PDF on disk', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{tab:results}{{1}{9}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('out of range');
+    expect(text).toContain('tab:results -> page 9');
+    expect(text).toMatch(/stale/);
+  });
+
+  it('says there is no .aux at all rather than calling the label undefined', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    // Deliberately no stageAux: a PDF surfaced by a previous run, with the build dir's .aux gone.
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/No \.aux found in the build directory/);
+  });
+
+  it('rejects an empty labels array instead of rendering every page', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: [] },
+    });
+    expect(res.isError).toBe(true);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('resolves a label past the floats REPORTING cap (a real manuscript has >200 labels)', async () => {
+    // pdf_geometry's floats index is capped at 200 entries because it PRINTS them. A lookup only
+    // searches, and every section, equation and subfigure of a real paper is a \newlabel, so
+    // reusing that cap would answer "no such label" for a label plainly in the file — a wrong
+    // answer, not a truncated one. LABEL_LOOKUP_MAX is why this resolves.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    const filler = Array.from({ length: 250 }, (_, i) => `\\newlabel{sec:${i}}{{1}{1}}`);
+    await stageAux(userDir, [...filler, '\\newlabel{tab:results}{{1}{3}}'].join('\n') + '\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect(structuredOf(res).pages.map((p) => p.page)).toEqual([3]);
+  });
+
+  it('never writes inside the project directory when resolving labels', async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3);
+    await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n');
+
+    const before = await listAllEntries(userDir);
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:a'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect(await listAllEntries(userDir)).toEqual(before);
   });
 });
