@@ -1477,6 +1477,37 @@ Harmless only because no project is named `please` — the first word matching a
   apart from one that answers no — "could not be checked" rather than "no such project" — and never
   throws out of prompt rendering.
 
+- **`commit`, `discard` and the ignore filter batch their pathspec lists too** (#110). #94 named
+  `revert` only; the same unbatched shape survived at three other sites in `GitService`, and one
+  of them is reachable on **every** commit rather than only on an unusually large operation:
+  `ignoredPaths` → `trackedAtHead` asks `ls-tree HEAD` about everything the session has touched,
+  so a session that has edited thousands of files crossed Windows' ~32 KB command line routinely.
+  The other two are `commit`'s `ls-files`/`add` and `discard`'s `ls-files`/`checkout`/`clean`,
+  both fed by a caller-named `paths` list. All six calls now go through the existing
+  `chunkPathspecs`, every chunk keeping `--literal-pathspecs` before the subcommand.
+  `ignoredPaths` itself was already safe — `check-ignore --stdin` reads paths on stdin, not argv.
+
+  Combining is exact in each case, and the reasoning is written at each site: the chunks
+  partition the list, so a listing's union is a concatenation and a chunk printing **nothing**
+  means none of _its own_ paths matched — never "nothing matched overall". `trackedAtHead`
+  stays fail-closed: a throwing chunk propagates rather than shrinking the tracked set, which
+  would report a tracked file as ignored and silently drop the session's edit to it.
+
+  **The new partial-failure mode is answered per tool, not borrowed from `revert`.** A failed
+  `git add` chunk is staging only: nothing was committed, no file on disk changed, and the only
+  content that can be left staged is what the call itself named — every other commit scope
+  resets the index to HEAD before staging — so `commit` says exactly that and says a retry is
+  safe. `discard`'s `checkout`/`clean` destroy working-tree content, so a failed chunk means an
+  earlier chunk's files are already gone; that message takes the `landedOrExplain` shape, but
+  without the revert's ban on retrying — retrying is how a discard is finished, it just destroys
+  the rest, which is what it says.
+
+  The regression test reuses #94's recording-`git`-shim harness (argv per invocation, one file
+  per spawn), since on Linux a 40 KB argv is legal and a behavioural test alone passes against
+  the unbatched code on this gate's platform. Each behavioural body also runs at one-chunk and
+  several-chunk sizes against ground truth from a single unscoped git call, and both new failure
+  messages are asserted together with the clone state they claim.
+
 - **`revert` batches its pathspec lists, so a large reverted commit no longer blows Windows'
   command line** (#94). `revert` handed git one pathspec list — in the preflight (`ls-tree`,
   the link probes, the dirty scan), in the scoped unstage, and in the numstat comparisons. On a

@@ -609,9 +609,22 @@ export class GitService {
       // `lstat` itself failing means nothing is. A path matching only one of the two still commits
       // as before (e.g. a tracked file removed on disk stages its deletion); this only refuses when
       // BOTH say no.
-      const indexed = (await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...paths]))
-        .split('\0')
-        .filter(Boolean);
+      //
+      // The pathspec list is {@link chunkPathspecs}-batched (#110): a `scope: "paths"` request
+      // naming thousands of files handed one `ls-files` an oversized command line on Windows.
+      // Combining is a CONCATENATION, and that is exactly the union one call would print: the
+      // chunks partition `paths`, every index entry a pathspec matches is printed by the one
+      // chunk holding that pathspec, and a chunk printing nothing means none of ITS pathspecs
+      // matched — never "nothing matched overall". Duplicates across chunks would be harmless
+      // here (membership is tested with `some`), and cannot arise anyway.
+      const indexed: string[] = [];
+      for (const chunk of chunkPathspecs(paths)) {
+        indexed.push(
+          ...(await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...chunk]))
+            .split('\0')
+            .filter(Boolean),
+        );
+      }
       const unmatched: string[] = [];
       for (const p of paths) {
         if (indexed.some((name) => coversPath(p, name))) continue;
@@ -630,7 +643,16 @@ export class GitService {
       }
       // `--literal-pathspecs`: a pathspec is a glob by default, so naming `a[1].tex` would also
       // stage a peer's dirty `a1.tex` — past the ownership check, which compared literal names.
-      await git.raw(['--literal-pathspecs', 'add', '--', ...paths]);
+      //
+      // Batched like the listing above (#110), and every chunk keeps that flag. Staging the same
+      // paths in several `git add` calls stages exactly what one call would have: `add` is a
+      // per-path index write with no cross-path state, and the chunks partition the list. The
+      // partial-failure mode the batching introduces is answered by `stageOrExplain` — see there.
+      await this.stageOrExplain(paths, async () => {
+        for (const chunk of chunkPathspecs(paths)) {
+          await git.raw(['--literal-pathspecs', 'add', '--', ...chunk]);
+        }
+      });
     } else {
       await git.add(['-A']);
     }
@@ -657,6 +679,41 @@ export class GitService {
     await git.raw(args);
     const sha = (await git.revparse(['HEAD'])).trim();
     return { committed: true, sha, filesChanged: staged.length, files };
+  }
+
+  /**
+   * Run {@link commit}'s batched `git add` and, if it fails, say what the batching left behind.
+   *
+   * Deliberately NOT worded like {@link landedOrExplain}, which the revert path uses: this is a
+   * different failure. `git add` only writes the INDEX, and it runs before the commit, so when a
+   * chunk fails nothing has been committed and no file on disk has changed — the caller has lost
+   * nothing and a retry cannot double-apply anything, which is precisely what a revert's wrapper
+   * has to forbid. What HAS changed is that the index may now hold some of the named paths and
+   * not others, where one unbatched `add` was all-or-nothing. That is worth saying rather than
+   * hiding, because the caller can see it in `status`/`diff` and would otherwise wonder where a
+   * staged file came from.
+   *
+   * It is bounded, too: the only content that can be staged is what this call itself named, and
+   * every other route into a commit resets the index to HEAD before staging (`commitContents`,
+   * and `commit` with `fromHead` — i.e. scope "session" and scope "paths"), so a leftover partial
+   * stage cannot ride along into some later, unrelated commit. Hence "retrying is safe", stated
+   * plainly, instead of the revert's "do NOT simply retry".
+   */
+  private async stageOrExplain<T>(paths: string[], step: () => Promise<T>): Promise<T> {
+    try {
+      return await step();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Staging the requested path(s) failed: ${reason}. NOTHING was committed and no file on ` +
+          `disk changed, but the index may already hold some of the ${paths.length} path(s) ` +
+          'named — a long path list is split across several `git add` calls and one of them ' +
+          'failed. Only what this call named can be staged, and every other commit scope resets ' +
+          'the index to HEAD first, so nothing else can ride along. Inspect it with ' +
+          '`status`/`diff`; re-running `commit` is safe and stages the rest.',
+        { cause: err },
+      );
+    }
   }
 
   /**
@@ -920,18 +977,34 @@ export class GitService {
     const caseInsensitive = await this.isCaseInsensitive(dir);
     // `-z` so a name with a newline or non-ASCII byte comes back verbatim, not C-quoted.
     if (!caseInsensitive) {
-      const out = await git.raw([
-        '--literal-pathspecs',
-        'ls-tree',
-        '-r',
-        '-z',
-        '--name-only',
-        'HEAD',
-        '--',
-        ...rels,
-      ]);
       const wanted = new Set(rels);
-      return new Set(out.split('\0').filter((name) => wanted.has(name)));
+      const tracked = new Set<string>();
+      // {@link chunkPathspecs}-batched (#110), and this is the site that made the issue worth
+      // doing: `ignoredPaths` (which calls this) runs on EVERY session-scope commit over what
+      // the session has touched, so a session with thousands of edited files crossed Windows'
+      // command line here routinely rather than on some rare large operation.
+      //
+      // Combining is a union over a partition, and the absence of output is not ambiguous: a
+      // chunk lists exactly the HEAD entries ITS pathspecs match, so a path missing from its own
+      // chunk's output is untracked at HEAD, and a chunk printing nothing means none of its
+      // paths are tracked — never that nothing is. A chunk that throws propagates (the commit
+      // refuses) rather than shrinking the tracked set, which would report a tracked file as
+      // ignored and silently drop the session's edit to it. Every chunk keeps
+      // `--literal-pathspecs`: `a[1].tex` is a glob otherwise.
+      for (const chunk of chunkPathspecs(rels)) {
+        const out = await git.raw([
+          '--literal-pathspecs',
+          'ls-tree',
+          '-r',
+          '-z',
+          '--name-only',
+          'HEAD',
+          '--',
+          ...chunk,
+        ]);
+        for (const name of out.split('\0')) if (wanted.has(name)) tracked.add(name);
+      }
+      return tracked;
     }
     // A pathspec can't be both literal and case-insensitive, so list the whole tree and fold.
     const out = await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
@@ -1259,7 +1332,13 @@ export class GitService {
     await git.raw(born ? ['read-tree', '--reset', 'HEAD'] : ['read-tree', '--empty']);
   }
 
-  /** Discard uncommitted changes (working tree + untracked), optionally limited to paths. */
+  /**
+   * Discard uncommitted changes (working tree + untracked), optionally limited to paths.
+   *
+   * The path-limited branch batches its pathspec lists ({@link chunkPathspecs}), so a failure
+   * part way through destroys some of the named paths and not others — {@link discardedOrExplain}
+   * is what tells the caller so.
+   */
   async discard(dir: string, paths?: string[]): Promise<{ discarded: boolean }> {
     const git = simpleGit(dir);
     if (paths && paths.length > 0) {
@@ -1289,23 +1368,77 @@ export class GitService {
         const canonical = canonicalNames(indexNames);
         resolvedPaths = paths.map((p) => canonical.resolve(toPosix(p)));
       }
-      const indexed = (
-        await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...resolvedPaths])
-      )
-        .split('\0')
-        .filter(Boolean);
+      // All three calls below are {@link chunkPathspecs}-batched (#110), every chunk keeping
+      // `--literal-pathspecs`. The listing combines as a concatenation — the chunks partition
+      // the list, each chunk prints the index entries ITS pathspecs match, and a chunk printing
+      // nothing means none of its own paths are tracked, never that none are.
+      const indexed: string[] = [];
+      for (const chunk of chunkPathspecs(resolvedPaths)) {
+        indexed.push(
+          ...(await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...chunk]))
+            .split('\0')
+            .filter(Boolean),
+        );
+      }
       const tracked = resolvedPaths.filter((p) =>
         indexed.some((name) => coversPath(p, name, caseInsensitive ? foldCase : undefined)),
       );
-      if (tracked.length > 0) {
-        await git.raw(['--literal-pathspecs', 'checkout', '--', ...tracked]);
-      }
-      await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...paths]);
+      // The two DESTRUCTIVE steps share one wrapper, so a failure in `clean` also reports the
+      // `checkout` chunks that already landed — see `discardedOrExplain`. Each chunk restores or
+      // removes only its own paths, with no cross-path state, so the chunks compose into exactly
+      // the discard one pair of calls would have performed.
+      await this.discardedOrExplain(async () => {
+        if (tracked.length > 0) {
+          for (const chunk of chunkPathspecs(tracked)) {
+            await git.raw(['--literal-pathspecs', 'checkout', '--', ...chunk]);
+          }
+        }
+        for (const chunk of chunkPathspecs(paths)) {
+          await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...chunk]);
+        }
+      });
     } else {
       await git.checkout(['--', '.']);
       await git.clean('fd');
     }
     return { discarded: true };
+  }
+
+  /**
+   * Run {@link discard}'s batched, DESTRUCTIVE steps and, if one fails, say what is already gone.
+   *
+   * This is the {@link landedOrExplain} shape rather than {@link stageOrExplain}'s, and for the
+   * revert's reason: `checkout`/`clean` overwrite and delete working-tree content, and a chunk
+   * that has run cannot be taken back. A caller told only "discard failed" would reasonably read
+   * that as "my changes are still there" — for an earlier chunk's files they are not, and no
+   * `status` reading before the call can be trusted afterwards.
+   *
+   * Where it deliberately differs from the revert's wording: a revert forbids the retry (it would
+   * apply the change twice), while here the retry is the way to finish the job — it just destroys
+   * the rest, which is what was asked for, so the message says that outright instead of banning
+   * it. It also does not count the paths: the split between what fell and what stands is what
+   * `status` answers, and quoting the requested total here would invite reading it as the number
+   * destroyed.
+   *
+   * Nothing is cleaned up on the way out on purpose. The tool's baseline reset and shadow settle
+   * run only on success, so after a partial discard this session's records and revision baselines
+   * still describe the pre-discard tree: a later `edit_file` on a discarded path then refuses with
+   * `ExternalChangeError` (overridable) rather than writing over it, which is the safe direction.
+   */
+  private async discardedOrExplain<T>(step: () => Promise<T>): Promise<T> {
+    try {
+      return await step();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `The discard failed PART WAY THROUGH: ${reason}. A long path list is split across ` +
+          'several git calls, so some of the named paths have ALREADY been reverted to HEAD or ' +
+          'deleted — that content is gone and cannot be recovered here — while the rest still ' +
+          'hold their uncommitted changes. Run `status` to see which is which. Running `discard` ' +
+          'again finishes the job and destroys the rest; it will not bring the first part back.',
+        { cause: err },
+      );
+    }
   }
 
   /**
