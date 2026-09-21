@@ -66,6 +66,16 @@ function fixturePath(i: number, stem = 'figure'): string {
   return `${DEEP_DIR}/${stem}-${String(i).padStart(4, '0')}-${'x'.repeat(30)}.tex`;
 }
 
+/**
+ * `core.ignorecase=false` is set explicitly, and it is not cosmetic: git turns it ON by default
+ * on macOS and Windows clones, and on such a repository `trackedAtHead` takes its OTHER branch —
+ * a whole-tree `ls-tree` with no pathspec at all, because a pathspec cannot be both literal and
+ * case-insensitive. There is nothing to batch there, so on those runners these fixtures silently
+ * stopped exercising the batched call (the argv test found zero pathspec-bearing `ls-tree`
+ * invocations on macOS CI and said so). The server's own source of truth for the fold is this
+ * config value, never the filesystem, so declaring it here is exactly how a case-sensitive
+ * repository is pinned on every platform — and it is the pathspec branch that this lane batches.
+ */
 async function initRepo(prefix: string): Promise<{ dir: string; git: SimpleGit }> {
   const dir = await tmp(prefix);
   const git = simpleGit(dir);
@@ -73,6 +83,10 @@ async function initRepo(prefix: string): Promise<{ dir: string; git: SimpleGit }
   await git.addConfig('user.email', 'local@example.com');
   await git.addConfig('user.name', 'Local');
   await git.addConfig('core.autocrlf', 'false');
+  await git.addConfig('core.ignorecase', 'false');
+  // Asserted, not assumed: if the setting ever failed to take, the tests below would go quiet
+  // (a branch with no pathspec passes every batching assertion vacuously) rather than fail.
+  expect(await new GitService().isCaseInsensitive(dir)).toBe(false);
   return { dir, git };
 }
 
