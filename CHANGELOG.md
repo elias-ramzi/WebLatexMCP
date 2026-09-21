@@ -11,6 +11,36 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`search_files`: grep the project instead of reading every candidate** (#105, finding 1).
+  Locating a phrase, a `\label`, or every site of a citation key meant `list_files` and then
+  `read_file` over each result — the whole file into context to find one line. `search_files`
+  returns the matching lines with their path, 1-based line number and an optional context window.
+
+  **Literal by default.** `\Cref{tab:sota}` searches for exactly that, backslashes and braces
+  included, which is the common case in LaTeX and the one a regex-by-default tool gets wrong
+  silently.
+
+  **A refused regex, not a bounded one.** `regex: true` opts into a pattern, and some shapes are
+  rejected with an explanation rather than executed. This is not conservatism: `RegExp.exec` is
+  uninterruptible, so a deadline cannot cut a match short — by the time the budget is checked the
+  match has already finished, or the process has not come back. The only place to refuse is
+  before starting. The analyzer turns on **character overlap** between a repeat and what follows
+  it, not on which metacharacters were written: `[^x]*a[^x]*a[^x]*b` contains no `.` at all and
+  takes **12 minutes** on a single line, while `\w+\s+\w+` — two chained quantifiers — is linear
+  and a LaTeX search needs it. A rule phrased over syntax would have missed the first and
+  wrongly refused the second. Every refusal names the overlapping pair and gives the anchored
+  rewrite (`[^}]*\}` rather than `.*\}`).
+
+  **`excludeComments`** skips hits that begin inside a LaTeX `%` comment, by backslash parity, so
+  `50\%` is live text and `\\%` is a comment. It applies only where `%` _is_ a comment
+  (`.tex`/`.sty`/`.cls`/`.bbl`/`.ltx`/`.latex`); elsewhere it is refused rather than quietly
+  filtering nothing.
+
+  **Nothing is silently absent.** Assets are never searched whatever `filter` says and come back
+  under `skipped`, so "not searched" cannot read as "no match". Output is budgeted by **rendered**
+  size — each match charged its real `JSON.stringify` cost, punctuation included — with a
+  per-file cap and an aggregate budget, and the `note` names whichever one actually fired.
+
 - **`edit_file` takes line ranges, and `replaceAll` can skip LaTeX comments** (#105, findings 3
   and 4). Two changes to the same machinery, both about edits a manuscript actually needs.
 
@@ -1075,6 +1105,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   restored byte-identically. All three fail against their reverted fix. None was vacuous.
 
 ### Changed
+
+- **One home for LaTeX's comment rule.** `edit_file`'s `excludeComments` and `search_files`'
+  each grew their own backslash-parity scan — one counting the run, one skipping the character
+  after each backslash. They agreed on every case tested, but two implementations of "what is a
+  comment" are how the code that _writes_ commented-out prose and the code that _reads_ it
+  eventually disagree. Both now delegate to `commentStartInRange` in `src/lib/latexComments.ts`;
+  a mutation of that one rule fails tests on both sides.
 
 - **The review round no longer concentrates every irreversible act in its cheapest phase** (#81,
   findings 1 and 2, and a partial mitigation of finding 3). `.claude/workflows/review-round.js`
