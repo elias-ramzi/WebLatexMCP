@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  assertLinearishRegex,
   buildSearchMatcher,
   escapeLiteral,
   MAX_PATTERN_CHARS,
@@ -112,9 +113,22 @@ describe('buildSearchMatcher: patterns that are refused, with what they cost', (
   });
 
   it('refuses a group construct it has not been taught, rather than guessing', () => {
-    // Modifier groups are the live example; the point is the fail-closed direction for
-    // anything the scanner cannot account for.
-    expect(() => buildSearchMatcher('(?i:foo)', { regex: true })).toThrow(/cannot verify/);
+    // The SCANNER is asserted directly, not through `buildSearchMatcher`, because the example
+    // is exactly as new as the runtime. Modifier groups reached V8 after Node 22, which CI
+    // runs, so there `new RegExp('(?i:foo)')` throws before the scan is ever reached and the
+    // refusal arrives from the syntax branch instead — which pinned nothing about the
+    // fail-closed direction and made this a test that passed only on a new enough Node.
+    // `assertLinearishRegex` does no compiling, so this bites on every engine.
+    expect(() => assertLinearishRegex('(?i:foo)')).toThrow(/cannot verify/);
+    expect(() => assertLinearishRegex('(?i:foo)')).toThrow(UnsafePatternError);
+  });
+
+  it('refuses an unparseable pattern whichever branch catches it first', () => {
+    // The end-to-end guarantee behind the test above, stated so it holds on every engine: a
+    // construct the scanner has not been taught never runs, whether it is the scanner or the
+    // engine's own parser that stops it. Which one does depends on the V8 version and is not
+    // what is being promised.
+    expect(() => buildSearchMatcher('(?i:foo)', { regex: true })).toThrow(UnsafePatternError);
   });
 
   it('names the construct and the escape route in the refusal', () => {
