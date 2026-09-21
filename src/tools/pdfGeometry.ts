@@ -105,18 +105,28 @@ const geometryPageShape = z.object({
     .optional()
     .describe(
       'Per-line text boxes, in drawing order. Absent (not empty) when "text" was not requested. ' +
-        'Each box runs from the text baseline UP by the em size (pdf.js reports height as the ' +
-        'full em, not the ascent), so it OVERSHOOTS the ink at the top by a few points, and ' +
-        'descenders (g, p, y, ...) extend BELOW y1 and are not included — a descender touching a ' +
-        'figure below it is a real collision this tool reports as clearance. The box is built ' +
+        "Each box runs from the text baseline UP by the font's DECLARED ascent when the font " +
+        'declares a usable one (pdf.js reports it per font, as a fraction of the em), and by the ' +
+        'full em otherwise — a missing, zero, non-finite (Symbol and ZapfDingbats literally ' +
+        'report NaN) or above-one ascent keeps the full-em box rather than taking a guessed one, ' +
+        'because a box built from a guess UNDER-covers and this tool must not report clearance ' +
+        'where there is ink. So a box still never under-runs the ink at the top, and under a ' +
+        'no-metrics font it still overshoots it by a few points. Descenders (g, p, y, ...) ' +
+        'extend BELOW the box and are not included either way — a descender touching a figure ' +
+        'below it is a real collision this tool reports as clearance. The box is built ' +
         "from the item's own text matrix (advance along its text direction, em along its up " +
         'direction), so a ROTATED item — a sideways table cell, a rotated axis label, or every ' +
         'line on a pdflscape landscape page, where the content is rotated inside the page as well ' +
         'as the page carrying /Rotate — gets a correct axis-aligned box, and a rotated line made ' +
         'of several items IS merged into one: items are grouped in their own frame (shared ' +
         'direction and up axes to within a degree, shared origin projected onto the up axis, ' +
-        'adjacency measured along the direction axis), not by page-axis y. What is still not ' +
-        'modelled is SHEAR (a slanted, non-orthogonal text matrix). As for ' +
+        'adjacency measured along the direction axis), not by page-axis y. SHEAR (a slanted, ' +
+        "non-orthogonal text matrix) is modelled too — the corners come from the matrix's own " +
+        'two column directions, so a skewed item gets the true bounds of its parallelogram, not ' +
+        'an orthogonal approximation. VERTICAL writing mode (a CJK WMode 1 font) gets a correct ' +
+        'per-item box — down the column from the baseline, centred across it — but the items of ' +
+        'one vertical line are NOT merged into a single column box the way a horizontal or ' +
+        'rotated line is, so expect one box per run rather than one per line. As for ' +
         'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
         'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
         'field is the per-page cap alone — since a NaN is not a measurement.',
@@ -254,6 +264,18 @@ const outputSchema = {
         'bounded). Almost always 0. Counted separately from floatsOmitted, which is the ' +
         'reporting cap, so neither kind of loss is ever silent.',
     ),
+  floatsRefused: z
+    .number()
+    .optional()
+    .describe(
+      'Present only when "floats" was requested: \\newlabel-SHAPED text found inside another ' +
+        "entry's argument, where no closing brace could be located within the parser's scan " +
+        'budget, and declined rather than reported. NOT a second floatsDropped and never added ' +
+        'to it: floatsDropped means "there was a real entry here and you are not getting it" — ' +
+        'a loss — while this means the opposite, that something LOOKED like an entry and was not ' +
+        'believed. Nothing is missing from the index because of it. Almost always 0; a non-zero ' +
+        'value says the .aux is malformed or hostile, not that the float index is incomplete.',
+    ),
   note: z
     .string()
     .optional()
@@ -282,11 +304,14 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         '"text" reports per-line boxes (pdf.js text items merged by shared baseline and ' +
         'horizontal adjacency); the "text" string on each box is truncated — it is a label for ' +
         "the box, not the document's content, so use read_file for that. A text box runs from " +
-        'the baseline up by the em, so it overshoots the ink above and excludes descenders ' +
-        '(g, p, y) below. Rotated text IS accounted for — a sideways table cell, a rotated axis ' +
-        'label and a pdflscape landscape page all get correct boxes, and a rotated line of ' +
-        'several items is merged into one — but a sheared (slanted, non-orthogonal) text matrix ' +
-        'is not modelled; see the schema field description for all of it. ' +
+        "the baseline up by the font's declared ascent where there is a usable one and by the " +
+        'full em otherwise, so it never under-runs the ink above — and it excludes descenders ' +
+        '(g, p, y) below either way. Rotated text IS accounted for — a sideways table cell, a ' +
+        'rotated axis label and a pdflscape landscape page all get correct boxes, and a rotated ' +
+        'line of several items is merged into one — and so is a sheared (slanted, ' +
+        'non-orthogonal) text matrix. Vertical writing mode gets a correct box per item but its ' +
+        'items are not merged into one column line; see the schema field description for all of ' +
+        'it. ' +
         '"images" reports image and form XObject PLACEMENT RECTANGLES — what an \\includegraphics ' +
         'figure actually occupies — and NOTHING ELSE: general vector path geometry (\\fbox rules, ' +
         'TikZ strokes) is explicitly out of scope, because pdf.js only exposes those as raw ' +
@@ -377,6 +402,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           let floatsOmitted: number | undefined;
           let floatsOmittedBySize: number | undefined;
           let floatsDropped: number | undefined;
+          let floatsRefused: number | undefined;
           let note: string | undefined;
           if (requestedKinds.includes('floats')) {
             const auxResult = await readAuxFloats(dir, root);
@@ -395,6 +421,13 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // A size cut is neither, and reporting it as either names a cause that did not fire.
             floatsOmittedBySize = plan.omittedBySize;
             floatsDropped = auxResult.dropped;
+            // A FOURTH counter, and the reason is the mirror image of floatsDropped's: a refused
+            // \newlabel-shaped string is not an entry the caller lost, it is a fabrication the
+            // reader declined to believe (see AuxFloatsResult.refused). Folding it into
+            // floatsDropped would report a loss that did not happen; dropping it on the floor
+            // (which is what this tool did until now) hides the only signal that the .aux is
+            // malformed at all.
+            floatsRefused = auxResult.refused;
             // Joined, never overwritten. In practice they cannot both be set — the reader's note
             // fires only when there is no .aux at all, which is also the case in which there are
             // no floats for the budget to cut — but "cannot happen" is not a reason to write code
@@ -415,6 +448,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             floatsOmitted,
             floatsOmittedBySize,
             floatsDropped,
+            floatsRefused,
             note,
           };
 
@@ -457,7 +491,10 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
               ? `  floats: ${floats.length} label(s)` +
                 (floatsOmitted ? ` (${floatsOmitted} past the cap)` : '') +
                 (floatsOmittedBySize ? ` (${floatsOmittedBySize} past the size budget)` : '') +
-                (floatsDropped ? ` (${floatsDropped} unreportable)` : '')
+                (floatsDropped ? ` (${floatsDropped} unreportable)` : '') +
+                // Worded apart from "unreportable" on purpose: nothing was lost here, so the
+                // text channel must not read as though something was. See floatsRefused.
+                (floatsRefused ? ` (${floatsRefused} refused as not an entry)` : '')
               : '';
           const noteLine = note ? `  … ${note}` : '';
           const text = [header, ...pageLines, skippedLine, floatsLine, noteLine]
