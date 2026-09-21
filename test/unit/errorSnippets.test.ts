@@ -406,21 +406,92 @@ describe('attachErrorSnippets', () => {
   it('checks a location once, not once per diagnostic sitting on it', async () => {
     // A generated or converted .tex puts the whole body on line 1, so every error is co-located on
     // a line that can be megabytes. Verifying the echo per *error* re-normalized that line each
-    // time — 1.6s for a 500KB line and 1000 errors, inside the per-project lock. The echo below
-    // never matches, which is the case that used to re-run the check every time.
+    // time — 1.6s for a 500KB line and 1000 errors, inside the per-project lock, where a peer
+    // session waits. The echo below never matches, which is the case that used to re-run the
+    // check every time.
+    //
+    // Like the anti-quadratic test below, this measures SCALING rather than a wall clock. It also
+    // closed with an absolute budget (500ms) — tighter than the 1000ms that flaked on
+    // windows-latest (#129), over fs- and regex-bound work on a runner that inflates exactly that
+    // about tenfold. The guarantee is a shape: the expensive per-location work is done once, so
+    // the cost must not grow with the number of diagnostics sitting on that one location.
+    const FEW = 10;
+    const MANY = 1_000;
+
+    /**
+     * How much worse 100x the co-located diagnostics may be. A pure ratio — never a duration.
+     *
+     * The two hypotheses here are far further apart than in the anti-quadratic test, because the
+     * scaling claim is stronger: checking the location once makes the cost INDEPENDENT of how
+     * many diagnostics sit on it (~1x), while re-checking per diagnostic makes it proportional
+     * (~100x at this scale). Measured with the estimator below — the real implementation over six
+     * runs at 0.90-1.20, and the per-diagnostic loop spliced back in over four runs at
+     * 90.35-98.03. 10 is about log-midway: ~8x of headroom before noise can red the real
+     * implementation, ~9x before a regression could slip past.
+     *
+     * Note what this number is NOT. It is not "1x, because the work is constant": a threshold at
+     * the prediction is not a bound above it, the same trap as asserting 10 on a linear
+     * implementation handed 10x the input. Tightening either threshold back toward its prediction
+     * reintroduces the flake these tests were rewritten to remove.
+     */
+    const MAX_SCALING = 10;
+
+    /** Paired measurements to take, and small-size calls per measurement — see the loop below. */
+    const ROUNDS = 5;
+    const FEW_REPS = 3;
+
     const huge = 'the quick brown fox jumps over the lazy dog. '.repeat(12_000); // ~500KB
     const dir = await projectWith({ 'main.tex': `${huge}\nsecond line` });
-    const many = Array.from({ length: 1000 }, (_, i) =>
-      at('main.tex', 1, { message: `err ${i}`, echo: 'nothing like the line' }),
-    );
+    // One project, one location, two diagnostic counts: the file read and the single
+    // normalization are then literally identical fixed costs on both sides, so the ratio isolates
+    // the only thing that varies — how many diagnostics sit on that location.
+    const coLocated = (n: number) =>
+      Array.from({ length: n }, (_, i) =>
+        at('main.tex', 1, { message: `err ${i}`, echo: 'nothing like the line' }),
+      );
 
-    const started = process.hrtime.bigint();
-    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, many);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    const files = new FileService();
+    const few = coLocated(FEW);
+    const many = coLocated(MANY);
 
+    // Warm up, so round 1 is not timing the optimizing compiler instead of the algorithm.
+    await attachErrorSnippets(files, dir, few);
+
+    // Paired within each round, for the reason spelled out in the anti-quadratic test: measuring
+    // every small call and then every large one lets a change in machine load land entirely in
+    // one phase, which is a ratio of two different machines.
+    let outcome!: Awaited<ReturnType<typeof attachErrorSnippets>>;
+    const ratios: number[] = [];
+    let widestFewWindowMs = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      const t0 = process.hrtime.bigint();
+      for (let i = 0; i < FEW_REPS; i++) await attachErrorSnippets(files, dir, few);
+      const t1 = process.hrtime.bigint();
+      outcome = await attachErrorSnippets(files, dir, many);
+      const t2 = process.hrtime.bigint();
+      ratios.push(Number(t2 - t1) / (Number(t1 - t0) / FEW_REPS));
+      widestFewWindowMs = Math.max(widestFewWindowMs, Number(t1 - t0) / 1e6);
+    }
+
+    // The median round, not the fastest — and here there is direct evidence for that choice
+    // rather than an argument. While measuring the per-diagnostic control, one round came back at
+    // 0.19 against its four siblings' 71-116: a stall in that round's baseline window, which a
+    // minimum would have selected and PASSED, waving the regression through. A stall has to
+    // contaminate three rounds of five to move the median.
+    const scaling = [...ratios].sort((a, b) => a - b)[Math.floor(ROUNDS / 2)]!;
+
+    // The deterministic half, unchanged: the echo contradicts the source, so the location is
+    // counted as omitted and no error carries a snippet, however many diagnostics sit on it.
+    const { errors, omittedLocations } = outcome;
     expect(errors.every((e) => e.snippet === undefined)).toBe(true); // contradicted, so counted
     expect(omittedLocations).toBe(1);
-    expect(ms).toBeLessThan(500);
+
+    // Non-vacuity, as in the anti-quadratic test: the baseline window is ~70ms here, so it would
+    // take a machine some 70x quicker than this one to sink it into the timer's noise floor — and
+    // CI runners are slower, not faster. If that ever happens, fail rather than pass for the
+    // wrong reason.
+    expect(widestFewWindowMs).toBeGreaterThan(1);
+    expect(scaling).toBeLessThan(MAX_SCALING);
   });
 
   it('does not go quadratic on a document that fails with thousands of errors', async () => {
