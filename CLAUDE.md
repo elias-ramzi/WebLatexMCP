@@ -154,7 +154,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `commitContents` stages by `update-index`, which never consults `.gitignore`/`.git/info/exclude`,
   so the `summarize-paper` note that relies on the exclude was committed and pushed by the default
   scope while `"all"` (`git add -A`) left it alone. Ignored entries are settled and reported under
-  `ignored`. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
+  `ignored`. **A `check-ignore` that fails is never read as "nothing is ignored"** — returning
+  `[]` there would let the commit stage a file git means to exclude, so the filter throws. The one
+  failure with a cure of its own is named: a pathspec beyond a symbolic link (git exits 128 having
+  named one path) becomes `PathBeyondSymlinkError`, which quotes the path and points at `discard`,
+  because a recorded entry under a linked directory otherwise fails every later commit in the
+  session, unrelated files included. The path is reconstructed per requested path from git's own
+  quoted form rather than captured out of the message, which a path containing a quote or a
+  newline defeats; any other failure reports what actually happened. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
   and "tracked" is judged **where the staging step that follows will look** (`ignoredPaths`'
   `tracked` option): against HEAD for `commitContents` and `scope: "paths"`, which reset the index
   to HEAD first (`check-ignore --no-index` minus what `ls-tree HEAD` lists — a hand `git rm --cached`

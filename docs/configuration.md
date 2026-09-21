@@ -21,6 +21,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | `WEB_LATEX_MCP_CONCURRENCY_GUIDE`                          | no       | Path to a concurrency / safe-push guide surfaced to the client. Default bundled [`CONCURRENCY.md`](CONCURRENCY.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `WEB_LATEX_MCP_SKILLS_DIR`                                 | no       | Directory of skills exposed as MCP prompts (one subdirectory per skill, each with a `SKILL.md`). Default bundled [`.claude/skills`](skills.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`                           | no       | Output-schema client compatibility. Default **auto-detects Claude Desktop** and omits `outputSchema`/`structuredContent` for it only; `1` forces omit for every client, `0` disables. See [Claude Desktop compatibility](#claude-desktop-compatibility).                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `WEB_LATEX_MCP_SESSION_PROBE`                              | no       | Diagnostic only. Logs MCP connection and `_meta` information to **stderr** so a maintainer can find out how a client maps chats onto connections. Off unless set; `0`/`false`/`no`/`off` also mean off. See [Session identity probe](#session-identity-probe).                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ### `WEB_LATEX_MCP_PROJECTS` example
 
@@ -142,6 +143,15 @@ committed or mistaken for project content. With no `WEB_LATEX_MCP_SESSION` set, 
 and is still isolated, but shows up to its peers under a generated id.
 
 Shelves taken by `shelve` live under the same directory, in `shelves/`, but are **project-scoped rather than per-session**: any session on the project can list and reclaim one. That is deliberate — a shelf only its author could see would reproduce the invisible `git stash@{0}` the tool exists to replace.
+
+**Interim limitation: isolation is per server _process_, not per chat.** `WEB_LATEX_MCP_SESSION` is
+read once from the environment at startup, so every chat that shares one configured server entry
+shares one session identity and one set of shadow records — a `commit` from either chat carries
+both chats' edits. To get the per-section isolation described above today, give each session its
+**own server entry** with its own `WEB_LATEX_MCP_SESSION`, so each is a separate process. Making
+one process serve several independent sessions is tracked in
+[#18](https://github.com/elias-ramzi/WebLatexMCP/issues/18); the
+[session identity probe](#session-identity-probe) is the measurement that decides how.
 
 This works between processes on **one machine**; it is not coordination between people on different
 machines, who still meet at the git remote. See [Parallel sessions on one
@@ -428,6 +438,41 @@ only, leaving structured output fully intact for clients that support it (e.g. C
 ```json
 { "env": { "WEB_LATEX_MCP_NO_OUTPUT_SCHEMA": "1" } }
 ```
+
+## Session identity probe
+
+`WEB_LATEX_MCP_SESSION_PROBE=1` turns on **diagnostic stderr logging** for one open question: when you
+open several chats against a single configured server, does the client open one MCP connection per
+chat, one connection that tags each request with a conversation id, or one connection with nothing
+distinguishing the chats at all? The answer decides how per-chat session isolation can work
+(see [Parallel sessions](#parallel-sessions)), and it cannot be read off the code — it is a property
+of the client.
+
+It is **off unless you set it**, and `0`, `false`, `no` or `off` also mean off. When off, nothing is
+installed — not a no-op, nothing — so a tool result is byte-identical either way.
+
+With it on, every line is prefixed `[web-latex-mcp][probe]` (one `grep` away from the rest of the log)
+and the server reports three things:
+
+- each connection as it initializes, with a **monotonic counter** — so "one connection or N?" is read
+  off the highest number rather than counted by hand;
+- the `clientInfo` name and version negotiated on that connection, plus the **pid**, which answers the
+  other half of the question: one server process or several;
+- the `_meta` attached to each tool call, with the tool name, so you can line a call up with what you
+  did in which chat. An absent `_meta` prints `(absent)`, kept deliberately distinct from an empty
+  `{}` — that difference is itself part of the answer.
+
+Two limits worth knowing before you paste the output anywhere. `_meta` is **client-controlled data of
+unknown shape**: it is scrubbed of every configured token before printing and then truncated, in that
+order, so a client that echoes a credential into `_meta` does not put it in a log you forward — but it
+is still the client's data, so read it before sharing. And everything goes to **stderr**, never stdout,
+which carries the JSON-RPC protocol.
+
+```json
+{ "env": { "WEB_LATEX_MCP_SESSION_PROBE": "1" } }
+```
+
+Leave it off in normal use: it is a measuring device for a specific question, not a logging level.
 
 ## Cross-platform notes
 
