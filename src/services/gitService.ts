@@ -1443,8 +1443,18 @@ export class GitService {
    * The path-limited branch batches its pathspec lists ({@link chunkPathspecs}), so a failure
    * part way through destroys some of the named paths and not others — {@link discardedOrExplain}
    * is what tells the caller so.
+   *
+   * `discarded` answers "did this call REACH the paths it was given" — whether git knew each
+   * requested path at all — not "were bytes destroyed": a tracked path already identical to HEAD
+   * is reached and discarded even though nothing changed on disk. `missed` names the requested
+   * paths git matched nothing for, in the caller's own spelling, and is **omitted when empty** so
+   * the ordinary result shape stays `{ discarded: true }`. Before #127 both halves were silent:
+   * `git clean -f` matching nothing exits 0, so a request naming a file that was never there —
+   * or, on an ignorecase clone, naming an untracked file in another case — came back
+   * `discarded: true` with the file still sitting on disk. In the server's most destructive call,
+   * being told a discard happened when it did not is the failure mode that matters.
    */
-  async discard(dir: string, paths?: string[]): Promise<{ discarded: boolean }> {
+  async discard(dir: string, paths?: string[]): Promise<{ discarded: boolean; missed?: string[] }> {
     const git = simpleGit(dir);
     if (paths && paths.length > 0) {
       // `--literal-pathspecs`, as for every path-taking call in this file: a pathspec is a glob by
@@ -1456,8 +1466,8 @@ export class GitService {
       // the index actually tracks (`coversPath`'s directory rule, as in `commit` above: naming a
       // directory tracked underneath still counts), and skip it entirely when that subset is
       // empty. `clean -f` always runs over every requested path regardless — untracked is exactly
-      // what it exists to remove, and a path matching nothing there at all is already a silent
-      // no-op (exit 0), not an error.
+      // what it exists to remove, and a path matching nothing there at all stays a no-op (exit 0)
+      // rather than an error; it is now counted into `missed` instead of passing unremarked.
       // A literal pathspec never folds case (as in `commit` above), so on a case-insensitive
       // repository (`core.ignorecase = true`) a caller naming a tracked file in another case than
       // the index — the same file on that filesystem — matched nothing below, `checkout` was
@@ -1467,11 +1477,35 @@ export class GitService {
       // the caller's spelling unchanged, so an untracked scratch file still falls through to
       // `clean` exactly as before. On a case-sensitive repository this costs nothing extra.
       const caseInsensitive = await this.isCaseInsensitive(dir);
+      const fold = caseInsensitive ? foldCase : undefined;
       let resolvedPaths = paths;
       if (caseInsensitive) {
         const indexNames = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean);
         const canonical = canonicalNames(indexNames);
         resolvedPaths = paths.map((p) => canonical.resolve(toPosix(p)));
+      }
+      // The UNTRACKED half of the same question (#127). The index fold above left `clean` running
+      // over the caller's raw spelling, because an untracked file has no index entry to resolve
+      // against — so on an ignorecase clone `discard(['scratch.txt'])` folded a tracked path but
+      // left an untracked `Scratch.txt` on disk, and one call folded or did not depending on
+      // something the caller cannot see. `--icase-pathspecs` is not the way out: git refuses it
+      // alongside `--literal-pathspecs`, which every path-taking call here carries so that
+      // `a[1].tex` never also means `a1.tex`. So resolve against the OTHER source of truth — the
+      // working tree's untracked listing — with the same exact-spelling-first `canonicalNames`
+      // machinery, and keep every pathspec literal. `--exclude-standard` matches what `clean -f`
+      // (no `-x`) will actually remove, so the listing and the removal agree about ignored files.
+      // One extra `ls-files` per path-limited discard, unconditional because `missed` below needs
+      // the listing on a case-sensitive clone too; the fold itself is applied only when
+      // `core.ignorecase` says so, never because of what the filesystem does.
+      const untracked = (
+        await git.raw(['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '-z'])
+      )
+        .split('\0')
+        .filter(Boolean);
+      let cleanPaths = paths;
+      if (caseInsensitive) {
+        const canonicalUntracked = canonicalNames(untracked);
+        cleanPaths = paths.map((p) => canonicalUntracked.resolve(toPosix(p)));
       }
       // All three calls below are {@link chunkPathspecs}-batched (#110), every chunk keeping
       // `--literal-pathspecs`. The listing combines as a concatenation — the chunks partition
@@ -1486,8 +1520,21 @@ export class GitService {
         );
       }
       const tracked = resolvedPaths.filter((p) =>
-        indexed.some((name) => coversPath(p, name, caseInsensitive ? foldCase : undefined)),
+        indexed.some((name) => coversPath(p, name, fold)),
       );
+      // What this call will reach: every requested path that covers an index entry or an
+      // untracked working-tree file (`coversPath`'s directory rule, so naming a directory counts
+      // for what lies under it). Reported in the CALLER's own spelling — that is the string they
+      // typed and the one they have to correct. Computed BEFORE the destructive steps: afterwards
+      // a path that was reached looks exactly like one that never matched, since its file is gone
+      // or back at HEAD.
+      const missed = paths.filter((p) => {
+        const rel = toPosix(p);
+        return (
+          !indexed.some((name) => coversPath(rel, name, fold)) &&
+          !untracked.some((name) => coversPath(rel, name, fold))
+        );
+      });
       // The two DESTRUCTIVE steps share one wrapper, so a failure in `clean` also reports the
       // `checkout` chunks that already landed — see `discardedOrExplain`. Each chunk restores or
       // removes only its own paths, with no cross-path state, so the chunks compose into exactly
@@ -1498,14 +1545,23 @@ export class GitService {
             await git.raw(['--literal-pathspecs', 'checkout', '--', ...chunk]);
           }
         }
-        for (const chunk of chunkPathspecs(paths)) {
+        for (const chunk of chunkPathspecs(cleanPaths)) {
           await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...chunk]);
         }
       });
-    } else {
-      await git.checkout(['--', '.']);
-      await git.clean('fd');
+      // A partial miss still discarded something, so `discarded` stays true and `missed` names
+      // the rest; only a call that reached nothing at all reports `discarded: false`. A bare
+      // boolean cannot say "one of the two", and a bare list would leave `discarded: true` on a
+      // call that did nothing.
+      return {
+        discarded: missed.length < paths.length,
+        ...(missed.length > 0 ? { missed } : {}),
+      };
     }
+    // The whole-tree branch names no path, so nothing can be missed: `checkout -- .` plus
+    // `clean -fd` always leaves the tree at HEAD, which is the whole of what it promises.
+    await git.checkout(['--', '.']);
+    await git.clean('fd');
     return { discarded: true };
   }
 

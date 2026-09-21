@@ -13,49 +13,45 @@ import { GitService } from '../../src/services/gitService.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
- * Issue #70, the last "not provable on Linux" checkbox: **does a path-limited `discard` remove an
- * UNTRACKED file the caller named in another case?**
+ * Issue #70 (the probe) and issue #127 (the fix): **does a path-limited `discard` remove an
+ * UNTRACKED file the caller named in another case, and what does it report when it does not?**
  *
- * `GitService.discard` resolves requested paths onto the index's spelling (`canonicalNames`) and
- * uses those resolved names for `ls-files` and `checkout`, but the `clean -f` loop deliberately
- * iterates the caller's **raw** spelling — an untracked file has no index entry to resolve
- * against, so there is nothing else it could iterate. That leaves the untracked half of the call
- * matching by whatever rule git's own pathspec machinery applies, which is what this file
- * measures rather than assumes.
+ * `GitService.discard` resolved requested paths onto the index's spelling (`canonicalNames`) and
+ * used those resolved names for `ls-files` and `checkout`, but the `clean -f` loop iterated the
+ * caller's **raw** spelling — an untracked file has no index entry to resolve against. So one
+ * call folded or did not fold depending on something the caller cannot see, and because `git
+ * clean -f` matching nothing exits 0, both outcomes came back `discarded: true`.
  *
- * **Measured on Linux** (git 2.46, ext4, `core.ignorecase` forced to `true` on a case-sensitive
- * filesystem, so git believes the repository folds while the two names really are two files):
- * `git --literal-pathspecs clean -f -- scratch.txt` does **not** remove an untracked `Scratch.txt`.
- * It exits 0, prints nothing, and the file stays. Only the exact spelling removes it, and with
- * both names present only the exactly-named one goes.
+ * **What git itself does is unchanged, and is why the fix has to live in the server.** Measured
+ * on Linux (git 2.46, ext4, `core.ignorecase` forced to `true` on a case-sensitive filesystem, so
+ * git believes the repository folds while the two names really are two files):
+ * `git --literal-pathspecs clean -f -- scratch.txt` does **not** remove an untracked
+ * `Scratch.txt`. It exits 0, prints nothing, and the file stays. Measured again against a
+ * genuinely case-insensitive, case-preserving filesystem (NTFS through WSL2's DrvFs, where git
+ * auto-detects `core.ignorecase = true`): identical — `Scratch.txt` is the only directory entry,
+ * `git status` reports `?? Scratch.txt`, and only the exact spelling removes it.
  *
- * **Also measured against a genuinely case-insensitive, case-preserving filesystem** (NTFS through
- * WSL2's DrvFs, where git auto-detects `core.ignorecase = true`): identical. `Scratch.txt` is the
- * only directory entry, `git status` reports `?? Scratch.txt`, and `clean -f -- scratch.txt`
- * removes nothing while `clean -f -- Scratch.txt` removes it. The whole suite below is green with
- * `TMPDIR` pointed at that mount, so the case-insensitive branch of the third case is exercised
- * rather than merely predicted. That is the same git matching code as the macOS/Windows legs run,
- * over storage that really does fold — but not those platforms' own builds, which is why the CI
- * legs still decide it.
+ * `core.ignorecase` governs how git compares names against the *index* and the *working tree
+ * listing*; it does not make a pathspec case-insensitive. Pathspec folding is a separate, opt-in
+ * knob (`:(icase)` magic, `--icase-pathspecs`, `GIT_ICASE_PATHSPECS`) — and `--literal-pathspecs`,
+ * which every path-taking git call in this repo carries so that `a[1].tex` never also means
+ * `a1.tex`, is mutually exclusive with it ("fatal: global 'literal' pathspec setting is
+ * incompatible with all other global pathspec settings"). Dropping it to buy the fold would
+ * reintroduce globbing in the most destructive call in the server.
  *
- * **Prediction for macOS and Windows: identical — the file survives there too.** `core.ignorecase`
- * governs how git compares names against the *index* and the *working tree listing*; it does not
- * make a pathspec case-insensitive. Pathspec folding is a separate, opt-in knob (`:(icase)` magic,
- * `--icase-pathspecs`, `GIT_ICASE_PATHSPECS`) — and `--literal-pathspecs`, which every path-taking
- * git call in this repo carries, is mutually exclusive with it ("fatal: global 'literal' pathspec
- * setting is incompatible with all other global pathspec settings"). `clean` enumerates untracked
- * entries from the directory, which on a case-preserving filesystem hands it `Scratch.txt`, and
- * then compares that against the pathspec byte-exactly. The existing case-fold work corroborates
- * this from the other side: `canonicalNames` exists in `discard`/`commit` precisely because a
- * literal pathspec does not fold on an ignorecase clone, and those tests are green on the macOS
- * and Windows legs.
+ * **So #127 folds in the server instead**, against the other source of truth: `discard` resolves
+ * each requested path against the working tree's untracked listing (`ls-files --others
+ * --exclude-standard`) through the same exact-spelling-first `canonicalNames` machinery, on an
+ * ignorecase clone only, with every pathspec still literal. And it stops swallowing the miss —
+ * a requested path git can match nothing for comes back in `missed`, and a call that reached
+ * nothing at all reports `discarded: false`.
  *
- * **A red macOS or Windows leg here is the finding, not a flake.** It would mean git's untracked
- * matching folds on a genuinely case-insensitive filesystem while it does not on Linux — i.e. the
- * server's most destructive call behaves differently per platform for the same arguments, and
- * the Linux suite can never see it.
+ * **A red macOS or Windows leg here is the finding, not a flake.** `core.ignorecase` defaults to
+ * true on both, and the fixture pins it explicitly for exactly that reason; a divergence would
+ * mean the server's most destructive call behaves differently per platform for the same
+ * arguments, and the Linux suite can never see it.
  *
- * Anti-vacuity, which is the whole risk in a probe like this:
+ * Anti-vacuity, which is the whole risk in a file like this:
  *  - every case asserts the directory's contents **before** the destructive call, so a fixture
  *    that never materialised fails rather than satisfying an "it is gone" assertion for free;
  *  - each survival assertion is followed by a discard under the disk's own spelling that must
@@ -182,10 +178,13 @@ describe('discard and the case of an UNTRACKED path (issue #70)', () => {
     const res = await call(mine, 'discard', { paths: ['Scratch.txt'], confirm: true });
     expect(res.isError, res.text).toBe(false);
     expect(res.sc.discarded).toBe(true);
+    expect(res.sc.missed).toEqual([]);
     expect(await entries(h.dir)).toEqual(['Notes.txt']);
   });
 
-  it('the probe: naming the other case leaves the untracked file on disk, and still reports discarded', async () => {
+  // Pre-#127 this was the probe, and it asserted the opposite: the file SURVIVED and the tool
+  // still reported `discarded: true`. Both halves flipped with the fix.
+  it('#127: naming the other case removes the untracked file on an ignorecase clone', async () => {
     const h = await harness(true);
     const mine = await h.session('mine');
     await writeFile(path.join(h.dir, 'Scratch.txt'), 'scratch\n', 'utf8');
@@ -195,23 +194,45 @@ describe('discard and the case of an UNTRACKED path (issue #70)', () => {
 
     const res = await call(mine, 'discard', { paths: ['scratch.txt'], confirm: true });
     expect(res.isError, res.text).toBe(false);
-    // `clean` matching nothing is a silent no-op (exit 0), so the tool reports success either
-    // way — the caller is told the discard happened whatever the file did.
     expect(res.sc.discarded).toBe(true);
+    expect(res.sc.missed).toEqual([]);
 
-    // Measured on Linux; predicted identical on macOS/Windows (see the file header). A failure
-    // here on one leg only IS the #70 finding: git folded an untracked pathspec on a genuinely
-    // case-insensitive filesystem and did not on Linux.
+    // The server folded `scratch.txt` onto the untracked listing's `Scratch.txt` before handing
+    // it to `clean`; git's own pathspec matching is byte-exact here and always was (see the file
+    // header), so a failure on one leg only is a divergence in the SERVER's fold, not in git's.
+    expect(
+      await entries(h.dir),
+      `filesystem reported ${JSON.stringify(await entries(h.dir))} on ${process.platform}`,
+    ).toEqual(['Notes.txt']);
+  });
+
+  it('#127 twin, just outside: with core.ignorecase=false the untracked file survives and the miss is REPORTED', async () => {
+    const h = await harness(false);
+    const mine = await h.session('mine');
+    await writeFile(path.join(h.dir, 'Scratch.txt'), 'scratch\n', 'utf8');
+    expect(await entries(h.dir)).toEqual(['Notes.txt', 'Scratch.txt']);
+
+    const res = await call(mine, 'discard', { paths: ['scratch.txt'], confirm: true });
+    expect(res.isError, res.text).toBe(false);
+    // The clone says it is case-sensitive, so nothing is folded — byte-exact behaviour, even on
+    // macOS/Windows where the filesystem would disagree. `core.ignorecase` is the source of
+    // truth, never the filesystem.
     expect(
       await entries(h.dir),
       `filesystem reported ${JSON.stringify(await entries(h.dir))} on ${process.platform}`,
     ).toEqual(['Notes.txt', 'Scratch.txt']);
     expect(await readFile(path.join(h.dir, 'Scratch.txt'), 'utf8')).toBe('scratch\n');
+    // …but the caller is no longer told the file is gone. This is the half of #127 that holds
+    // whether or not the fold applies.
+    expect(res.sc.discarded).toBe(false);
+    expect(res.sc.missed).toEqual(['scratch.txt']);
+    expect(res.text).toContain('"scratch.txt"');
 
     // And the same file IS removable here — so "not folded" cannot be a `clean` that reached
     // nothing at all on this platform.
     const exact = await call(mine, 'discard', { paths: ['Scratch.txt'], confirm: true });
     expect(exact.isError, exact.text).toBe(false);
+    expect(exact.sc.missed).toEqual([]);
     expect(await entries(h.dir)).toEqual(['Notes.txt']);
   });
 
@@ -221,35 +242,36 @@ describe('discard and the case of an UNTRACKED path (issue #70)', () => {
     const fs = await writeBothSpellings(h.dir);
 
     if (fs.separate) {
-      // Case-sensitive filesystem (the ubuntu leg): two genuinely different files. If git folded
-      // untracked pathspecs under `core.ignorecase`, this call would destroy a file the caller
-      // never named — in the server's most destructive call.
+      // Case-sensitive filesystem (the ubuntu leg): two genuinely different files, on a clone
+      // whose `core.ignorecase` says they fold. THIS is what `canonicalNames`' exact-first rule
+      // buys: the caller named `scratch.txt` verbatim, the untracked listing holds it verbatim,
+      // so the fold never fires and the file the caller did not name survives. A fold that
+      // resolved to "whichever entry sorted first" would destroy `Scratch.txt` here — in the
+      // server's most destructive call.
       expect(await entries(h.dir)).toEqual(['Notes.txt', 'Scratch.txt', 'scratch.txt']);
       const res = await call(mine, 'discard', { paths: ['scratch.txt'], confirm: true });
       expect(res.isError, res.text).toBe(false);
+      expect(res.sc.missed).toEqual([]);
       expect(await entries(h.dir)).toEqual(['Notes.txt', 'Scratch.txt']);
       expect(await readFile(path.join(h.dir, 'Scratch.txt'), 'utf8')).toBe('upper\n');
       return;
     }
 
     // Case-insensitive filesystem (the macOS/Windows legs): the two writes are one file, kept
-    // under the spelling that created it, holding the second write's bytes. Same question, and
-    // the branch is chosen by what the disk did, never by `process.platform`.
+    // under the spelling that created it, holding the second write's bytes. There is no second
+    // file to destroy, and the one file IS what the caller named — the filesystem says so — so
+    // #127's fold removes it. The branch is chosen by what the disk did, never by
+    // `process.platform`.
     expect(await entries(h.dir)).toEqual(['Notes.txt', fs.onDisk].sort());
     expect(await readFile(path.join(h.dir, fs.onDisk), 'utf8')).toBe('lower\n');
 
     const res = await call(mine, 'discard', { paths: [fs.other], confirm: true });
     expect(res.isError, res.text).toBe(false);
+    expect(res.sc.missed).toEqual([]);
     expect(
       await entries(h.dir),
       `discard(${fs.other}) against on-disk ${fs.onDisk} on ${process.platform}`,
-    ).toEqual(['Notes.txt', fs.onDisk].sort());
-
-    // …and the disk's own spelling does remove it, so the survival above is a non-match and not
-    // a `clean` that reached nothing here.
-    const exact = await call(mine, 'discard', { paths: [fs.onDisk], confirm: true });
-    expect(exact.isError, exact.text).toBe(false);
-    expect(await entries(h.dir)).toEqual(['Notes.txt']);
+    ).toEqual(['Notes.txt']);
   });
 
   it('contrast: a TRACKED path named in the other case IS restored, because discard resolves it onto the index spelling', async () => {
@@ -276,5 +298,84 @@ describe('discard and the case of an UNTRACKED path (issue #70)', () => {
     // The clone says it is case-sensitive, so no spelling is resolved — even on macOS/Windows,
     // where the filesystem would disagree. `core.ignorecase` is the source of truth.
     expect(await readFile(path.join(h.dir, 'Notes.txt'), 'utf8')).toBe('CHANGED\n');
+    // And the tracked half reports its miss the same way the untracked half does: the edit is
+    // still sitting there, so the answer is not "discarded".
+    expect(res.sc.discarded).toBe(false);
+    expect(res.sc.missed).toEqual(['notes.txt']);
+  });
+
+  // The reporting half of #127, which holds whatever the fold does: a path no fold can rescue,
+  // because nothing of that name exists under any spelling.
+  it('#127: a path that matches nothing at all is reported, not swallowed', async () => {
+    const h = await harness(true);
+    const mine = await h.session('mine');
+
+    const res = await call(mine, 'discard', { paths: ['nothing-here.txt'], confirm: true });
+    expect(res.isError, res.text).toBe(false);
+    expect(res.sc.discarded).toBe(false);
+    expect(res.sc.missed).toEqual(['nothing-here.txt']);
+    // The text channel carries it too — an MCP client that shows only the text must not read
+    // this as a completed discard.
+    expect(res.text).toContain('nothing-here.txt');
+    expect(res.text).toContain('still exactly as they were');
+    // …and it must not open with the word the caller reads as "done".
+    expect(res.text).toMatch(/^discarded NOTHING:/);
+  });
+
+  it('#127: a partial miss still reports what it DID discard, and names only the rest', async () => {
+    const h = await harness(true);
+    const mine = await h.session('mine');
+    await writeFile(path.join(h.dir, 'Notes.txt'), 'CHANGED\n', 'utf8');
+    await writeFile(path.join(h.dir, 'Scratch.txt'), 'scratch\n', 'utf8');
+    expect(await entries(h.dir)).toEqual(['Notes.txt', 'Scratch.txt']);
+
+    const res = await call(mine, 'discard', {
+      paths: ['Notes.txt', 'Scratch.txt', 'nothing-here.txt'],
+      confirm: true,
+    });
+    expect(res.isError, res.text).toBe(false);
+    // Two of the three landed, so `discarded` is true — a bare boolean cannot say "one of the
+    // three", which is why `missed` exists alongside it rather than instead of it.
+    expect(res.sc.discarded).toBe(true);
+    expect(res.sc.missed).toEqual(['nothing-here.txt']);
+    expect(res.text).toMatch(/^discarded uncommitted changes, EXCEPT:/);
+    expect(await entries(h.dir)).toEqual(['Notes.txt']);
+    expect(await readFile(path.join(h.dir, 'Notes.txt'), 'utf8')).toBe('a\nb\nc\n');
+  });
+
+  it('#127: a whole-tree discard names no path, so it misses nothing', async () => {
+    const h = await harness(true);
+    const mine = await h.session('mine');
+    await writeFile(path.join(h.dir, 'Notes.txt'), 'CHANGED\n', 'utf8');
+    await writeFile(path.join(h.dir, 'Scratch.txt'), 'scratch\n', 'utf8');
+
+    const res = await call(mine, 'discard', { confirm: true });
+    expect(res.isError, res.text).toBe(false);
+    expect(res.sc.discarded).toBe(true);
+    expect(res.sc.missed).toEqual([]);
+    expect(await entries(h.dir)).toEqual(['Notes.txt']);
+  });
+
+  // Issue #130: `structuredContent` alone pins the HANDLER, not the contract. The MCP SDK
+  // validates the result against the outputSchema and then throws the parse result away, and a
+  // zod object strips rather than rejects, so a key the schema never declares reaches the client
+  // regardless — every assertion above would stay green with `missed` deleted from the schema,
+  // while a model reading the tool's schema would never learn the field exists. Asserted off a
+  // real `listTools()` round trip instead.
+  it('#127/#130: `missed` is DECLARED in the advertised outputSchema, not merely emitted', async () => {
+    const h = await harness(true);
+    const mine = await h.session('mine');
+
+    const advertised = (await mine.client.listTools()).tools.find((t) => t.name === 'discard');
+    const props = (
+      advertised?.outputSchema as { properties?: Record<string, { description?: string }> }
+    )?.properties;
+    expect(props?.missed).toBeDefined();
+    // Declared as the thing it is: a list of paths the discard could NOT reach, not a second
+    // list of what it removed.
+    expect(props?.missed?.description ?? '').toMatch(/NOT gone/);
+    expect(props?.discarded?.description ?? '').toMatch(/matched nothing/);
+    // And required, so a client never has to tell "no misses" from "this server is older".
+    expect((advertised?.outputSchema as { required?: string[] })?.required).toContain('missed');
   });
 });
