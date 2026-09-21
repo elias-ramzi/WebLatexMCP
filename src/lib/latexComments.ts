@@ -27,15 +27,25 @@
  */
 
 /**
- * Index of the `%` that starts a line comment in `line`, or `-1` when the line has none.
+ * Index into `content` of the `%` that starts a line comment within `[start, end)`, or `-1` when
+ * that span has none. The span must be ONE line's worth of content with no terminator inside it:
+ * a comment ends at the line break, so a scan that ran past one would carry a comment onto the
+ * following line.
  *
- * `line` is one source line with no terminator (as {@link splitLines} produces); a `\r` left on
- * the end would simply be ordinary content to this scan.
+ * The range form is the primitive, and `rewriteMode.ts`'s whole-file scan is its only reason for
+ * existing: that caller holds the file as one string and walks it by offset, so slicing a line
+ * out per match would allocate on every occurrence of a `replaceAll` run. {@link
+ * commentStartIndex} is the same scan over a standalone line.
+ *
+ * Parity is counted rather than implemented by skipping the character after each backslash. The
+ * two are equivalent — `\\%` is a comment and `\\\%` is not under either — but a counter says
+ * the rule the doc above states, where a loop that mutates its own index makes the reader
+ * re-derive it.
  */
-export function commentStartIndex(line: string): number {
+export function commentStartInRange(content: string, start: number, end: number): number {
   let backslashes = 0;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
+  for (let i = start; i < end; i++) {
+    const ch = content[i];
     if (ch === '\\') {
       backslashes++;
       continue;
@@ -45,4 +55,14 @@ export function commentStartIndex(line: string): number {
     backslashes = 0;
   }
   return -1;
+}
+
+/**
+ * Index of the `%` that starts a line comment in `line`, or `-1` when the line has none.
+ *
+ * `line` is one source line with no terminator (as {@link splitLines} produces); a `\r` left on
+ * the end would simply be ordinary content to this scan.
+ */
+export function commentStartIndex(line: string): number {
+  return commentStartInRange(line, 0, line.length);
 }

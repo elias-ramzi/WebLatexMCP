@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { EditOp } from '../services/fileService.js';
+import { commentStartInRange } from './latexComments.js';
 
 /**
  * Rewrite preservation mode: when the model replaces text in a `.tex`-like file, should the
@@ -132,41 +133,13 @@ export function commentOut(text: string): string {
  * which must be the offset of the line's terminator or end-of-file), or `-1` when that line
  * carries no comment.
  *
- * The escaping rule is TeX's own, and it is a **parity** rule on the run of backslashes
- * immediately before the `%`, not "is the previous character a backslash":
- *
- *  - `%`      -> a comment (zero backslashes, even).
- *  - `\%`     -> NOT a comment: an escaped, literal percent sign.
- *  - `\\%`    -> a comment. `\\` is a complete control sequence (a line break, in LaTeX) that
- *                consumes both backslashes, so the `%` that follows is unescaped. This is the
- *                boundary case worth stating out loud, because "a backslash appears before the
- *                `%`" gets it exactly backwards.
- *  - `\\\%`   -> NOT a comment (`\\` then `\%`).
- *
- * The loop implements that parity by skipping the character after every backslash it consumes,
- * which is the same thing TeX's tokenizer does and needs no counter.
- *
- * Known, accepted limitation, the same one `LINE_COMMENT_EXTENSIONS` documents: this has no idea
- * whether the line sits inside a `verbatim`/`lstlisting`/`minted` environment, where `%` is
- * ordinary printed text rather than a comment. Deciding that needs real LaTeX parsing. The cost
- * here is in the safe direction — a match inside such an environment is reported as commented and
- * therefore *skipped* by `excludeComments`, so the caller does less than it asked rather than
- * silently rewriting text it meant to protect.
+ * Delegated to {@link commentStartInRange}, the single home of the `%` rule, rather than scanned
+ * here. This module and `search_files`' `excludeComments` each grew their own parity scan — one
+ * counting backslashes, one skipping the character after each — and while the two agreed on
+ * every case tested, two implementations of the same rule are how the code that WRITES comments
+ * and the code that READS them eventually disagree. The rule itself, and its `verbatim`
+ * limitation, are stated there.
  */
-function commentStartOnLine(content: string, lineStart: number, lineEnd: number): number {
-  for (let i = lineStart; i < lineEnd; i++) {
-    const ch = content[i];
-    // The next character is escaped, whatever it is — which is exactly why `\\%` IS a comment:
-    // the second backslash is consumed here as the escaped character, leaving the `%` live.
-    if (ch === '\\') {
-      i++;
-      continue;
-    }
-    if (ch === '%') return i;
-  }
-  return -1;
-}
-
 /** Offset of the first character of the line containing `index`. */
 function lineStartAt(content: string, index: number): number {
   for (let i = index - 1; i >= 0; i--) {
@@ -221,7 +194,7 @@ export function matchIsCommented(content: string, start: number, end: number): b
   let lineStart = lineStartAt(content, start);
   for (;;) {
     const { end: lineEnd, next } = lineBoundsFrom(content, lineStart);
-    const commentAt = commentStartOnLine(content, lineStart, lineEnd);
+    const commentAt = commentStartInRange(content, lineStart, lineEnd);
     // `commentAt < end`: the comment begins before the match ends. `start < lineEnd`: the match
     // begins before this line's comment region ends. Together they are "the two spans overlap"
     // for the line currently under the cursor.
