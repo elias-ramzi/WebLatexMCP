@@ -1159,6 +1159,28 @@ export class GitService {
   }
 
   /**
+   * {@link numstat} over a pathspec list too long for one command line: `git diff <leading> --
+   * <chunk>` once per {@link chunkPathspecs} chunk, concatenated.
+   *
+   * The concatenation IS the union: `chunkPathspecs` partitions the paths, so a file can be
+   * reported by at most one chunk, and a path a chunk reports nothing for is unchanged in that
+   * diff rather than unexamined. Chunks keep the input's order and git sorts within each, so the
+   * result is byte-for-byte what a single call returns for an ordered path list. Handed the whole
+   * list this is exactly one call, so the small case is unchanged.
+   */
+  private async numstatBatched(
+    git: SimpleGit,
+    leading: string[],
+    paths: string[],
+  ): Promise<DiffFile[]> {
+    const files: DiffFile[] = [];
+    for (const chunk of chunkPathspecs(paths)) {
+      files.push(...(await this.numstat(git, [...leading, '--', ...chunk])));
+    }
+    return files;
+  }
+
+  /**
    * The blob id `content` would get if committed at `relPath` — `git hash-object --stdin --path`
    * WITHOUT `-w`, so nothing is written. `--path` applies the path's gitattributes clean filter
    * (`* text=auto` turns CRLF into LF), which is exactly the point: two byte strings with the same
@@ -2528,16 +2550,20 @@ export class GitService {
       //
       // An empty `touchedPaths` means the reverted commits changed no file at all; an unscoped
       // diff would then report the whole dirty tree as this revert's doing.
+      //
+      // Both diffstats and the unstage below batch their pathspec list ({@link chunkPathspecs}),
+      // so a commit touching thousands of paths does not hand git one oversized command line —
+      // which is exactly the failure `landedOrExplain` exists to describe rather than prevent.
       const files =
         touchedPaths.length > 0
           ? await this.landedOrExplain(git, touchedPaths, () =>
-              this.numstat(git, ['--cached', 'HEAD', '--', ...touchedPaths]),
+              this.numstatBatched(git, ['--cached', 'HEAD'], touchedPaths),
             )
           : [];
       const mismatchedFiles =
         expectSha !== undefined && touchedPaths.length > 0
           ? await this.landedOrExplain(git, touchedPaths, () =>
-              this.numstat(git, ['--cached', expectSha, '--', ...touchedPaths]),
+              this.numstatBatched(git, ['--cached', expectSha], touchedPaths),
             )
           : null;
       // `revert -n` STAGES what it reverted. Unstage it so the change sits in the working tree
@@ -2547,10 +2573,16 @@ export class GitService {
       // NEVER run that reset on a conflicted path: it silently clears the unmerged state and
       // leaves the `<<<<<<<` markers sitting in the file as an ordinary edit. The conflict branch
       // above therefore aborts and returns; it never reaches here.
+      //
+      // Batched like the diffstats: each chunk unstages its own paths and nothing else, so the
+      // chunks compose into exactly the reset one call would have performed. A chunk that fails
+      // leaves the earlier ones unstaged — `landedOrExplain` says so ("may still be staged").
       if (touchedPaths.length > 0) {
-        await this.landedOrExplain(git, touchedPaths, () =>
-          git.raw(['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...touchedPaths]),
-        );
+        await this.landedOrExplain(git, touchedPaths, async () => {
+          for (const chunk of chunkPathspecs(touchedPaths)) {
+            await git.raw(['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...chunk]);
+          }
+        });
       }
       return {
         status: 'reverted',
@@ -2618,31 +2650,38 @@ export class GitService {
    * v1's `-z` form is `XY <path>\0`, with a rename/copy's ORIGINAL path following as its own
    * record. Both sides of such a pair are checked against `touchedPaths`, so a rename away from a
    * touched path counts as dirt on it, while a path outside the set never enters the result.
+   *
+   * The pathspec list is {@link chunkPathspecs}-batched. Combining is a UNION and nothing else:
+   * a path git says nothing about in its chunk is clean there and everywhere, and both records
+   * of a rename pair come out of whichever chunk matched either side, so the pairing never
+   * straddles a chunk boundary. A chunk that throws propagates — never read as "clean".
    */
   private async dirtyAmong(git: SimpleGit, touchedPaths: string[]): Promise<string[]> {
     if (touchedPaths.length === 0) return [];
-    const out = await git.raw([
-      '-c',
-      'core.quotePath=false',
-      '--literal-pathspecs',
-      'status',
-      '--porcelain',
-      '-z',
-      '--',
-      ...touchedPaths,
-    ]);
-    const records = out.split('\0').filter(Boolean);
     const wanted = new Set(touchedPaths);
     const dirty = new Set<string>();
-    for (let i = 0; i < records.length; i++) {
-      const record = records[i] ?? '';
-      const code = record.slice(0, 2);
-      const named = [toPosix(record.slice(3))];
-      if (code.includes('R') || code.includes('C')) {
-        const original = records[++i];
-        if (original !== undefined) named.push(toPosix(original));
+    for (const chunk of chunkPathspecs(touchedPaths)) {
+      const out = await git.raw([
+        '-c',
+        'core.quotePath=false',
+        '--literal-pathspecs',
+        'status',
+        '--porcelain',
+        '-z',
+        '--',
+        ...chunk,
+      ]);
+      const records = out.split('\0').filter(Boolean);
+      for (let i = 0; i < records.length; i++) {
+        const record = records[i] ?? '';
+        const code = record.slice(0, 2);
+        const named = [toPosix(record.slice(3))];
+        if (code.includes('R') || code.includes('C')) {
+          const original = records[++i];
+          if (original !== undefined) named.push(toPosix(original));
+        }
+        for (const rel of named) if (wanted.has(rel)) dirty.add(rel);
       }
-      for (const rel of named) if (wanted.has(rel)) dirty.add(rel);
     }
     return [...dirty].sort();
   }
@@ -2658,6 +2697,13 @@ export class GitService {
    * `ls-tree -z` because the entry carries the path (`<mode> <type> <sha>\t<path>`) and a name
    * with a newline would otherwise split a record in two; `core.quotePath=false` alongside it for
    * the same rule every path-returning call here follows.
+   *
+   * Each ref's pathspec list is {@link chunkPathspecs}-batched, and the probe stays FAIL-CLOSED
+   * across the batching: a chunk that throws propagates out of here (the preflight then refuses
+   * the whole revert) rather than contributing an empty entry list that would read as "no links
+   * in this chunk". Per ref the combination is a union — a path `ls-tree` does not list in its
+   * chunk is simply absent from that tree — and every path still gets its own on-disk
+   * `lstat`/{@link linkedAncestor} check below, which no batching touches.
    */
   private async linksAmong(
     dir: string,
@@ -2673,21 +2719,23 @@ export class GitService {
     }
     const links = new Set<string>();
     for (const ref of refs) {
-      const out = await git.raw([
-        '-c',
-        'core.quotePath=false',
-        '--literal-pathspecs',
-        'ls-tree',
-        '-z',
-        ref,
-        '--',
-        ...touchedPaths,
-      ]);
-      for (const entry of out.split('\0')) {
-        const tab = entry.indexOf('\t');
-        if (tab < 0) continue;
-        if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
-        links.add(toPosix(entry.slice(tab + 1)));
+      for (const chunk of chunkPathspecs(touchedPaths)) {
+        const out = await git.raw([
+          '-c',
+          'core.quotePath=false',
+          '--literal-pathspecs',
+          'ls-tree',
+          '-z',
+          ref,
+          '--',
+          ...chunk,
+        ]);
+        for (const entry of out.split('\0')) {
+          const tab = entry.indexOf('\t');
+          if (tab < 0) continue;
+          if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
+          links.add(toPosix(entry.slice(tab + 1)));
+        }
       }
     }
     for (const rel of touchedPaths) {
@@ -2738,8 +2786,11 @@ export class GitService {
    *
    * If such a step fails, the caller must not be told "the revert failed": it did not, and a
    * caller who retries will revert twice. So the failure is re-thrown with the truth attached.
-   * The realistic trigger is a long path list on Windows, whose ~32 KB command line the
-   * server-derived `touchedPaths` can exceed on a large reverted commit.
+   * The trigger this was written for — a path list long enough to blow Windows' ~32 KB command
+   * line — is now batched away ({@link chunkPathspecs}), and a batched step can also fail PART
+   * WAY through, which is why the message says the change "may still be staged" rather than
+   * promising either state. Everything else that can fail mid-step (a spawn failure, a
+   * filesystem error, one pathological path longer than a whole command line) still lands here.
    */
   private async landedOrExplain<T>(
     git: SimpleGit,
@@ -2778,6 +2829,70 @@ export class GitService {
 function trackedModifiedPaths(status: GitStatusSummary): string[] {
   const notAdded = new Set(status.not_added);
   return status.files.filter((f) => !notAdded.has(f.path)).map((f) => f.path);
+}
+
+/**
+ * How many characters of PATHSPEC arguments a single git invocation may carry.
+ *
+ * Derived from the smallest command-line limit of the three platforms this server runs on:
+ * Windows caps a whole command line at 32,767 UTF-16 characters (`CreateProcessW`'s
+ * `lpCommandLine`, terminating NUL included), against ~2 MB on Linux (`ARG_MAX`, in practice
+ * a quarter of the stack rlimit) and 1 MB on macOS. So Windows is the one worth sizing for,
+ * and 8,000 is deliberately a quarter of it — the rest of that 32,767 pays for everything the
+ * count here cannot see:
+ *
+ * - the fixed part of the command line: the resolved path of `git.exe`, the global options
+ *   (`-c core.quotePath=false`, `--literal-pathspecs`), the subcommand and its flags, up to
+ *   two 40-character shas and the `--` separator — a few hundred characters;
+ * - Windows argument QUOTING, applied after this accounting: an argument holding a space or a
+ *   quote is wrapped in quotes and its backslashes doubled, so the rendered line can be close
+ *   to twice the raw length counted here (8,000 → ~16,000, still half the limit away);
+ * - on POSIX, the environment block, which shares the `ARG_MAX` budget with the arguments.
+ *
+ * Conservative on purpose: too low costs one extra git spawn per ~8 KB of paths, too high
+ * costs the spawn failure this constant exists to prevent (#94). Pinned by a unit test, so
+ * lowering it for a test cannot lower it in production.
+ */
+export const MAX_PATHSPEC_ARGV_CHARS = 8000;
+
+/**
+ * What one pathspec costs the command line beyond its own characters: the separating space,
+ * plus the pair of quotes Windows adds around an argument that needs them.
+ */
+const PATHSPEC_ARG_OVERHEAD = 3;
+
+/**
+ * Split `paths` into consecutive chunks, each small enough to hand to one git invocation.
+ *
+ * Chunked by ACCUMULATED LENGTH, never by a fixed count: `sections/a.tex` and a 200-character
+ * nested figure path cost the command line wildly different amounts, so a count is not a bound
+ * on argv size at all. Order is preserved and every path appears in exactly one chunk, so a
+ * caller that unions each chunk's output gets precisely what one call would have produced.
+ *
+ * A single path longer than the whole budget still gets a chunk of its own — dropping it would
+ * silently narrow the pathspec (a path missing from a `status` scope reads as "not dirty"),
+ * and splitting it is not a thing a pathspec permits. Such a call may still fail on Windows;
+ * failing loudly on one impossible path beats answering wrongly about the rest.
+ */
+export function chunkPathspecs(
+  paths: string[],
+  budget: number = MAX_PATHSPEC_ARGV_CHARS,
+): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let used = 0;
+  for (const p of paths) {
+    const cost = p.length + PATHSPEC_ARG_OVERHEAD;
+    if (current.length > 0 && used + cost > budget) {
+      chunks.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(p);
+    used += cost;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
 }
 
 /** Join at most `max` entries, appending `… N more` for whatever didn't fit. */
