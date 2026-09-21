@@ -1471,7 +1471,7 @@ Harmless only because no project is named `please` — the first word matching a
   a skill that works.
 
   **And a project id that does not resolve is reported, never asserted.** For the skills that do
-  take one, `registerSkillPrompts` can be handed a narrow `isRegisteredProject` lookup; an
+  take one, the server hands `registerSkillPrompts` a narrow `isRegisteredProject` lookup; an
   unregistered id renders a prompt that says so and asks which project to use, instead of a
   confident instruction to act on a project that does not exist. A lookup that _fails_ is worded
   apart from one that answers no — "could not be checked" rather than "no such project" — and never

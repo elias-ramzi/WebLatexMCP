@@ -113,7 +113,12 @@ export function createServer(
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
-  registerSkillPrompts(server, skills);
+  // The lookup is what keeps a mis-bound argument from becoming an instruction: a client that
+  // binds free text positionally can put any word in `project`, so an id that names nothing
+  // must render as a question rather than as `Apply it to the project \`please\``.
+  registerSkillPrompts(server, skills, {
+    isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
+  });
 
   return server;
 }
