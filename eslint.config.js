@@ -16,7 +16,18 @@ export default tseslint.config(
     // lints nothing. `.claude/*` ignores each direct child instead, so the negation can take one
     // of them back. Every other child, a nested worktree included, is still skipped as a
     // directory before eslint descends into it.
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**', '.claude/*', '!.claude/workflows'],
+    // `tmp/` is gitignored scratch space, so it is absent from CI's clean checkout but sits in
+    // a working tree that has ever used it — where it failed `npm run lint` on files nobody
+    // committed, making the documented local gate impossible to pass for a reason unrelated to
+    // any change. The other three mirror `.gitignore` entries too; this one was simply missed.
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'coverage/**',
+      'tmp/**',
+      '.claude/*',
+      '!.claude/workflows',
+    ],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
