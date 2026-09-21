@@ -1419,6 +1419,40 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **`pdf_geometry`'s `floats` index no longer fabricates a label out of `\newlabel`-shaped text
+  buried deep inside an unclosed group** (#80 §3). The `.aux` is document-controlled, so one
+  entry must not be able to cost unbounded work: `MAX_GROUP_SCAN` (4096) caps a group read and
+  `GROUP_SKIP_SCAN` (16384) is a larger budget used only to _locate_ an over-budget group's true
+  end. When neither found the closing brace, the scanner advanced exactly as far as it had read
+  and no further — correct, since guessing would skip a legitimate later `\newlabel` in text
+  nobody scanned, but it said nothing about the text _beyond_ the budget. That text is still
+  inside the group, so a `\newlabel`-shaped string more than 16 KB into it was the next thing
+  `indexOf` found and came back as a real label — and a fabricated label is a page `render_pages`
+  resolves and renders with confidence, which is the failure that feature exists to prevent.
+
+  The abandoned group's own brace walk is now **carried forward instead of dropped**. Each later
+  marker is resolved against it: the walk is continued from where it stopped to that marker's
+  index, which either finds the group's close first (the marker is ordinary text after it, and is
+  parsed exactly as before) or does not (the marker is inside the group, and is refused). So a
+  real entry after such a group is still reported, and the buried fake is not.
+
+  **Refused is counted apart from dropped**, as a new `refused` on the reader's result rather
+  than folded into `dropped`: `dropped` means "a real entry you are not getting", while a refusal
+  means the opposite — text inside another entry's argument that was declined rather than
+  believed. Reporting one as the other would name a cause that did not fire.
+
+  The three outcomes the scanner already distinguished stay distinct. A group that runs unbalanced
+  to the **true end of the file** proves no closing brace exists anywhere, so there is nothing to
+  walk forward over and the long-standing recall contract for a corrupt tail is unchanged.
+
+  Cost is unchanged in order: the continuation cursor only moves forward, so every character is
+  walked at most once across all continuations — one extra linear pass at worst, on top of the
+  `indexOf` pass the scan already makes, with group reads still bounded by
+  `PARSE_BOUND * (MAX_GROUP_SCAN + GROUP_SKIP_SCAN)`. Answering "is this marker inside the group?"
+  by re-walking the group per marker would have walked straight back into the quadratic blowup
+  these budgets exist to prevent (520 KB of unbalanced markers once took 27 s of blocked event
+  loop inside `runExclusive`); a growth-ratio test pins the open-span path against it.
+
 - **`revert` batches its pathspec lists, so a large reverted commit no longer blows Windows'
   command line** (#94). `revert` handed git one pathspec list — in the preflight (`ls-tree`,
   the link probes, the dirty scan), in the scoped unstage, and in the numstat comparisons. On a
