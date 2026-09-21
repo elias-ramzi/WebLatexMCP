@@ -201,8 +201,13 @@ describe.skipIf(process.platform === 'win32')('ignoredPaths beyond a symlink (po
     // `discard` is what the message sends the caller to, so it must not die the same way.
     // Its git calls (`ls-files`, `clean -f`) accept a beyond-a-link pathspec as a no-op —
     // measured, not assumed — which is what lets the tool go on to clear the shadow entry.
+    // Since #127 it also SAYS that git reached nothing — the path is neither in the index nor in
+    // the untracked listing (git does not descend a symlink), so it comes back `missed`. The
+    // tool's shadow settle runs over every requested path regardless, which is exactly what
+    // makes `discard` the way out of an entry git itself refuses to stage.
     await expect(new GitService().discard(dir, ['linkdir/notes.tex'])).resolves.toEqual({
-      discarded: true,
+      discarded: false,
+      missed: ['linkdir/notes.tex'],
     });
     // And it left the real file alone: `clean` does not descend through a symlink.
     expect(

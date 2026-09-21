@@ -83,10 +83,16 @@ describe('discard + delete against a bare-repo stand-in', () => {
     expect((await git.status(dir)).clean).toBe(true);
   });
 
-  it('a path matching nothing at all (not tracked, not on disk) is a silent no-op, not an error', async () => {
+  // Issue #127 amended the report, not the behaviour: the call is still a no-op rather than an
+  // error, but `clean -f` matching nothing exits 0, so `discarded: true` used to come back for a
+  // path that was never there. It now says so.
+  it('a path matching nothing at all (not tracked, not on disk) is a no-op, not an error, and is REPORTED as missed (#127)', async () => {
     const { git, dir } = await setup({ 'main.tex': 'orig\n' });
 
-    await expect(git.discard(dir, ['nothing-here.txt'])).resolves.toEqual({ discarded: true });
+    await expect(git.discard(dir, ['nothing-here.txt'])).resolves.toEqual({
+      discarded: false,
+      missed: ['nothing-here.txt'],
+    });
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('orig\n');
     expect((await git.status(dir)).clean).toBe(true);
   });
@@ -119,7 +125,11 @@ describe('discard + delete against a bare-repo stand-in', () => {
     await simpleGit(dir).raw(['config', 'core.ignorecase', 'false']);
     await files.write(dir, { path: 'Notes.txt', content: 'changed\n' });
 
-    await expect(git.discard(dir, ['notes.txt'])).resolves.toEqual({ discarded: true });
+    // …and #127: the miss is reported rather than swallowed, on the case-sensitive clone too.
+    await expect(git.discard(dir, ['notes.txt'])).resolves.toEqual({
+      discarded: false,
+      missed: ['notes.txt'],
+    });
 
     expect(await readFile(path.join(dir, 'Notes.txt'), 'utf8')).toBe('changed\n');
     expect((await git.status(dir)).clean).toBe(false);

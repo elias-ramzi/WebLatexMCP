@@ -16,7 +16,21 @@ const inputSchema = {
 };
 
 const outputSchema = {
-  discarded: z.boolean(),
+  discarded: z
+    .boolean()
+    .describe(
+      'Whether the call reached what it was given: false when every requested path matched ' +
+        'nothing at all. NOT a claim that bytes were destroyed — a tracked path already ' +
+        'identical to HEAD is reached and reported discarded.',
+    ),
+  missed: z
+    .array(z.string())
+    .describe(
+      'Requested paths git matched nothing for — neither tracked nor present as an untracked ' +
+        'file — in the spelling you asked for. These files are NOT gone: the discard could not ' +
+        'reach them. Always present; empty when every path was reached, and always empty for a ' +
+        'whole-tree discard, which names no path.',
+    ),
 };
 
 export function registerDiscard(server: McpServer, ctx: AppContext): void {
@@ -26,7 +40,9 @@ export function registerDiscard(server: McpServer, ctx: AppContext): void {
       title: 'Discard uncommitted changes',
       description:
         'Revert the working tree to the last commit (and remove untracked files), optionally ' +
-        'limited to paths. Destructive — requires confirm=true.',
+        'limited to paths. Destructive — requires confirm=true. Paths are matched literally, ' +
+        'never as globs; any the repository does not know come back in `missed` rather than ' +
+        'being reported as discarded.',
       inputSchema,
       outputSchema,
     },
@@ -49,15 +65,33 @@ export function registerDiscard(server: McpServer, ctx: AppContext): void {
           // peer's lines as if nobody owned them (`settleAll`). Folded the same way `commit`
           // folds names, and for the same reason: on an ignorecase clone a session's entry can be
           // keyed under a different spelling than the path the caller named.
+          // Deliberately every requested path, `res.missed` included, not just the reached ones:
+          // a path git can match nothing for is exactly the wedged shadow entry `discard` is
+          // documented (in `ignoredPaths`' refusal message) as the way out of — a record git
+          // itself refuses to stage, e.g. one filed beyond a symlink. Narrowing the settle to
+          // what git reached would close that escape hatch.
           const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : undefined;
           if (paths?.length) {
             await ctx.shadows.settleAll(id, paths, fold);
           } else {
             await ctx.shadows.clearAll(id);
           }
+          // `missed` is omitted by the service when empty, so the ordinary `{ discarded: true }`
+          // shape stays untouched for its other callers; normalise it here, because the wire
+          // contract is better off with one shape a client never has to branch on.
+          const missed = res.missed ?? [];
+          // The lead has to match `discarded`: a call that reached nothing must not open with
+          // the word "discarded", which is the whole complaint #127 was filed about.
+          const text = missed.length
+            ? `${res.discarded ? 'discarded uncommitted changes, EXCEPT' : 'discarded NOTHING'}: ` +
+              `git matched nothing for ${missed.map((p) => `"${p}"`).join(', ')} — ` +
+              `${missed.length === 1 ? 'that file is' : 'those files are'} still exactly as ` +
+              'they were. Check the spelling (a path is matched literally, never as a glob) ' +
+              'with `status` or `list_files`.'
+            : 'discarded uncommitted changes';
           return {
-            content: [{ type: 'text', text: 'discarded uncommitted changes' }],
-            structuredContent: { ...res },
+            content: [{ type: 'text', text }],
+            structuredContent: { ...res, missed },
           };
         });
       } catch (err) {

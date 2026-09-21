@@ -2601,6 +2601,30 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   an absence of evidence. Closing it reverses that contract and the test that pins it, so it is
   left as an owner's call with the cost written down.
 
+- **`discard`: an untracked path's case is folded too, and a path git reaches nothing for is no
+  longer reported as discarded** (#127). The two halves of one `discard` call disagreed: tracked
+  paths were resolved onto the index's own spelling, but the `clean -f` loop ran over the
+  caller's raw spelling, because an untracked file has no index entry to resolve against — so on
+  a `core.ignorecase` clone `discard(['scratch.txt'])` restored a modified `Notes.txt` while
+  leaving an untracked `Scratch.txt` sitting on disk. One call folded or did not fold depending
+  on something the caller cannot see. Untracked paths are now resolved against the working
+  tree's own untracked listing (`ls-files --others --exclude-standard`) through the same
+  exact-spelling-first `canonicalNames` machinery, on an ignorecase clone only —
+  `core.ignorecase` in the clone's config stays the source of truth, never the filesystem, and
+  behaviour on a case-sensitive clone is byte-exact unchanged. Not `--icase-pathspecs`: git
+  refuses it alongside `--literal-pathspecs`, which every path-taking call carries so that
+  `a[1].tex` never also means `a1.tex`, and buying the fold by dropping it would reintroduce
+  globbing in the most destructive call in the server.
+
+  And the reporting half, which held whichever way the fold went: `git clean -f` matching
+  nothing exits 0, so `discarded: true` came back for a file that is still there. `discard` now
+  returns **`missed`** — the requested paths git matched nothing for, in the caller's own
+  spelling, named in the text channel too — and `discarded: false` when the call reached nothing
+  at all. `discarded` answers "did this reach the paths it was given", not "were bytes
+  destroyed"; a partial miss stays `discarded: true` with the rest under `missed`, because a
+  bare boolean cannot say "one of the two" and a bare list would leave `discarded: true` on a
+  call that did nothing.
+
 ### Tests
 
 - **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"
@@ -2632,6 +2656,14 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   collapse to "1 skipped" on exactly the two legs the checkbox was filed about. Every survival
   assertion is followed by a discard under the disk's own spelling that must remove the file, so
   "it did not fold" can never be a `clean` that reached nothing.
+
+  **Superseded in the same cycle by the #127 fix above**, which folds the untracked half in the
+  server (git's own matching is unchanged, and the measurements above still explain why the fix
+  cannot be a pathspec flag). The probe's assertions flipped with it: the survival cases now
+  assert removal on an ignorecase clone, the twin with `core.ignorecase=false` keeps the
+  byte-exact behaviour, and every case also pins `missed`/`discarded` — with the `missed`
+  declaration asserted off a `listTools()` round trip rather than off `structuredContent`, since
+  the MCP SDK passes an undeclared key straight through (#130).
 
 - **Output-contract tests now assert the advertised `outputSchema`, not just `structuredContent`**
   (#130; no `src/` file changes). `McpServer` validates a tool result against the tool's output
