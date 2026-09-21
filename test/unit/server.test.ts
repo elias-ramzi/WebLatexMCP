@@ -323,8 +323,18 @@ describe('add_writing_convention confirmGuideEdit gate', () => {
 
 describe('createServer skill prompts', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('advertises each skill as a prompt carrying its description', async () => {
@@ -673,8 +683,18 @@ describe('doctor', () => {
 
 describe('list_skills', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('lists every bundled skill with its description', async () => {

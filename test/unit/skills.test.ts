@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { loadSkills, parseSkill } from '../../src/lib/skills.js';
+import { loadSkills, parseSkill, parseProjectUse } from '../../src/lib/skills.js';
 import { buildSkillMessage } from '../../src/prompts/skills.js';
+import type { Skill } from '../../src/lib/skills.js';
 
 const SKILL = `---
 name: demo-skill
@@ -42,6 +43,39 @@ describe('parseSkill', () => {
     expect(parseSkill('---\ndescription: no name\n---\n\nBody\n')).toBeUndefined();
     expect(parseSkill('---\nname: a\ndescription: b\n---\n')).toBeUndefined();
   });
+
+  it('reads the project declaration', () => {
+    expect(parseSkill('---\nname: a\ndescription: b\nproject: none\n---\n\nBody\n')?.project).toBe(
+      'none',
+    );
+    expect(
+      parseSkill('---\nname: a\ndescription: b\nproject: required\n---\n\nBody\n')?.project,
+    ).toBe('required');
+  });
+
+  it('defaults to optional when the key is absent — a pre-existing SKILL.md keeps working', () => {
+    const skill = parseSkill(SKILL);
+    expect(skill?.project).toBe('optional');
+  });
+
+  it('degrades an unreadable value to the default and warns, keeping the skill', () => {
+    const warnings: string[] = [];
+    const skill = parseSkill(
+      '---\nname: a\ndescription: b\nproject: yes please\n---\n\nBody\n',
+      (m) => warnings.push(m),
+    );
+    // A typo in a user's own skills directory must cost a warning, never the skill.
+    expect(skill?.name).toBe('a');
+    expect(skill?.project).toBe('optional');
+    expect(warnings[0]).toContain('yes please');
+  });
+
+  it('tolerates quotes and case in the value', () => {
+    expect(parseProjectUse('"None"')).toBe('none');
+    expect(parseProjectUse("  'Required' ")).toBe('required');
+    expect(parseProjectUse('nope')).toBeUndefined();
+    expect(parseProjectUse(undefined)).toBeUndefined();
+  });
 });
 
 describe('loadSkills', () => {
@@ -74,6 +108,18 @@ describe('loadSkills', () => {
     expect(skills.map((s) => s.name)).toEqual(dirs);
   });
 
+  it('declares a project requirement on every bundled skill', async () => {
+    const skills = await loadSkills({});
+    const byName = new Map(skills.map((s) => [s.name, s.project]));
+    // session-feedback reports on the server, not on a paper: its body says "No project id is
+    // needed to run this", so its prompt must advertise no project argument to mis-bind.
+    expect(byName.get('session-feedback')).toBe('none');
+    for (const [name, use] of byName) {
+      if (name === 'session-feedback') continue;
+      expect([name, use]).toEqual([name, 'optional']);
+    }
+  });
+
   it('reads an override dir, sorted by name', async () => {
     await writeSkill(tmp, 'zeta', SKILL.replace('demo-skill', 'zeta'));
     await writeSkill(tmp, 'alpha', SKILL.replace('demo-skill', 'alpha'));
@@ -96,7 +142,7 @@ describe('loadSkills', () => {
 });
 
 describe('buildSkillMessage', () => {
-  const skill = { name: 'demo', description: 'd', body: 'BODY' };
+  const skill: Skill = { name: 'demo', description: 'd', body: 'BODY', project: 'optional' };
 
   it('scopes to a project when one is given', () => {
     const text = buildSkillMessage(skill, 'pictura');
@@ -107,5 +153,23 @@ describe('buildSkillMessage', () => {
   it('tells the model to ask when no project is given', () => {
     expect(buildSkillMessage(skill)).toContain('Ask which project');
     expect(buildSkillMessage(skill, '  ')).toContain('Ask which project');
+  });
+
+  it('says nothing about a project for a skill that takes none', () => {
+    const text = buildSkillMessage({ ...skill, project: 'none' }, 'please');
+    expect(text).not.toContain('project');
+    expect(text).toContain('BODY');
+  });
+
+  it('reports an unrecognised id instead of instructing the model to act on it', () => {
+    const text = buildSkillMessage(skill, 'nope', 'unknown');
+    expect(text).toContain('No project named `nope` is registered');
+    expect(text).not.toContain('Apply it to the project');
+  });
+
+  it('separates a failed lookup from a project that is known not to exist', () => {
+    const text = buildSkillMessage(skill, 'pictura', 'unverified');
+    expect(text).toContain('could not be checked');
+    expect(text).not.toContain('No project named');
   });
 });

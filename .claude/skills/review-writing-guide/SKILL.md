@@ -1,6 +1,7 @@
 ---
 name: review-writing-guide
 description: Review a paper against the LaTeX writing guide and report where it diverges — tense, first-person overuse, section signposting, caption and float conventions, equation punctuation and notation, citation placement (never in the abstract, cite on first mention, re-anchor per section, no re-citing within one), acronym definition, en/em dashes and English usage, \autoref and quote marks. Produces a prioritized report with a concrete suggested rewrite per finding. Use when the user asks to "review the writing", "check the style", "does this follow the writing guide", "critique the prose", or "what should I fix before submitting". Read-only — it never edits, commits, or pushes. Operates on projects served by the web-latex-mcp MCP server. In Claude Code, prefer the /review-writing command, which parallelizes this across agents; follow this procedure directly in clients without subagents.
+project: optional
 ---
 
 # Review a paper against the writing guide

@@ -1,6 +1,7 @@
 ---
 name: verify-citations
 description: Verify the references of a document against DBLP, Crossref and OpenAlex — check each one's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write an audit report you can open, and optionally annotate the entries you confirmed. Works whatever shape the bibliography has — a BibTeX .bib, a LaTeX thebibliography, or a reference list written as prose in a markdown or plain-text document — and whether the document is on a git remote (Overleaf, GitHub) or is just a directory on this machine with no remote at all. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a paper, proposal, or draft. Read-only for the bibliography by default (the report is a separate local file, never pushed); never changes it without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
+project: optional
 ---
 
 # Verify a document's references against DBLP, Crossref and OpenAlex

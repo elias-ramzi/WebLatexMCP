@@ -1453,6 +1453,30 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   these budgets exist to prevent (520 KB of unbalanced markers once took 27 s of blocked event
   loop inside `runExclusive`); a growth-ratio test pins the open-span path against it.
 
+- **A skill prompt no longer reads free text as a project id** (#105, finding 6). Every bundled
+  skill was registered as a prompt with the same one-argument schema (`project`), so a client that
+  binds a prompt's free-text invocation positionally put the first whitespace-delimited word there:
+  `/session-feedback please describe why you used so many bash calls` rendered
+  `Apply it to the project \`please\``, for a skill whose own body says no project id is needed.
+Harmless only because no project is named `please` — the first word matching a **real** registered
+  project would have reviewed the wrong project with no error anywhere.
+
+  **A skill now declares whether it takes a project at all.** `SKILL.md` frontmatter carries
+  `project: none | optional | required`, and the prompt's argument list is built per skill, so a
+  procedure that acts on no project advertises no argument and there is nothing to mis-bind.
+  `session-feedback` is `none`; the other seven bundled skills are `optional` — each acts on a
+  project but can ask which. The key is a narrowing declaration: a `SKILL.md` without it, including
+  one from a user's own `WEB_LATEX_MCP_SKILLS_DIR`, keeps exactly today's behaviour (`optional`),
+  and an unrecognised value logs to stderr and falls back to that same default rather than dropping
+  a skill that works.
+
+  **And a project id that does not resolve is reported, never asserted.** For the skills that do
+  take one, `registerSkillPrompts` can be handed a narrow `isRegisteredProject` lookup; an
+  unregistered id renders a prompt that says so and asks which project to use, instead of a
+  confident instruction to act on a project that does not exist. A lookup that _fails_ is worded
+  apart from one that answers no — "could not be checked" rather than "no such project" — and never
+  throws out of prompt rendering.
+
 - **`revert` batches its pathspec lists, so a large reverted commit no longer blows Windows'
   command line** (#94). `revert` handed git one pathspec list — in the preflight (`ls-tree`,
   the link probes, the dirty scan), in the scoped unstage, and in the numstat comparisons. On a
