@@ -11,6 +11,7 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import { toPosix } from '../../src/lib/paths.js';
+import { GROUP_SKIP_SCAN } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 import type { AppContext } from '../../src/context.js';
 import type { GeometryPage, GeometryResult } from '../../src/services/pdfRender.js';
@@ -128,6 +129,7 @@ interface GeometryOut {
   floatsOmitted?: number;
   floatsOmittedBySize?: number;
   floatsDropped?: number;
+  floatsRefused?: number;
   note?: string;
 }
 
@@ -238,6 +240,50 @@ describe('pdf_geometry', () => {
     const out = structuredOf(res);
     expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
     expect(out.floatsDropped).toBe(1);
+  });
+
+  it('reports floatsRefused through the tool, apart from floatsDropped and never folded into it', async () => {
+    // The lib half is covered by test/unit/auxFloats.test.ts ("#80 §3: counts a refused marker
+    // apart from a dropped entry"); this is the tool boundary, which until now computed the
+    // count and dropped it on the floor — a field the outputSchema does not declare is stripped
+    // silently by the MCP SDK, so only a round trip through a real client can catch that.
+    const { client, userDir } = await setup();
+    // The same hostile .aux as the lib test: fig:real's group never closes within the scan
+    // budget, so the \newlabel-shaped text buried inside it is REFUSED (not an entry), while
+    // fig:real itself is DROPPED (a real entry the caller does not get).
+    const pad = 'x'.repeat(GROUP_SKIP_SCAN + 2000);
+    await stageAux(
+      userDir,
+      [
+        `\\newlabel{fig:real}{{1}{7}{${pad}\\newlabel{fig:fake}{{9}{999}} tail}{figure.1}{}}`,
+        '\\newlabel{fig:after}{{4}{8}}',
+      ].join('\n'),
+    );
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['floats'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structuredOf(res);
+    expect(out.floats).toEqual([{ label: 'fig:after', number: '4', page: '8' }]);
+    // The two counts say different things and the tool must keep them apart: one entry lost,
+    // one fabrication declined. A single number would report the fabrication as a loss.
+    expect(out.floatsDropped).toBe(1);
+    expect(out.floatsRefused).toBe(1);
+    // And the text channel says so in words that do not claim a loss.
+    expect(textOf(res)).toContain('1 refused as not an entry');
+
+    // The field also has to be DECLARED, not merely present in the payload: the MCP SDK passes
+    // an undeclared key through, so a caller (a model reading the schema) would never learn the
+    // count exists. Asserted off the advertised outputSchema rather than off the result.
+    const advertised = (await client.listTools()).tools.find((t) => t.name === 'pdf_geometry');
+    const props = (
+      advertised?.outputSchema as { properties?: Record<string, { description?: string }> }
+    )?.properties;
+    expect(props?.floatsRefused).toBeDefined();
+    // And declared as the thing it is: not a second floatsDropped.
+    expect(props?.floatsRefused?.description ?? '').toMatch(/NOT a second floatsDropped/);
   });
 
   it('kinds: ["floats"] alone never opens the compiled PDF (FIX8)', async () => {

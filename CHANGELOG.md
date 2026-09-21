@@ -2484,6 +2484,60 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   `ignoredPaths` returns on success, its `tracked: 'head' | 'index'` split and its case folding are
   untouched, with a differential test pinning the success answers.
 
+- **`pdf_geometry`: a text box now stops at the font's declared ascent, vertical text is boxed the
+  right way up, and the "no font metrics" premise behind three documented gaps was simply wrong**
+  (#80 §6, bullets 1 and 2). Our own doc comment said pdf.js "exposes no font metrics through
+  `getTextContent`". It does: `TextContent.styles[item.fontName]` carries
+  `{ fontFamily, ascent, descent, vertical }`, and the ascent is a **fraction of the em** —
+  normalized by the worker from either `/Ascent` over 1000 or `hhea.ascender` over
+  `head.unitsPerEm`, and used by pdf.js's own text layer as a multiplier of the same `height`
+  each item reports. Measured against the installed pdfjs-dist, not assumed: a `/Helvetica` page
+  reports `0.718` and a `/Times-Roman` page `0.683`, and a test now reads a real ascent out of a
+  real PDF so the unit cannot drift unnoticed.
+
+  **The ascent is spent only where a font declares a usable one.** This is a guard, not an
+  improvement: today's baseline-to-em box OVER-covers the ink, which for a collision question is
+  a false positive, while a box built from a guessed ascent UNDER-covers — the false negative
+  this tool exists to avoid. So a missing, zero, negative, non-finite or above-one ascent keeps
+  the full-em box, and pdf.js's own `0.8` text-layer default is never used. The non-finite case
+  is reachable rather than theoretical: pdf.js's standard-font metrics carry `ascent: Math.NaN`
+  for `Symbol` and `ZapfDingbats`, and an `ErrorFont` carries no ascent at all. An item with no
+  usable metrics comes back **byte-identical** to before, under rotation and shear too, pinned by
+  a differential test against a reimplementation of the previous box math.
+
+  **Vertical writing mode (a CJK `WMode 1` font) is no longer measured as though horizontal.**
+  pdf.js reports such an item the other way round — `width` is the em across the column, `height`
+  is the accumulated advance DOWN it — so the old box ran the advance UPWARD from the origin and
+  sat entirely above the text, over blank paper. It now runs down the column and is centred
+  across the baseline, which is the PDF's own default vertical origin (`v = (w0/2, DW2[0])`) and
+  what pdf.js assumes too. Half a close, stated as such: the boxes are right, but the grouping
+  rule is unchanged and groups on the origin projected onto the up axis — exactly the coordinate
+  consecutive items down a column differ in — so a vertical line still comes back as one box per
+  item rather than one per line.
+
+  **Shear needed no fix; the comment claiming it as a gap was stale.** Since the rotation work,
+  `itemFrame` has built its corners from the text matrix's own two column directions, scaled by
+  the two lengths pdf.js measured along them — which is the exact parallelogram of a slanted
+  matrix, not an orthogonal approximation of it. A test now pins that against a ground truth
+  derived the other way round (the text-space rectangle mapped straight through the matrix), so
+  the claim is now checked rather than asserted. The schema text, the tool description and this
+  module's comment said otherwise and have been corrected.
+
+  **The merge rule did not change.** Grouping is computed from the full-em corners in every case,
+  including for an item whose box was cut to an ascent or rebuilt for vertical mode: under a
+  sheared matrix the up axis leans along the reading direction, so a shorter box would move the
+  along-axis reach and silently regroup lines. A test constructs exactly that case and pins one
+  line either way. Descenders remain outside the box, as before — spending the declared _descent_
+  would grow every box downward and is deliberately left for its own change.
+
+- **`pdf_geometry`: `floatsRefused` is reported instead of being dropped on the floor** (#119
+  follow-up). `readAuxFloats` has always counted a `\newlabel`-shaped string found inside another
+  entry's argument — a fabrication it declined to believe — separately from a real entry it could
+  not report, and the tool surfaced only the latter. Both now reach the caller, and are kept
+  apart in the schema wording and in the text line: `floatsDropped` means "there was a real entry
+  here and you are not getting it", `floatsRefused` means nothing is missing at all. Folding them
+  would report a refusal as a loss.
+
 ### Tests
 
 - **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"

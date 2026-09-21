@@ -493,3 +493,235 @@ describe('mergeTextLines — rotated lines (issue #80 section 6, third bullet)',
     expect(lines[0]?.box).toEqual({ x0: 90, y0: 50, x1: 100, y1: 130 });
   });
 });
+
+/**
+ * The box math before font metrics existed, reimplemented here as an INDEPENDENT reference: the
+ * item's four corners at `origin + s*dir + t*up` for `s in [0, width]`, `t in [0, height]`, with
+ * the same non-finite-axis fallback `itemAxes` applies. Copied from the shipped code as it stood
+ * before this change rather than called into, since the whole point is to detect the day the two
+ * stop agreeing — a reference that delegates to the code under test proves nothing.
+ */
+function legacyBox(it: TextItemLike): { x0: number; y0: number; x1: number; y1: number } {
+  const [a, b, c, d, e, f] = it.transform;
+  const dirLen = Math.hypot(a, b);
+  let dir: [number, number] = dirLen > 0 ? [a / dirLen, b / dirLen] : [1, 0];
+  if (!Number.isFinite(dir[0]) || !Number.isFinite(dir[1])) dir = [1, 0];
+  const upLen = Math.hypot(c, d);
+  let up: [number, number] = upLen > 0 ? [c / upLen, d / upLen] : [0, 1];
+  if (!Number.isFinite(up[0]) || !Number.isFinite(up[1])) up = [0, 1];
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const s of [0, it.width]) {
+    for (const t of [0, it.height]) {
+      xs.push(e + s * dir[0] + t * up[0]);
+      ys.push(f + s * dir[1] + t * up[1]);
+    }
+  }
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+}
+
+describe('mergeTextLines — declared font ascent (issue #80 section 6, bullet 1)', () => {
+  it('cuts the top of the box to the declared ascent, as a fraction of the em', () => {
+    // 0.718 is Helvetica's, measured out of the installed pdf.js rather than assumed: a page
+    // drawing /Helvetica reports styles[fontName].ascent === 0.718 (718/1000 of its own
+    // standard-font metrics table), and pdf.js's text layer uses it the same way — as a
+    // multiplier of hypot(trm[2], trm[3]), which is the very `height` this item carries.
+    const lines = mergeTextLines([
+      { str: 'Hg', transform: [10, 0, 0, 10, 20, 100], width: 30, height: 10, ascent: 0.718 },
+    ]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.box).toEqual({ x0: 20, y0: 100, x1: 50, y1: 107.18 });
+  });
+
+  it.each([
+    ['absent', undefined],
+    // Reachable, not theoretical: pdf.js's standard-font metrics table carries
+    // `ascent: Math.NaN` for Symbol and ZapfDingbats, and a LaTeX document using either
+    // (math fonts routinely do) reports NaN straight through `styles`.
+    ['NaN (Symbol, ZapfDingbats)', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['zero', 0],
+    ['negative', -0.7],
+    // Above the em: growing the box is the SAFE direction, but an /Ascent descriptor is
+    // document-controlled and unbounded, so a hostile one would produce a box a kilometre tall.
+    ['just above one', 1.0001],
+    ['absurdly large (a hostile /Ascent)', 1e6],
+  ])('falls back to the full em height for a %s ascent, never to a default', (_label, ascent) => {
+    const lines = mergeTextLines([
+      { str: 'Hg', transform: [10, 0, 0, 10, 20, 100], width: 30, height: 10, ascent },
+    ]);
+    // The full em: 100 -> 110. Emphatically NOT 108, which is what pdf.js's own text-layer
+    // default of 0.8 would give — that number is a rendering nicety, and spending it here would
+    // shrink every box under a metrics-less font by a fifth of an em on no evidence at all.
+    expect(lines[0]?.box).toEqual({ x0: 20, y0: 100, x1: 50, y1: 110 });
+    expect(lines[0]?.box.y1).not.toBe(108);
+  });
+
+  it('spends the ascent along the UP axis of a rotated item, not along page +y', () => {
+    // 90deg CCW: up axis is -x, so the ascent shortens the box's x extent, not its y one.
+    const lines = mergeTextLines([
+      { str: 'Up', transform: [0, 10, -10, 0, 0, 0], width: 50, height: 10, ascent: 0.7 },
+    ]);
+    expect(lines[0]?.box).toEqual({ x0: -7, y0: 0, x1: 0, y1: 50 });
+  });
+
+  it('agrees edge-for-edge with the pre-metrics box for every item that declares no usable ascent', () => {
+    // Invariant: an item with no usable metrics must come out byte-identical to what the code
+    // produced before metrics existed — under rotation and shear too, not only in the plain case.
+    const cases: TextItemLike[] = [];
+    for (const deg of [0, 17, 45, 90, 180, 270, 359]) {
+      const rad = (deg * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      for (const size of [1, 9.9632, 24]) {
+        for (const k of [0, 0.25]) {
+          const a = size * cos;
+          const b = size * sin;
+          const c = size * (k * cos - sin);
+          const d = size * (k * sin + cos);
+          for (const ascent of [undefined, Number.NaN, 0, 1.5]) {
+            cases.push({
+              str: 'x',
+              transform: [a, b, c, d, 13.5, -7.25] as Matrix,
+              width: 3.25 * size,
+              height: Math.hypot(c, d),
+              ...(ascent === undefined ? {} : { ascent }),
+            });
+          }
+        }
+      }
+    }
+    // Universally quantified over `cases`, so the set's own size is asserted too: an empty or
+    // accidentally-truncated generator would make every expectation below vacuous.
+    expect(cases.length).toBeGreaterThanOrEqual(168);
+    for (const c of cases) {
+      const box = mergeTextLines([c])[0]?.box;
+      const want = legacyBox(c);
+      // Object.is per edge (toBe), not toBeCloseTo: identical arithmetic on identical inputs must
+      // give identical bits, or something in the path changed.
+      expect(box?.x0).toBe(want.x0);
+      expect(box?.y0).toBe(want.y0);
+      expect(box?.x1).toBe(want.x1);
+      expect(box?.y1).toBe(want.y1);
+    }
+  });
+});
+
+describe('mergeTextLines — sheared text matrices (issue #80 section 6, bullet 2)', () => {
+  it('bounds the true parallelogram of a sheared matrix, derived independently through the matrix itself', () => {
+    // The numbers are pdf.js's own, measured on a hand-built PDF against the installed
+    // pdfjs-dist 6.1.200: `BT /F3 12 Tf 12 0 3 12 20 40 Tm (Shear) Tj ET` comes back as
+    // transform [144, 0, 36, 144, 20, 40], width 327.888, height 148.43180252223578.
+    const it: TextItemLike = {
+      str: 'Shear',
+      transform: [144, 0, 36, 144, 20, 40],
+      width: 327.888,
+      height: 148.43180252223578,
+    };
+    // Ground truth, derived the other way round: the glyphs occupy [0, advance] x [0, 1] in TEXT
+    // space (2.277 ems wide, one em tall), and the text matrix maps that rectangle into user
+    // space. transformedBoxBounds is tested independently above, and this route never touches a
+    // normalized axis — so an implementation that orthogonalized the up axis, or that rebuilt
+    // corners from the raw matrix and double-applied its scale, would disagree here.
+    const want = transformedBoxBounds({ x0: 0, y0: 0, x1: 327.888 / 144, y1: 1 }, it.transform);
+    const box = mergeTextLines([it])[0]!.box;
+    expect(box.x0).toBeCloseTo(want.x0, 9);
+    expect(box.y0).toBeCloseTo(want.y0, 9);
+    expect(box.x1).toBeCloseTo(want.x1, 9);
+    expect(box.y1).toBeCloseTo(want.y1, 9);
+    // And concretely: the skew widens the box by the up axis's own x component (36pt), so it is
+    // NOT the 327.888-wide axis-aligned rectangle an orthogonal approximation would give.
+    expect(box.x1 - box.x0).toBeCloseTo(327.888 + 36, 9);
+  });
+
+  it('keeps the merge rule on the full-em frame, so a declared ascent cannot regroup a sheared line', () => {
+    // A sheared pair placed where the merge rule can actually see them as one line: the up axis
+    // of [40, 0, 40, 40, ...] is (40, 40), so two origins agree on `across` (the origin projected
+    // onto the up axis) when their offset is perpendicular to it — hence (0, 100) and
+    // (145, -45). That is the only construction in which the em-vs-ink choice is observable at
+    // all, which is why it looks contrived.
+    //
+    // The em-frame reach of the first item is 0 + 100 (advance) + 40 (the up axis's own x lean
+    // over one em) = 140, and the second starts at 145: a 5pt gap, inside the 6pt default. Cut
+    // the top to half an em and that reach becomes 120, the gap becomes 25pt, and the line
+    // splits. Grouping is therefore computed from the em corners whatever the box does, and this
+    // test is what says so.
+    const shear = (width: number, x: number, y: number, ascent?: number): TextItemLike => ({
+      str: width > 50 ? 'Slant' : 'ed',
+      transform: [40, 0, 40, 40, x, y],
+      width,
+      height: Math.hypot(40, 40),
+      ...(ascent === undefined ? {} : { ascent }),
+    });
+    const plain = [shear(100, 0, 100), shear(40, 145, -45)];
+    expect(mergeTextLines(plain)).toHaveLength(1);
+    const withAscent = [shear(100, 0, 100, 0.5), shear(40, 145, -45, 0.5)];
+    const lines = mergeTextLines(withAscent);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.text).toBe('Slanted');
+    // The boxes still shrank — this is not "the ascent was ignored", it is "the ascent did not
+    // move the grouping".
+    expect(lines[0]!.box.y1).toBeLessThan(mergeTextLines(plain)[0]!.box.y1);
+  });
+});
+
+describe('mergeTextLines — vertical writing mode (issue #80 section 6)', () => {
+  /** A vertical-mode item as pdf.js reports one: `width` is the em ACROSS the column
+   *  (hypot(trm[0], trm[1])) and `height` is the accumulated advance DOWN it. */
+  function verticalItem(str: string, x: number, y: number, advance: number, em = 12): TextItemLike {
+    return { str, transform: [em, 0, 0, em, x, y], width: em, height: advance, vertical: true };
+  }
+
+  it('runs the box DOWN the column from the origin and centres it across the baseline', () => {
+    const lines = mergeTextLines([verticalItem('縦書き', 100, 700, 48)]);
+    expect(lines).toHaveLength(1);
+    // Down: y from 700-48 to 700. Across: centred on x=100 (the PDF's own default vertical
+    // origin v = (w0/2, DW2[0]), which is what pdf.js assumes too).
+    expect(lines[0]?.box).toEqual({ x0: 94, y0: 652, x1: 106, y1: 700 });
+  });
+
+  it('no longer puts the box entirely on the wrong side of the text', () => {
+    // The pre-change measurement treated `height` as an em measured UP the up axis, so the box
+    // sat above the origin — over blank paper — while every glyph hung below it. Nothing about
+    // the two boxes overlapped except the baseline itself.
+    const it = verticalItem('縦', 100, 700, 48);
+    const box = mergeTextLines([it])[0]!.box;
+    const before = legacyBox(it);
+    expect(before).toEqual({ x0: 100, y0: 700, x1: 112, y1: 748 });
+    expect(box.y1).toBeLessThanOrEqual(700);
+    expect(box.y0).toBeLessThan(before.y0);
+  });
+
+  it('does not spend an ascent on a vertical item, whose height is an advance and not an em', () => {
+    const plain = mergeTextLines([verticalItem('縦', 100, 700, 48)])[0]!.box;
+    const withAscent = mergeTextLines([{ ...verticalItem('縦', 100, 700, 48), ascent: 0.5 }])[0]!
+      .box;
+    // Halving it would have shortened the RUN, dropping 24pt of real glyphs off the bottom.
+    expect(withAscent).toEqual(plain);
+  });
+
+  it('leaves a horizontal item untouched when the flag is false or absent', () => {
+    const base: TextItemLike = {
+      str: 'H',
+      transform: [12, 0, 0, 12, 100, 700],
+      width: 12,
+      height: 12,
+    };
+    const want = { x0: 100, y0: 700, x1: 112, y1: 712 };
+    expect(mergeTextLines([base])[0]?.box).toEqual(want);
+    expect(mergeTextLines([{ ...base, vertical: false }])[0]?.box).toEqual(want);
+  });
+
+  it('still reports one box per item down a column — correct boxes, not a merged column line', () => {
+    // The honest limit of this change: the grouping rule is unchanged, and it groups on the
+    // origin projected onto the up axis, which is exactly the coordinate consecutive items in a
+    // vertical line differ in. So they stay separate boxes rather than becoming one column box,
+    // the way a horizontal or rotated line does.
+    const lines = mergeTextLines([
+      verticalItem('縦', 100, 700, 48),
+      verticalItem('書', 100, 652, 48),
+    ]);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.box.y0)).toEqual([652, 604]);
+  });
+});

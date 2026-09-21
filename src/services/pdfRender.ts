@@ -629,19 +629,7 @@ export class PdfRenderer implements PdfRenderService {
     const page = await doc.getPage(pageNum);
     try {
       const content = await page.getTextContent();
-      const items: TextItemLike[] = [];
-      for (const raw of content.items) {
-        // Same skip as geometryForPage: a marked-content item carries neither field.
-        if (raw.transform === undefined || typeof raw.str !== 'string') {
-          continue;
-        }
-        items.push({
-          str: raw.str,
-          transform: raw.transform as unknown as Matrix,
-          width: raw.width ?? 0,
-          height: raw.height ?? 0,
-        });
-      }
+      const items = textItemsOf(content);
       // The per-line cap is the page budget, so `mergeTextLines`' own truncation can only fire on
       // a single line that already exhausts the page — at which point the budget below reports
       // every following line as omitted anyway, and the cut is never silent either way.
@@ -692,22 +680,7 @@ export class PdfRenderer implements PdfRenderService {
       let textOmitted = 0;
       if (kinds.includes('text')) {
         const content = await page.getTextContent();
-        const items: TextItemLike[] = [];
-        for (const raw of content.items) {
-          // Marked-content items (only present when includeMarkedContent is requested, which this
-          // call never does) carry neither field — skip anything that isn't a real text item, and
-          // whitespace-only strings are handled by mergeTextLines itself.
-          if (raw.transform === undefined || typeof raw.str !== 'string') {
-            continue;
-          }
-          items.push({
-            str: raw.str,
-            transform: raw.transform as unknown as Matrix,
-            width: raw.width ?? 0,
-            height: raw.height ?? 0,
-          });
-        }
-        const lines = mergeTextLines(items);
+        const lines = mergeTextLines(textItemsOf(content));
         const mapped = lines.map((l) => ({
           // Bounds of all four corners of the user-space box under the viewport transform, not
           // just two: under a 90/270 rotation the corners swap axes, and taking only two corners
@@ -934,16 +907,81 @@ interface PdfjsViewport {
 
 /** One item of `getTextContent()`'s `items` array. pdf.js's own type is `TextItem |
  *  TextMarkedContent`; a marked-content item carries neither `transform` nor `str`, which is why
- *  both are optional here and `geometry` skips an item missing either. */
+ *  both are optional here and `geometry` skips an item missing either.
+ *
+ *  `fontName` is the key into the content's `styles` map — pdf.js's internal loaded name
+ *  (`g_d0_f1`), not the document's `/F1`. Optional like the rest, since a marked-content item has
+ *  none. */
 interface PdfjsTextItem {
   str?: string;
   transform?: number[];
   width?: number;
   height?: number;
+  fontName?: string;
+}
+
+/**
+ * One entry of `getTextContent()`'s `styles` map — pdf.js's `TextStyle`, keyed by the same
+ * `fontName` each text item carries. Verified against the installed pdfjs-dist 6.1.200:
+ * `TextStyle = { ascent: number, descent: number, vertical: boolean, fontFamily: string }` in
+ * `types/src/display/api.d.ts`, populated in the worker's `ensureTextContentItem` from the
+ * translated font (`ascent: font.ascent, descent: font.descent, vertical: font.vertical`).
+ *
+ * Every field is optional here, and for one reason each: `ascent` can be `NaN` (pdf.js's own
+ * standard-font metrics carry `Math.NaN` for `Symbol` and `ZapfDingbats`) or missing outright
+ * (an `ErrorFont` defines no `ascent` property at all), and `vertical` is absent on a font pdf.js
+ * failed to translate. `pdfGeometry.ts` treats every unusable value as "not declared" and keeps
+ * today's full-em box, so nothing here needs to invent one.
+ */
+interface PdfjsTextStyle {
+  ascent?: number;
+  descent?: number;
+  vertical?: boolean;
+  fontFamily?: string;
 }
 
 interface PdfjsTextContent {
   items: PdfjsTextItem[];
+  /** Optional because a pre-`styles` fake (and a marked-content-only page) may not carry one; a
+   *  missing map simply means no item gets font metrics, which is today's behaviour exactly. */
+  styles?: Record<string, PdfjsTextStyle | undefined>;
+}
+
+/**
+ * One page's text content as `mergeTextLines` wants it: pdf.js's per-ITEM geometry joined to its
+ * per-FONT metrics.
+ *
+ * Shared by both text walks on purpose, the same way the walks themselves are deliberately one
+ * algorithm: `geometry`'s "text" kind and `text` differ only in their budgets, and a second copy
+ * of this join is how they would come to disagree about what a box or a line is. The join is the
+ * only place that knows `styles` is keyed by `item.fontName`; `pdfGeometry.ts` never sees a font
+ * name, only the two numbers it can use.
+ *
+ * A style that is missing, or whose `ascent`/`vertical` are unusable, is passed through as-is —
+ * `pdfGeometry.ts` falls back to the full-em box for exactly that case, so nothing is defaulted
+ * or invented here.
+ */
+function textItemsOf(content: PdfjsTextContent): TextItemLike[] {
+  const styles = content.styles;
+  const items: TextItemLike[] = [];
+  for (const raw of content.items) {
+    // Marked-content items (only present when includeMarkedContent is requested, which neither
+    // walk does) carry neither field — skip anything that isn't a real text item; whitespace-only
+    // strings are handled by mergeTextLines itself.
+    if (raw.transform === undefined || typeof raw.str !== 'string') {
+      continue;
+    }
+    const style = raw.fontName === undefined ? undefined : styles?.[raw.fontName];
+    items.push({
+      str: raw.str,
+      transform: raw.transform as unknown as Matrix,
+      width: raw.width ?? 0,
+      height: raw.height ?? 0,
+      ascent: style?.ascent,
+      vertical: style?.vertical,
+    });
+  }
+  return items;
 }
 
 /** `getOperatorList()`'s result: parallel arrays of op codes and their argument tuples. */

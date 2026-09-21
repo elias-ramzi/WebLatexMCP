@@ -472,6 +472,20 @@ interface FakeTextItem {
   transform: number[];
   width: number;
   height: number;
+  /** The key into `FakePage.styles`, as pdf.js's own items carry (its internal loaded name,
+   *  `g_d0_f1`, not the document's `/F1`). Optional: an item without one gets no font metrics,
+   *  which is what every pre-existing case in this file exercises. */
+  fontName?: string;
+}
+
+/** One entry of `getTextContent()`'s `styles` map. Every field optional for the same reason the
+ *  service's own type has them optional: pdf.js reports `ascent: NaN` for Symbol/ZapfDingbats
+ *  and omits it entirely for a font it could not translate. */
+interface FakeTextStyle {
+  ascent?: number;
+  descent?: number;
+  vertical?: boolean;
+  fontFamily?: string;
 }
 
 interface FakeViewport {
@@ -483,6 +497,9 @@ interface FakeViewport {
 interface FakePage {
   viewport: FakeViewport;
   textItems?: FakeTextItem[];
+  /** Left undefined by every pre-existing case, which is itself a case worth keeping: a content
+   *  object with no `styles` map at all must produce exactly the boxes it always did. */
+  styles?: Record<string, FakeTextStyle>;
   fnArray?: number[];
   argsArray?: unknown[][];
 }
@@ -513,7 +530,11 @@ function fakeGeometryLoader(pages: FakePage[]): PdfjsLoader {
             getViewport: () => p.viewport,
             render: () => ({ promise: Promise.resolve() }),
             cleanup: () => {},
-            getTextContent: () => Promise.resolve({ items: (p.textItems ?? []) as unknown[] }),
+            getTextContent: () =>
+              Promise.resolve({
+                items: (p.textItems ?? []) as unknown[],
+                ...(p.styles === undefined ? {} : { styles: p.styles }),
+              }),
             getOperatorList: () =>
               Promise.resolve({ fnArray: p.fnArray ?? [], argsArray: p.argsArray ?? [] }),
           });
@@ -1862,5 +1883,144 @@ describe('PdfRenderer.text', () => {
       throw new Error('DOMMatrix is not defined');
     });
     await expect(renderer.text({ pdfPath })).rejects.toThrow(/@napi-rs\/canvas/);
+  });
+});
+
+describe('PdfRenderer.geometry — font metrics from getTextContent().styles (#80 §6)', () => {
+  let dir: string;
+  let pdfPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-geomfont-'));
+    pdfPath = path.join(dir, 'doc.pdf');
+    await writeFile(pdfPath, minimalPdf(1));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('joins styles onto each item by fontName and cuts the box to the declared ascent', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          styles: { g_d0_f1: { ascent: 0.718, descent: -0.207, vertical: false } },
+          textItems: [
+            {
+              str: 'Hg',
+              transform: [1, 0, 0, 1, 10, 700],
+              width: 40,
+              height: 10,
+              fontName: 'g_d0_f1',
+            },
+          ],
+        },
+      ]),
+    );
+    const page = (await renderer.geometry({ pdfPath, kinds: ['text'] })).pages[0]!;
+    // User space {x0:10, y0:700, x1:50, y1:707.18}; flipped at page height 800.
+    expect(page.text![0]).toEqual({
+      x0: 10,
+      y0: 92.82,
+      x1: 50,
+      y1: 100,
+      text: 'Hg',
+      mergedItems: 1,
+    });
+  });
+
+  it('keeps the full-em box when the content carries no styles map at all', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          textItems: [
+            {
+              str: 'Hg',
+              transform: [1, 0, 0, 1, 10, 700],
+              width: 40,
+              height: 10,
+              fontName: 'g_d0_f1',
+            },
+          ],
+        },
+      ]),
+    );
+    const page = (await renderer.geometry({ pdfPath, kinds: ['text'] })).pages[0]!;
+    expect(page.text![0]?.y0).toBe(90);
+  });
+
+  it.each([
+    ['a fontName with no entry in the map', 'g_d0_f9', {}],
+    ['a NaN ascent (Symbol, ZapfDingbats)', 'g_d0_f1', { g_d0_f1: { ascent: Number.NaN } }],
+    ['a style with no ascent property (an untranslatable font)', 'g_d0_f1', { g_d0_f1: {} }],
+  ])('keeps the full-em box for %s', async (_label, fontName, styles) => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          styles,
+          textItems: [
+            { str: 'Hg', transform: [1, 0, 0, 1, 10, 700], width: 40, height: 10, fontName },
+          ],
+        },
+      ]),
+    );
+    const page = (await renderer.geometry({ pdfPath, kinds: ['text'] })).pages[0]!;
+    // 800 - (700 + 10). Not 92 (a 0.8 default), not 92.82 (some other font's metrics).
+    expect(page.text![0]?.y0).toBe(90);
+  });
+
+  it('carries the vertical flag through, so a vertical item is boxed down its column', async () => {
+    const renderer = new PdfRenderer(
+      fakeGeometryLoader([
+        {
+          viewport: idViewport(600, 800),
+          styles: { g_d0_f1: { ascent: 0.88, vertical: true } },
+          textItems: [
+            // pdf.js's vertical shape: width is the em ACROSS the column, height the advance DOWN it.
+            {
+              str: '縦書',
+              transform: [12, 0, 0, 12, 100, 700],
+              width: 12,
+              height: 48,
+              fontName: 'g_d0_f1',
+            },
+          ],
+        },
+      ]),
+    );
+    const page = (await renderer.geometry({ pdfPath, kinds: ['text'] })).pages[0]!;
+    // User space {x0:94, y0:652, x1:106, y1:700} -> top-left at page height 800.
+    expect(page.text![0]?.x0).toBe(94);
+    expect(page.text![0]?.x1).toBe(106);
+    expect(page.text![0]?.y0).toBe(100);
+    expect(page.text![0]?.y1).toBe(148);
+  });
+
+  it('reads a REAL Helvetica ascent out of the installed pdf.js, in fractions of the em', async () => {
+    // The units claim, pinned against the real library rather than against a fake: pdf.js
+    // normalizes every ascent producer (the /Ascent descriptor over PDF_GLYPH_SPACE_UNITS, or
+    // hhea.ascender over head.unitsPerEm) into a FRACTION OF THE EM before it reaches `styles`.
+    // Helvetica's is 718/1000. If that normalization ever changed — or if this code started
+    // treating the number as points or as thousandths — this box would be wrong by ~1000x and
+    // the assertion below could not pass.
+    const realPdf = path.join(dir, 'real.pdf');
+    const pageHeight = 100;
+    await writeFile(realPdf, minimalPdf(1, 200, pageHeight, { text: () => 'Helvetica' }));
+    const page = (await new PdfRenderer().geometry({ pdfPath: realPdf, kinds: ['text'] }))
+      .pages[0]!;
+    expect(page.text).toHaveLength(1);
+    const box = page.text![0]!;
+    expect(box.text).toBe('Helvetica');
+    // Drawn by the helper at 12pt with its baseline at user-space y = pageHeight - 30.
+    const baselineTopLeft = 30;
+    expect(box.y1).toBeCloseTo(baselineTopLeft, 6);
+    const height = box.y1 - box.y0;
+    expect(height).toBeCloseTo(12 * 0.718, 2);
+    // Emphatically neither the full em (12) nor pdf.js's own 0.8 text-layer default (9.6).
+    expect(height).toBeLessThan(12);
+    expect(Math.abs(height - 9.6)).toBeGreaterThan(0.5);
   });
 });
