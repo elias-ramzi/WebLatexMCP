@@ -2538,6 +2538,36 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   here and you are not getting it", `floatsRefused` means nothing is missing at all. Folding them
   would report a refusal as a loss.
 
+- **`pdf_geometry`: a vertical (CJK) line is merged into one column box** (#80 section 6, the
+  last remaining gap). A `WMode 1` line was boxed the right way up per item but never combined:
+  grouping ran on the horizontal pairing for every item — line position = the origin projected
+  onto the up axis, adjacency measured along the direction axis — and consecutive items down a
+  column differ in exactly the coordinate that pairing calls the baseline. Correct boxes, one per
+  glyph run, where a caller asking how tall a column is wanted one.
+
+  The merge rule now reads each item in the frame its writing mode actually uses: for a vertical
+  item the **column** (the direction axis) takes the place of the baseline and the **run down it**
+  (the negated up axis, since a vertical run advances backward along `up`) takes the place of the
+  advance. Horizontal items are untouched — the swapped pair is the same pair — so an unrotated
+  or rotated horizontal document's output is unchanged, edge for edge.
+
+  Two details carry the rest. The grouping extent for a vertical item is now its own
+  (`±em/2` across, a full advance back down), not the horizontal reading: measured the horizontal
+  way, an item's along-extent sits a whole advance behind its glyphs, and the gap between two
+  items comes out right only while their advances are equal — a column ending in a short glyph
+  split. And the default backward-overlap allowance is the item's **em** (`width` for a vertical
+  item), not its `height`, which for one of these is the whole run's advance and would let an
+  item four glyphs back up the column join the line.
+
+  **What still does not merge**: two neighbouring columns (their cross coordinates differ by a
+  column width), and a horizontal line sharing a coordinate with a vertical one. The axes alone
+  cannot separate that second pair — a 270-degree-rotated horizontal item and an upright vertical
+  one have the same advance and cross axes — so the writing mode is compared on top of the raw
+  frame axes, and each half is pinned by its own test. A generated property asserts the thing that
+  matters for a collision question: a merged line's box **covers every item merged into it**,
+  across rotated, sheared, horizontal and vertical runs, with a per-mode merge count asserted
+  alongside it so the property cannot pass vacuously on a rule that never merges.
+
 ### Tests
 
 - **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"

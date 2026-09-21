@@ -6,6 +6,7 @@ import {
   roundBox,
   mergeTextLines,
   IDENTITY,
+  type Box,
   type Matrix,
   type TextItemLike,
 } from '../../src/lib/pdfGeometry.js';
@@ -712,16 +713,290 @@ describe('mergeTextLines — vertical writing mode (issue #80 section 6)', () =>
     expect(mergeTextLines([{ ...base, vertical: false }])[0]?.box).toEqual(want);
   });
 
-  it('still reports one box per item down a column — correct boxes, not a merged column line', () => {
-    // The honest limit of this change: the grouping rule is unchanged, and it groups on the
-    // origin projected onto the up axis, which is exactly the coordinate consecutive items in a
-    // vertical line differ in. So they stay separate boxes rather than becoming one column box,
-    // the way a horizontal or rotated line does.
+  it('merges the items of one column into a single column box (issue #80 section 6, vertical merge)', () => {
+    // The gap this closes. Grouping used to run on the HORIZONTAL pairing for every item —
+    // baseline = origin projected onto the up axis — and consecutive items down a column differ
+    // in exactly that coordinate, so each glyph run came back as its own box: correct boxes,
+    // uncombined. The column is now the cross axis and the run down it is the advance.
     const lines = mergeTextLines([
       verticalItem('縦', 100, 700, 48),
       verticalItem('書', 100, 652, 48),
+      verticalItem('き', 100, 604, 48),
+    ]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(3);
+    expect(lines[0]?.text).toBe('縦書き');
+    // Down from y=700 through three 48pt advances to y=556, and 12pt wide centred on x=100.
+    expect(lines[0]?.box).toEqual({ x0: 94, y0: 556, x1: 106, y1: 700 });
+  });
+
+  it('measures the gap down a column from the glyphs, not from the origin — a run of UNEQUAL advances still merges', () => {
+    // Pins the vertical branch of `emExtent` specifically, not merely the axis swap. Grouping a
+    // vertical item on the horizontal extent puts its along-extent a whole advance behind where
+    // its glyphs sit; two items then measure a gap of (advance_i - advance_{i+1}), which is 0
+    // only while the advances happen to be equal. Every other column test here uses one advance
+    // throughout and so passes either way: this is the shape that tells them apart.
+    const lines = mergeTextLines([
+      verticalItem('長い行', 100, 700, 48),
+      verticalItem('。', 100, 652, 12),
+    ]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(2);
+    expect(lines[0]?.box).toEqual({ x0: 94, y0: 640, x1: 106, y1: 700 });
+  });
+
+  it('does not merge two neighbouring columns', () => {
+    // The narrowing half: the cross axis of a vertical item is its DIRECTION axis, so two columns
+    // one em apart differ by 12pt there — far past the 1pt tolerance — even though they overlap
+    // completely in the coordinate the run advances along.
+    const lines = mergeTextLines([
+      verticalItem('右', 112, 700, 48),
+      verticalItem('列', 112, 652, 48),
+      verticalItem('左', 100, 700, 48),
+      verticalItem('列', 100, 652, 48),
     ]);
     expect(lines).toHaveLength(2);
-    expect(lines.map((l) => l.box.y0)).toEqual([652, 604]);
+    expect(lines.map((l) => l.text)).toEqual(['右列', '左列']);
+    expect(lines[0]?.box).toEqual({ x0: 106, y0: 604, x1: 118, y1: 700 });
+    expect(lines[1]?.box).toEqual({ x0: 94, y0: 604, x1: 106, y1: 700 });
+  });
+
+  it('never merges a vertical item with a horizontal one, even when their frame axes are identical and their coordinates line up', () => {
+    // The writing mode is compared on top of the axes because the axes cannot carry this. Both
+    // items below have dir = (1,0) and up = (0,1) — the SAME frame — but the vertical one's
+    // position is read off its x and its run off -y, while the horizontal one's are read off its
+    // y and its x. Line them up and, without the writing-mode clause, the rule compares the
+    // vertical item's x against the horizontal item's y (both 100) and their runs across
+    // opposite axes (gap 0), merging a line at y=100 with a column at y=-40 into one box
+    // spanning 150pt of blank paper.
+    //
+    // The construction is contrived precisely BECAUSE it has to force two coordinate systems into
+    // agreement — but a text matrix is document-controlled and can put an origin anywhere, so it
+    // is reachable, and the cost of being wrong is a box covering paper no glyph touches.
+    const horizontal: TextItemLike = {
+      str: 'H',
+      transform: [10, 0, 0, 10, 0, 100],
+      width: 40,
+      height: 10,
+    };
+    const vertical: TextItemLike = {
+      str: 'V',
+      transform: [10, 0, 0, 10, 100, -40],
+      width: 10,
+      height: 48,
+      vertical: true,
+    };
+    const lines = mergeTextLines([horizontal, vertical]);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.text)).toEqual(['H', 'V']);
+    expect(lines[0]?.box).toEqual({ x0: 0, y0: 100, x1: 40, y1: 110 });
+    expect(lines[1]?.box).toEqual({ x0: 95, y0: -88, x1: 105, y1: -40 });
+  });
+
+  it('does not merge a 270-degree-rotated horizontal run into a column it is flush with', () => {
+    // The other aliasing pair, and the one a real document can produce: a sideways caption and an
+    // upright CJK column running down the same strip of page have the SAME advance and cross axes
+    // — (0,-1) and (1,0) — so only the writing mode and the raw frame axes separate them.
+    const sideways: TextItemLike = {
+      str: 'sideways',
+      transform: [0, -12, 12, 0, 100, 652],
+      width: 48,
+      height: 12,
+    };
+    const lines = mergeTextLines([verticalItem('縦', 100, 700, 48), sideways]);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.text)).toEqual(['縦', 'sideways']);
+  });
+
+  it('merges a ROTATED column, so a vertical line on a pdflscape page is one box too', () => {
+    // 90deg CCW: dir = (0,1), up = (-1,0), so the column runs along +x and its cross axis is +y.
+    const rotatedVertical = (str: string, x: number, y: number): TextItemLike => ({
+      str,
+      transform: [0, 12, -12, 0, x, y],
+      width: 12,
+      height: 48,
+      vertical: true,
+    });
+    const lines = mergeTextLines([
+      rotatedVertical('縦', 100, 700),
+      rotatedVertical('書', 148, 700),
+    ]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(2);
+    expect(lines[0]?.box).toEqual({ x0: 100, y0: 694, x1: 196, y1: 706 });
+  });
+
+  it('applies gapTolerancePt down the column, on both sides of the bound', () => {
+    const inside = [verticalItem('縦', 100, 700, 48), verticalItem('書', 100, 648, 48)]; // gap 4
+    expect(mergeTextLines(inside)).toHaveLength(1);
+    const outside = [verticalItem('縦', 100, 700, 48), verticalItem('書', 100, 642, 48)]; // gap 10
+    expect(mergeTextLines(outside)).toHaveLength(2);
+  });
+
+  it("bounds a backward overlap by the vertical item's EM, not by its accumulated advance", () => {
+    // The default allowance is one em — "a glyph may paint back over the one before it, nothing
+    // farther". A vertical item's em is its `width` (12 here); its `height` is the whole run's
+    // advance (48). Taking `height` would let an item 48pt back up the column — four glyphs — join
+    // the line, which is the blank-paper merge the backward bound exists to refuse.
+    const inside = [verticalItem('縦', 100, 700, 48), verticalItem('書', 100, 662, 48)]; // gap -10
+    expect(mergeTextLines(inside)).toHaveLength(1);
+    const outside = [verticalItem('縦', 100, 700, 48), verticalItem('書', 100, 672, 48)]; // gap -20
+    expect(mergeTextLines(outside)).toHaveLength(2);
+  });
+
+  it('honors an explicit overlapTolerancePt down a column as well', () => {
+    const items = [verticalItem('縦', 100, 700, 48), verticalItem('書', 100, 672, 48)]; // gap -20
+    expect(mergeTextLines(items)).toHaveLength(2);
+    expect(mergeTextLines(items, { overlapTolerancePt: 25 })).toHaveLength(1);
+  });
+
+  it('drops a non-finite-extent item before it can reach a column it would have joined', () => {
+    const items: TextItemLike[] = [
+      verticalItem('縦', 100, 700, 48),
+      { ...verticalItem('bad', 100, 652, 48), height: Infinity },
+      verticalItem('書', 100, 652, 48),
+    ];
+    const lines = mergeTextLines(items);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(2);
+    expect(lines[0]?.text).toBe('縦書');
+    expect(lines[0]?.box).toEqual({ x0: 94, y0: 604, x1: 106, y1: 700 });
+  });
+});
+
+/**
+ * A run of `n` items laid out CONTIGUOUSLY in the merge rule's own terms, from an explicit matrix
+ * shape — `deg` of rotation, `k` of shear, a font size, and a writing mode. Nothing here calls
+ * into pdfGeometry: the placement is derived from the matrix by hand, so a run that fails to merge
+ * is a statement about the code under test and not about the fixture.
+ *
+ * Each step moves the origin perpendicular to the line's CROSS axis (so the line position does not
+ * drift) by exactly the run's reach along its ADVANCE axis (so the gap is zero). Under shear the
+ * up axis leans into the direction axis, which is why the reach carries a `|dir·up|` term and why
+ * the step is not simply "advance along dir": stepping along dir under shear moves the cross
+ * coordinate too, and the line splits — the pre-existing limitation the hand-built shear test
+ * above works around the same way.
+ */
+function contiguousRun(opts: {
+  deg: number;
+  k: number;
+  size: number;
+  vertical: boolean;
+  n: number;
+  advance: number;
+  origin: readonly [number, number];
+}): TextItemLike[] {
+  const { deg, k, size, vertical, n, advance, origin } = opts;
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const a = size * cos;
+  const b = size * sin;
+  const c = size * (k * cos - sin);
+  const d = size * (k * sin + cos);
+  const dirLen = Math.hypot(a, b);
+  const upLen = Math.hypot(c, d);
+  const dir: readonly [number, number] = [a / dirLen, b / dirLen];
+  const up: readonly [number, number] = [c / upLen, d / upLen];
+  // pdf.js measures a vertical item the other way round: `width` is the em ACROSS the column and
+  // `height` is the advance DOWN it.
+  const width = vertical ? dirLen : advance;
+  const height = vertical ? advance : upLen;
+  const lean = Math.abs(dir[0] * up[0] + dir[1] * up[1]);
+  const reach = vertical ? width * lean + height : width + height * lean;
+  // The cross axis is `up` for a horizontal item and `dir` for a vertical one; the step is its
+  // perpendicular, scaled so the projection onto the advance axis is exactly `reach`.
+  const cross = vertical ? dir : up;
+  const denom = dir[0] * up[1] - dir[1] * up[0]; // never 0: the determinant is size^2 > 0
+  const alpha = reach / denom;
+  const step: readonly [number, number] = [alpha * cross[1], -alpha * cross[0]];
+  const items: TextItemLike[] = [];
+  for (let i = 0; i < n; i += 1) {
+    items.push({
+      str: `s${i}`,
+      transform: [a, b, c, d, origin[0] + i * step[0], origin[1] + i * step[1]] as Matrix,
+      width,
+      height,
+      ...(vertical ? { vertical: true } : {}),
+    });
+  }
+  return items;
+}
+
+/** Whether `outer` covers `inner`, with a slack of one ten-thousandth of a point — far below
+ *  anything reportable (boxes are rounded to 2dp downstream) and far above the float error of the
+ *  projections involved. */
+function covers(outer: Box, inner: Box): boolean {
+  const eps = 1e-4;
+  return (
+    outer.x0 <= inner.x0 + eps &&
+    outer.y0 <= inner.y0 + eps &&
+    outer.x1 >= inner.x1 - eps &&
+    outer.y1 >= inner.y1 - eps
+  );
+}
+
+describe('mergeTextLines — a merged box covers every item merged into it', () => {
+  it('holds over generated rotated, sheared, horizontal and vertical runs — and those runs do merge', () => {
+    // The error direction that matters for pdf_geometry is a box that is TOO SMALL: a false
+    // negative on "does this text touch that figure". So the property is coverage, asserted
+    // directly over generated frames rather than on one hand-built example.
+    //
+    // Coverage alone would be satisfied vacuously by a rule that never merged anything — a box
+    // trivially covers itself — which is exactly the state a vertical line was in before this
+    // change. So the merge count is asserted too, per writing mode, as a MINIMUM over the same
+    // generated set: on the pre-change code every vertical run comes back as four one-item lines
+    // and this fails.
+    const degs = [0, 17, 45, 90, 180, 270, 343];
+    const shears = [0, 0.25, -0.4];
+    const sizes = [1, 9.9632, 24];
+    const n = 4;
+    let cases = 0;
+    const fullyMerged = { horizontal: 0, vertical: 0 };
+    for (const deg of degs) {
+      for (const k of shears) {
+        for (const size of sizes) {
+          for (const vertical of [false, true]) {
+            const items = contiguousRun({
+              deg,
+              k,
+              size,
+              vertical,
+              n,
+              advance: 3.25 * size,
+              origin: [13.5, -7.25],
+            });
+            const lines = mergeTextLines(items);
+            const label = `deg=${deg} k=${k} size=${size} vertical=${vertical}`;
+            // Nothing generated here is non-finite, so no item is dropped and the lines partition
+            // the items in drawing order: the j-th line consumed the next `items` of them. That
+            // reconstruction is what lets the coverage check name the right items per line.
+            expect(
+              lines.reduce((t, l) => t + l.items, 0),
+              label,
+            ).toBe(items.length);
+            let at = 0;
+            for (const line of lines) {
+              for (let i = 0; i < line.items; i += 1) {
+                const own = mergeTextLines([items[at + i]!])[0]!.box;
+                expect(covers(line.box, own), `${label} item ${at + i}`).toBe(true);
+              }
+              at += line.items;
+            }
+            if (lines.length === 1 && lines[0]!.items === n) {
+              if (vertical) fullyMerged.vertical += 1;
+              else fullyMerged.horizontal += 1;
+            }
+            cases += 1;
+          }
+        }
+      }
+    }
+    // The generator's own size is asserted, so a truncated or empty sweep cannot make the
+    // expectations above vacuous.
+    expect(cases).toBe(degs.length * shears.length * sizes.length * 2);
+    const perMode = degs.length * shears.length * sizes.length;
+    expect(fullyMerged.horizontal).toBe(perMode);
+    expect(fullyMerged.vertical).toBe(perMode);
   });
 });

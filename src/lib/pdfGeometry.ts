@@ -140,14 +140,17 @@ const DEFAULT_MAX_TEXT_CHARS = 160;
  *
  * **How much drift actually survives is decided by the baseline clause, not by this constant, and
  * it is much less than a degree away from the origin.** `across` projects an item's ORIGIN onto
- * its OWN up axis, so a frame difference of d shifts `across` by about |origin| * sin(d), judged
+ * its OWN cross axis (its up axis horizontally, its direction axis vertically — see
+ * `groupingAxes`), so a frame difference of d shifts `across` by about |origin| * sin(d), judged
  * against `baselineTolerancePt` (1pt). Near the origin a full degree survives; at the far corner
  * of an A4 page (|origin| ~ 860pt) anything past roughly 0.07 degrees already reads as a different
  * baseline and splits. So this gate is the outer bound, not the operative one, over most of a
  * page. That is left as it is deliberately — the error direction is safe (a rotated line comes
  * back as several correct boxes, never as one box spanning two lines, which is the pre-existing
  * behaviour this merging improves on rather than a regression) and tightening the coupling means
- * projecting both origins onto the LINE's up axis, a behaviour change worth its own issue. What
+ * projecting both origins onto the LINE's cross axis, a behaviour change worth its own issue —
+ * still open, and untouched by the vertical-merge work, which changed WHICH axis an item is
+ * projected onto, never WHOSE. What
  * is not acceptable is a comment claiming a capability the code does not deliver, so: this
  * constant bounds frame disagreement; it does not by itself hold a drifting rotated line together.
  *
@@ -212,17 +215,59 @@ function itemAxes(transform: Matrix): { dir: Axis; up: Axis } {
   };
 }
 
+/**
+ * The two axes the MERGE RULE runs on: the item's own frame axes for a horizontal item, and the
+ * same two swapped (and one negated) for a vertical-mode one.
+ *
+ * - `advance` is the axis the run progresses along — the direction axis for horizontal text, and
+ *   the NEGATED up axis for vertical text, whose run goes BACKWARD along `up` (see `emExtent`).
+ * - `cross` is the axis the line's position is measured on — `up` for horizontal text (the
+ *   generalized baseline coordinate), and the direction axis for vertical text (which column the
+ *   run sits in).
+ *
+ * Grouping every item on the horizontal pairing is what left a vertical line unmerged: consecutive
+ * items down a column differ in exactly the coordinate that pairing calls the baseline, so every
+ * glyph run came back as its own box. Swapping the pair for a vertical item turns "same baseline,
+ * adjacent along the run" into "same column, adjacent down it" — the same rule, read in the frame
+ * the writing mode actually uses.
+ *
+ * These axes are NOT what keeps a vertical line and a horizontal one apart, and cannot be: a
+ * 270-degree-rotated horizontal item (`dir = (0,-1)`, `up = (1,0)`) and an upright vertical item
+ * (`dir = (1,0)`, `up = (0,1)`) yield the SAME advance/cross pair, while being two visually
+ * distinct lines — a sideways caption and an upright CJK column. So `mergeTextLines` keeps
+ * comparing the raw `dir`/`up` axes, as it always did, and requires the writing mode itself to
+ * match on top of them.
+ */
+function groupingAxes(dir: Axis, up: Axis, vertical: boolean): { advance: Axis; cross: Axis } {
+  return vertical ? { advance: [-up[0], -up[1]], cross: dir } : { advance: dir, cross: up };
+}
+
+/** The item's EM size: `height` for a horizontal item, `width` for a vertical one, because pdf.js
+ *  measures a vertical item the other way round (see `emExtent`). Used for the default
+ *  backward-overlap allowance, whose rationale is "one glyph may paint back over the one before
+ *  it, nothing farther" — that is an em in either writing mode, never a vertical item's
+ *  accumulated advance, which is as long as the run and would let an item most of a column behind
+ *  the line join it. */
+function emSize(item: TextItemLike): number {
+  return item.vertical === true ? item.width : item.height;
+}
+
 /** An item measured in its own frame: the axis-aligned box the caller gets back, the two axes that
  *  frame is built on, and the item's extent expressed in that frame. */
 interface ItemFrame {
   box: Box;
   dir: Axis;
   up: Axis;
-  /** The baseline coordinate, generalized: the item's ORIGIN projected onto the up axis. For an
-   *  unrotated item this is `transform[5]` itself, which is what the page-axis version of this
-   *  function compared. */
+  /** The item's writing mode, normalized to a boolean — part of the frame because two items in
+   *  different writing modes are never one line, however well their axes agree (`groupingAxes`). */
+  vertical: boolean;
+  /** The line-position coordinate, generalized: the item's ORIGIN projected onto its CROSS axis —
+   *  the up axis for a horizontal item (its baseline), the direction axis for a vertical one
+   *  (its column). For an unrotated horizontal item this is `transform[5]` itself, which is what
+   *  the page-axis version of this function compared. */
   across: number;
-  /** The item's extent along the direction axis — for an unrotated item, `box.x0` and `box.x1`. */
+  /** The item's extent along its ADVANCE axis — for an unrotated horizontal item, `box.x0` and
+   *  `box.x1`. */
   alongMin: number;
   alongMax: number;
 }
@@ -239,18 +284,43 @@ interface FrameExtent {
 }
 
 /**
- * Today's extent, and the ONLY one `mergeTextLines` ever groups on: the advance along the
- * direction axis and the full em along the up axis, both measured from the glyph origin.
+ * The item's FULL, untrimmed extent in its own frame — the ONLY one `mergeTextLines` ever groups
+ * on, and the one the emitted box starts from before any ascent is spent.
  *
- * Kept as its own function, and kept as the grouping frame for every item including a vertical
- * one, because the box math and the merge rule change independently: the box below now spends a
- * declared ascent where it has one, and a change in the corners would otherwise move
- * `alongMin`/`alongMax` with it and silently regroup a SHEARED line (whose up axis has a
- * component along the direction axis, so the along-extent does depend on the up extent). Grouping
- * is therefore computed from these corners in every case, which makes "the merge rule is
- * unchanged" a property of the code rather than a claim about it.
+ * For a horizontal item that is the advance along the direction axis and the full em along the up
+ * axis, both measured from the glyph origin. A vertical item is measured the other way round by
+ * pdf.js (`ensureTextContentItem`): `width` is `hypot(trm[0], trm[1])`, the em ACROSS the column,
+ * and `height` is the accumulated advance, run DOWN the column and reported as
+ * `Math.abs(totalHeight)`. So for one of those:
+ *
+ * - along the up axis the run goes from the origin BACKWARD by that advance (`tMin = -height`),
+ *   because text-space y decreases as vertical text advances (`translateTextMatrix(0, scaledDim)`
+ *   with a negative `scaledDim`, absolute-valued only when accumulated). Measuring it forward, as
+ *   the horizontal rule does, puts the extent entirely on the wrong side of the text;
+ * - across the column it is centred on the baseline (`±width/2`), which is the PDF's own default
+ *   vertical origin `v = (w0/2, DW2[0])` and what pdf.js itself assumes when a glyph has no
+ *   `/W2` entry (`defaultVMetrics = [dw2[1], defaultWidth * 0.5, dw2[0]]`, and the canvas
+ *   back-end shifts each glyph by `-width * 0.5`).
+ *
+ * Kept as its own function, separate from `inkExtent`, because the box math and the merge rule
+ * change independently: the box spends a declared ascent where it has one, and a change in the
+ * corners would otherwise move `alongMin`/`alongMax` with it and silently regroup a SHEARED line
+ * (whose up axis has a component along the direction axis, so the along-extent does depend on the
+ * up extent). Grouping is therefore computed from THESE corners in every case, which makes "an
+ * ascent cannot move the merge rule" a property of the code rather than a claim about it.
+ *
+ * The vertical branch is what changed when vertical lines learned to merge. Grouping used to use
+ * the horizontal reading for every item, which put a vertical item's along-extent a whole advance
+ * behind where its glyphs actually sit; the gap between two vertical items then came out right
+ * only for as long as their advances happened to be equal. It costs the emitted box nothing,
+ * because a vertical item never spends an ascent — see `inkExtent`, where the two extents are the
+ * same object for one.
  */
 function emExtent(item: TextItemLike): FrameExtent {
+  if (item.vertical === true) {
+    const half = item.width / 2;
+    return { sMin: -half, sMax: half, tMin: -item.height, tMax: 0 };
+  }
   return { sMin: 0, sMax: item.width, tMin: 0, tMax: item.height };
 }
 
@@ -287,49 +357,33 @@ function usableAscent(ascent: number | undefined): number | undefined {
 }
 
 /**
- * The extent the EMITTED box is built from: the em extent, with the up axis cut to the declared
- * ascent where there is a usable one, and replaced outright for a vertical-mode item.
+ * The extent the EMITTED box is built from: `emExtent`, with the up axis cut to the declared
+ * ascent where there is a usable one.
  *
- * A vertical item is measured the other way round by pdf.js (`ensureTextContentItem`): `width` is
- * `hypot(trm[0], trm[1])`, the em ACROSS the column, and `height` is the accumulated advance, run
- * DOWN the column and reported as `Math.abs(totalHeight)`. So:
- *
- * - along the up axis the run goes from the origin BACKWARD by that advance (`tMin = -height`),
- *   because text-space y decreases as vertical text advances (`translateTextMatrix(0, scaledDim)`
- *   with a negative `scaledDim`, absolute-valued only when accumulated). Measuring it forward, as
- *   the horizontal rule does, puts the box entirely on the wrong side of the text — which is what
- *   this function's absence did;
- * - across the column it is centred on the baseline (`±width/2`), which is the PDF's own default
- *   vertical origin `v = (w0/2, DW2[0])` and what pdf.js itself assumes when a glyph has no
- *   `/W2` entry (`defaultVMetrics = [dw2[1], defaultWidth * 0.5, dw2[0]]`, and the canvas
- *   back-end shifts each glyph by `-width * 0.5`).
- *
- * The ascent is not spent on a vertical item: there `height` is an advance, not an em, so
- * scaling it by an ascent fraction would shorten the RUN rather than trim the ink above a
- * baseline.
+ * The ascent is not spent on a vertical item: there `height` is an advance, not an em, so scaling
+ * it by an ascent fraction would shorten the RUN rather than trim the ink above a baseline. So a
+ * vertical item's emitted box IS its full extent, returned here unchanged — which is also why
+ * grouping a vertical line on the full extent (`emExtent`) can never disagree with the box it
+ * reports.
  */
 function inkExtent(item: TextItemLike): FrameExtent {
+  const em = emExtent(item);
   if (item.vertical === true) {
-    const half = item.width / 2;
-    return { sMin: -half, sMax: half, tMin: -item.height, tMax: 0 };
+    return em;
   }
   const ascent = usableAscent(item.ascent);
-  return {
-    sMin: 0,
-    sMax: item.width,
-    tMin: 0,
-    tMax: ascent === undefined ? item.height : item.height * ascent,
-  };
+  return ascent === undefined ? em : { ...em, tMax: item.height * ascent };
 }
 
-/** The four user-space corners of one frame extent, and their projections onto the direction
- *  axis. One function so the box corners and the grouping corners can only ever differ by the
- *  extent they were given, never by how they were built. */
+/** The four user-space corners of one frame extent, and their projections onto `alongAxis` (the
+ *  item's advance axis — see `groupingAxes`). One function so the box corners and the grouping
+ *  corners can only ever differ by the extent they were given, never by how they were built. */
 function frameCorners(
   origin: readonly [number, number],
   dir: Axis,
   up: Axis,
   extent: FrameExtent,
+  alongAxis: Axis,
 ): { xs: number[]; ys: number[]; along: number[] } {
   const xs: number[] = [];
   const ys: number[] = [];
@@ -340,7 +394,7 @@ function frameCorners(
       const y = origin[1] + s * dir[1] + t * up[1];
       xs.push(x);
       ys.push(y);
-      along.push(x * dir[0] + y * dir[1]);
+      along.push(x * alongAxis[0] + y * alongAxis[1]);
     }
   }
   return { xs, ys, along };
@@ -366,15 +420,21 @@ function frameCorners(
  *  `across`/`alongMin`/`alongMax` are projections of four corners built by the very same function
  *  as the box's, computed here rather than in mergeTextLines so that they cannot be the corners of
  *  some other, separately guarded frame. They are deliberately taken from the `emExtent` corners
- *  rather than from the box's own: the box may now be cut to a declared ascent (or rebuilt for a
- *  vertical item), and under a sheared matrix that would move the along-extent too and regroup
- *  lines that group today. The merge rule is being held still while the box math changes — see
- *  `emExtent`. For every item that has no usable ascent and is not vertical the two extents are
- *  the same numbers, so this is one computation done twice, not two rules.
+ *  rather than from the box's own: the box may be cut to a declared ascent, and under a sheared
+ *  matrix that would move the along-extent too and regroup lines that group today. The merge rule
+ *  is held still while the box math changes — see `emExtent`. For every item that has no usable
+ *  ascent the two extents are the same numbers, so this is one computation done twice, not two
+ *  rules.
  *
- *  That sharing is also what makes the unrotated reduction exact rather than approximate: with
- *  `dir = (1,0)` the projection `x * 1 + y * 0` IS each corner's x, so `alongMin`/`alongMax` are
- *  literally the numbers `box.x0`/`box.x1` carry, and `across` is literally `transform[5]`.
+ *  They are projected onto the item's ADVANCE and CROSS axes rather than onto `dir` and `up`
+ *  directly, which is the same pair for a horizontal item and the swapped one for a vertical
+ *  item — see `groupingAxes`, and `mergeTextLines` for why the writing mode is then part of the
+ *  frame too.
+ *
+ *  That sharing is also what makes the unrotated horizontal reduction exact rather than
+ *  approximate: with `dir = (1,0)` the advance axis IS `dir`, so the projection `x * 1 + y * 0` is
+ *  each corner's x, `alongMin`/`alongMax` are literally the numbers `box.x0`/`box.x1` carry, and
+ *  `across` is literally `transform[5]`.
  *
  *  The direction/up AXES get a sane fallback when non-finite (see itemAxes, above) — falling back
  *  to the unrotated unit vectors keeps a usable box. The item's ORIGIN (`e`, `f`) and its
@@ -385,14 +445,16 @@ function frameCorners(
 function itemFrame(item: TextItemLike): ItemFrame {
   const [, , , , e, f] = item.transform;
   const { dir, up } = itemAxes(item.transform);
+  const vertical = item.vertical === true;
+  const { advance, cross } = groupingAxes(dir, up, vertical);
   const origin: readonly [number, number] = [e, f];
 
-  const ink = frameCorners(origin, dir, up, inkExtent(item));
+  const ink = frameCorners(origin, dir, up, inkExtent(item), advance);
   // The grouping corners. Both extents are built from the same `width`/`height`/origin, so a
   // document-controlled non-finite one poisons both together and mergeTextLines' single
   // `hasNonFiniteEdge` check on the box below still catches it — an ascent fraction is finite by
   // construction (`usableAscent`) and `width / 2` cannot turn a finite width non-finite.
-  const em = frameCorners(origin, dir, up, emExtent(item));
+  const em = frameCorners(origin, dir, up, emExtent(item), advance);
   return {
     box: {
       x0: Math.min(...ink.xs),
@@ -402,7 +464,8 @@ function itemFrame(item: TextItemLike): ItemFrame {
     },
     dir,
     up,
-    across: e * up[0] + f * up[1],
+    vertical,
+    across: e * cross[0] + f * cross[1],
     alongMin: Math.min(...em.along),
     alongMax: Math.max(...em.along),
   };
@@ -426,27 +489,34 @@ function truncate(text: string, maxChars: number): string {
  * page's axes. Two items join a line when all three of these hold:
  *
  * - **Their frames agree**: the new item's direction axis is within `DIRECTION_TOLERANCE_COS` of
- *   the running line's, and so is its up axis. Both, not just the direction — the direction alone
- *   does not distinguish a mirrored or flipped up axis, so text set upside down along the same
- *   reading direction would otherwise be folded into the line above it.
- * - **Their baselines agree** within `baselineTolerancePt`, the baseline coordinate now being the
- *   item's origin projected onto its up axis.
- * - **They are adjacent along the direction axis**: the gap between the new item's near edge and
+ *   the running line's, and so is its up axis, and its WRITING MODE is the same. Both axes, not
+ *   just the direction — the direction alone does not distinguish a mirrored or flipped up axis,
+ *   so text set upside down along the same reading direction would otherwise be folded into the
+ *   line above it. And the writing mode on top of them, because the axes cannot tell those two
+ *   apart: a 270-degree-rotated horizontal item and an upright vertical one have the same advance
+ *   and cross axes (`groupingAxes`) while being a sideways caption and an upright CJK column —
+ *   two lines, not one.
+ * - **Their line positions agree** within `baselineTolerancePt`, that coordinate being the item's
+ *   origin projected onto its CROSS axis: the baseline for a horizontal item, the column for a
+ *   vertical one.
+ * - **They are adjacent along the ADVANCE axis**: the gap between the new item's near edge and
  *   the running line's far edge, both measured along that axis, is no more than `gapTolerancePt`
  *   forward and no more than `overlapTolerancePt` backward (a negative gap is an overlap) —
- *   default, per item, the item's own `height` floored at 1pt, since accents and combining glyphs
- *   legitimately paint back over the preceding glyph but nothing farther. The gap is bounded on
- *   **both** sides deliberately: an unbounded lower bound let an item anywhere behind the running
- *   line join it, merging two far-apart runs (e.g. two TikZ nodes on the same baseline) into one
- *   box spanning the blank paper between them, in reverse reading order.
+ *   default, per item, the item's own EM (`emSize`: `height` horizontally, `width` vertically)
+ *   floored at 1pt, since accents and combining glyphs legitimately paint back over the preceding
+ *   glyph but nothing farther. The gap is bounded on **both** sides deliberately: an unbounded
+ *   lower bound let an item anywhere behind the running line join it, merging two far-apart runs
+ *   (e.g. two TikZ nodes on the same baseline) into one box spanning the blank paper between
+ *   them, in reverse reading order.
  *
  * Otherwise a new line starts. The running line keeps its FIRST item's baseline coordinate and
  * frame, and tracks the far edge as a running maximum.
  *
  * All three quantities come off the same four corners `itemFrame` builds the box from, projected
- * onto that item's own axes, so the unrotated case reduces to the page-axis rule this function used
- * before — exactly, not approximately. With `b = c = 0` the frame is `dir = (1,0)`, `up = (0,1)`,
- * so the baseline coordinate is `transform[5]` and the two extents are the numbers `box.x0`/`box.x1`
+ * onto that item's own axes, so the unrotated horizontal case reduces to the page-axis rule this
+ * function used before — exactly, not approximately. With `b = c = 0` and no vertical flag the
+ * frame is `dir = (1,0)`, `up = (0,1)`, the advance axis IS `dir` and the cross axis IS `up`, so
+ * the baseline coordinate is `transform[5]` and the two extents are the numbers `box.x0`/`box.x1`
  * already carry. An unrotated document's output is therefore unchanged, edge for edge.
  *
  * What changed is only which items get unioned; the emitted box is the same user-space axis-aligned
@@ -476,12 +546,16 @@ function truncate(text: string, maxChars: number): string {
  *   an ascent was spent. Spending the declared DESCENT would close that, and is deliberately not
  *   done here: it would grow every box downward for every metrics-carrying font in one change
  *   that was meant to shrink them truthfully.
- * - **A vertical writing-mode item gets a vertical box, but a vertical LINE is still not merged.**
- *   `inkExtent` boxes such an item down the column and centred on its baseline instead of
- *   measuring it as though horizontal (which put the box entirely above the text). The grouping
- *   rule below is unchanged, and it groups on a shared origin-projected-onto-up: consecutive
- *   items down one column differ in exactly that coordinate, so they stay one box each rather
- *   than merging into one column box. Correct boxes, uncombined — not a full close.
+ * - **A vertical writing-mode line is boxed down the column AND merged into one box.**
+ *   `emExtent` measures such an item down the column and centred on its baseline instead of as
+ *   though horizontal (which put the box entirely above the text), and `groupingAxes` reads the
+ *   merge rule in the frame that mode actually uses: the column takes the place of the baseline
+ *   and the run down it takes the place of the advance. Grouping every item on the horizontal
+ *   pairing was what left a vertical line as one box per glyph run — consecutive items down a
+ *   column differ in exactly the coordinate that pairing calls the baseline. Two neighbouring
+ *   columns still do not merge (their cross coordinates differ by a column width), and neither
+ *   does a horizontal line that happens to share a coordinate with a vertical one (the writing
+ *   mode is part of the frame).
  */
 export function mergeTextLines(
   items: TextItemLike[],
@@ -501,12 +575,14 @@ export function mergeTextLines(
     text: string;
     box: Box;
     items: number;
-    /** The first item's frame and baseline coordinate, kept for the whole line — the running line
-     *  is grouped by the frame it was opened in, never by whatever the last item drifted to. */
+    /** The first item's frame and line-position coordinate, kept for the whole line — the running
+     *  line is grouped by the frame it was opened in, never by whatever the last item drifted
+     *  to. */
     across: number;
     alongMax: number;
     dir: Axis;
     up: Axis;
+    vertical: boolean;
   }
 
   const lines: Building[] = [];
@@ -535,17 +611,25 @@ export function mergeTextLines(
       // comparison never sees a NaN, and an earlier version of this comment describing what
       // happens when it does was describing an unreachable state. The guard for a poisoned matrix
       // is itemAxes' fallback plus hasNonFiniteEdge on the box, both above; not this line.
+      // The writing mode is compared alongside the axes, not derived from them: a
+      // 270-degree-rotated horizontal item and an upright vertical one agree on both advance and
+      // cross axes (see groupingAxes) yet are a sideways caption and an upright CJK column — and
+      // their extents are measured by opposite conventions, so unioning them would describe
+      // neither.
       const sameFrame =
+        frame.vertical === current.vertical &&
         dot(frame.dir, current.dir) >= DIRECTION_TOLERANCE_COS &&
         dot(frame.up, current.up) >= DIRECTION_TOLERANCE_COS;
       const sameBaseline = Math.abs(frame.across - current.across) <= baselineTolerancePt;
-      // Adjacent or overlapping ALONG THE DIRECTION AXIS: the gap between the new item's near edge
+      // Adjacent or overlapping ALONG THE ADVANCE AXIS: the gap between the new item's near edge
       // and the running line's far edge is within tolerance forward, and bounded backward too — an
       // overlap may not exceed this item's own em size (floored at 1pt), or an explicit override.
       // Measured in the frame rather than in page x, or a rotated line's own advance reads as a
-      // baseline change and every glyph run becomes its own box.
+      // baseline change and every glyph run becomes its own box. `emSize`, not `item.height`: a
+      // vertical item's `height` is the whole run's advance, which as a backward allowance would
+      // let an item most of a column behind the line join it.
       const gap = frame.alongMin - current.alongMax;
-      const minGap = -(overlapTolerancePt ?? Math.max(item.height, 1));
+      const minGap = -(overlapTolerancePt ?? Math.max(emSize(item), 1));
       const adjacent = gap <= gapTolerancePt && gap >= minGap;
       if (sameFrame && sameBaseline && adjacent) {
         current.text += item.str;
@@ -569,6 +653,7 @@ export function mergeTextLines(
       alongMax: frame.alongMax,
       dir: frame.dir,
       up: frame.up,
+      vertical: frame.vertical,
     };
   }
   if (current) {
