@@ -459,6 +459,10 @@ const FAKE_OPS = {
   paintFormXObjectEnd: 107,
   beginGroup: 108,
   endGroup: 109,
+  beginAnnotation: 110,
+  endAnnotation: 111,
+  paintInlineImageXObject: 112,
+  paintSolidColorImageMask: 113,
 };
 
 interface FakeTextItem {
@@ -804,7 +808,14 @@ describe('PdfRenderer.geometry', () => {
       // Watched failing pre-fix: the poisoned CTM propagated non-finite values into the box, so
       // the returned rect did not equal the identity-unit-square box below (a NaN component
       // instead of one of 0/1/99/100).
-      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      //
+      // The coordinates are unchanged by #80 §2 — keeping the last known-good CTM is still the
+      // right call — but they no longer come back bare: this box IS one measured under a refused
+      // transform, so it now says so. That flag is the whole of §2; see the `unreliableCtm`
+      // describe block below for what it is and is not.
+      expect(page.images).toEqual([
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image', unreliableCtm: true },
+      ]);
       for (const box of page.images ?? []) {
         expect(Number.isFinite(box.x0)).toBe(true);
         expect(Number.isFinite(box.y0)).toBe(true);
@@ -1088,6 +1099,528 @@ describe('PdfRenderer.geometry', () => {
       /Failed to open PDF/,
     );
   });
+
+  // Issue #80 §1. Annotation appearance streams are concatenated into the SAME operator list
+  // `page.getOperatorList()` returns, and pdf.js's `CanvasGraphics.beginAnnotation` rebases the
+  // whole graphics state on `baseTransform` before painting them — a base the walk never sees.
+  // Carrying the walk's stale CTM across that boundary put every image painted inside an
+  // annotation at the wrong place, and consecutive annotations accumulated the drift. The
+  // resolved call is to emit nothing in there and count it, not to model `baseTransform`: a gap
+  // that is counted is better than a rectangle nobody can vouch for. Reachable via `pdfcomment`,
+  // form fields, and `pdfpages` with links — NOT from plain `hyperref`: with no `/AP` the worker
+  // takes `_getOperatorListNoAppearance()` and emits no ops at all.
+  describe('an annotation appearance stream (beginAnnotation/endAnnotation)', () => {
+    // What pdf.js actually puts in the operator list for OPS.beginAnnotation:
+    // [id, rect, transform, matrix, isUsingOwnCanvas], with a sixth `canvasName` appended for
+    // checkbox/radio widgets. The walk reads NONE of them — deliberately, see walkImageGeometry's
+    // doc comment — so they are here only to keep the fake faithful to the real shape.
+    const annotArgs = (id: string) => [
+      id,
+      [0, 0, 100, 100],
+      [1, 0, 0, 1, 0, 0],
+      [1, 0, 0, 1, 0, 0],
+      false,
+    ];
+
+    it('emits no box for an image painted inside an annotation, counts it, and still emits one painted before it', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.endAnnotation,
+            ],
+            argsArray: [['page-img', 1, 1], annotArgs('a1'), ['annot-img', 1, 1], []],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: beginAnnotation/endAnnotation were unknown ops the walk ignored,
+      // so the annotation's image was measured under the page CTM and reported as a second,
+      // confidently-placed rectangle, with nothing counted.
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      expect(page.annotationImagesSkipped).toBe(1);
+      // A counted gap is NOT a cap omission: imagesOmitted is reserved for boxes cut by
+      // MAX_IMAGE_RECTS_PER_PAGE, and folding the two together would destroy that distinction.
+      expect(page.imagesOmitted).toBe(0);
+    });
+
+    it('does not let a transform inside an annotation move the CTM a later paint operator sees', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.transform,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [annotArgs('a1'), [2, 0, 0, 2, 50, 50], [], ['img', 1, 1]],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Exactly the rectangle this operator gets with the whole annotation block deleted — the
+      // identity unit square. Watched failing pre-fix: the annotation's own `cm` leaked out and
+      // the box came back at {x0:50,y0:48,x1:52,y1:50}.
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      expect(page.annotationImagesSkipped).toBe(0);
+    });
+
+    it('does not accumulate drift across consecutive annotations', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.transform,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.transform,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              annotArgs('a1'),
+              [2, 0, 0, 2, 50, 50],
+              [],
+              annotArgs('a2'),
+              [3, 0, 0, 3, 10, 10],
+              [],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Same identity unit square as with BOTH blocks deleted. This is the accumulation case the
+      // issue names: pre-fix the two `cm`s composed onto each other and onto the page CTM.
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      expect(page.annotationImagesSkipped).toBe(0);
+    });
+
+    it('ignores an endAnnotation with no matching beginAnnotation rather than throwing or suppressing what follows', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              [],
+              ['before', 1, 1],
+              annotArgs('a1'),
+              ['inside', 1, 1],
+              [],
+              ['after', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // The stray end must not drive the depth counter negative: a depth of -1 would leave the
+      // following real beginAnnotation at depth 0, and the annotation's image would be emitted as
+      // a page rectangle. Both page-level images are still here, the annotation's is not.
+      expect(page.images).toEqual([
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' },
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' },
+      ]);
+      expect(page.annotationImagesSkipped).toBe(1);
+    });
+
+    it('suppresses and counts a form XObject inside an annotation while keeping the CTM stack balanced', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              annotArgs('a1'),
+              // A non-identity form matrix and no bbox of any kind: pre-fix this produced an
+              // `approximate: true` unit-square box under the annotation's CTM.
+              [[2, 0, 0, 2, 50, 50], null],
+              [],
+              [],
+              ['img', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Only the page-level image survives; the form inside the annotation is a counted gap.
+      expect(page.images).toEqual([{ x0: 0, y0: 99, x1: 1, y1: 100, source: 'image' }]);
+      expect(page.annotationImagesSkipped).toBe(1);
+      // And the walk is still balanced afterwards: the image above lands at the OUTER CTM
+      // (identity), not the form's own [2,0,0,2,50,50].
+      expect(page.images![0]).not.toMatchObject({ x0: 50 });
+    });
+  });
+
+  // Issue #80 §2. `applyCtm` refusing a poisoned multiply is right — propagating Infinity/NaN
+  // would turn one bad operand into wall-to-wall garbage — but it used to be SILENT, so every
+  // later box on the page was computed against a transform the document did not ask for and came
+  // back finite, plausible and unflagged. By this codebase's own standard (`approximate` means
+  // "never use this for a collision computation"; source snippets are shown "only where they can
+  // be vouched for") such a box belongs in the same bucket.
+  describe('a box measured under a CTM the walk had to refuse (unreliableCtm)', () => {
+    // Already Infinity before applyCtm sees it (`Number.MAX_VALUE * 10` overflows when the
+    // literal is evaluated); the multiply then yields NaN in the slots where it meets a 0.
+    const poisonMatrix = [Number.MAX_VALUE * 10, 0, 0, 1, 0, 0];
+
+    it('flags every box drawn after a refused transform and stops flagging at the matching restore', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.save,
+              FAKE_OPS.transform,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.transform,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.transform,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.restore,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              [],
+              [1, 0, 0, 1, 10, 10],
+              ['good', 1, 1],
+              poisonMatrix,
+              ['poisoned', 1, 1],
+              // A perfectly legitimate `cm` — but composed onto the WRONG base, which is exactly
+              // the case the issue's worked table calls indistinguishable from a measurement.
+              [1, 0, 0, 1, 5, 5],
+              ['composed-onto-wrong-base', 1, 1],
+              [],
+              ['good-again', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Watched failing pre-fix: all four boxes came back identical to these but with no
+      // `unreliableCtm` anywhere — boxes 2 and 3 were indistinguishable from measurements.
+      expect(page.images).toEqual([
+        { x0: 10, y0: 189, x1: 11, y1: 190, source: 'image' },
+        { x0: 10, y0: 189, x1: 11, y1: 190, source: 'image', unreliableCtm: true },
+        { x0: 15, y0: 184, x1: 16, y1: 185, source: 'image', unreliableCtm: true },
+        { x0: 0, y0: 199, x1: 1, y1: 200, source: 'image' },
+      ]);
+      // The first and last carry no such property at all — not `undefined`, absent — so a caller
+      // reading `'unreliableCtm' in box` gets the same answer as one reading the value.
+      expect(Object.hasOwn(page.images![0]!, 'unreliableCtm')).toBe(false);
+      expect(Object.hasOwn(page.images![3]!, 'unreliableCtm')).toBe(false);
+    });
+
+    it('pops a poison latched by a form XObject own /Matrix at the matching paintFormXObjectEnd', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              [poisonMatrix, [0, 0, 10, 10]],
+              ['inside-form', 1, 1],
+              [],
+              ['after-form', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // The form's own box is measured under the refused matrix, so it is flagged too; so is the
+      // image inside it; the image after paintFormXObjectEnd is clean, because the implicit save
+      // the walk pushes at paintFormXObjectBegin carries the poison flag alongside the CTM.
+      expect(page.images).toEqual([
+        { x0: 0, y0: 190, x1: 10, y1: 200, source: 'form', unreliableCtm: true },
+        { x0: 0, y0: 199, x1: 1, y1: 200, source: 'image', unreliableCtm: true },
+        { x0: 0, y0: 199, x1: 1, y1: 200, source: 'image' },
+      ]);
+      expect(Object.hasOwn(page.images![2]!, 'unreliableCtm')).toBe(false);
+    });
+
+    it('keeps a poison latched at depth 0 with no enclosing save for the rest of the page', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.transform,
+              FAKE_OPS.paintImageXObject,
+              FAKE_OPS.transform,
+              FAKE_OPS.paintImageXObject,
+              // A bare restore against an empty stack: it pops nothing, so it must clear nothing
+              // either. There is no known-good state to go back to at depth 0.
+              FAKE_OPS.restore,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              poisonMatrix,
+              ['a', 1, 1],
+              [1, 0, 0, 1, 10, 10],
+              ['b', 1, 1],
+              [],
+              ['c', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      expect(page.images).toEqual([
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image', unreliableCtm: true },
+        { x0: 10, y0: 89, x1: 11, y1: 90, source: 'image', unreliableCtm: true },
+        { x0: 10, y0: 89, x1: 11, y1: 90, source: 'image', unreliableCtm: true },
+      ]);
+    });
+
+    it('drops a poisoned box whose edges come out non-finite rather than emitting it flagged', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(200, 200),
+            fnArray: [
+              FAKE_OPS.transform,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [
+              poisonMatrix,
+              // A document-controlled bbox carrying Infinity, measured while poisoned: the drop
+              // guard runs first and wins. Flagging is for a box that is still a number.
+              [null, [0, 0, Infinity, 10]],
+              [],
+              ['after', 1, 1],
+            ],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      const page = result.pages[0]!;
+      // Exactly one box: the form's was dropped outright, never emitted with `unreliableCtm` on
+      // it. Drop still beats flag.
+      expect(page.images).toEqual([
+        { x0: 0, y0: 199, x1: 1, y1: 200, source: 'image', unreliableCtm: true },
+      ]);
+      for (const box of page.images ?? []) {
+        expect(Number.isFinite(box.x0)).toBe(true);
+        expect(Number.isFinite(box.y0)).toBe(true);
+        expect(Number.isFinite(box.x1)).toBe(true);
+        expect(Number.isFinite(box.y1)).toBe(true);
+      }
+    });
+  });
+
+  describe('the two reachable rarer paint operators (#80 §5)', () => {
+    // Both paint the unit square under the current CTM, verified against the installed pdf.js
+    // 6.1.200 rather than assumed: CanvasGraphics.paintInlineImageXObject scales by
+    // (1/width, -1/height) and draws (0, -height, width, height), which composes to [0,1]x[0,1]
+    // before the CTM; paintSolidColorImageMask is a literal fillRect(0, 0, 1, 1).
+    //
+    // The four BATCHED operators issue #80 lists alongside these are deliberately NOT handled, and
+    // there is no test for them because there is nothing to test: they exist only as an output of
+    // pdf.js's QueueOptimizer, and page.getOperatorList() selects the NullOptimizer, whose
+    // _optimize() is a no-op. No operator list this walk can receive contains one. Writing a test
+    // that feeds one through FAKE_OPS would prove the walk handles an input it cannot be given —
+    // the shape of vacuous test this file's own comments warn about.
+    it('measures an inline image exactly as it measures an image XObject', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.transform,
+              FAKE_OPS.paintInlineImageXObject,
+              FAKE_OPS.paintImageXObject,
+            ],
+            argsArray: [[10, 0, 0, 20, 30, 40], [{ width: 4, height: 8 }], ['img', 1, 1]],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      // Identical rectangles from the two operators under one CTM: the inline image's own pixel
+      // dimensions are NOT its placement (pdf.js divides them straight back out), so a walk that
+      // used args[0].width/height would put this box at 4x8 and be wrong by construction.
+      expect(result.pages[0]!.images).toEqual([
+        { x0: 30, y0: 40, x1: 40, y1: 60, source: 'image' },
+        { x0: 30, y0: 40, x1: 40, y1: 60, source: 'image' },
+      ]);
+    });
+
+    it('measures a solid-colour image mask, which carries no args at all', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [FAKE_OPS.transform, FAKE_OPS.paintSolidColorImageMask],
+            argsArray: [[2, 0, 0, 2, 5, 5], []],
+          },
+        ]),
+      );
+
+      const result = await renderer.geometry({ pdfPath, kinds: ['images'] });
+      expect(result.pages[0]!.images).toEqual([{ x0: 5, y0: 93, x1: 7, y1: 95, source: 'image' }]);
+    });
+
+    it('suppresses and counts both of them inside an annotation, like every other paint op', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.paintInlineImageXObject,
+              FAKE_OPS.paintSolidColorImageMask,
+              FAKE_OPS.endAnnotation,
+            ],
+            argsArray: [
+              ['a1', [0, 0, 100, 100], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], false],
+              [{ width: 4, height: 8 }],
+              [],
+              [],
+            ],
+          },
+        ]),
+      );
+
+      const page = (await renderer.geometry({ pdfPath, kinds: ['images'] })).pages[0]!;
+      // A new paint operator that emits a box but skips the annotation guard would be a fresh
+      // instance of the bug #80 §1 fixed, in a branch nobody re-read.
+      expect(page.images).toEqual([]);
+      expect(page.annotationImagesSkipped).toBe(2);
+    });
+
+    it('flags them unreliableCtm under a refused transform, like every other paint op', async () => {
+      // The same matrix the unreliableCtm describe block uses, and for a reason worth recording:
+      // `Number.MAX_VALUE * 10` is already Infinity when the array literal is evaluated, so
+      // applyCtm's multiply produces non-finite slots and REFUSES. Plain Number.MAX_VALUE is
+      // finite, so the walk would compose it happily, the boxes would come out infinite and be
+      // DROPPED by hasNonFiniteEdge, and this test would have asserted nothing about the flag
+      // while looking like it did — which is what it did on the first attempt.
+      const poisonMatrix = [Number.MAX_VALUE * 10, 0, 0, 1, 0, 0];
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.transform,
+              FAKE_OPS.paintInlineImageXObject,
+              FAKE_OPS.paintSolidColorImageMask,
+            ],
+            argsArray: [poisonMatrix, [{ width: 1, height: 1 }], []],
+          },
+        ]),
+      );
+
+      const page = (await renderer.geometry({ pdfPath, kinds: ['images'] })).pages[0]!;
+      expect(page.images).toEqual([
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image', unreliableCtm: true },
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'image', unreliableCtm: true },
+      ]);
+    });
+  });
+
+  describe('an annotation must not leak a pending group bbox in either direction', () => {
+    const annotArgs = ['a1', [0, 0, 100, 100], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], false];
+    const groupArgs = [{ bbox: [0, 0, 56, 28], matrix: null }];
+
+    it('does not hand a group bbox opened inside an annotation to a form outside it', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+            ],
+            argsArray: [annotArgs, groupArgs, [], [null, null], []],
+          },
+        ]),
+      );
+
+      const page = (await renderer.geometry({ pdfPath, kinds: ['images'] })).pages[0]!;
+      // Watched failing pre-fix: pendingGroup was the one piece of walk state the annotation
+      // snapshot left out, so the form after the bracket was measured with the ANNOTATION's
+      // 56x28 group bbox — a confidently-placed rectangle, no `approximate` flag, entirely wrong.
+      // With no bbox it can vouch for, the form falls back to the flagged unit square.
+      expect(page.images).toEqual([
+        { x0: 0, y0: 99, x1: 1, y1: 100, source: 'form', approximate: true },
+      ]);
+    });
+
+    it('gives a form after the bracket the group bbox that was pending BEFORE it', async () => {
+      const renderer = new PdfRenderer(
+        fakeGeometryLoader([
+          {
+            viewport: idViewport(100, 100),
+            fnArray: [
+              FAKE_OPS.beginGroup,
+              FAKE_OPS.beginAnnotation,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+              FAKE_OPS.endAnnotation,
+              FAKE_OPS.paintFormXObjectBegin,
+              FAKE_OPS.paintFormXObjectEnd,
+            ],
+            argsArray: [groupArgs, annotArgs, [null, null], [], [], [null, null], []],
+          },
+        ]),
+      );
+
+      const page = (await renderer.geometry({ pdfPath, kinds: ['images'] })).pages[0]!;
+      // The other direction, and the reason the snapshot has to RESTORE rather than merely clear:
+      // the form inside the annotation consumes pendingGroup (that consume runs before the
+      // annotation guard, so the matching End stays balanced), which pre-fix left the real form
+      // after the bracket with nothing and downgraded it to the approximate unit square.
+      expect(page.images).toEqual([{ x0: 0, y0: 72, x1: 56, y1: 100, source: 'form' }]);
+      expect(page.annotationImagesSkipped).toBe(1);
+    });
+  });
 });
 
 describe('pdf.js OPS table', () => {
@@ -1113,8 +1646,47 @@ describe('pdf.js OPS table', () => {
       'paintFormXObjectEnd',
       'beginGroup',
       'endGroup',
+      'beginAnnotation',
+      'endAnnotation',
+      'paintInlineImageXObject',
+      'paintSolidColorImageMask',
     ];
     for (const name of names) {
+      expect(typeof pdfjs.OPS[name]).toBe('number');
+    }
+  });
+
+  it('pins the pdf.js major the batched-operator claim was verified against', async () => {
+    // The schema, docs/tools.md and the CHANGELOG all now state as FACT that pdf.js's four
+    // batched paint operators cannot reach this tool. That is true of 6.x and was verified by
+    // reading the chain: getOperatorList() passes isOpList, which sets RenderingIntentFlag.OPLIST,
+    // which selects NullOptimizer (whose _optimize() is empty) instead of QueueOptimizer — and
+    // those four opcodes are emitted ONLY by QueueOptimizer splices.
+    //
+    // The walk has no branch for them, so if a future pdf.js changed that selection, or emitted
+    // them from the evaluator, the failure would be SILENTLY MISSING RECTANGLES on a page that
+    // has figures — the exact direction this tool exists to avoid, and worse than the documented
+    // gap the claim replaced. Nothing else in the suite would notice.
+    //
+    // This does not detect the change; it forces a human to re-derive the claim on a major bump,
+    // which is the cheap half. The four opcodes are asserted to exist so that "we are talking
+    // about the same table" stays true, and so a rename does not read as a fix.
+    const pkg = (await import('pdfjs-dist/package.json', {
+      with: { type: 'json' },
+    })) as unknown as {
+      default: { version: string };
+    };
+    expect(pkg.default.version.split('.')[0]).toBe('6');
+
+    const pdfjs = (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as {
+      OPS: Record<string, unknown>;
+    };
+    for (const name of [
+      'paintImageXObjectRepeat',
+      'paintInlineImageXObjectGroup',
+      'paintImageMaskXObjectGroup',
+      'paintImageMaskXObjectRepeat',
+    ]) {
       expect(typeof pdfjs.OPS[name]).toBe('number');
     }
   });

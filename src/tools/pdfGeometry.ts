@@ -12,6 +12,7 @@ import {
 } from '../services/pdfRender.js';
 import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
 import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
+import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -78,6 +79,21 @@ const geometryBoxShape = z.object({
         'unit-square CTM fallback, not a measured placement rectangle. Often far smaller (or ' +
         'otherwise unrelated) than the real figure; NEVER use it for a collision computation.',
     ),
+  unreliableCtm: z
+    .literal(true)
+    .optional()
+    .describe(
+      'Present (and true) on an IMAGE OR FORM box only — the text path has no CTM latch and ' +
+        'never sets this, so its absence on a text box says nothing about that box. On an image ' +
+        'or form box it means the POSITION was computed under a transform the document did not ' +
+        "ask for: a cm operand (or a form's own /Matrix) overflowed to a non-finite " +
+        'value, the walk refused the multiply and carried the last known-good transform forward, ' +
+        'and this box was measured against that. The numbers are finite and plausible and are ' +
+        'NOT a measurement — NEVER use one for a collision computation. Distinct from ' +
+        '"approximate", and a box can carry both: "approximate" says the EXTENT is a unit-square ' +
+        "fallback, this says the PLACEMENT is not the document's. Only a content stream with an " +
+        'overflowing operand reaches this at all; no TeX toolchain emits one.',
+    ),
 });
 
 const geometryPageShape = z.object({
@@ -96,10 +112,11 @@ const geometryPageShape = z.object({
         "from the item's own text matrix (advance along its text direction, em along its up " +
         'direction), so a ROTATED item — a sideways table cell, a rotated axis label, or every ' +
         'line on a pdflscape landscape page, where the content is rotated inside the page as well ' +
-        'as the page carrying /Rotate — gets a correct axis-aligned box. What is still not ' +
-        'modelled is SHEAR (a slanted, non-orthogonal text matrix), and line MERGING is keyed on ' +
-        'the baseline y alone, so a rotated line made of several text items comes back as several ' +
-        'separate boxes rather than one merged line — correct boxes, just not joined up. As for ' +
+        'as the page carrying /Rotate — gets a correct axis-aligned box, and a rotated line made ' +
+        'of several items IS merged into one: items are grouped in their own frame (shared ' +
+        'direction and up axes to within a degree, shared origin projected onto the up axis, ' +
+        'adjacency measured along the direction axis), not by page-axis y. What is still not ' +
+        'modelled is SHEAR (a slanted, non-orthogonal text matrix). As for ' +
         'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
         'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
         'field is the per-page cap alone — since a NaN is not a measurement.',
@@ -109,21 +126,22 @@ const geometryPageShape = z.object({
     .optional()
     .describe(
       'Image/form XObject placement rectangles, in drawing order. Absent (not empty) when ' +
-        '"images" was not requested. Covers paintImageXObject, paintImageMaskXObject and ' +
-        'paintFormXObjectBegin only. These produce no rectangle and no count — a gap, not a ' +
-        'zero: paintInlineImageXObject (plausible from some converters) and ' +
-        "paintSolidColorImageMask; and pdf.js's batching ops, which fire more readily than " +
-        'their names suggest — paintImageXObjectRepeat at 3 repeated placements, ' +
-        'paintInlineImageXObjectGroup and paintImageMaskXObjectGroup at 10 consecutive images ' +
-        '(the *Group forms do NOT require the images to be identical), and ' +
-        'paintImageMaskXObjectRepeat. Two more gaps: an image painted inside an ANNOTATION ' +
-        "appearance stream (pdfcomment, form fields, pdfpages links) is placed against pdf.js's " +
-        'own annotation base transform, which this walk does not model, so its rectangle would ' +
-        'be misplaced; and a box whose coordinates come out non-finite (a content stream whose ' +
-        'cm operands overflow) is dropped rather than reported, since a NaN is not a measurement ' +
-        '— the walk then keeps the last usable transform, so a later box on that same page can be ' +
-        'placed against a transform the document did not ask for. Only a stream with an ' +
-        'overflowing operand reaches this at all; no TeX toolchain emits one.',
+        '"images" was not requested. Covers paintImageXObject, paintImageMaskXObject, ' +
+        'paintInlineImageXObject, paintSolidColorImageMask and paintFormXObjectBegin. ' +
+        "pdf.js's batched forms (paintImageXObjectRepeat, paintInlineImageXObjectGroup, " +
+        'paintImageMaskXObjectGroup, paintImageMaskXObjectRepeat) are NOT a gap here, despite ' +
+        "what an earlier version of this text said: they are produced only by pdf.js's " +
+        'QueueOptimizer, and reading an operator list selects the NullOptimizer instead, so no ' +
+        'list this tool can receive ever contains one. What IS still unreported: an image ' +
+        'painted inside an ANNOTATION appearance stream (pdfcomment, form fields, pdfpages ' +
+        'links — not plain hyperref) is skipped rather than placed, because pdf.js rebases the ' +
+        'graphics state on an annotation base transform this walk does not model; those are ' +
+        'COUNTED, per page, in annotationImagesSkipped. And a box whose coordinates come out ' +
+        'non-finite (a content stream whose cm operands overflow) is dropped rather than ' +
+        'reported, since a NaN is not a measurement; the walk then carries the last usable ' +
+        'transform forward, and every later box measured against it is flagged ' +
+        'unreliableCtm: true rather than passed off as a measurement. Only a stream with an ' +
+        'overflowing operand reaches that at all; no TeX toolchain emits one.',
     ),
   textOmitted: z
     .number()
@@ -134,6 +152,18 @@ const geometryPageShape = z.object({
     .number()
     .describe(
       `Image rects past the ${MAX_IMAGE_RECTS_PER_PAGE}-per-page cap (MAX_IMAGE_RECTS_PER_PAGE).`,
+    ),
+  annotationImagesSkipped: z
+    .number()
+    .describe(
+      'Image/form paint operators found INSIDE an annotation appearance stream (pdfcomment, ' +
+        'form fields, pdfpages links — not plain hyperref, which emits no appearance ops at ' +
+        'all) and deliberately not measured: pdf.js rebases the graphics state on its own ' +
+        'annotation base transform there, which this walk does not model, so any rectangle it ' +
+        'produced would be in the wrong place. A counted gap, NOT a zero — the figures are ' +
+        'there and this says how many went unreported. Counted separately from imagesOmitted, ' +
+        'which is the per-page cap alone: folding them together would claim a rectangle was ' +
+        'computed and trimmed for size when in fact none was ever computed.',
     ),
 });
 
@@ -199,6 +229,20 @@ const outputSchema = {
         'file is document-controlled, so the work it can cost is bounded) and this count ' +
         'saturates with it.',
     ),
+  floatsOmittedBySize: z
+    .number()
+    .optional()
+    .describe(
+      'Present only when "floats" was requested: entries cut because the floats payload hit its ' +
+        `${FLOATS_CONTENT_BUDGET}-character budget, charged on the JSON-ENCODED size of the ` +
+        'array (escaping included — a \\label key is backslash-dense LaTeX and roughly doubles ' +
+        'in width once encoded), not on the sum of the field lengths. Every byte of this payload ' +
+        'comes from the document, so a count cap alone is not a bound on what you receive. ' +
+        'Counted apart from floatsOmitted (the entry cap) and floatsDropped (found but ' +
+        'unreportable) because it is a different cause. The entries kept are the first ones in ' +
+        "the .aux's own order — never reordered, never cherry-picked by size — and the omitted " +
+        'ones are not fetchable from this result. Almost always 0.',
+    ),
   floatsDropped: z
     .number()
     .optional()
@@ -216,7 +260,11 @@ const outputSchema = {
     .describe(
       'Explains an unusual situation: "floats" requested but no .aux was found in the build ' +
         'directory (nothing has been compiled with that root file yet, or the backend in use ' +
-        'does not write one).',
+        'does not write one), and/or the floats payload hit its size budget, in which case it ' +
+        'names the bound that fired. (There is a second, single-oversized-entry bound behind ' +
+        'that one, but the .aux reader caps every field at 200 characters, so one entry cannot ' +
+        'render anywhere near the whole budget and callers will not see it fire — it is ' +
+        'defence in depth, not a case to code against.)',
     ),
 };
 
@@ -236,20 +284,23 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         "the box, not the document's content, so use read_file for that. A text box runs from " +
         'the baseline up by the em, so it overshoots the ink above and excludes descenders ' +
         '(g, p, y) below. Rotated text IS accounted for — a sideways table cell, a rotated axis ' +
-        'label and a pdflscape landscape page all get correct boxes — but a rotated line of ' +
-        'several items comes back as several boxes rather than one merged line, and a sheared ' +
-        'text matrix is not modelled; see the schema field description for all of it. ' +
+        'label and a pdflscape landscape page all get correct boxes, and a rotated line of ' +
+        'several items is merged into one — but a sheared (slanted, non-orthogonal) text matrix ' +
+        'is not modelled; see the schema field description for all of it. ' +
         '"images" reports image and form XObject PLACEMENT RECTANGLES — what an \\includegraphics ' +
         'figure actually occupies — and NOTHING ELSE: general vector path geometry (\\fbox rules, ' +
         'TikZ strokes) is explicitly out of scope, because pdf.js only exposes those as raw ' +
         'path-construction operators in untransformed space, and replaying them correctly is a ' +
         'full graphics-state interpreter. A frame drawn purely with rules or strokes and no ' +
         'embedded image is not reported at all — a caller who assumes otherwise will measure a ' +
-        'collision that is not there, or miss one that is. A handful of rarer paint operators ' +
-        "(inline images, and pdf.js's batched repeated-placement forms), and anything painted " +
-        'inside an annotation appearance stream, are not handled either — see the schema field ' +
-        'description. A form whose own bounding box could not be recovered is flagged ' +
-        '"approximate": true and must never be used for a collision computation. ' +
+        'collision that is not there, or miss one that is. Anything painted inside an ' +
+        'ANNOTATION appearance stream is not measured either, because pdf.js rebases the ' +
+        'graphics state there on a base transform this tool does not model — those are counted ' +
+        'per page in annotationImagesSkipped rather than going silently missing. ' +
+        'A form whose own bounding box could not be recovered is flagged "approximate": true ' +
+        'and must never be used for a collision computation, and neither must a box measured ' +
+        'after an overflowing cm operand forced the walk to keep an older transform ' +
+        '("unreliableCtm": true). ' +
         '"floats" (opt-in, since it is document-wide rather than per-page) reports a label -> ' +
         'printed-page index parsed from the build-dir .aux, so it reflects the LAST COMPILE: a ' +
         'label added since, or one whose reference has not converged yet (LaTeX\'s "may have ' +
@@ -324,14 +375,31 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
 
           let floats: Array<{ label: string; number: string; page: string }> | undefined;
           let floatsOmitted: number | undefined;
+          let floatsOmittedBySize: number | undefined;
           let floatsDropped: number | undefined;
           let note: string | undefined;
           if (requestedKinds.includes('floats')) {
             const auxResult = await readAuxFloats(dir, root);
-            floats = auxResult.floats;
+            // The size budget is applied AFTER the reader's count cap, over whatever survived it,
+            // because the two bound different things and the count cap is the cheaper one: there
+            // is no point charging rendered characters against entries that were never going to
+            // be returned. Every byte here is document-controlled (`\label` keys straight out of
+            // the .aux), and a count cap alone is not a bound on what the client receives — the
+            // #68 lesson, applied to the field issue #80 flagged for it. See floatsBudget.ts.
+            const plan = planFloatsPayload(auxResult.floats);
+            floats = plan.floats;
             floatsOmitted = auxResult.omitted;
+            // A THIRD counter rather than folded into floatsOmitted, for the same reason
+            // annotationImagesSkipped is not imagesOmitted: floatsOmitted means "past the
+            // DEFAULT_MAX_FLOATS entry cap" and floatsDropped means "found but unreportable".
+            // A size cut is neither, and reporting it as either names a cause that did not fire.
+            floatsOmittedBySize = plan.omittedBySize;
             floatsDropped = auxResult.dropped;
-            note = auxResult.note;
+            // Joined, never overwritten. In practice they cannot both be set — the reader's note
+            // fires only when there is no .aux at all, which is also the case in which there are
+            // no floats for the budget to cut — but "cannot happen" is not a reason to write code
+            // that silently discards one of them if it ever does.
+            note = [auxResult.note, plan.note].filter(Boolean).join(' ') || undefined;
           }
 
           // The response boundary. It sits below the geometry() call deliberately: that call reads
@@ -345,6 +413,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             skippedPages: result.skippedPages,
             floats,
             floatsOmitted,
+            floatsOmittedBySize,
             floatsDropped,
             note,
           };
@@ -367,6 +436,14 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             if (p.images !== undefined) {
               parts.push(`${p.images.length} image rect(s)`);
               if (p.imagesOmitted > 0) parts.push(`${p.imagesOmitted} image rect(s) omitted`);
+              // Surfaced in the text channel as well as structuredContent, and named as a
+              // different thing from the cap: a client reading only the text would otherwise see
+              // "3 image rect(s)" on a page holding five figures and have no way to know two of
+              // them were never measured. Same reason omittedSnippetLocations is reported rather
+              // than left as a silent gap.
+              if (p.annotationImagesSkipped > 0) {
+                parts.push(`${p.annotationImagesSkipped} in annotation(s), not measured`);
+              }
             }
             return `  ${parts.join(' — ')}`;
           });
@@ -379,6 +456,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             floats !== undefined
               ? `  floats: ${floats.length} label(s)` +
                 (floatsOmitted ? ` (${floatsOmitted} past the cap)` : '') +
+                (floatsOmittedBySize ? ` (${floatsOmittedBySize} past the size budget)` : '') +
                 (floatsDropped ? ` (${floatsDropped} unreportable)` : '')
               : '';
           const noteLine = note ? `  … ${note}` : '';
