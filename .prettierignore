@@ -3,3 +3,4 @@ node_modules
 coverage
 test/fixtures
 tmp
+.claude/plans
