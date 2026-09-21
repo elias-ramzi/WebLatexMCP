@@ -18,6 +18,11 @@ import {
   isIncompatibleClient,
   outputSchemaMode,
 } from './lib/outputSchemaCompat.js';
+import {
+  createSessionProbe,
+  installConnectionProbe,
+  sessionProbeEnabled,
+} from './lib/sessionProbe.js';
 
 async function main(): Promise<void> {
   // Fail fast instead of hanging on an interactive credential prompt when no token or
@@ -48,7 +53,22 @@ async function main(): Promise<void> {
   );
   const concurrencyGuide = await loadConcurrencyGuide(process.env);
   const skills = await loadSkills(process.env);
-  const server = createServer(ctx, writingGuide, concurrencyGuide, skills, writingGuideHasExtra);
+  // Opt-in session-identity instrumentation for #18's spike. Unset (the default) leaves `probe`
+  // undefined, so nothing is installed anywhere and no line is written: see src/lib/sessionProbe.ts.
+  const probe = sessionProbeEnabled(process.env)
+    ? // Read lazily: the resolver learns a project's token when that project is first touched, so
+      // a list snapshotted here would scrub almost nothing.
+      createSessionProbe({ secrets: () => credentials.allSecrets() })
+    : undefined;
+  probe?.startup(config.sessionId);
+  const server = createServer(
+    ctx,
+    writingGuide,
+    concurrencyGuide,
+    skills,
+    writingGuideHasExtra,
+    probe,
+  );
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
@@ -66,6 +86,9 @@ async function main(): Promise<void> {
         `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
     );
   };
+  // Chained after the handler above, and deliberately so: the probe runs first inside that chain
+  // (see installConnectionProbe), so a firing is counted even if the compatibility logger throws.
+  if (probe) installConnectionProbe(server.server, probe);
   // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
   // session that dies without this is detected as gone by pid instead.
   const release = (): void => {

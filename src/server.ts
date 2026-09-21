@@ -41,6 +41,8 @@ import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { registerSkillPrompts } from './prompts/skills.js';
 import { buildInstructions } from './lib/writingGuide.js';
 import { getServerVersion } from './lib/version.js';
+import { installToolCallProbe } from './lib/sessionProbe.js';
+import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
 
 /**
@@ -54,6 +56,12 @@ import type { Skill } from './lib/skills.js';
  * `skills` are the bundled `.claude/skills` procedures. They are surfaced twice: as MCP prompts
  * for the user to invoke (see ./prompts/skills.ts) and through the `list_skills` tool so the model
  * can discover and follow one on its own.
+ *
+ * `probe` is the opt-in session-identity instrument (`src/lib/sessionProbe.ts`, off unless
+ * `WEB_LATEX_MCP_SESSION_PROBE` is set). Passed, it wraps `registerTool` **before** any tool is
+ * registered, so every tool below reports its call's `_meta` to stderr. Omitted — which is the
+ * default and every existing call site — nothing at all is installed: `registerTool` is still the
+ * prototype's own method and the server behaves exactly as it did before the probe existed.
  */
 export function createServer(
   ctx: AppContext,
@@ -61,6 +69,7 @@ export function createServer(
   concurrencyGuide?: string,
   skills: Skill[] = [],
   writingGuideHasExtra = false,
+  probe?: SessionProbe,
 ): McpServer {
   const instructions = buildInstructions(writingGuide, concurrencyGuide, writingGuideHasExtra);
   const server = new McpServer(
@@ -70,6 +79,9 @@ export function createServer(
     },
     instructions ? { instructions } : undefined,
   );
+
+  // Before the registrations below: the wrapper only covers tools registered after it.
+  if (probe) installToolCallProbe(server, probe);
 
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);

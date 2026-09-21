@@ -1135,6 +1135,36 @@ kinds: ["text"]` already carries each merged line's string — and what was miss
   including that it can wait on or time out against a peer and that it creates
   `<workspace>/.sessions/<id>/` — so "writes nothing" is never stated without the caveat.
 
+- **`WEB_LATEX_MCP_SESSION_PROBE`: opt-in stderr instrumentation for the session-identity spike**
+  (#18, "Step 0 — spike first"). #18 opens with a blocking empirical question — when a user opens
+  several Claude Desktop chats against one configured server, does Desktop give one MCP connection
+  per chat, one connection whose requests carry a conversation id in `_meta`, or one connection
+  with nothing distinguishing? — and nobody could answer it, because the server logged none of
+  what it takes to tell those apart. Set the variable to `1` and the server reports, to stderr:
+  every `initialized` firing with a **monotonic counter** (so "one connection or N?" is read off
+  the highest `#n` rather than counted), the `clientInfo` and pid of each, and the `_meta` of
+  **every** tool call with the tool's name. That is the whole feature: it measures identity, it
+  establishes none — the refactor #18 describes is deliberately not started here.
+
+  **One wiring point, not thirty.** Every tool registers through `server.registerTool`, so the
+  probe wraps that one method in `createServer` before any tool registers; a tool added later is
+  covered with no edit. It reads `extra._meta`, which the SDK assigns straight from the request's
+  `params._meta`, so what the spike measures is exactly what a per-request identity would consume.
+
+  **`_meta` is client-controlled data of unknown shape**, and is treated as such: the rendered
+  JSON is scrubbed of known secrets **before** it is truncated (truncating first could cut a token
+  in half and leave the prefix readable in a log the user pastes into an issue), capped at 2000
+  characters with the overflow counted, and every failure mode of `JSON.stringify` — circular
+  references, `BigInt`, a throwing getter, a value with no JSON form — becomes a marker string.
+  A probe that crashes a tool call is worse than no probe, so every entry point swallows its own
+  failures and reports them through the same sink.
+
+  **Off by default and inert, not merely harmless.** Unset, nothing is installed at all:
+  `registerTool` is still the prototype's own method, so there is no wrapper in the hot path to
+  measure or fail. Tests pin that identity, pin that a probed tool call's result is _equal_ to the
+  unprobed one (error results included), and pin that the default sink is `console.error` —
+  stdout is the JSON-RPC channel.
+
 ### Changed
 
 - **One home for LaTeX's comment rule.** `edit_file`'s `excludeComments` and `search_files`'
