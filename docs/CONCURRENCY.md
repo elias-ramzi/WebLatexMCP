@@ -197,7 +197,7 @@ later edits do not quietly clear it, because that session's shadow is anchored t
 base the file has since moved past, and committing it would revert whatever landed in
 between.
 
-There are two honest ways out, and both are the caller's decision: commit with
+There are three honest ways out, and all are the caller's decision: commit with
 `scope: "all"` to take the working tree as it stands, or discard those files to give
 up that session's version (which also throws away any other session's uncommitted
 work at those paths — `discard` reverts the working tree, not one session's view of
@@ -206,6 +206,16 @@ nothing to stage for the paths taken — the content is already at HEAD, because
 `push` with `message` committed it or a hand edit reverted it — the record is settled
 without a commit (`committed: false`, the files under `settled`), so a stale flag never
 forces an empty commit to get out.
+
+The third is `shelve`: it takes the named paths' content out of the clone entirely and
+settles them in every session, so the record goes without the work going. That is the
+difference from `discard`, which also settles those paths but keeps nothing — `shelve`
+is the exit for the case where the content still matters. Its partner `unshelve`
+settles across every session and then records into the calling session, exactly as
+`revert` does and for the same reason: restored bytes are content nobody currently
+owns, so ownership has to be decided rather than observed. Both live outside the
+clone, under `<workspace>/.sessions/<project>/shelves/`, and are project-scoped, so a
+shelf is visible to every session on the project rather than only its author.
 
 One more thing a session commit never takes: a file git ignores. Staging from the
 shadow bypasses `git add`, which is the only place `.gitignore` and

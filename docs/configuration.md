@@ -141,6 +141,8 @@ Session state (the lock, and each session's record of its own changes) lives und
 committed or mistaken for project content. With no `WEB_LATEX_MCP_SESSION` set, a session still works
 and is still isolated, but shows up to its peers under a generated id.
 
+Shelves taken by `shelve` live under the same directory, in `shelves/`, but are **project-scoped rather than per-session**: any session on the project can list and reclaim one. That is deliberate — a shelf only its author could see would reproduce the invisible `git stash@{0}` the tool exists to replace.
+
 This works between processes on **one machine**; it is not coordination between people on different
 machines, who still meet at the git remote. See [Parallel sessions on one
 clone](CONCURRENCY.md#parallel-sessions-on-one-clone) for the model, the conflict semantics, and the

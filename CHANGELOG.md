@@ -11,6 +11,72 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`shelve` / `unshelve` / `list_shelves`: set uncommitted work aside without publishing or
+  destroying it** (#86). `push` refuses to rebase over an uncommitted tracked file, and every
+  exit it offered either **published** that file (`commit`, or a `message` on `push`) or
+  **destroyed** it (`discard`). The ordinary case — push section A while section B is
+  mid-sentence — had no safe way out. `shelve` is that exit, and `push`'s refusal now names it,
+  between the two publishing routes and the destructive one.
+
+  **Deliberately not `git stash`.** A stash is a ref inside the shared clone: invisible to every
+  tool here and to every peer session, which is how an unreclaimed `stash@{0}` sat for five days
+  in a real session. A shelf lives under `<workspace>/.sessions/<project>/shelves/`, outside the
+  clone, and is labelled and listable. It is also **project-scoped, not session-scoped** — any
+  session on the project can list and reclaim one, because a shelf only its author can see
+  reproduces the problem it replaces.
+
+  Two orderings carry the safety and are not implementation details. **The shelf is fully on disk
+  before the working tree is touched**, so a crash leaves the work duplicated rather than gone —
+  and because a restore whose bytes are already on disk is treated as a no-op rather than a
+  conflict, reclaiming it afterwards is not wedged. And **the manifest is written last**, so a
+  half-written shelf is invisible rather than corrupt: `list_shelves` skips it and `unshelve`
+  does not know it.
+
+  `unshelve` **refuses rather than overwrites.** If anything is at a shelved path that the shelve
+  did not leave there, or HEAD's content for it is no longer what the shelved edit was made
+  against, nothing is written, the tree is left exactly as it was, and **the shelf is left
+  intact** — which is what
+  makes eliding a large side safe here in a way it is not for a push conflict: every byte stays
+  recoverable by resolving the collision and calling again. The report gives `base`/`ours`/
+  `theirs` per file rather than writing markers into anyone's files, and `conflictPaths` is never
+  capped. A HEAD that advanced without touching the shelved files is **not** a conflict: the
+  check is per file, against the shelf's stored base, not against the recorded `headSha`.
+
+  Both operations refuse when a live peer session owns one of the paths — and when they cannot
+  read that peer's change index to tell. **An unreadable index means unreadable, never "owns
+  nothing"**, the same fail-closed reading `commit scope: "paths"` uses; getting it backwards is
+  the one defect that would silently take a peer's in-flight lines. A `.bib` stays behind
+  `confirmBibEdit`, judged on the link-resolved name, and a path that is a symbolic link on any
+  side (HEAD's mode, the index's, `lstat`, or a linked ancestor) is refused outright, because
+  restoring content through a link puts the bytes wherever it points. A path that could not be
+  judged at all counts as a link, on purpose.
+
+  The decision for one file is a pure function over bytes (`planUnshelveFile`), not an inline
+  question to `git status`, and that is not a refactor: asking git alone missed a path git
+  declines to report. An untracked shelved path later covered by a `.gitignore` was invisible to
+  `status`, so a file the user wrote there afterwards was silently overwritten and the shelf then
+  deleted, making the loss unrecoverable. A path that was untracked when shelved is now checked
+  for **presence** — the shelve removed it, so anything there is someone's work — which needs no
+  filter reasoning; a tracked path still goes through `git status`, because only git applies the
+  path's clean filter (the #63 defect) and `.gitignore` never hides a tracked file. The dirty
+  check folds case like every other by-name comparison here; it did not, which made it fail open
+  on exactly the platforms where `core.ignorecase` is git's default.
+
+  A **staged** path is refused outright: `discard`'s path-limited branch restores from the index
+  rather than HEAD and cannot remove a staged new file, so shelving one reported success while
+  leaving the work in the tree — the push stayed blocked and the shelf could never be reclaimed.
+
+  The conflict payload is bounded by all three of #68's caps, including the **aggregate** one an
+  earlier draft omitted: a per-side cap alone lets 20 files × 3 sides × 12000 characters through
+  with nothing individually oversized, `truncated: false`, and a result an order of magnitude past
+  the size that originally failed to deliver. `list_shelves` is bounded too, since nothing reaps a
+  shelf.
+
+  `shelve` settles the shelved paths across every session and deliberately does **not** record:
+  the tree now equals HEAD there, so there is nothing for anyone to own. `unshelve` settles and
+  then records into the calling session, exactly as `revert` does, since the restored bytes are
+  content no session currently owns.
+
 - **`pdf_geometry`'s `floats` payload is bounded by rendered size, not only by entry count**
   (#80, the "related" note). It was capped at 200 entries with each field capped at 200
   characters — roughly 120 KB worst case, and no bound at all on what a client will accept. Every
