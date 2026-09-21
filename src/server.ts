@@ -24,6 +24,7 @@ import { registerPush } from './tools/push.js';
 import { registerDeleteFile } from './tools/deleteFile.js';
 import { registerDiscard } from './tools/discard.js';
 import { registerRevert } from './tools/revert.js';
+import { registerShelve, registerUnshelve, registerListShelves } from './tools/shelve.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
@@ -92,6 +93,12 @@ export function createServer(
   registerPush(server, ctx);
   registerDiscard(server, ctx);
   registerRevert(server, ctx);
+  // The third exit from push's dirty-tree refusal: neither publishes the work nor
+  // destroys it. Registered beside discard/revert because that is the family it belongs
+  // to — path-limited operations that rewrite the working tree under the caller.
+  registerShelve(server, ctx);
+  registerUnshelve(server, ctx);
+  registerListShelves(server, ctx);
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);

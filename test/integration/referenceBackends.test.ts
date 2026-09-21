@@ -28,6 +28,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { DoctorService } from '../../src/services/doctor.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
+import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
@@ -144,6 +145,7 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       references: new ReferenceResolver(refBackends, opts),
       doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),
+      shelves: new ShelfStore(workspace, config.sessionId),
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
         git.readAtRefBytes(d, 'HEAD', rel),
       ),

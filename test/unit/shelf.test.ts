@@ -3,6 +3,8 @@ import {
   SHELF_ID_RE,
   assertShelfId,
   capUnshelveConflict,
+  planUnshelveFile,
+  type UnshelveFileState,
   countLines,
   isShelfId,
   newShelfId,
@@ -175,6 +177,12 @@ describe('countLines', () => {
   });
 });
 
+/** Large enough that the aggregate budget never fires in the tests that predate it — those
+ *  pin the file cap and the per-side cap, and a shared budget silently cutting alongside them
+ *  would make it impossible to tell which bound a `note` came from. The aggregate has its own
+ *  tests below. */
+const BIG_BUDGET = 10_000_000;
+
 describe('capUnshelveConflict', () => {
   const file = (over: Partial<UnshelveConflictFile> = {}): UnshelveConflictFile => ({
     path: 'a.tex',
@@ -189,6 +197,7 @@ describe('capUnshelveConflict', () => {
     const plan = capUnshelveConflict([file(), file({ path: 'b.tex' })], {
       maxFiles: 20,
       sideCap: 100,
+      totalBudget: BIG_BUDGET,
     });
     expect(plan.truncated).toBe(false);
     expect(plan.note).toBe('');
@@ -204,7 +213,11 @@ describe('capUnshelveConflict', () => {
 
   it('elides a side over the cap and reports its TRUE length', () => {
     const long = 'x'.repeat(50);
-    const plan = capUnshelveConflict([file({ ours: long })], { maxFiles: 20, sideCap: 10 });
+    const plan = capUnshelveConflict([file({ ours: long })], {
+      maxFiles: 20,
+      sideCap: 10,
+      totalBudget: BIG_BUDGET,
+    });
     expect(plan.files[0]?.ours).toBeNull();
     expect(plan.files[0]?.elided).toEqual({ ours: 50 });
     expect(plan.files[0]?.base).toBe('base');
@@ -216,7 +229,11 @@ describe('capUnshelveConflict', () => {
 
   it('keeps a side exactly at the cap', () => {
     const exact = 'x'.repeat(10);
-    const plan = capUnshelveConflict([file({ ours: exact })], { maxFiles: 20, sideCap: 10 });
+    const plan = capUnshelveConflict([file({ ours: exact })], {
+      maxFiles: 20,
+      sideCap: 10,
+      totalBudget: BIG_BUDGET,
+    });
     expect(plan.files[0]?.ours).toBe(exact);
     expect(plan.files[0]?.elided).toBeUndefined();
     expect(plan.truncated).toBe(false);
@@ -227,6 +244,7 @@ describe('capUnshelveConflict', () => {
     const plan = capUnshelveConflict([file({ base: null, ours: long, theirs: null })], {
       maxFiles: 20,
       sideCap: 10,
+      totalBudget: BIG_BUDGET,
     });
     const only = plan.files[0];
     expect(only?.base).toBeNull();
@@ -241,7 +259,11 @@ describe('capUnshelveConflict', () => {
 
   it('drops files past maxFiles from files but never from paths', () => {
     const files = ['a', 'b', 'c', 'd'].map((n) => file({ path: `${n}.tex` }));
-    const plan = capUnshelveConflict(files, { maxFiles: 2, sideCap: 1000 });
+    const plan = capUnshelveConflict(files, {
+      maxFiles: 2,
+      sideCap: 1000,
+      totalBudget: BIG_BUDGET,
+    });
     expect(plan.files.map((f) => f.path)).toEqual(['a.tex', 'b.tex']);
     expect(plan.paths).toEqual(['a.tex', 'b.tex', 'c.tex', 'd.tex']);
     expect(plan.truncated).toBe(true);
@@ -253,18 +275,175 @@ describe('capUnshelveConflict', () => {
 
   it('names both caps when both fire', () => {
     const files = ['a', 'b', 'c'].map((n) => file({ path: `${n}.tex`, ours: 'x'.repeat(50) }));
-    const plan = capUnshelveConflict(files, { maxFiles: 2, sideCap: 10 });
+    const plan = capUnshelveConflict(files, { maxFiles: 2, sideCap: 10, totalBudget: BIG_BUDGET });
     expect(plan.note).toContain('detailed');
     expect(plan.note).toContain('characters');
     expect(plan.truncated).toBe(true);
   });
 
+  it('cuts on the AGGREGATE budget even when every single side is under its own cap', () => {
+    // The case the per-side cap cannot see, and the one the first version of this shipped
+    // without: nothing is individually oversized, so without a total budget nothing is elided,
+    // `truncated` is false, the note is empty, and the result is ~10x the size that was
+    // originally rejected undelivered.
+    const side = 'x'.repeat(1000);
+    const files = ['a', 'b', 'c', 'd'].map((n) =>
+      file({ path: `${n}.tex`, base: side, ours: side, theirs: side }),
+    );
+    const plan = capUnshelveConflict(files, {
+      maxFiles: 20,
+      sideCap: 5000,
+      totalBudget: 3500,
+    });
+    expect(plan.truncated).toBe(true);
+    const kept = plan.files.flatMap((f) => [f.base, f.ours, f.theirs]).filter((s) => s !== null);
+    expect(kept.join('').length).toBeLessThanOrEqual(3500);
+    // A tail, not a hole: the first file comes back whole rather than every file half.
+    expect(plan.files[0]!.base).toBe(side);
+    expect(plan.files[0]!.ours).toBe(side);
+    expect(plan.files[3]!.theirs).toBeNull();
+    // Cut sides carry their TRUE length, so nothing is lost silently.
+    expect(plan.files[3]!.elided?.theirs).toBe(1000);
+    // Every path stays named, whatever was cut.
+    expect(plan.paths).toEqual(['a.tex', 'b.tex', 'c.tex', 'd.tex']);
+  });
+
+  it('names the aggregate budget and NOT the per-side cap when only the aggregate fired', () => {
+    const side = 'x'.repeat(1000);
+    const files = ['a', 'b'].map((n) => file({ path: `${n}.tex`, ours: side, theirs: side }));
+    const plan = capUnshelveConflict(files, { maxFiles: 20, sideCap: 5000, totalBudget: 1500 });
+    expect(plan.note).toContain('total budget');
+    // Reporting a cap that did not fire sends the reader hunting for one enormous file that is
+    // not there — the conflictBudget rule, applied here.
+    expect(plan.note).not.toContain('over 5000 characters');
+  });
+
+  it('never elides for the aggregate when the whole payload fits', () => {
+    const files = [file({ path: 'a.tex', base: 'b', ours: 'o', theirs: 't' })];
+    const plan = capUnshelveConflict(files, { maxFiles: 20, sideCap: 100, totalBudget: 100 });
+    expect(plan.truncated).toBe(false);
+    expect(plan.note).toBe('');
+    expect(plan.files[0]).toEqual({
+      path: 'a.tex',
+      reason: 'dirty',
+      base: 'b',
+      ours: 'o',
+      theirs: 't',
+    });
+  });
+
   it('is empty-safe', () => {
-    expect(capUnshelveConflict([], { maxFiles: 20, sideCap: 10 })).toEqual({
-      files: [],
-      paths: [],
-      truncated: false,
-      note: '',
+    expect(capUnshelveConflict([], { maxFiles: 20, sideCap: 10, totalBudget: BIG_BUDGET })).toEqual(
+      {
+        files: [],
+        paths: [],
+        truncated: false,
+        note: '',
+      },
+    );
+  });
+});
+
+describe('planUnshelveFile', () => {
+  const B = (s: string): Buffer => Buffer.from(s, 'utf8');
+  /** A tracked file the shelf modified: base = HEAD then, shelved = the edit taken. */
+  const tracked = (over: Partial<UnshelveFileState> = {}): UnshelveFileState => ({
+    base: B('H\n'),
+    shelved: B('EDIT\n'),
+    current: B('H\n'),
+    headNow: B('H\n'),
+    dirty: false,
+    ...over,
+  });
+  /** An untracked file the shelf took: no base, and the shelve REMOVED the path. */
+  const untracked = (over: Partial<UnshelveFileState> = {}): UnshelveFileState => ({
+    base: null,
+    shelved: B('NEW\n'),
+    current: null,
+    headNow: null,
+    dirty: false,
+    ...over,
+  });
+
+  it('applies the ordinary case: tree back at HEAD, HEAD unmoved', () => {
+    expect(planUnshelveFile(tracked())).toEqual({ kind: 'apply' });
+    expect(planUnshelveFile(untracked())).toEqual({ kind: 'apply' });
+  });
+
+  it('conflicts as dirty when git reports the tracked path changed', () => {
+    expect(planUnshelveFile(tracked({ current: B('LIVE\n'), dirty: true }))).toEqual({
+      kind: 'conflict',
+      reason: 'dirty',
+    });
+  });
+
+  it('conflicts when an UNTRACKED shelved path has something there again, even with dirty false', () => {
+    // THE DATA-LOSS CASE. git declines to report a path it has been told to ignore, so a
+    // `.gitignore` landing after the shelve makes the user's new file invisible to `git status`
+    // — and the first version of this logic asked git alone. It overwrote the file, returned
+    // `restored: true` with no conflicts, and then deleted the shelf, so the bytes were
+    // unrecoverable. Presence is the right question here and needs no filter reasoning at all.
+    expect(
+      planUnshelveFile(untracked({ current: B('PRECIOUS NEW WORK\n'), dirty: false })),
+    ).toEqual({ kind: 'conflict', reason: 'dirty' });
+  });
+
+  it('conflicts as head-moved when HEAD changed under the path, tree clean', () => {
+    expect(planUnshelveFile(tracked({ current: B('H2\n'), headNow: B('H2\n') }))).toEqual({
+      kind: 'conflict',
+      reason: 'head-moved',
+    });
+  });
+
+  it('does NOT conflict when HEAD moved elsewhere — base still matches this path', () => {
+    // A per-file check, not a comparison against the manifest's headSha: otherwise every
+    // unshelve after any unrelated commit would refuse.
+    expect(planUnshelveFile(tracked())).toEqual({ kind: 'apply' });
+  });
+
+  it('conflicts when a commit created a path the shelf took while untracked', () => {
+    expect(
+      planUnshelveFile(untracked({ headNow: B('someone else\n'), current: B('someone else\n') })),
+    ).toEqual({
+      kind: 'conflict',
+      reason: 'head-moved',
+    });
+  });
+
+  it('calls a restore whose bytes are already on disk a NO-OP, not a conflict', () => {
+    // Exactly the state a crash between writing the shelf and clearing the tree leaves. Calling
+    // it a conflict makes the shelf permanently unreclaimable, with `ours` and `theirs`
+    // byte-identical — and the claim that such a crash is "at worst a no-op restore" false.
+    expect(planUnshelveFile(tracked({ current: B('EDIT\n'), dirty: true }))).toEqual({
+      kind: 'noop',
+    });
+    expect(planUnshelveFile(untracked({ current: B('NEW\n') }))).toEqual({ kind: 'noop' });
+  });
+
+  it('treats a shelved DELETION already applied as a no-op, and an undeleted file as a conflict', () => {
+    const deleted: UnshelveFileState = {
+      base: B('H\n'),
+      shelved: null,
+      current: null,
+      headNow: B('H\n'),
+      dirty: true,
+    };
+    expect(planUnshelveFile(deleted)).toEqual({ kind: 'noop' });
+    expect(planUnshelveFile({ ...deleted, current: B('H\n'), dirty: false })).toEqual({
+      kind: 'apply',
+    });
+  });
+
+  it('distinguishes an empty file from an absent one', () => {
+    // `null` means absent and must never compare equal to zero bytes, or a restore that should
+    // create an empty file reads as already done.
+    expect(planUnshelveFile(untracked({ shelved: Buffer.alloc(0), current: null }))).toEqual({
+      kind: 'apply',
+    });
+    expect(
+      planUnshelveFile(untracked({ shelved: Buffer.alloc(0), current: Buffer.alloc(0) })),
+    ).toEqual({
+      kind: 'noop',
     });
   });
 });

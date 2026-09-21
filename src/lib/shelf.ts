@@ -214,6 +214,12 @@ export interface UnshelveConflictPlan {
 /**
  * Cap a conflict payload so it fits in one tool result.
  *
+ * Three bounds, each reported only when it actually fired: how many files get a detailed block,
+ * how long any ONE side may be, and — the one an earlier version of this omitted — how much
+ * every side of every file may come to in TOTAL. A per-side cap without an aggregate is not a
+ * bound on the result: 20 files x 3 sides x 12000 characters clears every individual cap and
+ * still renders 720000 characters with `truncated: false`.
+ *
  * The first `maxFiles` files get a detailed block; the rest are named in `paths` only, which is
  * never capped and never elided — the path list is the one thing a caller needs in order to act.
  * Each side is capped at `sideCap` characters; a cut side comes back `null` with its **true**
@@ -230,24 +236,45 @@ export interface UnshelveConflictPlan {
  */
 export function capUnshelveConflict(
   files: UnshelveConflictFile[],
-  opts: { maxFiles: number; sideCap: number },
+  opts: { maxFiles: number; sideCap: number; totalBudget: number },
 ): UnshelveConflictPlan {
   const maxFiles = Math.max(0, opts.maxFiles);
   const sideCap = Math.max(0, opts.sideCap);
+  const totalBudget = Math.max(0, opts.totalBudget);
   const paths = files.map((f) => f.path);
   const kept = files.slice(0, maxFiles);
   const droppedFiles = files.length - kept.length;
   let anySideElided = false;
+  let budgetFired = false;
+  // Charged across every side of every file, not per side. The per-side cap alone is only half
+  // of the mechanism #68 built, and the missing half is the one that matters: 20 files x 3 sides
+  // x 12000 characters is 720000 characters with nothing individually over its cap, so nothing
+  // is elided, `truncated` is false and the note is empty — a payload an order of magnitude past
+  // the ~67k that was rejected undelivered in the first place. Five shelved 8 kB sections
+  // rebased over reach ~120k without an adversary anywhere.
+  let used = 0;
 
   const out = kept.map((file) => {
     const elided: UnshelveSideElision = {};
     const cut = (value: string | null, side: keyof UnshelveSideElision): string | null => {
       // A genuinely absent side stays absent: `null` in, `null` out, and no `elided` entry.
       if (value === null) return null;
-      if (value.length <= sideCap) return value;
-      elided[side] = value.length;
-      anySideElided = true;
-      return null;
+      if (value.length > sideCap) {
+        elided[side] = value.length;
+        anySideElided = true;
+        return null;
+      }
+      // The aggregate. Charged in the order sides are visited, so the cut is a tail rather than
+      // a hole: a caller reading the first files in full is better off than one reading every
+      // file half. An over-budget side is elided with its true length, exactly as an
+      // over-the-side-cap one is, and stays recoverable because the shelf is left intact.
+      if (used + value.length > totalBudget) {
+        elided[side] = value.length;
+        budgetFired = true;
+        return null;
+      }
+      used += value.length;
+      return value;
     };
     const entry: UnshelveConflictFile & { elided?: UnshelveSideElision } = {
       path: file.path,
@@ -273,11 +300,93 @@ export function capUnshelveConflict(
         `so resolving the collision and unshelving again recovers every byte`,
     );
   }
+  // Named apart from the per-side cap, and only when it actually fired: reporting "a side was
+  // too long" for a payload cut by the aggregate sends the reader looking for one big file that
+  // is not there. Same rule conflictBudget.ts follows.
+  if (budgetFired) {
+    notes.push(
+      `the ${totalBudget}-character total budget across every side of every file was reached, ` +
+        `so later sides were elided; the shelf is left intact, so resolving the collision and ` +
+        `unshelving again recovers every byte`,
+    );
+  }
 
   return {
     files: out,
     paths,
-    truncated: droppedFiles > 0 || anySideElided,
+    truncated: droppedFiles > 0 || anySideElided || budgetFired,
     note: notes.join('; '),
   };
+}
+
+/** What one shelved file's restore would do to the tree, decided from bytes alone. */
+export type UnshelveVerdict =
+  | { kind: 'apply' }
+  | { kind: 'noop' }
+  | { kind: 'conflict'; reason: UnshelveConflictReason };
+
+/** One file's inputs to {@link planUnshelveFile}, all as raw bytes (or absent). */
+export interface UnshelveFileState {
+  /** HEAD's bytes when the shelf was taken. `null` iff the file was untracked then. */
+  base: Buffer | null;
+  /** The bytes the shelf holds. `null` iff the shelf recorded a deletion. */
+  shelved: Buffer | null;
+  /** What is in the working tree now. `null` iff the path is absent. */
+  current: Buffer | null;
+  /** HEAD's bytes now. `null` iff the path is not tracked at HEAD now. */
+  headNow: Buffer | null;
+  /** Whether `git status` reports this path as changed — already folded by the caller. */
+  dirty: boolean;
+}
+
+/**
+ * Decide, for ONE shelved file, whether `unshelve` may write it.
+ *
+ * Pure and byte-level so it can be unit-tested exhaustively, which is the whole reason it is not
+ * inline in the tool: the first version of this logic lived in the handler, had no seam, and
+ * silently destroyed a user's work (see the `git status` note below).
+ *
+ * **Why `dirty` is passed in rather than derived here.** Asking whether the working tree differs
+ * from HEAD is not a byte comparison: under a gitattributes clean filter (`* text=auto`) a CRLF
+ * working-tree file never equals its own blob, and comparing the two directly reports a file
+ * nobody touched as conflicted forever — the #63 defect. `git status` answers that question
+ * correctly, filters included, so the caller asks git and hands the answer down.
+ *
+ * **And why `git status` alone is NOT enough — the bug this function exists to fix.** git declines
+ * to report a path it has been told to ignore, so an UNTRACKED shelved path that is later covered
+ * by a `.gitignore` is invisible to `status`: the user's new file at that path was overwritten,
+ * the call reported `restored: true` with zero conflicts, and the shelf was then deleted, making
+ * the loss unrecoverable. For an entry the shelf took while untracked (`base === null`) the tree
+ * must therefore be checked for PRESENCE, which needs no filter reasoning at all: the shelve
+ * removed that path, so anything there now is someone's work. A TRACKED entry needs no such
+ * check — `.gitignore` never applies to a tracked file, so `status` does report it.
+ *
+ * A restore whose bytes are already on disk is a **no-op**, not a conflict. That matters for a
+ * real case rather than a tidy one: a crash between writing the shelf and clearing the tree
+ * leaves exactly that state, and calling it a conflict makes the shelf permanently unreclaimable
+ * with `ours` and `theirs` byte-identical.
+ */
+export function planUnshelveFile(state: UnshelveFileState): UnshelveVerdict {
+  const { base, shelved, current, headNow, dirty } = state;
+
+  // Already what the shelf would write — including "already absent" for a shelved deletion.
+  if (bytesEqual(current, shelved)) return { kind: 'noop' };
+
+  // HEAD moved UNDER THIS FILE, so the shelved edit no longer applies to what it was made
+  // against. Both sides are blob bytes here, so this comparison is filter-free and exact; a HEAD
+  // that advanced without touching this path compares equal and is correctly not a conflict.
+  if (!bytesEqual(headNow, base)) return { kind: 'conflict', reason: 'head-moved' };
+
+  // Untracked when shelved: the shelve removed the path, so anything present now is live work
+  // that `git status` may or may not be willing to mention. See the doc comment.
+  if (base === null && current !== null) return { kind: 'conflict', reason: 'dirty' };
+
+  if (dirty) return { kind: 'conflict', reason: 'dirty' };
+  return { kind: 'apply' };
+}
+
+/** Byte equality where `null` (absent) is a value distinct from empty. */
+export function bytesEqual(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.equals(b);
 }

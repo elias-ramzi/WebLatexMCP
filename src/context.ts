@@ -16,6 +16,7 @@ import { ReferenceResolver } from './services/referenceResolver.js';
 import { DoctorService } from './services/doctor.js';
 import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
+import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
@@ -59,6 +60,14 @@ export interface AppContext {
   sessions: SessionRegistry;
   /** This session's own uncommitted changes — see `src/services/shadowStore.ts`. */
   shadows: ShadowStore;
+  /**
+   * Work set aside by `shelve`, outside the clone — see `src/services/shelfStore.ts`.
+   *
+   * Project-scoped, deliberately not session-scoped: any session on the project can list and
+   * unshelve one. A shelf only this session could see would reproduce the invisible, unreclaimed
+   * `git stash@{0}` that #86 exists to replace.
+   */
+  shelves: ShelfStore;
   /** Sticky per-project rewrite-preservation mode — see `src/services/rewriteModeStore.ts`. */
   rewriteModes: RewriteModeStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
@@ -78,6 +87,7 @@ export function createContext(
   const git = new GitService(identity);
 
   const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
+  const shelves = new ShelfStore(config.workspaceRoot, config.sessionId);
   const rewriteModes = new RewriteModeStore(config.workspaceRoot);
   // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
   // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
@@ -187,6 +197,7 @@ export function createContext(
     doctor: new DoctorService(),
     sessions,
     shadows,
+    shelves,
     rewriteModes,
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
