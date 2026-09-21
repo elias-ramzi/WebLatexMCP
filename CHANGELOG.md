@@ -2633,6 +2633,36 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   assertion is followed by a discard under the disk's own spelling that must remove the file, so
   "it did not fold" can never be a `clean` that reached nothing.
 
+- **Output-contract tests now assert the advertised `outputSchema`, not just `structuredContent`**
+  (#130; no `src/` file changes). `McpServer` validates a tool result against the tool's output
+  schema and then discards the parse result — only `parseResult.success` is read, `parseResult.data`
+  is never used — so the handler's own object is what reaches the client. A **required field
+  missing** from `structuredContent` fails the parse and surfaces as an `McpError`, which a
+  `structuredContent` assertion does catch. A field **present in `structuredContent` and absent
+  from the `outputSchema`** does not: a zod object strips rather than rejects, and nothing strips
+  it from the forwarded object either, so the key reaches the caller while `tools/list` — the only
+  place a client can learn a field exists — never mentions it. A test asserting only on
+  `structuredContent` therefore pins the handler and says nothing about the declared contract.
+  That is how #128's `floatsRefused` test passed with the field deleted from the schema.
+
+  `test/helpers/outputSchema.ts` is the one place that answers the question, off a real
+  `listTools()` round trip: `advertisedOutputSchema`, a `declaredField` pointer walk
+  (`pages[].images[].unreliableCtm`), and `expectDeclaredField` / `expectUndeclaredField` with
+  optional `required` and `description` clauses. Applied to the four tests whose stated purpose
+  **is** the contract — `pdf_geometry`'s `floatsDropped`/`floatsRefused`/`annotationImagesSkipped`
+  /`unreliableCtm`, `push`'s conflict-budget reporting fields, `set_rewrite_mode`'s `previous`,
+  and `add_asset`'s deliberate absence of a `diff` — and deliberately **not** to the other 50-odd
+  files that assert on `structuredContent`, which legitimately test what the handler computes and
+  would only gain coupling to schema churn.
+
+  Every converted assertion is mutation-proved in both directions: renaming the field in the
+  schema (keeping it optional, so the parse still succeeds) turns each one red, and the same
+  mutation leaves the pre-conversion test green. The comment in
+  `test/integration/pdfGeometry.test.ts` that claimed a schema/field mismatch would surface as an
+  opaque "Output validation error" is corrected in all three places it appeared: true of a missing
+  required field, false of an undeclared extra one, which is the direction that decides whether a
+  field is in the contract.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
