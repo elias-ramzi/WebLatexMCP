@@ -90,6 +90,23 @@ export interface GeometryBox extends Box {
    * for a collision computation against another box.
    */
   approximate?: true;
+  /**
+   * Present (and `true`) on a box computed while the walk's CTM was known to be unusable — a
+   * document-controlled `cm` operand, or a form XObject's own `/Matrix`, whose multiply overflowed
+   * to a non-finite value and was therefore refused (see `applyCtm`). The refusal keeps the last
+   * known-good CTM, so the numbers below are finite and plausible, but they are measured against a
+   * transform the document did not ask for. This is NOT a measured placement and must NEVER be
+   * used for a collision computation against another box.
+   *
+   * Distinct from `approximate`, and a box can carry both: `approximate` says the box's *extent*
+   * could not be recovered (the unit-square fallback stood in for a real bbox), while
+   * `unreliableCtm` says its *position* was computed under a transform that is not the document's.
+   * The flag is stack-scoped — it is pushed and popped with the CTM by `save`/`restore` and by the
+   * implicit save/restore around `paintFormXObjectBegin`/`End` — so a poison latched inside a `q`
+   * stops at the matching `Q`, while one latched at depth 0 with no enclosing `save` correctly
+   * marks every remaining box on the page.
+   */
+  unreliableCtm?: true;
 }
 
 export interface GeometryPage {
@@ -100,6 +117,18 @@ export interface GeometryPage {
   images?: GeometryBox[];
   textOmitted: number;
   imagesOmitted: number;
+  /**
+   * Image/form paint operators skipped because they were inside an annotation appearance stream
+   * (`beginAnnotation`…`endAnnotation`), where the walk cannot vouch for a rectangle — see
+   * `walkImageGeometry`. A counted gap, not a zero: the figures are there and this says how many
+   * of them went unreported.
+   *
+   * Counted SEPARATELY from `imagesOmitted`, which this file's comments reserve strictly for boxes
+   * cut by the per-page cap (`MAX_IMAGE_RECTS_PER_PAGE`). Folding the two together would say a
+   * rectangle existed and was trimmed for size when in fact none was ever computed. Required, not
+   * optional, so a future page-shape construction site cannot forget to say which it is.
+   */
+  annotationImagesSkipped: number;
 }
 
 export interface GeometryRequest {
@@ -309,6 +338,25 @@ interface PdfjsOps {
   transform: number;
   paintImageXObject: number;
   paintImageMaskXObject: number;
+  /** An image written inline in the content stream (`BI`…`ID`…`EI`) rather than referenced as an
+   *  XObject — plausible from some PDF converters. Painted into the unit square under the current
+   *  CTM exactly as `paintImageXObject` is: pdf.js's `CanvasGraphics.paintInlineImageXObject`
+   *  scales by `(1/width, -1/height)` and then draws `(0, -height, width, height)`, which composes
+   *  to `[0,1]x[0,1]` before the CTM. Verified against the installed pdf.js 6.1.200. */
+  paintInlineImageXObject: number;
+  /** A one-colour image mask, which pdf.js paints as a literal `fillRect(0, 0, 1, 1)` under the
+   *  current CTM — the unit square again. Verified against the installed pdf.js 6.1.200.
+   *
+   *  These two are handled while the four BATCHED forms in issue #80 §5
+   *  (`paintImageXObjectRepeat`, `paintInlineImageXObjectGroup`, `paintImageMaskXObjectGroup`,
+   *  `paintImageMaskXObjectRepeat`) are deliberately not, and the difference is reachability, not
+   *  effort: those four exist only as an output of pdf.js's `QueueOptimizer`, and
+   *  `page.getOperatorList()` requests `RenderingIntentFlag.OPLIST`, which selects `NullOptimizer`
+   *  — whose `_optimize()` is a no-op. So no operator list this walk can ever receive contains
+   *  one. These two, by contrast, are emitted by the EVALUATOR itself (`addImageOps(
+   *  OPS.paintInlineImageXObject, …)` and `fn = OPS.paintSolidColorImageMask` in the worker), so
+   *  they reach the walk unchanged. */
+  paintSolidColorImageMask: number;
   paintFormXObjectBegin: number;
   paintFormXObjectEnd: number;
   /** Emitted around a form XObject that carries a `/Group` (transparency): the group's own
@@ -316,6 +364,12 @@ interface PdfjsOps {
    *  bbox in that case (see `buildFormXObject` in pdf.js's evaluator). */
   beginGroup: number;
   endGroup: number;
+  /** The bracket pdf.js emits around each annotation's appearance stream, which is concatenated
+   *  onto the page's own operator list. The walk uses this pair **only** to suppress emission
+   *  between them and count what it suppressed — it deliberately does not model the annotation's
+   *  own transform/matrix args, nor pdf.js's `baseTransform` (see `walkImageGeometry`). */
+  beginAnnotation: number;
+  endAnnotation: number;
 }
 
 /** The slice of pdf.js's runtime API this service uses. */
@@ -511,15 +565,29 @@ export class PdfRenderer implements PdfRenderService {
 
       let images: GeometryBox[] | undefined;
       let imagesOmitted = 0;
+      // Kept apart from imagesOmitted on purpose: one counts rectangles the walk computed and then
+      // trimmed for size, the other counts paint operators it never measured at all. See the field
+      // doc comments on GeometryPage.
+      let annotationImagesSkipped = 0;
       if (kinds.includes('images')) {
         const opList = await page.getOperatorList();
-        const boxes = walkImageGeometry(opList, ops, viewportTransform);
-        const capped = boxes.slice(0, MAX_IMAGE_RECTS_PER_PAGE);
-        imagesOmitted = boxes.length - capped.length;
+        const walked = walkImageGeometry(opList, ops, viewportTransform);
+        const capped = walked.boxes.slice(0, MAX_IMAGE_RECTS_PER_PAGE);
+        imagesOmitted = walked.boxes.length - capped.length;
+        annotationImagesSkipped = walked.annotationImagesSkipped;
         images = capped;
       }
 
-      return { page: pageNum, pageWidthPt, pageHeightPt, text, images, textOmitted, imagesOmitted };
+      return {
+        page: pageNum,
+        pageWidthPt,
+        pageHeightPt,
+        text,
+        images,
+        textOmitted,
+        imagesOmitted,
+        annotationImagesSkipped,
+      };
     } finally {
       page.cleanup();
     }
@@ -749,10 +817,40 @@ const UNIT_BOX: Box = { x0: 0, y0: 0, x1: 1, y1: 1 };
  * turning one bad `cm` into wall-to-wall NaN boxes. Keeping the last known-good CTM instead is the
  * conservative choice: the page's remaining geometry stays usable, at the cost of one region that
  * is under-reported rather than reported as garbage.
+ *
+ * That choice is still right, but it is no longer *silent*. A refusal means every box drawn after
+ * it is measured against a transform the document did not ask for, and comes back finite,
+ * plausible and — until the caller is told — indistinguishable from a measurement. So the outcome
+ * is reported rather than inferred. The flag exists because a refusal is not recoverable from the
+ * return value: `multiply` allocates a fresh array every time, so `next === current` is never true
+ * and could not have served as the test (an earlier version of this comment warned against it as
+ * though it could); and comparing the six numbers instead would call a page poisoned for a
+ * perfectly legitimate identity `cm`. Neither reading works, so the outcome is returned.
  */
-function applyCtm(m: Matrix, current: Matrix): Matrix {
+function applyCtm(m: Matrix, current: Matrix): CtmUpdate {
   const next = multiply(m, current);
-  return next.every((v) => Number.isFinite(v)) ? next : current;
+  return next.every((v) => Number.isFinite(v))
+    ? { matrix: next, refused: false }
+    : { matrix: current, refused: true };
+}
+
+/** The outcome of one `applyCtm` — the CTM to carry forward, and whether it is the document's. */
+interface CtmUpdate {
+  /** The composed matrix, or `current` unchanged when the multiply had to be refused. */
+  matrix: Matrix;
+  /** True when `matrix` is the last known-good CTM rather than what the document asked for. */
+  refused: boolean;
+}
+
+/**
+ * One entry of the walk's own CTM stack. The poison flag travels with the matrix rather than
+ * beside it because the two are restored together: a `Q` that puts back a CTM from before a
+ * refused `cm` also puts back the fact that nothing had been refused yet, and a flag kept in a
+ * bare variable would outlive the state it describes and mark the rest of the page.
+ */
+interface CtmFrame {
+  ctm: Matrix;
+  poisoned: boolean;
 }
 
 /**
@@ -789,6 +887,52 @@ interface PendingGroupBox {
  *    arg — is dropped rather than emitted, since a zod `z.number()` in the tool schema rejects
  *    both and the MCP SDK's post-handler output validation would otherwise fail the *whole* call
  *    with an unscrubbed, un-caught `McpError`, discarding every other page's geometry with it.
+ *    Keeping the last good CTM leaves every *later* box on the page measured against a transform
+ *    the document did not ask for, finite and plausible and, until #80 §2, unflagged — which is
+ *    exactly the "a rectangle in the wrong place reads like a measurement" failure this tool
+ *    exists to avoid. So a refusal latches a `poisoned` flag and every box emitted under it
+ *    carries `unreliableCtm: true`. The flag lives on the CTM stack frame, not beside it, so it
+ *    pops with the CTM at `restore`/`paintFormXObjectEnd`; one latched at depth 0 with no
+ *    enclosing `save` therefore marks the rest of the page, which is correct — there is no
+ *    known-good state left to return to. The `hasNonFiniteEdge` drop runs FIRST and still wins:
+ *    a poisoned box whose edges come out non-finite is dropped, never emitted with a flag on it,
+ *    because a flag describes a number and a NaN is not one.
+ *  - `OPS.beginAnnotation`/`OPS.endAnnotation` bracket an annotation's appearance stream, which
+ *    the worker concatenates onto the page's own operator list (reachable via `pdfcomment`, form
+ *    fields, and `pdfpages` with links — NOT from plain `hyperref`: with no `/AP` the worker takes
+ *    `_getOperatorListNoAppearance()` and emits no ops at all). pdf.js's own
+ *    `CanvasGraphics.beginAnnotation` rebases the entire graphics state on `baseTransform` —
+ *    `#restoreInitialState()` drains the whole state stack, then `resetCtxToDefault()`, then
+ *    `setTransform(baseTransform)`, then the op's own transform and matrix — a base this walk
+ *    never sees and cannot reconstruct from the operator list alone. Carrying the stale CTM across
+ *    that boundary put every image inside an annotation at the wrong place, and consecutive
+ *    annotations accumulated the drift. The resolved call is to emit NOTHING between the two ops
+ *    and count what was suppressed (`annotationImagesSkipped`), rather than to model
+ *    `baseTransform`: a gap that is counted is better than a rectangle nobody can vouch for, which
+ *    is the same standard `omittedSnippetLocations` holds compile diagnostics to. The paint ops
+ *    inside still run their stack bookkeeping — `paintFormXObjectBegin`/`End` push and pop as
+ *    usual — so only the emission is suppressed and the walk stays balanced.
+ *
+ *    Leaving the bracket restores the state snapshotted on entry (a *copy* of the stack array,
+ *    the current CTM and the poison flag). That is isolation, not `baseTransform` modelling, and
+ *    it is deliberately not what pdf.js does: pdf.js drains the state stack at `beginAnnotation`
+ *    and `endAnnotation` is asymmetric — it takes no args, never calls `restore()` and never puts
+ *    the CTM back, so after an annotation pdf.js's own CTM is not the pre-annotation one either.
+ *    Nothing normally follows an annotation block (they are appended last, one flat
+ *    non-overlapping sequence per annotation), so in practice the restored state is never used;
+ *    if a malformed stream did put content after one, the pre-annotation state is the only thing
+ *    this walk still holds that it can vouch for. The stack is restored by splicing the snapshot
+ *    back in rather than truncating to its old length, because an annotation's ops can pop BELOW
+ *    the snapshot depth and a bare `length = n` would grow the array back with holes. An
+ *    `endAnnotation` with no matching `beginAnnotation` is ignored outright — never allowed to
+ *    drive the depth negative, which would leave the next real annotation unsuppressed — for the
+ *    same reason `restore` on an empty stack does not throw: a truncated or malformed operator
+ *    list is a real thing a document can produce.
+ *  - Four paint operators emit a box, and all four are the SAME box: the unit square under the
+ *    current CTM. `paintImageXObject` and `paintImageMaskXObject` were always handled;
+ *    `paintInlineImageXObject` and `paintSolidColorImageMask` are #80 §5's two reachable gaps,
+ *    closed here. See `PdfjsOps` for why the other four operators that issue names are NOT gaps
+ *    this walk can ever see — the optimizer that produces them is never the one in play.
  *  - `paintFormXObjectBegin`/`paintFormXObjectEnd` push/pop their own CTM even though no explicit
  *    `OPS.save`/`OPS.restore` appears in the operator list around them — pdf.js's own
  *    `CanvasGraphics.paintFormXObjectBegin` calls `this.save()` internally when executing this op
@@ -816,11 +960,34 @@ function walkImageGeometry(
   opList: PdfjsOperatorList,
   ops: PdfjsOps,
   viewportTransform: Matrix,
-): GeometryBox[] {
+): { boxes: GeometryBox[]; annotationImagesSkipped: number } {
   const boxes: GeometryBox[] = [];
-  const stack: Matrix[] = [];
+  const stack: CtmFrame[] = [];
   let current: Matrix = IDENTITY;
+  let poisoned = false;
   let pendingGroup: PendingGroupBox | null = null;
+  /** Nesting depth of beginAnnotation…endAnnotation. Non-zero means "emit nothing, count it".
+   *  A depth rather than a boolean only because a malformed stream could nest the bracket; real
+   *  annotation oplists arrive as a flat, non-overlapping sequence. */
+  let annotationDepth = 0;
+  let annotationImagesSkipped = 0;
+  /** The walk's state as it stood at the OUTERMOST beginAnnotation, put back at the matching
+   *  endAnnotation. See the doc comment: isolation, not baseTransform modelling.
+   *
+   *  `pendingGroup` is in here for the same reason the CTM is, and leaving it out was a real leak
+   *  in both directions: a `beginGroup` inside the annotation whose form never arrived left its
+   *  bbox sitting in the variable for the next form AFTER the bracket, which would then be
+   *  measured with an annotation's extent; and a `pendingGroup` set before the bracket was
+   *  consumed and cleared by the first form inside it (the consume runs before the
+   *  annotationDepth check, so that the matching End stays balanced), silently downgrading the
+   *  real post-bracket form to its `approximate` unit-square fallback. Snapshot everything the
+   *  walk carries across operators, not only the parts with a stack. */
+  let preAnnotation: {
+    stack: CtmFrame[];
+    current: Matrix;
+    poisoned: boolean;
+    pendingGroup: PendingGroupBox | null;
+  } | null = null;
 
   const toViewport = (box: Box, ctm: Matrix): Box =>
     roundBox(transformedBoxBounds(box, multiply(ctm, viewportTransform)));
@@ -831,23 +998,74 @@ function walkImageGeometry(
     const args = argsArray[i];
 
     if (fn === ops.save) {
-      stack.push(current);
+      stack.push({ ctm: current, poisoned });
     } else if (fn === ops.restore) {
       const prev = stack.pop();
       if (prev !== undefined) {
-        current = prev;
+        current = prev.ctm;
+        // Popped together with the CTM it describes: going back to a matrix from before a refused
+        // `cm` also goes back to not having refused one. A bare restore against an empty stack
+        // clears nothing, because there is no known-good state to go back to.
+        poisoned = prev.poisoned;
+      }
+    } else if (fn === ops.beginAnnotation) {
+      // Snapshot only on the way in to the OUTERMOST bracket — an inner one would otherwise
+      // overwrite the state the outer one has to put back. The stack is COPIED, not aliased:
+      // the annotation's own ops mutate the live array in place.
+      if (annotationDepth === 0) {
+        preAnnotation = { stack: [...stack], current, poisoned, pendingGroup };
+      }
+      annotationDepth++;
+    } else if (fn === ops.endAnnotation) {
+      // An unmatched end is ignored rather than driving the depth negative, which would leave the
+      // NEXT real annotation at depth 0 and unsuppressed — the same fail-safe rule as restore on
+      // an empty stack, and for the same reason.
+      if (annotationDepth > 0) {
+        annotationDepth--;
+        if (annotationDepth === 0 && preAnnotation) {
+          // splice, not `stack.length = n`: the annotation's ops can pop below the snapshot depth,
+          // and truncating an already-shorter array would grow it back full of holes.
+          stack.splice(0, stack.length, ...preAnnotation.stack);
+          current = preAnnotation.current;
+          poisoned = preAnnotation.poisoned;
+          pendingGroup = preAnnotation.pendingGroup;
+          preAnnotation = null;
+        }
       }
     } else if (fn === ops.transform) {
       // Guarded, not a bare multiply: see applyCtm's doc comment — a document-controlled operand
-      // here must not poison every box drawn for the rest of the page.
-      current = applyCtm(args as unknown as Matrix, current);
-    } else if (fn === ops.paintImageXObject || fn === ops.paintImageMaskXObject) {
+      // here must not poison every box drawn for the rest of the page. The refusal is latched
+      // rather than dropped on the floor, so the boxes that follow say they were measured under a
+      // CTM that is not the document's.
+      const update = applyCtm(args as unknown as Matrix, current);
+      current = update.matrix;
+      if (update.refused) {
+        poisoned = true;
+      }
+    } else if (
+      fn === ops.paintImageXObject ||
+      fn === ops.paintImageMaskXObject ||
+      fn === ops.paintInlineImageXObject ||
+      fn === ops.paintSolidColorImageMask
+    ) {
+      if (annotationDepth > 0) {
+        // Inside an annotation appearance stream the walk has no base transform it can vouch for,
+        // so the placement is a counted gap rather than a rectangle. See the doc comment.
+        annotationImagesSkipped++;
+        continue;
+      }
       const box = toViewport(UNIT_BOX, current);
       // A non-finite edge here means this operator list is not something we can measure — never
       // something we approximated — so, unlike the `approximate` fallback below, the box is
-      // dropped outright rather than emitted flagged.
+      // dropped outright rather than emitted flagged. This runs BEFORE the unreliableCtm flag is
+      // applied, and wins: drop still beats flag, because a flag qualifies a number and a
+      // NaN/Infinity edge is not one.
       if (!hasNonFiniteEdge(box)) {
-        boxes.push({ ...box, source: 'image' });
+        boxes.push({
+          ...box,
+          source: 'image',
+          ...(poisoned ? { unreliableCtm: true as const } : {}),
+        });
       }
     } else if (fn === ops.beginGroup) {
       const groupOptions = (Array.isArray(args) ? args[0] : undefined) as
@@ -870,20 +1088,35 @@ function walkImageGeometry(
       pendingGroup = null;
     } else if (fn === ops.paintFormXObjectBegin) {
       // Implicit save (see the doc comment above) — always pushed, even when the form carries no
-      // matrix of its own, so the matching End always has something to pop.
-      stack.push(current);
+      // matrix of its own, so the matching End always has something to pop. This runs inside an
+      // annotation too: only the EMISSION is suppressed in there, never the bookkeeping, or the
+      // walk would come out of the bracket unbalanced.
+      stack.push({ ctm: current, poisoned });
       const [matrix, bbox] = (Array.isArray(args) ? args : [null, null]) as [
         number[] | null,
         number[] | null,
       ];
       if (matrix) {
-        // Same guard as OPS.transform: the form's own /Matrix is document-controlled too.
-        current = applyCtm(matrix as unknown as Matrix, current);
+        // Same guard as OPS.transform: the form's own /Matrix is document-controlled too, and a
+        // refusal here latches the same flag — the form's own box is the first thing measured
+        // under the CTM it just failed to update.
+        const update = applyCtm(matrix as unknown as Matrix, current);
+        current = update.matrix;
+        if (update.refused) {
+          poisoned = true;
+        }
       }
       // Consume (and clear) any pending group bbox now, whether or not it ends up used below, so
       // it can never be reused by a later, unrelated form.
       const pending = pendingGroup;
       pendingGroup = null;
+
+      if (annotationDepth > 0) {
+        // As for images: a counted gap, not a rectangle. Reached only after the push and the
+        // matrix bookkeeping above, so the matching paintFormXObjectEnd still pops what it should.
+        annotationImagesSkipped++;
+        continue;
+      }
 
       let box: Box;
       let ctm: Matrix;
@@ -909,17 +1142,22 @@ function walkImageGeometry(
           ...viewportBox,
           source: 'form',
           ...(approximate ? { approximate } : {}),
+          // A form box can carry both flags: `approximate` says its extent is a fallback,
+          // `unreliableCtm` says its position is not the document's. They answer different
+          // questions, so neither subsumes the other.
+          ...(poisoned ? { unreliableCtm: true as const } : {}),
         });
       }
     } else if (fn === ops.paintFormXObjectEnd) {
       const prev = stack.pop();
       if (prev !== undefined) {
-        current = prev;
+        current = prev.ctm;
+        poisoned = prev.poisoned;
       }
     }
     // Everything else (path construction, text, colour, shading, ...) is ignored: general vector
     // path geometry is explicitly out of scope (see the class method's doc comment).
   }
 
-  return boxes;
+  return { boxes, annotationImagesSkipped };
 }

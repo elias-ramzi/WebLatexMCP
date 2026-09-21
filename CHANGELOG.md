@@ -11,6 +11,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`pdf_geometry`'s `floats` payload is bounded by rendered size, not only by entry count**
+  (#80, the "related" note). It was capped at 200 entries with each field capped at 200
+  characters — roughly 120 KB worst case, and no bound at all on what a client will accept. Every
+  byte of it is parsed from the build-dir `.aux`, i.e. written from the document's own `\label`s.
+  `src/lib/floatsBudget.ts` charges each entry its real `JSON.stringify` cost (a backslash-dense
+  `\label` key roughly doubles in width once encoded) against a 20000-character budget —
+  `CONFLICT_CONTENT_BUDGET`'s number, deliberately, since this is the same defect #68 fixed for
+  push conflicts. The tail is cut, never reordered or cherry-picked by size, counted in the new
+  `floatsOmittedBySize` (kept apart from `floatsOmitted`, the entry cap, and `floatsDropped`,
+  found-but-unreportable), and the `note` names whichever bound fired and never the other.
+
 - **CI finally says something about `.claude/workflows/*.js` beyond "the whitespace is tidy"** (#81,
   finding 4). `eslint.config.js` ignored `.claude/**` wholesale, `tsc --noEmit` never saw those files
   and nothing imported them, so the only automated statement about 626 lines of JavaScript that
@@ -1235,6 +1246,37 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   call site are unchanged, `isLockContentionError` is untouched, and `existsSync` stays uninjected.
 
 ### Fixed
+
+- **`pdf_geometry` now measures two more paint operators, and says what it deliberately does not
+  measure** (#80 §1, §2, §5, §6). Four changes, one theme — a rectangle nobody can vouch for is
+  worse than an admitted gap. That is the standard each gap below is now held to; it is **not** a
+  claim that the tool has no gaps left. Shear, baseline-to-em versus true ascent, vertical writing
+  mode and general vector path geometry all remain unmeasured, and all remain documented as such:
+
+  - An image painted inside an **annotation appearance stream** (`pdfcomment`, form fields,
+    `pdfpages` links — not plain `hyperref`, which emits no appearance ops) was measured against
+    the page's CTM, because the walk did not model pdf.js's `beginAnnotation`, which rebases the
+    whole graphics state on a `baseTransform` the operator list does not carry. Every such image
+    came back confidently placed and wrong, and consecutive annotations accumulated the drift.
+    They are now skipped and counted, per page, in the new `annotationImagesSkipped`.
+  - A `cm` operand that overflows to a non-finite value is refused and the last known-good
+    transform carried forward (that part is unchanged). Every box measured after such a refusal
+    now carries **`unreliableCtm: true`**: before, those boxes came back finite, plausible and
+    indistinguishable from measurements.
+  - **`paintInlineImageXObject` and `paintSolidColorImageMask`** are handled. Both paint the unit
+    square under the current CTM, verified against the installed pdf.js rather than assumed.
+    Issue #80 §5 lists four more operators as gaps; they are **not** gaps, and the entry is
+    corrected rather than carried: those four exist only as an output of pdf.js's `QueueOptimizer`,
+    and reading an operator list selects the `NullOptimizer`, whose `_optimize()` is a no-op — so
+    no list this tool can receive contains one. The schema said otherwise and now does not.
+  - A **rotated line made of several text items is merged into one box**, by grouping items in
+    their own frame rather than on page-axis `y`. Shear is still not modelled, and still says so.
+
+  Two of these — `annotationImagesSkipped` and `unreliableCtm` — were computed by the service but
+  missing from the tool's published `outputSchema`, which is the only thing a caller can read to
+  learn a field exists. (They were **not** stripped from the payload, as first suspected: the MCP
+  SDK validates and then discards the parsed value. The defect was the advertised contract, not the
+  bytes.) An integration test now asserts both against the schema `tools/list` actually publishes.
 
 - **`/review --fix` no longer ships its last round's fixes unreviewed** (#82). The implement/verify
   loop caps at three rounds, so the fixes written in answer to the final round went out with no
