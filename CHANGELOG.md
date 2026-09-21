@@ -2695,6 +2695,40 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
   required field, false of an undeclared extra one, which is the direction that decides whether a
   field is in the contract.
 
+- **The anti-quadratic `errorSnippets` test measures scaling, not a wall clock** (#129; no `src/`
+  file changes). `test/unit/errorSnippets.test.ts`'s _"does not go quadratic on a document that
+  fails with thousands of errors"_ closed with `expect(ms).toBeLessThan(1000)`. That failed on
+  `windows-latest` at 2398ms on a PR carrying no `src/` change at all — and the same commit had
+  passed Windows minutes earlier in the `push` run of the identical tree, which is what tells a
+  slow runner from a regression. An absolute budget is a Linux-shaped number asserted on a shared
+  machine roughly an order of magnitude slower and variable run to run.
+
+  The three deterministic assertions above it are unchanged and still carry the guarantee — the
+  work is bounded by `MAX_SNIPPET_LOCATIONS` and not by the 20,000 diagnostics. What replaces the
+  budget is the claim the test's _name_ makes: the same call is timed at 2,000 and at 20,000
+  diagnostics, and the ratio must stay under 30. A ratio of two measurements taken on one machine,
+  in one process, milliseconds apart is machine-independent by construction — a uniformly slower
+  runner scales both halves and cancels out, and a higher fixed per-call cost (Windows fs) inflates
+  both by the same constant, which moves the ratio TOWARD 1 rather than away.
+
+  Three details decide whether a test of this shape is worth having, and all three are easy to get
+  wrong. The threshold is **not** the 10 the input scale suggests: an implementation linear in the
+  diagnostic count takes 10x as long on 10x the input by definition, so the input scale is the
+  linear _prediction_, not a bound above it, and asserting it would red on the first sample. The
+  small size is **batched** (20 calls per measurement), because a ~1.5ms baseline measures timer
+  granularity, GC luck and JIT warmup rather than complexity — and a non-vacuity assertion fails
+  the test outright if that window ever shrinks into the noise floor, rather than letting it pass
+  for the wrong reason. And the two sizes are timed **back to back inside each round**, then
+  reduced by the **median** of the per-round ratios: timing every small call and then every large
+  one lets a load change land entirely in one phase, which is a ratio of two different machines,
+  and the per-round ratio turns out to be bimodal under GC, so reducing by the fastest round picks
+  the low mode on both sides and discards half the separation (4.8-6.8 against 36.0-42.7, where
+  the median gives 7.6-10.2 against 99.3-107.8).
+
+  Proven against a control rather than asserted. With the `order.some(...)` dedup spliced back in
+  where the `Map` is, the new assertion fails 5 runs out of 5, at 98.7-102.2 against its limit of
+  30; the real implementation measures 7.6-10.2 over six runs and passed 8 out of 8.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added

@@ -425,22 +425,94 @@ describe('attachErrorSnippets', () => {
 
   it('does not go quadratic on a document that fails with thousands of errors', async () => {
     // Distinct *locations* are what the dedup scans, so co-located errors would not exercise it.
-    // Measured on this machine: a linear scan over 20k of them costs ~5ms, the `includes` it
-    // replaced ~2.8s — the bound below sits two orders of magnitude clear of the first and well
-    // under the second. All of this runs inside the per-project lock, where a peer session waits.
-    const dir = await projectWith({
-      'main.tex': Array.from({ length: 20_000 }, (_, i) => `line ${i + 1}`).join('\n'),
-    });
-    const many = Array.from({ length: 20_000 }, (_, i) => at('main.tex', i + 1));
+    //
+    // The guarantee is a SHAPE, not a duration: the snippet work is bounded by
+    // MAX_SNIPPET_LOCATIONS, and the rest grows with the diagnostic count and never with its
+    // square. So this measures how the cost SCALES between two input sizes, not a wall clock. An
+    // absolute 1000ms budget stood here and failed on windows-latest at 2398ms while the same
+    // commit had passed Windows minutes earlier in another run — evidence of a busy shared
+    // runner, not of a regression (#129). A ratio of two measurements taken on one machine, in
+    // one process, milliseconds apart is machine-independent by construction: a uniformly slower
+    // runner scales both halves and cancels out, and a higher fixed per-call cost (Windows fs)
+    // inflates both by the same constant, which moves the ratio TOWARD 1 rather than away.
+    const SMALL = 2_000;
+    const LARGE = 20_000;
 
-    const started = process.hrtime.bigint();
-    const { errors, omittedLocations } = await attachErrorSnippets(new FileService(), dir, many);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    /**
+     * How much worse the 10x-larger input may be. A pure ratio — never a duration.
+     *
+     * Deliberately not the 10 the input scale suggests: an implementation linear in the
+     * diagnostic count takes 10x as long on 10x the input BY DEFINITION, so the input scale is
+     * the linear *prediction*, not a bound sitting above it, and asserting it would red on the
+     * first sample. The two hypotheses this test separates are ~10x (linear) and ~100x
+     * (quadratic), and the threshold comes from where they actually land — six runs of each on
+     * the maintainer's machine, using the estimator below: the real implementation 7.6-10.2,
+     * and an `order.some(...)` dedup spliced back in where the Map is 99.3-107.8. 30 leaves
+     * ~2.9x of headroom before noise can red a linear implementation and ~3.3x before a
+     * quadratic one could slip past.
+     */
+    const MAX_SCALING = 30;
 
+    /** Paired measurements to take, and small-size calls per measurement — see the loop below. */
+    const ROUNDS = 5;
+    const SMALL_REPS = 20;
+
+    const projectOf = (n: number) =>
+      projectWith({ 'main.tex': Array.from({ length: n }, (_, i) => `line ${i + 1}`).join('\n') });
+    const diagnosticsFor = (n: number) =>
+      Array.from({ length: n }, (_, i) => at('main.tex', i + 1));
+
+    const files = new FileService();
+    const smallDir = await projectOf(SMALL);
+    const largeDir = await projectOf(LARGE);
+    const smallDiagnostics = diagnosticsFor(SMALL);
+    const largeDiagnostics = diagnosticsFor(LARGE);
+
+    // Warm up, so round 1 is not timing the optimizing compiler instead of the algorithm.
+    await attachErrorSnippets(files, smallDir, smallDiagnostics);
+
+    // Each round times the two sizes BACK TO BACK and takes their ratio there and then. Pairing
+    // is what makes this survive a drifting machine: measuring all the small calls and then all
+    // the large ones lets a load change between the two phases land entirely in one of them, and
+    // that is a ratio of two different machines. Batching the small size keeps its window in the
+    // tens of milliseconds — one call costs ~1.5ms here, and a ratio built from sub-millisecond
+    // samples measures timer granularity and GC luck rather than complexity.
+    let outcome!: Awaited<ReturnType<typeof attachErrorSnippets>>;
+    const ratios: number[] = [];
+    let widestSmallWindowMs = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      const t0 = process.hrtime.bigint();
+      for (let i = 0; i < SMALL_REPS; i++) {
+        await attachErrorSnippets(files, smallDir, smallDiagnostics);
+      }
+      const t1 = process.hrtime.bigint();
+      outcome = await attachErrorSnippets(files, largeDir, largeDiagnostics);
+      const t2 = process.hrtime.bigint();
+      ratios.push(Number(t2 - t1) / (Number(t1 - t0) / SMALL_REPS));
+      widestSmallWindowMs = Math.max(widestSmallWindowMs, Number(t1 - t0) / 1e6);
+    }
+
+    // The median round, not the fastest. A stall has to contaminate three rounds of five to move
+    // it, and — the reason it is not a minimum — the per-round ratio is bimodal under GC: the low
+    // mode measured 4.8-6.8 linear against 36.0-42.7 quadratic, a 5.3x window to place a
+    // threshold in, where the median gives 9.7x. Selecting the fastest round selects that low
+    // mode on both sides and throws half the separation away.
+    const scaling = [...ratios].sort((a, b) => a - b)[Math.floor(ROUNDS / 2)]!;
+
+    // The deterministic half, unchanged and true on every platform at any speed: the snippet work
+    // is capped, so 20,000 diagnostics buy exactly MAX_SNIPPET_LOCATIONS excerpts, and every
+    // location left without one is counted rather than silently dropped.
+    const { errors, omittedLocations } = outcome;
     expect(errors).toHaveLength(20_000);
     expect(errors.filter((e) => e.snippet !== undefined)).toHaveLength(MAX_SNIPPET_LOCATIONS);
     expect(omittedLocations).toBe(20_000 - MAX_SNIPPET_LOCATIONS);
-    expect(ms).toBeLessThan(1000);
+
+    // Non-vacuity. Should the baseline window ever shrink into the timer's noise floor, the ratio
+    // stops measuring complexity and starts measuring jitter — so fail saying so, rather than
+    // passing for the wrong reason. The window is ~30ms here, and CI runners are slower, not
+    // faster, so only a machine some 30x quicker than this one trips it.
+    expect(widestSmallWindowMs).toBeGreaterThan(1);
+    expect(scaling).toBeLessThan(MAX_SCALING);
   });
 });
 
