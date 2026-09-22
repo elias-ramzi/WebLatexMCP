@@ -2640,6 +2640,17 @@ Harmless only because no project is named `please` — the first word matching a
   genuinely linear code inside a full suite; they now count the characters the scan looks at
   (`measureAuxScanWork`), which is deterministic and let the threshold tighten from 3.0 to 2.5.
 
+- **`status` bounds its path lists, in both channels** (#175, #68). Every list — `staged`,
+  `unstaged`, `untracked`, `externalChanges`, `sessionChanges`, `otherChanges`, `conflictedChanges`
+  and each peer's `activeSessions[].changes` — shipped uncapped as JSON and again `join(', ')`ed
+  into the result text, so an untracked `figures/` tree put the most-called tool in the server past
+  a client's cap, undelivered. `planStatusPayload` (`src/lib/statusBudget.ts`) now fits them into
+  the house 20000-character budget charged across both channels, cutting by a declared priority
+  (`conflictedChanges` and `externalChanges` before the informational `untracked`) with every cut
+  counted in `pathsOmitted`/`truncated`, and caps `activeSessions` at 20 sessions. `aheadCommits`
+  and `behindCommits` stay **complete** — a conflict payload caps its own `remoteCommits` and points
+  here for the full list — and only their text rendering is bounded.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
