@@ -305,6 +305,10 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
 
         const sources: Array<{ path: string; format: string; count: number }> = [];
         const found: Located[] = [];
+        // The bytes each contributing candidate was parsed from, kept for the baseline claim
+        // below. They are exactly the bytes the caller is shown, which is the point: recording
+        // what a second read finds would absorb a hand edit that landed in between (#182).
+        const texts = new Map<string, string>();
         for (const candidate of candidates) {
           // Read WITHOUT claiming the out-of-band-edit baseline (issue #171). Whether the caller
           // receives this file whole is not decided here — it is decided by the three budget
@@ -320,6 +324,7 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
           const formats = [...new Set(parsed.map((e) => e.format))].join('+');
           sources.push({ path: candidate, format: formats, count: parsed.length });
           found.push(...parsed.map((e) => ({ ...e, path: candidate })));
+          texts.set(candidate, text);
         }
 
         const needle = filter?.trim().toLowerCase();
@@ -346,14 +351,14 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         const entries = typedPlan.entries;
 
         // The plans are known, so what the caller actually received is known: claim the
-        // out-of-band-edit baseline for exactly the files that went over the wire whole. A second
-        // read is what this costs — `FileService` records a baseline only as part of reading, and
-        // there is no seam for recording bytes already in hand. The window between the two reads
-        // is the one place this can still be wrong, and it degrades to precisely the behaviour
-        // that shipped before this fix (a baseline over the current bytes), inside a window
-        // narrower than the read-then-write one the guard already lives with.
-        for (const whole of wholeSources(sources, entries)) {
-          await ctx.files.readText(dir, whole, { recordBaseline: true });
+        // out-of-band-edit baseline for exactly the files that went over the wire whole — with the
+        // bytes already in hand (#182), never by reading them again. A second read would record
+        // whatever the file says NOW, so a hand edit landing between the two reads became the
+        // baseline and the guard never fired for it; the bytes above are the ones the caller was
+        // actually shown, so that window does not exist.
+        const whole = new Set(wholeSources(sources, entries));
+        for (const [candidate, text] of texts) {
+          if (whole.has(candidate)) await ctx.files.recordBaseline(dir, candidate, text);
         }
 
         const header = relPath

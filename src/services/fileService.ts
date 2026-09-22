@@ -604,11 +604,20 @@ export class FileService {
    *
    * `recordBaseline` says whether **the caller could now base a write on this file**, and so
    * defaults to false. Record only when the caller asked for this file and received all of it:
-   * `read_file` does, and `list_references` — but the latter only for a bibliography it returned
-   * WHOLE. It used to hold this licence outright, on the premise that it hands back every entry
+   * `read_file` does — but only when it asked for the whole file. A `startLine`/`endLine` read is
+   * refused the baseline HERE rather than at the call site (#181), because this rule is about the
+   * READ, not about what a caller meant by one: the bytes recorded are the whole file's, so a
+   * five-line read of a 2000-line document would vouch for 1995 lines nobody has seen, and the
+   * next `write_file` replaces them with no `ExternalChangeError`. The test is the REQUEST, never
+   * a computed coverage: `startLine: 1` alone does hand back every byte, and is still refused,
+   * since a second way to derive "whole" is a second place for this rule to drift — and that
+   * costs one re-read to acknowledge a change, where the other direction destroys the user's work.
+   * `list_references` may record too — but only for a bibliography it returned WHOLE. It used to hold this licence outright, on the premise that it hands back every entry
    * verbatim; #147 made `raw` cuttable, #165 the typed fields, and #170 dropped the default
    * `maxResults` to 50, so a 200-entry `.bib` now shows 50 entries. It therefore decides per file,
-   * after its budgets have run, and claims only the files that shipped uncut (#171). Nothing else
+   * after its budgets have run, and claims only the files that shipped uncut (#171) — through
+   * {@link recordBaseline}, with the bytes it already holds, rather than by reading them twice.
+   * Nothing else
    * qualifies — not a file the server chose for its own purposes (`detectRootFile` sniffing every
    * `.tex` for `\documentclass`), not five lines of context around a location a *log* named
    * (`compile`, `list_comments`), and not a file read only to answer a question about it
@@ -656,9 +665,13 @@ export class FileService {
       };
     }
     const raw = await readFile(abs, 'utf8');
-    if (opts.recordBaseline) this.revisions.record(abs, raw);
+    const whole = opts.startLine === undefined && opts.endLine === undefined;
+    // What gets recorded is the WHOLE file's bytes, so only a whole-file read may claim it — see
+    // this method's doc comment (#181). Enforced here rather than in `read_file`, so no caller can
+    // get it wrong and the rule lives in the one place it is written down.
+    if (opts.recordBaseline && whole) this.revisions.record(abs, raw);
     const totalLines = splitLines(raw).length;
-    if (opts.startLine === undefined && opts.endLine === undefined) {
+    if (whole) {
       return { path: opts.path, content: raw, totalLines, truncated: false };
     }
     const start = Math.max(1, opts.startLine ?? 1);
@@ -687,6 +700,46 @@ export class FileService {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
       throw err;
     }
+  }
+
+  /**
+   * Record the out-of-band-edit baseline for bytes the caller ALREADY holds (#182).
+   *
+   * The seam `read`/`readText`/`readBytes` cannot provide: each of those can only record what it
+   * itself just read, so a caller that learns only later that it handed a file over whole had to
+   * read that file a second time — which `list_references` did (#171), because whether a
+   * bibliography arrives uncut is decided by three budget planners and `maxResults`, all of which
+   * run after every candidate has been read.
+   *
+   * That second read is not merely a cost. A hand edit landing between the two reads is recorded
+   * as the baseline, so the guard never fires for it. Recording the bytes in hand closes that
+   * window: the baseline is exactly what the caller was shown, not whatever the file says by the
+   * time the decision is made.
+   *
+   * The licence is the one {@link read} documents, unchanged — claim this only for a file the
+   * caller asked for and received ALL of. Recording RESETS the guard rather than arming it, so a
+   * baseline claimed over bytes the caller never saw tells the guard the server has seen a hand
+   * edit it has not, and the next write clobbers it silently.
+   *
+   * The path is resolved exactly as a read resolves it, and both halves of that matter. The key is
+   * the `resolveInside` string, unchanged: re-spelling it files the baseline under a name no write
+   * ever looks up, which is how the guard went quiet on macOS (`/var` -> `/private/var`) and on
+   * Windows 8.3 short paths. And `strictLinks` keeps the same default as every read (false, i.e.
+   * honour the project's link policy), because this seam PAIRS with a read that has already run
+   * this guard: a stricter default would refuse to record for exactly the files a
+   * `followSymlinks: true` project's read allowed, and a looser one would record for a path no
+   * read could reach. It stays a parameter so a record the server makes on its own initiative can
+   * be held to the strict rule, as every other method here can.
+   */
+  async recordBaseline(
+    projectDir: string,
+    relPath: string,
+    content: string | Buffer,
+    opts: { strictLinks?: boolean } = {},
+  ): Promise<void> {
+    const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
+    this.revisions.record(abs, content);
   }
 
   /** Create or overwrite a file. */

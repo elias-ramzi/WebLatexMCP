@@ -2522,6 +2522,16 @@ Harmless only because no project is named `please` — the first word matching a
   `activeSessionsOmitted` and each session's `changesOmitted` as the way to tell a complete answer
   from a cut one, and a test ties the claim to `status`'s actual budget and advertised schema.
 
+- **`read_file` with a line range no longer claims the out-of-band-edit baseline over the whole
+  file** (#181). A five-line read of a 2000-line document recorded all 2000 lines, so the next
+  `write_file` replaced a hand edit outside the range with no `ExternalChangeError`. `FileService.read`
+  now refuses the claim for any `startLine`/`endLine` read, so no caller can get it wrong.
+
+- **`list_references` records the bytes it showed the caller, instead of reading every
+  fully-shipped bibliography a second time** (#182). `FileService.recordBaseline` is the new seam
+  for bytes already in hand; the second read cost a hand edit landing between the two reads, which
+  was absorbed as the baseline and so never tripped the guard.
+
 ### Tests
 
 - **The advertised `outputSchema` is now tested, whole-payload, for every tool the suite can
