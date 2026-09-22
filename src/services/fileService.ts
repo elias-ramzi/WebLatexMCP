@@ -624,7 +624,14 @@ export class FileService {
         content: '',
         totalLines: 0,
         truncated: true,
-        note: `Binary or large file (${info.size} bytes); content not returned. Open directly at ${abs}`,
+        // `toPosix` on the interpolation, NOT on `abs`: this is the documented binary/large-file
+        // branch of an ordinary `read_file`, so the string reaches a caller who was promised
+        // "file paths are always POSIX, on every OS". The binding itself must stay native — it
+        // is the `resolveInside` string, which is this path's one identity for `readFile` below
+        // and for `this.revisions.record`, and re-spelling it would file a baseline under a key
+        // no write ever looks up (the way the symlink guard went quiet on macOS `/var` and on
+        // Windows 8.3 names).
+        note: `Binary or large file (${info.size} bytes); content not returned. Open directly at ${toPosix(abs)}`,
       };
     }
     const raw = await readFile(abs, 'utf8');

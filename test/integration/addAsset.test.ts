@@ -10,6 +10,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import { expectUndeclaredField } from '../helpers/outputSchema.js';
+import { toPosix } from '../../src/lib/paths.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe, 0xfd]);
@@ -227,7 +228,10 @@ describe('add_asset result shape', () => {
     // primitive the extension allowlist exists to close. A schema promising a diff invites a
     // caller to ask why it is missing, and invites the next implementer to supply it.
     await expectUndeclaredField(client, 'add_asset', 'diff');
-    expect(sc.source).toBe(srcFile);
+    // `toPosix`: `source` is a display field at the response boundary, so it carries the
+    // POSIX spelling on every OS. Identity on this leg when the host separator is already
+    // `/`; the conversion itself is driven, and pinned, in `toolPathsPosix.test.ts`.
+    expect(sc.source).toBe(toPosix(srcFile));
     expect(sc.bytesWritten).toBe(PNG.length);
     expect(typeof sc.sha256).toBe('string');
     expect((sc.sha256 as string).length).toBe(64);
@@ -235,7 +239,7 @@ describe('add_asset result shape', () => {
     // The absence of a diff is asserted structurally above; here, on the rendered text.
     expect(textOf(res)).not.toContain('"diff"');
     const text = plainText(res);
-    expect(text).toContain(srcFile);
+    expect(text).toContain(toPosix(srcFile));
     expect(text).toContain(String(PNG.length));
     expect(text).toContain((sc.sha256 as string).slice(0, 12));
   });

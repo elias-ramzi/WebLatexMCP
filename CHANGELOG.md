@@ -1480,6 +1480,41 @@ kinds: ["text"]` already carries each merged line's string — and what was miss
 
 ### Fixed
 
+- **`add_asset`'s `source` and `read_file`'s binary/large-file `note` no longer carry native
+  separators** (#138, the remainder of #80 §4). `docs/tools.md` opens with "File paths are always
+  POSIX (`/`-separated), on every OS" and CLAUDE.md repeats it; a sweep of `src/tools/` found the
+  last two sites that reached `structuredContent` and not merely a message. `add_asset` reported
+  the realpath'd `source` — a **declared** output field — exactly as the host spelled it, and
+  `read_file`'s documented binary/large-file branch put an absolute native path into `note`. Both
+  are reachable through ordinary use on Windows, and both contradicted a neighbouring field in the
+  same result object.
+
+  Each conversion sits at the **emission point** and nowhere earlier, which is the whole
+  difficulty rather than a detail. `source` is the path `resolveAssetSource` realpath'd, stat'd,
+  judged against the asset allowlist and read; `note`'s `abs` is the `resolveInside` string that
+  is that path's one identity for `readFile` and for the revision tracker's baseline key —
+  re-spelling either would hand a display value to a filesystem call, the trap `toPosixOut`'s own
+  doc comment names, and for the second would file a baseline under a key no write looks up (how
+  the symlink guard once went quiet on macOS `/var` and Windows 8.3 names). So `add_asset`
+  converts `origin` in one `toPosixOut` call that feeds both channels, after every syscall it was
+  for; `fileService` converts the interpolation in the note and leaves `abs` alone. Nothing about
+  `add_asset`'s guards changes: the allowlist still runs on the destination, on the source's own
+  name and on the source's realpath'd target, and `source` still proves what was copied without
+  echoing bytes back.
+
+  `src/lib/assetImport.ts`'s refusals are brought to the same convention — every path the
+  **server** resolved is POSIX in the message, as `register_project`'s already were. The one
+  exception is the not-absolute refusal, which quotes the caller's own `sourcePath` and its tilde
+  expansion: re-spelling half of a quotation would read as though the server had rewritten the
+  input.
+
+  Both defects survived because neither was covered. `test/integration/toolPathsPosix.test.ts`
+  now drives both tools through its stubbed-separator harness — a literal backslash in a real
+  directory name plus a `path.sep` stub, so the assertions bite on Linux and macOS, where the
+  conversion is otherwise the identity — and asserts the consumer side too: the bytes still land
+  byte-identically from the native source, and the note's byte count still comes from a `stat` of
+  the native path.
+
 - **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
   read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
   `list_skills` renders the same instruction text as the skill prompts but was still calling

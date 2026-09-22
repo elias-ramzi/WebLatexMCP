@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { toPosixOut } from '../lib/paths.js';
 import { resolveAssetSource } from '../lib/assetImport.js';
 import {
   isImportableAsset,
@@ -112,12 +113,24 @@ export function registerAddAsset(server: McpServer, ctx: AppContext): void {
           // source that had somehow slipped an extension check, its contents. The headline
           // below (created/replaced, path, byte count, sha256, resolved source) is the correct
           // confirmation for an asset: it proves what was copied without echoing bytes back.
+          //
+          // `origin` is the realpath'd source, and it is now DONE: every filesystem act it was
+          // for — realpath, stat, the extension check on the resolved target, the read — already
+          // happened inside `resolveAssetSource`, and `writeBytes` above works from `bytes` and
+          // the destination, never from this string. So this is the emission point, and the one
+          // conversion sits here rather than anywhere upstream (see `toPosixOut`'s doc comment:
+          // converting a value still headed for a syscall is the trap next door). One call feeds
+          // both channels, so the headline and `structuredContent` cannot disagree about a
+          // separator. `origin` may also be the literal 'inline base64', which carries no
+          // separator and passes through unchanged — this converts a spelling, never a claim
+          // about what was copied.
+          const { source } = toPosixOut({ source: origin });
           const headline =
             `${res.created ? 'added' : 'replaced'} ${res.path} (${res.bytesWritten} bytes, ` +
-            `sha256 ${sha256.slice(0, 12)}…) from ${origin}`;
+            `sha256 ${sha256.slice(0, 12)}…) from ${source}`;
           return {
             content: [{ type: 'text', text: headline }],
-            structuredContent: { ...res, source: origin, sha256 },
+            structuredContent: { ...res, source, sha256 },
           };
         });
       } catch (err) {
