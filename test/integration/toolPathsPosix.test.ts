@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach, beforeAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -12,6 +13,7 @@ import { buildDir, buildPdfPath, logBaseDir } from '../../src/services/compiler.
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
 import { toFileUrl } from '../../src/lib/paths.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -464,5 +466,140 @@ describe('pdf_geometry: paths at the response boundary', () => {
     expect(text).toContain(out.pdfPath ?? '');
     expect(text).not.toContain(nativePdfPath);
     expect(text).not.toContain('\\');
+  });
+});
+
+/* ------------------------------------------------------------------ add_asset */
+
+/** Twelve bytes with a PNG magic number: enough to be a distinct, hashable payload. */
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe, 0xfd]);
+
+/**
+ * A source file OUTSIDE every project sandbox — which is what `add_asset` reads, by design — in a
+ * directory whose own name carries the backslash segment, and canonicalized, because the reported
+ * `source` is the realpath'd path (macOS `/var` -> `/private/var`, Windows `RUNNER~1`).
+ */
+async function assetSourceFile(): Promise<string> {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-posixsrc-'));
+  cleanups.push(() => rm(parent, { recursive: true, force: true }));
+  const dir = path.join(parent, SEGMENT);
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'plot.png');
+  await writeFile(file, PNG);
+  return realpath(file);
+}
+
+interface AddAssetOut {
+  path: string;
+  bytesWritten: number;
+  created: boolean;
+  source: string;
+  sha256: string;
+}
+
+function assetOut(res: unknown): AddAssetOut {
+  return (res as { structuredContent: AddAssetOut }).structuredContent;
+}
+
+describe('add_asset: paths at the response boundary', () => {
+  it('returns the resolved source with POSIX separators, in both channels', async () => {
+    const { client, userDir } = await setupLocal('asx');
+    const nativeSource = await assetSourceFile();
+
+    const res = await withWindowsSep(() =>
+      client.callTool({
+        name: 'add_asset',
+        arguments: { project: 'poster', path: 'figures/plot.png', sourcePath: nativeSource },
+      }),
+    );
+    expect(res.isError ?? false).toBe(false);
+
+    const out = assetOut(res);
+    expect(out.source).toBe(posixOf(nativeSource));
+    expect(out.source).not.toContain('\\');
+    const text = textOf(res);
+    expect(text).toContain(`from ${posixOf(nativeSource)}`);
+    expect(text).not.toContain(nativeSource);
+
+    // The consumer proof, and the reason the conversion sits at the emission point and not one
+    // line earlier. `source` is the realpath'd path `resolveAssetSource` opened: realpath, stat,
+    // the extension check on the resolved target and the read all take the host's own spelling.
+    // Converted any earlier, `realpath` would be handed `…/out/dir/plot.png` — nothing is there
+    // on this host — and the call would fail outright instead of copying anything. So assert the
+    // bytes landed, byte-identically, at the NATIVE destination: a `source` string that merely
+    // looks right proves nothing about what was copied, and "proves what was copied without
+    // echoing bytes back" is this field's whole job.
+    expect(out.bytesWritten).toBe(PNG.length);
+    expect(out.created).toBe(true);
+    expect(Buffer.compare(await readFile(path.join(userDir, 'figures', 'plot.png')), PNG)).toBe(0);
+    expect(out.sha256).toBe(createHash('sha256').update(PNG).digest('hex'));
+  });
+
+  it('declares source in the outputSchema it advertises', async () => {
+    // `source` is a documented field, not an incidental one — which is exactly why a native path
+    // in it is a contract violation rather than cosmetic. Asserted off `tools/list`, since the
+    // SDK discards its own parse result and `structuredContent` alone pins only the handler.
+    const { client } = await setupLocal('asd');
+    await expectDeclaredField(client, 'add_asset', 'source', { required: true });
+  });
+});
+
+/* ------------------------------------------------------------------ read_file */
+
+interface ReadFileOut {
+  content: string;
+  truncated: boolean;
+  note?: string;
+}
+
+function readOut(res: unknown): ReadFileOut {
+  return (res as { structuredContent: ReadFileOut }).structuredContent;
+}
+
+describe('read_file: paths at the response boundary', () => {
+  it('returns the binary/large-file note with POSIX separators, in both channels', async () => {
+    const { client, userDir } = await setupLocal('rfn');
+    await mkdir(path.join(userDir, 'figures'), { recursive: true });
+    const nativeAbs = path.join(userDir, 'figures', 'plot.png');
+    await writeFile(nativeAbs, PNG);
+
+    const res = await withWindowsSep(() =>
+      client.callTool({
+        name: 'read_file',
+        arguments: { project: 'poster', path: 'figures/plot.png' },
+      }),
+    );
+    expect(res.isError ?? false).toBe(false);
+
+    const out = readOut(res);
+    expect(out.truncated).toBe(true);
+    // The documented branch: an asset extension (or a file over the text cap) is not returned
+    // inline, and the note hands the caller a path instead — so that path is the one thing this
+    // result is FOR, and it is spelled the way every other path this server returns is.
+    expect(out.note).toBe(
+      `Binary or large file (${PNG.length} bytes); content not returned. ` +
+        `Open directly at ${posixOf(nativeAbs)}`,
+    );
+    expect(out.note).not.toContain('\\');
+    // `read_file` renders `result.note ?? result.content`, so the two channels are the same
+    // string by construction — assert it, so a future split cannot quietly disagree.
+    expect(textOf(res)).toBe(out.note);
+
+    // Two consumer proofs that the converted string is the note and nothing else. First: the
+    // byte count in that very sentence comes from `stat(abs)`, so a conversion applied to `abs`
+    // rather than to the interpolation would have thrown ENOENT before the note existed.
+    // Second, and the one the revision tracker depends on — `abs` is also the key
+    // `this.revisions.record` files a baseline under, and the text branch below reads through
+    // it — so a plain read on the same backslash-bearing project must still return its content.
+    const tex = await withWindowsSep(() =>
+      client.callTool({
+        name: 'read_file',
+        arguments: { project: 'poster', path: 'main.tex' },
+      }),
+    );
+    expect(tex.isError ?? false).toBe(false);
+    const texOut = readOut(tex);
+    expect(texOut.content).toBe(MAIN_TEX);
+    expect(texOut.note).toBeUndefined();
   });
 });

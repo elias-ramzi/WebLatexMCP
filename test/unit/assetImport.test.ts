@@ -6,6 +6,7 @@ import { mkdtemp, writeFile, rm, symlink, chmod, mkdir, realpath } from 'node:fs
 import { resolveAssetSource } from '../../src/lib/assetImport.js';
 import { MAX_ASSET_BYTES, MAX_INLINE_ASSET_BYTES } from '../../src/lib/assets.js';
 import { assetSourceBlockedMessage } from '../../src/lib/assets.js';
+import { toPosix } from '../../src/lib/paths.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe, 0xfd]);
 
@@ -115,7 +116,7 @@ describe('resolveAssetSource', () => {
     } catch (err) {
       const msg = (err as Error).message;
       expect(msg).not.toContain('~');
-      expect(msg).toContain(path.join(os.homedir(), 'definitely-not-here-xyz.png'));
+      expect(msg).toContain(toPosix(path.join(os.homedir(), 'definitely-not-here-xyz.png')));
     }
   });
 
@@ -211,7 +212,7 @@ describe('resolveAssetSource', () => {
     await writeFile(secret, 'fake-secret-token=hunter2\n');
 
     const res = resolveAssetSource({ destPath: 'figures/innocent.png', sourcePath: secret });
-    await expect(res).rejects.toThrow(assetSourceBlockedMessage(secret));
+    await expect(res).rejects.toThrow(assetSourceBlockedMessage(toPosix(secret)));
   });
 
   it('refuses id_rsa, .env, and notes.txt as sourcePath, each naming the offending file', async () => {
@@ -221,7 +222,7 @@ describe('resolveAssetSource', () => {
       await writeFile(file, 'not an asset\n');
       await expect(
         resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: file }),
-      ).rejects.toThrow(assetSourceBlockedMessage(file));
+      ).rejects.toThrow(assetSourceBlockedMessage(toPosix(file)));
     }
   });
 
@@ -252,7 +253,7 @@ describe('resolveAssetSource', () => {
       // name (photo.png), or a symlink launders any source past the gate.
       await expect(
         resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: link }),
-      ).rejects.toThrow(assetSourceBlockedMessage(secret));
+      ).rejects.toThrow(assetSourceBlockedMessage(toPosix(secret)));
     },
   );
 
@@ -297,7 +298,7 @@ describe('resolveAssetSource', () => {
       // itself cannot be traversed. Since the extension check is pure string work done before
       // any I/O, the file being unreadable must not matter at all.
       const res = resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: secret });
-      await expect(res).rejects.toThrow(assetSourceBlockedMessage(secret));
+      await expect(res).rejects.toThrow(assetSourceBlockedMessage(toPosix(secret)));
       await expect(res).rejects.not.toThrow(/EACCES|permission denied/i);
     },
   );
@@ -335,7 +336,7 @@ describe('resolveAssetSource', () => {
     const probe = path.join(secret, 'x.png');
 
     const res = resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: probe });
-    await expect(res).rejects.toThrow(`sourcePath "${probe}" was not found.`);
+    await expect(res).rejects.toThrow(`sourcePath "${toPosix(probe)}" was not found.`);
     await expect(res).rejects.not.toThrow(/ENOTDIR|realpath|not a directory/);
   });
 
@@ -347,8 +348,117 @@ describe('resolveAssetSource', () => {
       await symlink(loop, loop);
 
       const res = resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: loop });
-      await expect(res).rejects.toThrow(`sourcePath "${loop}" was not found.`);
+      await expect(res).rejects.toThrow(`sourcePath "${toPosix(loop)}" was not found.`);
       await expect(res).rejects.not.toThrow(/ELOOP/);
     },
   );
+});
+
+/**
+ * The paths `resolveAssetSource` puts into its refusals are paths the SERVER resolved, and they
+ * reach a caller through `errorResult`. "File paths are always POSIX (`/`-separated), on every
+ * OS" is the first line of `docs/tools.md`, and `register_project` already holds error text to
+ * it (`No such file or directory: ${toPosix(target)}`), so these do too (#138).
+ *
+ * Non-vacuity, the whole difficulty here: `toPosix` splits on `path.sep`, which is already `/` on
+ * a POSIX host, so on Linux and macOS every assertion below would pass against the unconverted
+ * code. Two facts fix that, and they are the ones `test/integration/toolPathsPosix.test.ts`
+ * documents at length: `path.sep` is a writable data property whose value `path.join`/`resolve`/
+ * `extname` do not consult (their POSIX implementations use a literal `'/'`), and a backslash is
+ * a legal character in a POSIX filename. So the directory below really contains one, the stub
+ * makes the server's own conversion really convert, and real filesystem work keeps working. On
+ * Windows nothing is arranged: the separators are genuinely backslashes and the stub stands down.
+ */
+describe('resolveAssetSource: paths in refusals are POSIX', () => {
+  const cleanups: Array<() => Promise<unknown>> = [];
+
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  const WINDOWS = process.platform === 'win32';
+  const SEGMENT = WINDOWS ? 'outdir' : 'out\\dir';
+
+  function posixOf(native: string): string {
+    return native.split('\\').join('/');
+  }
+
+  async function withWindowsSep<T>(fn: () => Promise<T>): Promise<T> {
+    if (WINDOWS) return await fn();
+    const original = Object.getOwnPropertyDescriptor(path, 'sep');
+    Object.defineProperty(path, 'sep', { value: '\\', configurable: true, writable: true });
+    try {
+      return await fn();
+    } finally {
+      if (original) Object.defineProperty(path, 'sep', original);
+    }
+  }
+
+  /** A canonicalized temp dir whose last segment is backslash-bearing on POSIX. */
+  async function segmentDir(): Promise<string> {
+    const base = await realpath(await mkdtemp(path.join(os.tmpdir(), 'ovl-assetposix-')));
+    cleanups.push(() => rm(base, { recursive: true, force: true }));
+    const dir = path.join(base, SEGMENT);
+    await mkdir(dir);
+    return dir;
+  }
+
+  it('names a missing sourcePath with POSIX separators', async () => {
+    const dir = await segmentDir();
+    const missing = path.join(dir, 'nope.png');
+
+    const err = await withWindowsSep(async () => {
+      try {
+        await resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: missing });
+        return null;
+      } catch (e) {
+        return e as Error;
+      }
+    });
+
+    expect(err).not.toBeNull();
+    expect(err!.message).toBe(`sourcePath "${posixOf(missing)}" was not found.`);
+    expect(err!.message).not.toContain('\\');
+  });
+
+  it('names a realpath-resolved, non-regular sourcePath with POSIX separators', async () => {
+    // Reaches the message built from `real` (the realpath'd target) rather than from `expanded`,
+    // so both halves of the function are covered. Asset-named so it clears the cheap pre-I/O
+    // extension filter and actually gets as far as the stat/isFile check.
+    const dir = await segmentDir();
+    const sub = path.join(dir, 'looks-like-an-asset.png');
+    await mkdir(sub);
+
+    const err = await withWindowsSep(async () => {
+      try {
+        await resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: sub });
+        return null;
+      } catch (e) {
+        return e as Error;
+      }
+    });
+
+    expect(err).not.toBeNull();
+    expect(err!.message).toBe(`sourcePath "${posixOf(sub)}" is not a regular file.`);
+    expect(err!.message).not.toContain('\\');
+  });
+
+  it('keeps the NATIVE spelling for the filesystem, so a real source still resolves', async () => {
+    // The consumer half, in the one direction that can actually go wrong here: if `expanded`
+    // itself were converted rather than only the message interpolation, `realpath` would be
+    // handed `…/out/dir/plot.png` — a path nothing is at on this host — and this import would
+    // fail instead of returning the bytes. `origin` is the service's own resolved value and
+    // stays native; `add_asset` converts it at the response boundary, not here.
+    const dir = await segmentDir();
+    const file = path.join(dir, 'plot.png');
+    await writeFile(file, PNG);
+
+    const res = await withWindowsSep(() =>
+      resolveAssetSource({ destPath: 'figures/plot.png', sourcePath: file }),
+    );
+
+    expect(Buffer.compare(res.bytes, PNG)).toBe(0);
+    expect(res.origin).toBe(file);
+    if (!WINDOWS) expect(res.origin).toContain('\\');
+  });
 });

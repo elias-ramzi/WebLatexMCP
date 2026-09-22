@@ -18,6 +18,7 @@ import {
   assetTooLargeMessage,
 } from './assets.js';
 import { MAX_ASSET_BYTES, MAX_INLINE_ASSET_BYTES } from './assets.js';
+import { toPosix } from './paths.js';
 
 export interface ResolvedAsset {
   bytes: Buffer;
@@ -51,6 +52,12 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   // A relative path is ambiguous: relative to the server process's cwd, which the caller
   // (running in a different process, possibly on a different machine's mental model of the
   // project) cannot know. Refuse rather than guess.
+  // Deliberately the ONE message in this function that keeps native separators. Both halves of
+  // it are quotations of what the caller typed: `sourcePath` verbatim, and `expanded` as the
+  // tilde expansion of that same string. Re-spelling only the second would read as though the
+  // server had rewritten the path — `"sub\dir\x.png" is not absolute (resolved to
+  // "sub/dir/x.png")` — and the point of the sentence is to show the caller their own input.
+  // Every message below names a path the SERVER resolved, and those are converted.
   if (!path.isAbsolute(expanded)) {
     throw new Error(
       `sourcePath "${sourcePath}" is not absolute (resolved to "${expanded}"). ` +
@@ -73,8 +80,15 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   // no errno text or syscall name in the message. That existence/type oracle for asset-NAMED
   // paths is the accepted cost of resolving a caller-named path at all, not something this
   // filter claims to prevent.
+  //
+  // `toPosix` on the interpolation only, never on the value: `expanded` goes on to `realpath`
+  // and `readFile` below and must keep the host's own spelling, exactly as `toPosixOut`'s doc
+  // comment requires. These messages reach a caller through `errorResult`, and the server
+  // promises "file paths are always POSIX, on every OS" — `register_project` already converts
+  // its equivalents (`No such file or directory: …`), so this is that same convention, not a
+  // new one. The extension the allowlist judged is unaffected by a separator.
   if (!isImportableAsset(expanded)) {
-    throw new Error(assetSourceBlockedMessage(expanded));
+    throw new Error(assetSourceBlockedMessage(toPosix(expanded)));
   }
 
   // realpath follows symlinks so the reported origin names where the bytes actually came from.
@@ -99,9 +113,9 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
     if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
       // Report only the already-expanded absolute path, not the original tilde form: the
       // caller needs to see exactly what was checked against the filesystem.
-      throw new Error(`sourcePath "${expanded}" was not found.`, { cause: err });
+      throw new Error(`sourcePath "${toPosix(expanded)}" was not found.`, { cause: err });
     }
-    throw new Error(`sourcePath "${expanded}" could not be resolved.`, { cause: err });
+    throw new Error(`sourcePath "${toPosix(expanded)}" could not be resolved.`, { cause: err });
   }
 
   let st;
@@ -110,12 +124,12 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
-      throw new Error(`sourcePath "${real}" was not found.`, { cause: err });
+      throw new Error(`sourcePath "${toPosix(real)}" was not found.`, { cause: err });
     }
-    throw new Error(`sourcePath "${real}" could not be resolved.`, { cause: err });
+    throw new Error(`sourcePath "${toPosix(real)}" could not be resolved.`, { cause: err });
   }
   if (!st.isFile()) {
-    throw new Error(`sourcePath "${real}" is not a regular file.`);
+    throw new Error(`sourcePath "${toPosix(real)}" is not a regular file.`);
   }
 
   // The source itself must be a recognized asset type too — checked on the REALPATH'D path, so a
@@ -127,7 +141,7 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   // commit+push) exfiltrated. Note this deliberately does NOT require the source and destination
   // extensions to match: importing plot.jpeg as plot.jpg is a legitimate rename.
   if (!isImportableAsset(real)) {
-    throw new Error(assetSourceBlockedMessage(real));
+    throw new Error(assetSourceBlockedMessage(toPosix(real)));
   }
 
   // Check the size BEFORE reading: reading first would slurp a multi-gigabyte file into memory
