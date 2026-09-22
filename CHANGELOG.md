@@ -1412,6 +1412,19 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
 
 ### Fixed
 
+- **`push`'s review payload is budgeted too, not just its conflict payload** (#160, #153, #68). Branch
+  mode returned `diff` (the whole review branch vs its base) and `diffFiles` uncapped, while the
+  conflict branch of the same tool has been budgeted since #68 — so the one result most likely to
+  carry a large patch was the one with no bound on it. `planPushReviewDiff` (`src/lib/diffBudget.ts`,
+  additive) now fits it into the house `DIFF_CONTENT_BUDGET` (20000) across at most `DIFF_MAX_FILES`
+  (20) files, cutting whole hunks from the end with a marker in place, and reports `diffChars`,
+  `diffTruncated`, `diffHunksOmitted`, `diffPatchFilesOmitted`, `diffFilesOmitted` and `diffNote`
+  (all newly declared in the `outputSchema`, since an undeclared key makes the whole call fail
+  `-32602`). The patch is charged **once**, not twice as `diff`'s is: this result puts only the
+  summary in the text channel, so a new `structuredOnlyCost` charges the single rendering — the note
+  still reaches both channels, so a client that drops `structuredContent` is told what was cut and
+  is routed to `diff` with `ref: "<base>...<branch>"`. The conflict branch's budget is untouched.
+
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.
 

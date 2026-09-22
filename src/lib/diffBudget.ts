@@ -125,6 +125,20 @@ export function renderCost(s: string): number {
   return s.length + JSON.stringify(s).length - DIFF_JSON_QUOTES_OVERHEAD;
 }
 
+/**
+ * What one string costs when this server renders it in exactly ONE channel — JSON-encoded into
+ * `structuredContent` and nowhere else. The `JSON.stringify` term is kept for the same reason
+ * {@link renderCost} keeps it: it is the real escaping cost, and LaTeX is backslash-dense, so a
+ * raw-length charge under-counts. The two quotes are charged once per field by
+ * {@link DIFF_JSON_QUOTES_OVERHEAD} and so are removed here.
+ *
+ * `push`'s branch-mode review diff (issue #160) is the caller for this: its result text is the
+ * one-line `prepareBranch` summary, and the patch itself travels only in `structuredContent.diff`.
+ */
+export function structuredOnlyCost(s: string): number {
+  return JSON.stringify(s).length - DIFF_JSON_QUOTES_OVERHEAD;
+}
+
 /** A single file's section of a unified diff. */
 export interface PatchSection {
   /**
@@ -257,6 +271,14 @@ interface PatchBudgetOptions {
   maxFiles: number;
   /** Route-to-the-rest text appended to each omission marker; `''` when a `note` carries it. */
   hint: string;
+  /**
+   * What one rendered string costs. Defaults to {@link renderCost} — BOTH channels — because that
+   * is what `diff` and `changeDiff` do; a caller whose payload ships in only ONE channel passes
+   * {@link structuredOnlyCost} instead. The charge is a parameter rather than a constant precisely
+   * so the two cannot be confused: a single-channel payload charged twice silently halves what the
+   * caller gets, and a two-channel payload charged once overruns by 2x, which is the #68 defect.
+   */
+  cost?: (s: string) => number;
 }
 
 /**
@@ -282,6 +304,7 @@ interface PatchBudgetOptions {
  * the marker still names the size, so the caller is told what is there and how to get it.
  */
 function planPatch(sections: PatchSection[], opts: PatchBudgetOptions): PatchPlan {
+  const renderCharge = opts.cost ?? renderCost;
   const kept = sections.slice(0, opts.maxFiles);
   let sectionsOmitted = sections.length - kept.length;
 
@@ -290,7 +313,7 @@ function planPatch(sections: PatchSection[], opts: PatchBudgetOptions): PatchPla
   // the boilerplate explaining an overrun caused one.
   let remaining = opts.budget;
   if (sections.length > 0) {
-    remaining -= renderCost(renderFileOmissionMarker(sections.length, opts.hint));
+    remaining -= renderCharge(renderFileOmissionMarker(sections.length, opts.hint));
   }
 
   const included: PatchSection[] = [];
@@ -299,9 +322,9 @@ function planPatch(sections: PatchSection[], opts: PatchBudgetOptions): PatchPla
     // of its hunks. The allowance can only be an over-charge (the file may keep everything), never
     // an under-charge, which is what makes the rendered total a real bound.
     const mandatory =
-      renderCost(section.header) +
+      renderCharge(section.header) +
       (section.hunks.length > 0
-        ? renderCost(
+        ? renderCharge(
             renderHunkOmissionMarker(
               section,
               section.hunks.length,
@@ -335,7 +358,7 @@ function planPatch(sections: PatchSection[], opts: PatchBudgetOptions): PatchPla
     let cutChars = 0;
     for (const hunk of section.hunks) {
       if (!stopped) {
-        const cost = renderCost(hunk);
+        const cost = renderCharge(hunk);
         if (cost <= remaining) {
           remaining -= cost;
           parts.push(hunk);
@@ -550,4 +573,204 @@ export function planChangeDiff(patch: string, budget = CHANGE_DIFF_BUDGET): Chan
     diff: plan.patch,
     truncated: plan.hunksOmitted > 0 || plan.sectionsOmitted > 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// `push`, branch mode: the review diff (issue #160)
+// ---------------------------------------------------------------------------
+
+/**
+ * The JSON punctuation and key names `push`'s awaiting-approval `structuredContent` wraps around
+ * the review payload — `status`, `pushed`, `remote`, `branch`, `base`, `committedSha`, the
+ * `diff`/`diffFiles` keys themselves and the counters' digits — everything except the two payload
+ * bodies and `summary`, which are charged exactly. Larger than
+ * {@link DIFF_STRUCTURED_SCAFFOLD_OVERHEAD} because this result carries more small fields than a
+ * `diff` result does. It covers the fixed key names, the counters' digits and the redacted
+ * `remote` URL; `branch` and `base` are caller-supplied and unbounded, so they are charged
+ * EXACTLY instead (as `planDiffPayload` charges `ref`) rather than swallowed by a constant a long
+ * enough branch name would break. A test that stringifies a real result pins that this still
+ * accounts for the rest, from both sides — the same technique `conflictBudget.ts` uses for the
+ * templates it cannot call.
+ */
+export const PUSH_REVIEW_SCAFFOLD_OVERHEAD = 400;
+
+/** What {@link planPushReviewDiff} hands `src/tools/push.ts` for an `awaiting-approval` result. */
+export interface PushReviewDiffPlan {
+  /** The patch as it will be sent, cut at hunk boundaries with a marker where anything went. */
+  diff: string;
+  /** Characters in the FULL patch, before any cut — so the real size is always known. */
+  diffChars: number;
+  /** Per-file added/removed counts, capped at {@link DIFF_MAX_FILES}. */
+  diffFiles: DiffFile[];
+  /** Entries cut from {@link PushReviewDiffPlan.diffFiles} by that cap. */
+  diffFilesOmitted: number;
+  /** Hunks cut from a file the patch still details. */
+  diffHunksOmitted: number;
+  /** Files the patch drops entirely — no header, no hunks. Independent of `diffFilesOmitted`:
+   * that one is the summary list's cap, this one the patch's, and either can fire alone. */
+  diffPatchFilesOmitted: number;
+  /** True iff anything at all was cut. Never inferred from an empty `diff`: an empty patch means
+   * the branch commit changed nothing, and the two must never be confusable. */
+  diffTruncated: boolean;
+  /** What was cut and how to get it — present only when something actually was. */
+  diffNote?: string;
+}
+
+export interface PushReviewDiffOptions {
+  /** `prepareBranch`'s one-line summary. Charged exactly: it ships in BOTH channels. */
+  summary: string;
+  /** The base branch, for the `diff` call the note routes a caller to. */
+  base: string;
+  /** The review branch, likewise. */
+  branch: string;
+  budget?: number;
+  maxFiles?: number;
+}
+
+/** The JSON cost of the `diffFiles` array. It ships only in `structuredContent` — `push`'s text
+ * channel has no per-file summary, unlike `diff`'s — so there is no text term here. */
+function filesJsonCost(files: DiffFile[]): number {
+  return (
+    FILES_ARRAY_JSON_OVERHEAD +
+    files.reduce((n, f) => n + JSON.stringify(f).length + FILES_ELEMENT_SEPARATOR_OVERHEAD, 0)
+  );
+}
+
+/**
+ * Plan the review payload of a branch-mode `push` (`status: "awaiting-approval"`).
+ *
+ * Two decisions carry this, and the issue (#160) left both open on purpose.
+ *
+ *  1. **The share is the full house figure, {@link DIFF_CONTENT_BUDGET}, reused rather than
+ *     restated.** #153 gave `diff` that figure because the caller asked for the patch, and
+ *     `changeDiff` the 2000-character diagnostic share because nobody did. Branch mode is squarely
+ *     the first case: its whole purpose is to commit somewhere safe so the patch can be reviewed
+ *     before it lands, and `prepareBranch`'s own summary says "Review the diff vs <base>, then
+ *     approve to land it." A caller who is told to review and then handed a silently gutted patch
+ *     has been given the worst of both. The rest of an awaiting-approval result is small and
+ *     fixed-shape (`status`/`pushed`/`remote`/`branch`/`base`/`committedSha`/`summary`), and is
+ *     charged exactly below rather than paid for out of the patch's share — so "it ships alongside
+ *     other fields" is answered by charging them, not by shrinking the budget. Note that
+ *     `rebasedOver` is NOT one of those fields: it exists only on `safePushToolResult`'s branches,
+ *     which this planner never touches.
+ *  2. **Charged ONCE, with {@link structuredOnlyCost}.** `push`'s awaiting-approval result puts
+ *     only `prep.summary` in the text channel; the patch travels in `structuredContent.diff`
+ *     alone. So the same 20000 bounds the same thing it bounds for `diff` — the total size of the
+ *     result a client receives — while the charge matches how many times the patch is actually
+ *     rendered. Charging it twice here would halve what a reviewer gets for no reason a reader
+ *     could find in the code. **If anyone later renders the patch into the text channel too** (a
+ *     defensible change — the conflict branch above deliberately does exactly that, so an MCP-only
+ *     client that drops `structuredContent` can still act), this must become
+ *     {@link renderCost} in the same commit, or the result overruns by 2x. That is the whole
+ *     reason the charge is a named parameter and not a default.
+ *
+ * The `note` IS rendered into both channels (it is small, bounded by {@link DIFF_NOTE_RESERVE},
+ * and a cut nobody is told about is the one thing worse than a cut), so the reserve pays for two
+ * copies of it — pinned by a test.
+ */
+export function planPushReviewDiff(
+  patch: string,
+  files: DiffFile[],
+  opts: PushReviewDiffOptions,
+): PushReviewDiffPlan {
+  const budget = opts.budget ?? DIFF_CONTENT_BUDGET;
+  const maxFiles = opts.maxFiles ?? DIFF_MAX_FILES;
+
+  const keptFiles = files.slice(0, maxFiles);
+  const diffFilesOmitted = files.length - keptFiles.length;
+
+  const fixed =
+    PUSH_REVIEW_SCAFFOLD_OVERHEAD +
+    DIFF_JSON_QUOTES_OVERHEAD +
+    renderCost(opts.summary) +
+    opts.base.length +
+    opts.branch.length +
+    DIFF_TEXT_SEPARATOR_OVERHEAD +
+    DIFF_NOTE_RESERVE +
+    filesJsonCost(keptFiles);
+
+  // The aggregate note carries the route out, so the per-file markers stay terse — as in
+  // `planDiffPayload`, and unlike `planChangeDiff`, whose budget is too small to afford a note.
+  const plan = planPatch(splitPatch(patch), {
+    budget: budget - fixed,
+    maxFiles,
+    hint: '',
+    cost: structuredOnlyCost,
+  });
+
+  const diffTruncated =
+    diffFilesOmitted > 0 || plan.hunksOmitted > 0 || plan.sectionsOmitted > 0 || plan.starved;
+  const result: PushReviewDiffPlan = {
+    diff: plan.patch,
+    diffChars: patch.length,
+    diffFiles: keptFiles,
+    diffFilesOmitted,
+    diffHunksOmitted: plan.hunksOmitted,
+    diffPatchFilesOmitted: plan.sectionsOmitted,
+    diffTruncated,
+  };
+  if (!diffTruncated) return result;
+  result.diffNote = describePushReviewCuts(plan, {
+    diffFilesOmitted,
+    total: files.length,
+    budget,
+    maxFiles,
+    base: opts.base,
+    branch: opts.branch,
+  });
+  return result;
+}
+
+/**
+ * The `note`, naming ONLY the bound that actually fired — `conflictBudget.ts`'s rule, and
+ * `describeDiffCuts`'s after it. The route out is `diff` with the branch's own three-dot range
+ * (`resolveDiffRef` accepts one), which already has `detail: "full"` for a caller that wants
+ * every line; that is why `push` grows no escape-hatch argument of its own here.
+ */
+function describePushReviewCuts(
+  plan: PatchPlan,
+  ctx: {
+    diffFilesOmitted: number;
+    total: number;
+    budget: number;
+    maxFiles: number;
+    base: string;
+    branch: string;
+  },
+): string {
+  const reasons: string[] = [];
+  if (ctx.diffFilesOmitted > 0) {
+    reasons.push(
+      `only the first ${ctx.maxFiles} of ${ctx.total} changed files are listed in diffFiles[]`,
+    );
+  }
+  if (plan.sectionsOmitted > 0) {
+    reasons.push(`${plan.sectionsOmitted} file(s) got no section in the patch at all`);
+  }
+  if (plan.hunksOmitted > 0) {
+    reasons.push(
+      `${plan.hunksOmitted} hunk(s) across ${plan.filesWithCutHunks} file(s) were cut from the ` +
+        'patch (whole hunks only — a part-hunk is not a diff)',
+    );
+  }
+  if (plan.starved) {
+    reasons.push('the per-file headers alone consumed the budget, so no hunk fits');
+  }
+  return (
+    `${reasons.join('; ')}. The review patch is budgeted to ${ctx.budget} characters. The branch ` +
+    `is committed and nothing was lost: read the whole change with diff, ref: ` +
+    `"${ctx.base}...${ctx.branch}" (add detail: "full" for every line), or read a file with ` +
+    'read_file. Approve only once you have reviewed it.'
+  );
+}
+
+/**
+ * `push`'s awaiting-approval text channel, built from the already-cut plan and nothing else.
+ *
+ * The patch is deliberately NOT rendered here — see {@link planPushReviewDiff}, decision 2. Only
+ * the note joins the summary, so a client that drops `structuredContent` is still told that the
+ * patch it cannot see was cut, and how to fetch it.
+ */
+export function renderPushReviewText(summary: string, plan: PushReviewDiffPlan): string {
+  return plan.diffNote ? `${summary}\n\n${plan.diffNote}` : summary;
 }
