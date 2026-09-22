@@ -154,7 +154,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `commitContents` stages by `update-index`, which never consults `.gitignore`/`.git/info/exclude`,
   so the `summarize-paper` note that relies on the exclude was committed and pushed by the default
   scope while `"all"` (`git add -A`) left it alone. Ignored entries are settled and reported under
-  `ignored`. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
+  `ignored`. **A `check-ignore` that fails is never read as "nothing is ignored"** — returning
+  `[]` there would let the commit stage a file git means to exclude, so the filter throws. The one
+  failure with a cure of its own is named: a pathspec beyond a symbolic link (git exits 128 having
+  named one path) becomes `PathBeyondSymlinkError`, which quotes the path and points at `discard`,
+  because a recorded entry under a linked directory otherwise fails every later commit in the
+  session, unrelated files included. The path is reconstructed per requested path from git's own
+  quoted form rather than captured out of the message, which a path containing a quote or a
+  newline defeats; any other failure reports what actually happened. A tracked file matching a pattern is not ignored (as for `git add`) and still commits —
   and "tracked" is judged **where the staging step that follows will look** (`ignoredPaths`'
   `tracked` option): against HEAD for `commitContents` and `scope: "paths"`, which reset the index
   to HEAD first (`check-ignore --no-index` minus what `ls-tree HEAD` lists — a hand `git rm --cached`
@@ -690,7 +697,23 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   runs `clean -f` over every requested path, so an untracked name is removed rather than tripping
   `checkout`; and it settles only the named paths in every session's records (`ShadowStore.settleAll`)
   — `clearAll` is for the whole-tree discard alone, since dropping a peer's unrelated record is what
-  lets a later `scope: "paths"` take its lines.
+  lets a later `scope: "paths"` take its lines. **Both halves fold, and the report says what was
+  actually reached.** The untracked half has no index entry to resolve against, so on an ignorecase
+  clone it is resolved against the working tree's own untracked listing (`ls-files --others
+--exclude-standard`) before `clean` sees it — every call keeps `--literal-pathspecs`, because
+  `--icase-pathspecs` is mutually exclusive with it and buying the fold by reintroducing globbing in
+  the most destructive call in the server is not a trade worth making. Before this the two halves
+  disagreed: `discard(['notes.txt'])` restored a modified `Notes.txt` while `discard(['scratch.txt'])`
+  left an untracked `Scratch.txt` on disk, and one call folded or not depending on something the
+  caller could not see. A path git matched nothing for comes back in `missed` and, when the call
+  reached nothing at all, `discarded: false` — `git clean -f` matching nothing exits 0, so the old
+  unconditional `discarded: true` told the caller a file was gone while it was still there.
+  `discarded` answers "did this reach the paths it was given", not "were bytes destroyed": a tracked
+  path already at HEAD is reached and still reports discarded. **A `missed` path is still settled in
+  every session's records, deliberately** — a path git can match nothing for is exactly the wedged
+  shadow entry that `ignoredPaths`' refusal sends the caller to `discard` to clear, so narrowing the
+  settle to reached paths would close that escape hatch. That makes `discarded: false` with records
+  settled a visible asymmetry rather than an invisible one; keep it, and keep it written down.
 - **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
   range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
   rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,

@@ -64,7 +64,8 @@ const geometryBoxShape = z.object({
     .optional()
     .describe(
       'Present on a text box only: how many pdf.js text items were merged into this line ' +
-        '(shared baseline and horizontal adjacency) — a rough signal of merge quality.',
+        "(a shared line position and adjacency along the run, in the item's own frame) — a " +
+        'rough signal of merge quality.',
     ),
   source: z
     .enum(['image', 'form'])
@@ -119,14 +120,21 @@ const geometryPageShape = z.object({
         'line on a pdflscape landscape page, where the content is rotated inside the page as well ' +
         'as the page carrying /Rotate — gets a correct axis-aligned box, and a rotated line made ' +
         'of several items IS merged into one: items are grouped in their own frame (shared ' +
-        'direction and up axes to within a degree, shared origin projected onto the up axis, ' +
-        'adjacency measured along the direction axis), not by page-axis y. SHEAR (a slanted, ' +
+        'direction and up axes to within a degree AND the same writing mode, the origin ' +
+        'projected onto the CROSS axis — the up axis for horizontal text, the direction axis ' +
+        'for vertical — and adjacency measured along the ADVANCE axis — the direction axis for ' +
+        'horizontal text, the reverse up axis for vertical), not by page-axis y. SHEAR (a slanted, ' +
         "non-orthogonal text matrix) is modelled too — the corners come from the matrix's own " +
         'two column directions, so a skewed item gets the true bounds of its parallelogram, not ' +
         'an orthogonal approximation. VERTICAL writing mode (a CJK WMode 1 font) gets a correct ' +
-        'per-item box — down the column from the baseline, centred across it — but the items of ' +
-        'one vertical line are NOT merged into a single column box the way a horizontal or ' +
-        'rotated line is, so expect one box per run rather than one per line. As for ' +
+        'box — down the column from the baseline, centred across it — and the items of one ' +
+        'vertical line ARE merged into a single column box: the column is read as the line ' +
+        'position and the run down it as the advance. Two neighbouring columns stay separate, ' +
+        'and a vertical line is never merged with a horizontal one even where they share a ' +
+        'coordinate. Still NOT merged: a rotated line whose items drift in frame by more than a ' +
+        'fraction of a degree splits far from the page origin, and a genuinely sheared ' +
+        'contiguous run splits in either writing mode — correct boxes, uncombined, in both. ' +
+        'As for ' +
         'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
         'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
         'field is the per-page cap alone — since a NaN is not a measurement.',
@@ -301,17 +309,18 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         "convention as render_pages' clip, so the two tools compose: render_pages to look, " +
         "pdf_geometry to measure. Answers questions eyeballing a PNG cannot: does this table's " +
         'text box overlap the figure frame above it, and by how many points. ' +
-        '"text" reports per-line boxes (pdf.js text items merged by shared baseline and ' +
-        'horizontal adjacency); the "text" string on each box is truncated — it is a label for ' +
+        '"text" reports per-line boxes (pdf.js text items merged by a shared line position ' +
+        'and adjacency along the run, both measured in the item\'s own frame); the "text" ' +
+        'string on each box is truncated — it is a label for ' +
         "the box, not the document's content, so use read_file for that. A text box runs from " +
         "the baseline up by the font's declared ascent where there is a usable one and by the " +
         'full em otherwise, so it never under-runs the ink above — and it excludes descenders ' +
         '(g, p, y) below either way. Rotated text IS accounted for — a sideways table cell, a ' +
         'rotated axis label and a pdflscape landscape page all get correct boxes, and a rotated ' +
         'line of several items is merged into one — and so is a sheared (slanted, ' +
-        'non-orthogonal) text matrix. Vertical writing mode gets a correct box per item but its ' +
-        'items are not merged into one column line; see the schema field description for all of ' +
-        'it. ' +
+        'non-orthogonal) text matrix. Vertical writing mode is handled too: a correct box per ' +
+        'item AND its items merged into one column line; see the schema field description for ' +
+        'all of it. ' +
         '"images" reports image and form XObject PLACEMENT RECTANGLES — what an \\includegraphics ' +
         'figure actually occupies — and NOTHING ELSE: general vector path geometry (\\fbox rules, ' +
         'TikZ strokes) is explicitly out of scope, because pdf.js only exposes those as raw ' +
