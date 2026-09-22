@@ -20,6 +20,12 @@ import {
   CONFLICT_MAX_COMMIT_FILES,
 } from '../lib/conflictBudget.js';
 import { guardPeerWork } from '../lib/peerRefusal.js';
+import {
+  planPushReviewDiff,
+  renderPushReviewText,
+  DIFF_CONTENT_BUDGET,
+  DIFF_MAX_FILES,
+} from '../lib/diffBudget.js';
 
 const conflictHunkSchema = z.object({
   startLine: z.number(),
@@ -228,8 +234,60 @@ const outputSchema = {
     ),
   // status === 'awaiting-approval'
   base: z.string().optional(),
-  diff: z.string().optional(),
-  diffFiles: z.array(diffFileSchema).optional(),
+  diff: z
+    .string()
+    .optional()
+    .describe(
+      'Branch mode, before approval: the unified patch of the review branch vs its base. ' +
+        `Budgeted to ${DIFF_CONTENT_BUDGET} characters, so it may be cut at hunk boundaries with ` +
+        'a "... N of M hunk(s) omitted" marker where each cut happened — see diffTruncated and ' +
+        'diffNote. Empty means the branch commit changed nothing, never that the patch was cut ' +
+        '(a cut always leaves the file headers behind).',
+    ),
+  diffFiles: z
+    .array(diffFileSchema)
+    .optional()
+    .describe(
+      `Per-file added/removed line counts for the review branch, at most ${DIFF_MAX_FILES} of ` +
+        'them — see diffFilesOmitted.',
+    ),
+  diffChars: z
+    .number()
+    .optional()
+    .describe(
+      'Branch mode: characters in the FULL review patch, before any cut, so the real size is ' +
+        'always known.',
+    ),
+  diffTruncated: z
+    .boolean()
+    .optional()
+    .describe(
+      'Branch mode: true iff anything was cut from the review payload — the patch, or the ' +
+        'diffFiles list. Absent unless status === "awaiting-approval".',
+    ),
+  diffHunksOmitted: z
+    .number()
+    .optional()
+    .describe('Branch mode: hunks cut from a file the review patch still shows.'),
+  diffPatchFilesOmitted: z
+    .number()
+    .optional()
+    .describe(
+      'Branch mode: changed files given no section in the review patch at all — no headers, no ' +
+        'hunks. Distinct from diffFilesOmitted, which is about the diffFiles summary: the two ' +
+        'caps fire independently.',
+    ),
+  diffFilesOmitted: z
+    .number()
+    .optional()
+    .describe('Branch mode: changed files cut from the diffFiles summary by its cap.'),
+  diffNote: z
+    .string()
+    .optional()
+    .describe(
+      'Branch mode: what was cut from the review payload and how to read the rest. Present only ' +
+        'when something actually was cut.',
+    ),
 };
 
 /**
@@ -330,7 +388,12 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         'intact) — re-run push. That retry does not apply when expectedRemoteHead was given: it is ' +
         'one attempt only, refused as "remote-moved" on a second lost race. Branch mode commits to ' +
         'a local review branch and lands it only on ' +
-        'approve=true. Once past the live-peer guard, untracked files never block a push; uncommitted ' +
+        'approve=true; that pre-approval result carries the branch-vs-base patch in ' +
+        `structuredContent.diff (and diffFiles), budgeted to ${DIFF_CONTENT_BUDGET} characters ` +
+        `across at most ${DIFF_MAX_FILES} files — a large patch comes back cut at hunk ` +
+        'boundaries with every cut marked and counted (diffTruncated, diffNote), and the whole ' +
+        'change is one `diff` call away with ref: "<base>...<branch>". ' +
+        'Once past the live-peer guard, untracked files never block a push; uncommitted ' +
         'modifications to files git already ' +
         'tracks do, since git cannot rebase over them — commit first (or discard them); a ' +
         "`message` here commits the WHOLE working tree, including any peers' in-flight work, so " +
@@ -392,8 +455,18 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
               throw new Error('Branch mode requires a commit "message" to stage the work.');
             }
             const prep = await ctx.git.prepareBranch(dir, { branch, message, base });
+            // The review payload is budgeted exactly as the conflict branch above is (issue
+            // #160): `prepareBranch` diffs the whole review branch against its base, so this is
+            // the largest patch this tool can produce, and an oversized result is rejected by the
+            // client outright and delivers nothing (#68). ONE plan drives both channels —
+            // `renderPushReviewText` reads the already-cut plan and never `prep.diff`.
+            const review = planPushReviewDiff(prep.diff, prep.files, {
+              summary: prep.summary,
+              base: prep.base,
+              branch: prep.branch,
+            });
             return {
-              content: [{ type: 'text', text: prep.summary }],
+              content: [{ type: 'text', text: renderPushReviewText(prep.summary, review) }],
               structuredContent: {
                 status: prep.status,
                 pushed: false,
@@ -402,8 +475,14 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
                 base: prep.base,
                 summary: prep.summary,
                 committedSha: prep.committedSha,
-                diff: prep.diff,
-                diffFiles: prep.files,
+                diff: review.diff,
+                diffFiles: review.diffFiles,
+                diffChars: review.diffChars,
+                diffTruncated: review.diffTruncated,
+                diffHunksOmitted: review.diffHunksOmitted,
+                diffPatchFilesOmitted: review.diffPatchFilesOmitted,
+                diffFilesOmitted: review.diffFilesOmitted,
+                ...(review.diffNote ? { diffNote: review.diffNote } : {}),
               },
             };
           }
