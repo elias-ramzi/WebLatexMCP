@@ -12,6 +12,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A ceiling on a HUNG job, not a slow one. vitest already bounds each test (90s on windows, 30s
+    # elsewhere -- see vitest.config.ts), and that bound is what catches a test that runs long; it
+    # does not catch a worker that never returns. On #169 `npm test` sat in-progress for 38 minutes
+    # on windows-latest with that 90s budget in force, so no per-test timeout ever fired -- and the
+    # identical tree passed the same job in 9m13s in a concurrent run of the same commit, which is
+    # what tells a hang from the platform slowdown. Tightening testTimeout would not have caught it.
+    # Without a job ceiling the default is GitHub's 360 minutes: six hours of runner time (windows
+    # bills at 2x) and the PR pinned at BLOCKED throughout, because the stuck check is the most
+    # recent one for its required context and branch protection reads that one. 25 is ~2.5x the
+    # slowest successful windows run observed (5-10 minutes across the last 39). If a legitimate run
+    # starts approaching it, find out what got slower rather than raising it.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -35,6 +47,8 @@ jobs:
   tex-smoke:
     name: LaTeX compile smoke
     runs-on: ubuntu-latest
+    # Same reasoning; here the cold-cache apt/TeX Live steps are the slow ones, not the tests.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
