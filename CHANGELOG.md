@@ -2627,6 +2627,11 @@ Harmless only because no project is named `please` — the first word matching a
   one of its rounds came back at **0.19** against its four siblings' 71-116, a stall in that
   round's baseline window that a minimum would have selected — passing the regression through.
 
+- **`auxFloats`' three linearity tests measure scan steps, not wall clock** (#173). A growth ratio
+  over `Date.now()` is machine-speed independent but not load independent, and one read 3.21x on
+  genuinely linear code inside a full suite; they now count the characters the scan looks at
+  (`measureAuxScanWork`), which is deterministic and let the threshold tighten from 3.0 to 2.5.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added

@@ -105,6 +105,32 @@ export const GROUP_SKIP_SCAN = MAX_GROUP_SCAN * 4;
 export const PARSE_BOUND = 50_000;
 
 /**
+ * A scan-work accumulator: the number of CHARACTERS of `aux` this scan has looked at — every
+ * character the `indexOf` pass walks over on its way to a marker, every character a brace walk
+ * (`scanBalance`) steps through, and every character `skipWs` runs past. It exists for exactly one
+ * reason: the guarantee this whole module is built around is that total work stays LINEAR in
+ * `aux.length` no matter how the file is malformed, and a test can only hold that guarantee by
+ * measuring the work. Measuring it with `Date.now()` was tried first and flaked — at the input
+ * sizes these bounds make cheap, a single-digit-millisecond sample is dominated by scheduler
+ * jitter and GC from the rest of a parallel test run, so a genuinely linear scan read 3.2x while
+ * the threshold separating linear (~2x) from quadratic (~4x) sat at 3.0 (issue #173). A character
+ * count is exactly the quantity those bounds bound, is identical on every machine and under any
+ * load, and is inflated precisely by the mistake being guarded against: re-walking a group from
+ * its start for every marker reads the same characters over and over, and the counter says so.
+ *
+ * It is threaded as an optional parameter and is `undefined` on every production path — the only
+ * way to obtain one is `measureAuxScanWork`, a separate export that no ordinary caller reaches, so
+ * there is no option a caller of `parseAuxLabels`/`readAuxFloats` could leave switched on. Nothing
+ * here logs (stdout is the JSON-RPC channel, and this would not even earn a stderr line); it only
+ * adds to a number. Counting is done by arithmetic at each scan's exit (`i - from`), never a
+ * per-character increment, so the hot loops keep their shape whether or not one is passed.
+ */
+interface ScanWork {
+  /** Characters examined so far. Monotonically increasing; never reset mid-scan. */
+  steps: number;
+}
+
+/**
  * The one home of the brace-balance rules — `{` opens, `}` closes, and a backslash escapes
  * whatever follows it so a literal `\{`/`\}` never perturbs the count — factored out of
  * `readBraceGroup` so a walk can be RESUMED rather than restarted. `readBraceGroup` runs it over
@@ -130,6 +156,7 @@ function scanBalance(
   from: number,
   to: number,
   depth: number,
+  work?: ScanWork,
 ): { kind: 'closed'; end: number } | { kind: 'open'; depth: number; next: number } {
   let d = depth;
   let i = from;
@@ -146,10 +173,12 @@ function scanBalance(
     } else if (ch === '}') {
       d--;
       if (d === 0) {
+        if (work) work.steps += i + 1 - from;
         return { kind: 'closed', end: i + 1 };
       }
     }
   }
+  if (work) work.steps += Math.max(0, i - from);
   return { kind: 'open', depth: d, next: i };
 }
 
@@ -171,6 +200,7 @@ function readBraceGroup(
   s: string,
   start: number,
   maxScan: number,
+  work?: ScanWork,
 ):
   | { kind: 'ok'; content: string; end: number }
   | {
@@ -184,7 +214,7 @@ function readBraceGroup(
     return { kind: 'fail', reason: 'unbalanced', scannedTo: start, depth: 0, next: start };
   }
   const limit = Math.min(s.length, start + maxScan);
-  const walk = scanBalance(s, start, limit, 0);
+  const walk = scanBalance(s, start, limit, 0, work);
   if (walk.kind === 'closed') {
     return { kind: 'ok', content: s.slice(start + 1, walk.end - 1), end: walk.end };
   }
@@ -244,6 +274,7 @@ function readBraceGroup(
 function readGroupOrSkip(
   s: string,
   start: number,
+  work?: ScanWork,
 ):
   | { kind: 'ok'; content: string; end: number }
   | { kind: 'tooLong'; content: string; end: number }
@@ -255,7 +286,7 @@ function readGroupOrSkip(
       depth: number;
       next: number;
     } {
-  const primary = readBraceGroup(s, start, MAX_GROUP_SCAN);
+  const primary = readBraceGroup(s, start, MAX_GROUP_SCAN, work);
   if (primary.kind === 'ok') {
     return primary;
   }
@@ -265,7 +296,7 @@ function readGroupOrSkip(
     // former is evidence about the text that follows.
     return { kind: 'unbalanced', depth: primary.depth, next: primary.next };
   }
-  const retry = readBraceGroup(s, start, GROUP_SKIP_SCAN);
+  const retry = readBraceGroup(s, start, GROUP_SKIP_SCAN, work);
   if (retry.kind === 'ok') {
     return { kind: 'tooLong', content: retry.content, end: retry.end };
   }
@@ -321,9 +352,10 @@ interface OpenSpan {
 }
 
 /** Skip whitespace (including newlines — a `\newlabel` can be wrapped across lines) from `i`. */
-function skipWs(s: string, i: number): number {
+function skipWs(s: string, i: number, work?: ScanWork): number {
   let j = i;
   while (j < s.length && /\s/.test(s[j] ?? '')) j++;
+  if (work) work.steps += j - i;
   return j;
 }
 
@@ -476,15 +508,19 @@ type ScanOutcome =
  * marker far from the previous one pays for the gap, and the markers that gap contains do not
  * exist to pay for it.
  */
-function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
+function* scanAuxEntries(aux: string, work?: ScanWork): Generator<ScanOutcome> {
   let searchFrom = 0;
   let scans = 0;
   let openSpan: OpenSpan | null = null;
   while (scans < PARSE_BOUND) {
     const markerIdx = aux.indexOf(NEWLABEL_MARKER, searchFrom);
     if (markerIdx === -1) {
+      // The search still read everything left of end-of-file looking for one.
+      if (work) work.steps += Math.max(0, aux.length - searchFrom);
       break;
     }
+    // `indexOf` looked at every character from `searchFrom` through the end of the match.
+    if (work) work.steps += markerIdx + NEWLABEL_MARKER.length - searchFrom;
     scans++;
     // Advance past this marker regardless of what happens below, so a malformed entry cannot
     // wedge the scan in place.
@@ -493,7 +529,7 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     if (openSpan) {
       // Carry the abandoned group's own brace walk forward to this marker — never past it, so
       // the cost is the gap between two markers and each character is walked at most once.
-      const walk = scanBalance(aux, openSpan.next, markerIdx, openSpan.depth);
+      const walk = scanBalance(aux, openSpan.next, markerIdx, openSpan.depth, work);
       if (walk.kind === 'closed') {
         // The group ended before this marker, so the marker is ordinary text that follows it:
         // the span is over and the marker gets the normal treatment below.
@@ -507,8 +543,8 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
       }
     }
 
-    let i = skipWs(aux, searchFrom);
-    const keyGroup = readGroupOrSkip(aux, i);
+    let i = skipWs(aux, searchFrom, work);
+    const keyGroup = readGroupOrSkip(aux, i, work);
     if (keyGroup.kind === 'unbalanced') {
       if (keyGroup.depth > 0) {
         // A `{` was opened for the key and the walk proved it never closes anywhere in the file.
@@ -546,8 +582,8 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     const keyContent = keyGroup.content;
     searchFrom = keyGroup.end;
 
-    i = skipWs(aux, keyGroup.end);
-    const outerGroup = readGroupOrSkip(aux, i);
+    i = skipWs(aux, keyGroup.end, work);
+    const outerGroup = readGroupOrSkip(aux, i, work);
     if (outerGroup.kind === 'unbalanced') {
       // Truly no closing brace anywhere in the rest of the file for this group. searchFrom stays
       // at the key's own (already-known-safe) end from above; nothing further is located. But
@@ -607,13 +643,13 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     // under that budget to get here), so these two reads can never themselves hit a scan budget —
     // only genuine unbalance is possible, and that stays a silent skip as it always has.
     const inner = outerGroup.content;
-    let j = skipWs(inner, 0);
-    const numberGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN);
+    let j = skipWs(inner, 0, work);
+    const numberGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN, work);
     if (numberGroup.kind !== 'ok') {
       continue;
     }
-    j = skipWs(inner, numberGroup.end);
-    const pageGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN);
+    j = skipWs(inner, numberGroup.end, work);
+    const pageGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN, work);
     if (pageGroup.kind !== 'ok') {
       continue;
     }
@@ -634,11 +670,10 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
   }
 }
 
-export function parseAuxLabels(aux: string, opts?: { maxLabels?: number }): AuxLabel[] {
-  const maxLabels = opts?.maxLabels ?? DEFAULT_MAX_LABELS;
+function collectAuxLabels(aux: string, maxLabels: number, work?: ScanWork): AuxLabel[] {
   const results: AuxLabel[] = [];
 
-  for (const outcome of scanAuxEntries(aux)) {
+  for (const outcome of scanAuxEntries(aux, work)) {
     if (outcome.kind !== 'entry') {
       continue;
     }
@@ -649,6 +684,31 @@ export function parseAuxLabels(aux: string, opts?: { maxLabels?: number }): AuxL
   }
 
   return results;
+}
+
+export function parseAuxLabels(aux: string, opts?: { maxLabels?: number }): AuxLabel[] {
+  return collectAuxLabels(aux, opts?.maxLabels ?? DEFAULT_MAX_LABELS);
+}
+
+/**
+ * `parseAuxLabels`, plus the number of characters the scan looked at getting there — the test
+ * seam for this module's linearity guarantee (see `ScanWork`). It is a SEPARATE export rather
+ * than an option on `parseAuxLabels` so that nothing a production caller can pass turns
+ * instrumentation on: `parseAuxLabels` and `readAuxFloats` call the scan with no accumulator at
+ * all, and their behaviour and return types are untouched by this existing. It runs the same
+ * `collectAuxLabels` over the same generator with the same early stop, so what it counts is the
+ * work the real parse does — not a re-implementation of it, which is the one way a work counter
+ * can go quietly wrong. `labels` is returned alongside `steps` so a test can assert the parse's
+ * OUTCOME in the same call it measures; a measurement of a scan that stopped early for the wrong
+ * reason would otherwise look like excellent linearity.
+ */
+export function measureAuxScanWork(
+  aux: string,
+  opts?: { maxLabels?: number },
+): { labels: AuxLabel[]; steps: number } {
+  const work: ScanWork = { steps: 0 };
+  const labels = collectAuxLabels(aux, opts?.maxLabels ?? DEFAULT_MAX_LABELS, work);
+  return { labels, steps: work.steps };
 }
 
 /** `pdf_geometry`'s "floats" cap — labels past this are reported as `omitted`, never silently. */
