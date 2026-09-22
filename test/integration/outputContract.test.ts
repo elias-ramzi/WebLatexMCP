@@ -27,8 +27,10 @@
  * git-backed set — 34 of the 38 registered tools in all — so the audit that was a throwaway
  * script becomes something CI re-runs on every commit. The four it leaves out are the
  * bibliography tools (`list_references`, `check_citations`, `search_references`, `add_citation`):
- * two of them need a stubbed backend to answer at all, and `list_references` has an open hole
- * (#137) whose fix is in flight, so pinning its payload here would pin the bug.
+ * two of them need a stubbed backend to answer at all. `list_references` was left out because
+ * #137's fix was in flight when this was written; that fix has since landed (#142), so the only
+ * thing keeping it out now is that nobody has written the fixture — extending the sweep to it is
+ * a good next step, not a hazard.
  *
  * What would make these fail: adding a key to any of these handlers' `structuredContent` without
  * adding it to the tool's `outputSchema` (or deleting one from the schema while the handler still
