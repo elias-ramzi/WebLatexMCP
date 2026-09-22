@@ -9,8 +9,17 @@ import { foldCase } from '../lib/caseFold.js';
 import { dedupeFolded } from '../lib/peerRefusal.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
 import { latestTouch } from '../services/shadowStore.js';
-import { renderCommitLines } from '../lib/conflictText.js';
 import { splitStalePeers } from '../lib/peerSummary.js';
+import {
+  planCommitText,
+  planStatusPayload,
+  renderCommitBlock,
+  renderPathListLine,
+  STATUS_PEER_TEXT_PATHS,
+  type StatusFlatListName,
+  type StatusPeerInput,
+  type StatusPeerPlan,
+} from '../lib/statusBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -34,6 +43,14 @@ const commitSchema = z.object({
     ),
 });
 
+/**
+ * Appended to every path list the payload budget can cut, because a cut changes what the field
+ * promises and a field that still reads as complete is the reading a caller will act on.
+ */
+const CUT_NOTE =
+  'May be cut to fit the result payload budget — pathsOmitted says how many went, per list, and ' +
+  'truncated says whether anything did. An empty list always means git reported nothing.';
+
 const outputSchema = {
   branch: z.string(),
   ahead: z.number().describe('Local commits not on the remote (unpushed).'),
@@ -48,30 +65,44 @@ const outputSchema = {
       'Clone state vs the tracked remote branch, from ahead/behind. "behind"/"diverged" mean ' +
         'origin moved; sync (project_sync) before pushing. Counts reflect the last fetch, not a live remote.',
     ),
-  clean: z.boolean(),
-  staged: z.array(z.string()),
-  unstaged: z.array(z.string()),
-  untracked: z.array(z.string()),
+  clean: z
+    .boolean()
+    .describe(
+      'Whether git reported a clean working tree. Derived from what git reported, never from ' +
+        'what this report shows: a path list cut to fit the payload budget (see truncated) ' +
+        'changes neither this nor ahead/behind/syncState.',
+    ),
+  staged: z.array(z.string()).describe(CUT_NOTE),
+  unstaged: z.array(z.string()).describe(CUT_NOTE),
+  untracked: z.array(z.string()).describe(CUT_NOTE),
   aheadCommits: z
     .array(commitSchema)
-    .describe('Local commits not yet on the remote (what a push would send).'),
+    .describe(
+      'Local commits not yet on the remote (what a push would send). Complete — never capped, ' +
+        'unlike the text rendering below it, which shows the first few and says how many more.',
+    ),
   behindCommits: z
     .array(commitSchema)
-    .describe('Remote commits not yet local (what landed upstream since the last sync).'),
+    .describe(
+      'Remote commits not yet local (what landed upstream since the last sync). Complete — never ' +
+        "capped: a conflict result's remoteCommits is capped and points here for the full list.",
+    ),
   externalChanges: z
     .array(z.string())
-    .describe('Files changed on disk directly (not via this server this session).'),
+    .describe(`Files changed on disk directly (not via this server this session). ${CUT_NOTE}`),
   session: z.string().describe('Id of this session.'),
   sessionChanges: z
     .array(z.string())
     .describe(
-      'Uncommitted files this session edited (staged or not) — what a default commit would send.',
+      'Uncommitted files this session edited (staged or not) — what a default commit would send. ' +
+        CUT_NOTE,
     ),
   otherChanges: z
     .array(z.string())
     .describe(
       "Uncommitted files this session did not edit (staged or not) — another session's in-flight " +
-        'work, or edits made outside this server. A default commit leaves these alone.',
+        'work, or edits made outside this server. A default commit leaves these alone. ' +
+        CUT_NOTE,
     ),
   activeSessions: z
     .array(
@@ -84,7 +115,15 @@ const outputSchema = {
           .nullable()
           .describe(
             "Every path in that session's shadow index (all of them, not only currently dirty " +
-              'ones); null when the index could not be read.',
+              'ones); null when the index could not be read. May be cut to fit the payload ' +
+              'budget — changesOmitted says how many went, and is what tells a cut list apart ' +
+              'from a session that recorded nothing.',
+          ),
+        changesOmitted: z
+          .number()
+          .describe(
+            'Paths cut from changes by the payload budget; 0 when none were. Always 0 when ' +
+              'changes is null: unreadable is not a cut, and neither is it "owns nothing".',
           ),
         lastWriteAt: z
           .string()
@@ -117,7 +156,49 @@ const outputSchema = {
     .array(z.string())
     .describe(
       'Files this session edited that a commit has since changed on the same lines. They are ' +
-        'excluded from commits until re-read and re-edited on the current content.',
+        'excluded from commits until re-read and re-edited on the current content. ' +
+        CUT_NOTE,
+    ),
+  truncated: z
+    .boolean()
+    .describe(
+      'Whether anything was cut from this report to keep it inside its payload budget — paths, ' +
+        "a peer's changes, or a whole session. False means every list here is complete. It is " +
+        'never inferred from an empty list, and it never affects clean/ahead/behind/syncState, ' +
+        'which come from git.',
+    ),
+  activeSessionsOmitted: z
+    .number()
+    .describe(
+      'Other sessions not listed individually in activeSessions because the report lists at most ' +
+        '20 (live sessions first, then the most recently seen); 0 when none were. Not the same ' +
+        'fact as staleSessions, which counts sessions that exited having recorded nothing.',
+    ),
+  pathsOmitted: z
+    .object({
+      conflictedChanges: z.number(),
+      externalChanges: z.number(),
+      sessionChanges: z.number(),
+      otherChanges: z.number(),
+      activeSessionChanges: z.number(),
+      staged: z.number(),
+      unstaged: z.number(),
+      untracked: z.number(),
+    })
+    .optional()
+    .describe(
+      'Paths cut from each list by the payload budget, present only when something was cut. ' +
+        'activeSessionChanges is the total across every listed session (the per-session figure ' +
+        'is activeSessions[].changesOmitted). Lists are kept in this priority order — ' +
+        'conflictedChanges, externalChanges, sessionChanges, otherChanges, activeSessionChanges, ' +
+        'staged, unstaged, untracked — so what blocks a commit survives a cut and the untracked ' +
+        'tree is what goes.',
+    ),
+  note: z
+    .string()
+    .optional()
+    .describe(
+      'What the payload budget cut and where to look instead. Present only when something was cut.',
     ),
 };
 
@@ -133,7 +214,11 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         'commit (aheadCommits, behindCommits) lists the files it touched with added/removed line ' +
         'counts; for the content, diff with ref: "<hash>~1..<hash>". Also splits the ' +
         "uncommitted changes into this session's and other sessions', and lists the other agent " +
-        'sessions currently working on the project.',
+        'sessions currently working on the project. The path lists are bounded: a working tree ' +
+        'with thousands of dirty or untracked files is cut to fit the result, with pathsOmitted ' +
+        'saying how many went from each and truncated saying whether anything did. The commit ' +
+        'lists are not — aheadCommits and behindCommits are always complete, and only the text ' +
+        'rendering of them is shortened.',
       inputSchema,
       outputSchema,
     },
@@ -203,13 +288,43 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         const externalChanges = (
           await ctx.files.externalModifications(dir, [...status.unstaged, ...status.untracked])
         ).map(toPosix);
-        const peerDetail = (p: (typeof peers)[number]): string => {
+        // Everything the report may have to cut, handed to the planner in one piece: the flat path
+        // lists and every listed peer's shadow index. `status` had no bound of any kind, and every
+        // one of these ships twice — as JSON and joined into the text — so the budget is charged
+        // across both channels and the text below is rendered from the ALREADY-CUT plan (#175).
+        const peerInputs: StatusPeerInput[] = shownPeers.map((p) => {
           const entries = peerShadows.get(p.sessionId) ?? null;
+          return {
+            session: p.sessionId,
+            live: p.live,
+            lastSeen: p.heartbeatAt,
+            changes: entries ? entries.map((e) => toPosix(e.path)) : null,
+            lastWriteAt: entries ? latestTouch(entries) : null,
+          };
+        });
+        const plan = planStatusPayload({
+          staged,
+          unstaged,
+          untracked,
+          externalChanges,
+          sessionChanges,
+          otherChanges,
+          conflictedChanges,
+          peers: peerInputs,
+        });
+        // The commit lists are budgeted in the TEXT channel only: `structuredContent`'s copies stay
+        // complete because `conflictBudget.ts` caps its own `remoteCommits` and points a caller
+        // mid-conflict at `status.behindCommits` for the full list. `renderCommitBlock` goes through
+        // `renderCommitLines`, whose trailing "… N more commit(s) (see structuredContent)" is true
+        // for exactly this reason.
+        const behindText = planCommitText(behindCommits);
+        const aheadText = planCommitText(aheadCommits);
+        const peerDetail = (p: StatusPeerPlan): string => {
           const segments: string[] = [];
           if (!p.live) segments.push('gone');
-          if (entries === null) {
+          if (p.changes === null) {
             segments.push('index unreadable');
-          } else if (entries.length === 0) {
+          } else if (p.changes.length === 0 && p.changesOmitted === 0) {
             // "nothing recorded", never "no changes": an empty index also covers a session whose
             // own index write failed, whose dirty lines are in the tree unowned. This line is the
             // channel a human actually reads, so it must not assert what the schema and the docs
@@ -219,20 +334,22 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           } else {
             // Cap what the text shows — a peer with a long-running session can list dozens of
             // touched paths, and this line is meant to be skimmed, not to duplicate the structured
-            // `changes` array (which stays complete).
-            const shown = entries.slice(0, 5).map((e) => toPosix(e.path));
-            const remaining = entries.length - shown.length;
+            // `changes` array. The shown paths come from the PLAN, not from the raw index, so the
+            // two channels can never name a path the other one dropped; `and N more` still counts
+            // against the true total, so the line stays truthful about how many there are.
+            const total = p.changes.length + p.changesOmitted;
+            const shown = p.changes.slice(0, STATUS_PEER_TEXT_PATHS);
+            const remaining = total - shown.length;
             segments.push(
               remaining > 0 ? `${shown.join(', ')} and ${remaining} more` : shown.join(', '),
             );
-            const lastWrite = latestTouch(entries);
             segments.push(
-              lastWrite
-                ? `last write ${formatAge(lastWrite, Date.now())} ago`
+              p.lastWriteAt
+                ? `last write ${formatAge(p.lastWriteAt, Date.now())} ago`
                 : 'no write on record',
             );
           }
-          return `${p.sessionId} (${segments.join('; ')})`;
+          return `${p.session} (${segments.join('; ')})`;
         };
         // Stale sessions are counted, never dropped silently — the "and N exited with nothing
         // recorded" clause survives even when nothing else is shown, so the line still says the
@@ -243,34 +360,51 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           staleSessions > 0
             ? `${staleSessions} session${staleSessions === 1 ? '' : 's'} exited with nothing recorded`
             : '';
+        // A session the budget could not list is counted like a stale one — never dropped silently
+        // — and stated as its own clause, because "not listed here" and "exited having recorded
+        // nothing" are different facts about a session and a reader must not have to guess which.
+        const omittedSessionsClause =
+          plan.activeSessionsOmitted > 0
+            ? `${plan.activeSessionsOmitted} more session${
+                plan.activeSessionsOmitted === 1 ? '' : 's'
+              } not listed`
+            : '';
+        const sessionClauses = [
+          plan.peers.length > 0 ? plan.peers.map(peerDetail).join(', ') : '',
+          staleClause,
+          omittedSessionsClause,
+        ].filter(Boolean);
         const otherSessionsLine =
-          shownPeers.length > 0
-            ? `other sessions: ${shownPeers.map(peerDetail).join(', ')}` +
-              (staleClause ? `, and ${staleClause}` : '')
-            : staleClause
-              ? `other sessions: ${staleClause}`
-              : '';
+          sessionClauses.length > 0
+            ? `other sessions: ${
+                sessionClauses.length === 1
+                  ? sessionClauses[0]
+                  : `${sessionClauses.slice(0, -1).join(', ')}, and ${sessionClauses.at(-1)}`
+              }`
+            : '';
+        // Every list line is rendered from the plan's own paths, never from the full list: a text
+        // channel built from the uncut lists would reintroduce exactly the payload the budget
+        // exists to prevent — half the feature, reading as though it worked.
+        const line = (label: string, name: StatusFlatListName): string =>
+          plan.lists[name].length > 0
+            ? renderPathListLine(label, plan.lists[name], plan.omitted[name])
+            : '';
         const text = [
           `branch ${status.branch} — ${syncSummary(status.branch, status.ahead, status.behind)}`,
           status.clean ? 'working tree clean' : 'working tree has changes',
-          staged.length ? `staged: ${staged.join(', ')}` : '',
-          unstaged.length ? `unstaged: ${unstaged.join(', ')}` : '',
-          untracked.length ? `untracked: ${untracked.join(', ')}` : '',
+          line('staged', 'staged'),
+          line('unstaged', 'unstaged'),
+          line('untracked', 'untracked'),
           behindCommits.length
-            ? `landed upstream:\n${renderCommitLines(behindCommits).join('\n')}`
+            ? `landed upstream:\n${renderCommitBlock(behindText).join('\n')}`
             : '',
-          aheadCommits.length ? `to push:\n${renderCommitLines(aheadCommits).join('\n')}` : '',
-          externalChanges.length
-            ? `⚠ changed directly (not via tools): ${externalChanges.join(', ')}`
-            : '',
-          sessionChanges.length
-            ? `this session ("${ctx.shadows.sessionId}") changed: ${sessionChanges.join(', ')}`
-            : '',
-          otherChanges.length ? `changed by others: ${otherChanges.join(', ')}` : '',
-          conflictedChanges.length
-            ? `⚠ conflicted (this session vs a commit): ${conflictedChanges.join(', ')}`
-            : '',
+          aheadCommits.length ? `to push:\n${renderCommitBlock(aheadText).join('\n')}` : '',
+          line('⚠ changed directly (not via tools)', 'externalChanges'),
+          line(`this session ("${ctx.shadows.sessionId}") changed`, 'sessionChanges'),
+          line('changed by others', 'otherChanges'),
+          line('⚠ conflicted (this session vs a commit)', 'conflictedChanges'),
           otherSessionsLine,
+          plan.note ?? '',
         ]
           .filter(Boolean)
           .join('\n');
@@ -278,30 +412,37 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           content: [{ type: 'text', text }],
           structuredContent: {
             ...status,
-            // Same values the text above was rendered from, so the two channels cannot disagree
-            // about a separator.
-            staged,
-            unstaged,
-            untracked,
+            // Same values the text above was rendered from — one plan, two renderers — so the two
+            // channels cannot disagree about a separator or about what got cut.
+            staged: plan.lists.staged,
+            unstaged: plan.lists.unstaged,
+            untracked: plan.lists.untracked,
+            // Complete, deliberately: `conflictBudget.ts` caps a conflict's own `remoteCommits` and
+            // sends the caller here for the full list. Only their TEXT rendering is bounded.
             aheadCommits,
             behindCommits,
             syncState: syncState(status.ahead, status.behind),
-            externalChanges,
+            externalChanges: plan.lists.externalChanges,
             session: ctx.shadows.sessionId,
-            sessionChanges,
-            otherChanges,
-            conflictedChanges,
-            activeSessions: shownPeers.map((p) => {
-              const entries = peerShadows.get(p.sessionId) ?? null;
-              return {
-                session: p.sessionId,
-                live: p.live,
-                lastSeen: p.heartbeatAt,
-                changes: entries ? entries.map((e) => toPosix(e.path)) : null,
-                lastWriteAt: entries ? latestTouch(entries) : null,
-              };
-            }),
+            sessionChanges: plan.lists.sessionChanges,
+            otherChanges: plan.lists.otherChanges,
+            conflictedChanges: plan.lists.conflictedChanges,
+            // Built field by field rather than spread: a plan object that grows a field would
+            // otherwise reach the client undeclared, which the SDK passes through and the caller's
+            // own validator then rejects with -32602 and no result at all.
+            activeSessions: plan.peers.map((p) => ({
+              session: p.session,
+              live: p.live,
+              lastSeen: p.lastSeen,
+              changes: p.changes,
+              changesOmitted: p.changesOmitted,
+              lastWriteAt: p.lastWriteAt,
+            })),
             staleSessions,
+            activeSessionsOmitted: plan.activeSessionsOmitted,
+            truncated: plan.truncated,
+            ...(plan.truncated ? { pathsOmitted: plan.omitted } : {}),
+            ...(plan.note ? { note: plan.note } : {}),
           },
         };
       } catch (err) {
