@@ -1474,6 +1474,31 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   selected no text; no synctex location; a withheld path). The unopenable-path guard is untouched
   and runs first: the budget only ever removes fields, so a `file`/`line`/`snippet` withheld because
   the document named a path leaving the project can never come back through it.
+- **`compile`'s `errors[]` and `warnings[]` are budgeted, warnings cut before errors** (#162,
+  #68, #153). `logTail` beside them had been bounded at 80 lines all along, while both arrays went
+  into `structuredContent` uncapped — and the tool's own comment said why that hurts ("a normal
+  build has hundreds of [warnings]"), having bounded the per-warning cost and left the count open.
+  A thesis-length document with a wide table emits an `Overfull \hbox` per line: a 1200-warning
+  log now measured at **201,966 characters** of rendered payload, three times the ~67k a client
+  rejected undelivered in #68, on a **successful** compile of an ordinary document — and `compile`
+  is the most-called tool in the server, so this fired on the loop the agent was already in. The
+  new `src/lib/diagnosticsBudget.ts` is a pure planner in the family shape (a budget, a plan, a
+  `note`, a thin tool layer): 20000 characters charged across BOTH channels, allocated in
+  `ALLOCATION_ORDER` — **errors first, so warnings are cut first**, the thing that breaks the build
+  cut last — with the text channel rendered from the already-cut payload so it cannot re-render the
+  full set behind the budget's back. The two channels are charged apart rather than averaged,
+  because they differ: the first ten errors ship **twice** (rendered into the result text with
+  their snippets, and again as JSON), warnings ship once, and `renderErrorLine` is the same call
+  the cost function charges and the tool ships. Cuts are counted in **new** fields,
+  `errorsOmittedByCap`/`warningsOmittedByCap`, never folded into `warningsOmitted` — that one
+  counts what the caller's own `warningsFilter` removed at their request, a different claim its
+  schema text makes at length, and the two are never added. `omittedSnippetLocations` keeps its
+  meaning and its schema text now says so: it is counted where snippets are attached, before the
+  cap, so it answers "what could the log be vouched for" rather than "what fit", and an error the
+  cap drops is counted in `errorsOmittedByCap` instead. Nothing about snippet provenance changed,
+  an error carrying a snippet is kept past the count cap (so context the server already read is
+  never thrown away), at least one error is always returned, and `logTail`'s own 80-line bound is
+  untouched — it is the fallback evidence for the warnings this cut removes.
 
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.

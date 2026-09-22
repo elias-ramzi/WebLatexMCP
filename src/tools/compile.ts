@@ -8,11 +8,16 @@ import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint } from '../lib/viewerHint.js';
 import { attachErrorSnippets } from '../lib/errorSnippets.js';
 import {
-  formatSnippet,
   unopenablePaths,
   withoutUnopenableLocation,
   MAX_REPORTED_PATH_CHECKS,
 } from '../lib/sourceSnippet.js';
+import {
+  planDiagnosticsPayload,
+  DIAGNOSTICS_CONTENT_BUDGET,
+  DIAGNOSTICS_MAX_ERRORS,
+  DIAGNOSTICS_MAX_WARNINGS,
+} from '../lib/diagnosticsBudget.js';
 import {
   parseLog,
   filterLog,
@@ -25,9 +30,6 @@ import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
-
-/** How many errors the result text lists before pointing at structuredContent and the log. */
-const MAX_TEXT_ERRORS = 10;
 
 const inputSchema = {
   project: z.string().optional(),
@@ -229,8 +231,51 @@ const outputSchema = {
       'The session that held the lock while this call waited — a peer process, or this very ' +
         'session when a concurrent call in the same process still held it.',
     ),
-  errors: z.array(errorShape),
-  warnings: z.array(warningShape),
+  errors: z
+    .array(errorShape)
+    .describe(
+      "The compile errors, in the order the log reports them — TeX's first error is usually the " +
+        'cause and the ones after it the cascade, so this is cut as a TAIL, never reordered. ' +
+        `At most ${DIAGNOSTICS_MAX_ERRORS} of them (plus any later one carrying a snippet, so a ` +
+        'source excerpt the server already vouched for is never thrown away by the cap), and ' +
+        `fewer when the ${DIAGNOSTICS_CONTENT_BUDGET}-character result budget bites first. ` +
+        'Warnings are cut before errors, and at least one error is always returned. What went is ' +
+        'counted in errorsOmittedByCap and explained in note; the complete set is in the log at ' +
+        'logPath.',
+    ),
+  warnings: z
+    .array(warningShape)
+    .describe(
+      `At most ${DIAGNOSTICS_MAX_WARNINGS} warnings, and fewer when the ` +
+        `${DIAGNOSTICS_CONTENT_BUDGET}-character result budget (shared with errors[], which is ` +
+        'allocated first) bites — a normal build emits hundreds, and an unbounded list is how a ' +
+        'result gets rejected by a client and delivers nothing at all. Cut as a tail, in log ' +
+        'order. TWO different things can shorten this list and they are counted apart: ' +
+        'warningsOmitted is what YOUR warningsFilter removed, warningsOmittedByCap is what did ' +
+        'not fit. Either way the box lines are still in logTail and everything is in logPath.',
+    ),
+  errorsOmittedByCap: z
+    .number()
+    .describe(
+      'How many errors this result does not carry because they did not fit — over the ' +
+        `${DIAGNOSTICS_MAX_ERRORS}-error cap, or over the ${DIAGNOSTICS_CONTENT_BUDGET}-character ` +
+        'budget charged across both channels (the first errors are rendered into the result text ' +
+        'with their snippets as well as into structuredContent). 0 means errors[] is the whole ' +
+        'set. Never a filter: warningsFilter does not touch errors. `note` says which bound ' +
+        'fired; read the omitted ones in the log at logPath.',
+    ),
+  warningsOmittedByCap: z
+    .number()
+    .describe(
+      'How many warnings this result does not carry because they did not fit — over the ' +
+        `${DIAGNOSTICS_MAX_WARNINGS}-warning cap, or over the shared ` +
+        `${DIAGNOSTICS_CONTENT_BUDGET}-character budget, for which errors[] is allocated first. ` +
+        'This is NOT warningsOmitted: that one counts what your own warningsFilter removed at ' +
+        'your request, which is a different claim, and the two are never added together. A ' +
+        'non-zero value here on a call you passed no filter to means the document simply has ' +
+        'more warnings than one result can carry — narrow warningsFilter to spend the budget on ' +
+        'the ones you want, or read logPath.',
+    ),
   warningsOmitted: z
     .number()
     .describe(
@@ -242,7 +287,9 @@ const outputSchema = {
         'warnings (a "LaTeX Font Warning:", a bare "pdfTeX warning") which drop without being ' +
         'counted here, while a rerun hint ("Label(s) may have changed") is a structured warning ' +
         'that is kept in the tail regardless. Read this number against warnings[], never against ' +
-        'the size of logTail.',
+        'the size of logTail. It is also NOT a count of what the result-size budget cut — that is ' +
+        'warningsOmittedByCap, a different claim about a different cause, and adding the two ' +
+        'together is never right.',
     ),
   missingPackages: z
     .array(z.string())
@@ -278,8 +325,22 @@ const outputSchema = {
         'that leaves the project through a symlink, or naming one past the ' +
         `${MAX_REPORTED_PATH_CHECKS}-file cap on resolving where the log’s paths lead (never ` +
         'checked, which is not the same claim as an escape). 0 means every ' +
-        'located error has its source context: co-located errors share one snippet, so an error ' +
-        'without one is not a gap when 0. This is the flag for "there is more to see".',
+        'located error IN THIS RESULT has its source context: co-located errors share one ' +
+        'snippet, so an error without one is not a gap when 0. Counted where the snippets are ' +
+        'attached, which is BEFORE the result-size cap, so it answers "what could the log be ' +
+        'vouched for" and not "what fit": an error the cap dropped takes its snippet with it and ' +
+        'is counted in errorsOmittedByCap instead — never here, since nothing about that ' +
+        'location went unvouched. Read the two together; either being non-zero is the flag for ' +
+        '"there is more to see".',
+    ),
+  note: z
+    .string()
+    .optional()
+    .describe(
+      'What the result-size cap cut from errors[]/warnings[] and how to get the rest. Present ' +
+        'only when something actually was cut, and it names only the bound that fired. Distinct ' +
+        'from `hint`, which is about the compile itself (a missing package, a needed ' +
+        'shell-escape retry) rather than about what this result could carry.',
     ),
   hint: z
     .string()
@@ -344,7 +405,11 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'A failure caused by a package the local TeX installation does not have names it in ' +
         'missingPackages, so you can act on it without parsing the log. On a warning-heavy ' +
         'document, warningsFilter trims warnings[] AND logTail together (warningsOmitted counts ' +
-        'the removed ones) — never errors. Also reports whether the ' +
+        'the removed ones) — never errors. The result is budgeted either way ' +
+        `(${DIAGNOSTICS_CONTENT_BUDGET} characters across both channels, warnings cut before ` +
+        'errors, what went counted in errorsOmittedByCap/warningsOmittedByCap and explained in ' +
+        'note), so a build with hundreds of box warnings comes back bounded instead of being ' +
+        'rejected by the client and delivering nothing. Also reports whether the ' +
         'backend actually wrote a fresh PDF (`rebuilt` — false means a peer session already ' +
         'compiled this shared clone and there was nothing to do) and how long this call waited ' +
         'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended).',
@@ -465,6 +530,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           });
           const lockWaitSec = Math.round(lock.waitedMs / 100) / 10;
           const lockHeldBy = lock.waitedOn;
+          // ONE plan drives both channels (issue #162). `errors[]` and `warnings[]` are the last
+          // two document-controlled payloads in this tool that nothing bounded — `logTail` beside
+          // them has been capped at 80 lines all along — and a normal warning-heavy build puts
+          // enough of them in a result to have it rejected undelivered. The plan carries the text
+          // rendering of the errors it KEPT, so the text channel cannot re-render the full set
+          // behind the budget's back (the rule `diff.ts` and `searchFiles.ts` follow).
+          const diagnostics = planDiagnosticsPayload(errors, shownFilteredWarnings);
           const structuredContent = {
             success: outcome.success,
             rootFile: root,
@@ -477,8 +549,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             pdfMtime: outcome.pdfMtime,
             lockWaitSec,
             lockHeldBy,
-            errors,
-            warnings: shownFilteredWarnings,
+            errors: diagnostics.errors,
+            warnings: diagnostics.warnings,
+            errorsOmittedByCap: diagnostics.errorsOmittedByCap,
+            warningsOmittedByCap: diagnostics.warningsOmittedByCap,
             warningsOmitted,
             missingPackages,
             logTail: rawLog
@@ -491,6 +565,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 ),
             logPath: outLogPath,
             omittedSnippetLocations,
+            ...(diagnostics.note ? { note: diagnostics.note } : {}),
             hint,
           };
           // Name the backend in the text too, not only structuredContent: which engine spoke
@@ -512,31 +587,19 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           }
           // Render the source context into the text too, not only structuredContent: a client that
           // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
-          // Errors sharing a location print the snippet once.
-          // Which errors the text lists: the first MAX_TEXT_ERRORS, plus any later one carrying a
-          // snippet. Snippets attach per location while this window counts errors, so capping
-          // purely by position dropped excerpts the server had already paid to read — and the
-          // client this rendering exists for is precisely the one that cannot read them out of
-          // structuredContent. The snippet cap bounds how many extras this can add.
-          let listed = 0;
-          const printable = errors.filter((e) => {
-            if (listed < MAX_TEXT_ERRORS) {
-              listed++;
-              return true;
-            }
-            return e.snippet !== undefined;
-          });
-          const errorLines = printable
-            .map((e) => {
-              const head = `  ${e.file ?? '?'}:${e.line ?? '?'} ${e.message}`;
-              // Each snippet is carried once per location, so this prints every excerpt once.
-              return e.snippet ? `${head}\n${formatSnippet(e, e.line)}` : head;
-            })
-            .join('\n');
+          // Errors sharing a location print the snippet once. Which errors the text lists, and
+          // what that costs, is one decision made in `diagnosticsBudget.ts` — rendered here from
+          // the errors the budget KEPT, never from the full array beside it.
+          const errorLines = diagnostics.errorLines;
           const dropped = [
-            errors.length > printable.length
-              ? `  … ${errors.length - printable.length} more error(s) — see structuredContent or ${outLogPath ?? 'the log'}`
+            diagnostics.errors.length > diagnostics.errorsInText
+              ? `  … ${diagnostics.errors.length - diagnostics.errorsInText} more error(s) — see structuredContent or ${outLogPath ?? 'the log'}`
               : '',
+            // Said in the text as well as in structuredContent, and charged there: the client this
+            // rendering exists for is the one that cannot read the counters at all, and a list
+            // silently missing two thirds of a build's warnings is exactly what a budget must not
+            // produce.
+            diagnostics.note ? `  … ${diagnostics.note}` : '',
             omittedSnippetLocations > 0
               ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
                 `did not name the file and line outright (every diagnostic, under tectonic), or ` +

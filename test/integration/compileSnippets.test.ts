@@ -291,29 +291,44 @@ describe('compile: source context', () => {
     // Resolving where a log's paths lead is capped, and past the cap a location is withheld. That
     // is caution about a path nobody looked at — reporting it as a symlink escape accuses the
     // document of something the server never checked, and sends the caller hunting for a link
-    // that does not exist. The withheld location must also take its snippet with it: the excerpt
-    // is rendered against `line`, so source with no line is source with nowhere to go.
+    // that does not exist.
+    //
+    // The diagnostic that lands past the cap is a WARNING here, and that is forced rather than
+    // chosen (#162): paths are resolved in the order `[...errors, ...warnings]`, so an ERROR past
+    // the 200-path cap sits at index 200+ of `errors[]` — which is now past the 20-error result
+    // cap by construction, so it is not in the result to assert on at all. The other half of the
+    // original claim, that a withheld location takes its snippet with it (the excerpt is rendered
+    // against `line`, so source with no line is source with nowhere to go), is pinned directly on
+    // `withoutUnopenableLocation` in test/unit/sourceSnippet.test.ts, and on the escaped-path
+    // branch by the symlink test above, which sits at index 0 and is unaffected by any cap.
     const noise = Array.from(
       { length: MAX_REPORTED_PATH_CHECKS },
       (_, i) => `./aux-${i}.log:1: Undefined control sequence.`,
     );
     const { client } = await setup(
       { 'main.tex': '\\documentclass{article}\n\\begin{document}\nhi $x\n\\end{document}\n' },
-      [...noise, './main.tex:3: Missing $ inserted.', ''].join('\n'),
+      [
+        ...noise,
+        '(./main.tex',
+        "LaTeX Warning: Reference `fig:x' undefined on input line 3.",
+        ')',
+        '',
+      ].join('\n'),
     );
 
     const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
     const structured = res.structuredContent as {
       errors: Array<{ file?: string; line?: number; message: string; snippet?: string }>;
+      warnings: Array<{ file?: string; line?: number; message: string }>;
       omittedSnippetLocations: number;
     };
-    const real = structured.errors.find((e) => e.message.includes('Missing $'));
+    // The noise itself was resolved and is fine, so it keeps its locations.
+    expect(structured.errors[0]?.file).toBe('aux-0.log');
+    const real = structured.warnings.find((w) => w.message.includes('fig:x'));
     expect(real).toBeDefined();
     // Withheld, because it sits past the cap — an in-project file that is perfectly fine.
     expect(real?.file).toBeUndefined();
     expect(real?.line).toBeUndefined();
-    // …and the snippet the server had already read goes with the location it belongs to.
-    expect(real?.snippet).toBeUndefined();
 
     const text = textOf(res);
     expect(text).toContain('never checked');
