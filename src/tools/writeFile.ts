@@ -31,7 +31,17 @@ const outputSchema = {
   path: z.string(),
   bytesWritten: z.number(),
   created: z.boolean(),
-  diff: z.string(),
+  diff: z
+    .string()
+    .describe(
+      'Confirmation diff against HEAD. Budgeted (#153): a large patch comes back cut at hunk ' +
+        'boundaries with a "... N of M hunk(s) omitted" marker — call diff for the whole one. ' +
+        'Empty for a local project (there is no baseline of ours to diff against) or when ' +
+        'nothing changed; never empty merely because it was cut.',
+    ),
+  diffTruncated: z
+    .boolean()
+    .describe('True iff the confirmation diff above was cut to fit its budget.'),
 };
 
 export function registerWriteFile(server: McpServer, ctx: AppContext): void {
@@ -81,9 +91,10 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
             changedPath(target, relPath),
           );
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
+          // Both channels render from the same budgeted plan, never from the full patch.
           return {
-            content: [{ type: 'text', text: diff ? `${headline}\n\n${diff}` : headline }],
-            structuredContent: { ...res, diff },
+            content: [{ type: 'text', text: diff.diff ? `${headline}\n\n${diff.diff}` : headline }],
+            structuredContent: { ...res, diff: diff.diff, diffTruncated: diff.truncated },
           };
         });
       } catch (err) {

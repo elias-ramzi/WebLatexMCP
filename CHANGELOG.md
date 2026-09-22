@@ -1175,6 +1175,56 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Changed
 
+- **`diff` and the write-confirmation diffs are budgeted, cut at hunk boundaries** (#153, #68).
+  `diff` was the largest unbudgeted payload in the server and one of the most-called tools: the
+  patch went back **twice** — verbatim in the result text and again in `structuredContent.diff` —
+  over a `GitService.diff` that caps nothing, with `files[]` uncapped beside it. A regenerated
+  `.bbl`, a re-exported `.svg` or `ref: "HEAD~20"` is one call away from the ~67k-character result
+  a client rejected outright in #68, delivering nothing at all; unlike a conflict report there is
+  no anomaly to notice first, because a diff is _expected_ to be large. A real 600-line rewrite
+  measured 96,163 characters before this change and 19,922 after.
+
+  The new planner is `src/lib/diffBudget.ts`, the fifth member of the family `conflictBudget.ts`
+  started: a budget, a plan, a `note`, and a tool layer that only maps the plan onto response
+  shapes. Three things decide its shape. **The cut is at hunk boundaries** — unlike a droppable
+  field or a page tail, a patch is a sequence of hunks whose `@@` headers give the lines under
+  them meaning, so a mid-hunk cut yields text that looks like a diff and is not one; every file
+  that lost hunks keeps its `diff --git`/`---`/`+++` headers and carries a `... N of M hunk(s)
+omitted` marker in place. **The budget is charged on the rendered size of BOTH channels** — the
+  patch ships twice, so counting it once is wrong by 2x — which means a 12k patch that looks
+  comfortably inside a 20000-character budget is in fact 24k on the wire and is cut; the charge is
+  `JSON.stringify`-exact, so backslash-dense LaTeX is charged what it really costs. And the cut
+  stops at the **file** boundary rather than running to the end of the patch: a regenerated `.bbl`
+  is exactly the kind of first file that blows a budget, and letting it blank every later file's
+  hunks would throw away the section the reviewer opened `diff` for.
+
+  `diff` keeps the house figure (`DIFF_CONTENT_BUDGET` = 20000, as `CONFLICT_CONTENT_BUDGET` /
+  `FLOATS_CONTENT_BUDGET` / `SEARCH_CONTENT_BUDGET`) and the house list cap (`DIFF_MAX_FILES` = 20
+  on `files[]`, as `capList`), and reports `truncated`, `diffChars` (the full patch's true size),
+  `hunksOmitted`, `patchFilesOmitted`, `filesOmitted` and a `note` that names only the bound that
+  actually fired. `detail: "full"` is the escape hatch, exactly as `conflictDetail: "full"` is.
+
+  **The confirmation diff gets a much smaller budget on purpose** (`CHANGE_DIFF_BUDGET` = 2000, the
+  house figure for a diagnostic share of a result). `diff` returns the patch the caller asked for;
+  `write_file`/`edit_file`/`add_citation` return one nobody asked for — a courtesy echo on a call
+  whose answer is "written" — and a `write_file` over a large file shipped that whole file straight
+  back as one `+` hunk, twice. The headline and the summary already carry the fact that matters,
+  and the whole patch is one `diff` call away, which is the escape hatch here rather than a new
+  flag on three write tools. Those three tools now also report `diffTruncated`; `diff: ''` keeps
+  meaning what it always did — there is no diff at all (a local project, or nothing changed) — and
+  never "it was cut", since a cut patch still carries its headers. `changeDiff` still returns `''`
+  for a local project, and every git call keeps `--literal-pathspecs`.
+
+  Both channels are rendered from **one** plan object, so they cannot disagree about what was cut
+  (`push.ts`'s rule, and `searchFiles.ts`'s). The accounting is proved rather than asserted: the
+  render templates live beside the cost functions and the cost functions call them (stronger than
+  a pinned constant, which `conflictBudget.ts` needs only because its templates live elsewhere),
+  the pieces rendered outside the planner are named constants pinned by a test that stringifies a
+  real result, a unit test bounds the rendered payload across seven adversarial patch shapes
+  (one enormous hunk, 3000 tiny ones, 400 files, 14-deep paths, backslash- and
+  control-character-dense content, binary-only), and an integration test measures the size of the
+  real MCP result — text plus JSON — off a live client against a real clone.
+
 - **`status` collapses a dead, change-free peer session into a count instead of listing it**
   (#73, #78). A session record under `<workspace>/.sessions/<projectId>/` is removed only on a clean
   shutdown (`SessionRegistry.release()` on SIGINT/SIGTERM/beforeExit), so every killed agent process

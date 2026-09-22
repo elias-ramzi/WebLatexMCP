@@ -183,6 +183,9 @@ describe('edit_file rewrite-preservation mode', () => {
       path: 'main.tex',
       appliedEdits: 1,
       diff: expect.any(String),
+      // #153: the confirmation diff is budgeted, so every write tool now also reports whether it
+      // was cut. A local project has no diff at all here, so nothing can have been.
+      diffTruncated: false,
       rewriteMode: 'always',
       preservedEdits: 1,
     });

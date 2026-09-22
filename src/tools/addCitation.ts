@@ -39,7 +39,17 @@ const outputSchema = {
    */
   via: z.string().optional(),
   bibtex: z.string(),
-  diff: z.string(),
+  diff: z
+    .string()
+    .describe(
+      'Confirmation diff against HEAD. Budgeted (#153): a large patch comes back cut at hunk ' +
+        'boundaries with a "... N of M hunk(s) omitted" marker — call diff for the whole one. ' +
+        'Empty for a local project, and when the entry was already present (nothing was ' +
+        'written); never empty merely because it was cut.',
+    ),
+  diffTruncated: z
+    .boolean()
+    .describe('True iff the confirmation diff above was cut to fit its budget.'),
 };
 
 /** 1-based line of the `@type{key,` header in a bibliography, or 1 when it cannot be located. */
@@ -126,6 +136,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
                 ...(fetched.via ? { via: fetched.via } : {}),
                 bibtex,
                 diff: '',
+                diffTruncated: false,
               },
             };
           }
@@ -157,8 +168,9 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
             ? `${fetched.source} via ${fetched.via}`
             : String(fetched.source);
           const summary = `added ${merged.key} to ${bibPath}:${at} (from ${from})\n\n${bibtex}`;
+          // Both channels render from the same budgeted plan, never from the full patch.
           return {
-            content: [{ type: 'text', text: diff ? `${summary}\n\n${diff}` : summary }],
+            content: [{ type: 'text', text: diff.diff ? `${summary}\n\n${diff.diff}` : summary }],
             structuredContent: {
               path: bibPath,
               key: merged.key,
@@ -168,7 +180,8 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
               source: fetched.source,
               ...(fetched.via ? { via: fetched.via } : {}),
               bibtex,
-              diff,
+              diff: diff.diff,
+              diffTruncated: diff.truncated,
             },
           };
         });
