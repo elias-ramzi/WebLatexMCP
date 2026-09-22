@@ -1,7 +1,28 @@
 name: CI
 
+# A bare `push` plus a bare `pull_request` ran this whole matrix TWICE on every PR commit -- 3 OS
+# legs and the TeX smoke, from two run ids, on the same SHA (on #172 windows took 8m29s and 9m6s
+# doing identical work). That is double the bill, and windows bills at 2x. It is also a second
+# chance to get stuck: branch protection reads the MOST RECENT check run per required context, so
+# on #169 a duplicate that hung for 38 minutes kept the PR BLOCKED while its green sibling for the
+# same commit sat right beside it. A duplicate is not a free second opinion.
+#
+# `pull_request` alone covers PR branches, and it emits the SAME check-run names a push run does
+# (the name is the job name: `Lint, typecheck, test (<os>)` and `LaTeX compile smoke`), so the
+# required contexts on `dev` are satisfied unchanged -- verified against both runs of
+# 67c9afd, which carried the two sets side by side.
+#
+# `main` and `dev` MUST keep their push runs, and this is the part that looks redundant and is not:
+# back-merge.yml (see its header) auto-merges a `main -> dev` PR after every release and relies on
+# ci.yml's push run having already put the required checks on `main`'s HEAD SHA, so the back-merge
+# PR inherits them. Drop `push`, or scope it so `main` stops producing push runs, and that PR has
+# nothing to satisfy `dev`'s protection with -- and nobody finds out until the next release. `dev`
+# is listed for the same reason: after a squash merge its new HEAD gets its own checks rather than
+# inheriting only the PR's. Deleting the branch filter to "simplify" restores the duplication;
+# deleting the `push` key restores the release-day breakage.
 on:
   push:
+    branches: [main, dev]
   pull_request:
 
 jobs:
