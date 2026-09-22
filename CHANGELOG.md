@@ -1424,6 +1424,32 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   summary in the text channel, so a new `structuredOnlyCost` charges the single rendering — the note
   still reaches both channels, so a client that drops `structuredContent` is told what was cut and
   is routed to `diff` with `ref: "<base>...<branch>"`. The conflict branch's budget is untouched.
+- **`list_files` is bounded, in both channels, and cuts by what an entry is for** (#164, #68). The
+  listing had no cap, no counter and no budget, and it rendered every entry twice — once as a JSON
+  object in `structuredContent.files`, once as a text line. A `figures/` tree with one PDF per seed
+  per ablation, a vendored conference style bundle, or a `mode: 'local'` project registered on a
+  directory the server does not control, all reach thousands of entries; at ~60 characters of path
+  in two channels, 5000 of them is ~600k, which the client rejects **undelivered** — no listing and
+  no reason, on the tool an agent calls first to orient itself in a project it has never seen. The
+  new `src/lib/fileListBudget.ts` (a pure planner, the shape of `searchBudget.ts` /
+  `citationsBudget.ts` / `diffBudget.ts`) bounds it at **40000 characters charged across both
+  channels** — deliberately one house 20000-char share _per channel_, because unlike every other
+  budget in the family the listing is not one field of a result, it **is** the result, and because
+  the house `capList` figure of 20 is the wrong instrument here: the item is the answer and each
+  item is tiny, so a listing tool that returns 20 of 5000 files is not a listing tool. What survives
+  a cut is decided by `type`, in the order **tex > bib > doc > other > asset**, not by walk order —
+  the walk sorts by path, so `assets/` beat `main.tex` on the letter `a` and a figures tree starved
+  the sources the caller was almost certainly after; `other` outranks `asset` on recoverability,
+  since `filter: "assets"` brings assets back whole while no `filter` value isolates `.sty`/`.cls`.
+  Selection is by priority, presentation stays in path order. Whatever is cut is counted
+  (`totalFiles`, `omittedByCap`, `omittedBySize`, `omittedByType`, all declared in the
+  `outputSchema` — an undeclared counter is a `-32602` and no result at all, #137/#146) and named in
+  `note`, which points at the remedy that here actually exists: `subdir` and `filter` narrow the
+  walk itself, so the omitted entries come back whole. **A cut can never produce `files: []`** — the
+  first entry is kept whatever it costs — so an empty array keeps meaning only "nothing matched". A
+  new optional `maxResults` narrows by count (it can only narrow; the character budget is fixed),
+  and an uncut listing is unchanged on the wire: the same one line per entry, the same
+  `No matching files.`, no note.
 
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.
