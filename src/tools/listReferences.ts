@@ -238,6 +238,48 @@ function matches(entry: Located, needle: string): boolean {
   return haystack.includes(needle);
 }
 
+/** The per-entry counters every budget sets when it cuts something out of an entry. */
+interface CuttableEntry {
+  path: string;
+  fieldsOmitted?: number;
+  rawOmitted?: number;
+  typedOmitted?: number;
+  authorsOmitted?: number;
+}
+
+/**
+ * The files the caller genuinely received in full — the only ones this tool may claim the
+ * out-of-band-edit baseline for (issue #171).
+ *
+ * The licence `FileService.read` grants is "the caller asked for this file and received ALL of
+ * it", and `list_references` held it on the premise that it hands back every entry verbatim. Three
+ * changes ate that premise: #147 made `raw` cuttable, #165 made the typed fields cuttable, and
+ * #170 dropped the default `maxResults` from 200 to 50 — so on an ordinary 200-entry `.bib` the
+ * default call now shows 50 entries and used to reset the baseline over the whole file.
+ *
+ * So the test is per file, and it is the conjunction of both ways a file can arrive short: every
+ * entry it contributed reached the result (nothing lost to `filter` or `maxResults` — the counts
+ * must match `sources[].count`, which is taken before either applies), and not one of those
+ * entries carries a cut counter from any of the three budgets. Each clause only narrows, which is
+ * the direction this has to err in: not recording costs the caller nothing they cannot see, while
+ * recording wrongly disarms the guard for a file the user is editing by hand.
+ *
+ * A candidate that parsed to no entries at all never reaches `sources`, and so is never recorded:
+ * the caller received none of its bytes.
+ */
+function wholeSources(
+  sources: ReadonlyArray<{ path: string; count: number }>,
+  entries: readonly CuttableEntry[],
+): string[] {
+  const intact = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.rawOmitted !== undefined || entry.fieldsOmitted !== undefined) continue;
+    if (entry.typedOmitted !== undefined || entry.authorsOmitted !== undefined) continue;
+    intact.set(entry.path, (intact.get(entry.path) ?? 0) + 1);
+  }
+  return sources.filter((s) => (intact.get(s.path) ?? 0) === s.count).map((s) => s.path);
+}
+
 export function registerListReferences(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'list_references',
@@ -264,10 +306,14 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         const sources: Array<{ path: string; format: string; count: number }> = [];
         const found: Located[] = [];
         for (const candidate of candidates) {
-          // The caller gets these bytes back — each entry's verbatim `raw` — so this read is the
-          // caller's, and claims the out-of-band-edit baseline. Without it a bibliography listed
-          // here and hand-edited afterwards would be overwritten with no ExternalChangeError.
-          const text = await ctx.files.readText(dir, candidate, { recordBaseline: true });
+          // Read WITHOUT claiming the out-of-band-edit baseline (issue #171). Whether the caller
+          // receives this file whole is not decided here — it is decided by the three budget
+          // planners below and by `maxResults`, all of which run after every candidate has been
+          // read. Recording is not free to get wrong in this direction: it does not ARM the guard,
+          // it RESETS it, so a baseline claimed over a file the caller saw 50 entries of tells the
+          // guard the server has seen the user's hand edits, and the next write clobbers them with
+          // no ExternalChangeError. The baseline is claimed below, for the files that earned it.
+          const text = await ctx.files.readText(dir, candidate);
           if (!text) continue;
           const parsed = parseReferences(text, candidate);
           if (parsed.length === 0) continue;
@@ -298,6 +344,17 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         // this is the one region `list_references` prints.
         const typedPlan = planReferenceTyped(rawPlan.entries);
         const entries = typedPlan.entries;
+
+        // The plans are known, so what the caller actually received is known: claim the
+        // out-of-band-edit baseline for exactly the files that went over the wire whole. A second
+        // read is what this costs — `FileService` records a baseline only as part of reading, and
+        // there is no seam for recording bytes already in hand. The window between the two reads
+        // is the one place this can still be wrong, and it degrades to precisely the behaviour
+        // that shipped before this fix (a baseline over the current bytes), inside a window
+        // narrower than the read-then-write one the guard already lives with.
+        for (const whole of wholeSources(sources, entries)) {
+          await ctx.files.readText(dir, whole, { recordBaseline: true });
+        }
 
         const header = relPath
           ? `${entries.length} reference(s) in ${relPath}`

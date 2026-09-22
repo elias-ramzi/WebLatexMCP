@@ -2501,6 +2501,13 @@ Harmless only because no project is named `please` — the first word matching a
   `FileService.externalModifications` read every file as UTF-8, so a figure's bytes never matched
   their own recorded baseline and `status` reported it under `externalChanges` forever.
 
+- **`list_references` claims the out-of-band-edit baseline only for a bibliography it returned
+  whole** (#171, #147, #165, #170). It recorded one for every file it opened, which RESETS the
+  guard rather than arming it — so on an ordinary `.bib` cut by a budget or paged by `maxResults`
+  (default 50 since #170) the caller's next write clobbered a hand edit it had never been shown,
+  with no `ExternalChangeError`. The claim is now made per file, after the plans are known, and
+  only when every entry that file contributed shipped with nothing cut out of it.
+
 ### Tests
 
 - **The advertised `outputSchema` is now tested, whole-payload, for every tool the suite can
