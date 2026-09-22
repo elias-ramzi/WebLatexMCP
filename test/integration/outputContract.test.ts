@@ -463,82 +463,88 @@ describe('output contract: the git-backed tools', () => {
   });
 
   /**
-   * `shelve`/`unshelve`/`list_shelves` emit exactly one undeclared key, `version`.
+   * `shelve`/`unshelve`/`list_shelves` publish every key they return, `version` included.
    *
    * `ShelfManifest` carries `version: 1` and all three handlers hand the manifest out with a
-   * `{ ...manifest }` spread, while `shelfShape` declares six fields and not that one. Unlike
-   * `compile`'s `warnings[].snippet` (an explicit `undefined`, which JSON drops before the wire —
-   * the non-hole #137 records), this is a number and does reach the client.
-   *
-   * The hole is named rather than tolerated: `expectNoUndeclaredKeys` compares the WHOLE set, so
-   * the PR that declares — or stops emitting — `version` makes these lines fail and has to delete
-   * them. An allow-list that merely permitted the key would go quiet instead.
+   * `{ ...manifest }` spread. `shelfShape` declared six fields and not that one (#146), so the
+   * audit below ran with `knownUndeclared` pins; declaring `version` is what deleted them, and
+   * the whole-set comparison in `expectNoUndeclaredKeys` is what forced that deletion rather
+   * than letting a stale allow-list stand. Unlike `compile`'s `warnings[].snippet` (an explicit
+   * `undefined`, which JSON drops before the wire — the non-hole #137 records), this is a number
+   * and does reach the client.
    */
-  it('shelve, unshelve and list_shelves emit an undeclared `shelf.version`', async () => {
+  it('shelve, unshelve and list_shelves publish every key they return', async () => {
     const { client } = await gitHarness();
     await client.callTool({
       name: 'write_file',
       arguments: { project: 'demo', path: 'main.tex', content: `${MAIN_TEX}shelf me\n` },
     });
 
-    const KNOWN = { knownUndeclared: ['shelf.version'] };
-    const shelved = await auditCall(
-      client,
-      'shelve',
-      { project: 'demo', paths: ['main.tex'] },
-      KNOWN,
-    );
+    const shelved = await auditCall(client, 'shelve', { project: 'demo', paths: ['main.tex'] });
     const id = String((shelved.shelf as Record<string, unknown>).id);
 
-    await auditCall(
-      client,
-      'list_shelves',
-      { project: 'demo' },
-      { knownUndeclared: ['shelves[].version'] },
-    );
-    await auditCall(client, 'unshelve', { project: 'demo', id }, KNOWN);
+    await auditCall(client, 'list_shelves', { project: 'demo' });
+    await auditCall(client, 'unshelve', { project: 'demo', id });
   });
 
   /**
-   * And what that costs, which is the part a "merely undocumented field" reading misses.
+   * And what the hole cost, which is the part a "merely undocumented field" reading missed.
    *
    * `zod`'s JSON Schema conversion marks every object `additionalProperties: false` — all 38
    * advertised schemas, every nested object in them — and the SDK's own `Client` compiles an ajv
    * validator per schema during `listTools()` and checks every later `callTool` result against
    * it. So for any client built on the SDK (i.e. every one that lists tools at startup, which is
-   * all of them) these three tools do not return a slightly-too-wide payload: they **fail**, with
-   * `-32602` and no result at all.
-   *
-   * When the hole is fixed this test fails — `rejects` stops rejecting — and whoever fixes it
-   * turns it into the assertion that the call now succeeds.
+   * all of them) these three tools did not return a slightly-too-wide payload: they **failed**,
+   * with `-32602` and no result at all. This is the test #145 wrote as
+   * `rejects.toThrow(/must NOT have additional properties/)`, flipped by #146's fix — so it now
+   * pins the callability, against a client primed exactly the way a real one is.
    */
-  it('and an SDK client that listed tools first cannot call shelve at all', async () => {
+  it('and an SDK client that listed tools first can call shelve and get a result', async () => {
     const { client } = await gitHarness({ prime: true });
     await client.callTool({
       name: 'write_file',
       arguments: { project: 'demo', path: 'main.tex', content: `${MAIN_TEX}shelf me\n` },
     });
 
-    await expect(
-      client.callTool({ name: 'shelve', arguments: { project: 'demo', paths: ['main.tex'] } }),
-    ).rejects.toThrow(/must NOT have additional properties/);
-    // The shelve itself went through server-side — the rejection is the SDK refusing to hand back
-    // a result that contradicts the schema — so the listing is refused the same way.
-    await expect(
-      client.callTool({ name: 'list_shelves', arguments: { project: 'demo' } }),
-    ).rejects.toThrow(/must NOT have additional properties/);
+    const shelved = await client.callTool({
+      name: 'shelve',
+      arguments: { project: 'demo', paths: ['main.tex'] },
+    });
+    expect(isError(shelved), textOf(shelved)).toBe(false);
+    const shelf = structured(shelved)!.shelf as Record<string, unknown>;
+    // The key the validator used to reject the whole result over, now arriving intact: asserting
+    // its value (not merely that the promise resolved) is what shows the payload reached the
+    // client rather than the field having been dropped to appease the schema.
+    expect(shelf.version).toBe(1);
+    const id = String(shelf.id);
+
+    const listed = await client.callTool({ name: 'list_shelves', arguments: { project: 'demo' } });
+    expect(isError(listed), textOf(listed)).toBe(false);
+    const shelves = structured(listed)!.shelves as Array<Record<string, unknown>>;
+    expect(shelves.map((s) => [s.id, s.version])).toEqual([[id, 1]]);
+
+    // unshelve spreads the same manifest through a third site, so it gets the same check.
+    const restored = await client.callTool({
+      name: 'unshelve',
+      arguments: { project: 'demo', id },
+    });
+    expect(isError(restored), textOf(restored)).toBe(false);
+    expect((structured(restored)!.shelf as Record<string, unknown>).version).toBe(1);
   });
 
-  it('names `version` as the shelve hole rather than letting an empty check stand in for one', async () => {
-    // Guards the guard. If `undeclaredKeys` ever stopped walking into a nested object, the
-    // `knownUndeclared` entries above would go from "pinned hole" to "expected [x], got []" —
-    // loud. But if it stopped reporting anything at all AND someone relaxed those to a subset
-    // check, the whole file would pass vacuously. This asserts the finding directly, off the
-    // published schema, with no tool call in the way.
+  it('reports a key shelve does not declare rather than letting an empty check stand in', async () => {
+    // Guards the guard. `undeclaredKeys` returning [] is the pass condition for every audit in
+    // this file, so a version of it that had stopped walking into a nested object would make the
+    // whole file pass vacuously. `version` used to be the live finding here; now that it is
+    // declared, the probe is a key the schema certainly does not declare, in the same nested
+    // position, so the walk itself is still what is asserted.
     const schema = await advertisedOutputSchema(schemaClient, 'shelve');
 
     expect(
-      undeclaredKeys(schema, { shelf: { id: 'sh-0', version: 1, files: [] }, restored: [] }),
-    ).toEqual(['shelf.version']);
+      undeclaredKeys(schema, {
+        shelf: { id: 'sh-0', version: 1, notAField: 1, files: [] },
+        restored: [],
+      }),
+    ).toEqual(['shelf.notAField']);
   });
 });
