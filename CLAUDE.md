@@ -633,9 +633,11 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   it, in the strong form that a filter accepting everything is a no-op.
 
 - **Every document-controlled payload is budgeted, and the budget is charged against the RENDERED
-  size in every channel it ships in.** Eight libs now solve the same problem —
+  size in every channel it ships in.** Thirteen libs now solve the same problem —
   `conflictBudget.ts`, `floatsBudget.ts`, `searchBudget.ts`, `inlineBudget.ts`,
-  `referenceFieldsBudget.ts`, `referenceRawBudget.ts`, `citationsBudget.ts`, `diffBudget.ts` — and
+  `referenceFieldsBudget.ts`, `referenceRawBudget.ts`, `citationsBudget.ts`, `diffBudget.ts`,
+  `fileListBudget.ts`, `commentsBudget.ts`, `diagnosticsBudget.ts`, `referenceTypedBudget.ts`,
+  `statusBudget.ts` — and
   they exist because of #68: a ~67k-character conflict payload a client rejected **undelivered**,
   which is worse than a cut one because the caller gets nothing and no reason. The rules they share
   are not stylistic:
@@ -654,6 +656,17 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   - **Cut by declared priority, not in declaration order.** A single pool spent top-to-bottom cuts
     the finding that breaks the build because the advisory list ran first. Write the order down
     (`ALLOCATION_ORDER`, `hunks` before the sides) and say why each rank earns its place.
+  - **Where the lanes OVERLAP, strict priority is the wrong reading of that rule** — guarantee every
+    lane a share first, then spend the surplus in priority order (`statusBudget.ts`,
+    `commentsBudget.ts`). The distinction is whether one cause can populate several lanes at once. In
+    `status` it can: an untracked tree of 400 files lands in `untracked`, `otherChanges` AND
+    `externalChanges` (an untracked file has no baseline, so `externalModifications` reports every
+    one), so a single pool spent top-to-bottom gave lane 1 the whole budget and left the rest at the
+    forced keep-at-least-one — 1 path of 400, which is the blowup shape the budget exists to prevent,
+    merely inverted. A lane wanting less than its share releases the surplus upward, so the ordinary
+    case — one big list, the rest small — still gives the big list nearly the whole budget; pin that
+    with a test, or the guarantee quietly becomes an equal split nobody wanted. Where the lanes are
+    genuinely disjoint (`fileListBudget.ts`, `diffBudget.ts`), strict priority stays right.
   - **Count what was cut, never cut silently**, in the house shape (`…Omitted`, `omittedByCap`), and
     keep "cut" structurally unconfusable from "absent" — a `null` that means elided carries a
     matching `elided` entry, and `diff: ''` still means only that there is no diff.
