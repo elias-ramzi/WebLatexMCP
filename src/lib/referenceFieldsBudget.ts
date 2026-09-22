@@ -41,7 +41,11 @@
  *     `raw` is cut only at the far end of a long result, it is cut to a marked PREFIX rather than
  *     dropped, and the entry says so in `rawOmitted`. So the remedy this module points at holds
  *     except where that count says otherwise, and the notes below say so instead of promising
- *     unconditionally.
+ *     unconditionally. Issue #165 added the third planner of the family,
+ *     `src/lib/referenceTypedBudget.ts`, over the PARSED fields (`title`, `authors[]`, `venue`,
+ *     the identifiers). It does not qualify this licence further — a field dropped here is still
+ *     in `raw` on the same terms — but it is the one of the three that is charged against the
+ *     rendered TEXT as well as the JSON, because it is the only region `list_references` prints.
  *
  * The planner charges exactly what the tool sends, so the tool must hand these very objects through
  * to `structuredContent` — a test pins the accounting against `JSON.stringify` of the planned

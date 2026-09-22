@@ -1499,6 +1499,31 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   an error carrying a snippet is kept past the count cap (so context the server already read is
   never thrown away), at least one error is always returned, and `logTail`'s own 80-line bound is
   untouched — it is the fallback evidence for the warnings this cut removes.
+- **`list_references`' third document-controlled region — `title`, `authors[]`, `venue` and the
+  identifiers — is budgeted, in both channels it ships in** (#165, after #137 and #147). The parse
+  shortens nothing, so a 4000-character `title={…}` came back as a 4000-character `title`, a
+  200-author collaboration as 200 strings per entry, and a `prose` bibliography's heuristic title
+  as however much text sat between the delimiters it found — with no `.bib` anywhere in that path.
+  `src/lib/referenceTypedBudget.ts` is the third planner of the family and takes a third allocation
+  of the one house figure (`REFERENCE_TYPED_BUDGET` **is** `REFERENCE_FIELDS_BUDGET`, imported), so
+  the worst case for all three regions is ~60000 rendered characters **across both channels** — it
+  is charged on the JSON _and_ on the text `list_references` renders from it, which is why a third
+  allocation still lands under the ~67k a client rejected undelivered in #68. It cuts by declared
+  priority across the whole result rather than entry by entry, so every entry keeps its title
+  before any entry keeps its URL; a prose-shaped value is truncated to a marked prefix, an
+  identifier is dropped whole (half a DOI is not a short DOI), and `key`/`label` are never
+  truncated at all — an absurd one is dropped, since a cut cite key is one that does not exist.
+  `authors[]` gets `capList`'s cap of 20 with the rest reported as `authorsOmitted` ("first 20 of
+  214"), which is deliberately not `truncatedAuthors` (the document's own `and others`). New
+  counters `entries[].typedOmitted`, `entries[].authorsOmitted` and `typedNote` are **declared in
+  the `outputSchema`** — the omission that made this tool uncallable from v0.6.0 — and the text
+  channel is rendered from the already-cut payload by the renderer the cost function itself calls.
+  The same change lowers **`maxResults`' default from 200 to 50**, the one lever that reaches what
+  no content budget can refuse: at 200 an ordinary bibliography rendered ~120000 characters across
+  both channels even with all three regions budgeted — still far past the size a client rejects —
+  and arrived stripped of the authors, venue and DOI a reader is there for, because the per-entry
+  scaffold (`path`, `line`, `format`, `year`, cite key) is irreducible and crowds the content
+  budgets out. At 50 the same `.bib` comes back whole and fits.
 
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.
