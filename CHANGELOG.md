@@ -1515,6 +1515,35 @@ kinds: ["text"]` already carries each merged line's string — and what was miss
   byte-identically from the native source, and the note's byte count still comes from a `stat` of
   the native path.
 
+- **`list_references` declares `entries[].fields`, and budgets it** (#137, surfaced by the #130
+  audit in #135). Each entry's raw BibTeX field map — lowercased names, `@string` macros
+  expanded — was sent to clients and declared nowhere, and that was never merely a documentation
+  gap: **the tool has been uncallable from an SDK client since v0.6.0.** The server does transmit
+  the undeclared key — `McpServer` validates the result against the advertised schema, reads only
+  whether the parse succeeded, throws the parsed data away, and a zod object _strips_ rather than
+  _stricts_ — but zod's JSON Schema conversion marks every object node `additionalProperties:
+false`, and the SDK's own `Client` compiles an ajv validator per advertised schema during
+  `listTools()` and checks every later result against it. So the call did not return a slightly
+  too wide payload; it returned nothing, raising `-32602 … data/entries/0 must NOT have
+additional properties`. The suite missed it because a test client that never lists tools caches
+  no validator.
+
+  Declared rather than dropped, because removing a field callers may already read is the breaking
+  direction — and declaring it turns an accident into a promise, which is why it arrives with a
+  budget. `fields` is an open-ended `Record<string, string>` in which **both the keys and the
+  values are document-controlled**, so an undeclared accident was also an unbounded one: 200
+  entries x arbitrary fields is the shape of the ~67k-character conflict payload a client rejected
+  in #68. `src/lib/referenceFieldsBudget.ts` cuts a tail, counts it and never reorders: at most 20
+  fields per entry, one 20000-char budget (the house figure, charged on **rendered** JSON size
+  since LaTeX is backslash-dense and escaping roughly doubles it) across every map in a result,
+  and a field whose name or value is over-long is **dropped whole, never truncated** — `bibtex` is
+  the one format whose fields are exact, and a shortened value in an exact field is a wrong answer
+  rather than a short one. Everything cut is counted in the entry's `fieldsOmitted` and named in
+  the result's `fieldsNote` (and in the result text, which never prints the map itself), and is
+  still present verbatim in that entry's `raw`. An entry whose map was cut entirely sends no
+  `fields` key at all plus a `fieldsOmitted` count — "this entry has fields and none fit", which
+  an empty map would misreport as "this entry has no fields".
+
 - **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
   read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
   `list_skills` renders the same instruction text as the skill prompts but was still calling
