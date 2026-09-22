@@ -2263,6 +2263,28 @@ Harmless only because no project is named `please` — the first word matching a
   call returns `structuredContent`, so `auditCall` asserts `isError === false` before it looks at
   the payload, since a call that quietly started erroring is otherwise a test that cannot fail.
 
+  **And now all 38, the four bibliography tools included.** `list_references`,
+  `check_citations`, `search_references` and `add_citation` were the gap the first pass left —
+  `list_references` only because #137's fix (#142) was still in flight, the other two because
+  neither can answer without a bibliography backend. They now drive the **real**
+  `DblpService`/`CrossrefService`/`OpenAlexService` over a canned `fetch` (production mapping
+  code, canned bytes, no network) rather than the hand-written fake backends
+  `referenceBackends.test.ts` uses for the resolver's _decision_: a hand-built `ReferenceHit`
+  carries exactly the keys the test author typed, and the key that breaks a tool is the one
+  nobody typed. None of the four emits an undeclared key today — which is a finding only because
+  the check was shown to bite: injecting one into each handler fails each audit with the pointer
+  named, `results[].…` through the array included. The fixtures exist to keep anything from being
+  judged empty: a `.bib` carrying one of every `check_citations` finding, all three bibliography
+  shapes for `list_references`, a pinned search and a substituted one (the only call that emits
+  `fallbackFrom`/`hint`), and `add_citation` against a git-backed project so its `diff` is a real
+  diff — over the write, the already-present no-op, and the OpenAlex→Crossref DOI bridge, which
+  is the one branch that emits `via`. `list_references` also gets the primed-client pair the
+  shelve trio has, since #137 made it uncallable rather than merely wide: a client that calls
+  `listTools()` first now gets `entries[].fields` back instead of `-32602`. Finally, "all 38" is
+  asserted rather than asserted-in-a-comment: a test matches this file's own `auditCall` sites
+  against `tools/list`, so a 39th registered tool that nobody audits fails CI — judged against
+  the file's source, so it holds under a `-t` filter too.
+
 - **Both timing tests in `errorSnippets` measure scaling, not a wall clock** (#129; no `src/` file
   changes). `test/unit/errorSnippets.test.ts`'s _"does not go quadratic on a document that fails
   with thousands of errors"_ closed with `expect(ms).toBeLessThan(1000)`. That failed on

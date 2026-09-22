@@ -23,23 +23,37 @@
  *    over the payload rather than over a pointer somebody thought to name, which is the only
  *    shape of assertion that can catch a key nobody knew to look for.
  *
- * The same sweep then runs over the local-project read/write tools, the PDF readers and the
- * git-backed set — 34 of the 38 registered tools in all — so the audit that was a throwaway
- * script becomes something CI re-runs on every commit. The four it leaves out are the
- * bibliography tools (`list_references`, `check_citations`, `search_references`, `add_citation`):
- * two of them need a stubbed backend to answer at all. `list_references` was left out because
- * #137's fix was in flight when this was written; that fix has since landed (#142), so the only
- * thing keeping it out now is that nobody has written the fixture — extending the sweep to it is
- * a good next step, not a hazard.
+ * The same sweep then runs over the local-project read/write tools, the PDF readers, the
+ * git-backed set and the four bibliography tools — **all 38 registered tools** — so the audit
+ * that was a throwaway script becomes something CI re-runs on every commit. The last four in
+ * (`list_references`, `check_citations`, `search_references`, `add_citation`) needed fixtures
+ * rather than a decision: `list_references` was held back only until #137's fix landed (#142),
+ * and `search_references`/`add_citation` cannot answer at all without a bibliography backend, so
+ * they drive the real `DblpService`/`CrossrefService`/`OpenAlexService` over a canned `fetch`
+ * (see `stubbedReferences`) — production mapping code, canned bytes, no network. That the list
+ * stays at "all of them" is itself asserted, in the last describe.
  *
  * What would make these fail: adding a key to any of these handlers' `structuredContent` without
  * adding it to the tool's `outputSchema` (or deleting one from the schema while the handler still
- * emits it). That is exactly the change #128 and #137 both were.
+ * emits it). That is exactly the change #128, #137 and #146 all were.
+ *
+ * What it cannot catch, and no amount of tools in the list would change:
+ *
+ *  - a key on a **branch no call here takes**. Declaredness is judged over the payload a call
+ *    actually returned, so an undeclared key that only a conflict, a refusal or an exotic option
+ *    produces is invisible until some test drives that branch. Hence the deliberate second calls
+ *    below — `add_citation`'s already-present branch, `search_references`' substitution, and
+ *    `check_citations`' cross-project one — each of which emits keys the first call does not.
+ *  - an **empty array or an absent optional**: there is no element to judge and no key to check,
+ *    which is why the fixtures here go out of their way to populate both.
+ *  - the *reverse* hole — a field the schema declares that the handler never sends. The SDK
+ *    accepts that silently too; `expectUndeclaredField` is the helper for pinning it, per field.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -48,6 +62,10 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
+import { ReferenceResolver } from '../../src/services/referenceResolver.js';
+import { DblpService } from '../../src/services/dblp.js';
+import { CrossrefService } from '../../src/services/crossref.js';
+import { OpenAlexService } from '../../src/services/openalex.js';
 import { buildPdfPath, logBaseDir } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import {
@@ -58,6 +76,7 @@ import {
 import { createFakeRemote } from './helpers/bareRepo.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ExecResult } from '../../src/lib/exec.js';
+import type { FetchLike, FetchResponse } from '../../src/services/referenceBackend.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const IDENTITY = { name: 'Test', email: 'test@example.com' };
@@ -548,5 +567,416 @@ describe('output contract: the git-backed tools', () => {
         restored: [],
       }),
     ).toEqual(['shelf.notAField']);
+  });
+});
+
+/**
+ * The bibliography tools' fixtures.
+ *
+ * `refs.bib` deliberately carries one of each finding `check_citations` reports — a cited entry,
+ * an entry nothing cites, a key defined twice, and an entry missing fields its type requires — so
+ * all four of its result arrays come back non-empty. An empty array declares nothing about its
+ * element shape, which is the whole subject here.
+ */
+const REFS_BIB = [
+  '@inproceedings{knuth1984,',
+  '  author = {Donald E. Knuth},',
+  '  title = {The {TeX}book},',
+  '  booktitle = {Computers and Typesetting},',
+  '  year = {1984},',
+  '}',
+  '',
+  '@inproceedings{knuth1984,',
+  '  author = {Donald E. Knuth},',
+  '  title = {The {TeX}book, again},',
+  '  booktitle = {Computers and Typesetting},',
+  '  year = {1984},',
+  '}',
+  '',
+  '@article{incomplete2021,',
+  '  title = {An entry that never states who wrote it},',
+  '}',
+  '',
+  '@book{uncited1999,',
+  '  author = {A. N. Other},',
+  '  title = {Nobody Cites This},',
+  '  publisher = {A Press},',
+  '  year = {1999},',
+  '}',
+  '',
+].join('\n');
+
+/** A `thebibliography`, so `entries[].format: "bibitem"` is exercised as well. */
+const BIBLIST_TEX = [
+  '\\begin{thebibliography}{9}',
+  '\\bibitem{lamport1994} Leslie Lamport. LaTeX: A Document Preparation System. 1994.',
+  '\\end{thebibliography}',
+  '',
+].join('\n');
+
+/** A prose reference list, the third shape — its entries are labelled, not keyed. */
+const PROSE_MD = [
+  '# Notes',
+  '',
+  '## References',
+  '',
+  '1. Mittelbach, F. (2004). The LaTeX Companion. Addison-Wesley.',
+  '',
+].join('\n');
+
+/** A second project's shared bibliography, for the `bibliographyProject` branch. */
+const SHARED_BIB = [
+  '@inproceedings{knuth1984,',
+  '  title = {The {TeX}book, as the group keeps it},',
+  '}',
+  '',
+  '@inproceedings{knuth1984,',
+  '  title = {The {TeX}book, kept twice},',
+  '}',
+  '',
+].join('\n');
+
+const DBLP_SEARCH_JSON = JSON.stringify({
+  result: {
+    hits: {
+      hit: [
+        {
+          info: {
+            key: 'conf/cvpr/HeZRS16',
+            title: 'Deep Residual Learning for Image Recognition.',
+            year: '2016',
+            venue: 'CVPR',
+            type: 'Conference and Workshop Papers',
+            doi: '10.1109/CVPR.2016.90',
+            url: 'https://dblp.org/rec/conf/cvpr/HeZRS16',
+            authors: {
+              author: [
+                { '@pid': '1', text: 'Kaiming He' },
+                { '@pid': '2', text: 'Xiangyu Zhang' },
+              ],
+            },
+          },
+        },
+      ],
+    },
+  },
+});
+
+const DBLP_BIBTEX = [
+  '@inproceedings{DBLP:conf/cvpr/HeZRS16,',
+  '  author    = {Kaiming He and Xiangyu Zhang},',
+  '  title     = {Deep Residual Learning for Image Recognition},',
+  '  booktitle = {CVPR},',
+  '  year      = {2016},',
+  '  doi       = {10.1109/CVPR.2016.90}',
+  '}',
+  '',
+].join('\n');
+
+const CROSSREF_SEARCH_JSON = JSON.stringify({
+  message: {
+    items: [
+      {
+        DOI: '10.1109/cvpr.2016.90',
+        title: ['Deep Residual Learning for Image Recognition'],
+        author: [{ given: 'Kaiming', family: 'He' }],
+        issued: { 'date-parts': [[2016]] },
+        'container-title': ['2016 IEEE Conference on Computer Vision and Pattern Recognition'],
+        type: 'proceedings-article',
+        URL: 'https://doi.org/10.1109/cvpr.2016.90',
+      },
+    ],
+  },
+});
+
+const CROSSREF_BIBTEX = [
+  '@inproceedings{He_2016,',
+  '  author    = {He, Kaiming},',
+  '  title     = {Deep Residual Learning for Image Recognition},',
+  '  booktitle = {CVPR},',
+  '  year      = {2016},',
+  '  doi       = {10.1109/cvpr.2016.90}',
+  '}',
+  '',
+].join('\n');
+
+const OPENALEX_WORK_JSON = JSON.stringify({
+  id: 'https://openalex.org/W2194775991',
+  doi: 'https://doi.org/10.1109/cvpr.2016.90',
+  publication_year: 2016,
+});
+
+function okBody(body: string): FetchResponse {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => body,
+    json: async () => JSON.parse(body) as unknown,
+  };
+}
+
+function unreachable(): FetchResponse {
+  return {
+    ok: false,
+    status: 503,
+    statusText: 'Service Unavailable',
+    text: async () => '',
+    json: async () => ({}),
+  };
+}
+
+/**
+ * A resolver over the **real** backend services, each with a canned `fetch`.
+ *
+ * Handing `ReferenceResolver` three hand-written fake backends would be shorter — that is what
+ * `referenceBackends.test.ts` does, and it is right for a test about the resolver's *decision*.
+ * It is the wrong instrument here: this file audits what the tools **emit**, and a hand-built
+ * `ReferenceHit` carries exactly the keys the test author typed. Driving `DblpService` /
+ * `CrossrefService` / `OpenAlexService` for real means `results[]` is assembled by the production
+ * mapping code, so a field one of those clients grows is a field this audit sees.
+ *
+ * Each service gets its own stub, so nothing has to disambiguate one backend's `/works` from
+ * another's, and an unexpected URL fails loudly rather than being answered by the wrong canned body.
+ */
+function stubbedReferences(opts: { dblpDown?: boolean } = {}): ReferenceResolver {
+  const route =
+    (name: string, table: Array<[string, string]>): FetchLike =>
+    async (url: string) => {
+      const match = table.find(([fragment]) => url.includes(fragment));
+      if (!match) throw new Error(`the ${name} stub was asked for an unexpected URL: ${url}`);
+      return okBody(match[1]);
+    };
+  return new ReferenceResolver({
+    dblp: new DblpService(
+      opts.dblpDown
+        ? async () => unreachable()
+        : route('DBLP', [
+            ['/search/publ/api', DBLP_SEARCH_JSON],
+            ['/rec/', DBLP_BIBTEX],
+          ]),
+    ),
+    crossref: new CrossrefService(
+      route('Crossref', [
+        ['/transform', CROSSREF_BIBTEX],
+        ['/works?', CROSSREF_SEARCH_JSON],
+      ]),
+    ),
+    openalex: new OpenAlexService(
+      route('OpenAlex', [
+        ['/works?search=', '{"results":[]}'],
+        ['/works/W', OPENALEX_WORK_JSON],
+      ]),
+    ),
+  });
+}
+
+describe('output contract: the bibliography tools', () => {
+  it('list_references publishes every key it returns, for all three bibliography shapes', async () => {
+    const { client, userDir } = await localHarness();
+    await writeFile(path.join(userDir, 'refs.bib'), REFS_BIB);
+    await writeFile(path.join(userDir, 'biblist.tex'), BIBLIST_TEX);
+    await writeFile(path.join(userDir, 'notes.md'), PROSE_MD);
+
+    const out = await auditCall(client, 'list_references', { project: 'doc' });
+
+    const entries = out.entries as Array<Record<string, unknown>>;
+    // One of each shape: `entrySchema` is shared across the three, and each populates a
+    // different corner of it (`key`+`fields` for bibtex, `label` for a numbered prose item).
+    expect(new Set(entries.map((e) => e.format))).toEqual(new Set(['bibtex', 'bibitem', 'prose']));
+    expect(entries.some((e) => e.fields !== undefined)).toBe(true);
+    expect(entries.some((e) => e.label !== undefined)).toBe(true);
+    expect((out.sources as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  /**
+   * And that a client which listed tools first can actually call it.
+   *
+   * `entries[].fields` was emitted undeclared from v0.6.0 (#137), which did not make
+   * `list_references` a little too wide: it made it **uncallable** — the SDK's `Client` compiles
+   * an ajv validator per advertised schema during `listTools()` and rejects the whole result with
+   * `-32602 … must NOT have additional properties`. #142 declared the field; this pins the
+   * callability against a client primed exactly the way a real one is, which the audit above
+   * (deliberately unprimed, for the better diagnostic) does not.
+   */
+  it('and an SDK client that listed tools first can call list_references and get a result', async () => {
+    const { client, userDir } = await localHarness();
+    await writeFile(path.join(userDir, 'refs.bib'), REFS_BIB);
+    await prime(client);
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'doc' },
+    });
+
+    expect(isError(listed), textOf(listed)).toBe(false);
+    const entries = structured(listed)!.entries as Array<Record<string, unknown>>;
+    // Asserting the field's *value* arrived, not merely that the promise resolved: that is what
+    // separates "the schema declares it" from "the handler stopped sending it to appease ajv".
+    const knuth = entries.find((e) => e.key === 'knuth1984')!;
+    expect((knuth.fields as Record<string, string>).title).toContain('TeX');
+  });
+
+  it('check_citations publishes every key it returns, in-project and across projects', async () => {
+    const { client, userDir } = await localHarness();
+    await writeFile(path.join(userDir, 'refs.bib'), REFS_BIB);
+    // main.tex already cites knuth1984; this adds the key nothing defines.
+    await writeFile(path.join(userDir, 'intro.tex'), 'An unknown source \\cite{ghost2020}.\n');
+
+    const own = await auditCall(client, 'check_citations', { project: 'doc' });
+
+    // All four finding arrays populated, so each element shape is judged rather than skipped.
+    expect((own.undefinedCitations as unknown[]).length).toBeGreaterThan(0);
+    expect((own.uncitedEntries as unknown[]).length).toBeGreaterThan(0);
+    expect((own.duplicateKeys as unknown[]).length).toBeGreaterThan(0);
+    expect((own.incompleteEntries as unknown[]).length).toBeGreaterThan(0);
+    expect(own.bibliographyProject).toBeUndefined();
+
+    // The cross-project branch, which is the one that emits `bibliographyProject` at all.
+    const sharedDir = await mkdtemp(path.join(os.tmpdir(), 'wlm-contract-shared-'));
+    cleanups.push(() => rm(sharedDir, { recursive: true, force: true }));
+    await writeFile(path.join(sharedDir, 'shared.bib'), SHARED_BIB);
+    const registered = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'group', path: sharedDir },
+    });
+    expect(isError(registered), textOf(registered)).toBe(false);
+
+    const foreign = await auditCall(client, 'check_citations', {
+      project: 'doc',
+      bibliographyProject: 'group',
+    });
+
+    expect(foreign.bibliographyProject).toBe('group');
+    // Narrowed to what this draft cites, as the cross-project rule requires — and still carrying
+    // findings, so the audit above ran over populated arrays and not over four empty ones.
+    expect(foreign.uncitedEntries).toEqual([]);
+    expect((foreign.duplicateKeys as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('search_references publishes every key it returns, pinned and on a substitution', async () => {
+    const { client, ctx } = await localHarness();
+    ctx.references = stubbedReferences();
+
+    const pinned = await auditCall(client, 'search_references', {
+      query: 'deep residual learning',
+      source: 'dblp',
+    });
+
+    expect(pinned.source).toBe('dblp');
+    const hits = pinned.results as Array<Record<string, unknown>>;
+    expect(hits).toHaveLength(1);
+    // Every optional field of `hitSchema` populated by the canned record, so none of them is
+    // "declared but never seen" here.
+    expect(hits[0]).toMatchObject({
+      key: 'dblp:conf/cvpr/HeZRS16',
+      source: 'dblp',
+      year: 2016,
+      venue: 'CVPR',
+      doi: '10.1109/CVPR.2016.90',
+    });
+    expect(pinned.fallbackFrom).toBeUndefined();
+    expect(pinned.hint).toBeUndefined();
+
+    // Unpinned with DBLP unreachable: Crossref answers, and the two substitution-only keys
+    // (`fallbackFrom`, `hint`) are the ones a pinned call never emits.
+    ctx.references = stubbedReferences({ dblpDown: true });
+    const swapped = await auditCall(client, 'search_references', {
+      query: 'deep residual learning',
+    });
+
+    expect(swapped.source).toBe('crossref');
+    expect(swapped.fallbackFrom).toBe('dblp');
+    expect(swapped.hint).toBeTypeOf('string');
+  });
+
+  /**
+   * `add_citation` runs against a git-backed project on purpose: on a local one `changeDiff`
+   * returns `''` by design, so the `diff` key would be audited empty — and `diff` is the field
+   * this tool's payload is mostly made of.
+   */
+  async function citationHarness() {
+    const remote = await createFakeRemote({
+      'main.tex': MAIN_TEX,
+      'refs.bib': '@misc{seed2000,\n  title = {A seed entry so the file is tracked}\n}\n',
+    });
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-contract-cite-'));
+    cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
+    const dir = path.join(workspace, 'demo');
+    await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: 'contract-cite',
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+    ctx.references = stubbedReferences();
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'contract-cite', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.unshift(() => client.close());
+    return { client };
+  }
+
+  it('add_citation publishes every key it returns, on a write, a no-op and a DOI bridge', async () => {
+    const { client } = await citationHarness();
+
+    const added = await auditCall(client, 'add_citation', {
+      project: 'demo',
+      key: 'dblp:conf/cvpr/HeZRS16',
+    });
+
+    expect(added).toMatchObject({ path: 'refs.bib', added: true, alreadyPresent: false });
+    expect(added.source).toBe('dblp');
+    expect(added.via).toBeUndefined();
+    expect(String(added.diff)).toContain('HeZRS16');
+    expect(added.line).toBeGreaterThan(1);
+
+    // The already-present branch: same key set, different values, and a `diff` of ''.
+    const again = await auditCall(client, 'add_citation', {
+      project: 'demo',
+      key: 'dblp:conf/cvpr/HeZRS16',
+    });
+    expect(again).toMatchObject({ added: false, alreadyPresent: true, diff: '' });
+
+    // OpenAlex publishes no BibTeX, so this record is fetched from Crossref by DOI — the one
+    // branch that emits `via`.
+    const bridged = await auditCall(client, 'add_citation', {
+      project: 'demo',
+      key: 'openalex:W2194775991',
+    });
+    expect(bridged).toMatchObject({ added: true, source: 'openalex', via: 'crossref' });
+  });
+});
+
+/**
+ * Every registered tool is named in an audit call in this file.
+ *
+ * The file's claim is "all 38", and a claim like that goes stale the moment someone registers a
+ * 39th tool — silently, because nothing else here would fail. Asserted against this file's own
+ * source rather than against what the tests above happened to run, so it holds under
+ * `vitest -t <one test>` too, and so a failure names the missing tool instead of depending on
+ * which tests the runner selected.
+ *
+ * It says nothing about whether the call it finds reaches a real result — `auditCall`'s own
+ * `isError` check is what covers that, per tool.
+ */
+describe('output contract: coverage of the tool list', () => {
+  it('names every advertised tool in an auditCall', async () => {
+    const source = await readFile(fileURLToPath(import.meta.url), 'utf8');
+    const audited = new Set(
+      [...source.matchAll(/auditCall\(\s*\w+,\s*'([a-z_]+)'/g)].map((m) => m[1]!),
+    );
+    const { tools } = await schemaClient.listTools();
+    const missing = tools.map((t) => t.name).filter((name) => !audited.has(name));
+
+    expect(
+      missing.sort(),
+      'these registered tools are audited by no call in outputContract.test.ts, so nothing ' +
+        'checks that what they emit is what they advertise',
+    ).toEqual([]);
   });
 });
