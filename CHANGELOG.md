@@ -1480,6 +1480,29 @@ kinds: ["text"]` already carries each merged line's string — and what was miss
 
 ### Fixed
 
+- **`shelve`, `unshelve` and `list_shelves` were uncallable from any SDK client** (#146, found by
+  the #145 output-contract sweep). All three spread the whole `ShelfManifest` into
+  `structuredContent`, and the manifest carries `version: 1`, which `shelfShape` did not declare.
+  That is not a documentation gap: `zod`'s JSON Schema conversion marks every advertised object
+  `additionalProperties: false`, and the MCP SDK's own `Client` compiles an ajv validator per
+  `outputSchema` during `listTools()` and checks every later `callTool` result against it. So a
+  client that lists tools at startup — which is every real one — got
+  `-32602 … data/shelf must NOT have additional properties` and **no result at all**, for all
+  three tools. The shelve itself had already landed server-side; only the answer was thrown away.
+
+  Fixed by **declaring** `version` on `shelfShape`, not by dropping it from the payload: removing
+  a field callers may read is the breaking direction, and the value is a server-authored integer
+  (the manifest's schema version) rather than document-controlled text, so it needs no budget.
+  The three emission sites are the `shelve`, `unshelve` and `list_shelves` handlers, all fed by
+  the one shape. Never released — the shelve trio (#108) landed on `dev` after 0.6.0 and has
+  never been on `main` — so no published version shipped the break.
+
+  The contract test's two deliberate tripwires are cleared rather than relaxed: the
+  `knownUndeclared` pins are deleted (the audit compares the whole set, so a fixed hole fails the
+  pin), and the test that asserted the call is rejected now asserts it succeeds and that
+  `shelf.version` arrives as `1` through all three tools, against a client primed with
+  `listTools()` exactly as a real one is.
+
 - **`add_asset`'s `source` and `read_file`'s binary/large-file `note` no longer carry native
   separators** (#138, the remainder of #80 §4). `docs/tools.md` opens with "File paths are always
   POSIX (`/`-separated), on every OS" and CLAUDE.md repeats it; a sweep of `src/tools/` found the

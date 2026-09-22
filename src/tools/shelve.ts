@@ -85,6 +85,16 @@ const shelfFileShape = z.object({
 });
 
 const shelfShape = z.object({
+  version: z
+    .number()
+    .int()
+    .describe(
+      "The manifest's schema version, currently 1. Server-authored, and informational: this " +
+        'server only ever reads back a shelf it wrote itself, so a caller needs it solely to ' +
+        'tell two manifest shapes apart if a later one is ever added. Declared rather than ' +
+        'dropped because the handlers emit it, and a key the schema omits is one the SDK ' +
+        'rejects the whole result over (#146) — it is not a field a caller has to act on.',
+    ),
   id: z.string().describe('The shelf id, `sh-` + 8 hex. Pass it to unshelve.'),
   label: z.string().nullable().describe('The caller-supplied label, or null.'),
   createdAt: z.string().describe('ISO 8601.'),
