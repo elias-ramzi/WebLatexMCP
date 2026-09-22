@@ -64,6 +64,55 @@ describe('FileService out-of-band edit guard', () => {
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
   });
 
+  it('a ranged read does not claim a baseline over the lines it never showed', async () => {
+    // Issue #181. The ordering here is the only one that discriminates, and it is easy to get
+    // wrong: recording RESETS the guard rather than arming it, so "ranged read → hand edit →
+    // write" passes on the broken code too (with no baseline at all, a write is not refused, it
+    // is silent). The whole-file read is what arms the guard; the ranged read is what used to
+    // disarm it.
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
+    await editOnDisk(dir, 'main.tex', 'line one\nline two\nedited by the user\n');
+
+    const ranged = await files.read(dir, {
+      path: 'main.tex',
+      startLine: 1,
+      endLine: 1,
+      recordBaseline: true,
+    });
+    expect(ranged.content).toBe('line one');
+    expect(ranged.truncated).toBe(true);
+
+    // One line is not an acknowledgement of the other two — the bytes a baseline vouches for are
+    // the whole file's, and `write_file` replaces the whole file.
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe(
+      'line one\nline two\nedited by the user\n',
+    );
+  });
+
+  it('refuses the claim for a range that happens to cover the file — the test is the request', async () => {
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
+    await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+
+    // `startLine: 1` with no end does hand back every byte, trailing newline and all…
+    const covering = await files.read(dir, {
+      path: 'main.tex',
+      startLine: 1,
+      recordBaseline: true,
+    });
+    expect(covering.content).toBe('edited by the user\n');
+    expect(covering.truncated).toBe(false);
+
+    // …and is still refused the baseline, because the rule is about what was ASKED for. A second
+    // way to derive "whole" is a second place for this rule to drift, and the cost of erring here
+    // is one re-read to acknowledge the change, where erring the other way destroys the edit.
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+  });
+
   it('keeps one identity for a project reached through a symlink', async () => {
     // macOS hands out /var/folders/… for a real /private/var/folders/…, and Windows a short 8.3
     // path — so resolving reads through realpath while writes resolve the given string filed the
@@ -308,6 +357,101 @@ describe('FileService out-of-band edit guard', () => {
     await expect(
       files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
     ).resolves.toMatchObject({ path: 'main.tex' });
+  });
+
+  describe('recordBaseline, the seam for bytes already in hand', () => {
+    it('arms the guard from bytes the caller holds, with no read of its own', async () => {
+      // Issue #182. `list_references` cannot know at read time whether a bibliography will reach
+      // the caller whole, so it used to re-read the files that qualified just to record them.
+      const shown = await readFile(path.join(dir, 'main.tex'), 'utf8');
+      await files.recordBaseline(dir, 'main.tex', shown);
+      await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+
+      await expect(
+        files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+      ).rejects.toThrow(/changed on disk/);
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
+    });
+
+    it('records the bytes it is handed, never the bytes on disk — the window it exists to close', async () => {
+      // This is the whole correctness argument for the seam, and a re-read cannot satisfy it: the
+      // hand edit lands AFTER the caller was shown `shown` and BEFORE the claim is made, which is
+      // exactly the window between `list_references`' two reads. A re-read would hash the edited
+      // bytes as the baseline and the guard would never fire for them.
+      const shown = await readFile(path.join(dir, 'main.tex'), 'utf8');
+      await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+      await files.recordBaseline(dir, 'main.tex', shown);
+
+      await expect(
+        files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+      ).rejects.toThrow(/changed on disk/);
+    });
+
+    it('keys it the way a read does, for a project reached through a symlink', async () => {
+      // The identity rule: the key is the `resolveInside` string, unchanged. Re-spelling it files
+      // the baseline under a name no write looks up — macOS `/var` → `/private/var`, Windows 8.3.
+      const real = await mkdtemp(path.join(os.tmpdir(), 'ovl-real-'));
+      const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-link-'));
+      const link = path.join(parent, 'project');
+      try {
+        await writeFile(path.join(real, 'main.tex'), 'original\n', 'utf8');
+        await symlink(real, link, 'dir');
+
+        await files.recordBaseline(link, 'main.tex', 'original\n');
+        await writeFile(path.join(real, 'main.tex'), 'edited by the user\n', 'utf8');
+
+        await expect(
+          files.write(link, { path: 'main.tex', content: 'agent version\n' }),
+        ).rejects.toThrow(/changed on disk/);
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+        await rm(real, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses a path that leaves the project through a link, exactly as a read does', async () => {
+      // The seam pairs with a read, so it runs the same guard in the same position: a path no
+      // read could reach must not get a baseline filed for it either.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+
+        await expect(files.recordBaseline(dir, 'notes.tex', 'PRIVATE KEY\n')).rejects.toThrow(
+          /symlink/,
+        );
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('honours the project link policy by default, as every read does', async () => {
+      // A `followSymlinks: true` project reads its shared refs.bib through a link, so the seam
+      // must be able to record what that read returned; a stricter default here would refuse the
+      // claim for exactly the files the read allowed.
+      const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-shared-'));
+      try {
+        await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+        await symlink(path.join(shared, 'refs.bib'), path.join(dir, 'refs.bib'));
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+        const shown = await local.readText(dir, 'refs.bib');
+        await local.recordBaseline(dir, 'refs.bib', shown);
+
+        await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={B}}\n', 'utf8');
+        await expect(
+          local.write(dir, { path: 'refs.bib', content: '@misc{a, title={C}}\n' }),
+        ).rejects.toThrow(/changed on disk/);
+
+        // …and `strictLinks` is still available for a record the server makes on its own.
+        await expect(
+          local.recordBaseline(dir, 'refs.bib', shown, { strictLinks: true }),
+        ).rejects.toThrow(/symlink/);
+      } finally {
+        await rm(shared, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('linkTarget', () => {

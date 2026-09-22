@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -46,7 +46,7 @@ async function setup(files: Record<string, string>) {
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   cleanups.push(() => client.close());
   await client.callTool({ name: 'project_sync', arguments: { project: 'demo', mode: 'clone' } });
-  return client;
+  return { client, dir: path.join(workspace, 'demo') };
 }
 
 interface ReadResult {
@@ -58,7 +58,7 @@ interface ReadResult {
 describe('read_file at a ref', () => {
   it('returns the blob verbatim, and does not call a whole-file read truncated', async () => {
     const full = 'alpha\nbeta\ngamma\n';
-    const client = await setup({ 'main.tex': full });
+    const { client } = await setup({ 'main.tex': full });
 
     const whole = (
       await client.callTool({
@@ -93,7 +93,7 @@ describe('read_file at a ref', () => {
 
   it('does not rewrite CRLF line endings on the way out', async () => {
     const crlf = 'alpha\r\nbeta\r\n';
-    const client = await setup({ 'main.tex': crlf });
+    const { client } = await setup({ 'main.tex': crlf });
 
     const res = (
       await client.callTool({
@@ -102,5 +102,62 @@ describe('read_file at a ref', () => {
       })
     ).structuredContent as unknown as ReadResult;
     expect(res.content).toBe(crlf);
+  });
+});
+
+/**
+ * Issue #181: `read_file` passed `recordBaseline: true` whatever the caller asked for, and
+ * `FileService.read` recorded the WHOLE file before slicing — so five lines of a long document
+ * claimed the baseline for all of it, and the next `write_file` replaced a hand edit outside the
+ * range with no refusal. Recording RESETS the guard rather than arming it, which is why the whole
+ * read has to come first here: without it there is no baseline to disarm and nothing to see.
+ */
+describe('the out-of-band-edit baseline a read may claim', () => {
+  it('does not let a ranged read vouch for the lines it did not return', async () => {
+    const original = 'alpha\nbeta\ngamma\n';
+    const { client, dir } = await setup({ 'main.tex': original });
+
+    // The agent reads the file whole, which arms the guard.
+    await client.callTool({
+      name: 'read_file',
+      arguments: { project: 'demo', path: 'main.tex' },
+    });
+    // The user then hand-edits a part of it the agent is about to not look at.
+    const handEdited = 'alpha\nbeta\nedited by the user\n';
+    await writeFile(path.join(dir, 'main.tex'), handEdited, 'utf8');
+
+    // The agent reads one line back — and is shown nothing of the edit.
+    const ranged = (
+      await client.callTool({
+        name: 'read_file',
+        arguments: { project: 'demo', path: 'main.tex', startLine: 1, endLine: 1 },
+      })
+    ).structuredContent as unknown as ReadResult;
+    expect(ranged.content).toBe('alpha');
+
+    // So the whole-file write that follows is still refused, and the edit survives.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'agent version\n' },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(JSON.stringify(wrote.content)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe(handEdited);
+  });
+
+  it('still lets a whole read acknowledge the change, so the guard stays usable', async () => {
+    const { client, dir } = await setup({ 'main.tex': 'alpha\nbeta\n' });
+
+    await client.callTool({ name: 'read_file', arguments: { project: 'demo', path: 'main.tex' } });
+    await writeFile(path.join(dir, 'main.tex'), 'edited by the user\n', 'utf8');
+    // Narrowing the claim must not become a blanket refusal to record: a whole read is the
+    // acknowledgement, and after it the write goes through.
+    await client.callTool({ name: 'read_file', arguments: { project: 'demo', path: 'main.tex' } });
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'demo', path: 'main.tex', content: 'agent version\n' },
+    });
+    expect(wrote.isError).toBeFalsy();
   });
 });

@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
-import { createContext } from '../../src/context.js';
+import { createContext, type AppContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -88,7 +88,7 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-async function setup(): Promise<{ client: Client; userDir: string }> {
+async function setup(): Promise<{ client: Client; userDir: string; ctx: AppContext }> {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-ws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-dir-'));
   cleanups.push(
@@ -114,7 +114,7 @@ async function setup(): Promise<{ client: Client; userDir: string }> {
     name: 'register_project',
     arguments: { project: 'proposal', path: userDir },
   });
-  return { client, userDir };
+  return { client, userDir, ctx };
 }
 
 /** A second project, registered in place, so a cross-project call has somewhere to reach. */
@@ -758,5 +758,45 @@ describe('the out-of-band-edit baseline a listing may claim', () => {
       },
     });
     expect(allowed.isError).toBeFalsy();
+  });
+
+  it('records the bytes the caller was shown, not what the file says a moment later', async () => {
+    // Issue #182. The old fix re-read every fully-shipped bibliography just to record it, and a
+    // hand edit landing between the two reads was recorded AS the baseline — so the guard never
+    // fired for it. Here the edit lands the instant the parse read returns, which is exactly that
+    // window; recording the bytes already in hand is what closes it.
+    const { client, ctx } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    const original = bibOf('paged', 2);
+    await writeFile(path.join(dir, 'refs.bib'), original);
+    const handEdited = `${original}\n@misc{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+
+    const realReadText = ctx.files.readText.bind(ctx.files);
+    let armed = true;
+    ctx.files.readText = async (projectDir, relPath, opts) => {
+      const out = await realReadText(projectDir, relPath, opts);
+      if (armed && relPath === 'refs.bib') {
+        armed = false;
+        await writeFile(path.join(dir, 'refs.bib'), handEdited);
+      }
+      return out;
+    };
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib' },
+    });
+    const { entries } = listed.structuredContent as { entries: Array<{ key: string }> };
+    // What the caller received is the pre-edit file, whole — the hand-typed entry is not in it.
+    expect(entries.map((e) => e.key)).toEqual(['paged0', 'paged1']);
+
+    // So the baseline is those bytes, the disk no longer matches, and a blind write is refused.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'bibs', path: 'refs.bib', content: original, confirmBibEdit: true },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(handEdited);
   });
 });
