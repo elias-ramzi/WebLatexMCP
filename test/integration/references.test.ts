@@ -9,6 +9,11 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
+import {
+  REFERENCE_FIELDS_BUDGET,
+  REFERENCE_MAX_FIELD_VALUE_LENGTH,
+} from '../../src/lib/referenceFieldsBudget.js';
 
 /**
  * The case this exists for: a document that is neither on a git remote nor a `.bib`. A proposal
@@ -465,5 +470,135 @@ describe('a bibliography in another project', () => {
     // Not foreign, so nothing is narrowed: the uncited entry is still dead weight worth reporting.
     expect(report.bibliographyProject).toBeUndefined();
     expect(report.uncitedEntries.map((e) => e.key)).toEqual(['never2019cited']);
+  });
+});
+
+/**
+ * Issue #137: `entries[].fields` was emitted and never declared. The MCP SDK validates a result
+ * against the advertised `outputSchema` and throws the parse result away — and a zod object strips
+ * rather than rejects — so the key travelled unvalidated and unstripped, and no client was ever
+ * told it exists. These assertions therefore go through `tools/list`: asserting on
+ * `structuredContent` alone is what let the hole stand for as long as it did (#130).
+ */
+describe('the raw BibTeX field map is declared, and budgeted', () => {
+  it('advertises `entries[].fields` and its budget reporting in the schema clients read', async () => {
+    const { client, userDir } = await setup();
+    await writeFile(path.join(userDir, 'ref.bib'), BIB);
+
+    await expectDeclaredField(client, 'list_references', 'entries[].fields', {
+      required: false,
+      description: /raw BibTeX fields/,
+    });
+    await expectDeclaredField(client, 'list_references', 'entries[].fieldsOmitted', {
+      required: false,
+    });
+    await expectDeclaredField(client, 'list_references', 'fieldsNote', { required: false });
+
+    // And the declaration matches the behaviour: a real `.bib` entry still carries its field map,
+    // with the `@string` macro expanded, exactly as before this was declared.
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib', filter: 'he2016deep' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ fields?: Record<string, string>; fieldsOmitted?: number }>;
+      fieldsNote?: string;
+    };
+    expect(entries[0]!.fields).toMatchObject({
+      booktitle: 'IEEE/CVF Conference on Computer Vision and Pattern Recognition',
+      year: '2016',
+    });
+    expect(entries[0]!.fieldsOmitted).toBeUndefined();
+    // Nothing was cut, so the report keys are absent rather than present-and-zero.
+    expect(fieldsNote).toBeUndefined();
+  });
+
+  it('sends no field map at all for a prose entry, which has none to send', async () => {
+    const { client } = await setup();
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal' },
+    });
+    const { entries } = res.structuredContent as { entries: Array<Record<string, unknown>> };
+    expect(entries.every((e) => e.format === 'prose')).toBe(true);
+    expect(entries.some((e) => 'fields' in e)).toBe(false);
+  });
+
+  it('drops an over-long field whole rather than shortening it, and says which bound fired', async () => {
+    const { client, userDir } = await setup();
+    const abstract = `A ${'very '.repeat(REFERENCE_MAX_FIELD_VALUE_LENGTH / 4)}long abstract.`;
+    await writeFile(
+      path.join(userDir, 'ref.bib'),
+      [
+        '@article{verbose2024,',
+        '  title    = {A Modest Title},',
+        `  abstract = {${abstract}},`,
+        '  year     = {2024},',
+        '}',
+        '',
+      ].join('\n'),
+    );
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ fields?: Record<string, string>; fieldsOmitted?: number; raw: string }>;
+      fieldsNote?: string;
+    };
+    const entry = entries[0]!;
+    expect(Object.keys(entry.fields!)).toEqual(['title', 'year']);
+    // Dropped, never truncated: no shortened `abstract` posing as an exact BibTeX value.
+    expect(Object.values(entry.fields!).join('')).not.toContain('very very');
+    expect(entry.fieldsOmitted).toBe(1);
+    expect(fieldsNote).toContain('dropped whole');
+    // And the remedy the note names actually works — `raw` still has every byte.
+    expect(entry.raw).toContain('very very');
+    // The text channel says so too; a client reading only prose must not think `fields` is whole.
+    expect(textOf(res)).toContain('dropped whole');
+  });
+
+  it('holds the whole result inside one budget, cutting a tail it counts', async () => {
+    const { client, userDir } = await setup();
+    // Twenty entries, each carrying ~1900 characters of `note`: ~38k of field maps, well past the
+    // 20000-char budget, so the later entries lose theirs entirely.
+    const bulky = Array.from({ length: 20 }, (_, i) =>
+      [
+        `@article{bulk${i},`,
+        `  title = {Entry ${i}},`,
+        `  note  = {${'n'.repeat(REFERENCE_MAX_FIELD_VALUE_LENGTH - 100)}},`,
+        '}',
+        '',
+      ].join('\n'),
+    ).join('\n');
+    await writeFile(path.join(userDir, 'ref.bib'), bulky);
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ key: string; fields?: Record<string, string>; fieldsOmitted?: number }>;
+      fieldsNote?: string;
+    };
+    expect(entries).toHaveLength(20);
+
+    // Every entry is still returned in full but for its field map, which is a cut TAIL: the first
+    // N carry theirs, the rest carry a count. No holes, and nothing reordered.
+    const withFields = entries.map((e) => 'fields' in e);
+    const firstCut = withFields.indexOf(false);
+    expect(firstCut).toBeGreaterThan(0);
+    expect(withFields.slice(firstCut).some(Boolean)).toBe(false);
+    expect(entries.map((e) => e.key)).toEqual(entries.map((_, i) => `bulk${i}`));
+    expect(entries[19]!.fieldsOmitted).toBe(2);
+    expect(fieldsNote).toContain(`${REFERENCE_FIELDS_BUDGET}-char budget`);
+
+    const rendered = entries.reduce(
+      (sum, e) => (e.fields ? sum + JSON.stringify(e.fields).length + 10 : sum),
+      0,
+    );
+    expect(rendered).toBeLessThanOrEqual(REFERENCE_FIELDS_BUDGET);
   });
 });
