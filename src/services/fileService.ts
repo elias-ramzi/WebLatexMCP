@@ -204,6 +204,21 @@ function matchesFilter(type: FileType, filter: FileFilter): boolean {
   }
 }
 
+/**
+ * One surviving entry of `FileService.walk`: everything `list` needs except the size, which is
+ * the one thing that costs a syscall. `sizeBytes` is already filled in for a symlinked file —
+ * the walk had to `stat` it anyway to tell a file from a directory — and absent for a regular
+ * file, whose `stat` `list` makes once the filter has already let it through.
+ */
+interface WalkCandidate {
+  /** Project-relative, native separators; `list` converts to POSIX. */
+  rel: string;
+  /** Absolute, so `list` stats it without rebuilding the path. */
+  full: string;
+  type: FileType;
+  sizeBytes?: number;
+}
+
 function countOccurrences(haystack: string, needle: string): number {
   if (needle === '') return 0;
   let count = 0;
@@ -569,17 +584,19 @@ export class FileService {
   ): Promise<FileEntry[]> {
     const filter = opts.filter ?? 'all';
     const base = opts.subdir ? resolveInside(projectDir, opts.subdir) : path.resolve(projectDir);
-    const collected: string[] = [];
-    await this.walk(projectDir, base, collected);
+    const collected: WalkCandidate[] = [];
+    await this.walk(projectDir, base, filter, collected);
     const entries = await Promise.all(
-      collected.map(async (rel) => {
-        const info = await stat(path.join(projectDir, rel));
-        return { path: toPosix(rel), type: classify(rel), sizeBytes: info.size };
-      }),
+      collected.map(async (c) => ({
+        path: toPosix(c.rel),
+        type: c.type,
+        // A link's size came from the `stat` the walk had to make anyway to decide file-vs-dir;
+        // a regular file is stat'd here, and only because it survived the filter. `??` (not `||`)
+        // so a zero-byte link keeps its own size instead of paying a second syscall.
+        sizeBytes: c.sizeBytes ?? (await stat(c.full)).size,
+      })),
     );
-    return entries
-      .filter((e) => matchesFilter(e.type, filter))
-      .sort((a, b) => a.path.localeCompare(b.path));
+    return entries.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**
@@ -1273,11 +1290,24 @@ export class FileService {
    * while `read` follows it makes the same project both follow and not follow its own links
    * depending on which tool you call: the shared `refs.bib` the exemption exists for would be
    * readable only by someone who already knew it was there.
+   *
+   * The `filter` is applied **here**, not by the caller, because `classify` is a pure function of
+   * the name and `matchesFilter` consults only the type: a path the filter rejects need never be
+   * collected, and — the point — need never be `stat`ed. `detectRootFile` runs on every `compile`
+   * and asks for `tex`; it used to pay one `stat` for every figure in the tree (#174).
+   *
+   * What the filter must never do is change **traversal**. A symlink is still `stat`ed before it
+   * is classified, because that `stat` is what decides whether it is a file to list or a directory
+   * to descend into, and a directory link's own name (`figs -> /shared/figs`) says nothing about
+   * what is under it. The `followLinks` opt-in, the `seen` realpath cycle guard, the dangling-link
+   * drop and the `.git` skip are untouched: they are sandbox and termination guards, not an
+   * optimization's business.
    */
   private async walk(
     root: string,
     dir: string,
-    out: string[],
+    filter: FileFilter,
+    out: WalkCandidate[],
     seen: Set<string> = new Set(),
   ): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
@@ -1285,22 +1315,28 @@ export class FileService {
     for (const entry of entries) {
       if (entry.name === '.git') continue;
       const full = path.join(dir, entry.name);
+      // `path.extname` reads only the last path segment, so classifying the dirent's own name is
+      // the same answer `classify` gave the project-relative path — without building that path
+      // for a file about to be discarded.
+      const type = classify(entry.name);
       if (entry.isDirectory()) {
-        await this.walk(root, full, out, seen);
+        await this.walk(root, full, filter, out, seen);
       } else if (entry.isFile()) {
-        out.push(path.relative(root, full));
+        if (matchesFilter(type, filter)) out.push({ rel: path.relative(root, full), full, type });
       } else if (entry.isSymbolicLink() && followLinks) {
         // `stat` follows the link; a dangling one throws and is simply not there to list.
         const target = await stat(full).catch(() => null);
         if (target?.isFile()) {
-          out.push(path.relative(root, full));
+          if (matchesFilter(type, filter)) {
+            out.push({ rel: path.relative(root, full), full, type, sizeBytes: target.size });
+          }
         } else if (target?.isDirectory()) {
           // Keyed on the real directory, so `a -> ..` (or any longer cycle) is walked once
           // instead of forever. `realpath` itself fails on a self-referential chain (ELOOP).
           const real = await realpath(full).catch(() => null);
           if (real === null || seen.has(real)) continue;
           seen.add(real);
-          await this.walk(root, full, out, seen);
+          await this.walk(root, full, filter, out, seen);
         }
       }
     }
