@@ -632,6 +632,43 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   since this runs on every compile of every session; a differential test over generated logs pins
   it, in the strong form that a filter accepting everything is a no-op.
 
+- **Every document-controlled payload is budgeted, and the budget is charged against the RENDERED
+  size in every channel it ships in.** Eight libs now solve the same problem —
+  `conflictBudget.ts`, `floatsBudget.ts`, `searchBudget.ts`, `inlineBudget.ts`,
+  `referenceFieldsBudget.ts`, `referenceRawBudget.ts`, `citationsBudget.ts`, `diffBudget.ts` — and
+  they exist because of #68: a ~67k-character conflict payload a client rejected **undelivered**,
+  which is worse than a cut one because the caller gets nothing and no reason. The rules they share
+  are not stylistic:
+  - **Charge what is rendered, not what is held.** The marker boilerplate, the JSON punctuation,
+    the per-file headers and the elision text all cost bytes, and a payload that ships in both the
+    text channel and `structuredContent` costs roughly twice its own length — `diff` did exactly
+    that. A budget that counts the content once is wrong by 2x. The strongest form is to put the
+    render template beside the cost function and have the cost function **call** it, so the two
+    cannot drift (`diffBudget.ts`); where the template has to live elsewhere, pin the constant with
+    a test that renders a known input and bounds it from **both** sides, or it can be padded into
+    meaninglessness.
+  - **Render the text channel from the already-cut payload**, never from the full one, or the
+    channel that was supposed to be trimmed reintroduces the payload the budget exists to prevent —
+    half the feature, reading as though it worked. `searchFiles.ts` states this; `compile`'s
+    `warningsFilter` is the same rule for `logTail` and `warnings[]`.
+  - **Cut by declared priority, not in declaration order.** A single pool spent top-to-bottom cuts
+    the finding that breaks the build because the advisory list ran first. Write the order down
+    (`ALLOCATION_ORDER`, `hunks` before the sides) and say why each rank earns its place.
+  - **Count what was cut, never cut silently**, in the house shape (`…Omitted`, `omittedByCap`), and
+    keep "cut" structurally unconfusable from "absent" — a `null` that means elided carries a
+    matching `elided` entry, and `diff: ''` still means only that there is no diff.
+  - **House figures**: 20 for a capped list (`capList`, `CONFLICT_MAX_FILES`), 20000 characters for a
+    rendered content budget, 2000 for a merely diagnostic share. Reuse the constant rather than
+    restating the number; a second allocation of the same figure is fine and is not a second number,
+    but say why the pool is split.
+  - **A cut changes what a field promises, so fix the prose too.** `raw` is documented as the entry
+    verbatim and "authoritative when a field is doubtful"; once it can be cut, every sentence
+    promising that — in the schema, in `referenceFieldsBudget.ts`, in `docs/tools.md` — is false
+    until amended. The counter is the amendment's anchor.
+  - **Every counter is a new `structuredContent` key, so every counter must be declared in the
+    `outputSchema`** — see the tool-return-shape bullet. Adding a budget is the change most likely
+    to make a tool uncallable.
+
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it
