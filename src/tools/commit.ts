@@ -212,12 +212,27 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // reported as excluded.
           await ctx.shadows.refresh(id, dir);
           const remaining = await ctx.shadows.changes(id);
-          const conflicted = remaining.filter((c) => c.conflicted).map((c) => c.path);
-          const unrecorded = remaining.filter((c) => c.unrecorded).map((c) => c.path);
+          // Every path list this tool RETURNS is spelled the one way docs/tools.md's opening line
+          // promises ("file paths are always POSIX, on every OS"), converted once here and used
+          // for the text channel and `structuredContent` alike — `leftUncommitted` already was,
+          // at each of its three sources, which is exactly how one result came to carry two
+          // spellings of the same kind of data (#148 §2). Nothing changes on any platform: git's
+          // own output is `/`-separated and a shadow key was normalised with `toPosix` when it was
+          // recorded, so these are all idempotent. The point is that the rule is now visibly
+          // applied to all of them rather than to whichever list happened to get a call.
+          //
+          // At the reporting boundary and nowhere earlier: everything above this line that hands
+          // a path to git (`git add`'s pathspecs in `commitPaths`/`commitEverything`, the
+          // `ignoredPaths` probes) or looks one up in the shadow store has already run.
+          const files = res.files.map((f) => ({ ...f, path: toPosix(f.path) }));
+          const ignored = res.ignored.map(toPosix);
+          settled = settled.map(toPosix);
+          const conflicted = remaining.filter((c) => c.conflicted).map((c) => toPosix(c.path));
+          const unrecorded = remaining.filter((c) => c.unrecorded).map((c) => toPosix(c.path));
           const unrecordedSet = new Set(unrecorded);
           const collided = conflicted.filter((p) => !unrecordedSet.has(p));
-          const added = res.files.reduce((sum, f) => sum + f.added, 0);
-          const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
+          const added = files.reduce((sum, f) => sum + f.added, 0);
+          const removed = files.reduce((sum, f) => sum + f.removed, 0);
           // `headSha` reports a clone with no commits as the sentinel "unborn" — say so rather than
           // presenting the sentinel as if it were a commit id.
           const headAt = res.sha === 'unborn' ? 'no commits yet' : `HEAD ${res.sha.slice(0, 8)}`;
@@ -230,7 +245,7 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // `settled` carries shadow spellings and `ignored` the caller's; compare through the
           // same fold as everything else on an ignorecase clone.
           const nameKey = fold ?? ((p: string) => p);
-          const ignoredSet = new Set(res.ignored.map(nameKey));
+          const ignoredSet = new Set(ignored.map(nameKey));
           const settledAllIgnored =
             settled.length > 0 && settled.every((p) => ignoredSet.has(nameKey(p)));
           const headline = res.committed
@@ -242,21 +257,21 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
                     ? ' (named paths)'
                     : ' (whole clone)'
               }`
-            : res.ignored.length === 0
+            : ignored.length === 0
               ? 'nothing to commit — the working tree already matches HEAD for the requested paths; ' +
                 `settled this session's stale record of: ${settled.join(', ')} ` +
                 `(not yet pushed: ${headAt})`
               : settledAllIgnored
                 ? `nothing to commit — every requested path is ignored by git (never committed by ` +
-                  `any scope): ${res.ignored.join(', ')}; settled this session's stale record of: ` +
+                  `any scope): ${ignored.join(', ')}; settled this session's stale record of: ` +
                   `${settled.join(', ')} (${headAt})`
-                : `nothing to commit — ${res.ignored.join(', ')} skipped as ignored by git (never ` +
+                : `nothing to commit — ${ignored.join(', ')} skipped as ignored by git (never ` +
                   `committed by any scope); nothing to commit for the rest of the requested paths ` +
                   `— the working tree already matches HEAD there; settled this session's stale ` +
                   `record of: ${settled.join(', ')} (${headAt})`;
           const text = [
             headline,
-            ...res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
+            ...files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
             res.leftUncommitted.length
               ? `left uncommitted (not this session's): ${res.leftUncommitted.join(', ')}`
               : '',
@@ -270,8 +285,8 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
                 `${collided.join(', ')}. Commit with scope "all" to take the working tree as ` +
                 `it stands,${discardHint(collided)}`
               : '',
-            res.ignored.length
-              ? `skipped — ignored by git (never committed by any scope): ${res.ignored.join(', ')}`
+            ignored.length
+              ? `skipped — ignored by git (never committed by any scope): ${ignored.join(', ')}`
               : '',
           ]
             .filter(Boolean)
@@ -283,13 +298,16 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               committed: res.committed,
               sha: res.sha,
               filesChanged: res.filesChanged,
-              files: res.files,
+              // The same converted values the text above was rendered from, so the two channels
+              // cannot disagree about a separator. `leftUncommitted` is converted at its source
+              // (see `commitSession`/`commitPaths`), the one list that always was.
+              files,
               scope: effective,
               session: ctx.shadows.sessionId,
               leftUncommitted: res.leftUncommitted,
               conflicted,
               unrecorded,
-              ignored: res.ignored,
+              ignored,
               settled,
             },
           };

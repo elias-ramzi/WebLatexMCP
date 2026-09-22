@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { syncState, syncSummary } from '../lib/syncState.js';
 import { toPosix } from '../lib/paths.js';
+import type { RemoteCommit } from '../services/gitService.js';
 import { foldCase } from '../lib/caseFold.js';
 import { dedupeFolded } from '../lib/peerRefusal.js';
 import { collectPeerShadows, formatAge } from '../lib/peerAttribution.js';
@@ -153,20 +154,31 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         // clone the three git lists can name the very same file under two different spellings, and
         // deduping on the raw string would let both survive as if they were two files.
         const fold = (await ctx.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
+        // Every path list this tool RETURNS is spelled the one way docs/tools.md's opening line
+        // promises ("file paths are always POSIX, on every OS"), from one conversion each that
+        // feeds the text channel and `structuredContent` alike. git's own output is already
+        // `/`-separated, so none of this changes a byte on any platform today — it is the rule
+        // being applied uniformly rather than to whichever list happened to get a `toPosix`,
+        // which is what left one result carrying two spellings of the same kind of data (#148 §2).
+        // Converted HERE and nowhere earlier: `status.unstaged`/`status.untracked` are handed to
+        // `ctx.files.externalModifications` below, which resolves them against the filesystem, so
+        // that call keeps getting the raw git spelling — the trap `toPosixOut`'s doc comment names.
+        const staged = status.staged.map(toPosix);
+        const unstaged = status.unstaged.map(toPosix);
+        const untracked = status.untracked.map(toPosix);
+        const aheadCommits = posixCommits(status.aheadCommits);
+        const behindCommits = posixCommits(status.behindCommits);
         // `status.staged` joins the working-tree lists so a path dirty only in the index (a hand
         // `git add`, or an interrupted `commitContents`) is not invisible to `otherChanges`/
         // `sessionChanges` — the same rescue `commit`'s `scope: "paths"` already applies to its own
         // dirty set (`src/tools/commit.ts`, `commitPaths`). Deduped on the folded key, keeping the
         // first-seen spelling for display: a path can be both staged and unstaged (staged once,
         // then edited again), or — on an ignorecase clone — reported under two spellings.
-        const dirty = dedupeFolded(
-          [...status.unstaged, ...status.untracked, ...status.staged].map(toPosix),
-          fold,
-        );
+        const dirty = dedupeFolded([...unstaged, ...untracked, ...staged], fold);
         const owned = new Set(changes.map((c) => fold(c.path)));
         const sessionChanges = dirty.filter((p) => owned.has(fold(p))).sort();
         const otherChanges = dirty.filter((p) => !owned.has(fold(p))).sort();
-        const conflictedChanges = changes.filter((c) => c.conflicted).map((c) => c.path);
+        const conflictedChanges = changes.filter((c) => c.conflicted).map((c) => toPosix(c.path));
         const peers = (await ctx.sessions.peers(id)).filter((p) => !p.self);
         // Read-only, no lock: every peer's shadow index (live or not — a session that exited
         // still gets its last-known changes reported).
@@ -186,10 +198,11 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         }));
         // Flag files a human edited directly (as opposed to changes the tools made), so the
         // agent acknowledges them before writing over them.
-        const externalChanges = await ctx.files.externalModifications(dir, [
-          ...status.unstaged,
-          ...status.untracked,
-        ]);
+        // The raw git spellings go in (this reads the files off disk); the result comes back out
+        // converted, like every other list here.
+        const externalChanges = (
+          await ctx.files.externalModifications(dir, [...status.unstaged, ...status.untracked])
+        ).map(toPosix);
         const peerDetail = (p: (typeof peers)[number]): string => {
           const entries = peerShadows.get(p.sessionId) ?? null;
           const segments: string[] = [];
@@ -207,7 +220,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
             // Cap what the text shows — a peer with a long-running session can list dozens of
             // touched paths, and this line is meant to be skimmed, not to duplicate the structured
             // `changes` array (which stays complete).
-            const shown = entries.slice(0, 5).map((e) => e.path);
+            const shown = entries.slice(0, 5).map((e) => toPosix(e.path));
             const remaining = entries.length - shown.length;
             segments.push(
               remaining > 0 ? `${shown.join(', ')} and ${remaining} more` : shown.join(', '),
@@ -240,15 +253,13 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         const text = [
           `branch ${status.branch} — ${syncSummary(status.branch, status.ahead, status.behind)}`,
           status.clean ? 'working tree clean' : 'working tree has changes',
-          status.staged.length ? `staged: ${status.staged.join(', ')}` : '',
-          status.unstaged.length ? `unstaged: ${status.unstaged.join(', ')}` : '',
-          status.untracked.length ? `untracked: ${status.untracked.join(', ')}` : '',
-          status.behindCommits.length
-            ? `landed upstream:\n${renderCommitLines(status.behindCommits).join('\n')}`
+          staged.length ? `staged: ${staged.join(', ')}` : '',
+          unstaged.length ? `unstaged: ${unstaged.join(', ')}` : '',
+          untracked.length ? `untracked: ${untracked.join(', ')}` : '',
+          behindCommits.length
+            ? `landed upstream:\n${renderCommitLines(behindCommits).join('\n')}`
             : '',
-          status.aheadCommits.length
-            ? `to push:\n${renderCommitLines(status.aheadCommits).join('\n')}`
-            : '',
+          aheadCommits.length ? `to push:\n${renderCommitLines(aheadCommits).join('\n')}` : '',
           externalChanges.length
             ? `⚠ changed directly (not via tools): ${externalChanges.join(', ')}`
             : '',
@@ -267,6 +278,13 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           content: [{ type: 'text', text }],
           structuredContent: {
             ...status,
+            // Same values the text above was rendered from, so the two channels cannot disagree
+            // about a separator.
+            staged,
+            unstaged,
+            untracked,
+            aheadCommits,
+            behindCommits,
             syncState: syncState(status.ahead, status.behind),
             externalChanges,
             session: ctx.shadows.sessionId,
@@ -279,7 +297,7 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
                 session: p.sessionId,
                 live: p.live,
                 lastSeen: p.heartbeatAt,
-                changes: entries ? entries.map((e) => e.path) : null,
+                changes: entries ? entries.map((e) => toPosix(e.path)) : null,
                 lastWriteAt: entries ? latestTouch(entries) : null,
               };
             }),
@@ -291,4 +309,17 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
       }
     },
   );
+}
+
+/**
+ * A commit list with every touched-file path spelled POSIX — the same rule the flat path lists
+ * above follow, applied to the one place a path hides inside a nested object. A commit's `files`
+ * come from `git --numstat`, so they are already `/`-separated; the conversion is the convention
+ * being visible rather than a fix, and it is a no-op on every platform.
+ */
+function posixCommits(commits: RemoteCommit[]): RemoteCommit[] {
+  return commits.map((c) => ({
+    ...c,
+    files: c.files.map((f) => ({ ...f, path: toPosix(f.path) })),
+  }));
 }

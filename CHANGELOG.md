@@ -1362,6 +1362,46 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Fixed
 
+- **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
+  `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.
+
+  `FileService.readBytes`' over-cap refusal ends "Open it directly at `<abs>`" — the one thing the
+  message is _for_, since it hands the caller a path instead of the bytes — and that path was
+  native, the same defect shape as the binary/large-file `note` #141 fixed four hundred lines up in
+  the same file. It is now `toPosix`'d **on the interpolation, never on `abs`**, exactly as that
+  note is: `abs` stays the `resolveInside` string that `readFile` and `this.revisions.record` key
+  on, and re-spelling it would file a baseline under a key no write looks up. The branch was left
+  untested in #141 for fear of a 25 MiB fixture; it needs none — `truncate` makes a sparse file
+  whose `stat` size is over the cap while it allocates no blocks, and the pre-read `stat` guard
+  never opens it, which is what the four cap tests beside it already do. **No injectable cap was
+  added**: the seam would have been production surface around a security-shaped number that
+  `src/lib/assets.ts` argues against in as many words, bought for nothing. The message surfaces in
+  no tool result — `revert`'s shadow-attribution loop catches every throw and logs it — so the test
+  is a unit one, and it fails against the old code.
+
+  `status`, `commit` and `revert` each mapped _some_ of their returned path lists through `toPosix`
+  and not others (`status`'s `sessionChanges` yes, its `staged`/`unstaged`/`untracked`/
+  `externalChanges`/`conflictedChanges`/`activeSessions[].changes` no; `commit`'s `leftUncommitted`
+  yes, its `files`/`conflicted`/`unrecorded`/`ignored`/`settled` no; `revert`'s `mismatchedFiles`
+  yes, its `files`/`conflictPaths` no), so one result could carry two spellings of the same kind of
+  data and the next reader could not tell which were converted by rule and which by accident. Every
+  such list is now converted once, at the reporting boundary, and the text channel is rendered from
+  that same value so the two cannot disagree. **No behaviour changes on any platform** — git's own
+  output is `/`-separated and a shadow key is normalised when it is recorded — which is the point:
+  this is the convention made uniform, not a Windows bug. What stays native is asserted rather than
+  assumed: `status` still hands `ctx.files.externalModifications` the raw git spellings it resolves
+  against the filesystem, `revert` still hands `settleAll`/`readAtRefBytes`/`readBytes`
+  `pre.touchedPaths` untouched, and `commit` converts strictly below every `git add` pathspec and
+  `check-ignore` probe. `src/tools/doctor.ts`'s `workspaceRoot` remains deliberately unconverted.
+
+  On coverage: a git-sourced list cannot be made to fail such a test, because a relative path from
+  git is `/`-separated everywhere and a filename literally holding a backslash comes back C-quoted
+  (`"out\\dir/notes.tex"`) rather than as a separator — so those conversions are no-ops by
+  construction and no assertion about them is written. The two lists that _can_ carry one are the
+  shadow-store-sourced ones, `status`'s `activeSessions[].changes` (read out of a file another
+  server process wrote) and `commit`'s `settled`; both are pinned under the stubbed-separator
+  harness and both fail against the old code.
+
 - **`logTail` carries the line that says _what_ failed, and a package name holding a `.` or a `-` is
   a warning at all** (#78, #73). Two gaps in the log de-noiser, both of which left `logTail` — the
   channel a text-only client reads — describing a compile the structured fields got right.
