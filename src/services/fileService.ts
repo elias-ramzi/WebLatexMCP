@@ -604,7 +604,11 @@ export class FileService {
    *
    * `recordBaseline` says whether **the caller could now base a write on this file**, and so
    * defaults to false. Record only when the caller asked for this file and received all of it:
-   * `read_file` does, and `list_references` (which hands back every entry verbatim). Nothing else
+   * `read_file` does, and `list_references` — but the latter only for a bibliography it returned
+   * WHOLE. It used to hold this licence outright, on the premise that it hands back every entry
+   * verbatim; #147 made `raw` cuttable, #165 the typed fields, and #170 dropped the default
+   * `maxResults` to 50, so a 200-entry `.bib` now shows 50 entries. It therefore decides per file,
+   * after its budgets have run, and claims only the files that shipped uncut (#171). Nothing else
    * qualifies — not a file the server chose for its own purposes (`detectRootFile` sniffing every
    * `.tex` for `\documentclass`), not five lines of context around a location a *log* named
    * (`compile`, `list_comments`), and not a file read only to answer a question about it
