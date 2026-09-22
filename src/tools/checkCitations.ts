@@ -10,6 +10,13 @@ import {
   type ReferenceEntry,
 } from '../lib/references.js';
 import { citingDocumentCandidates, referenceSourceCandidates } from '../lib/referenceSources.js';
+import {
+  CITATIONS_MAX_FINDINGS,
+  CITATIONS_MAX_PLACES,
+  CITATIONS_MAX_RESULTS,
+  planCitationsPayload,
+  type CitationsPlan,
+} from '../lib/citationsBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -38,6 +45,19 @@ const inputSchema = {
         'draft actually cites: a shared bibliography is not dead weight for one draft, so ' +
         'uncitedEntries comes back empty (run check_citations inside that project to audit it).',
     ),
+  maxResults: z
+    .number()
+    .int()
+    .min(1)
+    .max(CITATIONS_MAX_RESULTS)
+    .optional()
+    .describe(
+      `Cap on findings returned in EACH of the four lists (default ${CITATIONS_MAX_FINDINGS}). ` +
+        'A character budget applies on top and can cut further — advisory findings first, ' +
+        'undefinedCitations last — so raising this does not guarantee a longer report; narrow ' +
+        '`documents` or `bibliography` instead. Nothing is ever cut silently: every list has an ' +
+        '`…Omitted` count and `note` names which bound fired.',
+    ),
 };
 
 const placeSchema = z.object({ path: z.string(), line: z.number() });
@@ -56,7 +76,16 @@ const outputSchema = {
   entryCount: z.number(),
   citationCount: z.number().describe('Distinct cite keys used across the documents.'),
   undefinedCitations: z
-    .array(z.object({ key: z.string(), uses: z.array(placeSchema) }))
+    .array(
+      z.object({
+        key: z.string(),
+        uses: z.array(placeSchema),
+        usesOmitted: z
+          .number()
+          .optional()
+          .describe(`Further uses of this key, not listed (max ${CITATIONS_MAX_PLACES} shown).`),
+      }),
+    )
     .describe('Cited in a document but absent from every bibliography — these break the build.'),
   uncitedEntries: z
     .array(
@@ -71,10 +100,21 @@ const outputSchema = {
       'In the bibliography but never cited — dead weight, not an error. Always empty when ' +
         '`bibliographyProject` is set: a shared bibliography is meant to hold entries this draft ' +
         'does not cite, so listing them would be noise. Audit it by running check_citations ' +
-        'inside that project.',
+        'inside that project. Being advisory, this is also the first list the output budget cuts.',
     ),
   duplicateKeys: z
-    .array(z.object({ key: z.string(), occurrences: z.array(placeSchema) }))
+    .array(
+      z.object({
+        key: z.string(),
+        occurrences: z.array(placeSchema),
+        occurrencesOmitted: z
+          .number()
+          .optional()
+          .describe(
+            `Further definitions of this key, not listed (max ${CITATIONS_MAX_PLACES} shown).`,
+          ),
+      }),
+    )
     .describe(
       'The same cite key defined more than once; later definitions are ignored. Limited to cited ' +
         'keys when `bibliographyProject` is set.',
@@ -85,13 +125,35 @@ const outputSchema = {
         key: z.string(),
         path: z.string(),
         line: z.number(),
-        type: z.string().optional(),
+        type: z
+          .string()
+          .optional()
+          .describe('BibTeX entry type — it says which fields are required.'),
         missing: z.array(z.string()),
+        missingOmitted: z
+          .number()
+          .optional()
+          .describe(`Further missing fields, not listed (max ${CITATIONS_MAX_PLACES} shown).`),
       }),
     )
     .describe(
       'BibTeX entries missing a field their type requires ("a|b" means either will do). Limited ' +
         'to cited entries when `bibliographyProject` is set.',
+    ),
+  undefinedCitationsOmitted: z
+    .number()
+    .describe('Undefined citations found but not listed. Cut LAST — these break the build.'),
+  uncitedEntriesOmitted: z
+    .number()
+    .describe('Uncited entries found but not listed. Cut FIRST — advisory, and the longest list.'),
+  duplicateKeysOmitted: z.number().describe('Duplicate keys found but not listed.'),
+  incompleteEntriesOmitted: z.number().describe('Incomplete entries found but not listed.'),
+  note: z
+    .string()
+    .optional()
+    .describe(
+      'Present only when a bound cut something; names which list, how many, and whether the ' +
+        'per-list cap or the character budget fired. Nothing is ever dropped silently.',
     ),
 };
 
@@ -152,7 +214,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
       inputSchema,
       outputSchema,
     },
-    async ({ project, documents, bibliography, bibliographyProject }) => {
+    async ({ project, documents, bibliography, bibliographyProject, maxResults }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         // Resolved separately, so each path stays sandboxed inside the project it belongs to —
@@ -255,16 +317,22 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
           .filter((e) => e.missing.length > 0)
           .sort((a, b) => a.key.localeCompare(b.key));
 
+        // Every byte of all four lists is document-controlled, and a group .bib carried in the
+        // project routinely makes `uncitedEntries` hundreds of rows long on a perfectly ordinary
+        // paper. The planner cuts before anything is sent, counts what it cut, and decides the
+        // ORDER — advisory findings first, build-breaking ones last (issue #154).
+        const plan = planCitationsPayload(
+          { undefinedCitations, uncitedEntries, duplicateKeys, incompleteEntries },
+          { maxResults },
+        );
+
         const result = {
           documents: scanned,
           bibliographySources: sources,
           ...(foreign ? { bibliographyProject: bib.id } : {}),
           entryCount: entries.length,
           citationCount: uses.size,
-          undefinedCitations,
-          uncitedEntries,
-          duplicateKeys,
-          incompleteEntries,
+          ...plan,
         };
 
         return {
@@ -278,19 +346,32 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
   );
 }
 
-interface Report {
+/**
+ * What `render` reads: the header fields plus the planner's own output shape.
+ *
+ * The four lists are NOT restated here. They used to be, and had already drifted: the handler
+ * emits `incompleteEntries[].type` and `outputSchema` declares it, but the hand-written interface
+ * omitted it — harmless (an interface a non-literal argument is checked against permits extra
+ * properties, so nothing failed) but exactly the kind of divergence that becomes a real one the
+ * moment `render` wants a field the copy forgot. Extending {@link CitationsPlan} makes the
+ * renderer's view of the payload the same type the planner produces, so it cannot drift again.
+ */
+interface Report extends CitationsPlan {
   documents: string[];
   bibliographySources: string[];
   bibliographyProject?: string;
   entryCount: number;
   citationCount: number;
-  undefinedCitations: Array<{ key: string; uses: Array<{ path: string; line: number }> }>;
-  uncitedEntries: Array<{ key: string; path: string; line: number; title?: string }>;
-  duplicateKeys: Array<{ key: string; occurrences: Array<{ path: string; line: number }> }>;
-  incompleteEntries: Array<{ key: string; path: string; line: number; missing: string[] }>;
 }
 
-/** The findings as text, so a client that drops `structuredContent` still gets the whole report. */
+/**
+ * The findings as text, so a client that drops `structuredContent` still gets the whole report.
+ *
+ * Rendered from the ALREADY-CUT payload, never from the full lists: both channels ship in the
+ * same result, so a text channel built from the uncut findings would restore exactly the
+ * oversized payload the budget exists to prevent — the rule `search_files` states at
+ * `src/tools/searchFiles.ts`.
+ */
 function render(r: Report): string {
   const from = r.bibliographyProject ? ` (project "${r.bibliographyProject}")` : '';
   const lines = [
@@ -307,30 +388,42 @@ function render(r: Report): string {
   // Where the header ends, so "no problems" stays right whether or not the cross-project note
   // above added a line.
   const headerLines = lines.length;
-  const section = (title: string, items: string[]): void => {
-    if (items.length === 0) return;
-    lines.push('', `${title} (${items.length}):`, ...items.map((i) => `  ${i}`));
+  // A section whose entries were all cut still has to appear — "(showing 0 of 220)" is a finding,
+  // and dropping the heading would read as "no uncited entries" instead.
+  const section = (title: string, items: string[], omitted: number): void => {
+    if (items.length === 0 && omitted === 0) return;
+    const total = items.length + omitted;
+    const count = omitted > 0 ? `showing ${items.length} of ${total}` : `${total}`;
+    lines.push('', `${title} (${count}):`, ...items.map((i) => `  ${i}`));
   };
+  const places = (list: Array<{ path: string; line: number }>, omitted?: number): string =>
+    list.map((x) => `${x.path}:${x.line}`).join(', ') + (omitted ? `, +${omitted} more` : '');
   section(
     'Cited but not defined',
-    r.undefinedCitations.map(
-      (u) => `${u.key} — ${u.uses.map((x) => `${x.path}:${x.line}`).join(', ')}`,
-    ),
+    r.undefinedCitations.map((u) => `${u.key} — ${places(u.uses, u.usesOmitted)}`),
+    r.undefinedCitationsOmitted,
   );
   section(
     'Defined but never cited',
     r.uncitedEntries.map((e) => `${e.key} (${e.path}:${e.line})${e.title ? ` — ${e.title}` : ''}`),
+    r.uncitedEntriesOmitted,
   );
   section(
     'Duplicate keys',
-    r.duplicateKeys.map(
-      (d) => `${d.key} — ${d.occurrences.map((x) => `${x.path}:${x.line}`).join(', ')}`,
-    ),
+    r.duplicateKeys.map((d) => `${d.key} — ${places(d.occurrences, d.occurrencesOmitted)}`),
+    r.duplicateKeysOmitted,
   );
   section(
     'Missing required fields',
-    r.incompleteEntries.map((e) => `${e.key} (${e.path}:${e.line}) — ${e.missing.join(', ')}`),
+    r.incompleteEntries.map(
+      (e) =>
+        `${e.key} (${e.path}:${e.line}) — ` +
+        e.missing.join(', ') +
+        (e.missingOmitted ? `, +${e.missingOmitted} more` : ''),
+    ),
+    r.incompleteEntriesOmitted,
   );
   if (lines.length === headerLines) lines.push('', 'No problems found.');
+  if (r.note) lines.push('', r.note);
   return lines.join('\n');
 }
