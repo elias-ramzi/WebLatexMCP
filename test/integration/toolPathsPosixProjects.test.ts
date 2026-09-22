@@ -9,7 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry, readProjectRegistry } from '../../src/services/projectRegistry.js';
 import { createFakeRemote } from './helpers/bareRepo.js';
-import type { GitService } from '../../src/services/gitService.js';
+import { GitService } from '../../src/services/gitService.js';
 import type { FileService } from '../../src/services/fileService.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -336,5 +336,152 @@ describe('project_sync: paths at the response boundary', () => {
     // directory, so the conversion must sit below it.
     expect(cloneDirs).toEqual([nativeDir]);
     if (!WINDOWS) expect(cloneDirs[0]).toContain('\\');
+  });
+});
+
+/**
+ * `status` and `commit` — the second half of #148, and a different shape of the same rule.
+ *
+ * Both tools return several path lists, and before this some went through `toPosix` and some did
+ * not (`status`'s `sessionChanges` did, its `staged`/`unstaged`/`untracked`/`externalChanges`/
+ * `conflictedChanges`/`activeSessions[].changes` did not; `commit`'s `leftUncommitted` did, its
+ * `files`/`conflicted`/`unrecorded`/`ignored`/`settled` did not), so one result could carry two
+ * spellings of the same kind of data.
+ *
+ * What is testable here is narrower than the change, and the boundary is worth stating exactly:
+ *
+ *  - A list sourced from **git** (`staged`/`unstaged`/`untracked`, `files`, `conflictPaths`,
+ *    every `revert` list) is already `/`-separated on every platform, and the only way to put a
+ *    backslash in one is a filename literally containing one — which git C-quotes
+ *    (`"out\\dir/notes.tex"`), so it never arrives as a separator anyway. Converting those is a
+ *    no-op by construction; no assertion about them can fail, and none is written below.
+ *  - A list sourced from the **shadow store** can be made to carry one, because a shadow key is
+ *    a project-relative path this server composed, and it is read back out of a file another
+ *    server process wrote. Those are the two lists asserted here, and they do fail against the
+ *    unfixed code.
+ *
+ * Non-vacuous on the POSIX legs only, and by nature rather than by omission: a relative path on
+ * Windows has no backslash in it to begin with, which is the mirror image of the absolute-path
+ * tests above (where Windows is the real thing and POSIX needs the stub). The assertions still
+ * run there, they just cannot discriminate — the two `if (!WINDOWS)` guards below mark exactly
+ * where that is true.
+ */
+
+const IDENTITY = { name: 'Test', email: 'test@example.com' };
+
+/** A project-relative path whose DIRECTORY name carries the backslash segment. */
+const REL = `${SEGMENT}/notes.tex`;
+
+interface GitHarness {
+  /** Open a client for one session id, over the shared clone — as two agent sessions would. */
+  session: (id: string) => Promise<Client>;
+}
+
+async function gitSessions(): Promise<GitHarness> {
+  const remote = await createFakeRemote({ 'main.tex': 'x\n' });
+  cleanups.push(() => remote.cleanup());
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-posixlists-'));
+  cleanups.push(() => rmDir(workspace));
+  const dir = path.join(workspace, 'demo');
+  await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+  const session = async (id: string): Promise<Client> => {
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: id,
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `test-${id}`, version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.unshift(() => client.close());
+    return client;
+  };
+  return { session };
+}
+
+async function writeUnderSegment(client: Client, content: string): Promise<void> {
+  const res = await client.callTool({
+    name: 'write_file',
+    arguments: { project: 'demo', path: REL, content, createDirs: true },
+  });
+  expect(res.isError ?? false).toBe(false);
+}
+
+interface StatusOut {
+  activeSessions: Array<{ session: string; changes: string[] | null }>;
+}
+
+function statusOut(res: unknown): StatusOut {
+  return (res as { structuredContent: StatusOut }).structuredContent;
+}
+
+describe('status: path lists at the response boundary', () => {
+  it('reports a peer session’s changed paths with POSIX separators, in both channels', async () => {
+    // `activeSessions[].changes` is read out of the PEER's `shadow.json` — a file another server
+    // process wrote — so it is exactly the kind of value the boundary conversion is for.
+    const { session } = await gitSessions();
+    const mine = await session('sess-a');
+    const peer = await session('sess-b');
+    await writeUnderSegment(peer, 'peer line\n');
+
+    const res = await withWindowsSep(() =>
+      mine.callTool({ name: 'status', arguments: { project: 'demo' } }),
+    );
+    expect(res.isError ?? false).toBe(false);
+
+    const out = statusOut(res);
+    const listed = out.activeSessions.find((p) => p.session === 'sess-b');
+    expect(listed).toBeDefined();
+    expect(listed?.changes).toEqual([posixOf(REL)]);
+    const text = textOf(res);
+    // One converted value feeds both channels, so the peer line names the identical string.
+    expect(text).toContain(posixOf(REL));
+    if (!WINDOWS) {
+      // Where the assertions above discriminate: the shadow key genuinely holds a backslash, so
+      // the converted spelling differs from the raw one. On Windows a relative path has no
+      // backslash to convert and both spellings are the same string — hence the guard.
+      expect(REL).toContain('\\');
+      expect(listed?.changes?.[0]).not.toContain('\\');
+      expect(text).not.toContain(REL);
+    }
+  });
+});
+
+interface CommitOut {
+  committed: boolean;
+  settled: string[];
+}
+
+function commitOut(res: unknown): CommitOut {
+  return (res as { structuredContent: CommitOut }).structuredContent;
+}
+
+describe('commit: path lists at the response boundary', () => {
+  it('reports settled paths with POSIX separators', async () => {
+    // `settled` is the shadow spelling of every entry a deliberate scope "all" take dropped
+    // (`ShadowStore.settle`), so it comes from this session's own index rather than from git.
+    const { session } = await gitSessions();
+    const mine = await session('sess-a');
+    await writeUnderSegment(mine, 'my line\n');
+
+    const res = await withWindowsSep(() =>
+      mine.callTool({
+        name: 'commit',
+        arguments: { project: 'demo', message: 'add a note', scope: 'all' },
+      }),
+    );
+    expect(res.isError ?? false).toBe(false);
+
+    const out = commitOut(res);
+    expect(out.committed).toBe(true);
+    expect(out.settled).toEqual([posixOf(REL)]);
+    if (!WINDOWS) {
+      expect(REL).toContain('\\');
+      expect(out.settled[0]).not.toContain('\\');
+    }
   });
 });

@@ -500,4 +500,57 @@ describe('FileService readBytes size cap', () => {
     await mkdir(path.join(dir, 'adir'), { recursive: true });
     await expect(files.readBytes(dir, { path: 'adir' })).rejects.toThrow(/Not a file/);
   });
+
+  // "File paths are always POSIX (`/`-separated), on every OS" — docs/tools.md's opening
+  // promise, repeated in CLAUDE.md. This refusal hands the caller an absolute path to open
+  // INSTEAD of the bytes, so that path is the one thing the message is for, and it was the last
+  // native absolute path `FileService` emitted (issue #148 §1; the binary/large-file note in
+  // `read` was fixed by #141, in this same file, four hundred lines up).
+  //
+  // Not an integration test, and deliberately so: nothing surfaces this string in a tool result.
+  // Its only caller is `src/tools/revert.ts`, whose shadow-attribution loop catches every throw
+  // and logs it to stderr rather than failing the call — by design, since the revert is already
+  // on disk by then. So the unit layer is where this message is observable at all.
+  //
+  // The harness is `test/integration/toolPathsPosix.test.ts`'s, for its reason: `toPosix` splits
+  // on `path.sep`, which is `/` on a POSIX host, so the conversion is the identity there and a
+  // naive assertion passes against the unfixed code. A directory whose NAME carries a literal
+  // backslash (legal on POSIX) plus a `path.sep` stub over the narrowest possible window makes
+  // the conversion genuinely convert; on Windows both stand down, because the platform supplies
+  // real backslashes and a filename cannot contain one.
+  it('names the file to open with POSIX separators (over-cap refusal)', async () => {
+    const WINDOWS = process.platform === 'win32';
+    const projectDir = path.join(dir, WINDOWS ? 'capdir' : 'cap\\dir');
+    await mkdir(projectDir, { recursive: true });
+    const p = path.join(projectDir, 'over-cap-posix.bin');
+    await writeFile(p, '');
+    // Sparse: `truncate` allocates no blocks, and the guard reads `stat`, never the bytes — so
+    // the 25 MiB branch costs nothing on disk and needs no fixture. (The four tests above
+    // already rely on this.)
+    await truncate(p, MAX_BINARY_READ_BYTES + 1);
+
+    const original = Object.getOwnPropertyDescriptor(path, 'sep');
+    if (!WINDOWS) {
+      Object.defineProperty(path, 'sep', { value: '\\', configurable: true, writable: true });
+    }
+    let err: unknown;
+    try {
+      err = await files
+        .readBytes(projectDir, { path: 'over-cap-posix.bin' })
+        .then(() => null)
+        .catch((e: unknown) => e);
+    } finally {
+      if (!WINDOWS && original) Object.defineProperty(path, 'sep', original);
+    }
+
+    // Guard the harness itself: with no backslash in the native spelling there is nothing to
+    // convert and everything below would pass either way.
+    expect(p).toContain('\\');
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toContain(`Open it directly at ${p.split('\\').join('/')}.`);
+    // What the unfixed code said. The whole assertion, since the two spellings differ only in
+    // the separator.
+    expect(msg).not.toContain(p);
+  });
 });

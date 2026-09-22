@@ -168,6 +168,15 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             // sides are one call away and nothing here needs budgeting the way `push`'s
             // rendered conflict payload does.
             const oursRef = 'HEAD';
+            // Spelled the one way docs/tools.md's opening line promises ("file paths are always
+            // POSIX, on every OS"), from one conversion feeding the text channel and
+            // `structuredContent` alike — `mismatchedFiles` on the success path already was, and
+            // `files`/`conflictPaths` were not, which is how one result came to carry two
+            // spellings of the same kind of data (#148 §2). git's own output is `/`-separated, so
+            // this changes nothing on any platform; it makes the rule uniform. Note what stays
+            // native: `pre.touchedPaths` is what `settleAll`, `readAtRefBytes` and `readBytes`
+            // are given below, and is never converted — the trap `toPosixOut`'s doc comment names.
+            const conflictPaths = res.conflictPaths.map(toPosix);
             // Only when ONE commit with ONE parent was reverted does a single ref name what the
             // revert would restore. For a multi-commit revert each commit restores its own
             // parent, and a root commit has none — `<sha>^` would not even resolve. Null then,
@@ -175,7 +184,7 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             const theirsRef = pre.restoreRef;
             const text = [
               `revert conflicted — nothing changed on disk (the revert was aborted).`,
-              `conflicting: ${res.conflictPaths.join(', ')}`,
+              `conflicting: ${conflictPaths.join(', ')}`,
               theirsRef === null
                 ? `Read the current content with read_file and ref "${oursRef}". Each reverted ` +
                   'commit restores its own parent, so read the side you want at that commit' +
@@ -196,7 +205,7 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
                 matchesRef: null,
                 expectRef: expectRef ?? null,
                 mismatchedFiles: [],
-                conflictPaths: res.conflictPaths,
+                conflictPaths,
                 oursRef,
                 theirsRef,
               },
@@ -341,25 +350,31 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
           const matchesRef: boolean | null =
             res.mismatchedFiles === null ? null : mismatchedFiles.length === 0;
 
-          const added = res.files.reduce((sum, f) => sum + f.added, 0);
-          const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
+          // As on the conflict branch above: one conversion each, for both channels. `restored`
+          // holds `pre.touchedPaths` entries, so it is converted HERE for display only — the
+          // array itself was handed to git and to `FileService` untouched.
+          const files = res.files.map((f) => ({ ...f, path: toPosix(f.path) }));
+          const conflictPaths = res.conflictPaths.map(toPosix);
+          const restoredOut = restored.map(toPosix);
+          const added = files.reduce((sum, f) => sum + f.added, 0);
+          const removed = files.reduce((sum, f) => sum + f.removed, 0);
           const shas = pre.commits.map((c) => c.slice(0, 8)).join(', ');
           const text = [
             `reverted ${shas} — ${res.filesChanged} file(s), +${added} -${removed}, ` +
               'not committed',
-            ...res.files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
+            ...files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
             matchesRef === null
               ? ''
               : matchesRef
                 ? `the reverted paths now match "${expectRef ?? ''}"`
                 : `the reverted paths do NOT match "${expectRef ?? ''}": ` +
                   mismatchedFiles.map((f) => `${f.path} +${f.added} -${f.removed}`).join(', '),
-            restored.length === 0
+            restoredOut.length === 0
               ? ''
               : `restored, and therefore untracked — \`diff\` does NOT show ` +
-                `${restored.length === 1 ? 'it' : 'them'} (git diff ignores untracked files); ` +
-                `read ${restored.length === 1 ? 'it' : 'them'} with \`read_file\` or see ` +
-                `\`status\`: ${restored.join(', ')}`,
+                `${restoredOut.length === 1 ? 'it' : 'them'} (git diff ignores untracked files); ` +
+                `read ${restoredOut.length === 1 ? 'it' : 'them'} with \`read_file\` or see ` +
+                `\`status\`: ${restoredOut.join(', ')}`,
             'Nothing is committed — review with `diff`, then land it with `commit`.',
           ]
             .filter(Boolean)
@@ -371,12 +386,12 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
               status: res.status,
               reverted: true,
               commits: res.commits,
-              files: res.files,
+              files,
               filesChanged: res.filesChanged,
               matchesRef,
               expectRef: expectRef ?? null,
               mismatchedFiles,
-              conflictPaths: res.conflictPaths,
+              conflictPaths,
               oursRef: null,
               theirsRef: null,
             },

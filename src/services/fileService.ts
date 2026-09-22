@@ -750,7 +750,14 @@ export class FileService {
       throw new Error(
         `"${opts.path}" is ${info.size} bytes, over the ${MAX_BINARY_READ_BYTES}-byte binary read ` +
           `cap (the text read cap, ${MAX_READ_BYTES} bytes, is a separate and smaller limit). ` +
-          `Open it directly at ${abs}.`,
+          // `toPosix` on the interpolation, NOT on `abs` — exactly as the binary/large-file note
+          // in `read` above does it, and for the same two reasons. The sentence is the one thing
+          // this refusal is FOR (it hands the caller a path to open instead of the bytes), so it
+          // is spelled the way every other path this server returns is; while `abs` itself stays
+          // native, because it is the `resolveInside` string that `readFile` and
+          // `this.revisions.record` below key on, and re-spelling it would file a baseline under
+          // a key no write ever looks up.
+          `Open it directly at ${toPosix(abs)}.`,
       );
     }
     const buf = await readFile(abs);
