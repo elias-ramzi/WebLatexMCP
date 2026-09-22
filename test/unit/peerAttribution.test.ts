@@ -509,10 +509,27 @@ describe('renderPeerRefusal', () => {
       const pointer = renderPeerRefusal(paths, a, NOW)
         .split('\n')
         .find((l) => l.startsWith('Lists here are capped')) as string;
-      expect(pointer).toContain('names every path they omit, uncapped');
+      expect(pointer).toContain('covers the same ground more fully');
       expect(pointer).toContain('a superset of the files named here');
       expect(pointer).not.toContain('reports them whole');
       expect(pointer).not.toContain('above');
+    });
+
+    // Issue #185: the line used to say `status` "names every path they omit, uncapped", which #175
+    // falsified by budgeting `otherChanges` and capping `activeSessions`. The claim of
+    // completeness is what must never come back — a *stuck* caller reads this line and nothing
+    // else. The behavioural half of this (that those lists really are cut, and that the counters
+    // named here are the ones that ship) lives in `test/unit/statusPointerClaim.test.ts`; this is
+    // only the wording guard.
+    it('never claims those `status` lists are uncapped or complete', () => {
+      const paths = Array.from({ length: REFUSAL_PATH_CAP + 1 }, (_, i) => `u${i}.tex`);
+      const a: Attribution = { sessions: [], unowned: paths };
+      const pointer = renderPeerRefusal(paths, a, NOW)
+        .split('\n')
+        .find((l) => l.startsWith('Lists here are capped')) as string;
+      expect(pointer).not.toMatch(/uncapped/i);
+      expect(pointer).not.toMatch(/names every path/i);
+      expect(pointer).not.toMatch(/\bin full\b/i);
     });
 
     it('spells out the subtraction that yields the unowned set, and the null-claims-everything rule', () => {
