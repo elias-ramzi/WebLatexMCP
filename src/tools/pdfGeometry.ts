@@ -284,6 +284,20 @@ const outputSchema = {
         'believed. Nothing is missing from the index because of it. Almost always 0; a non-zero ' +
         'value says the .aux is malformed or hostile, not that the float index is incomplete.',
     ),
+  floatsIndeterminate: z
+    .number()
+    .optional()
+    .describe(
+      'Present only when "floats" was requested: \\newlabel markers whose own label key was ' +
+        "opened with a { that no closing brace could be found for within the parser's scan " +
+        'budget, so nothing at all about them could be read — not even the key, which means ' +
+        'they cannot be told apart from a cleveref shadow record. It means only that a marker ' +
+        'was there and nothing can be said about it. NOT added to floatsDropped, ' +
+        'floatsRefused, floatsOmitted or floatsOmittedBySize, and never folded into any of ' +
+        'them: floatsDropped means "a real entry is missing", floatsRefused means "nothing is ' +
+        'missing, something that looked like an entry was declined", and this means neither. ' +
+        'Almost always 0; a non-zero value says the .aux is malformed or hostile.',
+    ),
   note: z
     .string()
     .optional()
@@ -412,6 +426,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           let floatsOmittedBySize: number | undefined;
           let floatsDropped: number | undefined;
           let floatsRefused: number | undefined;
+          let floatsIndeterminate: number | undefined;
           let note: string | undefined;
           if (requestedKinds.includes('floats')) {
             const auxResult = await readAuxFloats(dir, root);
@@ -437,6 +452,14 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // (which is what this tool did until now) hides the only signal that the .aux is
             // malformed at all.
             floatsRefused = auxResult.refused;
+            // A FIFTH counter, and the reason it is not one of the four above is that it makes
+            // a weaker claim than any of them: a \newlabel marker was there and its key never
+            // closed, so there is no label to call lost (floatsDropped) and no grounds to call
+            // the bytes a fabrication either (floatsRefused). With no key there is nothing to
+            // test for a cleveref shadow, so folding it into floatsDropped could report a
+            // shadow record — excluded from the index by design — as a missing float. Until
+            // #139 these markers were counted nowhere at all and simply vanished.
+            floatsIndeterminate = auxResult.indeterminate;
             // Joined, never overwritten. In practice they cannot both be set — the reader's note
             // fires only when there is no .aux at all, which is also the case in which there are
             // no floats for the budget to cut — but "cannot happen" is not a reason to write code
@@ -458,6 +481,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             floatsOmittedBySize,
             floatsDropped,
             floatsRefused,
+            floatsIndeterminate,
             note,
           };
 
@@ -503,7 +527,13 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                 (floatsDropped ? ` (${floatsDropped} unreportable)` : '') +
                 // Worded apart from "unreportable" on purpose: nothing was lost here, so the
                 // text channel must not read as though something was. See floatsRefused.
-                (floatsRefused ? ` (${floatsRefused} refused as not an entry)` : '')
+                (floatsRefused ? ` (${floatsRefused} refused as not an entry)` : '') +
+                // Worded apart from BOTH of the above: nothing is claimed lost and nothing is
+                // claimed fabricated, only that a marker could not be read. See
+                // floatsIndeterminate.
+                (floatsIndeterminate
+                  ? ` (${floatsIndeterminate} marker(s) too malformed to judge)`
+                  : '')
               : '';
           const noteLine = note ? `  … ${note}` : '';
           const text = [header, ...pageLines, skippedLine, floatsLine, noteLine]

@@ -1588,6 +1588,45 @@ additional properties`. The suite missed it because a test client that never lis
   a sheared run placed where text actually goes. Both now place naturally, and the sweep's
   `k !== 0` cases fail on the old code.
 
+- **A DOCUMENTED CONTRACT WAS REVERSED: a `\newlabel` inside a group that closes nowhere in the
+  `.aux` is no longer reported as a real float** (#139 §1, closing the last sub-case of #80 §3).
+  #119 left this reportable as a deliberate **recall bet** — a corrupt or truncated `.aux` tail
+  probably still holds real records, so keep them — and wave 7 (#133) pinned the behaviour with a
+  characterization test so the bet could not be lost silently. The repository owner has reversed
+  it, and `auxFloats.ts` now **fails closed**: an unclosed group makes every later marker a
+  counted `refused`, not a float.
+
+  The reason is the harm path, not tidiness. `render_pages` and `extract_text` both read this
+  index for label→page lookup, so a fabricated label whose key collides with a requested one
+  resolves to a page the tool then renders **with confidence** — off bytes the document itself
+  controls. That is the failure shape the rest of the server refuses by construction. The
+  evidence was never the problem either: a brace walk that reaches end-of-file without the depth
+  touching 0 **proves** the group is open at every position after it, and the walk is already
+  paid for. (The older comment justifying the asymmetry with "there is no cheap check left to
+  make" was false, and was corrected in #133 before the decision itself was revisited.)
+
+  What is actually given up is narrow. On the shape the bet was made for — an `.aux` cut off
+  mid-write by a killed `latexmk` — the unclosed group is the last thing in the file, so there is
+  nothing after it to refuse and every entry before it is still reported. What is given up is
+  recall on a file where a group opens, never closes, and legitimate entries follow it anyway.
+  Mechanically it is one span: `searchFrom` is still never advanced on these branches, so the
+  "never advance on a guess" rule is untouched and the
+  `PARSE_BOUND * (MAX_GROUP_SCAN + GROUP_SKIP_SCAN)` work bound is unchanged.
+
+- **A `\newlabel` whose own key group never closes is counted instead of vanishing** (#139 §2,
+  the key-side remainder of #76's FINDING 2). Such a marker produced no outcome at all: `total`,
+  `dropped` and `refused` all zero, a real marker gone with nothing saying it had been there.
+  It now lands in a **third** count, `pdf_geometry`'s `floatsIndeterminate` — deliberately not
+  folded into either neighbour, and added to neither. `floatsDropped` means "a real entry is
+  missing"; with no key text there is nothing to test for a cleveref shadow record, so folding it
+  in could report a shadow (excluded from the index by design) as a lost float.
+  `floatsRefused` means the opposite, "nothing is missing, a fake was declined", which is a claim
+  about the bytes that nothing here supports either. The new count says only: a marker existed
+  and we can say nothing about it. Length is not the line — a key `{` that never closes is
+  counted whether the scan ran out of budget or out of file — but a `\newlabel` followed by no
+  `{` at all still is not, because nothing was opened and there is no evidence an invocation was
+  ever there.
+
 - **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
   read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
   `list_skills` renders the same instruction text as the skill prompts but was still calling

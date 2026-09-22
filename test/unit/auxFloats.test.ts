@@ -42,13 +42,25 @@ describe('parseAuxLabels', () => {
     ]);
   });
 
-  it('skips a \\newlabel truncated mid-brace without throwing, and keeps scanning', () => {
+  it('#139: a \\newlabel truncated mid-brace does not throw, keeps what precedes it, and refuses what follows', () => {
+    // CONTRACT REVERSED in #139 §1 (wave 8), deliberately and by the repository owner's call.
+    // This test used to assert `[{fig:ok}]` — that a marker after an unclosed group is still a
+    // real entry. It is not: `broken`'s outer group opens and closes NOWHERE in the file, which
+    // PROVES (see scanBalance — a depth reaching 0 returns 'closed') that every byte after it is
+    // inside that group. So `fig:ok` is \newlabel-shaped text in another entry's argument, and
+    // reporting it hands render_pages/extract_text a label->page row invented by a
+    // document-controlled .aux, which they then render with confidence. #119 kept it reportable
+    // as a RECALL bet on corrupt tails; #139 reversed the bet and fails closed instead.
+    //
+    // What the reversal does NOT cost is the recall that actually matters on a truncated file:
+    // everything BEFORE the damage is still reported, which is what `fig:before` pins here.
     const aux = [
+      '\\newlabel{fig:before}{{1}{3}}',
       '\\newlabel{broken}{{1}{2}', // no closing brace for the outer group
       '\\newlabel{fig:ok}{{4}{8}}',
     ].join('\n');
     expect(() => parseAuxLabels(aux)).not.toThrow();
-    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:before', number: '1', page: '3' }]);
   });
 
   it('skips a \\newlabel with a missing key group without throwing', () => {
@@ -159,19 +171,26 @@ describe('parseAuxLabels', () => {
     expect(result).toEqual([{ label: 'fig:after', number: '4', page: '8' }]);
   });
 
-  it('#80 §3: keeps the truncated outcome distinct — a group unbalanced to the TRUE end of the file still lets later markers through', () => {
-    // The three outcomes must not collapse into one policy. Here the outer group blows the
-    // MAX_GROUP_SCAN budget but the GROUP_SKIP_SCAN retry reaches the real end of the string
-    // without ever balancing (readGroupOrSkip's 'exhausted' + reason 'truncated'), which PROVES
-    // no closing brace exists anywhere. There is no cheap check left to make and nothing to walk
-    // forward over, so parseAuxLabels' long-standing recall contract for a corrupt tail stands:
-    // the markers that follow are treated as entries of their own, exactly as before this fix.
-    // Contrast the test above, where the file continues past the budget and the walk can go on.
+  it('#139: the truncated outcome no longer lets later markers through — a group unbalanced to the TRUE end of the file refuses them', () => {
+    // THE BET THIS TEST PINS WAS REVERSED. Wave 7 (PR #133) wrote this test to pin #119's recall
+    // contract — "a group unbalanced to the TRUE end of the file still lets later markers
+    // through" — precisely so the bet could not be lost silently. Wave 8 (#139 §1) reverses it
+    // on the owner's call, so the test is rewritten to the new contract rather than deleted: the
+    // reversal now cannot be lost silently either.
+    //
+    // Why reversed: the outer group blows the MAX_GROUP_SCAN budget and the GROUP_SKIP_SCAN
+    // retry reaches the real end of the string without ever balancing (readGroupOrSkip's
+    // 'exhausted' + reason 'truncated'), which PROVES no closing brace exists anywhere — so
+    // fig:ok is provably inside fig:broken's group. Establishing that costs nothing (the walk is
+    // already paid for; the old "no cheap check left to make" justification was false and was
+    // corrected in #133). Reporting it anyway is a fabricated label->page row off a
+    // document-controlled .aux, which render_pages resolves and renders with confidence.
     const pad = 'x'.repeat(MAX_GROUP_SCAN + 2000);
     const aux = `\\newlabel{fig:broken}{{1}{7}{${pad}\n\\newlabel{fig:ok}{{4}{8}}`;
     expect(pad.length + 80).toBeLessThan(GROUP_SKIP_SCAN); // the retry really does reach EOF
 
-    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    // Was [{ label: 'fig:ok', number: '4', page: '8' }] on dev, before #139.
+    expect(parseAuxLabels(aux)).toEqual([]);
   });
 
   it('stays linear on a file of markers buried in ONE unclosed group (the #80 §3 open-span path)', () => {
@@ -217,6 +236,75 @@ describe('parseAuxLabels', () => {
     const tSmall = medianOf3Ms(n);
     const tLarge = medianOf3Ms(n * 2);
     expect(tLarge / tSmall).toBeLessThan(3.0);
+  });
+
+  it('#139: stays linear on markers following a group that closes NOWHERE (the branch #139 added a span to)', () => {
+    // #139 §1 opens an OpenSpan on the 'truncated'/'unbalanced' branches, where none was opened
+    // before, so this is new work on a path that had none. The obvious wrong way to answer "is
+    // this marker inside that group?" is to re-walk the group from its own start for every
+    // marker: O(n) per marker over O(n) markers, i.e. the 27-second blowup the scan bounds exist
+    // to prevent. It is answered instead by the same forward-only cursor the 'tooLong' branch
+    // uses — and on THIS branch the cursor already sits at end-of-file, so each continuation is
+    // a no-op and the per-marker cost is O(1) outright, not merely amortized.
+    //
+    // A scaling ratio, never a wall-clock budget: PR #136 removed this repo's last two absolute
+    // budgets because they flake across machines and barely discriminate.
+    function build(markers: number): string {
+      // One group that opens and never closes, with `markers` well-formed \newlabel markers
+      // after it. Every one of them is inside it, so every one must be refused.
+      const tail = Array.from(
+        { length: markers },
+        (_, i) => `\\newlabel{l${i}}{{${i}}{${i}}}`,
+      ).join('\n');
+      return `\\newlabel{fig:real}{{1}{7}{${tail}`;
+    }
+
+    const SMALL = 275;
+    const LARGE = SMALL * 2;
+    // The branch under test is reachable ONLY while the whole file is within the retry's reach:
+    // past GROUP_SKIP_SCAN the retry is budget-exhausted and this silently measures the OLD
+    // 'tooLong' path instead. Asserted rather than assumed, so the input cannot drift off it.
+    expect(build(LARGE).length).toBeLessThan(GROUP_SKIP_SCAN);
+    // Nothing is reported. Pre-#139 every buried marker came back as a fabricated row, which is
+    // also why this is the cheapest possible correctness check to pair with the timing.
+    expect(parseAuxLabels(build(LARGE), { maxLabels: LARGE })).toEqual([]);
+
+    // That cap on input size also caps the work one parse can do, so each half is repeated to
+    // get the measurement clear of timer resolution.
+    const REPS = 800;
+    function timeMs(markers: number): number {
+      const aux = build(markers);
+      const start = Date.now();
+      for (let r = 0; r < REPS; r++) parseAuxLabels(aux, { maxLabels: markers });
+      return Date.now() - start;
+    }
+    timeMs(SMALL); // warm the JIT, so round 0 is not the outlier every run
+
+    // Paired within each round and the MEDIAN OF THE RATIOS taken, not the ratio of two medians:
+    // this file runs in a parallel vitest worker pool, and pairing keeps a contention spike in
+    // the numerator alongside the denominator it should be compared against.
+    const ratios: number[] = [];
+    for (let round = 0; round < 5; round += 1) {
+      const small = timeMs(SMALL);
+      const large = timeMs(LARGE);
+      // Non-vacuity floor. A ratio computed from two sub-millisecond readings is noise, and
+      // clamping them to a floor (as the sibling tests above must, at their sizes) would make
+      // this assertion pass whatever the code does. Measured locally at 75-130ms for this half,
+      // so 5ms leaves well over an order of magnitude of headroom for a faster machine.
+      expect(large).toBeGreaterThanOrEqual(5);
+      ratios.push(large / Math.max(small, 1));
+    }
+    ratios.sort((a, b) => a - b);
+    const median = ratios[2];
+    if (median === undefined) {
+      throw new Error('unreachable: ratios always has exactly 5 elements');
+    }
+
+    // Doubling the input roughly doubles the time when the cursor is forward-only. Measured on
+    // this implementation: 1.15-2.42x. Measured against a reference that re-walks the group from
+    // its start for every marker (the quadratic mistake this guards): 3.69-5.72x. 3.0 sits
+    // between them and matches the threshold the two sibling linearity tests already use.
+    expect(median).toBeLessThan(3.0);
   });
 
   it('stays linear (not quadratic) on a large file of unbalanced \\newlabel markers', () => {
@@ -325,6 +413,7 @@ describe('readAuxFloats', () => {
       total: 2,
       dropped: 0,
       refused: 0,
+      indeterminate: 0,
     });
   });
 
@@ -572,21 +661,16 @@ describe('readAuxFloats', () => {
     expect(result.refused).toBe(1);
   });
 
-  it('#80 §3 RESIDUAL (characterization, not an endorsement): a fake inside a group that closes NOWHERE is still reported', async () => {
-    // What is closed and what is not, measured rather than reasoned about. The sibling test
-    // above covers the sub-case issue #80 §3 actually names — a fake more than GROUP_SKIP_SCAN
-    // characters into a group the file continues past — and it is refused. THIS is the sub-case
-    // that is left: the group closes nowhere at all, so `readGroupOrSkip` answers 'exhausted' +
-    // reason 'truncated' (or plain 'unbalanced'), no OpenSpan is opened, and the next indexOf
-    // picks the fake up as a real entry.
+  it('#139 §1: a fake inside a group that closes NOWHERE is refused too — the last #80 §3 fabrication path', async () => {
+    // The sub-case #119 left open, and the exact input wave 7 pinned as a characterization of
+    // it. Pre-#139 this returned floats: [{fig:fake, 9, 999}] with refused: 0 — a row invented
+    // by the .aux's own bytes, indistinguishable in the payload from a real one, which
+    // render_pages and extract_text resolve to a page and render with confidence.
     //
-    // It is pinned here deliberately, ugly result and all, for two reasons. It is the only
-    // fabrication path left in this file and a report is easy to lose, whereas a test is not.
-    // And closing it is a one-line change (open a span on those branches too, leaving searchFrom
-    // exactly where it is — the walk has already proven the group is open at every position to
-    // end-of-file, so the check costs nothing) which would REVERSE the recall contract the test
-    // 'keeps the truncated outcome distinct' pins, so whoever closes it has to change that test
-    // in the same breath. Failing here is the intended way to find that out.
+    // The group closes nowhere at all, so readGroupOrSkip answers 'exhausted' + reason
+    // 'truncated'. That answer is a PROOF the group is open from `start` to end-of-file, so an
+    // OpenSpan is opened on that branch now (searchFrom is still not advanced — nothing was
+    // located to advance to, and "never advance on a guess" is untouched).
     dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
     const auxPath = buildAuxPath(dir, 'main.tex');
     await mkdir(path.dirname(auxPath), { recursive: true });
@@ -597,13 +681,109 @@ describe('readAuxFloats', () => {
     expect(pad.length + 100).toBeLessThan(GROUP_SKIP_SCAN);
 
     const result = await readAuxFloats(dir, 'main.tex');
-    // Reported as an ordinary float, indistinguishable from a real one, with refused at 0 — so
-    // nothing in the payload tells a caller this row was invented by the .aux's own bytes.
-    expect(result.floats).toEqual([{ label: 'fig:fake', number: '9', page: '999' }]);
-    expect(result.total).toBe(1);
-    expect(result.refused).toBe(0);
-    // fig:real itself is still counted, so the loss half of #80 §3 is closed even here.
+    expect(result.floats).toEqual([]);
+    expect(result.total).toBe(0);
+    // fig:real is a real entry the caller does not get (dropped); fig:fake is a fabrication
+    // declined (refused). The counts stay apart, exactly as on the 'tooLong' sibling — which is
+    // the point: the two branches now answer the same question the same way, and the asymmetry
+    // #119 documented is gone.
     expect(result.dropped).toBe(1);
+    expect(result.refused).toBe(1);
+    // Nothing here is indeterminate: fig:real's KEY parsed fine, only its outer group did not.
+    expect(result.indeterminate).toBe(0);
+  });
+
+  it('#139 §2: a \\newlabel whose KEY group never closes is counted as indeterminate, not dropped and not refused', async () => {
+    // Issue #139 §2, the key-side remainder of #76's FINDING 2. The KEY group exceeds even the
+    // GROUP_SKIP_SCAN retry without closing while the file continues past it (readGroupOrSkip's
+    // 'exhausted' + reason 'tooLong'), so nothing at all about the marker could be read.
+    //
+    // Watched failing pre-fix on dev: {"total":1,"dropped":0,"refused":0} with no third count at
+    // all — the marker simply vanished and nothing said it had been there.
+    //
+    // It must be its OWN count, not folded into either neighbour. `dropped` means "a real entry
+    // is missing"; there is no key text here, so there is nothing to test isCleverefShadow
+    // against and a cleveref shadow record (excluded from the index by design) would be reported
+    // as a lost float. `refused` means the opposite — "nothing is missing, a fake was declined"
+    // — which is a claim about the bytes that nothing here supports either.
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    // >16 KB of key with no closing brace, and ordinary .aux text after it so the retry is
+    // BUDGET-exhausted rather than running off the end of the file.
+    const hugeKey = 'k'.repeat(GROUP_SKIP_SCAN + 100);
+    const trailer = ' and the file continues well past the retry budget with ordinary text.';
+    await writeFile(auxPath, `\\newlabel{fig:a}{{1}{3}}\n\\newlabel{${hugeKey}${trailer}`);
+    expect(hugeKey.length).toBeGreaterThan(GROUP_SKIP_SCAN); // the shape this test is about
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    // The real entry before it is untouched.
+    expect(result.floats).toEqual([{ label: 'fig:a', number: '1', page: '3' }]);
+    expect(result.total).toBe(1);
+    expect(result.indeterminate).toBe(1);
+    // Neither of the other two fires, and the new count is added to neither of them.
+    expect(result.dropped).toBe(0);
+    expect(result.refused).toBe(0);
+  });
+
+  it('#139 §2: an unclosed KEY is indeterminate whether the retry runs out of budget or out of file', async () => {
+    // Length must not be the line. The same "key opened, never closed" state reaches
+    // readGroupOrSkip as three different outcomes depending only on how far the file happens to
+    // extend past it — 'exhausted'/'tooLong' (above), 'exhausted'/'truncated' (>MAX_GROUP_SCAN,
+    // running off the end), and plain 'unbalanced' (a short key running off the end). A counter
+    // that fired on only some of them would be drawing a 4096-character distinction no caller
+    // could act on, so all three are counted and this pins it.
+    for (const key of ['k'.repeat(MAX_GROUP_SCAN + 100), 'fig:b']) {
+      dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+      const auxPath = buildAuxPath(dir, 'main.tex');
+      await mkdir(path.dirname(auxPath), { recursive: true });
+      // Nothing after the key at all, so the walk runs off the TRUE end of the file.
+      await writeFile(auxPath, `\\newlabel{fig:a}{{1}{3}}\n\\newlabel{${key}`);
+
+      const result = await readAuxFloats(dir, 'main.tex');
+      expect(result.floats).toEqual([{ label: 'fig:a', number: '1', page: '3' }]);
+      expect(result.indeterminate).toBe(1);
+      expect(result.dropped).toBe(0);
+      expect(result.refused).toBe(0);
+    }
+  });
+
+  it('#139 §2: a \\newlabel not followed by a brace at all is NOT indeterminate — nothing was opened', async () => {
+    // The one key-side failure that stays a silent skip, and the boundary is deliberate: with no
+    // `{` there is no evidence a \\newlabel INVOCATION was ever there (the bytes may be prose, or
+    // \\newlabelfoo), so counting it would put a number on text rather than on a marker. It also
+    // must not open a span, or arbitrary prose containing the word \\newlabel would start
+    // refusing every real entry after it — which fig:ok pins.
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    await writeFile(auxPath, '\\newlabel not-a-brace at all\n\\newlabel{fig:ok}{{4}{8}}');
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.floats).toEqual([{ label: 'fig:ok', number: '4', page: '8' }]);
+    expect(result.indeterminate).toBe(0);
+    expect(result.dropped).toBe(0);
+    expect(result.refused).toBe(0);
+  });
+
+  it('#139: an unclosed KEY opens a span too — a marker after it is refused, never fabricated', async () => {
+    // The two halves of #139 meeting: the unreadable key is counted (indeterminate), and because
+    // its `{` is provably still open, the \\newlabel-shaped text after it is refused rather than
+    // believed. The counts stay distinct: one marker we can say nothing about, one string we
+    // declined to read as an entry.
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const hugeKey = 'k'.repeat(GROUP_SKIP_SCAN + 100);
+    const trailer = ' and the file continues well past the retry budget with ordinary text.';
+    await writeFile(auxPath, `\\newlabel{${hugeKey}${trailer}\n\\newlabel{fig:after}{{4}{8}}`);
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.floats).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(result.indeterminate).toBe(1);
+    expect(result.refused).toBe(1);
+    expect(result.dropped).toBe(0);
   });
 
   it('respects an explicit max override', async () => {
