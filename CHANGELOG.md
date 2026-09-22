@@ -1450,6 +1450,30 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   new optional `maxResults` narrows by count (it can only narrow; the character budget is fixed),
   and an uncut listing is unchanged on the wire: the same one line per entry, the same
   `No matching files.`, no note.
+- **`list_comments` is budgeted, and its payload no longer ships twice unbounded** (#163, #68,
+  #153). The tool had no cap of any kind — no `maxResults`, no character budget, no counter — and
+  it rendered every comment **twice**: once into `structuredContent.comments`, once field for field
+  into the result text. `quote` is the PDF text the user selected (a selection can be a page),
+  `snippet` is five lines of project source, and `note` is uncapped user text — so 200 comments on
+  a paper under review, which is the ordinary case rather than the bad one, reached the ~67k
+  payload a client rejected **undelivered** in #68. A new pure planner, `src/lib/commentsBudget.ts`,
+  fixes it in the house shape (a budget, a plan, a `budgetNote`, a thin tool layer), with the render
+  templates living beside the cost function that **calls** them so the charge and the text cannot
+  drift, and the text channel rendered from the already-cut payload rather than from the full one.
+  The priority order is **within** a comment rather than between comments, because every comment is
+  equally something the user asked about: identity and location survive first, then `note` (clipped,
+  never dropped — it is the one field with no copy anywhere else a tool can reach), then `quote`
+  (still selectable in the viewer), then `snippet` (one `read_file` at the comment's own
+  `file`:`line`). So the recoverable fields are cut across **every** comment before a single comment
+  is dropped — dropping the 150th comment makes the user's 150th note invisible and puts it beyond
+  `resolve_comments`, which takes `ids` that come only from here. New `structuredContent` keys, all
+  declared in the `outputSchema` (an undeclared one makes the whole call fail `-32602` and return
+  nothing — #137, #146): `commentsOmitted`, `quotesOmitted`, `snippetsOmitted`, `truncated`,
+  `budgetNote`, and per comment `noteOmittedChars`/`quoteOmittedChars`/`snippetOmittedChars`, whose
+  presence is what tells a budget cut apart from the innocent reasons a field is absent (the user
+  selected no text; no synctex location; a withheld path). The unopenable-path guard is untouched
+  and runs first: the budget only ever removes fields, so a `file`/`line`/`snippet` withheld because
+  the document named a path leaving the project can never come back through it.
 
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.
