@@ -63,7 +63,10 @@ export const MAX_GROUP_SCAN = 4096;
  * `scanAuxEntries` advances `searchFrom` past that outcome depends on WHY it failed
  * (`readGroupOrSkip`'s own doc has the detail): when the retry itself ran off the true end of the
  * file (`reason: 'truncated'`), it does not — there is nothing left to find, so leaving
- * `searchFrom` alone risks nothing and forgoes nothing. When the retry was itself budget-exhausted
+ * `searchFrom` alone risks nothing and forgoes nothing. It does still open an `OpenSpan` there
+ * (see `scanAuxEntries`), which costs nothing and is not an advance: a walk that reached
+ * end-of-file without the depth ever touching 0 has PROVEN the group is open at every position
+ * after `start`, so every later marker is inside it. When the retry was itself budget-exhausted
  * (`reason: 'tooLong'`, more of the file remains beyond `GROUP_SKIP_SCAN`), it DOES advance, to
  * exactly as far as this call already scanned (`start + GROUP_SKIP_SCAN`) — not a guess, since
  * every character up to there was read looking for the closing brace. Total work across a whole
@@ -207,17 +210,21 @@ function readBraceGroup(
  *   inside), never just past the smaller budget's own limit.
  * - `'unbalanced'`: the ORDINARY (`MAX_GROUP_SCAN`) attempt ran off the true end of `s` without
  *   balancing — genuinely truncated/malformed, not merely long. No retry is attempted: there is
- *   provably no closing brace left to find, and (this is the part that matters) the caller must
- *   NOT advance past this failure — text immediately after may still hold an entirely separate,
- *   legitimate `\newlabel` marker of its own (this is `parseAuxLabels`'s long-standing contract
- *   for a truncated file, and existing callers/tests depend on it).
+ *   provably no closing brace left to find, and the caller must NOT advance `searchFrom` past
+ *   this failure, because nothing was located to advance TO. It carries `depth`/`next` anyway,
+ *   and `depth` is the discriminator the caller needs:
+ *     - `depth >= 1` — a `{` WAS opened at `start` and the walk proved it is still open at
+ *       end-of-file (see `scanBalance`: a depth reaching 0 returns `'closed'`), so every marker
+ *       after it is inside it and `scanAuxEntries` opens an `OpenSpan` to refuse them.
+ *     - `depth === 0` — `s[start]` was not a `{` at all, so no group was ever opened. This says
+ *       nothing whatever about the text that follows and must NEVER open a span.
  * - `'exhausted'`: the ordinary attempt was budget-exhausted (more of `s` remained) AND the
  *   `GROUP_SKIP_SCAN` retry ALSO failed to find a closing brace. Its true end is genuinely
  *   unknown, but WHY the retry failed still matters, so this carries its own `reason`:
  *     - `reason: 'truncated'` — the retry itself ran off the true end of `s` without balancing.
- *       Exactly like the ordinary `'unbalanced'` case, just discovered later: there is provably
- *       nothing more to find, so the caller must not "advance" past it (there is nothing there to
- *       skip past).
+ *       Exactly like the ordinary `'unbalanced'` case above, just discovered later: there is
+ *       provably nothing more to find, so the caller must not "advance" past it (there is nothing
+ *       there to skip past) — and, on the same proof, it opens an `OpenSpan` just the same.
  *     - `reason: 'tooLong'` — the retry was ITSELF budget-exhausted (more of `s` remains beyond
  *       `GROUP_SKIP_SCAN`). The group's true end is still unknown, but every character up to
  *       `scannedTo` (`start + GROUP_SKIP_SCAN`) WAS linearly read for brace-balance, so nothing in
@@ -225,12 +232,14 @@ function readBraceGroup(
  *       it at `start`) skips only text this call already looked at, never a guess. See
  *       `scanAuxEntries`'s own doc for how the two are used differently.
  *
- * `'exhausted'` also carries `depth`/`next`, the retry walk's resume state, which only the
- * `'tooLong'` reason has any use for: the group is still open at `scannedTo` and the file
- * continues past it, so `scanAuxEntries` keeps walking the SAME group from there (see
- * `OpenSpan`) rather than treating everything past the budget as text outside it. Under
- * `'truncated'` the retry already reached the true end of `s`, so there is nothing to resume
- * over.
+ * `'exhausted'` and `'unbalanced'` both carry `depth`/`next`, the walk's resume state, and every
+ * outcome that opens a group has a use for it. Under `'tooLong'` the group is still open at
+ * `scannedTo` and the file continues past it, so `scanAuxEntries` keeps walking the SAME group
+ * from there (see `OpenSpan`) rather than treating everything past the budget as text outside it.
+ * Under `'truncated'` (and `'unbalanced'` with `depth >= 1`) the walk already reached the true end
+ * of `s`, so `next` sits at end-of-file and the resumed walk is a no-op that can never close —
+ * which is precisely the wanted answer, delivered at O(1) per later marker: the group is open
+ * everywhere after `start`, so everything that follows is refused.
  */
 function readGroupOrSkip(
   s: string,
@@ -238,7 +247,7 @@ function readGroupOrSkip(
 ):
   | { kind: 'ok'; content: string; end: number }
   | { kind: 'tooLong'; content: string; end: number }
-  | { kind: 'unbalanced' }
+  | { kind: 'unbalanced'; depth: number; next: number }
   | {
       kind: 'exhausted';
       reason: 'truncated' | 'tooLong';
@@ -251,7 +260,10 @@ function readGroupOrSkip(
     return primary;
   }
   if (primary.reason === 'unbalanced') {
-    return { kind: 'unbalanced' };
+    // depth/next are the walk's own state, and `depth` is what tells "a `{` was opened here and
+    // never closes anywhere in `s`" (>= 1) from "there was no `{` here at all" (0). Only the
+    // former is evidence about the text that follows.
+    return { kind: 'unbalanced', depth: primary.depth, next: primary.next };
   }
   const retry = readBraceGroup(s, start, GROUP_SKIP_SCAN);
   if (retry.kind === 'ok') {
@@ -267,10 +279,18 @@ function readGroupOrSkip(
 }
 
 /**
- * A group `readGroupOrSkip` left OPEN: neither budget found its closing brace, and the file
- * continues past where the retry gave up (`'exhausted'` + `reason: 'tooLong'`). It holds the
- * brace walk's resume state, so `scanAuxEntries` can keep walking that one group forward instead
- * of guessing where it ends.
+ * A group `readGroupOrSkip` left OPEN: no scan budget found its closing brace. Two shapes reach
+ * here, and both are carried the same way.
+ *
+ * - The file continues past where the retry gave up (`'exhausted'` + `reason: 'tooLong'`). The
+ *   group MIGHT still close, so the walk is carried forward marker by marker to find out, and a
+ *   marker after the close is parsed normally.
+ * - The walk ran to the TRUE end of the file without the depth ever touching 0
+ *   (`'exhausted'` + `reason: 'truncated'`, and plain `'unbalanced'` with `depth >= 1`). The group
+ *   provably never closes, the carried walk is a no-op, and every later marker is refused.
+ *
+ * Either way it holds the brace walk's resume state, so `scanAuxEntries` can keep walking that
+ * one group forward instead of guessing where it ends.
  *
  * Why this is needed at all: advancing `searchFrom` to `start + GROUP_SKIP_SCAN` protects only
  * the text the retry actually read. Everything past it is still inside the group, and a
@@ -308,12 +328,12 @@ function skipWs(s: string, i: number): number {
 }
 
 /**
- * One marker's outcome from `scanAuxEntries`: either a successfully-parsed entry, or a specific,
- * countable reason it was dropped. Every OTHER failure — a missing/unbalanced key group, an
- * outer group that is truly unbalanced (not merely long), or a missing number/page group — stays
- * a silent skip, exactly as `parseAuxLabels`'s contract has always been for a malformed marker:
- * there is no real, located label to report in those cases. `'dropped'` covers the cases where we
- * DO have a real, located label but no valid `AuxLabel` to report for the entry as a whole:
+ * One marker's outcome from `scanAuxEntries`: a successfully-parsed entry, or one of three
+ * countable ways it did not become one. Every OTHER failure — a `\newlabel` not followed by a
+ * `{` at all, an outer group that is truly unbalanced (not merely long), or a missing
+ * number/page group — stays a silent skip, exactly as `parseAuxLabels`'s contract has always
+ * been for a malformed marker. `'dropped'` covers the cases where we DO have a real, located
+ * label but no valid `AuxLabel` to report for the entry as a whole:
  *   - `reason: 'fieldTooLong'` — the whole entry parsed cleanly, but label, number or page
  *     exceeded the per-field length cap (`MAX_FIELD_LENGTH`).
  *   - `reason: 'groupTooLong'` — the KEY parsed normally (short enough to accept), but the outer
@@ -329,9 +349,9 @@ function skipWs(s: string, i: number): number {
  *     impossible to craft) is still excluded from the count the same way an ordinary one is; see
  *     `scanAuxEntries` for where this is produced.
  * All three are countable — see `AuxFloatsResult.dropped` — because in every one of them there IS
- * a real `\newlabel` marker the caller is choosing not to report, which is a different thing from
- * a marker that never parsed at all (a key or outer group that never closes at all, e.g. inside a
- * truncated file, has no located label to report and stays a silent skip, same as always).
+ * a real `\newlabel` marker, with a real and known label, that the caller is choosing not to
+ * report. A marker whose KEY never closed has no such label and is a different outcome again —
+ * see `'indeterminate'` below.
  *
  * `'refused'` is a THIRD thing, and deliberately not a `'dropped'` with another reason. A
  * `'dropped'` says "there was a real `\newlabel` entry here and you are not getting it" — a loss
@@ -343,16 +363,42 @@ function skipWs(s: string, i: number): number {
  * guard against, and the same reason `pdf_geometry` keeps `floatsOmittedBySize` apart from
  * `floatsOmitted` and `floatsDropped`. It carries no label, because nothing about it was parsed:
  * treating its bytes as a label would be the very fabrication being refused.
+ *
+ * `'indeterminate'` is a FOURTH thing, and it is neither of the other two. It is yielded when a
+ * marker's own KEY group was opened (`\newlabel` IS followed by a `{`) but its closing brace was
+ * never located: `readGroupOrSkip`'s `'exhausted'` on the key under either reason, or its
+ * `'unbalanced'` with `depth >= 1`. The claim it makes is deliberately the weakest of the four —
+ * a `\newlabel` marker existed here and we can say NOTHING about it.
+ *
+ * Not `'dropped'`, which says "there was a real entry and you are not getting it": there is no
+ * key text here to know that with, and with no key there is nothing to test `isCleverefShadow`
+ * against — so folding it into `dropped` would report a cleveref shadow record (not a float, and
+ * excluded from every count in this file) as a lost float. Not `'refused'` either, which says
+ * the opposite thing: that nothing is missing, because the bytes were never an entry. Before
+ * this outcome existed such a marker produced no outcome at all and vanished with
+ * `total`/`dropped`/`refused` all 0 — issue #139 §2, the key-side remainder of #76's FINDING 2.
+ * It carries no label for the same reason `'refused'` does not: there is no parsed key to carry,
+ * and inventing one from the unterminated bytes is the fabrication this file exists to refuse.
+ *
+ * The one key-side failure that stays a silent skip is `depth === 0` — `\newlabel` followed by
+ * something that is not a `{` at all. Nothing was opened, so there is no evidence a `\newlabel`
+ * INVOCATION was ever there (the bytes may be prose, or `\newlabelfoo`), and counting it would
+ * put a number on text rather than on a marker. Length is deliberately NOT the line: a key
+ * `{` that never closes is `'unbalanced'` when the file ends within `MAX_GROUP_SCAN` of it and
+ * `'exhausted'` when it does not, and a counter that fired only past 4096 characters would be
+ * drawing a distinction no caller could act on.
  */
 type ScanOutcome =
   | { kind: 'entry'; entry: AuxLabel }
   | { kind: 'dropped'; label: string; reason: 'fieldTooLong' | 'groupTooLong' | 'keyTooLong' }
-  | { kind: 'refused' };
+  | { kind: 'refused' }
+  | { kind: 'indeterminate' };
 
 /**
  * The shared scan behind both `parseAuxLabels` and `readAuxFloats`: walks `aux` for `\newlabel`
- * markers, yielding one outcome per marker that gets far enough to read a key group. Bounded on
- * two independent axes (see `MAX_GROUP_SCAN`/`GROUP_SKIP_SCAN`/`PARSE_BOUND` above) so total work
+ * markers, yielding one outcome per marker that is not a silent skip (see `ScanOutcome` for
+ * which failures are which). Bounded on two independent axes (see
+ * `MAX_GROUP_SCAN`/`GROUP_SKIP_SCAN`/`PARSE_BOUND` above) so total work
  * is linear in `aux.length` no matter how the file is malformed — none of these bounds depend on
  * how many outcomes the caller actually consumes, so a caller that stops early (`parseAuxLabels`,
  * once it has `maxLabels` entries) does strictly less work, never more.
@@ -374,13 +420,12 @@ type ScanOutcome =
  *     is still open there, and the walk is carried forward marker by marker rather than the group
  *     being declared over (issue #80 §3 — this used to be the residual, and a `\newlabel`-shaped
  *     string more than `GROUP_SKIP_SCAN` characters into the group came back as a real label).
- *   - `'exhausted'` with `reason: 'truncated'`, or plain `'unbalanced'`: the retry (or the primary
- *     attempt) ran off the TRUE end of `aux` without ever finding a closing brace — there is
- *     provably nothing left to find no matter how far we looked, so `searchFrom` is left wherever
- *     it already is (which may still be past the key, if the key itself was located). This is
- *     `parseAuxLabels`'s long-standing contract for a truncated file: text immediately after a
- *     genuinely unbalanced group may still hold an entirely separate, legitimate `\newlabel` of
- *     its own, and an existing test depends on it not being skipped over.
+ *   - `'exhausted'` with `reason: 'truncated'`, or plain `'unbalanced'` with `depth >= 1`: the
+ *     retry (or the primary attempt) ran off the TRUE end of `aux` without ever finding a closing
+ *     brace — there is provably nothing left to find no matter how far we looked, so `searchFrom`
+ *     is left wherever it already is (which may still be past the key, if the key itself was
+ *     located). Nothing is advanced on these branches; an `OpenSpan` is opened instead, and the
+ *     paragraph below is why.
  *
  * While an `OpenSpan` is outstanding, every marker is first resolved AGAINST it: the brace walk
  * is continued from where it stopped to the marker's own index, which either finds the group's
@@ -392,24 +437,36 @@ type ScanOutcome =
  * fabricated label becomes a page `render_pages` renders with confidence, whereas a refused one
  * is a counted gap.
  *
- * The asymmetry with `'truncated'`/`'unbalanced'` is deliberate, but the reason originally
- * recorded here — "there is no cheap check left to make" — was wrong, and the correction matters
- * to whoever re-derives this. On those branches the retry reached the TRUE end of `aux` without
- * the depth ever touching 0, which (see `scanBalance`: a depth reaching 0 returns `'closed'`)
- * proves the group is open at EVERY position from `start` to end-of-file. So every later marker
- * is provably inside it, and establishing that costs nothing at all — the walk has already been
- * paid for. What keeps those markers reportable is therefore a deliberate RECALL choice, not an
- * absence of evidence: a corrupt `.aux` whose tail still holds legitimate `\newlabel` records is
- * judged the likelier case, and `parseAuxLabels`' long-standing contract for a truncated file
- * (pinned by its own test) turns on it.
+ * There used to be an ASYMMETRY here, and it is gone: a group that closes nowhere in the file
+ * was left reportable, so a `\newlabel`-shaped string sitting after it came back as a real entry
+ * (issue #80 §3's last sub-case, #139 §1). Two things were wrong with it, in order of
+ * importance.
  *
- * That choice has a measured cost, and it is the one sub-case of issue #80 §3 still open: a
- * `\newlabel`-shaped string inside a group that closes NOWHERE in the file is still reported as
- * a real entry (`test/unit/auxFloats.test.ts` pins the exact input, deliberately, as a
- * characterization of current behaviour rather than an endorsement). Closing it is a one-line
- * change — open an `OpenSpan` on these branches too, leaving `searchFrom` exactly where it is —
- * but it reverses the recall contract above and breaks the test that pins it, so it is an
- * owner's call about precision versus recall on a corrupt file, not a bug fix to slip in.
+ * The evidence is not absent. On these branches the walk reached the TRUE end of `aux` without
+ * the depth ever touching 0, which (see `scanBalance`: a depth reaching 0 returns `'closed'`)
+ * PROVES the group is open at every position from `start` to end-of-file. So every later marker
+ * is provably inside another entry's argument, and establishing that costs nothing at all — the
+ * walk has already been paid for. The comment that once justified the asymmetry with "there is
+ * no cheap check left to make" was simply false, and was corrected in #133 before the decision
+ * itself was revisited.
+ *
+ * What actually held it up was a RECALL bet — a corrupt or truncated `.aux` tail probably still
+ * holds legitimate records, so keep reporting them — and the repository owner reversed that bet
+ * in #139. This module feeds label→page lookup in `render_pages` and `extract_text`, so a
+ * fabricated label whose key happens to collide with a requested one resolves to a page the tool
+ * then renders WITH CONFIDENCE, off bytes the document itself controls. That is the failure
+ * shape the rest of this codebase refuses by construction — `approximate: true` meaning "never
+ * use this for a collision computation", a source snippet shown only where its location can be
+ * vouched for, `peerEntries` returning `null` for an unreadable index and never "owns nothing",
+ * and `refused` itself existing so a declined fake is never miscounted as a missing entry. A
+ * counted gap is recoverable; a confident wrong page is not.
+ *
+ * The recall cost is smaller than it reads, which is part of why the trade flipped. The markers
+ * a span now refuses are only those AFTER an unclosed group — and in the shape the bet was made
+ * for, an `.aux` cut off mid-write by a killed `latexmk`, the unclosed group IS the last thing
+ * in the file, so nothing follows it to refuse. What is given up is recall on a file where a
+ * group opens, never closes, and legitimate entries follow it anyway: a file no honest LaTeX run
+ * produces. What is bought is that no such file can invent a page number.
  *
  * Every `readGroupOrSkip` call is itself O(1)-bounded regardless of outcome, and the open-span
  * walk reads each character of `aux` at most once across all of its continuations (`next` never
@@ -453,19 +510,33 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     let i = skipWs(aux, searchFrom);
     const keyGroup = readGroupOrSkip(aux, i);
     if (keyGroup.kind === 'unbalanced') {
+      if (keyGroup.depth > 0) {
+        // A `{` was opened for the key and the walk proved it never closes anywhere in the file.
+        // searchFrom is NOT advanced (nothing was located to advance to), but everything after
+        // this point is provably inside that group, so carry it as a span and refuse what
+        // follows rather than reading it as entries of its own.
+        openSpan = { depth: keyGroup.depth, next: keyGroup.next };
+        yield { kind: 'indeterminate' };
+      }
+      // depth 0: `\newlabel` was not followed by a `{` at all. Nothing was opened, so this says
+      // nothing about the text after it — no span, and nothing to count. Silent skip, as always.
       continue;
     }
     if (keyGroup.kind === 'exhausted') {
       if (keyGroup.reason === 'tooLong') {
         // Not a guess — scannedTo is exactly how far this call already read; see this function's
-        // own doc for why that makes advancing here safe rather than a risk. The group is still
-        // open there and the file continues, so keep walking it rather than treating whatever
-        // follows the budget as text outside it.
+        // own doc for why that makes advancing here safe rather than a risk.
         searchFrom = keyGroup.scannedTo;
-        openSpan = { depth: keyGroup.depth, next: keyGroup.next };
       }
-      // reason 'truncated': genuinely ran off the true end of the file — nothing more to find, so
-      // leave searchFrom where it is, same contract as the plain 'unbalanced' case below.
+      // Either reason: the group is still open at `next`, so keep walking it rather than
+      // treating whatever follows as text outside it. Under 'tooLong' the file continues and the
+      // walk may yet find the close; under 'truncated' it reached end-of-file already and the
+      // carried walk is a no-op that can never close, which is the answer wanted.
+      openSpan = { depth: keyGroup.depth, next: keyGroup.next };
+      // A real \newlabel marker was here and its key never closed, so there is no label to
+      // report and nothing to test for a cleveref shadow. Counted as its own outcome rather than
+      // vanishing (#139 §2) — see ScanOutcome for why it is neither a drop nor a refusal.
+      yield { kind: 'indeterminate' };
       continue;
     }
 
@@ -479,16 +550,23 @@ function* scanAuxEntries(aux: string): Generator<ScanOutcome> {
     const outerGroup = readGroupOrSkip(aux, i);
     if (outerGroup.kind === 'unbalanced') {
       // Truly no closing brace anywhere in the rest of the file for this group. searchFrom stays
-      // at the key's own (already-known-safe) end from above; nothing further is known.
+      // at the key's own (already-known-safe) end from above; nothing further is located. But
+      // when a `{` WAS opened (depth >= 1), the walk has proven it stays open to end-of-file, so
+      // every later marker is inside it: carry the span. depth 0 means there was no group here
+      // at all (nothing followed the key), which is evidence about nothing.
+      if (outerGroup.depth > 0) {
+        openSpan = { depth: outerGroup.depth, next: outerGroup.next };
+      }
       continue;
     }
     if (outerGroup.kind === 'exhausted') {
       if (outerGroup.reason === 'tooLong') {
         searchFrom = outerGroup.scannedTo;
-        openSpan = { depth: outerGroup.depth, next: outerGroup.next };
       }
-      // reason 'truncated': stays at keyGroup.end, same reasoning as the key's own case above.
-      //
+      // Either reason opens the span, for the reason the key's own branch above records: under
+      // 'truncated' searchFrom stays at keyGroup.end and the group is proven open from here to
+      // end-of-file, so what follows is another entry's argument, not entries.
+      openSpan = { depth: outerGroup.depth, next: outerGroup.next };
       // The key DID parse — there is a real label here — so this is no longer a silent skip: the
       // caller gets a countable 'dropped' outcome instead of the entry simply vanishing.
       yield {
@@ -629,6 +707,17 @@ export interface AuxFloatsResult {
    *  not that the index is incomplete. Optional only so that object literals of this type
    *  written elsewhere keep compiling — `readAuxFloats` always sets it. */
   refused?: number;
+  /** `\newlabel` markers whose own KEY group was opened but whose closing brace neither scan
+   *  budget could locate, so nothing at all about them could be read (see `ScanOutcome`'s
+   *  `'indeterminate'`). Its own count, added to NONE of the others and never folded into them:
+   *  `dropped` means "a real entry is missing", `refused` means "nothing is missing, a fake was
+   *  declined", and this means neither — a marker existed and we can say nothing about it. There
+   *  is no key text here, so it cannot even be tested for a cleveref shadow, which is why
+   *  counting it as `dropped` would be wrong rather than merely imprecise. Before #139 these
+   *  markers vanished with every counter at zero. Almost always 0; a non-zero value means the
+   *  `.aux` is malformed or hostile. Optional for the same reason `refused` is — `readAuxFloats`
+   *  always sets it. */
+  indeterminate?: number;
   /** Present only when no `.aux` was found in the build directory. */
   note?: string;
 }
@@ -636,7 +725,8 @@ export interface AuxFloatsResult {
 /**
  * Read and parse the build-dir `.aux` for a project/root file, for `pdf_geometry`'s "floats" kind.
  * Never throws for a missing `.aux` (nothing compiled yet, or a backend that doesn't write one) —
- * that comes back as `{ floats: [], omitted: 0, total: 0, dropped: 0, refused: 0, note }`. Any
+ * that comes back as
+ * `{ floats: [], omitted: 0, total: 0, dropped: 0, refused: 0, indeterminate: 0, note }`. Any
  * other read failure (e.g. unreadable permissions) propagates, since that is a real problem the
  * caller should see, not a normal "not compiled yet" state.
  */
@@ -659,6 +749,7 @@ export async function readAuxFloats(
         total: 0,
         dropped: 0,
         refused: 0,
+        indeterminate: 0,
         note:
           `No .aux found in the build directory (${toPosix(auxPath)}) — nothing has been ` +
           'compiled with this root file yet, or the compile backend in use did not write one.',
@@ -675,7 +766,15 @@ export async function readAuxFloats(
   let total = 0;
   let dropped = 0;
   let refused = 0;
+  let indeterminate = 0;
   for (const outcome of scanAuxEntries(auxContent)) {
+    if (outcome.kind === 'indeterminate') {
+      // No key was parsed, so there is no label to test against isCleverefShadow — which is the
+      // reason this is its own counter and not a `dropped`: a cleveref shadow record with an
+      // unterminated key would otherwise be reported as a lost float. Counted in full.
+      indeterminate++;
+      continue;
+    }
     if (outcome.kind === 'refused') {
       // No label was parsed, so there is nothing to test for a cleveref shadow — and nothing to
       // test it against, since the point is that these bytes are not an entry. Counted in full.
@@ -697,5 +796,5 @@ export async function readAuxFloats(
     }
   }
 
-  return { floats, omitted: total - floats.length, total, dropped, refused };
+  return { floats, omitted: total - floats.length, total, dropped, refused, indeterminate };
 }
