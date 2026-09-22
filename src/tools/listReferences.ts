@@ -6,6 +6,7 @@ import { parseReferences, type ReferenceEntry } from '../lib/references.js';
 import { referenceSourceCandidates } from '../lib/referenceSources.js';
 import { planReferenceFields } from '../lib/referenceFieldsBudget.js';
 import { planReferenceRaw } from '../lib/referenceRawBudget.js';
+import { planReferenceTyped, renderReferenceLine } from '../lib/referenceTypedBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -42,21 +43,80 @@ const entrySchema = z.object({
     .describe(
       'How the entry was written, and so how far the parsed fields can be trusted: `bibtex` is ' +
         'exact, `bibitem` has an exact key and free-text rest, `prose` is entirely heuristic — ' +
-        'fall back to `raw` whenever a prose field looks wrong or is missing.',
+        'fall back to `raw` whenever a prose field looks wrong or is missing, UNLESS this entry ' +
+        'carries `rawOmitted` too, in which case `raw` is itself a budgeted prefix and the file ' +
+        'at `path`:`line` is the only whole copy.',
     ),
-  key: z.string().optional().describe('Cite key. Absent for prose entries, which are numbered.'),
-  label: z.string().optional().describe('How a numbered prose list refers to the entry ("1").'),
-  type: z.string().optional().describe('BibTeX entry type (article, inproceedings, …).'),
-  title: z.string().optional(),
-  authors: z.array(z.string()),
+  key: z
+    .string()
+    .optional()
+    .describe(
+      'Cite key — what `add_citation` and `\\cite` are called with. Absent for prose entries, ' +
+        'which are numbered. Never shortened by a budget: a key over 200 characters (which no ' +
+        'real bibliography writes) is dropped whole instead, since a truncated cite key is one ' +
+        'that does not exist; the entry is still located by `path`:`line`.',
+    ),
+  label: z
+    .string()
+    .optional()
+    .describe(
+      'How a numbered prose list refers to the entry ("1"). Identity, like `key`: never ' +
+        'truncated, dropped whole if absurdly long.',
+    ),
+  type: z
+    .string()
+    .optional()
+    .describe(
+      'BibTeX entry type (article, inproceedings, …). Dropped whole rather than shortened when a ' +
+        'budget cannot carry it; it is also in `fields` and `raw`.',
+    ),
+  title: z
+    .string()
+    .optional()
+    .describe(
+      'Title as the entry gives it — exact for `bibtex`, heuristic for `bibitem`/`prose`. ' +
+        'Budgeted: over 2000 characters it is CUT to a prefix ending in a ' +
+        '`… [+N characters omitted]` marker rather than dropped, and an entry past the ' +
+        'result-wide budget carries that marker alone. A marker means the title is partial; see ' +
+        '`typedOmitted` and `typedNote`.',
+    ),
+  authors: z
+    .array(z.string())
+    .describe(
+      'Author names, "First Last", in the document’s order. Budgeted: at most 20 names per ' +
+        'entry are returned and a long collaboration list is cut to its first 20 — see ' +
+        '`authorsOmitted` for how many are missing. An individual name over 2000 characters is ' +
+        'cut to a marked prefix.',
+    ),
   truncatedAuthors: z
     .boolean()
     .describe('The author list is abbreviated (`and others` / "et al."), so it will print short.'),
   year: z.number().optional(),
-  venue: z.string().optional(),
-  doi: z.string().optional(),
-  url: z.string().optional(),
-  arxivId: z.string().optional(),
+  venue: z
+    .string()
+    .optional()
+    .describe(
+      'Conference or journal. Cut to a marked prefix over 2000 characters, and dropped (with ' +
+        '`typedOmitted` counting it) on an entry past the result-wide budget.',
+    ),
+  doi: z
+    .string()
+    .optional()
+    .describe(
+      'DOI. Dropped whole rather than truncated when a budget cannot carry it: half a DOI is not ' +
+        'a short DOI, it is one that resolves to nothing.',
+    ),
+  url: z
+    .string()
+    .optional()
+    .describe('URL. Dropped whole rather than truncated when a budget cannot carry it.'),
+  arxivId: z
+    .string()
+    .optional()
+    .describe(
+      'arXiv identifier (e.g. "2001.10773"). Dropped whole rather than truncated when a budget ' +
+        'cannot carry it.',
+    ),
   raw: z
     .string()
     .describe(
@@ -96,6 +156,26 @@ const entrySchema = z.object({
         'budget covers every `raw` in the result, so the entries past it carry the marker alone. ' +
         'Absent when `raw` is the whole entry, which is the ordinary case. See `rawNote`.',
     ),
+  typedOmitted: z
+    .number()
+    .optional()
+    .describe(
+      'How many characters of this entry’s PARSED fields (`title`, `authors`, `venue`, `doi`, ' +
+        '`url`, `arxivId`, `type`, `key`, `label`) are missing because a budget cut them. Absent ' +
+        'when nothing was cut, and that absence is a promise: on an entry without this counter, ' +
+        'a field that is missing is one the parser never claimed. On an entry WITH it, a missing ' +
+        'field may have been cut — the text is in `raw`, unless `rawOmitted` says that was cut ' +
+        'too. See `typedNote`.',
+    ),
+  authorsOmitted: z
+    .number()
+    .optional()
+    .describe(
+      'How many author names are not in `authors[]`: at most 20 are returned per entry, so a ' +
+        '214-author collaboration comes back as the first 20 and `authorsOmitted: 194`. This is ' +
+        'NOT `truncatedAuthors`, which is the DOCUMENT abbreviating its own list (`and others`, ' +
+        '"et al.") — a defect of the bibliography rather than a cut made here.',
+    ),
 });
 
 const outputSchema = {
@@ -119,6 +199,16 @@ const outputSchema = {
         'many entries and characters it cut, and how to get the verbatim text back. Nothing is ' +
         'ever cut silently: a cut entry carries `rawOmitted` and its `raw` ends in a marker.',
     ),
+  typedNote: z
+    .string()
+    .optional()
+    .describe(
+      'Present only when the budget over the parsed fields (`title`, `authors`, `venue`, `doi`, ' +
+        '`url`, …) cut something; names which bound fired, how much it dropped, and in what ' +
+        'order the fields are cut. Nothing is ever cut silently: such an entry carries ' +
+        '`typedOmitted`, a cut title or venue ends in a marker, and a short author list carries ' +
+        '`authorsOmitted`.',
+    ),
 };
 
 type Located = ReferenceEntry & { path: string };
@@ -138,21 +228,6 @@ function matches(entry: Located, needle: string): boolean {
     .join(' ')
     .toLowerCase();
   return haystack.includes(needle);
-}
-
-function formatEntry(entry: Located): string {
-  const id = entry.key ?? (entry.label ? `[${entry.label}]` : '—');
-  const authors = entry.authors.length
-    ? `${entry.authors.join(', ')}${entry.truncatedAuthors ? ' et al.' : ''}`
-    : entry.format === 'prose'
-      ? '(authors not split out — see raw)'
-      : '(no author field)';
-  const where = [entry.venue, entry.year].filter(Boolean).join(' ');
-  const title = entry.title ?? entry.raw.slice(0, 120);
-  return (
-    `${id} — ${title}\n  ${authors}${where ? ` — ${where}` : ''}\n` +
-    `  ${entry.path}:${entry.line} (${entry.format})`
-  );
 }
 
 export function registerListReferences(server: McpServer, ctx: AppContext): void {
@@ -208,7 +283,13 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         // objects below are the budgeted ones — the text channel included, which must never
         // render the unbudgeted payload.
         const rawPlan = planReferenceRaw(fieldsPlan.entries);
-        const entries = rawPlan.entries;
+        // The third document-controlled region (issue #165): `title`, `authors[]`, `venue` and the
+        // identifiers beside them, which the parse never shortens and which `bibitem`/`prose`
+        // entries slice out of free text. Planned LAST, so its cost function prices the `raw` the
+        // result will actually carry — it charges the rendered TEXT as well as the JSON, since
+        // this is the one region `list_references` prints.
+        const typedPlan = planReferenceTyped(rawPlan.entries);
+        const entries = typedPlan.entries;
 
         const header = relPath
           ? `${entries.length} reference(s) in ${relPath}`
@@ -220,7 +301,7 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         const truncNote = truncated
           ? `\n\n(${filtered.length - entries.length} more not shown — narrow with \`filter\`.)`
           : '';
-        const body = entries.map(formatEntry).join('\n\n');
+        const body = entries.map((e) => renderReferenceLine(e)).join('\n\n');
         // The text channel never prints a raw field map, but it does have to say when one was
         // cut: a caller reading only the text would otherwise never learn that `fields` is partial.
         const fieldsNote = fieldsPlan.note ? `\n\n(${fieldsPlan.note})` : '';
@@ -228,6 +309,10 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         // title out of its budgeted `raw`, so a caller reading only the text would otherwise see
         // a shortened entry with nothing saying it was shortened.
         const rawNote = rawPlan.note ? `\n\n(${rawPlan.note})` : '';
+        // And for the parsed fields, which is the region the text channel actually prints: a
+        // caller reading only the prose would otherwise see a 20-name author list, or a title
+        // ending in a marker, with nothing saying a budget did it.
+        const typedNote = typedPlan.note ? `\n\n(${typedPlan.note})` : '';
 
         return {
           content: [
@@ -235,7 +320,7 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
               type: 'text',
               text:
                 `${header}${filterNote}${body ? `\n\n${body}` : ''}` +
-                `${truncNote}${fieldsNote}${rawNote}`,
+                `${truncNote}${fieldsNote}${rawNote}${typedNote}`,
             },
           ],
           structuredContent: {
@@ -246,6 +331,7 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
             entries,
             ...(fieldsPlan.note ? { fieldsNote: fieldsPlan.note } : {}),
             ...(rawPlan.note ? { rawNote: rawPlan.note } : {}),
+            ...(typedPlan.note ? { typedNote: typedPlan.note } : {}),
           },
         };
       } catch (err) {

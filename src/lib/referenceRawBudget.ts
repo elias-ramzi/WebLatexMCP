@@ -44,11 +44,21 @@
  *     authority. Losing either entirely is worse than halving both. So the figure is not a second
  *     number at all — {@link REFERENCE_RAW_BUDGET} *is* `REFERENCE_FIELDS_BUDGET`, imported rather
  *     than restated, so there is one constant to change — and the worst case for the two together
- *     lands at ~40000 characters, still below the ~67k a client actually rejected.
+ *     lands at ~40000 characters, still below the ~67k a client actually rejected. **Amended by
+ *     issue #165**, which found a third document-controlled region (the parsed fields: `title`,
+ *     `authors[]`, `venue`, the identifiers) bounded by nothing at all and gave it a third
+ *     allocation of the same constant, in `src/lib/referenceTypedBudget.ts`. The worst case for
+ *     all three together is ~60000 rendered characters ACROSS BOTH CHANNELS — the third planner is
+ *     charged on the JSON and on the rendered text together, where these two are charged on the
+ *     JSON alone — so the figure quoted above is now the two-region case, not the result's.
  *
  *  4. **The budget is charged on rendered size**, as `floatsBudget.ts` charges it, and on the JSON
- *     only: `formatEntry` prints a parsed line per entry and reaches `raw` solely as a title
- *     fallback, so there is no text-channel boilerplate to charge the way `conflictBudget.ts` must.
+ *     only: `renderReferenceLine` (`referenceTypedBudget.ts`) prints a parsed line per entry and
+ *     reaches `raw` solely as the title fallback for an entry the parser gave no title, so there
+ *     is no text-channel boilerplate to charge the way `conflictBudget.ts` must. That fallback
+ *     stays bounded at 120 characters per entry, and #165 keeps it honest from the other side: a
+ *     title the TYPED budget cut keeps a marker rather than vanishing, precisely so the fallback
+ *     cannot put refused document text back into the text channel.
  *     It is the JSON encoding rather than `.length` because BibTeX is brace- and backslash-dense
  *     (`{Deep} \emph{Residual}`), and `JSON.stringify` doubles every backslash and quote.
  *
@@ -154,11 +164,14 @@ export interface ReferenceRawOptions {
 /**
  * Cut `text` to at most `limit` UTF-16 code units without splitting a surrogate pair.
  *
+ * Exported because `referenceTypedBudget.ts` (issue #165) cuts prose-shaped values under the same
+ * rule; one implementation of it, as there is one elision marker.
+ *
  * A pair split down the middle renders as a replacement character and, worse, is a byte sequence
  * the document never contained — in a field whose whole promise is "as written", inventing one is
  * exactly the wrong direction. Dropping the leading half instead costs one character.
  */
-function cutTo(text: string, limit: number): string {
+export function cutTo(text: string, limit: number): string {
   if (text.length <= limit) return text;
   let end = limit;
   const last = text.charCodeAt(end - 1);
