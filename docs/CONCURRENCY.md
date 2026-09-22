@@ -143,6 +143,27 @@ rewriting an index at once, so operations must be serialised across processes, n
 just within one. And `git add` cannot tell whose change is whose, so one session
 committing would sweep up another's half-written paragraph under its own message.
 
+### One server process per session
+
+**A session is a server process.** `WEB_LATEX_MCP_SESSION` is read once at startup, so
+everything on this page assumes each session runs its own stdio server with its own `env`
+block. That is how Claude Code works, and the isolation described here is real there.
+
+**Claude Desktop shares one server process across every chat**, and gives one `env` block
+per configured server — so every Desktop chat resolves to the same session id and the
+split is inert: two chats editing one paper commit each other's work exactly as they did
+before per-session shadows existed. Nothing is broken by this and single-session behaviour
+is unchanged, but do not read the rest of this page as describing what a Desktop user gets
+from two chats.
+
+To get the isolation described here today, give each session its own server entry with its
+own `WEB_LATEX_MCP_SESSION`, so each is a separate process — see [configuration.md's interim
+limitation](configuration.md#parallel-sessions). Decoupling session identity from the
+process is tracked in
+[#18](https://github.com/elias-ramzi/WebLatexMCP/issues/18), and which shape that takes turns
+on an empirical question about Desktop the server can answer about itself: the [session
+identity probe](configuration.md#session-identity-probe).
+
 ### Naming your sessions
 
 Set `WEB_LATEX_MCP_SESSION` per session to something meaningful — `intro`,
@@ -388,8 +409,14 @@ and so has only a text channel — a dropped path is dropped from the response, 
 merely from one of two renderings of it. `status` is what makes that affordable: its
 `otherChanges` is the same disputed set — staged, unstaged and untracked alike, so a
 path modified only in the index is not left out — and its `activeSessions[].changes` is
-complete per session, both uncapped in `structuredContent` even though its own text shows
-five paths per peer. The refusal names them only when a cap actually fired, never as
+what each session claims. Neither is uncapped: since #175 both are budgeted like every
+other path list `status` returns, so the affordability argument above is weaker than it
+was. `truncated` is the always-present witness (`pathsOmitted` ships only when something
+was cut), and when it fired the subtraction yields a lower bound on the disputed set
+rather than the whole of it. The refusal says so itself (#185). What keeps that safe is
+that no report-derived list is load-bearing: `commit` and `push` read each session's
+change index directly, never this report, so acting on a short list is refused rather
+than silently wrong. The refusal names them only when a cap actually fired, never as
 boilerplate — and names them as a derivation rather than as two fields to go read.
 That is deliberate: there is no `unowned`-shaped field in `status`, and `otherChanges`
 is the whole disputed set, peer-owned files included, so feeding it to

@@ -499,8 +499,9 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `project_sync`/`discard` (`ctx.files.resetBaselines`), since those rewrite the tree.
   **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
   false.** Recording is a claim that _the caller could now base a write on this file_, so record only
-  when the caller asked for that file and got all of it: `read_file`, and `list_references` (every entry
-  verbatim). Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
+  when the caller asked for that file and got all of it: `read_file`, and `list_references` — the
+  latter only for a bibliography it returned WHOLE (#171), since its entries can be paged by
+  `maxResults` or cut by a budget. Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
   PR fixed. So: `detectRootFile` sniffing every `.tex` for `\documentclass` does not record (`compile`
   and the viewer's PDF poller both go through it); the five lines `compile`/`list_comments` fetch around
   a location the _log_ chose do not; `check_citations` does not, since it returns cite keys and line
@@ -510,6 +511,23 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   read plus one entry and so cannot lose a hand edit. Wrong in the safe direction costs one refusal the
   caller can override; the other way silently destroys a user's hand edits, which is what the guard
   exists to prevent.
+  **Two refinements keep the rule enforceable rather than merely stated.** A **ranged** read claims
+  nothing — `FileService.read` refuses the claim whenever `startLine`/`endLine` is given (#181), and it
+  refuses on the _request_, not on whether the range happened to cover the file: `startLine: 1` alone
+  does return every byte, but deriving "whole" a second way is a second place to drift, and
+  over-refusing costs one re-read while under-refusing destroys an edit. The enforcement sits in
+  `FileService.read` and **not** in `read_file`, deliberately — the docstring there is where the rule
+  reads as authoritative, which is exactly where it drifted, and a condition restated in the tool would
+  be a second home for one rule. `read_file` still passes `recordBaseline: true`: the flag says this is
+  the _kind_ of read that is eligible, never "record unconditionally". And
+  `FileService.recordBaseline(projectDir, relPath, content, { strictLinks? })` records for bytes the
+  caller **already holds** (#182), for the case `list_references` has: whether a file went over the wire
+  whole is decided by the budgets, which run after every candidate has been read, so the claim cannot be
+  made at read time. It closes a window as well as saving a read — re-reading absorbed a hand edit that
+  landed between the two reads as the baseline, so the guard never fired for it. Its `strictLinks`
+  defaults to **false**, like every read and unlike a server-initiative read: the seam records what a
+  read just returned, so its link guard must agree with that read's, or it would refuse exactly the
+  files a `followSymlinks: true` project's read allowed.
   **Every path resolves symlinks before acting** (`assertNoSymlinkEscape`): `resolveInside` compares
   strings, which a `notes.tex` pointing outside the clone defeats — and git stores a symlink as mode
   120000, so a collaborator can commit one. The check covers writes and deletes, not just reads, and a
