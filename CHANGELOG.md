@@ -2516,6 +2516,12 @@ Harmless only because no project is named `please` — the first word matching a
   with no `ExternalChangeError`. The claim is now made per file, after the plans are known, and
   only when every entry that file contributed shipped with nothing cut out of it.
 
+- **A `push`/`project_sync` peer refusal no longer promises that `status` lists the paths it
+  omitted uncapped** (#185). #175 budgeted `otherChanges` and capped `activeSessions`, falsifying
+  the one line a stuck caller reads; it now names `truncated`, `pathsOmitted.otherChanges`,
+  `activeSessionsOmitted` and each session's `changesOmitted` as the way to tell a complete answer
+  from a cut one, and a test ties the claim to `status`'s actual budget and advertised schema.
+
 ### Tests
 
 - **The advertised `outputSchema` is now tested, whole-payload, for every tool the suite can

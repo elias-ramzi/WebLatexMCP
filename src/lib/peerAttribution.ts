@@ -311,14 +311,46 @@ export function renderPeerRefusal(
   // throws before committing anything rather than skipping the offending paths. Naming a field
   // that bounces off a guard one tool over is the failure `composeClosing` above exists to end;
   // it would be back, one layer down, in a pointer that merely sounded helpful.
+  //
+  // And — issue #185 — it does not call those `status` lists UNCAPPED, which it did until #175
+  // (PR #183) put `otherChanges` in `ALLOCATION_ORDER` and capped `activeSessions` at
+  // `STATUS_MAX_SESSIONS`. A pointer that promises completeness is worse than no pointer: this is
+  // the one line a *stuck* caller reads, and it hands them a procedure ("subtract every live
+  // session's `changes` from `otherChanges`") whose inputs may both be short. So the claim is the
+  // weaker true one again — `status` covers more ground, and here is how to tell whether it
+  // covered all of it (`truncated`, `pathsOmitted.otherChanges`, `activeSessionsOmitted`, each
+  // session's `changesOmitted`) and what a short answer is still good for.
+  //
+  // REJECTED, deliberately, and this is the comment for whoever reaches for it: exempting
+  // `otherChanges` (and `activeSessions[].changes`) from `status`'s budget to make the old
+  // sentence true again — the way `behindCommits` is exempt for `conflictBudget.ts`'s pointer —
+  // undoes most of what #175 bought. `behindCommits` is exemptible because it is bounded by how
+  // far a clone has drifted from its remote; `otherChanges` is precisely the list that blows up
+  // (an untracked `figures/` tree, a regenerated build directory, a `mode: 'local'` directory the
+  // server does not control), and it is the single largest contributor to the undelivered-payload
+  // failure #175 exists to stop. Keeping a sentence true by removing the bound from the list most
+  // likely to be enormous trades a correct-but-incomplete answer for no answer at all. Fix the
+  // sentence, not the budget. `test/unit/statusPointerClaim.test.ts` ties the two together so the
+  // next change to that budget fails here rather than falsifying this line in silence.
+  //
+  // Every field this names is asserted against `status`'s advertised `outputSchema` by that test;
+  // naming a counter that does not ship would be this same defect one level further down.
   if (truncated) {
     lines.push(
       `Lists here are capped at ${REFUSAL_PATH_CAP} paths, the closing's included. \`status\` ` +
-        'names every path they omit, uncapped: `otherChanges` is every uncommitted file this ' +
+        'covers the same ground more fully: `otherChanges` is every uncommitted file this ' +
         'session did not write — a superset of the files named here — and ' +
         '`activeSessions[].changes` is what each session claims, with a `live` flag. Subtract ' +
         "every live session's `changes` from `otherChanges` for the files no live session owns; " +
-        'a session whose `changes` is null may own any of them.',
+        'a session whose `changes` is null may own any of them. Those lists are budgeted too, so ' +
+        'check before treating that subtraction as complete: `truncated` says whether anything ' +
+        "was cut, and `pathsOmitted.otherChanges`, `activeSessionsOmitted` and each session's " +
+        '`changesOmitted` say how much. If any of them is non-zero the subtraction ran over ' +
+        'short lists and yields a lower bound on the disputed set, not the whole of it — ' +
+        "`status`'s own `note` then names the routes that enumerate the same ground under their " +
+        'own budgets. Acting on a lower bound is safe but not sufficient: `commit` and `push` ' +
+        "read each session's change index directly, never this report, so a commit scope " +
+        '"paths" naming a path a live session turns out to own is refused, not silently taken.',
     );
   }
 
