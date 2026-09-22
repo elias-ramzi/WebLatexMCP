@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, chmod, writeFile } from 'node:fs/promises';
 import { platform } from 'node:process';
 import {
   parseAuxLabels,
+  measureAuxScanWork,
   readAuxFloats,
   DEFAULT_MAX_FLOATS,
   PARSE_BOUND,
@@ -12,6 +13,28 @@ import {
   GROUP_SKIP_SCAN,
 } from '../../src/lib/auxFloats.js';
 import { buildAuxPath } from '../../src/services/compiler.js';
+
+/**
+ * The ceiling every linearity test below asserts its growth ratio against: doubling the input
+ * must not much more than double the work. Three of those tests used to measure WALL CLOCK, and
+ * the ratio of two wall-clock samples is machine-speed independent but NOT load independent — at
+ * the input sizes this module's own scan bounds make cheap, each sample is single-digit
+ * milliseconds, so scheduler jitter and GC from the other 180 files of a parallel suite dominate
+ * it. One read 3.21x on genuinely linear code against a 3.0 threshold while passing 12/12 in
+ * isolation (#173). Raising the threshold would have bought green runs by giving up the only
+ * thing these tests do — telling linear (~2x) from quadratic (~4x) apart.
+ *
+ * So they measure SCAN STEPS instead (`measureAuxScanWork` — characters of the .aux the scan
+ * looked at, which is exactly the quantity MAX_GROUP_SCAN/GROUP_SKIP_SCAN/PARSE_BOUND bound).
+ * That is deterministic: identical on every machine, under any load, run to run. Measured on this
+ * implementation: 1.82x, 1.99x, 2.09x. Measured against references carrying the specific mistake
+ * each test guards (a span check that re-walks its group from the start for every marker; an
+ * unbounded outer-group read): 3.75x, 4.07x, 4.10x. 2.5 sits between them with 20% headroom over
+ * the worst linear reading and 33% under the best quadratic one — tighter than the 3.0 the
+ * wall-clock versions needed, and affordable precisely because there is no longer any noise to
+ * leave room for.
+ */
+const LINEAR_GROWTH_MAX = 2.5;
 
 describe('parseAuxLabels', () => {
   it('parses the plain LaTeX form', () => {
@@ -200,42 +223,37 @@ describe('parseAuxLabels', () => {
     // O(n) markers. It is answered instead by a cursor that only moves forward, so every
     // character of the file is walked at most once across all the continuations.
     //
-    // Same growth-ratio shape as the test above, and for the same reason: an absolute wall-clock
-    // budget is machine-speed dependent and flakes (see the note there), while "doubling the
-    // input roughly doubles the time" is not.
-    function parseTimeMs(n: number): number {
+    // Measured in SCAN STEPS, not milliseconds — see LINEAR_GROWTH_MAX above for why, and for
+    // the numbers. On this path: 1.99x as written, 3.75x against a reference whose span check
+    // re-walks the group from its own start for every marker.
+    function build(n: number): string {
       // One group that never closes, holding n well-formed \newlabel markers. Every one of them
       // is inside it, so every one is refused — and each refusal must cost only the characters
       // between it and the marker before it.
       const buried = Array.from({ length: n }, (_, i) => `\\newlabel{l${i}}{{${i}}{${i}}}`).join(
         '\n',
       );
-      const aux = `\\newlabel{fig:real}{{1}{7}{${'x'.repeat(GROUP_SKIP_SCAN + 100)}\n${buried}`;
-      const start = Date.now();
-      const result = parseAuxLabels(aux, { maxLabels: n });
-      const elapsedMs = Date.now() - start;
-      // Nothing is reported: fig:real's group is over budget, and every buried marker is inside
-      // it. Pre-fix every one of them came back as a fabricated row instead.
-      expect(result).toEqual([]);
-      return elapsedMs;
+      return `\\newlabel{fig:real}{{1}{7}{${'x'.repeat(GROUP_SKIP_SCAN + 100)}\n${buried}`;
     }
 
-    const TIMER_FLOOR_MS = 5;
-    function medianOf3Ms(n: number): number {
-      const samples = [parseTimeMs(n), parseTimeMs(n), parseTimeMs(n)]
-        .map((ms) => Math.max(ms, TIMER_FLOOR_MS))
-        .sort((a, b) => a - b);
-      const median = samples[1];
-      if (median === undefined) {
-        throw new Error('unreachable: samples always has exactly 3 elements');
-      }
-      return median;
+    function scanSteps(n: number): number {
+      const aux = build(n);
+      const { labels, steps } = measureAuxScanWork(aux, { maxLabels: n });
+      // Nothing is reported: fig:real's group is over budget, and every buried marker is inside
+      // it. Pre-fix every one of them came back as a fabricated row instead.
+      expect(labels).toEqual([]);
+      // Non-vacuity, in the one direction a work counter can go quietly wrong: a scan that
+      // stopped early (a bound tripping, a marker wedging it) would report a flattering ratio
+      // off work it never did. Every character of the file is looked at at least once by the
+      // marker search alone, so anything below this means the scan did not traverse the input.
+      expect(steps).toBeGreaterThanOrEqual(aux.length);
+      return steps;
     }
 
     const n = 6_000;
-    const tSmall = medianOf3Ms(n);
-    const tLarge = medianOf3Ms(n * 2);
-    expect(tLarge / tSmall).toBeLessThan(3.0);
+    const small = scanSteps(n);
+    const large = scanSteps(n * 2);
+    expect(large / small).toBeLessThan(LINEAR_GROWTH_MAX);
   });
 
   it('#139: stays linear on markers following a group that closes NOWHERE (the branch #139 added a span to)', () => {
@@ -247,8 +265,9 @@ describe('parseAuxLabels', () => {
     // uses — and on THIS branch the cursor already sits at end-of-file, so each continuation is
     // a no-op and the per-marker cost is O(1) outright, not merely amortized.
     //
-    // A scaling ratio, never a wall-clock budget: PR #136 removed this repo's last two absolute
-    // budgets because they flake across machines and barely discriminate.
+    // Measured in SCAN STEPS, not milliseconds — see LINEAR_GROWTH_MAX above. On this path:
+    // 1.82x as written (the constant GROUP_SKIP_SCAN retry is a fixed overhead both halves pay,
+    // which is why it sits under 2x), 4.10x against the re-walking reference.
     function build(markers: number): string {
       // One group that opens and never closes, with `markers` well-formed \newlabel markers
       // after it. Every one of them is inside it, so every one must be refused.
@@ -269,106 +288,51 @@ describe('parseAuxLabels', () => {
     // also why this is the cheapest possible correctness check to pair with the timing.
     expect(parseAuxLabels(build(LARGE), { maxLabels: LARGE })).toEqual([]);
 
-    // That cap on input size also caps the work one parse can do, so each half is repeated to
-    // get the measurement clear of timer resolution.
-    const REPS = 800;
-    function timeMs(markers: number): number {
+    function scanSteps(markers: number): number {
       const aux = build(markers);
-      const start = Date.now();
-      for (let r = 0; r < REPS; r++) parseAuxLabels(aux, { maxLabels: markers });
-      return Date.now() - start;
-    }
-    timeMs(SMALL); // warm the JIT, so round 0 is not the outlier every run
-
-    // Paired within each round and the MEDIAN OF THE RATIOS taken, not the ratio of two medians:
-    // this file runs in a parallel vitest worker pool, and pairing keeps a contention spike in
-    // the numerator alongside the denominator it should be compared against.
-    const ratios: number[] = [];
-    for (let round = 0; round < 5; round += 1) {
-      const small = timeMs(SMALL);
-      const large = timeMs(LARGE);
-      // Non-vacuity floor. A ratio computed from two sub-millisecond readings is noise, and
-      // clamping them to a floor (as the sibling tests above must, at their sizes) would make
-      // this assertion pass whatever the code does. Measured locally at 75-130ms for this half,
-      // so 5ms leaves well over an order of magnitude of headroom for a faster machine.
-      expect(large).toBeGreaterThanOrEqual(5);
-      ratios.push(large / Math.max(small, 1));
-    }
-    ratios.sort((a, b) => a - b);
-    const median = ratios[2];
-    if (median === undefined) {
-      throw new Error('unreachable: ratios always has exactly 5 elements');
+      const { labels, steps } = measureAuxScanWork(aux, { maxLabels: markers });
+      expect(labels).toEqual([]);
+      // Same non-vacuity floor as the sibling test above, and it matters more here: the input is
+      // deliberately kept small enough to stay on this branch, so a scan that bailed out early
+      // would still look plausible.
+      expect(steps).toBeGreaterThanOrEqual(aux.length);
+      return steps;
     }
 
-    // Doubling the input roughly doubles the time when the cursor is forward-only. Measured on
-    // this implementation: 1.15-2.42x. Measured against a reference that re-walks the group from
-    // its start for every marker (the quadratic mistake this guards): 3.69-5.72x. 3.0 sits
-    // between them and matches the threshold the two sibling linearity tests already use.
-    expect(median).toBeLessThan(3.0);
+    const small = scanSteps(SMALL);
+    const large = scanSteps(LARGE);
+    expect(large / small).toBeLessThan(LINEAR_GROWTH_MAX);
   });
 
   it('stays linear (not quadratic) on a large file of unbalanced \\newlabel markers', () => {
     // Each marker opens a brace that never closes, so an unbounded reader would scan to
     // end-of-string on every single one of them: O(n) work per marker * O(n) markers = O(n^2).
     //
-    // This used to assert an absolute wall-clock budget (elapsedMs < 5000). That is exactly the
-    // flake shape this project has already hit on windows-latest (see MEMORY.md), and it barely
-    // discriminated: measured pre-fix (i.e. against the code this test is supposed to catch a
-    // regression back to) on the machine that wrote that budget, 20,000 markers took 6539ms —
-    // against a 5000ms budget, only 1.3x margin. A CI box 1.4x faster than that machine would pass
-    // the absolute assertion against genuinely quadratic code.
-    //
-    // "not quadratic" is actually a claim about the GROWTH RATE, which is machine-speed
-    // independent: doubling the input should roughly double the time (allow real margin either
-    // side of 2x), not quadruple it. n is kept small so the test stays fast even though it now
-    // times two parses instead of one.
-    function parseTimeMs(n: number): number {
-      const aux = Array.from({ length: n }, (_, i) => `\\newlabel{l${i}}{`).join('\n');
-      const start = Date.now();
-      const result = parseAuxLabels(aux, { maxLabels: n });
-      const elapsedMs = Date.now() - start;
-      expect(result).toEqual([]); // every marker is unbalanced — none of them parse
-      return elapsedMs;
+    // This asserted an absolute wall-clock budget (elapsedMs < 5000) once, then a wall-clock
+    // GROWTH RATIO, and now a growth ratio over SCAN STEPS. The absolute budget barely
+    // discriminated (measured pre-fix, 20,000 markers took 6539ms against a 5000ms budget — 1.3x
+    // margin, so a CI box 1.4x faster passed genuinely quadratic code); the wall-clock ratio was
+    // machine-speed independent but not LOAD independent, and flaked at 3.21x inside a full
+    // suite (#173). See LINEAR_GROWTH_MAX above. On this path: 2.09x as written, 4.07x against a
+    // reference with the outer-group read left UNBOUNDED — the exact mistake MAX_GROUP_SCAN
+    // exists to prevent.
+    function build(n: number): string {
+      return Array.from({ length: n }, (_, i) => `\\newlabel{l${i}}{`).join('\n');
     }
 
-    // A floor under each raw measurement guards against sub-millisecond timer resolution
-    // producing a garbage ratio (e.g. 0ms vs 1ms reading as "infinitely worse").
-    const TIMER_FLOOR_MS = 5;
-
-    // Median of 3 samples, not a single one: this file runs inside a parallel vitest worker
-    // pool, so contention can land on one timed half and not the other. Measured spreads:
-    // cold fresh-process runs (no other work sharing the process) gave 1.685-2.138x; warm
-    // in-process runs — as this file actually executes, back-to-back inside one worker — gave
-    // up to 2.44x, only 2.4% under the old 2.5 threshold. That is thin enough to flake exactly
-    // the way this project has already seen on windows-latest (see MEMORY.md's recorded
-    // pushConflictBudget flake) even though the code is genuinely linear. A median-of-3 absorbs
-    // a single contention-skewed sample rather than asserting on it directly.
-    function medianOf3Ms(n: number): number {
-      const samples = [parseTimeMs(n), parseTimeMs(n), parseTimeMs(n)]
-        .map((ms) => Math.max(ms, TIMER_FLOOR_MS))
-        .sort((a, b) => a - b);
-      const median = samples[1];
-      if (median === undefined) {
-        throw new Error('unreachable: samples always has exactly 3 elements');
-      }
-      return median;
+    function scanSteps(n: number): number {
+      const aux = build(n);
+      const { labels, steps } = measureAuxScanWork(aux, { maxLabels: n });
+      expect(labels).toEqual([]); // every marker is unbalanced — none of them parse
+      // Non-vacuity floor, as in the two tests above.
+      expect(steps).toBeGreaterThanOrEqual(aux.length);
+      return steps;
     }
 
     const n = 6_000;
-    const tSmall = medianOf3Ms(n);
-    const tLarge = medianOf3Ms(n * 2);
-
-    // A quadratic scan would give ~4x here — confirmed against a standalone reference
-    // implementation with the outer-group read left UNBOUNDED (same input shape as this test:
-    // the KEY group always closes cleanly, only the trailing outer `{` is unbalanced and scans to
-    // end-of-string every time). Repeated runs on a loaded dev machine gave a 3.07-5.42x spread —
-    // noisy, but never below 3.0 — while the bounded (real) implementation is fast enough at this
-    // `n` that its ratio is dominated by `TIMER_FLOOR_MS` noise around 1x, nowhere near 3.0. 3.0
-    // is comfortably below the quadratic floor actually observed (still genuinely falsifiable —
-    // an unbounded scan fails this test) while giving real margin over the ~2x a linear scan
-    // gives and the up-to-2.44x observed for linear code under worker-pool contention, unlike the
-    // previous 2.5 threshold's 2.4% headroom.
-    expect(tLarge / tSmall).toBeLessThan(3.0);
+    const small = scanSteps(n);
+    const large = scanSteps(n * 2);
+    expect(large / small).toBeLessThan(LINEAR_GROWTH_MAX);
   });
 
   it('stays faithful to the file: cleveref shadow (@cref) entries are returned verbatim, not filtered', () => {
