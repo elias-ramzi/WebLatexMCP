@@ -1,9 +1,38 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm, truncate, chmod } from 'node:fs/promises';
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  readFile,
+  rm,
+  truncate,
+  chmod,
+  symlink,
+} from 'node:fs/promises';
 import { FileService, MAX_READ_BYTES } from '../../src/services/fileService.js';
 import { MAX_ASSET_BYTES, MAX_BINARY_READ_BYTES } from '../../src/lib/assets.js';
+import { toPosix } from '../../src/lib/paths.js';
+
+/**
+ * A counting pass-through for `stat`, to measure that a filtered `FileService.list` no longer
+ * stats the whole tree (issue #174). Disarmed by default, so every other test in this file runs
+ * against the real implementation untouched; a test arms it around the one call it measures.
+ * Same `vi.hoisted` + partial `vi.mock` shape as test/integration/resolvePushLinks.test.ts.
+ */
+const statCounter = vi.hoisted(() => ({ on: false, paths: [] as string[] }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const realStat = actual.stat as (p: unknown, opts?: unknown) => Promise<unknown>;
+  return {
+    ...actual,
+    stat: async (p: unknown, opts?: unknown) => {
+      if (statCounter.on) statCounter.paths.push(String(p));
+      return realStat(p, opts);
+    },
+  };
+});
 
 describe('FileService', () => {
   let dir: string;
@@ -552,5 +581,323 @@ describe('FileService readBytes size cap', () => {
     // What the unfixed code said. The whole assertion, since the two spellings differ only in
     // the separator.
     expect(msg).not.toContain(p);
+  });
+});
+
+/**
+ * `FileService.list` filters inside the walk and stats only what survives (issue #174), so the
+ * work is proportional to the answer rather than to the project. That is a pure optimization, and
+ * the thing worth pinning is the "pure" half: every expectation below is the output the previous
+ * implementation produced for the same tree, captured before the change and written out verbatim.
+ */
+describe('FileService.list is byte-identical under every filter', () => {
+  // Distinct contents so a size mix-up cannot pass; `.hidden` (extname '') and `Makefile` pin the
+  // no-extension branch, `.TEX` pins the lowercasing, and the nesting pins the recursion.
+  const TREE: ReadonlyArray<readonly [string, string]> = [
+    ['main.tex', '\\documentclass{article}\n'],
+    ['refs.bib', '@misc{a, title={A}}\n'],
+    ['README.md', '# readme\n'],
+    ['notes.txt', 'notes\n'],
+    ['Makefile', 'all:\n'],
+    ['figure.png', 'PNG\n'],
+    ['.hidden', 'x\n'],
+    ['sections/intro.tex', 'intro\n'],
+    ['sections/appendix.TEX', 'appendix upper\n'],
+    ['sections/data.csv', 'a,b\n'],
+    ['sections/img/plot.pdf', '%PDF\n'],
+    ['sections/img/diagram.svg', '<svg/>\n'],
+    ['bib/extra.bib', '@book{b, title={B}}\n'],
+    ['bib/notes.org', '* org\n'],
+    ['deep/a/b/leaf.tex', 'leaf\n'],
+    ['deep/a/b/leaf.jpeg', 'JPEG\n'],
+    ['.git/HEAD', 'ref: refs/heads/master\n'],
+  ];
+
+  const E = {
+    hidden: { path: '.hidden', type: 'other', sizeBytes: 2 },
+    extraBib: { path: 'bib/extra.bib', type: 'bib', sizeBytes: 20 },
+    notesOrg: { path: 'bib/notes.org', type: 'doc', sizeBytes: 6 },
+    leafJpeg: { path: 'deep/a/b/leaf.jpeg', type: 'asset', sizeBytes: 5 },
+    leafTex: { path: 'deep/a/b/leaf.tex', type: 'tex', sizeBytes: 5 },
+    figurePng: { path: 'figure.png', type: 'asset', sizeBytes: 4 },
+    mainTex: { path: 'main.tex', type: 'tex', sizeBytes: 24 },
+    makefile: { path: 'Makefile', type: 'other', sizeBytes: 5 },
+    notesTxt: { path: 'notes.txt', type: 'doc', sizeBytes: 6 },
+    readmeMd: { path: 'README.md', type: 'doc', sizeBytes: 9 },
+    refsBib: { path: 'refs.bib', type: 'bib', sizeBytes: 20 },
+    appendixTex: { path: 'sections/appendix.TEX', type: 'tex', sizeBytes: 15 },
+    dataCsv: { path: 'sections/data.csv', type: 'other', sizeBytes: 4 },
+    diagramSvg: { path: 'sections/img/diagram.svg', type: 'asset', sizeBytes: 7 },
+    plotPdf: { path: 'sections/img/plot.pdf', type: 'asset', sizeBytes: 5 },
+    introTex: { path: 'sections/intro.tex', type: 'tex', sizeBytes: 6 },
+  } as const;
+
+  let dir: string;
+  const files = new FileService();
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-list174-'));
+    for (const [rel, content] of TREE) {
+      const full = path.join(dir, rel);
+      await mkdir(path.dirname(full), { recursive: true });
+      await writeFile(full, content, 'utf8');
+    }
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("filter 'all' — every file but .git, sorted, with exact sizes", async () => {
+    expect(await files.list(dir, { filter: 'all' })).toEqual([
+      E.hidden,
+      E.extraBib,
+      E.notesOrg,
+      E.leafJpeg,
+      E.leafTex,
+      E.figurePng,
+      E.mainTex,
+      E.makefile,
+      E.notesTxt,
+      E.readmeMd,
+      E.refsBib,
+      E.appendixTex,
+      E.dataCsv,
+      E.diagramSvg,
+      E.plotPdf,
+      E.introTex,
+    ]);
+    // The default is 'all': an omitted filter must not take a different path from an explicit one.
+    expect(await files.list(dir)).toEqual(await files.list(dir, { filter: 'all' }));
+  });
+
+  it("filter 'tex'", async () => {
+    expect(await files.list(dir, { filter: 'tex' })).toEqual([
+      E.leafTex,
+      E.mainTex,
+      E.appendixTex,
+      E.introTex,
+    ]);
+  });
+
+  it("filter 'bib'", async () => {
+    expect(await files.list(dir, { filter: 'bib' })).toEqual([E.extraBib, E.refsBib]);
+  });
+
+  it("filter 'docs'", async () => {
+    expect(await files.list(dir, { filter: 'docs' })).toEqual([E.notesOrg, E.notesTxt, E.readmeMd]);
+  });
+
+  it("filter 'assets'", async () => {
+    expect(await files.list(dir, { filter: 'assets' })).toEqual([
+      E.leafJpeg,
+      E.figurePng,
+      E.diagramSvg,
+      E.plotPdf,
+    ]);
+  });
+
+  it('a subdir base composes with the filter, both unchanged', async () => {
+    expect(await files.list(dir, { subdir: 'sections', filter: 'all' })).toEqual([
+      E.appendixTex,
+      E.dataCsv,
+      E.diagramSvg,
+      E.plotPdf,
+      E.introTex,
+    ]);
+    expect(await files.list(dir, { subdir: 'sections', filter: 'tex' })).toEqual([
+      E.appendixTex,
+      E.introTex,
+    ]);
+  });
+
+  it('every filtered result is exactly the corresponding slice of the unfiltered one', async () => {
+    // The property behind all of the above, stated once against whatever the tree happens to be:
+    // filtering may not reorder, re-type or re-size anything, only drop.
+    const all = await files.list(dir, { filter: 'all' });
+    for (const [filter, type] of [
+      ['tex', 'tex'],
+      ['bib', 'bib'],
+      ['docs', 'doc'],
+      ['assets', 'asset'],
+    ] as const) {
+      expect(await files.list(dir, { filter })).toEqual(all.filter((e) => e.type === type));
+    }
+  });
+});
+
+/**
+ * The walk decides traversal before it consults the filter, so a filtered call reaches exactly the
+ * directories an unfiltered one does. Symlinks are where that could go wrong: a directory link's
+ * own name says nothing about what is under it, so it must be `stat`ed and descended into whatever
+ * the filter is. `followSymlinks` is the project owner's assertion (`setLinkPolicy`), and these
+ * expectations too are the previous implementation's output for the same trees.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'FileService.list follows links the same way under every filter',
+  () => {
+    let proj: string;
+    let shared: string;
+    const follow = new FileService();
+    const noFollow = new FileService();
+    follow.setLinkPolicy(() => true);
+
+    beforeEach(async () => {
+      proj = await mkdtemp(path.join(os.tmpdir(), 'ovl-list174p-'));
+      shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-list174s-'));
+      await mkdir(path.join(shared, 'figs'), { recursive: true });
+      await writeFile(path.join(shared, 'macros.tex'), 'macros\n', 'utf8');
+      await writeFile(path.join(shared, 'refs.bib'), '@misc{s, title={S}}\n', 'utf8');
+      await writeFile(path.join(shared, 'figs', 'logo.png'), 'PNG\n', 'utf8');
+      await writeFile(path.join(proj, 'main.tex'), 'main\n', 'utf8');
+      // `sharedlink` has no extension at all, so it classifies as 'other' and every narrow filter
+      // rejects its NAME — it must still be descended into, or `list_references` stops seeing the
+      // shared bibliography the opt-in exists for the moment someone passes a filter.
+      await symlink(shared, path.join(proj, 'sharedlink'), 'dir');
+      await symlink(path.join(shared, 'refs.bib'), path.join(proj, 'refs.bib'));
+      await symlink('nowhere-at-all', path.join(proj, 'dangling.tex'));
+    });
+
+    afterEach(async () => {
+      await rm(proj, { recursive: true, force: true });
+      await rm(shared, { recursive: true, force: true });
+    });
+
+    it('lists through a linked directory and a linked file, dangling link dropped', async () => {
+      expect(await follow.list(proj, { filter: 'all' })).toEqual([
+        { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+        { path: 'refs.bib', type: 'bib', sizeBytes: 20 },
+        { path: 'sharedlink/figs/logo.png', type: 'asset', sizeBytes: 4 },
+        { path: 'sharedlink/macros.tex', type: 'tex', sizeBytes: 7 },
+        { path: 'sharedlink/refs.bib', type: 'bib', sizeBytes: 20 },
+      ]);
+    });
+
+    it('a narrow filter reaches through the linked directory just the same', async () => {
+      expect(await follow.list(proj, { filter: 'tex' })).toEqual([
+        { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+        { path: 'sharedlink/macros.tex', type: 'tex', sizeBytes: 7 },
+      ]);
+      expect(await follow.list(proj, { filter: 'bib' })).toEqual([
+        { path: 'refs.bib', type: 'bib', sizeBytes: 20 },
+        { path: 'sharedlink/refs.bib', type: 'bib', sizeBytes: 20 },
+      ]);
+      expect(await follow.list(proj, { filter: 'assets' })).toEqual([
+        { path: 'sharedlink/figs/logo.png', type: 'asset', sizeBytes: 4 },
+      ]);
+      expect(await follow.list(proj, { filter: 'docs' })).toEqual([]);
+    });
+
+    it('a project that has NOT opted in sees no link at all, under any filter', async () => {
+      expect(await noFollow.list(proj, { filter: 'all' })).toEqual([
+        { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+      ]);
+      expect(await noFollow.list(proj, { filter: 'tex' })).toEqual([
+        { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+      ]);
+      expect(await noFollow.list(proj, { filter: 'bib' })).toEqual([]);
+      expect(await noFollow.list(proj, { filter: 'assets' })).toEqual([]);
+    });
+
+    it('the realpath cycle guard still walks `sub/up -> ..` once, filtered or not', async () => {
+      const cyc = await mkdtemp(path.join(os.tmpdir(), 'ovl-list174c-'));
+      try {
+        await mkdir(path.join(cyc, 'sub'), { recursive: true });
+        await writeFile(path.join(cyc, 'main.tex'), 'main\n', 'utf8');
+        await writeFile(path.join(cyc, 'sub', 'a.bib'), 'bib\n', 'utf8');
+        await symlink('..', path.join(cyc, 'sub', 'up'), 'dir');
+
+        expect(await follow.list(cyc, { filter: 'all' })).toEqual([
+          { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+          { path: 'sub/a.bib', type: 'bib', sizeBytes: 4 },
+          { path: 'sub/up/main.tex', type: 'tex', sizeBytes: 5 },
+          { path: 'sub/up/sub/a.bib', type: 'bib', sizeBytes: 4 },
+        ]);
+        expect(await follow.list(cyc, { filter: 'tex' })).toEqual([
+          { path: 'main.tex', type: 'tex', sizeBytes: 5 },
+          { path: 'sub/up/main.tex', type: 'tex', sizeBytes: 5 },
+        ]);
+        expect(await follow.list(cyc, { filter: 'bib' })).toEqual([
+          { path: 'sub/a.bib', type: 'bib', sizeBytes: 4 },
+          { path: 'sub/up/sub/a.bib', type: 'bib', sizeBytes: 4 },
+        ]);
+      } finally {
+        await rm(cyc, { recursive: true, force: true });
+      }
+    });
+  },
+);
+
+/**
+ * The optimization itself: a filtered `list` must not pay a `stat` for a path it is going to
+ * discard. `detectRootFile` asks for `tex` on every `compile`; before #174 it stat'd every figure
+ * in the tree to find a handful of `.tex` files.
+ */
+describe('FileService.list stats only what survives the filter', () => {
+  const ASSET_COUNT = 40;
+  const TEX_COUNT = 3;
+  const BIB_COUNT = 2;
+  const TOTAL = ASSET_COUNT + TEX_COUNT + BIB_COUNT;
+
+  let dir: string;
+  const files = new FileService();
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-stat174-'));
+    await mkdir(path.join(dir, 'figures', 'plots'), { recursive: true });
+    await mkdir(path.join(dir, 'sections'), { recursive: true });
+    for (let i = 0; i < ASSET_COUNT; i++) {
+      const sub = i % 2 === 0 ? 'figures' : path.join('figures', 'plots');
+      await writeFile(path.join(dir, sub, `f${String(i).padStart(3, '0')}.png`), 'PNG\n');
+    }
+    await writeFile(path.join(dir, 'main.tex'), 'main\n');
+    await writeFile(path.join(dir, 'sections', 'a.tex'), 'a\n');
+    await writeFile(path.join(dir, 'sections', 'b.tex'), 'b\n');
+    await writeFile(path.join(dir, 'refs.bib'), 'r\n');
+    await writeFile(path.join(dir, 'sections', 'more.bib'), 'm\n');
+    statCounter.paths.length = 0;
+  });
+
+  afterEach(async () => {
+    statCounter.on = false;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function countStats(filter: 'all' | 'tex' | 'bib' | 'assets'): Promise<number> {
+    statCounter.paths.length = 0;
+    statCounter.on = true;
+    try {
+      const entries = await files.list(dir, { filter });
+      expect(entries.length).toBeGreaterThan(0);
+      return statCounter.paths.length;
+    } finally {
+      statCounter.on = false;
+    }
+  }
+
+  it('pays one stat per returned entry, not one per file in the tree', async () => {
+    const all = await countStats('all');
+    // A MINIMUM, so the counter cannot read 0 (an uninstalled mock) and pass: an unfiltered list
+    // has to stat everything it returns, and it returns every file here.
+    expect(all).toBeGreaterThanOrEqual(TOTAL);
+
+    const tex = await countStats('tex');
+    const bib = await countStats('bib');
+    const assets = await countStats('assets');
+
+    // What the fix buys. Before it, each of these was `all`.
+    expect(tex).toBe(TEX_COUNT);
+    expect(bib).toBe(BIB_COUNT);
+    expect(assets).toBe(ASSET_COUNT);
+    expect(tex).toBeLessThan(all / 10);
+
+    // And every stat a filtered call does make is for a path it actually returns.
+    statCounter.paths.length = 0;
+    statCounter.on = true;
+    const entries = await files.list(dir, { filter: 'tex' });
+    statCounter.on = false;
+    expect(statCounter.paths.map((p) => toPosix(path.relative(dir, p))).sort()).toEqual(
+      entries.map((e) => e.path).sort(),
+    );
   });
 });

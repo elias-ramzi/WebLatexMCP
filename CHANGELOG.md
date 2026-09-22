@@ -1410,6 +1410,14 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   retry) and fails if they are split apart again. No behaviour change: `withFileLock`'s signature and
   call site are unchanged, `isLockContentionError` is untouched, and `existsSync` stays uninjected.
 
+- **`FileService.list` filters inside the walk and stats only what survives** (#174). It used to
+  `stat` every file in the project and apply the filter afterwards, so `detectRootFile` — which runs
+  on every `compile` — paid one syscall per figure to find a handful of `.tex` files. A symlink is
+  still `stat`ed before it is classified, since that is what decides file-vs-descend and a directory
+  link's name says nothing about its contents: the filter changes what is collected, never what is
+  walked. Output is unchanged for every filter, pinned by expectations captured from the old
+  implementation.
+
 ### Fixed
 
 - **`push`'s review payload is budgeted too, not just its conflict payload** (#160, #153, #68). Branch
