@@ -1544,6 +1544,50 @@ additional properties`. The suite missed it because a test client that never lis
   `fields` key at all plus a `fieldsOmitted` count — "this entry has fields and none fit", which
   an empty map would misreport as "this entry has no fields".
 
+- **`pdf_geometry` merges a drifting rotated line and a genuinely sheared run, instead of
+  returning one box per item** (#140, refs #80 §6, #132). **This changes reported output**: text
+  runs that previously came back as several correct-but-separate boxes now come back as one
+  merged line box, with the merged `text` and a higher `items` count. No box shrinks and no box
+  that was one line becomes two.
+
+  One root cause, two symptoms. `mergeTextLines` compared each item's line position as _the
+  item's origin projected onto its OWN cross axis_, so the two ends of every comparison were
+  read off two different rulers whenever the frames disagreed at all. A frame difference of _d_
+  displaced that coordinate by about `|origin| * sin(d)`, judged against a 1pt tolerance: 860pt
+  out on a page, 0.07° of per-item matrix drift already split a line that merged happily near
+  the page origin, so `DIRECTION_TOLERANCE_COS` (1°) was the outer bound and never the operative
+  one. And under shear `up · dir` is non-zero, so stepping one item forward along the advance
+  axis moved that same coordinate by `advance * (dir · up)` — past 1pt after a glyph or two —
+  and a naturally-placed slanted run came back as one box per item in both writing modes.
+
+  Both projections are now taken against the **running line's** axes: the candidate's origin
+  onto the line's position axis (the perpendicular to its advance axis, oriented the way its
+  cross axis points), and the candidate's em corners onto the line's advance axis. The line
+  coordinate is therefore the candidate's perpendicular **distance from that line's baseline**,
+  in points, with no `|origin|` term in it and no shear term either. `DIRECTION_TOLERANCE_COS`
+  is now the governing bound on frame disagreement, everywhere on the page.
+
+  **Axis-aligned horizontal text is bit-identical, not merely close.** For `b = c = 0`,
+  `itemAxes` returns `dir = (1,0)` and `up = (0,1)` exactly (the divisions are `a/|a|`, `0/|a|`,
+  `0/|d|`, `d/|d|`), so every item of such a line has the same axes as the line it joins, the
+  new position axis reduces to `(0,1)` bit for bit, and each projection is the identical
+  floating-point expression as before. A swept differential test asserts exact equality against
+  an independent reimplementation of the page-axis rule, including the rows at and either side
+  of every tolerance boundary. The vertical/CJK merging from #132 is unchanged for the same
+  reason (an upright vertical frame's position axis is its `dir`, exactly), and two items in
+  different writing modes are still never one line.
+
+  The one thing this loosens: a frame so flattened that `up` is within ~5° of `dir` has almost
+  no perpendicular separation left between consecutive lines, and two of them could merge. That
+  takes a text matrix with essentially no height, and every angle short of it separates as
+  before.
+
+  Test coverage the tree did not have: the existing hand-built shear test placed its pair
+  _perpendicular to the up axis_ — "which is why it looks contrived", as its own comment said —
+  and #132's generated property test stepped the same way by construction, so neither exercised
+  a sheared run placed where text actually goes. Both now place naturally, and the sweep's
+  `k !== 0` cases fail on the old code.
+
 - **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
   read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
   `list_skills` renders the same instruction text as the skill prompts but was still calling

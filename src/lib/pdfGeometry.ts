@@ -138,21 +138,23 @@ const DEFAULT_MAX_TEXT_CHARS = 160;
  * one line. Rather than something looser, because this comparison is what separates two visually
  * distinct lines that merely share a page coordinate.
  *
- * **How much drift actually survives is decided by the baseline clause, not by this constant, and
- * it is much less than a degree away from the origin.** `across` projects an item's ORIGIN onto
- * its OWN cross axis (its up axis horizontally, its direction axis vertically — see
- * `groupingAxes`), so a frame difference of d shifts `across` by about |origin| * sin(d), judged
- * against `baselineTolerancePt` (1pt). Near the origin a full degree survives; at the far corner
- * of an A4 page (|origin| ~ 860pt) anything past roughly 0.07 degrees already reads as a different
- * baseline and splits. So this gate is the outer bound, not the operative one, over most of a
- * page. That is left as it is deliberately — the error direction is safe (a rotated line comes
- * back as several correct boxes, never as one box spanning two lines, which is the pre-existing
- * behaviour this merging improves on rather than a regression) and tightening the coupling means
- * projecting both origins onto the LINE's cross axis, a behaviour change worth its own issue —
- * still open, and untouched by the vertical-merge work, which changed WHICH axis an item is
- * projected onto, never WHOSE. What
- * is not acceptable is a comment claiming a capability the code does not deliver, so: this
- * constant bounds frame disagreement; it does not by itself hold a drifting rotated line together.
+ * **This constant is the operative bound on frame disagreement, and holds a drifting rotated line
+ * together anywhere on the page.** It did not always. `across` used to project an item's ORIGIN
+ * onto its OWN cross axis, so a frame difference of d shifted `across` by about |origin| * sin(d),
+ * judged against `baselineTolerancePt` (1pt): near the page origin a full degree survived, but
+ * 860pt out anything past roughly 0.07 degrees already read as a different baseline and split the
+ * line, and this gate never got to speak. (860pt is a point in the upper reaches of an A4 page,
+ * not its corner — the corner is `hypot(595.28, 841.89)` = 1031pt, where the effective bound was
+ * tighter still at about 0.056 degrees. The 860/0.07 pair is the figure the pre-fix comment and
+ * issue #140 both used, kept here so the two read against each other.) `mergeTextLines`
+ * now projects a candidate's origin onto the RUNNING LINE's position axis (`positionAxis`), so
+ * `baselineTolerancePt` measures the candidate's PERPENDICULAR DISTANCE from that line's own
+ * baseline, in points, with no |origin| term in it at all. A drifting item that is still on the
+ * line stays on it wherever the line sits.
+ *
+ * What the baseline clause still bounds, and must, is genuine positional separation: two visually
+ * distinct lines 12pt apart remain two lines. What it no longer does is convert frame drift into
+ * a position error — that is this constant's job alone now.
  *
  * Compared as a dot product rather than an angle: both axes are already unit vectors (`itemAxes`),
  * so it costs two multiplies and no trigonometry.
@@ -221,9 +223,11 @@ function itemAxes(transform: Matrix): { dir: Axis; up: Axis } {
  *
  * - `advance` is the axis the run progresses along — the direction axis for horizontal text, and
  *   the NEGATED up axis for vertical text, whose run goes BACKWARD along `up` (see `emExtent`).
- * - `cross` is the axis the line's position is measured on — `up` for horizontal text (the
+ * - `cross` is the axis the line's position is measured ALONG — `up` for horizontal text (the
  *   generalized baseline coordinate), and the direction axis for vertical text (which column the
- *   run sits in).
+ *   run sits in). It is not itself the coordinate axis the merge rule uses: `positionAxis` first
+ *   removes whatever component of it leans along `advance`, which is what a sheared matrix puts
+ *   there. For an unsheared frame the two are the same vector, exactly.
  *
  * Grouping every item on the horizontal pairing is what left a vertical line unmerged: consecutive
  * items down a column differ in exactly the coordinate that pairing calls the baseline, so every
@@ -242,6 +246,64 @@ function groupingAxes(dir: Axis, up: Axis, vertical: boolean): { advance: Axis; 
   return vertical ? { advance: [-up[0], -up[1]], cross: dir } : { advance: dir, cross: up };
 }
 
+/**
+ * The axis a line's POSITION is actually measured on: `cross` with any component along `advance`
+ * removed, renormalized — i.e. the unit normal to the advance axis, oriented the way `cross`
+ * points.
+ *
+ * Why not `cross` itself. Under shear the up axis leans into the direction axis (`up · dir != 0`),
+ * so walking one item forward ALONG the advance axis moves the cross coordinate by
+ * `advance * (dir · up)` — past `baselineTolerancePt` after a glyph or two. Measured on the
+ * normal instead, walking along the advance axis moves the coordinate by exactly nothing, which
+ * is what "the next glyph is on the same line" has to mean for a slanted run. The quantity this
+ * returns an axis for is therefore the candidate's perpendicular distance from the running line's
+ * baseline, in points — a real distance, which is the unit `baselineTolerancePt` is expressed in.
+ *
+ * **For an unsheared frame this is `cross` itself, bit for bit, which is the whole safety
+ * property.** `lean` is then exactly 0, the subtraction is `cross - 0 * advance` (whose products
+ * are +/-0 and change nothing), and the length of a unit vector is exactly 1, so the division
+ * returns the same two doubles. That holds for every axis-aligned horizontal item — where
+ * `itemAxes` yields exactly `dir = (1,0)`, `up = (0,1)` — and for an upright vertical one, and for
+ * any rotation whose two axes come out exactly orthogonal. Only a genuinely sheared frame gets a
+ * different vector, which is exactly the case this exists for.
+ *
+ * Degenerate frames fall back to `cross`, the same way `itemAxes` falls back to the unrotated unit
+ * vectors: if `cross` is parallel to `advance` the text matrix has collapsed to a line and there
+ * is no position axis to find, and if the normalization does not come out finite there is nothing
+ * to prefer it over. Either way the result stays a unit-ish vector, so a projection of a finite
+ * origin stays finite and no box can be poisoned by this.
+ */
+function positionAxis(advance: Axis, cross: Axis): Axis {
+  const lean = dot(cross, advance);
+  const px = cross[0] - lean * advance[0];
+  const py = cross[1] - lean * advance[1];
+  const len = Math.hypot(px, py);
+  if (!(len > 0)) {
+    return cross;
+  }
+  const axis: Axis = [px / len, py / len];
+  return isFiniteAxis(axis) ? axis : cross;
+}
+
+/** One user-space point projected onto a unit axis. */
+function projectPoint(p: readonly [number, number], axis: Axis): number {
+  return p[0] * axis[0] + p[1] * axis[1];
+}
+
+/** The extent of a set of user-space corners along a unit axis. Taken over the SAME four corners
+ *  `frameCorners` built, in the same order, so switching which axis they are projected onto is the
+ *  only thing that ever changes about this number. */
+function projectExtent(
+  corners: readonly (readonly [number, number])[],
+  axis: Axis,
+): { min: number; max: number } {
+  const along: number[] = [];
+  for (const c of corners) {
+    along.push(c[0] * axis[0] + c[1] * axis[1]);
+  }
+  return { min: Math.min(...along), max: Math.max(...along) };
+}
+
 /** The item's EM size: `height` for a horizontal item, `width` for a vertical one, because pdf.js
  *  measures a vertical item the other way round (see `emExtent`). Used for the default
  *  backward-overlap allowance, whose rationale is "one glyph may paint back over the one before
@@ -253,7 +315,15 @@ function emSize(item: TextItemLike): number {
 }
 
 /** An item measured in its own frame: the axis-aligned box the caller gets back, the two axes that
- *  frame is built on, and the item's extent expressed in that frame. */
+ *  frame is built on, and the raw geometry the merge rule needs in order to re-measure the item in
+ *  SOMEBODY ELSE'S frame — the running line's.
+ *
+ *  It deliberately carries no `across`/`alongMin`/`alongMax` of its own. Those used to live here,
+ *  each projected onto the ITEM's axes, and comparing two of them was comparing two coordinates
+ *  read off two different rulers: a frame difference of d then showed up as a position difference
+ *  of about |origin| * sin(d), and a sheared step along the advance axis showed up as a baseline
+ *  change (issue #140). The projections are done in `mergeTextLines` instead, against the axes of
+ *  the line being joined, so both sides of every comparison are read off one ruler. */
 interface ItemFrame {
   box: Box;
   dir: Axis;
@@ -261,15 +331,17 @@ interface ItemFrame {
   /** The item's writing mode, normalized to a boolean — part of the frame because two items in
    *  different writing modes are never one line, however well their axes agree (`groupingAxes`). */
   vertical: boolean;
-  /** The line-position coordinate, generalized: the item's ORIGIN projected onto its CROSS axis —
-   *  the up axis for a horizontal item (its baseline), the direction axis for a vertical one
-   *  (its column). For an unrotated horizontal item this is `transform[5]` itself, which is what
-   *  the page-axis version of this function compared. */
-  across: number;
-  /** The item's extent along its ADVANCE axis — for an unrotated horizontal item, `box.x0` and
-   *  `box.x1`. */
-  alongMin: number;
-  alongMax: number;
+  /** The axes a line OPENED BY THIS ITEM is measured on: the advance axis from `groupingAxes`, and
+   *  the position axis (`positionAxis`) the line's own baseline coordinate runs on. An item that
+   *  joins an existing line is measured on that line's pair instead, never on these. */
+  advance: Axis;
+  position: Axis;
+  /** The glyph origin, `(transform[4], transform[5])`. */
+  origin: readonly [number, number];
+  /** The four user-space corners of the item's FULL EM extent (`emExtent`) — never the box's own,
+   *  which may have been cut to a declared ascent. Kept as corners rather than as an extent so the
+   *  merge rule can project them onto the running line's advance axis. */
+  emCorners: readonly (readonly [number, number])[];
 }
 
 /** An item's extent **in its own frame**: how far it reaches along the direction axis (`s`) and
@@ -304,10 +376,11 @@ interface FrameExtent {
  *
  * Kept as its own function, separate from `inkExtent`, because the box math and the merge rule
  * change independently: the box spends a declared ascent where it has one, and a change in the
- * corners would otherwise move `alongMin`/`alongMax` with it and silently regroup a SHEARED line
- * (whose up axis has a component along the direction axis, so the along-extent does depend on the
- * up extent). Grouping is therefore computed from THESE corners in every case, which makes "an
- * ascent cannot move the merge rule" a property of the code rather than a claim about it.
+ * corners would otherwise move the along-extent the gap clause measures and silently regroup a
+ * SHEARED line (whose up axis has a component along the direction axis, so the along-extent does
+ * depend on the up extent). Grouping is therefore computed from THESE corners in every case
+ * (`ItemFrame.emCorners`), which makes "an ascent cannot move the merge rule" a property of the
+ * code rather than a claim about it.
  *
  * The vertical branch is what changed when vertical lines learned to merge. Grouping used to use
  * the horizontal reading for every item, which put a vertical item's along-extent a whole advance
@@ -375,29 +448,27 @@ function inkExtent(item: TextItemLike): FrameExtent {
   return ascent === undefined ? em : { ...em, tMax: item.height * ascent };
 }
 
-/** The four user-space corners of one frame extent, and their projections onto `alongAxis` (the
- *  item's advance axis — see `groupingAxes`). One function so the box corners and the grouping
- *  corners can only ever differ by the extent they were given, never by how they were built. */
+/** The four user-space corners of one frame extent. One function so the box corners and the
+ *  grouping corners can only ever differ by the extent they were given, never by how they were
+ *  built. Projection onto an axis is `projectExtent`'s job, and is deliberately NOT done here:
+ *  the grouping corners are projected onto the RUNNING LINE's advance axis, which this function
+ *  has no business knowing about (issue #140). */
 function frameCorners(
   origin: readonly [number, number],
   dir: Axis,
   up: Axis,
   extent: FrameExtent,
-  alongAxis: Axis,
-): { xs: number[]; ys: number[]; along: number[] } {
-  const xs: number[] = [];
-  const ys: number[] = [];
-  const along: number[] = [];
+): readonly (readonly [number, number])[] {
+  const corners: (readonly [number, number])[] = [];
   for (const s of [extent.sMin, extent.sMax]) {
     for (const t of [extent.tMin, extent.tMax]) {
-      const x = origin[0] + s * dir[0] + t * up[0];
-      const y = origin[1] + s * dir[1] + t * up[1];
-      xs.push(x);
-      ys.push(y);
-      along.push(x * alongAxis[0] + y * alongAxis[1]);
+      corners.push([
+        origin[0] + s * dir[0] + t * up[0],
+        origin[1] + s * dir[1] + t * up[1],
+      ] as const);
     }
   }
-  return { xs, ys, along };
+  return corners;
 }
 
 /** An item's box and frame in user space, built from the text-rendering matrix itself rather than
@@ -417,24 +488,31 @@ function frameCorners(
  *  is orthogonalized anywhere. Rebuilding the corners from the raw matrix instead would
  *  double-apply the scale, since `width` and `height` already carry it.
  *
- *  `across`/`alongMin`/`alongMax` are projections of four corners built by the very same function
- *  as the box's, computed here rather than in mergeTextLines so that they cannot be the corners of
- *  some other, separately guarded frame. They are deliberately taken from the `emExtent` corners
- *  rather than from the box's own: the box may be cut to a declared ascent, and under a sheared
- *  matrix that would move the along-extent too and regroup lines that group today. The merge rule
- *  is held still while the box math changes — see `emExtent`. For every item that has no usable
- *  ascent the two extents are the same numbers, so this is one computation done twice, not two
- *  rules.
+ *  `emCorners` are four corners built by the very same function as the box's, computed here rather
+ *  than in mergeTextLines so that they cannot be the corners of some other, separately guarded
+ *  frame. They are deliberately the `emExtent` corners rather than the box's own: the box may be
+ *  cut to a declared ascent, and under a sheared matrix that would move the along-extent too and
+ *  regroup lines that group today. The merge rule is held still while the box math changes — see
+ *  `emExtent`. For every item that has no usable ascent the two extents are the same numbers, so
+ *  this is one computation done twice, not two rules.
  *
- *  They are projected onto the item's ADVANCE and CROSS axes rather than onto `dir` and `up`
- *  directly, which is the same pair for a horizontal item and the swapped one for a vertical
- *  item — see `groupingAxes`, and `mergeTextLines` for why the writing mode is then part of the
- *  frame too.
+ *  They are returned unprojected. `mergeTextLines` projects them onto the RUNNING LINE's advance
+ *  axis and the item's ORIGIN onto the running line's position axis, so that a comparison is never
+ *  between two coordinates read in two different frames — issue #140, whose two symptoms (a
+ *  rotated line splitting at the far corner of a page, a sheared run splitting after one glyph)
+ *  were both that. `advance`/`position` here are only what a line OPENED by this item would be
+ *  measured on.
+ *
+ *  Which axes those are comes from `groupingAxes` — the item's own `dir`/`up` pair for a
+ *  horizontal item and the swapped one for a vertical item — with `positionAxis` then taking the
+ *  shear out of the cross axis. See `mergeTextLines` for why the writing mode is part of the frame
+ *  on top of them.
  *
  *  That sharing is also what makes the unrotated horizontal reduction exact rather than
  *  approximate: with `dir = (1,0)` the advance axis IS `dir`, so the projection `x * 1 + y * 0` is
- *  each corner's x, `alongMin`/`alongMax` are literally the numbers `box.x0`/`box.x1` carry, and
- *  `across` is literally `transform[5]`.
+ *  each corner's x, the along-extent is literally the numbers `box.x0`/`box.x1` carry, the position
+ *  axis is exactly `(0,1)` (`positionAxis` subtracts a zero lean and divides by a length of
+ *  exactly 1), and the line coordinate is literally `transform[5]`.
  *
  *  The direction/up AXES get a sane fallback when non-finite (see itemAxes, above) — falling back
  *  to the unrotated unit vectors keeps a usable box. The item's ORIGIN (`e`, `f`) and its
@@ -449,25 +527,28 @@ function itemFrame(item: TextItemLike): ItemFrame {
   const { advance, cross } = groupingAxes(dir, up, vertical);
   const origin: readonly [number, number] = [e, f];
 
-  const ink = frameCorners(origin, dir, up, inkExtent(item), advance);
+  const ink = frameCorners(origin, dir, up, inkExtent(item));
   // The grouping corners. Both extents are built from the same `width`/`height`/origin, so a
   // document-controlled non-finite one poisons both together and mergeTextLines' single
   // `hasNonFiniteEdge` check on the box below still catches it — an ascent fraction is finite by
   // construction (`usableAscent`) and `width / 2` cannot turn a finite width non-finite.
-  const em = frameCorners(origin, dir, up, emExtent(item), advance);
+  const em = frameCorners(origin, dir, up, emExtent(item));
+  const xs = ink.map((c) => c[0]);
+  const ys = ink.map((c) => c[1]);
   return {
     box: {
-      x0: Math.min(...ink.xs),
-      y0: Math.min(...ink.ys),
-      x1: Math.max(...ink.xs),
-      y1: Math.max(...ink.ys),
+      x0: Math.min(...xs),
+      y0: Math.min(...ys),
+      x1: Math.max(...xs),
+      y1: Math.max(...ys),
     },
     dir,
     up,
     vertical,
-    across: e * cross[0] + f * cross[1],
-    alongMin: Math.min(...em.along),
-    alongMax: Math.max(...em.along),
+    advance,
+    position: positionAxis(advance, cross),
+    origin,
+    emCorners: em,
   };
 }
 
@@ -497,10 +578,13 @@ function truncate(text: string, maxChars: number): string {
  *   and cross axes (`groupingAxes`) while being a sideways caption and an upright CJK column —
  *   two lines, not one.
  * - **Their line positions agree** within `baselineTolerancePt`, that coordinate being the item's
- *   origin projected onto its CROSS axis: the baseline for a horizontal item, the column for a
- *   vertical one.
- * - **They are adjacent along the ADVANCE axis**: the gap between the new item's near edge and
- *   the running line's far edge, both measured along that axis, is no more than `gapTolerancePt`
+ *   origin projected onto the RUNNING LINE's POSITION axis — the perpendicular to the line's
+ *   advance axis, oriented the way its cross axis points (`positionAxis`). So the quantity
+ *   compared is the candidate's perpendicular distance from the line's own baseline (its own
+ *   column, in vertical mode), in points.
+ * - **They are adjacent along the RUNNING LINE's ADVANCE axis**: the gap between the new item's
+ *   near edge and the running line's far edge, both measured along that axis, is no more than
+ *   `gapTolerancePt`
  *   forward and no more than `overlapTolerancePt` backward (a negative gap is an overlap) —
  *   default, per item, the item's own EM (`emSize`: `height` horizontally, `width` vertically)
  *   floored at 1pt, since accents and combining glyphs legitimately paint back over the preceding
@@ -513,11 +597,24 @@ function truncate(text: string, maxChars: number): string {
  * frame, and tracks the far edge as a running maximum.
  *
  * All three quantities come off the same four corners `itemFrame` builds the box from, projected
- * onto that item's own axes, so the unrotated horizontal case reduces to the page-axis rule this
- * function used before — exactly, not approximately. With `b = c = 0` and no vertical flag the
- * frame is `dir = (1,0)`, `up = (0,1)`, the advance axis IS `dir` and the cross axis IS `up`, so
- * the baseline coordinate is `transform[5]` and the two extents are the numbers `box.x0`/`box.x1`
- * already carry. An unrotated document's output is therefore unchanged, edge for edge.
+ * onto THE LINE's axes rather than onto each item's own. That is the part issue #140 changed, and
+ * it is the difference between comparing two coordinates and comparing two coordinates read off
+ * the same ruler. Projected per item, a frame difference of d moved the line coordinate by about
+ * |origin| * sin(d) — so a rotated line drifting by a twentieth of a degree split at the far
+ * corner of an A4 page while merging near the page origin — and, under shear, stepping one item
+ * forward along the advance axis moved the item's own cross coordinate by `advance * (dir · up)`,
+ * so a naturally-placed slanted run split after a glyph or two, in both writing modes. Neither
+ * depended on where the text actually was, only on which ruler each end of the comparison used.
+ *
+ * The unrotated horizontal case still reduces to the page-axis rule this function used before —
+ * exactly, not approximately, and unchanged by #140. With `b = c = 0` and no vertical flag
+ * `itemAxes` returns `dir = (1,0)` and `up = (0,1)` EXACTLY (the divisions are `a/|a|`, `0/|a|`,
+ * `0/|d|`, `d/|d|`), so every item of such a line has the same axes as the line it joins,
+ * `positionAxis` gives back `(0,1)` bit for bit, the baseline coordinate is `transform[5]` and the
+ * two extents are the numbers `box.x0`/`box.x1` already carry. Projecting onto the line's axes and
+ * projecting onto the item's own are then the identical floating-point expression. An unrotated
+ * document's output is unchanged, edge for edge — pinned against an independent reimplementation
+ * of the page-axis rule in `test/unit/pdfGeometry.test.ts`.
  *
  * What changed is only which items get unioned; the emitted box is the same user-space axis-aligned
  * union it always was. That does narrow merging in one case, deliberately: two items sharing a
@@ -531,11 +628,20 @@ function truncate(text: string, maxChars: number): string {
  *
  * What the box does and does not claim, all documented in the tool's schema and docs/tools.md too:
  *
- * - **Shear is modelled** — it always was, since the rotation work, and the comment that used to
- *   stand here saying otherwise was wrong. `itemFrame` builds its corners from the matrix's own
- *   two columns, normalized, scaled by the two lengths pdf.js measured along them; that is the
- *   exact parallelogram of a slanted matrix, not an orthogonal approximation of it. See
- *   `itemFrame`.
+ * - **Shear is modelled, in the box and now in the merge rule too.** The box always was, since
+ *   the rotation work, and the comment that used to stand here saying otherwise was wrong:
+ *   `itemFrame` builds its corners from the matrix's own two columns, normalized, scaled by the
+ *   two lengths pdf.js measured along them; that is the exact parallelogram of a slanted matrix,
+ *   not an orthogonal approximation of it. The merge rule did NOT, until issue #140: under shear
+ *   `up · dir` is non-zero, so a run stepping forward along its advance axis moved its own cross
+ *   coordinate every item and a naturally-placed slanted line came back as one box per item.
+ *   Measuring the line position on the perpendicular to the advance axis (`positionAxis`) is what
+ *   fixed it, and it is why a sheared line's position coordinate is a distance from the line
+ *   rather than a coordinate along the up axis. The one thing this loosens is a frame so
+ *   flattened that `up` is nearly parallel to `dir`: there the perpendicular separation of two
+ *   real lines shrinks toward zero and they could merge. It takes the up axis within about 5
+ *   degrees of the direction axis to bring a 12pt leading inside a 1pt tolerance — a text matrix
+ *   with essentially no height left — and every angle short of that separates as it always did.
  * - **The box is cut to the declared ascent where the font declares a usable one**, and spans the
  *   full em where it does not — see `usableAscent`, which is a guard, not an optimisation: an
  *   ascent-sized box under-covers when the ascent is a guess, and under-covering is the false
@@ -577,12 +683,16 @@ export function mergeTextLines(
     items: number;
     /** The first item's frame and line-position coordinate, kept for the whole line — the running
      *  line is grouped by the frame it was opened in, never by whatever the last item drifted
-     *  to. */
+     *  to. `advance`/`position` are the axes EVERY later candidate is measured on, which is what
+     *  makes the two ends of each comparison commensurable (issue #140); `across` and `alongMax`
+     *  are already expressed on them. */
     across: number;
     alongMax: number;
     dir: Axis;
     up: Axis;
     vertical: boolean;
+    advance: Axis;
+    position: Axis;
   }
 
   const lines: Building[] = [];
@@ -620,7 +730,16 @@ export function mergeTextLines(
         frame.vertical === current.vertical &&
         dot(frame.dir, current.dir) >= DIRECTION_TOLERANCE_COS &&
         dot(frame.up, current.up) >= DIRECTION_TOLERANCE_COS;
-      const sameBaseline = Math.abs(frame.across - current.across) <= baselineTolerancePt;
+      // Both projections are taken against the RUNNING LINE's axes, never the candidate's own.
+      // Read per item, the line coordinate was a coordinate on a different ruler whenever the
+      // frames disagreed at all: a frame difference of d displaced it by about |origin| * sin(d),
+      // and under shear each step along the advance axis displaced it by `advance * (dir · up)`.
+      // Both split lines that are one line (issue #140). Measured here, `across` is the
+      // candidate's perpendicular distance from THIS line's baseline and the gap is measured
+      // along THIS line's advance, so the tolerances mean what they say in points.
+      const across = projectPoint(frame.origin, current.position);
+      const along = projectExtent(frame.emCorners, current.advance);
+      const sameBaseline = Math.abs(across - current.across) <= baselineTolerancePt;
       // Adjacent or overlapping ALONG THE ADVANCE AXIS: the gap between the new item's near edge
       // and the running line's far edge is within tolerance forward, and bounded backward too — an
       // overlap may not exceed this item's own em size (floored at 1pt), or an explicit override.
@@ -628,7 +747,7 @@ export function mergeTextLines(
       // baseline change and every glyph run becomes its own box. `emSize`, not `item.height`: a
       // vertical item's `height` is the whole run's advance, which as a backward allowance would
       // let an item most of a column behind the line join it.
-      const gap = frame.alongMin - current.alongMax;
+      const gap = along.min - current.alongMax;
       const minGap = -(overlapTolerancePt ?? Math.max(emSize(item), 1));
       const adjacent = gap <= gapTolerancePt && gap >= minGap;
       if (sameFrame && sameBaseline && adjacent) {
@@ -637,7 +756,7 @@ export function mergeTextLines(
         current.items += 1;
         // Running maximum, mirroring what the union box's far edge did before: an item that ends
         // short of the line's reach must not pull the next item's gap measurement back with it.
-        current.alongMax = Math.max(current.alongMax, frame.alongMax);
+        current.alongMax = Math.max(current.alongMax, along.max);
         continue;
       }
     }
@@ -645,15 +764,19 @@ export function mergeTextLines(
     if (current) {
       lines.push(current);
     }
+    // Opening a line: this item IS the frame, so its own axes are the line's and these two
+    // projections are the ones the comparisons above will keep using.
     current = {
       text: item.str,
       box: frame.box,
       items: 1,
-      across: frame.across,
-      alongMax: frame.alongMax,
+      across: projectPoint(frame.origin, frame.position),
+      alongMax: projectExtent(frame.emCorners, frame.advance).max,
       dir: frame.dir,
       up: frame.up,
       vertical: frame.vertical,
+      advance: frame.advance,
+      position: frame.position,
     };
   }
   if (current) {

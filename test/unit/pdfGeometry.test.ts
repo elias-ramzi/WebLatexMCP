@@ -636,11 +636,14 @@ describe('mergeTextLines — sheared text matrices (issue #80 section 6, bullet 
   });
 
   it('keeps the merge rule on the full-em frame, so a declared ascent cannot regroup a sheared line', () => {
-    // A sheared pair placed where the merge rule can actually see them as one line: the up axis
-    // of [40, 0, 40, 40, ...] is (40, 40), so two origins agree on `across` (the origin projected
-    // onto the up axis) when their offset is perpendicular to it — hence (0, 100) and
-    // (145, -45). That is the only construction in which the em-vs-ink choice is observable at
-    // all, which is why it looks contrived.
+    // A sheared pair sitting on ONE baseline, placed the way a PDF places one: both origins have
+    // the same page y and the second is further along the direction axis. Until #140 this pair
+    // had to be placed at (0, 100) and (145, -45) instead — 145pt apart perpendicular to the run
+    // — because `across` projected each origin onto its OWN up axis, and only an offset
+    // perpendicular to that axis came out equal. Its own comment called that contrived, and it
+    // was: those two items are not on one line by any reading a human would recognise. The merge
+    // rule now measures a candidate's perpendicular distance from the RUNNING LINE's baseline,
+    // so the natural placement is the one that merges and the old one (correctly) does not.
     //
     // The em-frame reach of the first item is 0 + 100 (advance) + 40 (the up axis's own x lean
     // over one em) = 140, and the second starts at 145: a 5pt gap, inside the 6pt default. Cut
@@ -654,9 +657,9 @@ describe('mergeTextLines — sheared text matrices (issue #80 section 6, bullet 
       height: Math.hypot(40, 40),
       ...(ascent === undefined ? {} : { ascent }),
     });
-    const plain = [shear(100, 0, 100), shear(40, 145, -45)];
+    const plain = [shear(100, 0, 100), shear(40, 145, 100)];
     expect(mergeTextLines(plain)).toHaveLength(1);
-    const withAscent = [shear(100, 0, 100, 0.5), shear(40, 145, -45, 0.5)];
+    const withAscent = [shear(100, 0, 100, 0.5), shear(40, 145, 100, 0.5)];
     const lines = mergeTextLines(withAscent);
     expect(lines).toHaveLength(1);
     expect(lines[0]?.text).toBe('Slanted');
@@ -870,12 +873,19 @@ describe('mergeTextLines — vertical writing mode (issue #80 section 6)', () =>
  * into pdfGeometry: the placement is derived from the matrix by hand, so a run that fails to merge
  * is a statement about the code under test and not about the fixture.
  *
- * Each step moves the origin perpendicular to the line's CROSS axis (so the line position does not
- * drift) by exactly the run's reach along its ADVANCE axis (so the gap is zero). Under shear the
- * up axis leans into the direction axis, which is why the reach carries a `|dir·up|` term and why
- * the step is not simply "advance along dir": stepping along dir under shear moves the cross
- * coordinate too, and the line splits — the pre-existing limitation the hand-built shear test
- * above works around the same way.
+ * Each step moves the origin ALONG THE ADVANCE AXIS by exactly the run's own reach along that
+ * axis, which is what "contiguous" means for a run of text: the next glyph starts where the last
+ * one stopped. The reach carries a `|dir·up|` term because under shear the up axis leans into the
+ * direction axis, so one em of height adds that much to the item's span along the advance.
+ *
+ * It used to step PERPENDICULAR TO THE CROSS AXIS instead, scaled to the same reach. That was a
+ * workaround for the defect #140 fixed, not a property of text: stepping along the advance axis
+ * under shear moved each item's own cross coordinate by `advance * (dir·up)` and split the line
+ * after one glyph, so the generated sweep could only stay green by placing its runs somewhere no
+ * PDF puts them. With the line position now measured against the RUNNING LINE's frame, the
+ * natural step is the one that merges, and the sweep exercises genuinely sheared runs in both
+ * writing modes. On the pre-#140 code every `k !== 0` case below comes back as four one-item
+ * lines.
  */
 function contiguousRun(opts: {
   deg: number;
@@ -904,12 +914,11 @@ function contiguousRun(opts: {
   const height = vertical ? advance : upLen;
   const lean = Math.abs(dir[0] * up[0] + dir[1] * up[1]);
   const reach = vertical ? width * lean + height : width + height * lean;
-  // The cross axis is `up` for a horizontal item and `dir` for a vertical one; the step is its
-  // perpendicular, scaled so the projection onto the advance axis is exactly `reach`.
-  const cross = vertical ? dir : up;
-  const denom = dir[0] * up[1] - dir[1] * up[0]; // never 0: the determinant is size^2 > 0
-  const alpha = reach / denom;
-  const step: readonly [number, number] = [alpha * cross[1], -alpha * cross[0]];
+  // The advance axis is `dir` for a horizontal item and the NEGATED up axis for a vertical one
+  // (its run goes backward along `up`); the step is exactly one reach along it, so consecutive
+  // items abut with a zero gap.
+  const advanceAxis: readonly [number, number] = vertical ? [-up[0], -up[1]] : dir;
+  const step: readonly [number, number] = [reach * advanceAxis[0], reach * advanceAxis[1]];
   const items: TextItemLike[] = [];
   for (let i = 0; i < n; i += 1) {
     items.push({
@@ -998,5 +1007,325 @@ describe('mergeTextLines — a merged box covers every item merged into it', () 
     const perMode = degs.length * shears.length * sizes.length;
     expect(fullyMerged.horizontal).toBe(perMode);
     expect(fullyMerged.vertical).toBe(perMode);
+  });
+});
+
+/**
+ * A point far out on an A4 page (595.28 x 841.89pt): |origin| at (500, 700) is ~860pt. That
+ * magnitude is the whole of issue #140's first symptom — before the fix, `across` projected an
+ * item's origin onto its OWN cross axis, so a frame difference of d shifted it by about
+ * |origin| * sin(d), and at 860pt anything past roughly 0.07 degrees read as a different
+ * baseline. The same run near the page origin merged; out here it did not.
+ *
+ * 860pt is the figure #140 and the pre-fix code comment both quote as "the far corner of an A4
+ * page"; the actual corner is `hypot(595.28, 841.89)` = 1031pt, where the bound was tighter still
+ * (~0.056 degrees). (500, 700) is used because it is a place text really sits.
+ */
+const A4_FAR_CORNER: readonly [number, number] = [500, 700];
+
+/** A three-item horizontal run whose ORIGINS sit exactly on one baseline while each item's matrix
+ *  carries 0.3 degrees more rotation than the last — a fifth of `DIRECTION_TOLERANCE_COS` over the
+ *  whole run, the kind of drift a per-item text matrix rebuilt from the document's own numbers
+ *  actually carries. */
+function driftingRun(origin: readonly [number, number]): TextItemLike[] {
+  return [0, 1, 2].map((k) => {
+    const rad = (0.3 * k * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    return {
+      str: `s${k}`,
+      transform: [10 * cos, 10 * sin, -10 * sin, 10 * cos, origin[0] + 40 * k, origin[1]] as Matrix,
+      width: 40,
+      height: 10,
+    };
+  });
+}
+
+describe('mergeTextLines — a drifting rotated line merges wherever it sits on the page (issue #140)', () => {
+  it('merges the same drifting run near the page origin AND at the far corner of an A4 page', () => {
+    // Near the origin this merged before the fix too: |origin| is small, so the per-item cross
+    // projection barely moved. At (500, 700) the identical run came back as THREE one-item boxes,
+    // which is the positional dependence #140 is about — the merge rule's effective tolerance
+    // shrank as the line moved away from the page origin.
+    const near = mergeTextLines(driftingRun([0, 0]));
+    expect(near).toHaveLength(1);
+    expect(near[0]?.items).toBe(3);
+    const far = mergeTextLines(driftingRun(A4_FAR_CORNER));
+    expect(far).toHaveLength(1);
+    expect(far[0]?.items).toBe(3);
+  });
+
+  it('makes DIRECTION_TOLERANCE_COS the governing bound at the far corner, not a positional accident', () => {
+    // The same 0.9-degree/1.1-degree pair the direction-tolerance test pins at the page origin,
+    // moved to (500, 700). Before the fix BOTH split there — the 0.9-degree tilt shifted `across`
+    // by 8.6pt, eight times the 1pt baseline tolerance, so the 1-degree constant never got to
+    // speak. Now the frame gate is what decides, and it decides the same way at both positions.
+    const [x, y] = A4_FAR_CORNER;
+    const pair = (deg: number): TextItemLike[] => [
+      item('Base', x, y, 40),
+      rotatedItem('Tilt', deg, x + 40, y, 40),
+    ];
+    expect(mergeTextLines(pair(0.9))).toHaveLength(1);
+    expect(mergeTextLines(pair(1.1))).toHaveLength(2);
+  });
+
+  it('still splits two genuinely different baselines at the far corner', () => {
+    // The clause has to keep doing its job: measuring the perpendicular distance from the line's
+    // own baseline is a LOOSER reading of frame drift, not a looser reading of position.
+    const [x, y] = A4_FAR_CORNER;
+    expect(mergeTextLines([item('A', x, y, 40), item('B', x + 40, y + 12, 40)])).toHaveLength(2);
+    // And exactly at the bound, on both sides of it.
+    expect(mergeTextLines([item('A', x, y, 40), item('B', x + 40, y + 1, 40)])).toHaveLength(1);
+    expect(mergeTextLines([item('A', x, y, 40), item('B', x + 40, y + 1.5, 40)])).toHaveLength(2);
+  });
+});
+
+/** An obliqued (synthetically italicised) text item: the up axis leans `k` ems along the direction
+ *  axis, which is exactly the `[size, 0, size*k, size, x, y]` matrix a PDF producer emits for a
+ *  slanted font. `advance` is the item's own advance, i.e. pdf.js's `width`. */
+function obliqueItem(
+  str: string,
+  k: number,
+  size: number,
+  x: number,
+  y: number,
+  advance: number,
+): TextItemLike {
+  const lean = size * k;
+  return {
+    str,
+    transform: [size, 0, lean, size, x, y],
+    width: advance,
+    height: Math.hypot(lean, size),
+  };
+}
+
+describe('mergeTextLines — a naturally-placed sheared run (issue #140)', () => {
+  const k = Math.tan((12 * Math.PI) / 180); // a typical synthetic-italic slant
+
+  it('merges a contiguous obliqued run stepped along its own direction axis', () => {
+    // Placed the way a PDF actually places one: each origin is the previous origin advanced along
+    // the DIRECTION axis by that item's own advance, all three on one page y. Under shear
+    // `up · dir` is 0.208, so before the fix each 30pt step moved the item's own cross coordinate
+    // by 6.2pt — six times the 1pt baseline tolerance — and this came back as three one-item
+    // boxes. Every sheared-run test in the tree before #140 avoided this by stepping
+    // perpendicular to the up axis instead, which is not where text goes.
+    const run = [0, 1, 2].map((i) => obliqueItem(`s${i}`, k, 12, 72 + 30 * i, 700, 30));
+    const lines = mergeTextLines(run);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(3);
+    expect(lines[0]?.text).toBe('s0s1s2');
+  });
+
+  it('merges a contiguous obliqued run at the far corner of the page too', () => {
+    const [x, y] = A4_FAR_CORNER;
+    const run = [0, 1, 2].map((i) => obliqueItem(`s${i}`, k, 12, x + 30 * i, y, 30));
+    expect(mergeTextLines(run)).toHaveLength(1);
+  });
+
+  it('merges a contiguous obliqued VERTICAL-mode run stepped down its own advance axis', () => {
+    // The same defect seen in the other writing mode. A vertical item runs BACKWARD along its up
+    // axis (pdf.js reports `height` as the accumulated advance down the column and `width` as the
+    // em across it), so the natural step is `-advance * up`. Its cross axis is `dir`, and under
+    // shear `dir · up` is again 0.208, so each step moved the per-item column coordinate by 6.2pt
+    // and split the column.
+    const size = 12;
+    const lean = size * k;
+    const upLen = Math.hypot(lean, size);
+    const up: readonly [number, number] = [lean / upLen, size / upLen];
+    const advance = 30;
+    const run: TextItemLike[] = [0, 1, 2].map((i) => ({
+      str: `縦${i}`,
+      transform: [
+        size,
+        0,
+        lean,
+        size,
+        100 - advance * i * up[0],
+        700 - advance * i * up[1],
+      ] as Matrix,
+      width: size,
+      height: advance,
+      vertical: true,
+    }));
+    const lines = mergeTextLines(run);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(3);
+  });
+
+  it('still keeps a sheared horizontal run and a sheared vertical run apart', () => {
+    // The writing-mode separation #132 established survives: two items in different modes are
+    // never one line however well their axes agree, and the position axis is derived from the
+    // advance axis, which is mode-dependent.
+    const size = 12;
+    const lean = size * k;
+    const horizontal = obliqueItem('h', k, size, 100, 700, 30);
+    const vertical: TextItemLike = {
+      str: '縦',
+      transform: [size, 0, lean, size, 100, 700],
+      width: size,
+      height: 30,
+      vertical: true,
+    };
+    expect(mergeTextLines([horizontal, vertical])).toHaveLength(2);
+  });
+});
+
+/**
+ * The merge rule exactly as it stood BEFORE any frame work: group by `transform[5]` alone, measure
+ * the gap along page x from `transform[4]` to `transform[4] + width`, box each item as
+ * `{x0: e, y0: f, x1: e + width, y1: f + height * ascent}`. Nothing in it knows about an axis.
+ *
+ * This is the oracle for the safety property of #140. For an axis-aligned horizontal item
+ * (`b = c = 0`, `a > 0`, `d > 0`) `itemAxes` returns `dir = (1, 0)` and `up = (0, 1)` EXACTLY —
+ * not approximately: the divisions are `a/|a|`, `0/|a|`, `0/|d|`, `d/|d|`. So every item of such a
+ * line has the same two axes as the line it joins, the position axis reduces to `(0, 1)` exactly
+ * (`up` minus a zero component along `(1, 0)`, whose length is exactly 1), and every projection
+ * `x * axis[0] + y * axis[1]` is the identical floating-point expression the page-axis rule
+ * evaluates. The claim is therefore bit-identity, not closeness, and the sweep below asserts it
+ * with `toEqual` over exact edge values rather than `toBeCloseTo`.
+ */
+function pageAxisLines(
+  items: TextItemLike[],
+  opts?: {
+    baselineTolerancePt?: number;
+    gapTolerancePt?: number;
+    maxTextChars?: number;
+    overlapTolerancePt?: number;
+  },
+): { text: string; box: Box; items: number }[] {
+  const baselineTolerancePt = opts?.baselineTolerancePt ?? 1;
+  const gapTolerancePt = opts?.gapTolerancePt ?? 6;
+  const maxTextChars = opts?.maxTextChars ?? 160;
+  const overlapTolerancePt = opts?.overlapTolerancePt;
+  const out: { text: string; box: Box; items: number }[] = [];
+  let cur: { text: string; box: Box; items: number; across: number; alongMax: number } | undefined;
+  for (const it of items) {
+    if (it.str.trim() === '') continue;
+    const e = it.transform[4];
+    const f = it.transform[5];
+    const a = it.ascent;
+    const usable = typeof a === 'number' && Number.isFinite(a) && a > 0 && a <= 1 ? a : 1;
+    const box: Box = { x0: e, y0: f, x1: e + it.width, y1: f + it.height * usable };
+    if (cur) {
+      const gap = e - cur.alongMax;
+      const minGap = -(overlapTolerancePt ?? Math.max(it.height, 1));
+      if (
+        Math.abs(f - cur.across) <= baselineTolerancePt &&
+        gap <= gapTolerancePt &&
+        gap >= minGap
+      ) {
+        cur.text += it.str;
+        cur.box = {
+          x0: Math.min(cur.box.x0, box.x0),
+          y0: Math.min(cur.box.y0, box.y0),
+          x1: Math.max(cur.box.x1, box.x1),
+          y1: Math.max(cur.box.y1, box.y1),
+        };
+        cur.items += 1;
+        cur.alongMax = Math.max(cur.alongMax, e + it.width);
+        continue;
+      }
+      out.push(cur);
+    }
+    cur = { text: it.str, box, items: 1, across: f, alongMax: e + it.width };
+  }
+  if (cur) out.push(cur);
+  return out.map((l) => ({
+    text: l.text.length > maxTextChars ? `${l.text.slice(0, maxTextChars)}…` : l.text,
+    box: l.box,
+    items: l.items,
+  }));
+}
+
+describe('mergeTextLines — axis-aligned horizontal text is unchanged, edge for edge (issue #140)', () => {
+  it('agrees with the page-axis rule exactly over a swept grid of unrotated runs', () => {
+    // The safety property. #132 proved its analogue structurally (`groupingAxes` returns the
+    // original pair for `vertical === false`); this one is proved behaviourally, against an
+    // independent reimplementation of the rule as it stood before any frame existed. Exact
+    // equality, including the boundary rows where a hair of projection error would flip a
+    // decision: baseline deltas at and either side of 1pt, gaps at and either side of 6pt, and
+    // backward overlaps at and either side of the item's own height.
+    const dys = [0, 0.5, 1, 1.0000001, 1.5, -1, -1.5, 12];
+    const gaps = [0, 3, 6, 6.0000001, 7, -5, -10, -10.0000001, -30];
+    const origins: readonly (readonly [number, number])[] = [
+      [0, 0],
+      [72, 90],
+      [500, 700],
+      [-40, 812.5],
+    ];
+    let cases = 0;
+    for (const [ox, oy] of origins) {
+      for (const dy of dys) {
+        for (const gap of gaps) {
+          for (const ascent of [undefined, 0.718]) {
+            const items: TextItemLike[] = [
+              { str: 'Foo', transform: [1, 0, 0, 1, ox, oy], width: 30, height: 10 },
+              {
+                str: 'Bar',
+                transform: [1, 0, 0, 1, ox + 30 + gap, oy + dy],
+                width: 25,
+                height: 10,
+                ...(ascent === undefined ? {} : { ascent }),
+              },
+              { str: 'Baz', transform: [1, 0, 0, 1, ox + 60, oy], width: 18, height: 12 },
+            ];
+            const label = `origin=${ox},${oy} dy=${dy} gap=${gap} ascent=${String(ascent)}`;
+            expect(mergeTextLines(items), label).toEqual(pageAxisLines(items));
+            cases += 1;
+          }
+        }
+      }
+    }
+    // The sweep's own size, so a truncated grid cannot make the assertion vacuous.
+    expect(cases).toBe(origins.length * dys.length * gaps.length * 2);
+  });
+
+  it('agrees with the page-axis rule under non-default tolerances too', () => {
+    const items: TextItemLike[] = [
+      item('Hello ', 0, 100, 40),
+      item('world', 55, 100.9, 30),
+      item('again', 20, 100, 30),
+    ];
+    for (const opts of [
+      { baselineTolerancePt: 0.5 },
+      { baselineTolerancePt: 2 },
+      { gapTolerancePt: 20 },
+      { overlapTolerancePt: 40 },
+      { maxTextChars: 4 },
+    ]) {
+      expect(mergeTextLines(items, opts), JSON.stringify(opts)).toEqual(pageAxisLines(items, opts));
+    }
+  });
+});
+
+describe('mergeTextLines — a degenerate frame still yields finite geometry (issue #140)', () => {
+  it('falls back to the cross axis when the up axis is parallel to the direction axis', () => {
+    // `positionAxis` subtracts the component of `cross` that leans along `advance`. When the text
+    // matrix has collapsed — here [10, 0, 10, 0, ...], whose two columns are the SAME direction —
+    // nothing is left to normalize, and dividing by that zero length would hand the merge rule a
+    // NaN axis and, through it, a NaN line coordinate. The guard returns `cross` unchanged
+    // instead, which is exactly what the rule compared before there was a position axis at all.
+    const flat = (str: string, x: number): TextItemLike => ({
+      str,
+      transform: [10, 0, 10, 0, x, 50],
+      width: 30,
+      height: 10,
+    });
+    // The pair is placed so the fallback's answer is observable: on `cross = (1, 0)` the line
+    // coordinate is the origin's x, 0 vs 0.5 is inside the 1pt tolerance, and the explicit
+    // overlap allowance clears the collapsed frame's 39.5pt backward gap. With a NaN axis every
+    // comparison against it is false and this comes back as two lines instead of one — verified
+    // by deleting the guard and watching this fail. The two clauses (`len > 0` and
+    // `isFiniteAxis`) both catch this same collapse, exactly as `itemAxes`' pair does; removing
+    // either one alone leaves the other holding, so this pins the guard, not a clause of it.
+    const lines = mergeTextLines([flat('A', 0), flat('B', 0.5)], { overlapTolerancePt: 50 });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.items).toBe(2);
+    for (const line of lines) {
+      for (const edge of [line.box.x0, line.box.y0, line.box.x1, line.box.y1]) {
+        expect(Number.isFinite(edge)).toBe(true);
+      }
+    }
   });
 });
