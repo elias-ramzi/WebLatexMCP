@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -14,6 +14,7 @@ import {
   REFERENCE_FIELDS_BUDGET,
   REFERENCE_MAX_FIELD_VALUE_LENGTH,
 } from '../../src/lib/referenceFieldsBudget.js';
+import { REFERENCE_MAX_RAW_LENGTH } from '../../src/lib/referenceRawBudget.js';
 
 /**
  * The case this exists for: a document that is neither on a git remote nor a `.bib`. A proposal
@@ -600,5 +601,162 @@ describe('the raw BibTeX field map is declared, and budgeted', () => {
       0,
     );
     expect(rendered).toBeLessThanOrEqual(REFERENCE_FIELDS_BUDGET);
+  });
+});
+
+/** Two BibTeX entries per file, so a `maxResults` boundary can fall cleanly between two files. */
+function bibOf(prefix: string, count: number): string {
+  return Array.from({ length: count }, (_, i) =>
+    [
+      `@article{${prefix}${i},`,
+      `  title = {Entry ${i} of ${prefix}},`,
+      '  year  = {2016},',
+      '}',
+      '',
+    ].join('\n'),
+  ).join('\n');
+}
+
+/**
+ * Issue #171: `list_references` used to claim the out-of-band-edit baseline over every file it
+ * opened, on the premise that it hands back every entry verbatim. #147, #165 and #170 killed that
+ * premise, and recording does not ARM the guard — it RESETS it, so the claim disarmed the guard
+ * for files the caller had only seen part of.
+ *
+ * Note what "the guard" means here: a write refuses only when a baseline EXISTS and is stale, so
+ * each of these has to arm one with `read_file` first. That is also why the fix is to narrow the
+ * claim rather than drop it: with no baseline at all, a write is not refused, it is silent.
+ */
+describe('the out-of-band-edit baseline a listing may claim', () => {
+  it('leaves the guard armed for a bibliography it returned only one page of', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    const original = bibOf('paged', 4);
+    await writeFile(path.join(dir, 'refs.bib'), original);
+
+    // The agent reads the file, which is what arms the guard.
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'refs.bib' } });
+    // The user then hand-edits it in their own editor.
+    const handEdited = `${original}\n@article{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'refs.bib'), handEdited);
+
+    // The listing shows two of the five entries, so the caller never sees the hand edit.
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib', maxResults: 2 },
+    });
+    const { truncated, entries } = listed.structuredContent as {
+      truncated: boolean;
+      entries: Array<{ key: string }>;
+    };
+    expect(truncated).toBe(true);
+    expect(entries.map((e) => e.key)).not.toContain('typed2026byhand');
+
+    // So the next blind write is still refused, and the hand edit is still on disk.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'refs.bib',
+        content: original,
+        confirmBibEdit: true,
+      },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(handEdited);
+  });
+
+  it('leaves it armed when a budget cut an entry, even with every entry listed', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    // One entry whose verbatim text is past the per-entry `raw` cap: nothing is paged out here,
+    // and the caller still does not receive this file whole.
+    const original = [
+      '@article{bulky2024,',
+      '  title = {A Modest Title},',
+      `  note  = {${'n'.repeat(REFERENCE_MAX_RAW_LENGTH)}},`,
+      '}',
+      '',
+    ].join('\n');
+    await writeFile(path.join(dir, 'refs.bib'), original);
+
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'refs.bib' } });
+    const handEdited = `${original}\n@misc{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'refs.bib'), handEdited);
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib' },
+    });
+    const { truncated, entries } = listed.structuredContent as {
+      truncated: boolean;
+      entries: Array<{ key: string; rawOmitted?: number }>;
+    };
+    // Every entry is listed — the hand-typed one included — but one of them arrived cut.
+    expect(truncated).toBe(false);
+    expect(entries.map((e) => e.key)).toContain('typed2026byhand');
+    expect(entries[0]!.rawOmitted).toBeGreaterThan(0);
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'bibs', path: 'refs.bib', content: original, confirmBibEdit: true },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+  });
+
+  it('claims it per file: the one returned whole, never the one cut beside it', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    // `.bib` files are listed first and then alphabetically, so `a.bib` fills the page and
+    // `z.bib` gets none of it.
+    await writeFile(path.join(dir, 'a.bib'), bibOf('alpha', 2));
+    await writeFile(path.join(dir, 'z.bib'), bibOf('zeta', 2));
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'a.bib' } });
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'z.bib' } });
+
+    // The user hand-edits both, so neither baseline matches the disk any more.
+    const alpha = `${bibOf('alpha', 2)}\n@misc{alphaHand,\n  title = {Typed By Hand},\n}\n`;
+    const zeta = `${bibOf('zeta', 2)}\n@misc{zetaHand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'a.bib'), alpha);
+    await writeFile(path.join(dir, 'z.bib'), zeta);
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', maxResults: 3 },
+    });
+    const { sources, entries } = listed.structuredContent as {
+      sources: Array<{ path: string; count: number }>;
+      entries: Array<{ path: string }>;
+    };
+    expect(sources.map((s) => `${s.path}:${s.count}`)).toEqual(['a.bib:3', 'z.bib:3']);
+    expect(entries.every((e) => e.path === 'a.bib')).toBe(true);
+
+    // `z.bib` contributed nothing to the page, so its baseline is untouched and stale.
+    const refused = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'z.bib',
+        content: bibOf('zeta', 2),
+        confirmBibEdit: true,
+      },
+    });
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain('changed on disk');
+
+    // `a.bib` came back whole, hand edit and all, so the caller CAN base a write on it: the
+    // narrowing must not become a blanket refusal to record.
+    const allowed = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'a.bib',
+        content: bibOf('alpha', 2),
+        confirmBibEdit: true,
+      },
+    });
+    expect(allowed.isError).toBeFalsy();
   });
 });
