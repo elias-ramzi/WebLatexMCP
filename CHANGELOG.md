@@ -1402,6 +1402,59 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
   server process wrote) and `commit`'s `settled`; both are pinned under the stubbed-separator
   harness and both fail against the old code.
 
+- **`check_citations` bounds its report, advisory findings first and build-breaking ones last**
+  (#154). The tool built four finding lists and returned every one of them whole through
+  `structuredContent`, then rendered every one of them again into the text channel: no cap, no
+  `maxResults`, no budget, no counter. The case that bit was the _ordinary_ one rather than a
+  hostile one — a group `.bib` carried in the project with 300 entries and a paper citing 80 of
+  them is ~220 `uncitedEntries`, each with a document-controlled BibTeX `title`, in both channels,
+  as the **default** result for a perfectly normal paper. The `bibliographyProject` path already
+  forced `uncitedEntries` empty for exactly that reason; the same reasoning applies when the shared
+  `.bib` lives _in_ the project, and there nothing applied it.
+
+  `src/lib/citationsBudget.ts` is the new planner — a pure function over plain data, the shape
+  `conflictBudget.ts`/`floatsBudget.ts`/`searchBudget.ts` already use, so the tool layer only maps
+  a plan onto response shapes. Three decisions carry it. **Per-list caps with an explicit
+  priority, never one global budget spent in declaration order**: `ALLOCATION_ORDER` writes the
+  order down, and read as a cut priority it is `uncitedEntries` first (advisory — "dead weight, not
+  an error" in the schema's own words — and the only list carrying free text), then
+  `incompleteEntries`, then `duplicateKeys`, with `undefinedCitations` cut **last** because those
+  break the build and are the cheapest list to carry. A shared budget walked in build order would
+  have spent it on the advisory list and cut the important one — the ordering mistake
+  `conflictBudget.ts` avoids by allocating `hunks` before the sides. The order is strict: once a
+  list is cut by size the ones behind it get nothing, rather than a few cheap advisory rows
+  slipping in behind a truncated higher-priority list. **Nest-aware counting**: capping the outer
+  list alone leaves one missing key cited 400 times carrying 400 `{path,line}` objects, so
+  `uses`/`occurrences`/`missing` are cut first, at 20 each, with their own `usesOmitted` /
+  `occurrencesOmitted` / `missingOmitted` — and the outer entry is then charged the cost of what it
+  will really send. **The budget is charged against rendered size**, each entry at its own
+  `JSON.stringify(entry).length`: a BibTeX title is LaTeX and LaTeX is backslash-dense, so raw
+  `.length` under-counts by roughly half.
+
+  Figures are the house ones — 20 per list (`capList`, `CONFLICT_MAX_FILES`) and 20000 characters
+  across the four (`CONFLICT_CONTENT_BUDGET`, `FLOATS_CONTENT_BUDGET`, `SEARCH_CONTENT_BUDGET`) —
+  with a new `maxResults` (1..1000) raising the per-list cap the way `list_references`' does,
+  though a cap is needed regardless because the _default_ has to be safe. Nothing is cut silently:
+  `undefinedCitationsOmitted` / `uncitedEntriesOmitted` / `duplicateKeysOmitted` /
+  `incompleteEntriesOmitted` are always present, `shown + omitted` always equals what was found,
+  and `note` names which list and which bound fired. One counter per list rather than two: unlike
+  the withheld-snippet counters, which distinguish two different _claims_, both bounds here make
+  the identical claim ("this finding exists and is not shown"), so which one fired is a fact about
+  what to do next and belongs in `note`. The cut is a tail of a key-sorted list, never a
+  cherry-picked subset, and the first `undefinedCitations` entry is kept even if it alone exceeds
+  the budget — a report listing nothing tells a caller nothing, and that exception is cheap
+  precisely because that list carries no document-controlled free text. **The text channel is
+  rendered from the already-cut payload**, so the two channels cannot disagree, and a section whose
+  entries were all cut still prints its heading with `showing 0 of N` rather than vanishing into
+  "no uncited entries". Every new key — the four counters, the three nested ones, and `note` — is
+  declared in `outputSchema`, and an integration test calls `listTools()` before the tool so the
+  SDK's per-schema ajv validator is armed and an undeclared key would fail the call outright
+  (#137, #146). The `bibliographyProject` rules are untouched: two sandboxes, read-only, no lock,
+  and `uncitedEntries` still empty by design rather than by a cap that happened to fire. Along the
+  way the renderer's hand-copied view of the payload — which had already drifted, omitting the
+  `incompleteEntries[].type` the handler emits and `outputSchema` declares — now extends the
+  planner's own type, so it cannot drift again.
+
 - **`logTail` carries the line that says _what_ failed, and a package name holding a `.` or a `-` is
   a warning at all** (#78, #73). Two gaps in the log de-noiser, both of which left `logTail` — the
   channel a text-only client reads — describing a compile the structured fields got right.
