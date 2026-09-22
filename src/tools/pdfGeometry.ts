@@ -120,10 +120,11 @@ const geometryPageShape = z.object({
         'line on a pdflscape landscape page, where the content is rotated inside the page as well ' +
         'as the page carrying /Rotate — gets a correct axis-aligned box, and a rotated line made ' +
         'of several items IS merged into one: items are grouped in their own frame (shared ' +
-        'direction and up axes to within a degree AND the same writing mode, the origin ' +
-        'projected onto the CROSS axis — the up axis for horizontal text, the direction axis ' +
-        'for vertical — and adjacency measured along the ADVANCE axis — the direction axis for ' +
-        'horizontal text, the reverse up axis for vertical), not by page-axis y. SHEAR (a slanted, ' +
+        'direction and up axes to within a degree AND the same writing mode, each origin ' +
+        "projected onto the RUNNING LINE'S position axis — the perpendicular to that line's " +
+        "advance axis, so the quantity compared is a candidate's perpendicular distance from " +
+        "that line's baseline rather than a coordinate in its own frame — and adjacency " +
+        "measured along that same line's ADVANCE axis), not by page-axis y. SHEAR (a slanted, " +
         "non-orthogonal text matrix) is modelled too — the corners come from the matrix's own " +
         'two column directions, so a skewed item gets the true bounds of its parallelogram, not ' +
         'an orthogonal approximation. VERTICAL writing mode (a CJK WMode 1 font) gets a correct ' +
@@ -131,9 +132,10 @@ const geometryPageShape = z.object({
         'vertical line ARE merged into a single column box: the column is read as the line ' +
         'position and the run down it as the advance. Two neighbouring columns stay separate, ' +
         'and a vertical line is never merged with a horizontal one even where they share a ' +
-        'coordinate. Still NOT merged: a rotated line whose items drift in frame by more than a ' +
-        'fraction of a degree splits far from the page origin, and a genuinely sheared ' +
-        'contiguous run splits in either writing mode — correct boxes, uncombined, in both. ' +
+        'coordinate. A line whose items drift in frame by up to a degree IS merged wherever it ' +
+        'sits on the page, and so is a genuinely sheared contiguous run, in either writing ' +
+        'mode: the one-degree frame tolerance is the whole bound, with no hidden dependence on ' +
+        'distance from the page origin. ' +
         'As for ' +
         'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
         'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
