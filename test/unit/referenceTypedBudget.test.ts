@@ -622,8 +622,10 @@ describe('list_references bounds the parsed fields on the wire', () => {
     );
 
     const res = await client.callTool({
+      // `maxResults` is stated rather than defaulted here: this test is about all three budgets
+      // saturating at once, which needs more entries than the default page deliberately returns.
       name: 'list_references',
-      arguments: { project: 'paper', path: 'ref.bib' },
+      arguments: { project: 'paper', path: 'ref.bib', maxResults: 120 },
     });
     expect(res.isError).toBeFalsy();
     const { entries } = res.structuredContent as { entries: WireEntry[] };
@@ -656,6 +658,122 @@ describe('list_references bounds the parsed fields on the wire', () => {
     // And each region is separately inside its own allocation, so one cannot hide behind another.
     expect(fieldsChannel).toBeLessThanOrEqual(REFERENCE_FIELDS_BUDGET + FIELDS_MAP_JSON_OVERHEAD);
     expect(typed).toBeLessThanOrEqual(REFERENCE_TYPED_BUDGET + cut * MAX_PER_ENTRY_OVERSPEND);
+  });
+
+  /**
+   * A bibliography shaped like one somebody actually keeps: real-length titles, four authors,
+   * a spelled-out venue, a DOI and a year. A fixture of minimal `@article{k, title={T}}` entries
+   * would pass every assertion below at any page size and prove nothing.
+   */
+  function realisticBib(count: number): string {
+    const titles = [
+      'Deep Residual Learning for Image Recognition',
+      'Attention Is All You Need: Transformer Architectures for Sequence Transduction',
+      'Virtual KITTI 2: A Synthetic Dataset for Autonomous Driving Perception',
+      'Segment Anything in High Resolution with Promptable Visual Foundation Models',
+      'An Image Is Worth 16x16 Words: Transformers for Image Recognition at Scale',
+    ];
+    const venues = [
+      'IEEE/CVF Conference on Computer Vision and Pattern Recognition',
+      'Advances in Neural Information Processing Systems',
+      'International Conference on Learning Representations',
+    ];
+    return Array.from({ length: count }, (_, i) =>
+      [
+        `@inproceedings{author${i}2020work,`,
+        `  title     = {${titles[i % titles.length]}},`,
+        '  author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},',
+        `  booktitle = {${venues[i % venues.length]}},`,
+        `  doi       = {10.1109/CVPR.2016.${900 + i}},`,
+        `  year      = {${2015 + (i % 8)}},`,
+        '}',
+      ].join('\n'),
+    ).join('\n\n');
+  }
+
+  /** What one call costs a client: the structured payload and the text, which both ship. */
+  function renderedSize(res: unknown): number {
+    const r = res as { structuredContent?: unknown; content?: unknown };
+    return (
+      JSON.stringify(r.structuredContent ?? {}).length + JSON.stringify(r.content ?? '').length
+    );
+  }
+
+  /**
+   * The size a client rejected undelivered in #68, and the figure every budget in this family is
+   * sized against. It is empirical rather than a spec, which is why the assertions below pair it
+   * with a fidelity claim and a comparison — a ceiling alone could be met by returning nothing.
+   */
+  const CLIENT_PAYLOAD_CEILING = 67000;
+
+  it('returns a page a client can be handed, whole, at the DEFAULT maxResults', async () => {
+    const { client, userDir } = await setup();
+    // 200 entries on disk — what the default used to hand back in one call.
+    await writeFile(path.join(userDir, 'ref.bib'), realisticBib(200));
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'paper', path: 'ref.bib' },
+    });
+    expect(res.isError).toBeFalsy();
+    const structured = res.structuredContent as {
+      count: number;
+      totalCount: number;
+      truncated: boolean;
+      entries: WireEntry[];
+      typedNote?: string;
+      rawNote?: string;
+      fieldsNote?: string;
+    };
+
+    // The property, not the digit: at the default page size an ordinary bibliography comes back
+    // WHOLE. Raise the default and this fails before anything else does — at 100 the venue is
+    // gone from every entry, at 200 the authors are too, which is what the old default shipped.
+    expect(structured.entries.every((e) => e.authors.length === 4)).toBe(true);
+    expect(structured.entries.every((e) => e.venue !== undefined)).toBe(true);
+    expect(structured.entries.every((e) => e.doi !== undefined)).toBe(true);
+    expect(structured.entries.every((e) => !e.title!.includes('characters omitted'))).toBe(true);
+    expect(structured.entries.some((e) => e.typedOmitted !== undefined)).toBe(false);
+    expect(structured.entries.some((e) => e.authorsOmitted !== undefined)).toBe(false);
+    expect(structured.typedNote).toBeUndefined();
+    expect(structured.rawNote).toBeUndefined();
+    expect(structured.fieldsNote).toBeUndefined();
+
+    // …and it fits. Both channels, measured on the wire form of the very result the client got.
+    expect(renderedSize(res)).toBeLessThan(CLIENT_PAYLOAD_CEILING);
+
+    // Nothing is hidden: the caller is told the listing was cut off and how to see the rest.
+    expect(structured.totalCount).toBe(200);
+    expect(structured.truncated).toBe(true);
+    expect(textOf(res)).toContain('more not shown');
+  });
+
+  it('shows what the old default cost: the same file at maxResults 200 does not fit, and is stripped', async () => {
+    const { client, userDir } = await setup();
+    await writeFile(path.join(userDir, 'ref.bib'), realisticBib(200));
+
+    const wide = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'paper', path: 'ref.bib', maxResults: 200 },
+    });
+    const structured = wide.structuredContent as { entries: WireEntry[]; typedNote?: string };
+
+    // This is the call the default used to make. It is over the size a client rejects…
+    expect(renderedSize(wide)).toBeGreaterThan(CLIENT_PAYLOAD_CEILING);
+    // …and the fields a reader is actually there for are the ones the budgets had to cut.
+    expect(structured.entries.every((e) => e.authors.length === 0)).toBe(true);
+    expect(structured.entries.every((e) => e.venue === undefined)).toBe(true);
+    // A caller who asks for the wide page is told, rather than left to notice.
+    expect(structured.typedNote).toBeDefined();
+    expect(textOf(wide)).toContain('(+4 more)');
+
+    // The comparison is the argument for the page size, and it is fixture-independent: the same
+    // bibliography, one call each way.
+    const narrow = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'paper', path: 'ref.bib' },
+    });
+    expect(renderedSize(narrow)).toBeLessThan(renderedSize(wide) * 0.6);
   });
 
   it('leaves an ordinary bibliography alone: no counters, no markers, no note', async () => {

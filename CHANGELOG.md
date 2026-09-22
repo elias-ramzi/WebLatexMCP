@@ -1518,6 +1518,12 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   counters `entries[].typedOmitted`, `entries[].authorsOmitted` and `typedNote` are **declared in
   the `outputSchema`** — the omission that made this tool uncallable from v0.6.0 — and the text
   channel is rendered from the already-cut payload by the renderer the cost function itself calls.
+  The same change lowers **`maxResults`' default from 200 to 50**, the one lever that reaches what
+  no content budget can refuse: at 200 an ordinary bibliography rendered ~120000 characters across
+  both channels even with all three regions budgeted — still far past the size a client rejects —
+  and arrived stripped of the authors, venue and DOI a reader is there for, because the per-entry
+  scaffold (`path`, `line`, `format`, `year`, cite key) is irreducible and crowds the content
+  budgets out. At 50 the same `.bib` comes back whole and fits.
 
 - **The last native absolute path `FileService` emitted, and one spelling per result in `status`,
   `commit` and `revert`** (#148, #138, #141, #80 §4). Two remainders #141 deliberately left behind.

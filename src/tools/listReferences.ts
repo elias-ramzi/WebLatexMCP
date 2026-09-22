@@ -31,7 +31,15 @@ const inputSchema = {
     .max(1000)
     .optional()
     .describe(
-      'Cap on entries returned (default 200). Narrow with `filter` rather than raising it.',
+      'Cap on entries returned — default 50, which is what a client can actually be handed. At ' +
+        '200 (the old default) an ordinary bibliography renders past the payload size a client ' +
+        'rejects outright even with every field budget spent, and it arrives stripped of the ' +
+        'authors, venue and DOI a reader is there for: the per-entry scaffold (path, line, ' +
+        'format, year, cite key) is irreducible, so no content budget can refuse it and only a ' +
+        'smaller page can. At 50 an ordinary `.bib` comes back whole — titles, authors, venue ' +
+        'and DOI intact. Narrow with `filter` rather than raising this; raise it and the parsed ' +
+        'fields are cut from the tail of the result, which `typedNote` (and `rawNote`, ' +
+        '`fieldsNote`) will tell you.',
     ),
 };
 
@@ -248,7 +256,7 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
       inputSchema,
       outputSchema,
     },
-    async ({ project, path: relPath, filter, maxResults = 200 }) => {
+    async ({ project, path: relPath, filter, maxResults = 50 }) => {
       try {
         const { dir } = await ctx.projectManager.requireProjectDir(project);
         const candidates = relPath ? [relPath] : await referenceSourceCandidates(ctx, dir);

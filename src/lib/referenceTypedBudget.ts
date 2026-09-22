@@ -72,8 +72,12 @@
  *     One thing this does NOT bound, and it is named here rather than left to be discovered: the
  *     per-entry scaffold (`path`, `line`, `format`, `year`, and the identity strings above) scales
  *     with `maxResults` and with nothing a budget can refuse, exactly as it did before any of
- *     these three planners existed. `filter`, `path` and a lower `maxResults` remain the remedy
- *     for a result that is simply long.
+ *     these three planners existed. `filter`, `path` and a smaller page remain the remedy for a
+ *     result that is simply long — which is why #165 also lowered `maxResults`' default from 200
+ *     to 50: at 200 an ordinary bibliography rendered ~120000 characters even with all three
+ *     regions budgeted, and arrived stripped of the authors, venue and DOI a reader is there for;
+ *     at 50 it comes back whole and under the cap. A page size is the only lever that reaches the
+ *     scaffold, because no content budget can refuse it.
  *
  *  4. **Cut by declared priority, not in declaration order** — the pool is spent in
  *     {@link ALLOCATION_ORDER}, pass by pass over the WHOLE result, not entry by entry. Entry-wise
@@ -616,6 +620,8 @@ function describe<E>(
     'total; an entry that lost any carries `typedOmitted`, and an entry without it has every ' +
     'field the parser claimed. The text is still in that entry’s `raw` — unless its `rawOmitted` ' +
     'says `raw` was cut as well, in which case the file at the entry’s `path`:`line` is the only ' +
-    'whole copy. Narrow with `filter`, `path` or a smaller `maxResults` for fuller entries.'
+    'whole copy. Narrow with `filter` or `path`, or ask for fewer entries: `maxResults`’ default ' +
+    'is sized so an ordinary bibliography comes back whole, so a result cut this way usually ' +
+    'means it was raised.'
   );
 }
