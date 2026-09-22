@@ -36,8 +36,12 @@
  *  3. **Cutting is cheap here in a way it is not elsewhere, and that is what licenses the tight
  *     caps.** Every entry also carries `raw`, the entry exactly as written, so a field this planner
  *     drops is still in the result verbatim — `fields` is a convenience over bytes the caller
- *     already has, not the only copy. (`raw` itself is uncapped; that is a separate question and
- *     not this module's to answer.)
+ *     already has, not the only copy. `raw` has since been budgeted too (issue #147,
+ *     `src/lib/referenceRawBudget.ts`), which qualifies that licence rather than withdrawing it:
+ *     `raw` is cut only at the far end of a long result, it is cut to a marked PREFIX rather than
+ *     dropped, and the entry says so in `rawOmitted`. So the remedy this module points at holds
+ *     except where that count says otherwise, and the notes below say so instead of promising
+ *     unconditionally.
  *
  * The planner charges exactly what the tool sends, so the tool must hand these very objects through
  * to `structuredContent` — a test pins the accounting against `JSON.stringify` of the planned
@@ -51,9 +55,10 @@
  * 20000 is this codebase's house figure for "one document-controlled field's share of a tool
  * result" — `CONFLICT_CONTENT_BUDGET`, then `FLOATS_CONTENT_BUDGET`, then
  * `SEARCH_CONTENT_BUDGET` — sized so the worst case lands well under the ~67k a client actually
- * rejected, while leaving room for the rest of the result (`raw` above all) alongside it. Nothing
- * about reference fields argues for a different number, and two budgets for the same class of
- * defect only invite the question of which is right.
+ * rejected, while leaving room for the rest of the result alongside it. Nothing about reference
+ * fields argues for a different number, and two budgets for the same class of defect only invite
+ * the question of which is right — which is why `referenceRawBudget.ts` re-exports THIS constant
+ * for `raw`'s own allocation rather than declaring a figure of its own.
  */
 export const REFERENCE_FIELDS_BUDGET = 20000;
 
@@ -324,7 +329,8 @@ function describe<E>(
   }
   if (parts.length === 0) return undefined;
   return (
-    `${parts.join(' ')} Every omitted field is still present verbatim in that entry's \`raw\`; ` +
-    'per-entry counts are in `fieldsOmitted`. Narrow with `filter` or `path` for fuller maps.'
+    `${parts.join(' ')} Every omitted field is still present verbatim in that entry's \`raw\`, ` +
+    'except where that entry’s `rawOmitted` says `raw` was itself cut; per-entry counts are in ' +
+    '`fieldsOmitted`. Narrow with `filter` or `path` for fuller maps.'
   );
 }

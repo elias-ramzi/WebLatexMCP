@@ -2027,6 +2027,38 @@ additional properties`. The suite missed it because a test client that never lis
   `fields` key at all plus a `fieldsOmitted` count — "this entry has fields and none fit", which
   an empty map would misreport as "this entry has no fields".
 
+- **`list_references` budgets `entries[].raw` as well, the larger of its two document-controlled
+  payloads** (#147, found by the lane that fixed #137 and deliberately left out of it). #137
+  bounded the field map and left the entry text beside it open: only `maxResults` bounded the
+  entry _count_, nothing bounded any single `raw` or their sum, so the tool budgeted the smaller
+  payload and pointed callers at the unbounded one as the remedy for every cut. A `.bib` is
+  document-controlled text — one entry carrying a pasted abstract, a base64 `file` field or a long
+  `annote` is ordinary rather than hostile, and 200 of them is the default page — and thirty
+  ordinary Zotero-sized entries already put ~55k characters of `raw` on the wire, the shape of the
+  ~67k conflict payload a client rejected undelivered in #68.
+
+  `src/lib/referenceRawBudget.ts` bounds it the way the siblings do, with one difference that is
+  the whole design: **a cut `raw` is marked and counted, never dropped whole and never silently
+  sliced.** Dropping an over-long _field_ whole was right because `raw` still had it; `raw` is the
+  only copy of itself, so the same move one level up would delete the evidence rather than
+  shorten it. A cut entry therefore keeps a verbatim **prefix** (a BibTeX entry's head is its
+  type, key and first fields — what identifies it), ends in a `… [+N characters omitted]` marker
+  so the text itself admits it is a prefix, and carries `rawOmitted`. The schema no longer calls
+  `raw` authoritative unconditionally: it says so except where `rawOmitted` fires. At most 2000
+  characters of any one entry are returned (the `fields` value gate, reused, so one pathological
+  entry cannot blind the twenty behind it), and one 20000-char budget — `REFERENCE_FIELDS_BUDGET`
+  itself, imported rather than restated, because two numbers for one class of defect only invite
+  the question of which is right — covers every `raw` in a result, charged on **rendered** JSON
+  size and cut as a sticky tail so the kept part is a describable prefix. `raw` gets its own
+  allocation of that figure rather than sharing the `fields` pool: they answer different questions
+  (verbatim authority vs. parsed convenience) and a single pool would make whichever was planned
+  second go dark on every real bibliography, where halving both leaves each useful. A marker-only
+  entry is still charged although the budget is gone — a `raw` of `''` would claim the entry as
+  written is empty — which is the one bounded overspend, and it is written down rather than
+  discovered. Everything cut is named in the result's `rawNote` and in the result text, so a
+  caller reading only prose is told too, and the text channel renders from the budgeted payload,
+  never the parser's.
+
 - **`list_skills` reports an unregistered project instead of asserting it, and the lock-taking
   read-only tools are named consistently** (#105, #112). Two loose ends from the same wave.
   `list_skills` renders the same instruction text as the skill prompts but was still calling
