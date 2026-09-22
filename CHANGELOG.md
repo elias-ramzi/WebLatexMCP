@@ -2774,6 +2774,43 @@ exited with no changes` — and, worse, rendered the newly-preserved peer as
 
 ### Tests
 
+- **The output-contract audit is now something CI re-runs, and it found three more holes** (#130,
+  #137 for context). #135 proved the MCP SDK does not protect the advertised `outputSchema` — a
+  key present in `structuredContent` and absent from the schema is forwarded to the client
+  unvalidated and unstripped — but it proved it with a throwaway monkeypatch over
+  `Client.prototype.callTool`, which saw only the tools the suite happened to call. That is a
+  floor on the holes, not a ceiling, and nothing re-ran it.
+
+  Re-instrumenting the suite the same way shows **six** of the 38 registered tools had no output
+  contract coverage at all: `credential_portal`, `list_comments`, `resolve_comments`,
+  `set_credential`, `viewer` (never called) and `reset_to_remote` (called once, into an error).
+  `test/integration/outputContract.test.ts` drives all six end to end through a real MCP client,
+  plus the local-project read/write tools, the PDF readers, and the git-backed set — and asserts
+  of each that **nothing it emits is undeclared**, so the audit is a test rather than a script.
+
+  The new check is `undeclaredKeys` / `expectNoUndeclaredKeys` in `test/helpers/outputSchema.ts`.
+  It walks the payload into the schema, which is the only direction that can find a key nobody
+  thought to name: `expectDeclaredField` takes a pointer, so it can only answer a question
+  somebody already asked. It judges the **wire form** (`JSON.parse(JSON.stringify(...))`), because
+  an explicitly-`undefined` key is a real own property that survives `InMemoryTransport` and does
+  not survive JSON — reporting one manufactures a finding that cannot exist over stdio (the
+  non-hole #137 records for `compile`'s `warnings[].snippet`). `knownUndeclared` compares the
+  **whole** set rather than tolerating a subset, so fixing a pinned hole fails the test and forces
+  the entry to be deleted.
+
+  Holes found, reported not fixed (no `src/` file changes in this lane): `shelve`, `unshelve` and
+  `list_shelves` emit `version` inside the shelf object — `ShelfManifest` carries `version: 1` and
+  all three hand the manifest out with a `{ ...manifest }` spread, while `shelfShape` declares six
+  fields and not that one.
+
+  And the severity of all of these is worse than "undocumented": zod's JSON Schema conversion
+  marks **every** object in **all 38** advertised schemas `additionalProperties: false`, and the
+  SDK's own `Client` compiles an ajv validator per schema during `listTools()` and checks every
+  later result against it. So for any client built on the SDK — i.e. any client that lists tools
+  at startup — these tools do not return a slightly-too-wide payload, they fail outright with
+  `-32602` and no result. Measured, and pinned by a test: `list_references` (#137) is rejected the
+  same way today.
+
 - **Probe: `discard` and the case of an UNTRACKED path** (#70, the last "not provable on Linux"
   checkbox — a measurement, not a fix; no `src/` file changes). `GitService.discard` resolves
   tracked paths onto the index's spelling but must run `clean -f` over the caller's **raw**
