@@ -93,6 +93,23 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
   so messages are token-scrubbed across every configured host.
+  **Every key that spread puts in must be declared in the `outputSchema`, or the call fails.** The
+  spread is the whole risk: `{ ...manifest }` and `{ ...entry }` carry whatever the service type
+  grew since the schema was written, and nothing on the server complains — `McpServer` validates
+  against the schema, reads only `parseResult.success` and throws `parseResult.data` away, and a zod
+  object _strips_ rather than _stricts_, so an undeclared key is neither rejected nor removed. It is
+  the **client** that refuses it: zod's JSON Schema conversion marks every object node
+  `additionalProperties: false`, and the SDK's `Client` compiles an ajv validator per advertised
+  schema during `listTools()` and checks every later result against it, so the caller gets
+  `-32602 … must NOT have additional properties` and **no result at all**. An undeclared field is a
+  broken tool, not a wide payload: `list_references` was uncallable from v0.6.0 (#137) and the
+  `shelve` trio from its own first release (#146). Two things follow. A test `Client` that never
+  calls `listTools()` caches no validator and so proves nothing about this — assert the advertised
+  schema off a `listTools()` round trip. And an assertion on a NAMED field only answers a question
+  someone already asked, which the offending key by definition was not; audit the whole payload
+  against the schema (`expectNoUndeclaredKeys`, `test/helpers/outputSchema.ts`), judged on the wire
+  form, since an explicitly-`undefined` key survives `InMemoryTransport` but not JSON and is not a
+  hole.
 - **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`revert`/`project_sync`/
   `reset_to_remote`, and `read_file` with a `ref`, all guard with `requireGitProject`. The confirmation
   diff in `write_file`/`edit_file`/`add_citation` goes through `changeDiff` (`src/lib/changeDiff.ts`),
