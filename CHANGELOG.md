@@ -1176,12 +1176,12 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 ### Changed
 
 - **README trimmed again, for the release.** The "Highlights" list is the part a reader decides on,
-  so it now carries only what distinguishes the server: the surgical-edit and parallel-session
-  bullets are gone (both are guarantees the tool reference and
-  [CONCURRENCY.md](docs/CONCURRENCY.md) document properly, and neither reads as a reason to install
-  anything), the compile bullet leads with the two supported backends — `latexmk`, which is what
-  Overleaf runs, or `tectonic` — instead of the snippet caveats, and the viewer bullet drops
-  SyncTeX, which names a mechanism rather than an outcome. The skills list drops
+  so it now carries only what distinguishes the server: the surgical-edit, parallel-session and
+  page-rendering bullets are gone (all three are documented properly in the tool reference and
+  [CONCURRENCY.md](docs/CONCURRENCY.md), and none reads as a reason to install anything), the
+  compile bullet leads with the two supported backends — `latexmk`, which is what Overleaf runs, or
+  `tectonic` — instead of the snippet caveats, and the viewer bullet drops SyncTeX, which names a
+  mechanism rather than an outcome. The skills list drops
   `/session-feedback`: it is a contribution channel, not a way to work on a paper, and it is
   already in "Contributing", which now says so in one sentence instead of thirteen lines.
   "Documentation" is a bare list of links — every description there restated what the linked page
