@@ -2534,6 +2534,60 @@ Harmless only because no project is named `please` — the first word matching a
 
 ### Tests
 
+- **The integration suite's fixture helper stopped paying for git processes nothing asserts on**
+  (CI wall clock). The unit of cost in `test/integration/` is the git subprocess — which is
+  precisely what `windows-latest` runs ~10x slower than linux, and why `vitest.config.ts` scopes its
+  timeout by platform. The suite issued **11,793 git spawns**, and ~30% of them were fixture
+  construction rather than behaviour under test: `git config` alone was 1,827 spawns, 1,442 of them
+  `config --local` writing `user.name`/`user.email`/`core.autocrlf` three processes at a time, in a
+  repository whose own `src/` never shells out to `git config` to set anything — `GitService`
+  already passes `-c core.autocrlf=false`. The helper was the outlier, not the pattern, so it now
+  passes the same identity as `-c` switches through simple-git's `config` option.
+
+  The larger half is that the seeds repeat. `createFakeRemote` costs 6 spawns and ~0.4s on linux,
+  the suite calls it 350 times, and there are only **109 distinct `(files, branch)` pairs** once
+  keyed per test file — so each distinct seed is now built once and handed out as a filesystem copy
+  of the finished bare repo, turning ~69% of fixture builds into a recursive copy with no git
+  process at all. The cache is scoped to the module registry, which under vitest's default
+  isolation means per test **file**: every caller still gets its own independent copy under its own
+  temp dir with its own `cleanup`, so nothing is shared between tests but bytes that were about to
+  be recomputed identically, and a template is never opened by a git process after it is built, so
+  no lock can be held when the copy is taken. Net on the integration suite: **11,793 git spawns ->
+  9,138** (-22.5%), and **133.7s -> 104.5s** (-21.8%) measured as wall clock at `--maxWorkers=3`, a
+  stand-in for a 4-core runner, over two alternating rounds each. The two figures agreeing is the
+  point: the time came off because the spawns did. Expect a larger proportional saving on windows,
+  where a spawn is ~10x costlier and the removed work was almost purely spawns. The test count is
+  unchanged at 3,246 — this buys time by not repeating work, never by covering less.
+
+- **CI splits into a `static` job and a per-platform sharded `test` matrix** (CI wall clock). Two
+  changes, one rename. `lint`, `format:check`, `typecheck` and `build` are eslint/prettier/tsc over
+  the same source on every leg — they cannot fail on one OS and pass on another — so they were ~35s
+  per leg of pure duplication and now run once, on ubuntu, as `Lint, typecheck, build`. The build
+  is not a prerequisite for the tests either: vitest runs from `src/`, and no test imports `dist/`.
+  The tests themselves now run under `vitest --shard`, and the shard counts are
+  deliberately uneven because two measurements say they should be.
+
+  **Sharding stops paying at three.** `--shard` splits by the sha1 of each file's path and slices by
+  file COUNT, not duration, so balance is a lottery over 185 files whose times differ by two orders
+  of magnitude. Against the real per-file durations the max-shard time goes 242s at 2 shards (1.01x
+  of an even split), 174s at 3 (1.08x), 163s at 4 (1.36x), 142s at 6 (1.77x): past three, an extra
+  runner buys almost nothing, because `safePush.test.ts` alone is ~46s and sets a floor on whichever
+  shard it lands in. **And the runners are not priced alike** — linux 1x, windows 2x, macos 10x — so
+  each platform is sharded only until it stops being the critical path and no further: windows takes
+  three (it is ~10x linux on git spawns, which is what these tests mostly do), macos takes two, which
+  puts it under windows' shard time, and ubuntu takes none because unsharded it already finishes
+  inside it. A third macos shard would raise the bill on the 10x runner to shorten a leg nobody is
+  waiting on. Verified to partition rather than sample: the three windows shards run 62 + 62 + 61 of
+  185 files and 1044 + 1325 + 877 of 3,246 tests.
+
+  **Every job name here is a required context on `dev`**, matched by exact string, so this rename had
+  to land together with a protection update — a job renamed on its own detaches its context, and
+  protection then waits forever for a name nothing will ever report. The header comment says so and
+  carries the `gh api` invocation. `back-merge.yml` is unaffected for a reason worth stating: it
+  needs `main`'s push run to have already put `dev`'s required checks on `main`'s HEAD, and `main`
+  receives this workflow in the same release PR that makes the new names current, so the names on
+  `main`'s HEAD and the names `dev` requires move together.
+
 - **The advertised `outputSchema` is now tested, whole-payload, for every tool the suite can
   reach** (#128, #130, #135, #137, #145). The MCP SDK does not protect the output contract, in a
   way that is worth stating exactly because both halves matter. On the **server** side,
