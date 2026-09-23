@@ -1175,18 +1175,38 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Changed
 
-- **README trimmed again, for the release.** The "Highlights" list is the part a reader decides on,
-  so it now carries only what distinguishes the server: the surgical-edit, parallel-session and
-  page-rendering bullets are gone (all three are documented properly in the tool reference and
-  [CONCURRENCY.md](docs/CONCURRENCY.md), and none reads as a reason to install anything), the
-  compile bullet leads with the two supported backends — `latexmk`, which is what Overleaf runs, or
-  `tectonic` — instead of the snippet caveats, and the viewer bullet drops SyncTeX, which names a
-  mechanism rather than an outcome. The skills list drops
-  `/session-feedback`: it is a contribution channel, not a way to work on a paper, and it is
-  already in "Contributing", which now says so in one sentence instead of thirteen lines.
-  "Documentation" is a bare list of links — every description there restated what the linked page
-  says on its first screen. Nothing is removed from the docs themselves; this only stops the README
-  being a second, staler copy of them.
+- **README cut to a landing page, for the release** (248 → 127 lines). It had grown into a second,
+  staler copy of `docs/` — the failure mode of which is not length but divergence, since the copy is
+  the one nobody updates. Every detail below moved rather than went away.
+
+  **"Highlights" is what a reader decides on**, so it carries only what distinguishes the server. The
+  surgical-edit, parallel-session and page-rendering bullets are gone — all three are documented in
+  the tool reference and [CONCURRENCY.md](docs/CONCURRENCY.md), and none reads as a reason to install
+  anything. The compile bullet leads with the two supported backends (`latexmk`, which is what
+  Overleaf runs, or `tectonic`) instead of the snippet caveats, and the viewer bullet drops SyncTeX,
+  which names a mechanism rather than an outcome. "What you can do" is gone outright:
+  [tools.md](docs/tools.md) is the tool reference, and a per-tool paragraph in the README was a
+  second one.
+
+  **"Install" is now the two one-liners and nothing else** — the plugin for Claude Code, shown the way
+  you actually type it, and the `.mcpb` drag for Claude Desktop — plus one chat line for the token and
+  the project. The npm-package route, the per-OS guides, the TeX/compiler explanation, the credential
+  portal in full, the env vars and the iPad/browser route all moved into
+  [docs/install/README.md](docs/install/README.md), which was already the hub for exactly this and now
+  leads with what the README leaves out. That page grew; the front page shrank by more.
+
+  The skills list drops `/session-feedback`: it is a contribution channel, not a way to work on a
+  paper. It is named in the beta warning instead, where someone hitting a rough edge is actually
+  reading, and in "Contributing", which now says so in one sentence instead of thirteen lines.
+  "Documentation" is a bare list of links — every description there restated what the linked page says
+  on its first screen.
+
+  One thing to know rather than discover: with "What you can do" gone, **`render_pages`,
+  `pdf_geometry` and `extract_text` are no longer named anywhere in the README at all** — not even in
+  passing. All three are fully documented in [tools.md](docs/tools.md), so nothing is undocumented, but
+  the front page no longer advertises that the server can look at, measure, or read back the typeset
+  page. That is a deliberate trade for a landing page that fits on one screen, and the place to undo it
+  if it turns out to cost installs is one Highlights bullet, not a restored section.
 
 - **`diff` and the write-confirmation diffs are budgeted, cut at hunk boundaries** (#153, #68).
   `diff` was the largest unbudgeted payload in the server and one of the most-called tools: the
