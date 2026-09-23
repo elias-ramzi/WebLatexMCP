@@ -1179,6 +1179,15 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
   staler copy of `docs/` — the failure mode of which is not length but divergence, since the copy is
   the one nobody updates. Every detail below moved rather than went away.
 
+  **The headline and the intro are now one unit rather than two copies of each other.** The old
+  headline ("Read, edit, compile, and commit LaTeX in any git-hosted project") and the paragraph
+  under it said nearly the same sentence twice, and the paragraph spent its remaining half on
+  transport and platform trivia the badges already carry. The headline is the promise — "LaTeX
+  without the round trip" — and the intro names the loop being closed (copy, paste, compile,
+  screenshot, paste back) before saying what closes it. Every claim it makes now maps to a
+  Highlights bullet directly below, which the old one did not: `stdio`, TeX Live and the supported
+  client list moved to the install guides and the badges.
+
   **"Highlights" is what a reader decides on**, so it carries only what distinguishes the server. The
   surgical-edit, parallel-session and page-rendering bullets are gone — all three are documented in
   the tool reference and [CONCURRENCY.md](docs/CONCURRENCY.md), and none reads as a reason to install

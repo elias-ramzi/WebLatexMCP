@@ -4,7 +4,7 @@
 
 # WebLatexMCP
 
-**Read, edit, compile, and commit LaTeX in any git-hosted project — straight from Claude.**
+**LaTeX without the round trip — Claude works on your real project, on your machine.**
 
 [![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
@@ -38,11 +38,12 @@
 
 ---
 
-An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a git-hosted project —
-**Overleaf**, **GitHub**, or any git remote. It keeps a local clone, compiles locally (TeX Live +
-`latexmk`, or `tectonic`) so you see errors and PDFs without round-tripping, and sends changes back through an explicit
-commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
-**macOS, Linux, and Windows**.
+Your paper is in Overleaf. Claude is in a chat window. Between them: copy, paste, compile, screenshot,
+paste back.
+
+**WebLatexMCP closes that loop.** An MCP server that hands Claude a real checkout of your project, so it
+edits the actual `.tex`, compiles it on your machine, and reads the errors that come back — while you
+watch the PDF reload beside it. Nothing is pushed until you say so.
 
 ## Highlights
 
