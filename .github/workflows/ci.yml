@@ -1,16 +1,15 @@
 name: CI
 
-# A bare `push` plus a bare `pull_request` ran this whole matrix TWICE on every PR commit -- 3 OS
-# legs and the TeX smoke, from two run ids, on the same SHA (on #172 windows took 8m29s and 9m6s
+# A bare `push` plus a bare `pull_request` ran this whole matrix TWICE on every PR commit -- every
+# OS leg and the TeX smoke, from two run ids, on the same SHA (on #172 windows took 8m29s and 9m6s
 # doing identical work). That is double the bill, and windows bills at 2x. It is also a second
 # chance to get stuck: branch protection reads the MOST RECENT check run per required context, so
 # on #169 a duplicate that hung for 38 minutes kept the PR BLOCKED while its green sibling for the
 # same commit sat right beside it. A duplicate is not a free second opinion.
 #
 # `pull_request` alone covers PR branches, and it emits the SAME check-run names a push run does
-# (the name is the job name: `Lint, typecheck, test (<os>)` and `LaTeX compile smoke`), so the
-# required contexts on `dev` are satisfied unchanged -- verified against both runs of
-# 67c9afd, which carried the two sets side by side.
+# (the name is the job name), so the required contexts on `dev` are satisfied unchanged -- verified
+# against both runs of 67c9afd, which carried the two sets side by side.
 #
 # `main` and `dev` MUST keep their push runs, and this is the part that looks redundant and is not:
 # back-merge.yml (see its header) auto-merges a `main -> dev` PR after every release and relies on
@@ -20,18 +19,72 @@ name: CI
 # is listed for the same reason: after a squash merge its new HEAD gets its own checks rather than
 # inheriting only the PR's. Deleting the branch filter to "simplify" restores the duplication;
 # deleting the `push` key restores the release-day breakage.
+#
+# EVERY JOB NAME HERE IS A REQUIRED CONTEXT ON `dev`. A job name is its check-run name, and branch
+# protection matches contexts by exact string, so renaming a job -- or changing a matrix value that
+# appears in a name -- silently detaches that context: protection keeps waiting for a name nothing
+# will ever report, and the PR sits BLOCKED forever, while the new name arrives as a check nothing
+# requires. Rename a job only together with a matching update to `dev`'s required contexts:
+#   gh api repos/{owner}/{repo}/branches/dev/protection/required_status_checks \
+#     -X PATCH -f 'contexts[]=...' ...
 on:
   push:
     branches: [main, dev]
   pull_request:
 
 jobs:
-  quality:
-    name: Lint, typecheck, test (${{ matrix.os }})
+  # eslint, prettier and tsc read the same source whatever the runner is: they cannot fail on one
+  # OS and pass on another, so paying for them on three was ~35s per leg of pure duplication on a
+  # matrix where windows is billed at 2x and macos at 10x. `npm run build` belongs here too and is
+  # NOT a prerequisite for the tests -- vitest runs from `src/`, and no test imports `dist/`.
+  static:
+    name: Lint, typecheck, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run build
+
+  test:
+    name: Test (${{ matrix.os }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:
       fail-fast: false
+      # The shard counts are DELIBERATELY uneven, and each row carries its own so nothing is
+      # coupled to a value declared elsewhere. Two measurements set them.
+      #
+      # First, sharding stops paying at three. `--shard` splits by the sha1 of each file's path and
+      # slices by file COUNT, not by duration, so balance is a lottery over 185 files whose times
+      # differ by two orders of magnitude. Measured max-shard time against the real per-file
+      # durations: 2 shards 242s (1.01x of an even split), 3 shards 174s (1.08x), 4 shards 163s
+      # (1.36x), 6 shards 142s (1.77x). Past three, an extra runner buys almost nothing because
+      # safePush.test.ts alone is ~46s and sets a floor on whichever shard it lands in. Four runners
+      # for 11s is not a trade worth making.
+      #
+      # Second, the runners are not priced or paced alike -- linux 1x, windows 2x, macos 10x -- so
+      # each platform is sharded only until it stops being the critical path, and no further:
+      #   windows is the slowest leg by far (~10x linux on git spawns, which is what these tests
+      #     mostly do -- see vitest.config.ts's platform-scoped timeout), so it takes all three;
+      #   macos takes two, which puts it under windows' shard time; a third would raise the bill on
+      #     the 10x runner to shorten a leg that is no longer the one anybody waits for;
+      #   ubuntu needs none -- unsharded it already finishes inside windows' shard time.
+      # Re-measure before changing these. Adding or renaming a test file re-rolls the hash split,
+      # so balance drifts on its own; `1/1` is a full run and is spelled out rather than special-cased.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, shard: 1, shards: 1 }
+          - { os: macos-latest, shard: 1, shards: 2 }
+          - { os: macos-latest, shard: 2, shards: 2 }
+          - { os: windows-latest, shard: 1, shards: 3 }
+          - { os: windows-latest, shard: 2, shards: 3 }
+          - { os: windows-latest, shard: 3, shards: 3 }
     runs-on: ${{ matrix.os }}
     # A ceiling on a HUNG job, not a slow one. vitest already bounds each test (90s on windows, 30s
     # elsewhere -- see vitest.config.ts), and that bound is what catches a test that runs long; it
@@ -39,12 +92,12 @@ jobs:
     # on windows-latest with that 90s budget in force, so no per-test timeout ever fired -- and the
     # identical tree passed the same job in 9m13s in a concurrent run of the same commit, which is
     # what tells a hang from the platform slowdown. Tightening testTimeout would not have caught it.
-    # Without a job ceiling the default is GitHub's 360 minutes: six hours of runner time (windows
-    # bills at 2x) and the PR pinned at BLOCKED throughout, because the stuck check is the most
-    # recent one for its required context and branch protection reads that one. 25 is ~2.5x the
-    # slowest successful windows run observed (5-10 minutes across the last 39). If a legitimate run
-    # starts approaching it, find out what got slower rather than raising it.
-    timeout-minutes: 25
+    # Without a job ceiling the default is GitHub's 360 minutes: six hours of runner time and the PR
+    # pinned at BLOCKED throughout, because the stuck check is the most recent one for its required
+    # context and branch protection reads that one. 15 is ~4x the slowest shard projected here; it
+    # was 25 for the whole unsharded suite, so a hang is now caught sooner as well as more cheaply.
+    # If a legitimate run starts approaching it, find out what got slower rather than raising it.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -58,12 +111,8 @@ jobs:
           git config --global user.email "ci@example.com"
           git config --global user.name "CI"
       - run: npm ci
-      - run: npm run lint
-      - run: npm run format:check
-      - run: npm run typecheck
-      - run: npm run build
       # Unit + integration tests use a local bare repo — no TeX, no secrets.
-      - run: npm test
+      - run: npm test -- --shard=${{ matrix.shard }}/${{ matrix.shards }}
 
   tex-smoke:
     name: LaTeX compile smoke
