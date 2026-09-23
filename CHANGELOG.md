@@ -9,6 +9,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-23
+
 ### Added
 
 - **A `pdf_geometry` tool: measure the compiled page in points, instead of eyeballing a PNG**
@@ -1175,18 +1177,19 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Changed
 
-- **README cut to a landing page, for the release** (248 → 127 lines). It had grown into a second,
+- **README cut to a landing page, for the release** (248 → 124 lines). It had grown into a second,
   staler copy of `docs/` — the failure mode of which is not length but divergence, since the copy is
   the one nobody updates. Every detail below moved rather than went away.
 
   **The headline and the intro are now one unit rather than two copies of each other.** The old
   headline ("Read, edit, compile, and commit LaTeX in any git-hosted project") and the paragraph
   under it said nearly the same sentence twice, and the paragraph spent its remaining half on
-  transport and platform trivia the badges already carry. The headline is the promise — "LaTeX
-  without the round trip" — and the intro names the loop being closed (copy, paste, compile,
-  screenshot, paste back) before saying what closes it. Every claim it makes now maps to a
-  Highlights bullet directly below, which the old one did not: `stdio`, TeX Live and the supported
-  client list moved to the install guides and the badges.
+  transport and platform trivia the badges already carry. The headline now says what the
+  server does in one line — "Edit, compile, and sync your Overleaf projects with Claude" — and the
+  intro is a single paragraph describing what that looks like from your side (Claude rewriting a
+  paragraph, compiling, checking a citation in Crossref or OpenAlex, looking at the typeset page,
+  with nothing reaching Overleaf until you say so), with no implementation detail. `stdio`, TeX Live
+  and the supported client list moved to the install guides and the badges.
 
   **"Highlights" is what a reader decides on**, so it carries only what distinguishes the server. The
   surgical-edit, parallel-session and page-rendering bullets are gone — all three are documented in
@@ -1197,8 +1200,8 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
   [tools.md](docs/tools.md) is the tool reference, and a per-tool paragraph in the README was a
   second one.
 
-  **"Install" is now the two one-liners and nothing else** — the plugin for Claude Code, shown the way
-  you actually type it, and the `.mcpb` drag for Claude Desktop — plus one chat line for the token and
+  **"Install" is now the two one-liners and nothing else** — for Claude Code, one chat line pointing
+  Claude at the repo, and the `.mcpb` drag for Claude Desktop — plus one chat line for the token and
   the project. The npm-package route, the per-OS guides, the TeX/compiler explanation, the credential
   portal in full, the env vars and the iPad/browser route all moved into
   [docs/install/README.md](docs/install/README.md), which was already the hub for exactly this and now
@@ -1211,11 +1214,11 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
   on its first screen.
 
   One thing to know rather than discover: with "What you can do" gone, **`render_pages`,
-  `pdf_geometry` and `extract_text` are no longer named anywhere in the README at all** — not even in
-  passing. All three are fully documented in [tools.md](docs/tools.md), so nothing is undocumented, but
-  the front page no longer advertises that the server can look at, measure, or read back the typeset
-  page. That is a deliberate trade for a landing page that fits on one screen, and the place to undo it
-  if it turns out to cost installs is one Highlights bullet, not a restored section.
+  `pdf_geometry` and `extract_text` are no longer named in the README** — the intro says Claude looks
+  at the typeset page, but no tool is named. All three are fully documented in
+  [tools.md](docs/tools.md), so nothing is undocumented; this is a deliberate trade for a landing page
+  that fits on one screen, and the place to undo it if it turns out to cost installs is one
+  Highlights bullet, not a restored section.
 
 - **`diff` and the write-confirmation diffs are budgeted, cut at hunk boundaries** (#153, #68).
   `diff` was the largest unbudgeted payload in the server and one of the most-called tools: the

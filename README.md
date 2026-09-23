@@ -4,7 +4,7 @@
 
 # WebLatexMCP
 
-**LaTeX without the round trip — Claude works on your real project, on your machine.**
+**Edit, compile, and sync your Overleaf projects with Claude.**
 
 [![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
@@ -38,12 +38,10 @@
 
 ---
 
-Your paper is in Overleaf. Claude is in a chat window. Between them: copy, paste, compile, screenshot,
-paste back.
-
-**WebLatexMCP closes that loop.** An MCP server that hands Claude a real checkout of your project, so it
-edits the actual `.tex`, compiles it on your machine, and reads the errors that come back — while you
-watch the PDF reload beside it. Nothing is pushed until you say so.
+**WebLatexMCP lets Claude work on your paper the way a co-author would** — rewriting the paragraph
+you point at, compiling to find out what actually broke, checking a citation in databases like
+Crossref or OpenAlex, looking at the typeset page before it tells you the figure fits. You review
+every change, and nothing reaches Overleaf until you say so.
 
 ## Highlights
 
