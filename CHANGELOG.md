@@ -1175,6 +1175,19 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Changed
 
+- **README trimmed again, for the release.** The "Highlights" list is the part a reader decides on,
+  so it now carries only what distinguishes the server: the surgical-edit and parallel-session
+  bullets are gone (both are guarantees the tool reference and
+  [CONCURRENCY.md](docs/CONCURRENCY.md) document properly, and neither reads as a reason to install
+  anything), the compile bullet leads with the two supported backends — `latexmk`, which is what
+  Overleaf runs, or `tectonic` — instead of the snippet caveats, and the viewer bullet drops
+  SyncTeX, which names a mechanism rather than an outcome. The skills list drops
+  `/session-feedback`: it is a contribution channel, not a way to work on a paper, and it is
+  already in "Contributing", which now says so in one sentence instead of thirteen lines.
+  "Documentation" is a bare list of links — every description there restated what the linked page
+  says on its first screen. Nothing is removed from the docs themselves; this only stops the README
+  being a second, staler copy of them.
+
 - **`diff` and the write-confirmation diffs are budgeted, cut at hunk boundaries** (#153, #68).
   `diff` was the largest unbudgeted payload in the server and one of the most-called tools: the
   patch went back **twice** — verbatim in the result text and again in `structuredContent.diff` —
