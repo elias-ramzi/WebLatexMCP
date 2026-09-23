@@ -23,10 +23,18 @@
  *     `otherChanges` from the budget (option 2 of #185, rejected in a comment in
  *     `peerAttribution.ts`) fails here, at the line that would be made to lie by it.
  *
+ * A fourth join was added by #187: every field `src/lib/statusBudget.ts` records as promised
+ * COMPLETE (`STATUS_COMPLETENESS_PROMISES`) is asserted to be advertised, and advertised as
+ * uncapped, and each promise made inside a tool's own advertised schema is asserted to still be
+ * there. That is the inverse direction of the three above — those check a pointer at a BUDGETED
+ * field is honest about the budget, this checks a pointer at an EXEMPT field still has its
+ * exemption.
+ *
  * What it does NOT catch, stated rather than implied: nothing here proves the refusal points at
- * `status` at all rather than somewhere else, and nothing here enumerates *other* pointers into
- * `status` — a third one, in a third file, would break exactly as this one did. That inventory
- * problem is #185's own closing observation and is not solved by this file.
+ * `status` at all rather than somewhere else, and nothing here (the inventory included) detects a
+ * *new* third pointer whose author never registered it — a third file can still cut its own list
+ * and promise `status` holds the rest, and no test will notice. What #187 bought is that
+ * registering is one line, and that a registered promise then fails at the budget.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -40,6 +48,7 @@ import type { Attribution } from '../../src/lib/peerAttribution.js';
 import {
   planStatusPayload,
   ALLOCATION_ORDER,
+  STATUS_COMPLETENESS_PROMISES,
   STATUS_MAX_SESSIONS,
 } from '../../src/lib/statusBudget.js';
 import type { StatusPayloadInput, StatusPeerInput } from '../../src/lib/statusBudget.js';
@@ -187,5 +196,70 @@ describe("the peer refusal's pointer into `status` (issue #185)", () => {
     expect(ALLOCATION_ORDER).toContain('otherChanges');
     expect(ALLOCATION_ORDER).toContain('activeSessionChanges');
     expect(Number.isFinite(STATUS_MAX_SESSIONS)).toBe(true);
+  });
+});
+
+/**
+ * The other direction (#187): a field `status` is recorded as keeping COMPLETE has to be advertised
+ * as such, and the promise a tool makes inside its own advertised schema has to still be there.
+ *
+ * These read the wire form for the same reason the joins above do — `tools/list` is the only
+ * document a client or a model actually sees, so a promise that lives only in a source comment is
+ * not a promise anyone can act on.
+ */
+describe('the status completeness inventory, against what the server advertises', () => {
+  let statusSchema: JsonSchemaNode;
+  let pushSchemaJson: string;
+
+  beforeAll(async () => {
+    const server = createServer({} as unknown as AppContext);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'status-completeness-test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    statusSchema = await advertisedOutputSchema(client, 'status');
+    pushSchemaJson = JSON.stringify(await advertisedOutputSchema(client, 'push'));
+    await client.close();
+  });
+
+  it('advertises every promised field, always present and described as uncapped', () => {
+    for (const { field, dependents } of STATUS_COMPLETENESS_PROMISES) {
+      const declared = declaredField(statusSchema, field);
+      expect(
+        declared,
+        `\`${field}\` is recorded as complete for ${dependents
+          .map((d) => d.module)
+          .join(', ')}, but \`status\` does not advertise it at all.`,
+      ).toBeDefined();
+      expect(
+        declared!.required,
+        `\`${field}\` is promised complete, so it must always ship: an absent list and an empty ` +
+          'one are the same value to a caller reading it as the full answer.',
+      ).toBe(true);
+      expect(
+        declared!.node.description ?? '',
+        `\`${field}\` is exempt from the payload budget because other code points at it for a ` +
+          'complete list, and its own description has to say so — that description is what a ' +
+          'model reads to decide whether the field can be trusted as whole.',
+      ).toMatch(/never capped/i);
+    }
+  });
+
+  it('keeps each promise a TOOL makes in its own advertised schema', () => {
+    const inTools = STATUS_COMPLETENESS_PROMISES.flatMap((p) =>
+      p.dependents.filter((d) => d.module === 'src/tools/push.ts').map((d) => ({ ...d, ...p })),
+    );
+    // Not vacuous: `push` is the one tool that makes this promise in its schema today, and this
+    // assertion is worthless if that list is ever silently empty.
+    expect(inTools.length).toBeGreaterThan(0);
+
+    for (const dep of inTools) {
+      expect(
+        pushSchemaJson,
+        `\`push\` is recorded as sending a caller to \`status.${dep.field}\` for the commits its ` +
+          `own ${dep.cap} dropped, but its advertised outputSchema no longer contains ` +
+          `"${dep.evidence}". Either the pointer moved — repoint the inventory entry — or it is ` +
+          'gone and the exemption may be up for re-decision.',
+      ).toContain(dep.evidence);
+    }
   });
 });

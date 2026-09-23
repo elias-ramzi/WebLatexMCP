@@ -4,13 +4,16 @@ import {
   CONFLICT_SIDE_CAP,
   CONFLICT_CONTENT_BUDGET,
   CONFLICT_MAX_FILES,
+  CONFLICT_MAX_COMMITS,
   FILE_HEADER_OVERHEAD,
   HUNK_MARKER_OVERHEAD,
   HUNK_JSON_OVERHEAD,
   HUNK_LINE_ELEMENT_OVERHEAD,
   type ConflictRefs,
 } from '../../src/lib/conflictBudget.js';
-import type { ConflictFileDetail } from '../../src/services/gitService.js';
+import { capRemoteCommits } from '../../src/lib/conflictText.js';
+import { STATUS_COMPLETENESS_PROMISES } from '../../src/lib/statusBudget.js';
+import type { ConflictFileDetail, RemoteCommit } from '../../src/services/gitService.js';
 import type { ConflictHunk } from '../../src/lib/conflictParser.js';
 
 /** Fixed, realistic refs for tests that don't care about ref content itself — mirrors the shape
@@ -445,5 +448,53 @@ describe('planConflictPayload', () => {
       expect(plan.truncated).toBe(false);
       expect(plan.note).toBeUndefined();
     });
+  });
+});
+
+/**
+ * This cap's OTHER half, which does not live in this file (#187).
+ *
+ * `CONFLICT_MAX_COMMITS` drops commits from both channels and tells the caller the whole list is in
+ * `status.behindCommits`. That promise is only true while `status` leaves `behindCommits` out of
+ * its own budget — a decision made in `src/lib/statusBudget.ts`, by people who may never read this
+ * file. #175 kept it because that wave's spec named this pointer; the second pointer into `status`,
+ * in `peerAttribution.ts`, was silently falsified by the same wave (#185).
+ *
+ * So the cap asserts its own delegation is registered. If someone deletes the inventory entry (or
+ * the field's exemption with it), the failure lands here, on the cap that depends on it, and not
+ * only in `statusBudget`'s tests.
+ */
+describe('CONFLICT_MAX_COMMITS delegates completeness to `status` (#187)', () => {
+  it('is registered as a dependent of `status.behindCommits` in the completeness inventory', () => {
+    const promise = STATUS_COMPLETENESS_PROMISES.find((p) => p.field === 'behindCommits');
+    expect(
+      promise,
+      'this cap tells the caller `status.behindCommits` holds every commit it dropped, but ' +
+        '`behindCommits` is no longer registered as a field `status` keeps complete ' +
+        '(STATUS_COMPLETENESS_PROMISES, src/lib/statusBudget.ts). Either it is still exempt and ' +
+        'the entry was lost — restore it — or it is now budgeted, and this cap is pointing at a ' +
+        'list that may be short, which is #185 over again.',
+    ).toBeDefined();
+
+    const dependent = promise!.dependents.find((d) => d.module === 'src/lib/conflictBudget.ts');
+    expect(
+      dependent,
+      'the inventory no longer records THIS file as depending on `behindCommits` being complete, ' +
+        'so a future reader weighing whether the exemption still earns its place will not see the ' +
+        'pointer below `CONFLICT_MAX_COMMITS` that still makes the promise.',
+    ).toBeDefined();
+    expect(dependent!.cap).toBe('CONFLICT_MAX_COMMITS');
+  });
+
+  it('really drops commits, so the delegation is load-bearing rather than decorative', () => {
+    const commits: RemoteCommit[] = Array.from({ length: CONFLICT_MAX_COMMITS + 3 }, (_, i) => ({
+      hash: `${i}`.padStart(40, '0'),
+      message: `Update on Overleaf ${i}`,
+      files: [],
+    }));
+
+    // The premise of the whole entry: this cap cuts, which is why something else has to hold the
+    // complete list. A cap that stopped cutting would make the exemption pointless, not safe.
+    expect(capRemoteCommits(commits).omitted).toBe(3);
   });
 });

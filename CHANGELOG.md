@@ -2667,6 +2667,25 @@ Harmless only because no project is named `please` — the first word matching a
   and `behindCommits` stay **complete** — a conflict payload caps its own `remoteCommits` and points
   here for the full list — and only their text rendering is bounded.
 
+- **Which `status` fields other code depends on being complete is now enumerated, and consumed by
+  the tests on both sides** (#187, #185, #175). Two modules cut a list of their own and tell the
+  caller `status` holds the whole of it: `conflictBudget.ts`'s `CONFLICT_MAX_COMMITS` survived
+  #175 because that spec named it, and `peerAttribution.ts`'s refusal did not — it promised an
+  uncapped `status` for a release (#185). The difference was whether a human remembered the second
+  pointer existed. `STATUS_COMPLETENESS_PROMISES` (`src/lib/statusBudget.ts`) now records each
+  promised field with **which code depends on it and where that promise is written**, so a reader
+  can check whether the dependency still exists instead of treating the exemption as sacred, and
+  `STATUS_UNPROMISED_POINTERS` records the deliberate opposite — `otherChanges` is pointed at and
+  budgeted anyway, since exempting the list most likely to be enormous to keep a sentence true is
+  the trade #185 rejected. Both halves are enforced by the type system, symmetrically: a promise's
+  field subtracts `ALLOCATION_ORDER`, so **budgeting a promised field stops compiling**, and an
+  unpromised pointer's field IS `ALLOCATION_ORDER`, so un-budgeting a warned one stops compiling
+  too. Tests consume it from both ends — the cap in `conflictBudget` asserts its own delegation is
+  registered, each dependent's promise is asserted to still be in that dependent's source, and a
+  real `status` call over a real clone returns every promised field whole while its path lists are
+  cut. What it does not do is notice a **new** pointer nobody registered; it makes registering one
+  line, and makes a registered promise fail at the budget rather than in prose.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
