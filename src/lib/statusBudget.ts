@@ -24,7 +24,9 @@
  *     `structuredContent.behindCommits`/`aheadCommits` stay complete, because
  *     `src/lib/conflictBudget.ts` caps its own `remoteCommits` at `CONFLICT_MAX_COMMITS` and points
  *     the caller at `status.behindCommits` as the complete list (`CONFLICT_COMMITS_MORE_HINT` in
- *     `conflictText.ts` says so in words). Capping them here would silently falsify that pointer and
+ *     `conflictText.ts` says so in words). Which fields carry such a promise, and which code made
+ *     it, is enumerated in {@link STATUS_COMPLETENESS_PROMISES} (#187) rather than left to prose
+ *     nobody re-reads. Capping them here would silently falsify that pointer and
  *     leave a caller mid-conflict with no complete list anywhere. Their TEXT rendering is bounded
  *     instead — see {@link planCommitText} — which is what `renderCommitLines`' own
  *     "(see structuredContent)" trailing line was built for. The consequence is stated rather than
@@ -192,6 +194,9 @@ const PEER_TEXT_IDENTITY_OVERHEAD = 60;
  *  1. `conflictedChanges` is cut last of all. These paths are excluded from every commit until
  *     re-read and re-edited, so a caller acting without them believes work is landing that is not.
  *     They are also, by construction, the shortest list here.
+ *
+ * A lane added here may not be a field {@link STATUS_COMPLETENESS_PROMISES} lists: that inventory's
+ * `field` type subtracts this array's own members, so the promise stops compiling first (#187).
  */
 export const ALLOCATION_ORDER = [
   'conflictedChanges',
@@ -214,6 +219,213 @@ export type StatusFlatListName = Exclude<StatusListName, 'activeSessionChanges'>
 export const FLAT_LIST_ORDER: readonly StatusFlatListName[] = ALLOCATION_ORDER.filter(
   (n): n is StatusFlatListName => n !== 'activeSessionChanges',
 );
+
+/* ─────────────────────────────── The completeness inventory (#187) ───────────────────────────────
+ *
+ * Which `status` fields OTHER code has promised a caller are complete, so a budget landing on one
+ * fails **here, at the budget**, instead of silently falsifying a sentence in another file.
+ *
+ * Why it exists. Two modules cut a list of their own and tell the caller that `status` holds the
+ * whole of what they cut. `conflictBudget.ts` (`CONFLICT_MAX_COMMITS`) survived #175's budget
+ * because that work's spec named it and a test pinned it. `peerAttribution.ts`'s refusal did not —
+ * it went on claiming `status` listed the omitted paths "uncapped" for a release (#185, corrected
+ * by #186). The only difference between the two was whether a human remembered the second pointer
+ * existed; nothing structural stopped it, and nothing structural stopped a third.
+ *
+ * What the inventory is NOT. It is **not** a list of the `status` fields other code POINTS AT.
+ * `otherChanges` is pointed at by `peerAttribution.ts` and is budgeted anyway, deliberately: it is
+ * the list that actually blows up (an untracked `figures/` tree, a regenerated build directory),
+ * and exempting it to keep a sentence true would undo most of #175 — so #186 rewrote the sentence
+ * instead. A field is listed here only when another module **delegates** completeness to it: that
+ * module cut something of its own and told the caller the whole of it is in this field. A pointer
+ * that names a field while saying it is bounded delegates nothing, and belongs in
+ * {@link STATUS_UNPROMISED_POINTERS} below, which is the other half of the same decision.
+ *
+ * Two compile-time guards carry most of the weight, and they are symmetric. A promise's `field` is
+ * typed {@link CompleteStatusField}, which is {@link ALLOCATION_ORDER}'s lanes SUBTRACTED from the
+ * budgetable fields — so adding a promised field to the allocation order stops this file compiling.
+ * An unpromised pointer's `field` is typed {@link StatusListName}, the lanes themselves — so
+ * REMOVING a bounded field from the allocation order (option 2 of #185, the trade to keep a
+ * sentence true) stops it compiling too. Each mistake fails in the file where it is made.
+ *
+ * What this does NOT catch, plainly. Nothing forces the author of a **new** pointer to register it:
+ * a third module can still cut its own list and point at, say, `status.conflictedChanges` without
+ * touching this file, and no test will notice. What the inventory buys is that registering is one
+ * line, that a registered promise then fails loudly at the budget, and that an entry says WHO
+ * depends on it — so a reader can check whether the dependency still exists (`evidence` is
+ * asserted against the dependent's own source in `test/unit/statusBudget.test.ts`) rather than
+ * treating the list as sacred. If `conflictBudget.ts` ever stops pointing at `behindCommits`, that
+ * dependent goes; if a field's last dependent goes, so does its exemption.
+ */
+
+/**
+ * Every `status` field this module has an opinion about: the budgeted lanes, plus the two commit
+ * lists it deliberately leaves out of the budget.
+ *
+ * A `status` field that is neither — `branch`, `ahead`, `syncState`, `session` — is derived from
+ * what git reported and carries no document-controlled payload, so it is not this module's business
+ * and is not enumerated here.
+ */
+export type BudgetableStatusField = StatusListName | 'aheadCommits' | 'behindCommits';
+
+/**
+ * The fields a completeness promise may name.
+ *
+ * Defined by SUBTRACTING {@link StatusListName} rather than listed by hand, which is the whole
+ * guard: put a promised field into {@link ALLOCATION_ORDER} and it leaves this type, so the entry
+ * promising it no longer typechecks. The mistake is caught in the file that makes it.
+ */
+export type CompleteStatusField = Exclude<BudgetableStatusField, StatusListName>;
+
+/** One module whose own cut is honest only because a `status` field ships complete. */
+export interface CompletenessDependent {
+  /** POSIX path from the repo root, so a test can read the file and check the promise is still there. */
+  module: string;
+  /** What in `module` does the cutting — the export, or the function, that made `status` the answer. */
+  cap: string;
+  /**
+   * A literal fragment of the promise as `module` spells it. Asserted to still appear in that
+   * file: when it does not, the dependency has moved or gone, and the exemption has to be
+   * re-decided rather than inherited.
+   */
+  evidence: string;
+  /** Why that module cannot answer the question itself. */
+  because: string;
+}
+
+/** One `status` field that must ship complete, and every module that depends on it. */
+export interface StatusCompletenessPromise {
+  field: CompleteStatusField;
+  /** Never empty: a field with no dependent is a preference, not a promise, and loses its exemption. */
+  dependents: readonly CompletenessDependent[];
+  /** What bounds this field in practice — why the exemption is affordable rather than merely wanted. */
+  affordable: string;
+}
+
+/**
+ * The `status` fields other code depends on being complete. Consumed by
+ * `test/unit/statusBudget.test.ts` (no listed field may be a budget lane; every dependent's promise
+ * must still be in its source), `test/unit/statusPointerClaim.test.ts` (every listed field is
+ * advertised, and advertised as uncapped) and `test/integration/statusCompleteness.test.ts` (every
+ * listed field ships whole through a real `status` call whose other lists were cut), plus
+ * `test/unit/conflictBudget.test.ts`, which asserts its own cap's delegation is registered here.
+ */
+export const STATUS_COMPLETENESS_PROMISES: readonly StatusCompletenessPromise[] = [
+  {
+    field: 'behindCommits',
+    affordable:
+      'Bounded by how far one clone has drifted from its remote since the last sync, which is ' +
+      "the remote's commit rate — not by anything a document or a build directory controls. " +
+      'The cost is stated rather than hidden: a clone hundreds of commits behind returns a large ' +
+      '`structuredContent`, by decree.',
+    dependents: [
+      {
+        module: 'src/lib/conflictBudget.ts',
+        cap: 'CONFLICT_MAX_COMMITS',
+        evidence: 'status.behindCommits',
+        because:
+          "A conflict's own `remoteCommits` is capped at 20 in both channels; the caller is told " +
+          'the rest are in `status.behindCommits`, which is true only because the aborted rebase ' +
+          'put the clone back at its pre-push state, so `status` still sees every one of them.',
+      },
+      {
+        module: 'src/lib/conflictText.ts',
+        cap: 'CONFLICT_COMMITS_MORE_HINT',
+        evidence: 'status.behindCommits',
+        because:
+          'The same cap in the TEXT channel. This is the one the caller actually reads mid-' +
+          'conflict, and it points here instead of at `structuredContent` precisely because ' +
+          '`remoteCommits` is itself capped — `status` is the only complete list left.',
+      },
+      {
+        module: 'src/tools/push.ts',
+        cap: 'capRemoteCommits, via CONFLICT_MAX_COMMITS',
+        evidence: 'status.behindCommits',
+        because:
+          'The advertised `remoteCommitsOmitted` description and the tool description both send a ' +
+          'caller here for the commits the conflict payload left out, so the promise ships in the ' +
+          "schema a model reads, not only in a result's text.",
+      },
+      {
+        module: 'src/lib/conflictText.ts',
+        cap: 'DEFAULT_COMMITS_MORE_HINT, ending the block planCommitText bounded',
+        evidence: '(see structuredContent)',
+        because:
+          "`status`'s own `landed upstream:` block is cut to " +
+          '`STATUS_COMMIT_TEXT_BUDGET` and ends by sending the caller to `structuredContent` for ' +
+          'the rest — a pointer from one channel of a result into the other, false the moment the ' +
+          'structured half is cut too.',
+      },
+    ],
+  },
+  {
+    field: 'aheadCommits',
+    affordable:
+      "Bounded by how many commits this clone has made since its last push — the session's own " +
+      'work, not a document-controlled list.',
+    dependents: [
+      {
+        module: 'src/lib/conflictText.ts',
+        cap: 'DEFAULT_COMMITS_MORE_HINT, ending the block planCommitText bounded',
+        evidence: '(see structuredContent)',
+        because:
+          "`status`'s `to push:` block is cut to `STATUS_COMMIT_TEXT_BUDGET` and ends by sending " +
+          'the caller to `structuredContent` for the rest. No OTHER tool delegates to ' +
+          '`aheadCommits` today — it is listed because `status` itself does, in the same result.',
+      },
+    ],
+  },
+];
+
+/** Just the promised field names, for a consumer that iterates them. */
+export const COMPLETE_STATUS_FIELDS: readonly CompleteStatusField[] =
+  STATUS_COMPLETENESS_PROMISES.map((p) => p.field);
+
+/**
+ * A pointer into `status` that names a **budgeted** field on purpose — the other half of the
+ * inventory, and the reason it cannot be read as "every field a pointer names must be complete".
+ *
+ * Typed `field: StatusListName`, so an entry here stops compiling if its field ever leaves
+ * {@link ALLOCATION_ORDER}: un-budgeting a list whose pointer was written to warn about the budget
+ * is as much a drift as budgeting a promised one, just in the other direction.
+ */
+export interface UnpromisedStatusPointer {
+  /** The lane the pointer names. Must be, and stay, budgeted. */
+  field: StatusListName;
+  /** POSIX path from the repo root of the module that names it. */
+  module: string;
+  /** A literal fragment of that pointer, asserted to still be in `module`'s source. */
+  evidence: string;
+  /** Why it stays budgeted although something points at it. */
+  why: string;
+}
+
+/**
+ * Pointers into `status` that carry no completeness promise, recorded so the next reader can tell
+ * "budgeted, and the pointer says so" from "nobody has looked at this one yet".
+ */
+export const STATUS_UNPROMISED_POINTERS: readonly UnpromisedStatusPointer[] = [
+  {
+    field: 'otherChanges',
+    module: 'src/lib/peerAttribution.ts',
+    evidence: 'Those lists are budgeted too',
+    why:
+      'This is exactly the list that blows up, and the single largest contributor to the ' +
+      'undelivered-payload failure #175 exists to stop. #185 was the refusal calling it uncapped; ' +
+      '#186 fixed the sentence rather than the budget, and the sentence now names `truncated`, ' +
+      '`pathsOmitted.otherChanges` and `activeSessionsOmitted` as the way to tell a complete ' +
+      'answer from a cut one.',
+  },
+  {
+    field: 'activeSessionChanges',
+    module: 'src/lib/peerAttribution.ts',
+    evidence: '`activeSessions[].changes`',
+    why:
+      'Capped per peer, and the peer list itself capped at `STATUS_MAX_SESSIONS`, for the same ' +
+      'reason. The refusal points at it as one input to a subtraction and says in the same breath ' +
+      'that the subtraction may run over short lists and yield a lower bound.',
+  },
+];
 
 /** One peer as `status` has already assembled it, before any bound is applied. */
 export interface StatusPeerInput {

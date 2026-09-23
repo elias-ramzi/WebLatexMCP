@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import {
   ALLOCATION_ORDER,
+  COMPLETE_STATUS_FIELDS,
   FLAT_LIST_ORDER,
   STATUS_COMMIT_MESSAGE_CAP,
   STATUS_COMMIT_TEXT_BUDGET,
@@ -9,6 +11,8 @@ import {
   STATUS_MAX_SESSIONS,
   STATUS_NOTE_RESERVE,
   STATUS_PEER_TEXT_PATHS,
+  STATUS_COMPLETENESS_PROMISES,
+  STATUS_UNPROMISED_POINTERS,
   buildStatusNote,
   pathCost,
   peerIdentityCost,
@@ -454,5 +458,103 @@ describe('planCommitText: the TEXT channel only', () => {
     const plan = planCommitText([]);
     expect(plan.maxCommits).toBe(0);
     expect(renderCommitBlock(plan)).toEqual([]);
+  });
+});
+
+/**
+ * The completeness inventory (#187) — the guard that makes a promise made in ANOTHER file fail
+ * here, at the budget, rather than in prose nobody re-reads.
+ *
+ * #185 happened because `peerAttribution.ts` told a caller `status` answered uncapped and #175 then
+ * capped it, with nothing between the two files. `conflictBudget.ts` made the same kind of promise
+ * and survived only because that wave's spec named it. These assertions are the structural half:
+ * every promise is registered, every registered promise is still made by the module that made it,
+ * and no registered field is a budget lane.
+ *
+ * `evidence` is read out of the dependent's own source rather than restated here, so a pointer that
+ * is deleted or reworded fails with "re-decide the exemption" instead of being inherited forever.
+ */
+describe('the status completeness inventory', () => {
+  const repoRoot = new URL('../../', import.meta.url);
+  const sourceOf = async (module: string): Promise<string> =>
+    readFile(new URL(module, repoRoot), 'utf8');
+
+  it('lists no field this budget cuts — the mistake #187 exists to catch', () => {
+    for (const promise of STATUS_COMPLETENESS_PROMISES) {
+      expect(
+        ALLOCATION_ORDER as readonly string[],
+        `\`${promise.field}\` is budgeted by ALLOCATION_ORDER and promised complete by ` +
+          `${[...new Set(promise.dependents.map((d) => d.module))].join(', ')}. One of the two ` +
+          'has to go: either ' +
+          'drop the lane, or drop the promise AND the sentence in the dependent that makes it. ' +
+          'This is #185 exactly — a budget landing on a field another file swears is whole.',
+      ).not.toContain(promise.field);
+    }
+  });
+
+  it('promises each field once, and never a field it also records as budgeted', () => {
+    const promised = STATUS_COMPLETENESS_PROMISES.map((p) => p.field);
+    expect(promised).toEqual([...COMPLETE_STATUS_FIELDS]);
+    expect(new Set(promised).size, 'a field is promised twice; merge the dependents').toBe(
+      promised.length,
+    );
+    expect(promised.length, 'an empty inventory guards nothing').toBeGreaterThan(0);
+
+    const bounded = new Set<string>(STATUS_UNPROMISED_POINTERS.map((p) => p.field));
+    for (const field of promised) {
+      expect(
+        bounded,
+        `\`${field}\` is recorded both as promised complete and as deliberately budgeted. Those ` +
+          'are opposite decisions about the same field.',
+      ).not.toContain(field);
+    }
+  });
+
+  it('records, for every promise, which code depends on it — a promise, not a preference', async () => {
+    for (const promise of STATUS_COMPLETENESS_PROMISES) {
+      expect(
+        promise.dependents.length,
+        `\`${promise.field}\` is exempt from the budget but names nobody who depends on that. An ` +
+          'exemption with no dependent is a preference: drop the entry and let the field be ' +
+          'budgeted like every other.',
+      ).toBeGreaterThan(0);
+
+      for (const dep of promise.dependents) {
+        const source = await sourceOf(dep.module);
+        expect(
+          source,
+          `${dep.module} is recorded as depending on \`status.${promise.field}\` being complete ` +
+            `(via ${dep.cap}), but no longer contains "${dep.evidence}". Either the promise moved ` +
+            '— point the entry at where it lives now — or it is gone, in which case that ' +
+            'dependent, and possibly the whole exemption, should go with it. Do not just delete ' +
+            'this assertion.',
+        ).toContain(dep.evidence);
+      }
+    }
+  });
+
+  it('records the pointers that name a BUDGETED field, so the inventory is not read as "any pointer"', async () => {
+    expect(
+      STATUS_UNPROMISED_POINTERS.length,
+      'the counter-examples are what stop this inventory reading as "every field a pointer names ' +
+        'must be complete"; `otherChanges` is pointed at and budgeted on purpose (#185, #186)',
+    ).toBeGreaterThan(0);
+
+    for (const pointer of STATUS_UNPROMISED_POINTERS) {
+      expect(
+        ALLOCATION_ORDER as readonly string[],
+        `\`${pointer.field}\` is recorded in ${pointer.module} as pointed at but bounded, and is ` +
+          'no longer a budget lane. If it was exempted to make a sentence true, that is option 2 ' +
+          'of #185, rejected in a comment in src/lib/peerAttribution.ts.',
+      ).toContain(pointer.field);
+
+      const source = await sourceOf(pointer.module);
+      expect(
+        source,
+        `${pointer.module} no longer contains "${pointer.evidence}", so the wording that ` +
+          `acknowledges \`${pointer.field}\` is budgeted has changed. Check it still tells the ` +
+          'caller the list may be short before updating this entry.',
+      ).toContain(pointer.evidence);
+    }
   });
 });
