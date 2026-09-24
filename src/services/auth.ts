@@ -39,6 +39,15 @@ const HOST_DEFAULTS: Record<string, HostDefaults> = {
   'git.overleaf.com': { tokenEnv: 'OVERLEAF_GIT_TOKEN', username: 'git' },
 };
 
+/**
+ * The host's defaults, own keys only: the host comes from a caller-supplied git URL, and a host
+ * named `constructor` or `__proto__` read back `Object`/`Object.prototype` from the literal above —
+ * whose `tokenEnv` is undefined, so the resolver looked up the env var literally named "undefined".
+ */
+function hostDefaults(host: string | undefined): HostDefaults | undefined {
+  return host !== undefined && Object.hasOwn(HOST_DEFAULTS, host) ? HOST_DEFAULTS[host] : undefined;
+}
+
 function hostOf(gitUrl: string): string | undefined {
   try {
     return new URL(gitUrl).hostname;
@@ -54,7 +63,7 @@ export function hostFromGitUrl(gitUrl: string): string | undefined {
 
 /** The conventional HTTPS username for a host (e.g. `git` for Overleaf), falling back to `git`. */
 export function defaultUsernameForHost(host: string | undefined): string {
-  return (host && HOST_DEFAULTS[host]?.username) || 'git';
+  return hostDefaults(host)?.username || 'git';
 }
 
 export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdentity {
@@ -62,24 +71,6 @@ export function loadIdentity(env: NodeJS.ProcessEnv = process.env): CommitIdenti
     name: env.WEB_LATEX_MCP_AUTHOR_NAME?.trim() || 'WebLatexMCP',
     email: env.WEB_LATEX_MCP_AUTHOR_EMAIL?.trim() || 'web-latex-mcp@localhost',
   };
-}
-
-/**
- * Build an authenticated URL by injecting credentials in-memory. Only http(s) URLs are
- * touched; the result is used transiently and never persisted to .git/config.
- */
-export function authenticateUrl(gitUrl: string, auth: AuthConfig): string {
-  if (!auth.token) return gitUrl;
-  let url: URL;
-  try {
-    url = new URL(gitUrl);
-  } catch {
-    return gitUrl;
-  }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return gitUrl;
-  url.username = encodeURIComponent(auth.username);
-  url.password = encodeURIComponent(auth.token);
-  return url.toString();
 }
 
 /** The list of secret strings to scrub from any output, for this auth config. */
@@ -105,7 +96,7 @@ export class CredentialResolver {
 
   async resolve(project: CredentialProject): Promise<AuthConfig> {
     const host = hostOf(project.gitUrl);
-    const defaults = host ? HOST_DEFAULTS[host] : undefined;
+    const defaults = hostDefaults(host);
     const username = project.username?.trim() || defaults?.username || 'git';
     const token = await this.resolveToken(project, host, defaults);
     if (token) this.seenTokens.add(token);

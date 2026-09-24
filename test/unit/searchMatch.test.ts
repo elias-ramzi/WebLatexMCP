@@ -146,3 +146,26 @@ describe('matchFileLines: long lines', () => {
     expect(found.matches[0]?.before?.[0]?.length).toBe(MAX_MATCH_TEXT_CHARS + 1); // + the `…`
   });
 });
+
+describe('matchFileLines: the deadline is checked between lines, not between files', () => {
+  it('stops part-way through a file once the deadline passes, and says how far it got', () => {
+    const text = Array.from({ length: 10 }, (_unused, i) => `hit ${i}`).join('\n');
+    // A clock that advances once per reading: the deadline reads as expired from the fourth
+    // check on, so exactly three lines are scanned.
+    let checks = 0;
+    const expired = (): boolean => ++checks > 3;
+
+    const found = matchFileLines(text, literal('hit'), { expired });
+
+    expect(found.matches.map((m) => m.line)).toEqual([1, 2, 3]);
+    expect(found.linesScanned).toBe(3);
+    expect(found.totalLines).toBe(10);
+    expect(found.complete).toBe(false);
+  });
+
+  it('reports a file scanned to the end as complete', () => {
+    const found = matchFileLines('hit\nhit\n', literal('hit'), { expired: () => false });
+    expect(found.complete).toBe(true);
+    expect(found.linesScanned).toBe(found.totalLines);
+  });
+});

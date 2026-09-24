@@ -482,5 +482,45 @@ describe('pathspec batching outside revert', () => {
       expect(pathspecUnionFor(invocations, 'checkout', 2)).toEqual(paths);
       expect(pathspecUnionFor(invocations, 'clean', 2)).toEqual(paths);
     });
+
+    // `shelve`'s two probes over the paths it is about to take. Unbatched, a shelve of a few
+    // hundred long paths handed `ls-tree`/`ls-files`/`diff` one ~39 KB command line each — past
+    // Windows' 32,767-character limit.
+    it('linkPathsAmong probes HEAD and the index in budgeted chunks, losing no path', async () => {
+      const { dir, git } = await initRepo('ovl-links-argv-');
+      const rels = Array.from({ length: 300 }, (_, i) => fixturePath(i));
+      await writeAll(dir, rels, 'v1\n');
+      await git.add('.');
+      await git.commit('base');
+      const paths = [...rels].sort();
+
+      const invocations = await recordGitArgv(async () => {
+        expect(await new GitService().linkPathsAmong(dir, paths)).toEqual([]);
+      });
+
+      assertEveryInvocationIsBudgetedAndLiteral(invocations);
+      expect(pathspecUnionFor(invocations, 'ls-tree', 2)).toEqual(paths);
+      expect(pathspecUnionFor(invocations, 'ls-files', 2)).toEqual(paths);
+    });
+
+    it('statAgainstHead diffs in budgeted chunks and reports every changed path', async () => {
+      const { dir, git } = await initRepo('ovl-stat-argv-');
+      const rels = Array.from({ length: 300 }, (_, i) => fixturePath(i));
+      await writeAll(dir, rels, 'v1\n');
+      await git.add('.');
+      await git.commit('base');
+      await writeAll(dir, rels, 'v1\nv2\n');
+      const paths = [...rels].sort();
+
+      let stats: Awaited<ReturnType<GitService['statAgainstHead']>> = [];
+      const invocations = await recordGitArgv(async () => {
+        stats = await new GitService().statAgainstHead(dir, paths);
+      });
+
+      assertEveryInvocationIsBudgetedAndLiteral(invocations);
+      expect(pathspecUnionFor(invocations, 'diff', 2)).toEqual(paths);
+      expect(stats.map((f) => f.path).sort()).toEqual(paths);
+      expect(stats.every((f) => f.added === 1 && f.removed === 0)).toBe(true);
+    });
   });
 });

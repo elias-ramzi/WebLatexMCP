@@ -267,3 +267,51 @@ describe('searchProject: the bounds', () => {
     expect(out.note).toContain('per-line scan cap');
   });
 });
+
+describe('searchProject: runtime bounds inside one file', () => {
+  const files = new FileService();
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-searchpartial-'));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('checks the deadline between LINES, and reports a file cut off part-way', async () => {
+    // One file, so the old between-files check had nothing to interrupt: it read the clock
+    // before the file and after it, and — the file being the last — never reported a timeout.
+    const body = Array.from({ length: 50 }, (_unused, i) => `needle ${i}`).join('\n');
+    await writeFile(path.join(dir, 'big.tex'), `${body}\n`);
+    let ticks = 0;
+    // Advances one step per reading: past the 10-unit budget after a dozen readings.
+    const now = (): number => ticks++;
+
+    const out = await searchProject(files, dir, { pattern: 'needle', budgetMs: 10, now });
+
+    expect(out.timedOut).toBe(true);
+    expect(out.filesPartiallySearched).toBe(1);
+    expect(out.totalMatches).toBeGreaterThan(0);
+    expect(out.totalMatches).toBeLessThan(50);
+    expect(out.note).toContain('big.tex');
+  });
+
+  it('says when excludeComments met files that have no % comment syntax', async () => {
+    await writeFile(path.join(dir, 'a.tex'), '% needle\nneedle\n');
+    await writeFile(path.join(dir, 'notes.md'), '% needle\n');
+    await writeFile(path.join(dir, 'todo.txt'), 'needle\n');
+
+    const out = await searchProject(files, dir, { pattern: 'needle', excludeComments: true });
+
+    // The .md line starting with `%` is reported: `%` is not a comment there.
+    expect(out.matches.map((m) => m.path)).toEqual(['a.tex', 'notes.md', 'todo.txt']);
+    expect(out.note).toMatch(/excludeComments/);
+    expect(out.note).toMatch(/2 searched file\(s\)/);
+  });
+
+  it('adds no excludeComments note when every searched file has % comments', async () => {
+    await writeFile(path.join(dir, 'a.tex'), 'needle\n');
+    const out = await searchProject(files, dir, { pattern: 'needle', excludeComments: true });
+    expect(out.note).toBeUndefined();
+  });
+});

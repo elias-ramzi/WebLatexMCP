@@ -144,6 +144,13 @@ function receivedChars(res: CallToolResult): number {
   return textOf(res).length + JSON.stringify(res.structuredContent ?? {}).length;
 }
 
+/**
+ * What a result may carry beyond {@link DIAGNOSTICS_CONTENT_BUDGET}: everything the budget
+ * deliberately does not govern — the headline, paths, counters, key names — which does not grow
+ * with the log.
+ */
+const FIXED_FIELDS_ALLOWANCE = 2000;
+
 describe('compile: errors[] and warnings[] are budgeted', () => {
   it('bounds a warning-heavy successful compile and counts what the cap cut', async () => {
     const { client } = await setup(cannedLog(false));
@@ -158,9 +165,12 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     expect(JSON.stringify(s.errors).length + JSON.stringify(s.warnings).length).toBeLessThanOrEqual(
       DIAGNOSTICS_CONTENT_BUDGET,
     );
-    // And the whole result, both channels, stays far below the ~67k a client rejected in #68 —
-    // `logTail`'s own 80-line bound is what keeps the rest of it small.
-    expect(receivedChars(res)).toBeLessThan(40_000);
+    // And the whole result, both channels, logTail included: it is charged against the same
+    // budget now, so the only excess is the fixed fields. (This used to read `< 40_000`, which
+    // held only because logTail's 80 short box lines happened to be small — it was not charged.)
+    expect(receivedChars(res)).toBeLessThanOrEqual(
+      DIAGNOSTICS_CONTENT_BUDGET + FIXED_FIELDS_ALLOWANCE,
+    );
 
     // Nothing cut silently: total = shown + omitted.
     expect(s.warnings.length).toBeGreaterThan(0);
@@ -176,8 +186,8 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     // rendered there too rather than leaving a silently short list.
     expect(textOf(res)).toContain('warnings: showing');
 
-    // logTail keeps its own, separate 80-line bound: it is the fallback evidence for the warnings
-    // this cut removed, so the box lines are still there.
+    // logTail keeps its share of the budget: it is the fallback evidence for the warnings this
+    // cut removed, so the latest box lines are still there.
     // filterLog keeps the TAIL of the log, so it is the last box lines that survive there.
     expect(s.logTail).toMatch(/Overfull \\hbox \(1199\.0pt too wide\)/);
     // 80 kept lines plus filterLog's own "N earlier diagnostic line(s) omitted" notice.
@@ -253,5 +263,71 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     await expectDeclaredField(client, 'compile', 'omittedSnippetLocations', {
       description: /errorsOmittedByCap/,
     });
+  });
+});
+
+/**
+ * The same end-to-end measurement, on the channel the budget above used to leave out. `logTail`
+ * was bounded in LINES (80) but each is an un-wrapped LOGICAL line of any length, so a document
+ * whose package warnings carry long messages shipped ~400k characters of `logTail` beside a
+ * perfectly budgeted `errors`/`warnings` — and the one error keep-at-least-one retains went out
+ * whole, in both channels, however long its message.
+ */
+describe('compile: logTail and a kept-regardless error are budgeted too', () => {
+  it('bounds a log of 80 very long package warnings, logTail included', async () => {
+    const long = 'x'.repeat(5000);
+    const log = [
+      '(./main.tex',
+      ...Array.from(
+        { length: 80 },
+        (_, i) => `Package foo Warning: ${long} on input line ${i + 3}.`,
+      ),
+      ')',
+      'Output written on main.pdf (1 page, 100 bytes).',
+    ].join('\n');
+    const { client } = await setup(log);
+    const res = (await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc' },
+    })) as CallToolResult;
+    const s = structured(res);
+
+    // Pre-fix: logTail alone was ~400k characters.
+    expect(receivedChars(res)).toBeLessThanOrEqual(
+      DIAGNOSTICS_CONTENT_BUDGET + FIXED_FIELDS_ALLOWANCE,
+    );
+    // Cut, not emptied: the latest lines survive, and the tail says what it dropped.
+    expect(s.logTail.split('\n').at(-1)).toBe('Output written on main.pdf (1 page, 100 bytes).');
+    expect(s.logTail.split('\n')[0]).toMatch(/^… \(\d+ earlier diagnostic line\(s\) omitted/);
+    expect(s.logTail).toMatch(/more characters — see logPath\]/);
+    expect(s.note).toMatch(/logTail: \d+ earlier line\(s\) trimmed/);
+    // Both overlapping lanes keep a share: the warnings are not starved by the tail.
+    expect(s.warnings.length).toBeGreaterThan(0);
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+
+  it('cuts the message of the one error it keeps regardless, instead of shipping it whole', async () => {
+    const log = [
+      '(./main.tex',
+      `! Package foo Error: ${'z'.repeat(60_000)}.`,
+      'l.3 Paragraph 0',
+      ')',
+      'No pages of output.',
+    ].join('\n');
+    const { client } = await setup(log);
+    const res = (await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc' },
+    })) as CallToolResult;
+    const s = structured(res);
+
+    expect(s.errors).toHaveLength(1);
+    expect(s.errors[0]?.message).toMatch(/^Package foo Error: zzz/);
+    expect(s.errors[0]?.message).toMatch(/more characters — see logPath\]$/);
+    // Pre-fix: the 60k message went out in the text channel AND in structuredContent.
+    expect(receivedChars(res)).toBeLessThanOrEqual(
+      DIAGNOSTICS_CONTENT_BUDGET + FIXED_FIELDS_ALLOWANCE,
+    );
+    expect(s.note).toMatch(/message of the first error was cut/);
   });
 });

@@ -34,6 +34,7 @@
 import { BackendUnavailableError } from './referenceBackend.js';
 import type { ReferenceHit } from './referenceBackend.js';
 import { parseRecordKey, REFERENCE_SOURCES } from '../lib/referenceKey.js';
+import { quoteId } from '../lib/projectId.js';
 import type { ReferenceSourceId } from '../lib/referenceKey.js';
 
 /**
@@ -336,13 +337,32 @@ function pinnedMessage(pin: NonNullable<Pin>, err: BackendUnavailableError): str
 }
 
 /**
+ * The rejected env value as the refusal shows it: `quoteId`'d, so a newline in it cannot forge a
+ * second line of the message nor a bidi control reorder the rest of it — the way `config.ts`
+ * quotes every env value it rejects. The value arrives already elided (`parseReferenceSource`
+ * cuts it to `<head>… (N characters)`), so that count is split back off and kept OUTSIDE the
+ * quotes, where it reads as the server's note rather than as part of the value. The split is
+ * taken only when the count exceeds the head it follows, as an elision's always does; were an
+ * unelided value to end in that exact shape it would merely be quoted in two pieces, both
+ * escaped, the suffix being nothing but digits. `server_info` renders the same value through this
+ * too, so the two messages quote it alike.
+ */
+export function quoteInvalidSource(value: string): string {
+  const elided = /^([\s\S]*)… \((\d+) characters\)$/u.exec(value);
+  if (elided && Number(elided[2]) > elided[1]!.length) {
+    return `${quoteId(elided[1]!)}… (${elided[2]} characters)`;
+  }
+  return quoteId(value);
+}
+
+/**
  * Refusal for a configured source that names no backend — same wording discipline as
  * `pinnedMessage`: name what is actually available, and both routes off the refusal.
  */
 function invalidSourceMessage(value: string): string {
   const ids = REFERENCE_SOURCES.map((s) => `"${s}"`).join(', ');
   return (
-    `WEB_LATEX_MCP_REFERENCE_SOURCE is set to "${value}", which is not a bibliography backend ` +
+    `WEB_LATEX_MCP_REFERENCE_SOURCE is set to ${quoteInvalidSource(value)}, which is not a bibliography backend ` +
     `this server knows; expected one of: ${REFERENCE_SOURCES.join(', ')}. No search was run: ` +
     'you named a bibliography, and answering from a different one would be a different claim. ' +
     'Fix or unset WEB_LATEX_MCP_REFERENCE_SOURCE (unset restores the default order: ' +

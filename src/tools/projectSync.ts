@@ -5,6 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { toPosixOut } from '../lib/paths.js';
 import type { SyncResult } from '../services/gitService.js';
 import { enrichPullRefusal } from '../lib/peerRefusal.js';
+import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
 
 const inputSchema = {
   project: z
@@ -18,16 +19,30 @@ const inputSchema = {
   gitUrl: z
     .string()
     .optional()
-    .describe('Register a new project at this Overleaf git URL (requires project id).'),
+    .describe(
+      'Register a new project at this git URL (requires project id). Stored tokenless: a ' +
+        'password or token embedded in an https URL is removed, never stored — supply it with ' +
+        'set_credential or `tokenEnv` instead.',
+    ),
 };
 
 const outputSchema = {
   project: z.string(),
   path: z.string(),
-  action: z.enum(['cloned', 'pulled', 'up-to-date', 'diverged']),
+  action: z
+    .enum(['cloned', 'pulled', 'up-to-date', 'diverged', 'remote-branch-missing'])
+    .describe(
+      '"remote-branch-missing": the fetch found the tracked branch gone from the remote (renamed ' +
+        'or deleted upstream) — nothing was pulled, ahead counts local commits on no remote ' +
+        'branch, and note says what the remote has now.',
+    ),
   ahead: z.number(),
   behind: z.number(),
   diverged: z.boolean(),
+  note: z
+    .string()
+    .optional()
+    .describe('Present only with action "remote-branch-missing": what happened and what it means.'),
 };
 
 export function registerProjectSync(server: McpServer, ctx: AppContext): void {
@@ -37,12 +52,22 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
       title: 'Sync an Overleaf project',
       description:
         'Clone the project if it is not present locally, otherwise fast-forward pull (ff-only). ' +
-        'If the local and remote histories have diverged, reports the divergence instead of merging.',
+        'If the local and remote histories have diverged, reports the divergence instead of merging. ' +
+        'If the tracked branch is gone from the remote (renamed or deleted upstream), reports ' +
+        '"remote-branch-missing" rather than up-to-date.',
       inputSchema,
       outputSchema,
     },
     async ({ project, mode = 'auto', gitUrl }) => {
       try {
+        // `registerProject` holds the URL without any http(s) secret; the caller must hear that
+        // the token they pasted was not used — on success, and above all on a failed clone/pull,
+        // which is then most likely an auth failure — exactly as `register_project` says it.
+        const credentialsNote = strippedCredentialsNoteFor(gitUrl || undefined);
+        const withCredentialsNote = (err: unknown): unknown =>
+          credentialsNote && err instanceof Error
+            ? new Error(`${err.message}${credentialsNote}`, { cause: err })
+            : err;
         if (gitUrl) {
           if (!project) {
             throw new Error('Registering a project with gitUrl also requires a project id.');
@@ -61,7 +86,11 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             if (mode === 'pull') {
               throw new Error(`Project "${cfg.id}" is not cloned yet; use mode "clone" or "auto".`);
             }
-            await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
+            try {
+              await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
+            } catch (err) {
+              throw withCredentialsNote(err);
+            }
             const ab = await ctx.git.aheadBehind(dir);
             result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
           } else {
@@ -71,11 +100,13 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             try {
               result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
             } catch (err) {
-              throw await enrichPullRefusal(
-                { sessions: ctx.sessions, shadows: ctx.shadows, git: ctx.git },
-                cfg.id,
-                dir,
-                err,
+              throw withCredentialsNote(
+                await enrichPullRefusal(
+                  { sessions: ctx.sessions, shadows: ctx.shadows, git: ctx.git },
+                  cfg.id,
+                  dir,
+                  err,
+                ),
               );
             }
           }
@@ -107,7 +138,7 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
               type: 'text',
               text: `${cfg.id}: ${result.action} (ahead ${result.ahead}, behind ${result.behind})${
                 result.diverged ? ' — diverged, resolve manually before pushing' : ''
-              }`,
+              }${result.note ? `\n${result.note}` : ''}${credentialsNote}`,
             },
           ],
           structuredContent: { ...payload },

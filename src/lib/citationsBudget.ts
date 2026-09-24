@@ -41,7 +41,15 @@
  *
  * The planner charges exactly what the tool sends, so the tool must hand these very objects
  * through to `structuredContent` — a test pins the plan's JSON size against the budget.
+ *
+ * It also bounds the report's two FILE lists, `documents` and `bibliographySources`, which the
+ * four-list budget above never covered: `documents` names every non-empty `.tex`/prose file the
+ * scan read, so a local project of 1500 markdown notes returned all 1500 paths — ~84 KB of
+ * `structuredContent`, past the ~67k a client rejected undelivered (#68) with not one finding in
+ * it. See {@link CITATIONS_MAX_FILES} and {@link CITATIONS_FILES_BUDGET}.
  */
+
+import { SEARCH_SKIPPED_BUDGET } from './searchBudget.js';
 
 /**
  * Hard ceiling on entries in each of the four finding lists, before the character budget is even
@@ -80,6 +88,33 @@ export const CITATIONS_MAX_PLACES = 20;
  * only invite the question of which one is right.
  */
 export const CITATIONS_CONTENT_BUDGET = 20000;
+
+/**
+ * Hard ceiling on the paths listed in EACH of `documents` and `bibliographySources` — the house
+ * figure for a capped list, reused from {@link CITATIONS_MAX_FINDINGS} rather than restated.
+ *
+ * Deliberately NOT raised by `maxResults`: that input is documented as the cap on the four
+ * finding lists, and these two are provenance, not findings — which files were read, not what is
+ * wrong with them. The report's header still counts every file (shown + omitted); a caller who
+ * needs the names narrows `documents` or `bibliography`, which it already knows how to do.
+ */
+export const CITATIONS_MAX_FILES = CITATIONS_MAX_FINDINGS;
+
+/**
+ * Character budget for EACH file list, charged on its rendered JSON. The house figure for a
+ * merely diagnostic share — reused from `search_files`' `skipped` list, the same kind of thing (a
+ * list of paths telling the caller what the tool touched, not an answer) — rather than restated.
+ *
+ * Why a budget on top of the count cap: path length is document-controlled too (a checkout's own
+ * directory layout), so 20 paths are not a bounded payload on their own. Why a pool of its own
+ * rather than a slice of {@link CITATIONS_CONTENT_BUDGET}: the finding lists must not lose room
+ * to a long directory name, and a strict-priority pool would have to rank provenance above or
+ * below `undefinedCitations`, neither of which is right. Why one allocation PER list rather than
+ * one shared: the lists are independent and small in the ordinary case (`bibliographySources` is
+ * usually one `.bib`), so a shared pool could only ever let a long `documents` crowd out the one
+ * `.bib` name a caller needs to read an `uncitedEntries` path against.
+ */
+export const CITATIONS_FILES_BUDGET = SEARCH_SKIPPED_BUDGET;
 
 /** Upper bound the tool's `maxResults` input accepts, matching `list_references`' own. */
 export const CITATIONS_MAX_RESULTS = 1000;
@@ -171,12 +206,16 @@ export interface IncompleteEntry extends IncompleteEntryLike {
   missingOmitted?: number;
 }
 
-/** The four uncut lists, exactly as the tool derives them. */
+/** The four uncut lists, exactly as the tool derives them, plus the two uncut file lists. */
 export interface CitationsFindings {
   undefinedCitations: UndefinedCitationLike[];
   uncitedEntries: UncitedEntryLike[];
   duplicateKeys: DuplicateKeyLike[];
   incompleteEntries: IncompleteEntryLike[];
+  /** Every document whose citations were collected. Absent means none. */
+  documents?: string[];
+  /** Every file the reference entries came from. Absent means none. */
+  bibliographySources?: string[];
 }
 
 /**
@@ -199,6 +238,12 @@ export interface CitationsPlan {
   uncitedEntriesOmitted: number;
   duplicateKeysOmitted: number;
   incompleteEntriesOmitted: number;
+  /** At most {@link CITATIONS_MAX_FILES} paths, and within {@link CITATIONS_FILES_BUDGET}. */
+  documents: string[];
+  bibliographySources: string[];
+  /** Paths not listed. `total = shown + omitted`, always; 0 — never absent — when none were cut. */
+  documentsOmitted: number;
+  bibliographySourcesOmitted: number;
   /** Present only when something was actually cut; names which bound fired for which list. */
   note?: string;
 }
@@ -269,10 +314,11 @@ function laneNote(lane: Lane, budget: number): string | undefined {
  */
 export function planCitationsPayload(
   findings: CitationsFindings,
-  opts: { maxResults?: number; budget?: number } = {},
+  opts: { maxResults?: number; budget?: number; filesBudget?: number } = {},
 ): CitationsPlan {
   const maxFindings = opts.maxResults ?? CITATIONS_MAX_FINDINGS;
   const budget = opts.budget ?? CITATIONS_CONTENT_BUDGET;
+  const filesBudget = opts.filesBudget ?? CITATIONS_FILES_BUDGET;
 
   // Pass 1 — the nested arrays, before anything is measured.
   const undefinedAll: UndefinedCitation[] = findings.undefinedCitations.map((u) => {
@@ -345,13 +391,48 @@ export function planCitationsPayload(
         `omitted (max ${CITATIONS_MAX_PLACES} per finding)`,
     );
   }
-  const note =
+  const findingsNote =
     parts.length === 0
       ? undefined
       : `${parts.join('; ')}. Lists are cut in this order: uncitedEntries (advisory) first, then ` +
         'incompleteEntries, duplicateKeys, and undefinedCitations last — those break the build. ' +
         '`maxResults` raises the per-list cap; the character budget is fixed, so narrow ' +
         '`documents` or `bibliography` when it is the budget that fired.';
+
+  // The file lists, each against its own cap and pool (see CITATIONS_FILES_BUDGET). Keep-first
+  // holds here: one path is bounded by the filesystem's own path limit, and a list that names no
+  // file at all while its counter says 1500 were read is less use than one that names one.
+  const fileLane = (
+    field: string,
+    paths: string[],
+  ): { kept: string[]; omitted: number; note: string | undefined } => {
+    const capped = cutInner(paths, CITATIONS_MAX_FILES);
+    const fitted = fitList(capped.kept, filesBudget, true);
+    const lane: Lane = {
+      field,
+      shown: fitted.kept.length,
+      cutByCap: capped.omitted,
+      cutBySize: fitted.cutBySize,
+    };
+    return {
+      kept: fitted.kept,
+      omitted: capped.omitted + fitted.cutBySize,
+      note: laneNote(lane, filesBudget),
+    };
+  };
+  const documents = fileLane('documents', findings.documents ?? []);
+  const sources = fileLane('bibliographySources', findings.bibliographySources ?? []);
+  const fileParts = [documents.note, sources.note].filter((p): p is string => p !== undefined);
+  const filesNote =
+    fileParts.length === 0
+      ? undefined
+      : `${fileParts.join('; ')}. The file lists are capped apart from the findings (at most ` +
+        `${CITATIONS_MAX_FILES} paths and ${filesBudget} characters each; \`maxResults\` does ` +
+        'not raise them) and every file was still checked — pass `documents` or `bibliography` ' +
+        'to name the ones you want listed.';
+
+  const noteParts = [findingsNote, filesNote].filter((p): p is string => p !== undefined);
+  const note = noteParts.length === 0 ? undefined : noteParts.join(' ');
 
   return {
     undefinedCitations: fitted.kept,
@@ -362,6 +443,10 @@ export function planCitationsPayload(
     uncitedEntriesOmitted: uncitedCapped.omitted + fittedUncited.cutBySize,
     duplicateKeysOmitted: duplicateCapped.omitted + fittedDuplicates.cutBySize,
     incompleteEntriesOmitted: incompleteCapped.omitted + fittedIncomplete.cutBySize,
+    documents: documents.kept,
+    bibliographySources: sources.kept,
+    documentsOmitted: documents.omitted,
+    bibliographySourcesOmitted: sources.omitted,
     ...(note === undefined ? {} : { note }),
   };
 }

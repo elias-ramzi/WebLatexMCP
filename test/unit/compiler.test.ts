@@ -220,6 +220,23 @@ describe('probeOnPath — the wiring between isNotFound and the availability ans
     await expect(probeOnPath('latexmk', '-v', exhausted)).rejects.toThrow(/EAGAIN/);
   });
 
+  it('names the backend and the way out when a present binary cannot be run', async () => {
+    // A non-executable latexmk is not "missing", so nothing is substituted and the compile
+    // refuses — with a message the caller can act on rather than a bare `spawn latexmk EACCES`.
+    const notExecutable = () =>
+      Promise.reject(Object.assign(new Error('spawn latexmk EACCES'), { code: 'EACCES' }));
+    const err: unknown = await probeOnPath('latexmk', '-v', notExecutable).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).toMatch(/latexmk is on PATH but could not be run/);
+    expect(message).toContain('EACCES');
+    expect(message).toContain('WEB_LATEX_MCP_COMPILER');
+    expect(message).toContain('compiler:');
+    // The errno survives the wrap, so nothing downstream can mistake it for ENOENT.
+    expect(isNotFound(err)).toBe(false);
+    expect((err as { code?: unknown }).code).toBe('EACCES');
+  });
+
   it('still answers false when the injected runner reports ENOENT', async () => {
     const absent = () =>
       Promise.reject(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));

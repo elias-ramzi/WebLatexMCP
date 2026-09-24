@@ -208,3 +208,85 @@ describe('check_citations bounds its report (#154)', () => {
     expect(report.undefinedCitations.map((u) => u.key)).toEqual(['nowhere']);
   });
 });
+
+interface FileLists {
+  documents: string[];
+  documentsOmitted: number;
+  bibliographySources: string[];
+  bibliographySourcesOmitted: number;
+  note?: string;
+}
+
+describe('check_citations bounds its file lists too', () => {
+  it('caps `documents` at 20 and counts the rest, and the header still counts all of them', async () => {
+    // A local project of many small prose notes: every non-empty one is a scanned document, and
+    // `documents` used to list each of them, past any finding budget.
+    const files: Record<string, string> = { 'refs.bib': entry('e000') };
+    for (let i = 0; i < 60; i++) {
+      files[`note-${String(i).padStart(3, '0')}.md`] = `See [@e000].\n`;
+    }
+    const client = await setup(files);
+    const { report, text } = await check(client);
+    const lists = report as unknown as FileLists;
+
+    expect(lists.documents.length).toBeLessThanOrEqual(20);
+    expect(lists.documents.length + lists.documentsOmitted).toBe(60);
+    expect(lists.documentsOmitted).toBe(40);
+    expect(lists.bibliographySourcesOmitted).toBe(0);
+    expect(lists.note).toContain('documents: showing 20 of 60');
+    // The header counts every scanned document, not just the listed ones.
+    expect(text).toContain('across 60 document(s)');
+    expect(text).toContain(lists.note!);
+    // The whole structured payload stays far from the ~67k a client rejected (#68).
+    expect(JSON.stringify(report).length).toBeLessThan(5000);
+  });
+
+  it('caps `bibliographySources` at 20, and the text names only the listed ones', async () => {
+    const files: Record<string, string> = { 'main.tex': '\\cite{b000}\n' };
+    for (let i = 0; i < 25; i++) {
+      const key = `b${String(i).padStart(3, '0')}`;
+      files[`${key}.bib`] = entry(key);
+    }
+    const client = await setup(files);
+    const { report, text } = await check(client);
+    const lists = report as unknown as FileLists;
+
+    expect(lists.bibliographySources).toHaveLength(20);
+    expect(lists.bibliographySourcesOmitted).toBe(5);
+    expect(lists.documentsOmitted).toBe(0);
+    expect(lists.note).toContain('bibliographySources: showing 20 of 25');
+    expect(text).toContain('b019.bib, +5 more');
+    expect(text).not.toContain('b024.bib');
+  });
+
+  it('charges the file lists their rendered size, so long names are cut before the count cap', async () => {
+    // 20 documents is within the count cap, but 20 long names are not within the size budget.
+    const files: Record<string, string> = { 'refs.bib': entry('e000') };
+    for (let i = 0; i < 20; i++) {
+      files[`${String(i).padStart(2, '0')}-${'x'.repeat(140)}.md`] = `See [@e000].\n`;
+    }
+    const client = await setup(files);
+    const { report } = await check(client);
+    const lists = report as unknown as FileLists;
+
+    expect(lists.documents.length).toBeGreaterThan(0);
+    expect(lists.documents.length).toBeLessThan(20);
+    expect(lists.documents.length + lists.documentsOmitted).toBe(20);
+    expect(JSON.stringify(lists.documents).length).toBeLessThanOrEqual(2000);
+    expect(lists.note).toMatch(
+      /documents: showing \d+ of 20 \(\d+ over the 2000-character budget\)/,
+    );
+  });
+
+  it('a small report lists every file and reports zero omitted, with no note', async () => {
+    const client = await setup({ 'refs.bib': entry('e000'), 'main.tex': '\\cite{e000}\n' });
+    const { report } = await check(client);
+    const lists = report as unknown as FileLists;
+
+    expect(lists.documents).toEqual(['main.tex']);
+    expect(lists.documentsOmitted).toBe(0);
+    expect(lists.bibliographySources).toEqual(['refs.bib']);
+    expect(lists.bibliographySourcesOmitted).toBe(0);
+    expect(lists.note).toBeUndefined();
+  });
+});

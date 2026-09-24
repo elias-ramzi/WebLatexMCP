@@ -10,6 +10,7 @@ import {
   parsePrintedPage,
   MAX_AMBIGUOUS_CANDIDATES,
 } from '../../src/lib/labelPages.js';
+import type { LabelPageEvidence } from '../../src/lib/labelPages.js';
 import type { AuxFloatsResult, AuxLabel } from '../../src/lib/auxFloats.js';
 
 function aux(
@@ -18,6 +19,17 @@ function aux(
 ): AuxFloatsResult {
   const floats: AuxLabel[] = entries.map(([label, page]) => ({ label, number: '1', page }));
   return { floats, omitted: 0, total: floats.length, dropped: 0, ...extra };
+}
+
+/**
+ * Page text in which every page of an `n`-page PDF shows "Figure 1" mid-line — the number `aux()`
+ * gives every label — so the printed-page route's text check passes and these tests keep
+ * exercising what they are about. `labelPagesVerify.test.ts` covers the check itself.
+ */
+function shown(n: number): LabelPageEvidence {
+  const text = new Map<number, string[]>();
+  for (let p = 1; p <= n; p++) text.set(p, ['body', 'Figure 1: caption', String(p)]);
+  return { pageCount: n, text };
 }
 
 describe('parsePrintedPage', () => {
@@ -55,7 +67,7 @@ describe('isRomanPage', () => {
 
 describe('planLabelPages', () => {
   it('resolves a label to the printed page the .aux records', () => {
-    const plan = planLabelPages(['tab:results'], aux([['tab:results', '7']]));
+    const plan = planLabelPages(['tab:results'], aux([['tab:results', '7']]), null, shown(9));
     expect(plan.failed).toEqual([]);
     expect(plan.resolved).toEqual([{ label: 'tab:results', printedPage: '7', page: 7 }]);
     expect(plan.pages).toEqual([7]);
@@ -68,6 +80,8 @@ describe('planLabelPages', () => {
         ['tab:a', '4'],
         ['fig:b', '4'],
       ]),
+      null,
+      shown(9),
     );
     expect(plan.pages).toEqual([4]);
     expect(plan.resolved.map((r) => r.label)).toEqual(['tab:a', 'fig:b']);
@@ -80,12 +94,19 @@ describe('planLabelPages', () => {
         ['tab:early', '2'],
         ['fig:late', '9'],
       ]),
+      null,
+      shown(9),
     );
     expect(plan.pages).toEqual([9, 2]);
   });
 
   it('fails a label with no \\newlabel in the .aux, and renders nothing at all', () => {
-    const plan = planLabelPages(['tab:new', 'fig:known'], aux([['fig:known', '2']]));
+    const plan = planLabelPages(
+      ['tab:new', 'fig:known'],
+      aux([['fig:known', '2']]),
+      null,
+      shown(3),
+    );
     expect(plan.failed).toEqual([{ label: 'tab:new', reason: 'notFound' }]);
     // The load-bearing half: one failure empties the plan, so the caller cannot be handed the
     // page of the label that DID resolve as if it answered both.
@@ -125,15 +146,21 @@ describe('planLabelPages', () => {
     expect(plan.failed[0]?.reason).toBe('notAPageNumber');
   });
 
-  it('resolves a multiply-defined label to its first record', () => {
+  it('refuses a multiply-defined label rather than resolving either record', () => {
+    // LaTeX prints the LAST record (\@newl@bel \global-defines each time), so the first-record
+    // answer this used to give was a page \pageref never printed.
     const plan = planLabelPages(
       ['tab:dup'],
       aux([
         ['tab:dup', '2'],
         ['tab:dup', '8'],
       ]),
+      null,
+      shown(9),
     );
-    expect(plan.resolved[0]?.page).toBe(2);
+    expect(plan.resolved).toEqual([]);
+    expect(plan.failed[0]?.reason).toBe('multiplyDefined');
+    expect(plan.failed[0]?.printedPages).toEqual(['2', '8']);
   });
 
   it('fails every label against an empty index (nothing compiled yet)', () => {
@@ -204,7 +231,7 @@ describe('labelRefusalMessage', () => {
 
 describe('labelResolutionNote / describeResolvedLabels / labelPageRangeMessage', () => {
   it('states that the page came from the LAST COMPILE, not the source on disk', () => {
-    const plan = planLabelPages(['tab:a'], aux([['tab:a', '5']]));
+    const plan = planLabelPages(['tab:a'], aux([['tab:a', '5']]), null, shown(5));
     const note = labelResolutionNote(plan);
     expect(note).toContain('LAST COMPILE');
     expect(note).toContain('tab:a -> page 5');
@@ -218,12 +245,16 @@ describe('labelResolutionNote / describeResolvedLabels / labelPageRangeMessage',
         ['tab:a', '5'],
         ['fig:b', '6'],
       ]),
+      null,
+      shown(6),
     );
     expect(describeResolvedLabels(plan.resolved)).toBe('tab:a -> page 5, fig:b -> page 6');
   });
 
   it('keeps the renderer’s own range message and adds where the number came from', () => {
-    const plan = planLabelPages(['tab:a'], aux([['tab:a', '9']]));
+    // A plan that resolved page 9 against a 9-page PDF, handed a range error from a render of
+    // a PDF that has since become shorter — the defensive path the tools keep.
+    const plan = planLabelPages(['tab:a'], aux([['tab:a', '9']]), null, shown(9));
     const msg = labelPageRangeMessage(plan, 'Page 9 is out of range: this document has 3 page(s).');
     expect(msg).toContain('Page 9 is out of range');
     expect(msg).toContain('tab:a -> page 9');
@@ -299,12 +330,16 @@ describe('planLabelPages against the PDF’s own /PageLabels', () => {
     expect(planLabelPages(['tab:results'], index, labels).resolved).toEqual([
       { label: 'tab:results', printedPage: '2', page: 5 },
     ]);
-    // The value just outside: the same .aux with no tree resolves to the wrong page 2 — which is
-    // exactly why the tree is consulted, and what this test would silently lose if the lookup
-    // were dropped.
-    expect(planLabelPages(['tab:results'], index).resolved).toEqual([
-      { label: 'tab:results', printedPage: '2', page: 2 },
-    ]);
+    // The value just outside: the same .aux with no tree resolves to page 2 only if page 2's
+    // own folio reads "2" — here its footer reads "A-2", no page number the route can match (the
+    // table is on PDF page 5), so the printed-page route refuses rather than rendering the
+    // plausible wrong page it used to.
+    const plan = planLabelPages(['tab:results'], index, null, {
+      pageCount: 6,
+      text: new Map([[2, ['A-2 body', 'A-2']]]),
+    });
+    expect(plan.resolved).toEqual([]);
+    expect(plan.failed[0]?.unverified).toBe('noFolio');
   });
 
   it('refuses a printed page the PDF prints TWICE, naming both candidates', () => {
@@ -445,8 +480,10 @@ describe('labelResolutionNote states which route resolved the pages', () => {
   });
 
   it('says the printed page was used directly when the PDF carries no tree', () => {
-    const note = labelResolutionNote(planLabelPages(['tab:a'], aux([['tab:a', '5']])));
+    const note = labelResolutionNote(
+      planLabelPages(['tab:a'], aux([['tab:a', '5']]), null, shown(5)),
+    );
     expect(note).toContain('no /PageLabels tree');
-    expect(note).toMatch(/nothing renumbered/);
+    expect(note).toMatch(/own folio .* was found to read the same/);
   });
 });

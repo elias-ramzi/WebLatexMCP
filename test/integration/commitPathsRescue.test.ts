@@ -84,7 +84,13 @@ async function setup(
 const MAIN_TEX = '\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n';
 
 describe('commit scope "paths" rescues a stale record without reaching git add for it', () => {
-  it('write then delete_file, then commit scope "paths": no fatal, settles the record', async () => {
+  // A file this session created and then deleted through the tools no longer reaches the rescue:
+  // its shadow (absent) equals HEAD (absent), so the refresh `commit` runs first under the lock
+  // settles it outright — before, it stayed tracked forever and every session-scope commit threw
+  // "nothing to commit". Naming it is then naming a path nobody tracks and nothing dirtied, which
+  // refuses in server words like any other such path. The rescue itself is still exercised by the
+  // hand-`rm` cases below, whose shadow does NOT equal HEAD.
+  it('write then delete_file, then commit scope "paths": no fatal, the record is already settled', async () => {
     const { client, ctx } = await setup({ 'main.tex': MAIN_TEX });
 
     const wrote = await client.callTool({
@@ -108,14 +114,14 @@ describe('commit scope "paths" rescues a stale record without reaching git add f
         paths: ['new.tex'],
       },
     });
-    // Pre-fix: isError true, with git's raw "fatal: pathspec 'new.tex' did not match any files".
-    expect(isError(result), textOf(result)).toBe(false);
-    const sc = structured(result);
-    expect(sc.committed).toBe(false);
-    expect(sc.settled).toEqual(['new.tex']);
+    // Originally (pre-#67): isError true, with git's raw "fatal: pathspec 'new.tex' did not match
+    // any files". Now a refusal in server words: the refresh settled the record first.
+    expect(isError(result), textOf(result)).toBe(true);
     const text = textOf(result);
+    expect(text).toMatch(/Nothing to commit at: new\.tex/);
     expect(text).not.toMatch(/fatal/);
     expect(text).not.toMatch(/pathspec/);
+    expect(await ctx.shadows.hasChanges('demo')).toBe(false);
 
     // The record is gone: a further scope "session" commit says there is nothing to commit.
     const second = await client.callTool({
@@ -234,19 +240,17 @@ describe('commit scope "paths" rescues a stale record without reaching git add f
   });
 
   it('one dirty path plus one rescued stale path: the commit lands with the dirty file only', async () => {
-    const { client, ctx } = await setup({ 'main.tex': MAIN_TEX });
+    const { client, ctx, dir } = await setup({ 'main.tex': MAIN_TEX });
 
-    // stale.tex: written by this session, then deleted — a rescued, stale record.
+    // stale.tex: written by this session, then removed by hand — a rescued, stale record. (By
+    // hand, not `delete_file`: a tool deletion is recorded, so the shadow equals HEAD and the
+    // commit's own refresh settles it before the rescue — see the first test.)
     const wroteStale = await client.callTool({
       name: 'write_file',
       arguments: { project: 'demo', path: 'stale.tex', content: 'draft\n' },
     });
     expect(isError(wroteStale), textOf(wroteStale)).toBe(false);
-    const deletedStale = await client.callTool({
-      name: 'delete_file',
-      arguments: { project: 'demo', path: 'stale.tex' },
-    });
-    expect(isError(deletedStale), textOf(deletedStale)).toBe(false);
+    await rm(path.join(dir, 'stale.tex'));
 
     // main.tex: genuinely dirty.
     const wroteMain = await client.callTool({

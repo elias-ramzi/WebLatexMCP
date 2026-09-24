@@ -146,35 +146,47 @@ export interface BibtexEntrySpan {
  * - **A run of entries, not one.** After an entry closes, whitespace — plus a `%`-comment line or
  *   an `@string`/`@preamble`/`@comment` block, which are separators rather than the end of the
  *   run — is skipped, and if what follows opens another *line-anchored* header, that entry is
- *   consumed too. A service legitimately answers with more than one: DBLP's `param=1` bib emits an
- *   `@inproceedings` plus the `@proceedings` its `crossref` field names, and cutting the second
- *   off would corrupt the entry that survives. Getting that wrong is worse than the junk this cut
- *   removes — which is also why a skipped `@string` stays *inside* the span: it defines the macros
- *   the entries around it use, and an entry with an unresolved abbreviation is corrupt too. So
+ *   consumed too. A service may legitimately answer with more than one: a DBLP bib in its
+ *   crossref style carries an `@inproceedings` plus the `@proceedings` its `crossref` field names
+ *   (which of DBLP's `param` values serves that style is not pinned by any recorded response in
+ *   this repo, so nothing here depends on it), and cutting the second off would corrupt the entry
+ *   that survives. Getting that wrong is worse than the junk this cut removes — which is also
+ *   why a skipped `@string` stays *inside* the span: it defines the macros the entries around it
+ *   use, and an entry with an unresolved abbreviation is corrupt too. So
  *   skipping only ever widens `end`, and only as a bridge to a further entry: a trailing macro or
  *   comment that no entry follows stays out, like any other trailing junk.
- * - **A close alone on its line, and outside the other pair.** Depth reaching 0 is necessary but
- *   not sufficient: an unmatched `}` inside a value reaches it in the middle of the entry, and
- *   cutting there yields a syntactically broken fragment. Two tests stand between depth 0 and a
- *   cut. The delimiter must be the **only** non-whitespace character on its line — every entry a
- *   service emits closes with a lone `}`/`)` on its own line, and "last on its line" alone
- *   believed a stray closer that happened to end one (`abstract = {Sentence one} extra }`), which
- *   cut the entry in half. And it must sit **outside the other delimiter pair**: inside
- *   `@article(...)` a `)` in a braced value is the author's text, not the entry's close, so the
- *   scan counts `{}` alongside `()` (and symmetrically for a `{`-entry) and refuses any closer
- *   reached while the other pair is open. A delimiter failing either test is not believed and the
- *   scan fails open instead.
+ * - **A close that ends the entry the way a service ends one, and outside the other pair.** Depth
+ *   reaching 0 is necessary but not sufficient: an unmatched `}` inside a value reaches it in the
+ *   middle of the entry, and cutting there yields a syntactically broken fragment. Two tests stand
+ *   between depth 0 and a cut. The delimiter must close the entry in one of the two shapes services
+ *   actually send. **Multi-line** (DBLP): the closer is the **only** non-whitespace character on
+ *   its line — "last on its line" alone believed a stray closer that happened to end one
+ *   (`abstract = {Sentence one} extra }`), which cut the entry in half. **One line** (Crossref's
+ *   `/transform`, ` @article{Smith_2020, title={…}, year={2020}}`): the closer ends the line the
+ *   header opened, with only whitespace after it up to the newline — and nothing after the cut
+ *   holds a closer of the entry's pair that no opener matches. That last clause is what keeps the
+ *   one-line shape from believing a multi-line entry whose *first* line happens to balance
+ *   (`@article{k, title={A } b}` then `  year = {2020}` then a lone `}`): the entry's real close
+ *   is then an unmatched closer further down, and its presence refuses the cut. Without the
+ *   one-line shape a Crossref entry never had a believable close at all, so every body it sent
+ *   failed open and carried its trailing junk into the `.bib`. And the delimiter must sit
+ *   **outside the other delimiter pair**: inside `@article(...)` a `)` in a braced value is the
+ *   author's text, not the entry's close, so the scan counts `{}` alongside `()` (and
+ *   symmetrically for a `{`-entry) and refuses any closer reached while the other pair is open. A
+ *   delimiter failing either test is not believed and the scan fails open instead.
  * - **Fail open.** An entry whose delimiters never balance, or whose closing delimiter is not
  *   believed, spans to the end of the text — exactly what this returned before it could see an end
  *   at all. A truncated-but-plausible entry is worse than a whole one with junk after it, and
  *   `assertApiBody` plus the header check already stand in front of this. When in doubt this
  *   returns *more* of the service's bytes, never fewer. The guarantee that buys is exact, and it
  *   is the believability rules above that pay for it: `end` is only ever placed at a delimiter
- *   that closed the entry's own pair while no other pair was open **and** that stands alone on
- *   its line, the way every service closes an entry — so a cut lands where the service ended an
- *   entry, or nowhere at all. It is not a promise that no body can be misread: a body that closes
- *   an entry some other way (a whole entry on one line) is not truncated, it simply gets no cut
- *   point and comes back whole, junk and all.
+ *   that closed the entry's own pair while no other pair was open **and** that closes it in one of
+ *   the two shapes services send — alone on its own line, or ending a one-line entry with no
+ *   unmatched closer anywhere after it — so a cut lands where the service ended an entry, or
+ *   nowhere at all. It is not a promise that no body can be misread: a body that closes an entry
+ *   some third way is not truncated, it simply gets no cut point and comes back whole, junk and
+ *   all — and so does a one-line entry followed by junk that itself carries an unmatched closer
+ *   (`<script>}</script>`), since that is indistinguishable from an entry continuing below.
  */
 export function bibtexEntrySpan(text: string): BibtexEntrySpan | null {
   const match = BIBTEX_ENTRY.exec(text);
@@ -207,9 +219,11 @@ type Continuation = { kind: 'entry'; at: number } | { kind: 'end' } | { kind: 'f
 
 /**
  * How a closing delimiter earns belief, so the two callers can demand different things of one.
- * An **entry**'s closer must be alone on its line; a **separator block**'s need only end one.
+ * An **entry**'s closer must close it the way a service does ({@link closesAnEntry}); a
+ * **separator block**'s need only end its line. `headerAt` is the offset of the `@` whose entry
+ * or block the delimiter would close.
  */
-type CloserTest = (text: string, i: number) => boolean;
+type CloserTest = (text: string, i: number, headerAt: number) => boolean;
 
 /**
  * Offset just past the delimiter that closes the entry whose header begins at `at`, or `null` when
@@ -232,7 +246,7 @@ type CloserTest = (text: string, i: number) => boolean;
  * trailing entry the separator exists to bridge to. A block's end is never a cut point either
  * (`end` only ever comes from an entry's close), so the strict test buys nothing there.
  */
-function entryEnd(text: string, at: number, believes: CloserTest = aloneOnItsLine): number | null {
+function entryEnd(text: string, at: number, believes: CloserTest = closesAnEntry): number | null {
   let i = at;
   while (i < text.length && text[i] !== '{' && text[i] !== '(') i++;
   if (i >= text.length) return null;
@@ -289,7 +303,7 @@ function entryEnd(text: string, at: number, believes: CloserTest = aloneOnItsLin
     // `abstract = {Sentence one} extra }`. `null` puts either on the same fail-open path as an
     // entry that never balances at all.
     if (otherDepth > 0) return null;
-    return believes(text, i) ? i + 1 : null;
+    return believes(text, i, at) ? i + 1 : null;
   }
   return null;
 }
@@ -303,6 +317,48 @@ function quotedValueEnd(text: string, at: number): number {
     if (text[i] === '"' && text[i - 1] !== '\\') return i;
   }
   return text.length;
+}
+
+/**
+ * True when the delimiter at `i`, which returned the entry opened at `headerAt` to depth 0 outside
+ * the other pair, closes that entry in one of the two shapes a service sends one in:
+ *
+ * - **alone on its own line** ({@link aloneOnItsLine}) — the multi-line shape DBLP serves; or
+ * - **ending the one line the whole entry sits on** — the shape Crossref's `/transform` serves
+ *   (` @article{Smith_2020, title={A {B} c}, …, year={2020}}`), where the closer shares its line
+ *   with the last field and so is never alone on it. The closer must end that line, the header
+ *   must sit on the same line, and the rest of the text must hold no closer of the entry's pair
+ *   that no opener matches ({@link hasUnmatchedCloser}). The last is the one-line shape's guard
+ *   against itself: a multi-line entry whose first line happens to balance (`@article{k, title={A
+ *   } b}` with more fields and a lone `}` below) reaches depth 0 at that line's end, and what gives
+ *   it away is the entry's real close further down — an unmatched closer, since the scan never saw
+ *   its opener. Refusing then fails open, the direction this is allowed to be wrong in.
+ */
+function closesAnEntry(text: string, i: number, headerAt: number): boolean {
+  if (aloneOnItsLine(text, i)) return true;
+  if (!endsItsLine(text, i)) return false;
+  // A newline anywhere between the header's `@` and this closer means the entry spans lines, and a
+  // multi-line entry's close must be alone on its own line — the one-line shape does not apply.
+  if (text.lastIndexOf('\n', i) >= headerAt) return false;
+  const close = text[i] as string;
+  return !hasUnmatchedCloser(text, i + 1, close === '}' ? '{' : '(', close);
+}
+
+/**
+ * True when, scanning from `from`, a `close` is reached that no `open` since `from` matches — the
+ * trace a still-open entry leaves after a premature depth 0. Escaped delimiters are literals, as in
+ * `entryEnd`. Deliberately blunt: no quote handling, no line rules. Whatever it over-counts only
+ * refuses a cut, and a refused cut fails open.
+ */
+function hasUnmatchedCloser(text: string, from: number, open: string, close: string): boolean {
+  let depth = 0;
+  for (let j = from; j < text.length; j++) {
+    const ch = text[j];
+    if (text[j - 1] === '\\') continue;
+    if (ch === open) depth++;
+    else if (ch === close && --depth < 0) return true;
+  }
+  return false;
 }
 
 /**

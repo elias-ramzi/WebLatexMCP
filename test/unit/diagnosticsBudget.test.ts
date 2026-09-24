@@ -161,7 +161,8 @@ describe('diagnostics budget: a warning-heavy successful build', () => {
 
 describe('diagnostics budget: allocation order', () => {
   it('declares errors before warnings, so warnings are cut first', () => {
-    expect([...ALLOCATION_ORDER]).toEqual(['errors', 'warnings']);
+    const order: readonly string[] = ALLOCATION_ORDER;
+    expect(order.indexOf('errors')).toBeLessThan(order.indexOf('warnings'));
   });
 
   it('keeps every error and cuts the warnings, on a failing warning-heavy build', () => {
@@ -209,14 +210,42 @@ describe('diagnostics budget: errors', () => {
     expect(plan.errorLines).toContain('line 55 of the source');
   });
 
-  it('returns one error even when it alone exceeds the whole budget', () => {
+  it('returns one error even when it alone exceeds the whole budget — with its message cut to fit', () => {
     const huge = err(1, { message: 'Undefined control sequence ' + 'z'.repeat(60_000) });
     const plan = planDiagnosticsPayload([huge, err(2), err(3)], [warn(1)]);
 
-    expect(plan.errors).toEqual([huge]);
+    expect(plan.errors).toHaveLength(1);
+    const kept = plan.errors[0]!;
+    // Kept-at-least-one keeps the error, not its unbounded message: shipping 60k characters in
+    // BOTH channels is the #68 shape this budget exists to prevent. Everything but the message is
+    // the original, untouched.
+    expect({ ...kept, message: '' }).toEqual({ ...huge, message: '' });
+    expect(kept.message.startsWith('Undefined control sequence zzz')).toBe(true);
+    expect(kept.message).toMatch(/… \[\d+ more characters — see logPath\]$/);
+    expect(renderedChars(plan)).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
+    // Cut to fit, not to a token: most of the budget is still spent on it.
+    expect(kept.message.length).toBeGreaterThan(DIAGNOSTICS_CONTENT_BUDGET / 4);
     expect(plan.errorsOmittedByCap).toBe(2);
     expect(plan.warnings).toEqual([]);
     expect(plan.note).toMatch(/errors: showing 1 of 3/);
+    expect(plan.note).toMatch(/message of the first error was cut/);
+  });
+
+  it('cuts the kept error on a character boundary, never inside a surrogate pair', () => {
+    // An astral character straddling every possible cut point: a lone surrogate is not text.
+    const huge = err(1, { message: 'Undefined control sequence ' + '😀'.repeat(30_000) });
+    const plan = planDiagnosticsPayload([huge], []);
+    const message = plan.errors[0]!.message;
+    expect(message.length).toBeLessThan(huge.message.length);
+    expect(message).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    expect(message).not.toMatch(/(?<![\ud800-\udbff])[\udc00-\udfff]/);
+  });
+
+  it('leaves a first error that fits exactly as it was — the very object', () => {
+    const e = err(1, { snippet: true });
+    const plan = planDiagnosticsPayload([e], []);
+    expect(plan.errors[0]).toBe(e);
+    expect(plan.note).toBeUndefined();
   });
 
   it('charges an error its TEXT rendering as well as its JSON when the text will print it', () => {
@@ -249,6 +278,99 @@ describe('diagnostics budget: errors', () => {
   });
 });
 
+/**
+ * A stand-in for `filterLog`'s fit: `n` lines of `width` characters, the earliest dropped until
+ * the JSON-rendered text fits `maxChars`, keeping at least the last line. Records every allowance it
+ * was offered so a test can see what the planner granted.
+ */
+function tailSource(n: number, width: number) {
+  const lines = Array.from({ length: n }, (_, i) => `L${i}`.padEnd(width, 'w'));
+  const offered: number[] = [];
+  const fit = (maxChars: number) => {
+    offered.push(maxChars);
+    let start = 0;
+    const render = (s: number) =>
+      (s > 0 ? [`… (${s} earlier diagnostic line(s) omitted)`] : [])
+        .concat(lines.slice(s))
+        .join('\n');
+    while (start < n - 1 && JSON.stringify(render(start)).length > maxChars) start++;
+    return { text: render(start), trimmed: start };
+  };
+  return { fit, offered, natural: JSON.stringify(lines.join('\n')).length };
+}
+
+/** {@link renderedChars}, plus `logTail`, which ships once — in `structuredContent` only. */
+function renderedWithTail(plan: Parameters<typeof renderedChars>[0] & { logTail?: string }) {
+  return (
+    renderedChars(plan) + (plan.logTail === undefined ? 0 : JSON.stringify(plan.logTail).length)
+  );
+}
+
+describe('diagnostics budget: logTail is charged too', () => {
+  it('declares where logTail sits in the allocation order', () => {
+    expect([...ALLOCATION_ORDER]).toEqual(['errors', 'logTail', 'warnings']);
+  });
+
+  it('bounds the WHOLE payload, logTail included, when every line of it is long', () => {
+    const tail = tailSource(80, 540);
+    expect(tail.natural).toBeGreaterThan(DIAGNOSTICS_CONTENT_BUDGET);
+    const warnings = Array.from({ length: 1500 }, (_, i) => warn(i));
+    const plan = planDiagnosticsPayload([], warnings, { fitLogTail: tail.fit });
+
+    expect(plan.logTail).toBeDefined();
+    expect(renderedWithTail(plan)).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
+    // The two lanes overlap — one box warning lands in both — so neither may take everything:
+    // each is guaranteed a share of what the errors left.
+    // Half each, give or take a line: a "share" of a few leftover characters is starvation.
+    const pool = DIAGNOSTICS_CONTENT_BUDGET - DIAGNOSTICS_NOTE_RESERVE;
+    expect(JSON.stringify(plan.warnings).length).toBeGreaterThan(0.4 * pool);
+    expect(JSON.stringify(plan.logTail).length).toBeGreaterThan(0.4 * pool);
+    expect(plan.logTailTrimmed).toBeGreaterThan(0);
+    expect(plan.note).toMatch(/logTail: \d+ earlier line\(s\) trimmed/);
+  });
+
+  it('leaves an ordinary logTail whole and gives the warnings what it did not use', () => {
+    const tail = tailSource(80, 70);
+    const warnings = Array.from({ length: 1500 }, (_, i) => warn(i));
+    const plan = planDiagnosticsPayload([], warnings, { fitLogTail: tail.fit });
+
+    expect(plan.logTailTrimmed).toBe(0);
+    expect(plan.logTail).not.toContain('omitted');
+    expect(renderedWithTail(plan)).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
+    // Surplus flows on: the warnings are not held to half when the tail needed less.
+    const alone = planDiagnosticsPayload([], warnings);
+    expect(plan.warnings.length).toBeGreaterThan(alone.warnings.length / 2);
+    expect(renderedWithTail(plan)).toBeGreaterThan(DIAGNOSTICS_CONTENT_BUDGET / 2);
+    expect(plan.note).not.toMatch(/logTail/);
+  });
+
+  it('gives logTail the surplus when the warnings need little', () => {
+    const tail = tailSource(80, 300);
+    const plan = planDiagnosticsPayload([], [warn(1)], { fitLogTail: tail.fit });
+    expect(plan.warnings).toHaveLength(1);
+    // Offered far more than half: the one warning needs almost nothing.
+    expect(tail.offered[0]).toBeGreaterThan(
+      0.9 * (DIAGNOSTICS_CONTENT_BUDGET - DIAGNOSTICS_NOTE_RESERVE),
+    );
+    expect(renderedWithTail(plan)).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
+  });
+
+  it('allocates the errors first: a tail never displaces an error', () => {
+    const errors = Array.from({ length: 12 }, (_, i) => err(i, { snippet: i < 10 }));
+    const tail = tailSource(80, 540);
+    const plan = planDiagnosticsPayload(errors, [], { fitLogTail: tail.fit });
+    expect(plan.errors).toEqual(errors);
+    expect(plan.errorsOmittedByCap).toBe(0);
+    expect(renderedWithTail(plan)).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
+  });
+
+  it('is absent from the plan when no source is given (rawLog ships its own tail)', () => {
+    const plan = planDiagnosticsPayload([], [warn(1)]);
+    expect(plan.logTail).toBeUndefined();
+    expect(plan.logTailTrimmed).toBe(0);
+  });
+});
+
 describe('diagnostics budget: the note', () => {
   it('fits inside its reserve in both channels, at its longest', () => {
     // Every clause firing at once, with the widest counts this module can produce.
@@ -256,8 +378,12 @@ describe('diagnostics budget: the note', () => {
       err(i, { message: 'Undefined control sequence ' + 'q'.repeat(400) }),
     );
     const warnings = Array.from({ length: 5000 }, (_, i) => warn(i));
-    const plan = planDiagnosticsPayload(errors, warnings);
+    // A tail the budget has to trim, so the logTail clause fires too.
+    const plan = planDiagnosticsPayload(errors, warnings, {
+      fitLogTail: tailSource(80, 540).fit,
+    });
 
+    expect(plan.note).toMatch(/logTail/);
     expect(plan.note).toBeDefined();
     expect(2 * plan.note!.length).toBeLessThanOrEqual(DIAGNOSTICS_NOTE_RESERVE);
   });

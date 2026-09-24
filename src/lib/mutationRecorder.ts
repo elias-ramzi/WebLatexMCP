@@ -1,4 +1,5 @@
 import type { MutationRecorder } from '../services/fileService.js';
+import { quoteId } from './projectId.js';
 
 /**
  * Dependencies `createSessionRecorder` needs, kept as plain functions rather than the concrete
@@ -77,7 +78,7 @@ export function createSessionRecorder(deps: SessionRecorderDeps): MutationRecord
           await deps.markUnrecorded(id, rel);
         } catch (markErr) {
           warn(
-            `could not mark "${rel}" unrecorded after its shadow record failed for session ` +
+            `could not mark ${quoteId(rel)} unrecorded after its shadow record failed for session ` +
               `attribution: ${markErr instanceof Error ? markErr.message : String(markErr)}`,
           );
         }
@@ -91,7 +92,7 @@ export function createSessionRecorder(deps: SessionRecorderDeps): MutationRecord
         // FileService.notify would log any throw here as a failed attribution, which is not what
         // happened — the change was recorded fine, only the liveness heartbeat failed.
         warn(
-          `heartbeat for project "${id}" failed while recording "${rel}" (the change itself ` +
+          `heartbeat for project ${quoteId(id)} failed while recording ${quoteId(rel)} (the change itself ` +
             `was recorded): ${touchErr instanceof Error ? touchErr.message : String(touchErr)}`,
         );
       }

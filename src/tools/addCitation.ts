@@ -60,28 +60,48 @@ function entryLine(content: string, key: string): number {
   return content.slice(0, idx).split('\n').length;
 }
 
-/** Resolve the .bib file to write to: the explicit one, or the project's sole .bib. */
+/**
+ * Resolve the .bib file to write to: the explicit one, or the project's sole .bib — plus where
+ * it really lands (`FileService.linkTarget`, `null` when no link is involved).
+ *
+ * The name gate judges the link-resolved name too, as every name-based gate does: a committed
+ * in-project `refs.bib -> main.tex` passes `isBibFile` on its own name, and appending BibTeX
+ * through it would land in main.tex. A link whose far end is a .bib (a shared bibliography
+ * linked in) is fine — that is where the entry belongs.
+ */
 async function resolveBibFile(
   ctx: AppContext,
   dir: string,
   bibFile: string | undefined,
-): Promise<string> {
+): Promise<{ bibPath: string; linkTarget: string | null }> {
+  let bibPath: string;
   if (bibFile) {
     if (!isBibFile(bibFile)) throw new Error(`"${bibFile}" is not a .bib file.`);
-    return bibFile;
+    bibPath = bibFile;
+  } else {
+    const bibs = await ctx.files.list(dir, { filter: 'bib' });
+    if (bibs.length === 0) {
+      throw new Error(
+        'No .bib file in the project. Pass bibFile to choose where to create one (e.g. "references.bib").',
+      );
+    }
+    if (bibs.length > 1) {
+      throw new Error(
+        `Multiple .bib files (${bibs.map((b) => b.path).join(', ')}). Pass bibFile to pick one.`,
+      );
+    }
+    bibPath = bibs[0]!.path;
   }
-  const bibs = await ctx.files.list(dir, { filter: 'bib' });
-  if (bibs.length === 0) {
+  // `linkTarget` can throw (ELOOP, EACCES); resolving it here, before anything is written, keeps
+  // a throw from reporting an error for a citation that already landed.
+  const linkTarget = await ctx.files.linkTarget(dir, bibPath);
+  if (linkTarget !== null && !isBibFile(linkTarget)) {
     throw new Error(
-      'No .bib file in the project. Pass bibFile to choose where to create one (e.g. "references.bib").',
+      `"${bibPath}" is a link to "${linkTarget}", which is not a .bib file; add_citation only ` +
+        'appends to a bibliography. Pass bibFile naming the real .bib.',
     );
   }
-  if (bibs.length > 1) {
-    throw new Error(
-      `Multiple .bib files (${bibs.map((b) => b.path).join(', ')}). Pass bibFile to pick one.`,
-    );
-  }
-  return bibs[0]!.path;
+  return { bibPath, linkTarget };
 }
 
 export function registerAddCitation(server: McpServer, ctx: AppContext): void {
@@ -103,18 +123,43 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
     async ({ project, key, bibFile }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
+        // A cheap, read-only preflight so a project with no usable .bib fails before a network
+        // round trip. Not authoritative: the tree can change before the lock is taken, so the
+        // target is resolved again under it below.
+        await resolveBibFile(ctx, dir, bibFile);
+        // Fetched OUTSIDE the lock: it touches no project state, and an openalex: key costs a
+        // DOI hop plus a Crossref fetch (15s timeout each) — held under runExclusive, that is as
+        // long as a peer's own lock wait (fileLock's DEFAULT_TIMEOUT_MS), so a peer's
+        // write/commit could fail with LockTimeoutError behind a citation lookup.
+        // Re-fetched from the issuing service so the appended text always originates from the
+        // API, never from the model. An OpenAlex key is bridged to Crossref by its DOI, and
+        // refused outright when it has none — we never assemble an entry ourselves.
+        const fetched = await ctx.references.fetchBibtex(key);
+        const bibtex = fetched.bibtex;
         return await ctx.projectManager.runExclusive(id, async () => {
-          const bibPath = await resolveBibFile(ctx, dir, bibFile);
-          // Re-fetch from the issuing service so the appended text always originates from the
-          // API, never from the model. An OpenAlex key is bridged to Crossref by its DOI, and
-          // refused outright when it has none — we never assemble an entry ourselves.
-          const fetched = await ctx.references.fetchBibtex(key);
-          const bibtex = fetched.bibtex;
+          // Authoritative resolution, under the lock: a peer cannot add a second .bib or plant a
+          // link between this check and the write. The link target is resolved here too, BEFORE
+          // the write, as write_file/edit_file do.
+          const { bibPath, linkTarget } = await resolveBibFile(ctx, dir, bibFile);
           // No baseline from this read: it happens before the already-present early return, and a
           // path that writes nothing must not claim the caller has seen the file (that is exactly
           // what made every compile disarm the guard). The write below is safe without it — see
           // there.
-          const existing = await ctx.files.readText(dir, bibPath);
+          // Read as bytes and decoded only when the decode is exact: the write below puts back the
+          // WHOLE file, so a lossy UTF-8 decode of a legacy Latin-1 bibliography (an accented
+          // author is the one byte 0xE9) would rewrite every such byte as U+FFFD, far from the
+          // appended entry. Refused before anything is written. An absent file is a new, empty one.
+          // Uncapped, like the text read this replaced: the binary read cap (sized for figures)
+          // would refuse a large shared bibliography that the append has no reason to refuse.
+          const existing = await ctx.files.readTextExact(dir, bibPath);
+          if (existing === null) {
+            throw new Error(
+              `"${bibPath}" is not valid UTF-8 (likely Latin-1 or another legacy encoding), and ` +
+                'add_citation rewrites the whole bibliography as UTF-8, which would replace every ' +
+                'character it cannot decode with U+FFFD. Nothing was written. Convert the file to ' +
+                'UTF-8 first (e.g. iconv -f latin1 -t utf-8), then add the citation again.',
+            );
+          }
           const merged = mergeBibEntry(existing, bibtex);
 
           if (merged.alreadyPresent) {
@@ -146,10 +191,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           // check would only refuse a write that is already safe, which is why this read did not
           // need to arm the guard to get past it.
           // A write through an in-project link changes the target, so that is the path to diff —
-          // same rule as write_file/edit_file (changedPath in src/lib/changeDiff.ts). Resolved
-          // BEFORE the write, as those tools do: `linkTarget` can throw (ELOOP, EACCES), and a
-          // throw after the write would report an error for a citation that already landed.
-          const linkTarget = await ctx.files.linkTarget(dir, bibPath);
+          // same rule as write_file/edit_file (changedPath in src/lib/changeDiff.ts).
           await ctx.files.write(dir, {
             path: bibPath,
             content: merged.content,

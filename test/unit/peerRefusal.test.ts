@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import {
   guardPeerWork,
   enrichPullRefusal,
@@ -14,6 +14,7 @@ import {
 } from '../../src/services/gitService.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import type { PeerSession } from '../../src/services/sessionRegistry.js';
+import { sessionDir } from '../../src/lib/sessionPaths.js';
 
 /**
  * Unit coverage for `guardPeerWork`'s dirty set (Task 1: `status.staged` must join the set the
@@ -71,7 +72,9 @@ describe('peerRefusal', () => {
     unstaged: [],
     untracked: [],
     aheadCommits: [],
+    aheadCommitsOmitted: 0,
     behindCommits: [],
+    remoteBranchMissing: false,
     ...overrides,
   });
 
@@ -130,6 +133,74 @@ describe('peerRefusal', () => {
         expect(header.match(/a\.tex/gi)).toHaveLength(1);
       },
     );
+    describe('a path this session ALSO owns (co-edited with a live peer)', () => {
+      // `push` with a `message` commits via `git add -A`, so a file both sessions edited carries
+      // the peer's lines into this session's commit. `commit scope: "paths"` refuses any path a
+      // live peer lists even when the caller owns it too (`peerOwnership`); the push guard must
+      // hold the same line instead of subtracting this session's own paths first.
+      it("refuses when a live peer's shadow lists a path this session's shadow lists too", async () => {
+        const { deps, workspace } = await makeDeps([peer('beta')]);
+        deps.git.status = () => Promise.resolve(status({ unstaged: ['sections/method.tex'] }));
+        await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+        const betaShadows = new ShadowStore(workspace, 'beta', () => Promise.resolve(null));
+        await betaShadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per B\n');
+
+        const message = await guardPeerWork(deps, 'demo', '/clone').then(
+          () => {
+            throw new Error('expected guardPeerWork to throw');
+          },
+          (err: unknown) => (err as Error).message,
+        );
+        expect(message).toContain('"beta" owns sections/method.tex');
+        expect(message).toMatch(/also carries this session's own edits/);
+        expect(message).not.toMatch(/or may have/);
+        expect(message).toMatch(/scope "session"/);
+        expect(message).toMatch(/without a `message`/);
+      });
+
+      it("refuses over this session's own path when a live peer's index is unreadable (fail closed)", async () => {
+        const { deps, workspace } = await makeDeps([peer('beta')]);
+        deps.git.status = () => Promise.resolve(status({ unstaged: ['sections/method.tex'] }));
+        await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+        const betaDir = sessionDir(workspace, 'demo', 'beta');
+        await mkdir(betaDir, { recursive: true });
+        await writeFile(path.join(betaDir, 'shadow.json'), '{ not json');
+
+        const message = await guardPeerWork(deps, 'demo', '/clone').then(
+          () => {
+            throw new Error('expected guardPeerWork to throw');
+          },
+          (err: unknown) => (err as Error).message,
+        );
+        expect(message).toMatch(/unreadable/);
+        // The shared-file sentence does not claim beta edited it — only that it may have.
+        expect(message).toMatch(/or may have: a live session's change index cannot be read/);
+      });
+
+      it("matches the peer's spelling through the case fold on an ignorecase clone", async () => {
+        const { deps, workspace } = await makeDeps([peer('beta')]);
+        deps.git.isCaseInsensitive = () => Promise.resolve(true);
+        deps.git.status = () => Promise.resolve(status({ unstaged: ['sections/method.tex'] }));
+        await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+        const betaShadows = new ShadowStore(workspace, 'beta', () => Promise.resolve(null));
+        await betaShadows.record('demo', '/clone', 'Sections/Method.tex', 'a\n', 'a, per B\n');
+
+        await expect(guardPeerWork(deps, 'demo', '/clone')).rejects.toThrow(
+          /beta" owns sections\/method\.tex/,
+        );
+      });
+
+      it("does not refuse this session's own path when no live peer lists it", async () => {
+        const { deps, workspace } = await makeDeps([peer('beta')]);
+        deps.git.status = () => Promise.resolve(status({ unstaged: ['sections/method.tex'] }));
+        await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+        // beta is live with a readable index that lists a different, clean file.
+        const betaShadows = new ShadowStore(workspace, 'beta', () => Promise.resolve(null));
+        await betaShadows.record('demo', '/clone', 'sections/intro.tex', 'i\n', 'i, per B\n');
+
+        await expect(guardPeerWork(deps, 'demo', '/clone')).resolves.toBeUndefined();
+      });
+    });
   });
 
   describe('enrichPullRefusal', () => {
@@ -154,6 +225,32 @@ describe('peerRefusal', () => {
           'diverged; push rebases onto the remote and surfaces any real conflict.',
       );
       expect(result.message).not.toContain('Then sync again.');
+    });
+
+    it("decorates a path this session also owns when a live peer's shadow lists it too", async () => {
+      const { deps, workspace } = await makeDeps([peer('beta')]);
+      await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+      const betaShadows = new ShadowStore(workspace, 'beta', () => Promise.resolve(null));
+      await betaShadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per B\n');
+
+      const err = new LocalChangesOverwriteError(['sections/method.tex']);
+      const result = await enrichPullRefusal(deps, 'demo', '/clone', err);
+
+      expect(result).not.toBe(err);
+      expect(result.message.startsWith(err.message)).toBe(true);
+      expect(result.message).toContain('"beta" owns sections/method.tex');
+      expect(result.message).toMatch(/also carries this session's own edits/);
+      expect(result.message).toMatch(/scope "session"/);
+    });
+
+    it('still passes through a path only this session owns (no live peer lists it)', async () => {
+      const { deps } = await makeDeps([peer('beta')]);
+      await deps.shadows.record('demo', '/clone', 'sections/method.tex', 'a\n', 'a, per A\n');
+
+      const err = new LocalChangesOverwriteError(['sections/method.tex']);
+      const result = await enrichPullRefusal(deps, 'demo', '/clone', err);
+
+      expect(result).toBe(err);
     });
 
     it('leaves a pull-worded UntrackedOverwriteError with an empty paths list unchanged', async () => {

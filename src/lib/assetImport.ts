@@ -10,7 +10,9 @@
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import {
   isImportableAsset,
   assetTypeBlockedMessage,
@@ -46,13 +48,100 @@ function expandHome(p: string): string {
   return p;
 }
 
-async function resolveFromSourcePath(destPath: string, sourcePath: string): Promise<ResolvedAsset> {
+/**
+ * The two filesystem calls the sourcePath route makes, injectable so a test can perform an
+ * attacker's move at the exact moment it matters (a name swapped for a link after `realpath`,
+ * a file grown after `fstat`) against a real temp directory. Production passes nothing and gets
+ * `node:fs/promises`.
+ */
+export interface AssetSourceFs {
+  realpath(p: string): Promise<string>;
+  open(p: string, flags: number): Promise<FileHandle>;
+}
+const NODE_FS: AssetSourceFs = { realpath: (p) => realpath(p), open: (p, f) => open(p, f) };
+
+/**
+ * Flags for the one `open` of the resolved source. `O_NOFOLLOW` makes the open fail rather than
+ * follow a link at the final component — the realpath'd target contained none when it was
+ * resolved, so one appearing there now is a swap. `O_NONBLOCK` keeps a FIFO swapped in at the name
+ * from hanging the open itself (it is then refused by `fstat`); on a regular file it changes
+ * nothing. Neither is defined on Windows, where they fall back to 0: there is no `O_NOFOLLOW`
+ * equivalent reachable from Node, and creating a symlink there needs a privilege the ordinary
+ * attacker lacks, so the handle-based read still closes the size-cap and file-type races.
+ */
+const OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+
+/** Chunk size for the bounded read through the handle. */
+const READ_CHUNK = 1024 * 1024;
+
+/**
+ * A Windows network (UNC) or device path: `\\server\share\…`, `\\?\…`, `\\.\…`. On Windows `/`
+ * and `\` are both separators, so any two leading separators name one; on POSIX only the
+ * backslash spellings count, since a leading `//` there is an ordinary absolute path (and a
+ * leading `\` is not absolute at all). Pure string work — the whole point is that it runs before
+ * any syscall, because merely resolving `\\server\share\x.png` makes Windows connect to `server`
+ * over SMB and offer it this machine's NTLM credentials.
+ */
+export function isUncOrDevicePath(
+  p: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (p.startsWith('\\\\')) return true;
+  return platform === 'win32' && /^[\\/]{2}/.test(p);
+}
+
+/**
+ * Collapse a syscall failure on the source into found / not-found / unresolvable, never the raw
+ * errno text: that text names the syscall and echoes the path, and is itself an oracle (ENOTDIR on
+ * a path through a regular file proves the file exists; ELOOP proves a symlink cycle — or, from the
+ * `O_NOFOLLOW` open, a link swapped in at the name). `EISDIR` is Windows refusing to open a
+ * directory, which POSIX opens and `fstat` then refuses; both read "is not a regular file".
+ */
+function sourceSyscallError(shown: string, err: unknown): Error {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === 'EISDIR') {
+    return new Error(`sourcePath "${shown}" is not a regular file.`, { cause: err });
+  }
+  if (
+    code === 'ENOENT' ||
+    code === 'ENOTDIR' ||
+    code === 'ELOOP' ||
+    code === 'EMLINK' ||
+    code === 'ENAMETOOLONG'
+  ) {
+    return new Error(`sourcePath "${shown}" was not found.`, { cause: err });
+  }
+  return new Error(`sourcePath "${shown}" could not be resolved.`, { cause: err });
+}
+
+async function resolveFromSourcePath(
+  destPath: string,
+  sourcePath: string,
+  fs: AssetSourceFs,
+): Promise<ResolvedAsset> {
   const expanded = expandHome(sourcePath);
+
+  // A network or device path is refused before anything else touches it — before `isAbsolute`
+  // too, so the refusal reads the same on every platform (on POSIX `\\server\…` is merely
+  // relative, and "not absolute" would hide why it can never work). `expanded`, not `sourcePath`:
+  // a Windows home directory can itself live on a share, and `~/x.png` then expands to one.
+  // Like the relative-path message below, this quotes the caller's own input verbatim.
+  if (isUncOrDevicePath(expanded)) {
+    const resolvedTo = expanded === sourcePath ? '' : ` (resolved to "${expanded}")`;
+    throw new Error(
+      `sourcePath "${sourcePath}"${resolvedTo} is a Windows network (UNC) or device path. ` +
+        'add_asset reads only files on a local disk of the machine running this server: ' +
+        'resolving a network path would make this machine connect to that server. Copy the ' +
+        'file to a local disk first, or pass its bytes as contentBase64.',
+    );
+  }
 
   // A relative path is ambiguous: relative to the server process's cwd, which the caller
   // (running in a different process, possibly on a different machine's mental model of the
   // project) cannot know. Refuse rather than guess.
-  // Deliberately the ONE message in this function that keeps native separators. Both halves of
+  // Deliberately, with the network-path refusal above, one of the TWO messages in this function
+  // that keep native separators. Both halves of
   // it are quotations of what the caller typed: `sourcePath` verbatim, and `expanded` as the
   // tilde expansion of that same string. Re-spelling only the second would read as though the
   // server had rewritten the path — `"sub\dir\x.png" is not absolute (resolved to
@@ -102,34 +191,11 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   // caller.
   let real: string;
   try {
-    real = await realpath(expanded);
+    real = await fs.realpath(expanded);
   } catch (err) {
-    // Never let the raw errno text (which names the syscall and echoes the path) escape to the
-    // caller — that text is itself an oracle (e.g. ENOTDIR on a path through a regular file
-    // proves the file exists; ELOOP proves a symlink cycle). Every code collapses to one of two
-    // wordings: "was not found" for the family of codes that mean the path plainly doesn't
-    // resolve, "could not be resolved" for anything else (permission denied, or unexpected).
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
-      // Report only the already-expanded absolute path, not the original tilde form: the
-      // caller needs to see exactly what was checked against the filesystem.
-      throw new Error(`sourcePath "${toPosix(expanded)}" was not found.`, { cause: err });
-    }
-    throw new Error(`sourcePath "${toPosix(expanded)}" could not be resolved.`, { cause: err });
-  }
-
-  let st;
-  try {
-    st = await stat(real);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENAMETOOLONG') {
-      throw new Error(`sourcePath "${toPosix(real)}" was not found.`, { cause: err });
-    }
-    throw new Error(`sourcePath "${toPosix(real)}" could not be resolved.`, { cause: err });
-  }
-  if (!st.isFile()) {
-    throw new Error(`sourcePath "${toPosix(real)}" is not a regular file.`);
+    // Report only the already-expanded absolute path, not the original tilde form: the caller
+    // needs to see exactly what was checked against the filesystem.
+    throw sourceSyscallError(toPosix(expanded), err);
   }
 
   // The source itself must be a recognized asset type too — checked on the REALPATH'D path, so a
@@ -139,19 +205,65 @@ async function resolveFromSourcePath(destPath: string, sourcePath: string): Prom
   // constrained nothing about sourcePath, so any file on the machine — a credential, an SSH key,
   // /etc/passwd — could be read and (via a text-ish asset extension like .svg/.eps, or via
   // commit+push) exfiltrated. Note this deliberately does NOT require the source and destination
-  // extensions to match: importing plot.jpeg as plot.jpg is a legitimate rename.
+  // extensions to match: importing plot.jpeg as plot.jpg is a legitimate rename. It runs before
+  // the open, so a non-asset target is never even opened.
   if (!isImportableAsset(real)) {
     throw new Error(assetSourceBlockedMessage(toPosix(real)));
   }
 
-  // Check the size BEFORE reading: reading first would slurp a multi-gigabyte file into memory
-  // just to then reject it.
-  if (st.size > MAX_ASSET_BYTES) {
-    throw new Error(assetTooLargeMessage(destPath, st.size, MAX_ASSET_BYTES));
+  // Everything from here on is judged on ONE handle, never on the path again. Checking the path
+  // and then reading it by path is a check-then-use race: whoever owns the source name can swap
+  // it, after the checks, for a link to `~/.ssh/id_rsa` (which the read would follow), for a file
+  // over the size cap, or for a FIFO. `O_NOFOLLOW` refuses a link at the name (see OPEN_FLAGS);
+  // `fstat` on the handle judges the file actually opened; the read goes through that handle.
+  let fh: FileHandle;
+  try {
+    fh = await fs.open(real, OPEN_FLAGS);
+  } catch (err) {
+    throw sourceSyscallError(toPosix(real), err);
   }
+  try {
+    let st;
+    try {
+      st = await fh.stat();
+    } catch (err) {
+      throw sourceSyscallError(toPosix(real), err);
+    }
+    if (!st.isFile()) {
+      throw new Error(`sourcePath "${toPosix(real)}" is not a regular file.`);
+    }
+    // Check the size BEFORE reading: reading first would slurp a multi-gigabyte file into memory
+    // just to then reject it.
+    if (st.size > MAX_ASSET_BYTES) {
+      throw new Error(assetTooLargeMessage(destPath, st.size, MAX_ASSET_BYTES));
+    }
 
-  const bytes = await readFile(real);
-  return { bytes, origin: real, sha256: sha256Of(bytes) };
+    // ...and bound the read itself, since the file can still grow after that `fstat`: read at
+    // most one byte past the cap, and refuse if that byte exists.
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const want = Math.min(READ_CHUNK, MAX_ASSET_BYTES + 1 - total);
+      if (want <= 0) break;
+      const chunk = Buffer.allocUnsafe(want);
+      let bytesRead: number;
+      try {
+        ({ bytesRead } = await fh.read(chunk, 0, want, null));
+      } catch (err) {
+        throw sourceSyscallError(toPosix(real), err);
+      }
+      if (bytesRead === 0) break;
+      chunks.push(bytesRead === want ? chunk : chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > MAX_ASSET_BYTES) {
+      throw new Error(assetTooLargeMessage(destPath, total, MAX_ASSET_BYTES));
+    }
+    const bytes = Buffer.concat(chunks, total);
+    return { bytes, origin: real, sha256: sha256Of(bytes) };
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
 }
 
 function resolveFromBase64(destPath: string, contentBase64: string): ResolvedAsset {
@@ -183,11 +295,14 @@ function resolveFromBase64(destPath: string, contentBase64: string): ResolvedAss
   return { bytes, origin: 'inline base64', sha256: sha256Of(bytes) };
 }
 
-export async function resolveAssetSource(opts: {
-  destPath: string;
-  sourcePath?: string;
-  contentBase64?: string;
-}): Promise<ResolvedAsset> {
+export async function resolveAssetSource(
+  opts: {
+    destPath: string;
+    sourcePath?: string;
+    contentBase64?: string;
+  },
+  fs: AssetSourceFs = NODE_FS,
+): Promise<ResolvedAsset> {
   // 1. Destination allowlist FIRST, before anything is read off disk. This ordering is
   // security-relevant: a refused destination type must never cause the server to read a file
   // from outside every project sandbox. That read is the whole reason the allowlist exists —
@@ -215,7 +330,7 @@ export async function resolveAssetSource(opts: {
 
   // 3. Resolve the chosen source.
   if (hasSourcePath) {
-    return resolveFromSourcePath(opts.destPath, opts.sourcePath as string);
+    return resolveFromSourcePath(opts.destPath, opts.sourcePath as string, fs);
   }
   return resolveFromBase64(opts.destPath, opts.contentBase64 as string);
 }

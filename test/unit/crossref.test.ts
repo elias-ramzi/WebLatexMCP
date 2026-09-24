@@ -479,6 +479,37 @@ describe('fetchBibtex returns the entry, not whatever else shares the body', () 
     const svc = new CrossrefService(() => Promise.resolve(ok(BROKEN)));
     expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(BROKEN.trim());
   });
+
+  // The fixtures above are multi-line, with the close alone on its own line — a shape Crossref's
+  // `/transform` never sends. What it does send (recorded from api.crossref.org) is the whole
+  // entry on ONE line, led by a space and closed by ` }` sharing that line. The alone-on-its-line
+  // rule believed no close in it at all and failed open, so the trailing junk these tests exist to
+  // keep out reached the .bib on exactly the shape the service really serves.
+  const REAL =
+    ' @inproceedings{He_2016, title={Deep Residual Learning for Image Recognition}, ' +
+    'url={http://dx.doi.org/10.1109/CVPR.2016.90}, DOI={10.1109/cvpr.2016.90}, ' +
+    'booktitle={2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, ' +
+    'publisher={IEEE}, author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian}, ' +
+    'year={2016}, month=June, pages={770–778} }\n';
+
+  it('drops a trailing <script> after the one-line entry Crossref really serves', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok(REAL + '<script>alert(1)</script>')));
+    const text = await svc.fetchBibtex('10.1109/CVPR.2016.90');
+    expect(text).toBe(REAL.trim());
+    expect(text).not.toContain('script');
+  });
+
+  it('drops a trailing HTML footer after the one-line entry', async () => {
+    const svc = new CrossrefService(() =>
+      Promise.resolve(ok(REAL + '<p>Served by edge-cache</p>')),
+    );
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(REAL.trim());
+  });
+
+  it('returns the one-line entry unchanged when nothing follows it', async () => {
+    const svc = new CrossrefService(() => Promise.resolve(ok(REAL)));
+    expect(await svc.fetchBibtex('10.1109/CVPR.2016.90')).toBe(REAL.trim());
+  });
 });
 
 describe('an EMPTY 200 on the BibTeX path is a failure, not "no such record"', () => {

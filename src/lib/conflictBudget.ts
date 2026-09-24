@@ -44,6 +44,20 @@ import type { ConflictFileDetail } from '../services/gitService.js';
  * the shape is structural rather than a flat template — a hunk's JSON, an elided hunk block's
  * spans/count) the exact `JSON.stringify` of what will actually be sent, charged against the same
  * shared budget so eliding something no longer "costs nothing" and staying silent forever.
+ *
+ * A fourth round: every charge above took `Math.max(textCost, jsonCost)` — "the more expensive of
+ * the two channels" — on the theory that one shared budget then bounds both. It bounded each
+ * channel on its own at best, never what the caller receives: the per-file payload ships TWICE,
+ * as the file blocks of the result text and again as `structuredContent.conflictFiles`, so the
+ * caller gets the SUM. And the per-file JSON scaffold (`{"path":…,"base":…,"hunks":[…]}`, the
+ * `null` a cut or absent side still costs, the `elided` wrapper and its keys), the text channel's
+ * line breaks, its `overlap:` label and its absent-side lines were never charged at all — 20
+ * backslash-heavy files reached 23,485 characters of JSON alone, past the 20000 budget, and ~40k
+ * across the two channels. Every charge is now `text + json` (the `diffBudget.ts` rule: the same
+ * content in two channels adds), every piece of framing is a named constant pinned against the
+ * real render, and the pointer that would replace each cuttable part is RESERVED before any
+ * content is admitted — see {@link planConflictPayload} — so a cut can never overrun the budget
+ * that forced it.
  */
 
 /**
@@ -55,10 +69,22 @@ import type { ConflictFileDetail } from '../services/gitService.js';
 export const CONFLICT_SIDE_CAP = 12000;
 
 /**
- * Total character budget across every file's `hunks` + `base` + `ours` + `theirs` combined —
- * charged at their RENDERED size (content plus the overhead constants below), not raw content, so
- * this is actually a bound on what the caller receives rather than on an internal accounting
- * fiction. Sized so the worst case lands well under the ~67k that originally failed.
+ * Total character budget for the per-file conflict payload across BOTH channels combined — the
+ * file blocks of the result text plus `structuredContent.conflictFiles`, charged at their RENDERED
+ * size in each (content, JSON escaping, and every piece of framing named below), so a part that
+ * ships in both is charged twice. 20000 is the house figure for a rendered content budget
+ * (`DIFF_CONTENT_BUDGET` is the same figure charged the same way), sized so the worst case lands
+ * well under the ~67k that originally failed.
+ *
+ * What it bounds, precisely: everything {@link planConflictPayload} decides — each detailed file's
+ * text block (from the blank line before its header on) and its `conflictFiles` entry, array
+ * punctuation included. What it does not: the report-level prelude of the text (summary,
+ * guidance, refs, the landed-commit list, the never-capped `conflictPaths` line, the note) and the
+ * other `structuredContent` keys, none of which are per-file content. And it holds whenever the
+ * MANDATORY per-file framing fits in it — each file's header, path and JSON scaffold plus the
+ * pointer reserved for every part that could be cut. When 20 files' framing alone exceeds it (very
+ * long paths, or many hunks whose elided span lists are themselves long), no plan can honour it
+ * and the `note` says so instead of letting the overrun pass as a budget that held.
  */
 export const CONFLICT_CONTENT_BUDGET = 20000;
 
@@ -132,6 +158,39 @@ export const HUNK_LINE_ELEMENT_OVERHEAD = 2;
 export const FILE_HEADER_OVERHEAD = 12;
 
 /**
+ * Line breaks `renderConflictText`'s `out.join('\n')` spends on every detailed file's text block,
+ * whatever is inside it: before the blank separator line, before the header, and before each of
+ * the three side lines. A shown `overlap:` block costs one more, charged with the block
+ * ({@link HUNKS_BLOCK_TEXT_OVERHEAD}, and the elided form's own line break). Pinned in
+ * `conflictText.test.ts` by measuring whole rendered file blocks.
+ */
+export const FILE_TEXT_LINE_BREAKS = 5;
+
+/**
+ * Literal characters of the text channel's `overlap:` block around the markers when the hunks are
+ * shown in full — the `overlap:\n` label plus the line break that joins the block to the file's
+ * other lines. Pinned against `renderHunksBlock` in `conflictText.test.ts`.
+ */
+export const HUNKS_BLOCK_TEXT_OVERHEAD = 'overlap:\n'.length + 1;
+
+/**
+ * Literal characters of ONE `structuredContent.conflictFiles` entry's JSON scaffold —
+ * `{"path":,"base":,"ours":,"theirs":,"hunks":[]}` — EXCLUDING the path's own JSON string, the
+ * three side values (a side's JSON string, or the `null` a cut or absent side still costs, charged
+ * with the side) and the hunks inside the array (charged with the hunks). Pinned against
+ * `JSON.stringify` of a real `buildConflictFilePayload` entry in `conflictText.test.ts`.
+ */
+export const FILE_JSON_OVERHEAD = 46;
+
+/**
+ * Literal characters of the `,"elided":{…}` wrapper an entry grows once anything in it is cut,
+ * LESS ONE: each elided part is charged its key, its value and one separating comma, and `k`
+ * parts need only `k - 1` commas, so the wrapper constant gives the surplus comma back. Pinned
+ * against `JSON.stringify` of a real entry with and without an elision in `conflictText.test.ts`.
+ */
+export const ELIDED_JSON_WRAPPER_OVERHEAD = ',"elided":{}'.length - 1;
+
+/**
  * Literal characters of one side's label line when rendered in full (`${label}:\n`) in the text
  * channel. The three labels differ in length ("base (common ancestor)" / "ours (local)" /
  * "theirs (remote that landed)"); this uses the longest of them plus `:\n` so one constant safely
@@ -146,6 +205,22 @@ export const SIDE_LABEL_OVERHEAD = 'theirs (remote that landed)'.length + ':\n'.
  * here; a circular import between the two would follow otherwise.
  */
 const LONGEST_SIDE_LABEL = 'theirs (remote that landed)';
+
+/**
+ * Literal characters of `renderSide`'s ABSENT branch (`${label}: (absent — added or deleted on this
+ * side)`), sized against the longest label like {@link SIDE_LABEL_OVERHEAD}. An absent side is
+ * never cut and never inlined, so this — plus the `null` it costs in JSON — is a mandatory charge.
+ * Pinned against the real `renderSide` output in `conflictText.test.ts`.
+ */
+export const SIDE_ABSENT_OVERHEAD =
+  LONGEST_SIDE_LABEL.length + ': (absent — added or deleted on this side)'.length;
+
+/** The one line break `renderConflictText` spends joining an ELIDED `overlap:` line to the file's
+ * other lines (the shown block's is inside {@link HUNKS_BLOCK_TEXT_OVERHEAD}). */
+const LINE_BREAK = 1;
+
+/** What `null` costs in JSON — a cut or absent side's value in its `conflictFiles` entry. */
+const JSON_NULL = 'null'.length;
 
 /**
  * Literal characters `renderSide`'s ELIDED branch wraps around one side — `${label}: (` + the
@@ -359,15 +434,12 @@ function lineArrayEscapeOverhead(lines: string[]): number {
 }
 
 /**
- * What ONE hunk actually costs once rendered, in the more expensive of the two channels — content
- * plus the digits of its own `startLine`/`endLine` plus whichever of the text-marker or
- * JSON-encoding overhead is larger. Taking the max (rather than summing, or picking one channel)
- * means a single shared budget bounds BOTH channels, since they're built from the same plan.
- *
- * The JSON side additionally charges the real escaping cost of every `local`/`remote` line
- * (backslashes, quotes, literal newlines, control characters) — without it, a hunk whose lines are
- * escape-heavy could be "at budget" by raw content length while its real JSON-encoded size runs
- * well past it.
+ * What ONE hunk costs once rendered, in BOTH channels — it ships as marker text and again as a
+ * `ConflictHunk` object in `structuredContent`, so the two add. Each side counts the content plus
+ * the digits of its own `startLine`/`endLine` plus that channel's framing; the JSON side
+ * additionally charges the real escaping cost of every `local`/`remote` line (backslashes,
+ * quotes, literal newlines, control characters) — LaTeX is backslash-dense, so a raw-length
+ * charge under-counts it.
  */
 function hunkRenderCost(h: ConflictHunk): number {
   const contentChars = h.local.join('\n').length + h.remote.join('\n').length;
@@ -381,16 +453,37 @@ function hunkRenderCost(h: ConflictHunk): number {
     HUNK_JSON_OVERHEAD +
     lineElements * HUNK_LINE_ELEMENT_OVERHEAD +
     escapeOverhead;
-  return Math.max(textCost, jsonCost);
+  return textCost + jsonCost;
 }
 
-/** Rendered cost of a whole file's `hunks` block: each hunk's own cost plus the `\n`/`,` join
- * separators between them (one character each, same order in both channels). */
+/** Rendered cost of a whole file's `hunks` shown in full, both channels: each hunk's own cost,
+ * the `\n` (text) and `,` (JSON) separators between them, and the `overlap:` block around them. */
 function hunksRenderCost(hunks: ConflictHunk[]): number {
   if (hunks.length === 0) return 0;
   const perHunk = hunks.reduce((sum, h) => sum + hunkRenderCost(h), 0);
-  return perHunk + (hunks.length - 1);
+  return HUNKS_BLOCK_TEXT_OVERHEAD + perHunk + 2 * (hunks.length - 1);
 }
+
+/**
+ * What one detailed file costs whatever the plan decides inside it, both channels: the text
+ * block's header line and line breaks, and the JSON entry's scaffold, path, and its share of the
+ * `conflictFiles` array's punctuation (`n` entries need `n - 1` commas and 2 brackets = one per
+ * entry, plus the one {@link planConflictPayload} charges once).
+ */
+function fileFrameCost(path: string): number {
+  const textCost = FILE_HEADER_OVERHEAD + path.length + FILE_TEXT_LINE_BREAKS;
+  const jsonCost = FILE_JSON_OVERHEAD + JSON.stringify(path).length + 1;
+  return textCost + jsonCost;
+}
+
+/** One `elided.<key>` member of a `conflictFiles` entry: its key, its colon, its value, and the
+ * separating comma {@link ELIDED_JSON_WRAPPER_OVERHEAD} gives back once per entry. */
+function elidedMemberCost(key: ConflictSideKey | 'hunks', value: unknown): number {
+  return JSON.stringify(key).length + ':'.length + JSON.stringify(value).length + ','.length;
+}
+
+/** What an absent side (added/deleted on that side) costs, both channels — mandatory. */
+const SIDE_ABSENT_COST = SIDE_ABSENT_OVERHEAD + JSON_NULL;
 
 function fullHunksPlan(hunks: ConflictHunk[]): ConflictHunksPartPlan {
   return {
@@ -418,11 +511,11 @@ function fullFilePlan(f: ConflictFileDetail): ConflictFilePlan {
 const SIDE_KEYS: readonly ConflictSideKey[] = ['base', 'ours', 'theirs'];
 
 /**
- * What eliding a file's whole `hunks` block actually costs to render — the note naming how many
- * hunks and where, in the more expensive of the two channels. Charged against the SAME budget as
- * inclusion (see {@link planConflictPayload}'s note on charging elision) so a run of starved,
- * all-elided files cannot render an unbounded amount of "here's what got cut" boilerplate for
- * free.
+ * What eliding a file's whole `hunks` block costs to render, both channels — the text line naming
+ * how many hunks and where (plus its line break), and the `elided.hunks` member of the JSON entry.
+ * Reserved against the SAME budget as inclusion (see {@link planConflictPayload}) so a run of
+ * starved, all-elided files cannot render an unbounded amount of "here's what got cut"
+ * boilerplate for free.
  */
 function hunksElisionCost(
   count: number,
@@ -431,22 +524,25 @@ function hunksElisionCost(
 ): number {
   const spansText = renderElidedHunkSpans(spans, count);
   const textCost =
-    HUNK_ELISION_TEXT_OVERHEAD + String(count).length + String(chars).length + spansText.length;
+    LINE_BREAK +
+    HUNK_ELISION_TEXT_OVERHEAD +
+    String(count).length +
+    String(chars).length +
+    spansText.length;
   // The structured shape is exactly `elided.hunks` in `buildConflictFilePayload` — measuring the
-  // real JSON.stringify of that shape is exact by construction, the same technique Finding 1 uses
-  // for escape-heavy content, and avoids hand-decomposing a nested array-of-objects into constants.
-  const jsonCost = JSON.stringify({ chars, count, spans }).length;
-  return Math.max(textCost, jsonCost);
+  // real JSON.stringify of that shape is exact by construction, and avoids hand-decomposing a
+  // nested array-of-objects into constants. The array itself is left empty (`[]`, already in
+  // FILE_JSON_OVERHEAD).
+  const jsonCost = elidedMemberCost('hunks', { chars, count, spans });
+  return textCost + jsonCost;
 }
 
 /**
- * What eliding one side of one file actually costs to render — the `(N chars, elided —
- * read_file(...))` pointer (text) or the `elided.<key>` entry (structured), in the more expensive
- * of the two channels. Charged against the same budget as inclusion for the same reason as
+ * What eliding one side of one file costs to render, both channels — the `(N chars, elided —
+ * read_file(...))` pointer (text), and the `null` value plus the `elided.<key>` member
+ * (structured). Reserved against the same budget as inclusion for the same reason as
  * {@link hunksElisionCost}. `hunksRendered` is threaded through to {@link sideElisionHint} so the
- * charge reflects whichever hint text will actually be rendered for `base` when there is no merge
- * base — the hunks pass (above) always runs first, so by the time this is called for a file's
- * sides, that file's `hunks.included` decision already exists to derive it from.
+ * charge reflects whichever hint text would be rendered for `base` when there is no merge base.
  */
 function sideElisionCost(
   path: string,
@@ -459,8 +555,14 @@ function sideElisionCost(
   const textCost = SIDE_ELISION_OVERHEAD + String(chars).length + hint.text.length;
   // Real JSON.stringify of the exact `elided.<key>` shape `buildConflictFilePayload` builds — see
   // the note on `hunksElisionCost` above for why this is exact rather than decomposed further.
-  const jsonCost = JSON.stringify({ chars, ref: hint.json }).length;
-  return Math.max(textCost, jsonCost);
+  const jsonCost = JSON_NULL + elidedMemberCost(key, { chars, ref: hint.json });
+  return textCost + jsonCost;
+}
+
+/** What one side costs inlined in full, both channels: the labelled text block, and the JSON
+ * string (escapes included) that replaces the `null`. */
+function sideRenderCost(content: string): number {
+  return SIDE_LABEL_OVERHEAD + content.length + JSON.stringify(content).length;
 }
 
 /**
@@ -470,25 +572,29 @@ function sideElisionCost(
  * `CONFLICT_MAX_FILES` — for a caller that explicitly wants the complete payload and can take the
  * size.
  *
- * `detail: 'auto'` (the default a caller should use):
+ * `detail: 'auto'` (the default a caller should use). Every charge is the part's RENDERED size in
+ * BOTH channels summed — the text block and the `conflictFiles` entry — since the caller receives
+ * both:
  *  0. Files beyond `CONFLICT_MAX_FILES` get no per-file block at all (they stay listed in the
  *     report's own `conflictPaths`, untouched by this planner).
- *  1. Every included file's header line is a mandatory, unconditional cost (it renders whether or
- *     not anything inside the file is elided) — charged up front against the budget.
- *  2. Allocate `hunks` against what's left of `CONFLICT_CONTENT_BUDGET` first, at RENDERED size —
- *     hunks get first claim because they are the least recoverable part (see
- *     {@link ConflictFilePlan.hunks}).
- *  3. Allocate `base`/`ours`/`theirs` against whatever budget remains, at RENDERED size, each ALSO
- *     capped individually at `CONFLICT_SIDE_CAP` (on raw content, regardless of remaining budget)
- *     — one huge side must never eat the whole budget and starve every other file's sides.
+ *  1. Every detailed file's frame — header line, line breaks, JSON scaffold and path — is a
+ *     mandatory, unconditional cost, charged up front. So is an absent side's line and `null`.
+ *  2. The FALLBACK for every part that could be cut — the pointer or span note that would replace
+ *     it, and the `elided` wrapper its entry would grow — is RESERVED up front too, before any
+ *     content is admitted. Admitting a part then costs only what it adds over its fallback, and
+ *     cutting it costs nothing further, so the cuts can never overrun the budget that forced them
+ *     (charging the pointer only after the cut, as this once did, let content fill the budget and
+ *     the pointers land on top of it). A part cheaper than its own pointer is always admitted.
+ *     The wrapper is given back on a file's last decision when nothing in it was cut.
+ *  3. Allocate `hunks` against what's left first — hunks get first claim because they are the
+ *     least recoverable part (see {@link ConflictFilePlan.hunks}).
+ *  4. Allocate `base`/`ours`/`theirs` against whatever remains, each ALSO capped individually at
+ *     `CONFLICT_SIDE_CAP` (on raw content, regardless of remaining budget) — one huge side must
+ *     never eat the whole budget and starve every other file's sides.
  *
  * Anything that does not fit is marked `included: false` with its true (untruncated) CONTENT
  * character count, never the truncated size or the rendered cost used to decide — an elided entry
- * that lied about its own size would be worse than showing nothing. Eliding is not free, either:
- * the pointer/note that replaces the dropped content is itself charged against the same budget
- * (via {@link hunksElisionCost} / {@link sideElisionCost}), so a conflict where nothing fits still
- * renders a bounded amount of "here's what got cut" text rather than one unbudgeted pointer per
- * part.
+ * that lied about its own size would be worse than showing nothing.
  */
 export function planConflictPayload(
   files: ConflictFileDetail[],
@@ -503,43 +609,103 @@ export function planConflictPayload(
   const omittedFiles = files.slice(CONFLICT_MAX_FILES).map((f) => f.path);
 
   let budgetRemaining = CONFLICT_CONTENT_BUDGET;
-  // File headers are mandatory, not elidable — charge them up front so the passes below see what
-  // is actually left for content.
-  for (const f of cappedFiles) {
-    budgetRemaining -= FILE_HEADER_OVERHEAD + f.path.length;
-  }
-  // True when the mandatory, unconditional header charge alone already exhausted the budget —
-  // before any hunk or side was even considered. Recorded here (rather than inferred later from
+  // Step 1a: file frames are mandatory, not elidable — charge them up front so the passes below
+  // see what is actually left. The `+ 1` is the array bracket the per-file shares leave over.
+  const frameChars =
+    cappedFiles.length === 0
+      ? 0
+      : 1 + cappedFiles.reduce((sum, f) => sum + fileFrameCost(f.path), 0);
+  budgetRemaining -= frameChars;
+  // True when the mandatory frame charge alone already exhausted the budget — before any hunk or
+  // side was even considered. Recorded here (rather than inferred later from
   // `aggregateBudgetExceeded`) because it names a distinct cause: long paths, not a lot of content.
   const headersExhaustedBudget = budgetRemaining <= 0;
+
+  // Step 1b + 2: absent sides (mandatory) and the fallback of every cuttable part (reserved).
+  // The fallback for `base` is reserved at the dearer of its two no-merge-base hints (the one
+  // pointing at markers, possible only when the file has hunks): whether the hunks will be shown
+  // is not decided yet, and reserving the smaller one could under-count.
+  interface FileLedger {
+    /** Cuttable parts of this file not yet decided. */
+    undecided: number;
+    /** Whether anything in this file has been cut — the `elided` wrapper stays reserved if so. */
+    elided: boolean;
+  }
+  const hunksFallback = (f: ConflictFileDetail): number =>
+    hunksElisionCost(f.hunks.length, hunksChars(f.hunks), hunkSpans(f.hunks));
+  const sideFallback = (f: ConflictFileDetail, key: ConflictSideKey, chars: number): number =>
+    sideElisionCost(f.path, key, chars, refs, f.hunks.length > 0);
+  const ledgers: FileLedger[] = cappedFiles.map((f) => {
+    let undecided = 0;
+    if (f.hunks.length > 0) {
+      undecided++;
+      budgetRemaining -= hunksFallback(f);
+    }
+    for (const key of SIDE_KEYS) {
+      const content = f[key];
+      if (content === null) {
+        budgetRemaining -= SIDE_ABSENT_COST;
+      } else {
+        undecided++;
+        budgetRemaining -= sideFallback(f, key, content.length);
+      }
+    }
+    if (undecided > 0) budgetRemaining -= ELIDED_JSON_WRAPPER_OVERHEAD;
+    return { undecided, elided: false };
+  });
+  // True when frames plus reserved fallbacks already exceed the budget: no plan can then honour
+  // it, and the note must say so rather than let the overrun pass as a budget that held.
+  const mandatoryExceedsBudget = budgetRemaining < 0;
+
+  /**
+   * Decide one cuttable part: admit it iff what it adds over its (already reserved) fallback fits
+   * — or it adds nothing, since a part cheaper than its own pointer never grows the payload. On
+   * the file's last decision with nothing cut, the `elided` wrapper will not render, so its
+   * reservation counts toward admitting this part.
+   */
+  const decide = (
+    ledger: FileLedger,
+    renderCost: number,
+    fallback: number,
+    forceCut: boolean,
+  ): boolean => {
+    ledger.undecided--;
+    const wrapperBack = ledger.undecided === 0 && !ledger.elided ? ELIDED_JSON_WRAPPER_OVERHEAD : 0;
+    const extra = renderCost - fallback - wrapperBack;
+    if (!forceCut && extra <= Math.max(0, budgetRemaining)) {
+      budgetRemaining -= extra;
+      return true;
+    }
+    ledger.elided = true;
+    return false;
+  };
 
   let sideCapExceeded = false;
   let aggregateBudgetExceeded = false;
 
-  // Pass 1: hunks, in file order, get first claim on the (rendered-size) budget. A file with NO
-  // hunks (a pure add/delete conflict) is never "elided" — cost is 0 either way, and there is
-  // nothing to report cutting — even once budgetRemaining has already gone negative from mandatory
-  // headers alone. Indexed by POSITION (not a Map keyed by path) so pass 2 below can pair each
-  // file with its hunks plan without a lookup that could silently miss a duplicate path.
+  // Pass 1: hunks, in file order, get first claim on the budget. A file with NO hunks (a pure
+  // add/delete conflict) is never "elided" — there is nothing to report cutting. Indexed by
+  // POSITION (not a Map keyed by path) so pass 2 below can pair each file with its hunks plan
+  // without a lookup that could silently miss a duplicate path.
   const hunksPlans: ConflictHunksPartPlan[] = [];
-  for (const f of cappedFiles) {
+  cappedFiles.forEach((f, i) => {
     const chars = hunksChars(f.hunks);
-    const cost = hunksRenderCost(f.hunks);
     const spans = hunkSpans(f.hunks);
-    if (f.hunks.length === 0 || cost <= budgetRemaining) {
-      budgetRemaining -= cost;
-      hunksPlans.push({ included: true, chars, count: f.hunks.length, spans });
-    } else {
-      aggregateBudgetExceeded = true;
-      budgetRemaining -= hunksElisionCost(f.hunks.length, chars, spans);
-      hunksPlans.push({ included: false, chars, count: f.hunks.length, spans });
+    const count = f.hunks.length;
+    if (count === 0) {
+      hunksPlans.push({ included: true, chars, count, spans });
+      return;
     }
-  }
+    const included = decide(ledgers[i]!, hunksRenderCost(f.hunks), hunksFallback(f), false);
+    if (!included) aggregateBudgetExceeded = true;
+    hunksPlans.push({ included, chars, count, spans });
+  });
 
   // Pass 2: sides, in file order and base/ours/theirs order within a file, against what's left.
   const filePlans: ConflictFilePlan[] = cappedFiles.map((f, i) => {
     const hunksPlan = hunksPlans[i];
-    if (!hunksPlan) {
+    const ledger = ledgers[i];
+    if (!hunksPlan || !ledger) {
       // Cannot happen: pass 1 above pushes exactly one entry per cappedFiles element, in order —
       // this is a programming error, not a runtime input the caller could trigger.
       throw new Error(
@@ -547,37 +713,27 @@ export function planConflictPayload(
           'pass 2 must iterate the same cappedFiles array in the same order',
       );
     }
-    // Whether THIS file's hunks block is actually showing full overlap markers on screen — the
-    // hunks pass above already decided this, so the no-merge-base hint (base only) can be honest
-    // about it instead of guessing. `hunksRendered` is false for an empty `hunks: []` too (that
-    // case is always `included: true` trivially, but there is nothing to point at either).
-    const hunksRendered = f.hunks.length > 0 && hunksPlan.included;
     const sidePlans = {} as Record<ConflictSideKey, ConflictPartPlan>;
     for (const key of SIDE_KEYS) {
       const content = f[key];
       if (content === null) {
-        // Absent on this side (added/deleted) — nothing to elide, nothing to budget.
+        // Absent on this side (added/deleted) — nothing to elide; its line was charged up front.
         sidePlans[key] = { included: true, chars: 0 };
         continue;
       }
       const chars = content.length;
-      if (chars > CONFLICT_SIDE_CAP) {
-        sideCapExceeded = true;
-        sidePlans[key] = { included: false, chars };
-        budgetRemaining -= sideElisionCost(f.path, key, chars, refs, hunksRendered);
-        continue;
-      }
-      // The structured channel is JSON: charge its real (escape-inclusive) length, not raw
-      // `chars` — see the module header's third round of fixes.
-      const cost = Math.max(chars + SIDE_LABEL_OVERHEAD, JSON.stringify(content).length);
-      if (cost <= budgetRemaining) {
-        budgetRemaining -= cost;
-        sidePlans[key] = { included: true, chars };
-      } else {
-        aggregateBudgetExceeded = true;
-        sidePlans[key] = { included: false, chars };
-        budgetRemaining -= sideElisionCost(f.path, key, chars, refs, hunksRendered);
-      }
+      const overCap = chars > CONFLICT_SIDE_CAP;
+      if (overCap) sideCapExceeded = true;
+      // The structured channel is JSON: `sideRenderCost` charges its real (escape-inclusive)
+      // length — see the module header's third round of fixes.
+      const included = decide(
+        ledger,
+        overCap ? 0 : sideRenderCost(content),
+        sideFallback(f, key, chars),
+        overCap,
+      );
+      if (!included && !overCap) aggregateBudgetExceeded = true;
+      sidePlans[key] = { included, chars };
     }
     return {
       path: f.path,
@@ -617,13 +773,19 @@ export function planConflictPayload(
     // was reached" would hide that the cause here is path length, not content.
     // Name the charge that actually fired — header boilerplate plus every path — not the path
     // characters alone, or the number can read as smaller than the budget it claims to have used.
-    const totalHeaderChars = cappedFiles.reduce(
-      (sum, f) => sum + FILE_HEADER_OVERHEAD + f.path.length,
-      0,
-    );
+    // Both channels count: the text header line and the JSON entry scaffold each carry the path.
     reasons.push(
-      `the ${cappedFiles.length}-file headers alone (${totalHeaderChars} chars of headers and paths) ` +
+      `the ${cappedFiles.length}-file headers alone (${frameChars} chars of headers and paths) ` +
         `consumed the ${CONFLICT_CONTENT_BUDGET}-char budget, so no content could be inlined`,
+    );
+  } else if (mandatoryExceedsBudget) {
+    // Frames fit, but frames plus the pointers that stand in for every cut part do not: the
+    // result is over budget however the content is cut, and saying only "the budget was reached"
+    // would read as a budget that held.
+    reasons.push(
+      `the headers and the pointers standing in for the cut parts of ${cappedFiles.length} ` +
+        `file(s) alone exceed the ${CONFLICT_CONTENT_BUDGET}-char budget, so this result is ` +
+        'larger than it — the omitted content is still fetchable as below',
     );
   }
   if (fileCapExceeded) {

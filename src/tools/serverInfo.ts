@@ -7,6 +7,8 @@ import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
 import { countWritingConventions } from '../lib/writingConventions.js';
 import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
+import { errorResult } from '../lib/errors.js';
+import { quoteInvalidSource } from '../services/referenceResolver.js';
 
 const outputSchema = {
   name: z.string(),
@@ -151,90 +153,96 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       outputSchema,
     },
     async () => {
-      const info = {
-        name: 'web-latex-mcp',
-        version: getServerVersion(),
-        workspaceRoot: toPosix(ctx.config.workspaceRoot),
-        workspaceLocal: ctx.config.workspaceIsLocal ?? false,
-        workspaceExcludePattern: ctx.config.workspaceExcludePattern,
-        compiler: ctx.config.compiler ?? 'latexmk',
-        // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
-        // "dblp" here would describe the fallback order's first try as a choice someone made.
-        referenceSource: ctx.config.referenceSourceExplicit
-          ? ctx.config.referenceSource
-          : undefined,
-        // Reported apart from `referenceSource`, never folded into it: the value is not a
-        // backend id, and a rejected value is nobody's choice.
-        referenceSourceInvalid: ctx.config.referenceSourceInvalid,
-        contactEmailConfigured: ctx.config.contactEmail !== undefined,
-        // The boolean, and only the boolean: `ctx.config` never holds the rejected address.
-        contactEmailInvalid: ctx.config.contactEmailInvalid,
-        rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
-        // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
-        // default when the env names nothing, so that form would call every default install
-        // "configured". Matches listProjects.ts exactly.
-        envConfigured: ctx.config.rewriteModeExplicit === true,
-        writingGuideExtraPath: ctx.config.extraWritingGuidePath
-          ? toPosix(ctx.config.extraWritingGuidePath)
-          : undefined,
-        writingGuideExtraLoaded: ctx.config.extraWritingGuidePath
-          ? (ctx.config.extraWritingGuideLoaded ?? false)
-          : undefined,
-        writingGuideExtraRuleCount: await countWritingConventions(ctx.config.extraWritingGuidePath),
-      };
-      // Say it out loud: the exclude is real but lives in .git/info/exclude, which is invisible to
-      // anyone who did not run this server — the user may still want a tracked .gitignore entry.
-      const excludeLine = info.workspaceExcludePattern
-        ? `git: clones are excluded from the host repo as "${info.workspaceExcludePattern}" via ` +
-          '.git/info/exclude (local to this checkout only — collaborators will not see it)\n'
-        : '';
-      // Three states matter here, and only three: not configured (say nothing); configured and
-      // loaded (name the path, so a user can tell it took); configured but NOT loaded (name the
-      // path AND say plainly that those conventions are not in effect — the state a typo produces
-      // silently otherwise, forever, with no other signal).
-      let writingGuideLine = '';
-      if (info.writingGuideExtraPath) {
-        const countClause =
-          info.writingGuideExtraRuleCount !== undefined
-            ? `, ${info.writingGuideExtraRuleCount} conventions`
-            : '';
-        writingGuideLine = info.writingGuideExtraLoaded
-          ? `writing guide (project-specific): ${info.writingGuideExtraPath} — loaded${countClause}\n`
-          : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT ` +
-            `loaded${countClause}; these conventions are not in effect\n`;
-      }
-      // An unusable WEB_LATEX_MCP_REFERENCE_SOURCE REPLACES the unpinned description rather than
-      // appending to it: search_references refuses in that state, so describing the fallback
-      // order here would tell a user diagnosing that refusal exactly the wrong thing.
-      const referencesDetail = info.referenceSourceInvalid
-        ? `WEB_LATEX_MCP_REFERENCE_SOURCE is set to "${info.referenceSourceInvalid}", which is ` +
-          `not a backend (expected one of: ${REFERENCE_SOURCES.join(', ')}) — search_references ` +
-          'REFUSES until it is fixed or unset, unless the call passes source:. Every other tool ' +
-          'is unaffected'
-        : info.referenceSource
-          ? `${info.referenceSource} (WEB_LATEX_MCP_REFERENCE_SOURCE — never substituted)`
-          : 'dblp, then crossref, then openalex (unpinned — an unreachable one is substituted)';
-      // Same shape, and for the same reason: an unusable WEB_LATEX_MCP_CONTACT_EMAIL REPLACES
-      // the reassuring clause instead of silently reading as "nobody configured a contact".
-      // The address itself is never rendered — only that one was set and rejected.
-      const contactDetail = info.contactEmailInvalid
-        ? ', polite-pool contact IGNORED (WEB_LATEX_MCP_CONTACT_EMAIL is not a usable address)'
-        : info.contactEmailConfigured
-          ? ', polite-pool contact set'
+      try {
+        const info = {
+          name: 'web-latex-mcp',
+          version: getServerVersion(),
+          workspaceRoot: toPosix(ctx.config.workspaceRoot),
+          workspaceLocal: ctx.config.workspaceIsLocal ?? false,
+          workspaceExcludePattern: ctx.config.workspaceExcludePattern,
+          compiler: ctx.config.compiler ?? 'latexmk',
+          // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
+          // "dblp" here would describe the fallback order's first try as a choice someone made.
+          referenceSource: ctx.config.referenceSourceExplicit
+            ? ctx.config.referenceSource
+            : undefined,
+          // Reported apart from `referenceSource`, never folded into it: the value is not a
+          // backend id, and a rejected value is nobody's choice.
+          referenceSourceInvalid: ctx.config.referenceSourceInvalid,
+          contactEmailConfigured: ctx.config.contactEmail !== undefined,
+          // The boolean, and only the boolean: `ctx.config` never holds the rejected address.
+          contactEmailInvalid: ctx.config.contactEmailInvalid,
+          rewriteMode: ctx.config.rewriteMode ?? DEFAULT_REWRITE_MODE,
+          // Not `rewriteMode !== undefined`: loadConfig populates rewriteMode with the built-in
+          // default when the env names nothing, so that form would call every default install
+          // "configured". Matches listProjects.ts exactly.
+          envConfigured: ctx.config.rewriteModeExplicit === true,
+          writingGuideExtraPath: ctx.config.extraWritingGuidePath
+            ? toPosix(ctx.config.extraWritingGuidePath)
+            : undefined,
+          writingGuideExtraLoaded: ctx.config.extraWritingGuidePath
+            ? (ctx.config.extraWritingGuideLoaded ?? false)
+            : undefined,
+          writingGuideExtraRuleCount: await countWritingConventions(
+            ctx.config.extraWritingGuidePath,
+          ),
+        };
+        // Say it out loud: the exclude is real but lives in .git/info/exclude, which is invisible to
+        // anyone who did not run this server — the user may still want a tracked .gitignore entry.
+        const excludeLine = info.workspaceExcludePattern
+          ? `git: clones are excluded from the host repo as "${info.workspaceExcludePattern}" via ` +
+            '.git/info/exclude (local to this checkout only — collaborators will not see it)\n'
           : '';
-      const text =
-        `web-latex-mcp v${info.version}\n` +
-        `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
-        excludeLine +
-        writingGuideLine +
-        `compiler: ${info.compiler}\n` +
-        `references: ${referencesDetail}${contactDetail}\n` +
-        `rewrite mode (default): ${info.rewriteMode}` +
-        (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
-      return {
-        content: [{ type: 'text', text }],
-        structuredContent: { ...info },
-      };
+        // Three states matter here, and only three: not configured (say nothing); configured and
+        // loaded (name the path, so a user can tell it took); configured but NOT loaded (name the
+        // path AND say plainly that those conventions are not in effect — the state a typo produces
+        // silently otherwise, forever, with no other signal).
+        let writingGuideLine = '';
+        if (info.writingGuideExtraPath) {
+          const countClause =
+            info.writingGuideExtraRuleCount !== undefined
+              ? `, ${info.writingGuideExtraRuleCount} conventions`
+              : '';
+          writingGuideLine = info.writingGuideExtraLoaded
+            ? `writing guide (project-specific): ${info.writingGuideExtraPath} — loaded${countClause}\n`
+            : `writing guide (project-specific): ${info.writingGuideExtraPath} — NOT ` +
+              `loaded${countClause}; these conventions are not in effect\n`;
+        }
+        // An unusable WEB_LATEX_MCP_REFERENCE_SOURCE REPLACES the unpinned description rather than
+        // appending to it: search_references refuses in that state, so describing the fallback
+        // order here would tell a user diagnosing that refusal exactly the wrong thing.
+        const referencesDetail = info.referenceSourceInvalid
+          ? `WEB_LATEX_MCP_REFERENCE_SOURCE is set to ${quoteInvalidSource(info.referenceSourceInvalid)}, which is ` +
+            `not a backend (expected one of: ${REFERENCE_SOURCES.join(', ')}) — search_references ` +
+            'REFUSES until it is fixed or unset, unless the call passes source:. Every other tool ' +
+            'is unaffected'
+          : info.referenceSource
+            ? `${info.referenceSource} (WEB_LATEX_MCP_REFERENCE_SOURCE — never substituted)`
+            : 'dblp, then crossref, then openalex (unpinned — an unreachable one is substituted)';
+        // Same shape, and for the same reason: an unusable WEB_LATEX_MCP_CONTACT_EMAIL REPLACES
+        // the reassuring clause instead of silently reading as "nobody configured a contact".
+        // The address itself is never rendered — only that one was set and rejected.
+        const contactDetail = info.contactEmailInvalid
+          ? ', polite-pool contact IGNORED (WEB_LATEX_MCP_CONTACT_EMAIL is not a usable address)'
+          : info.contactEmailConfigured
+            ? ', polite-pool contact set'
+            : '';
+        const text =
+          `web-latex-mcp v${info.version}\n` +
+          `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
+          excludeLine +
+          writingGuideLine +
+          `compiler: ${info.compiler}\n` +
+          `references: ${referencesDetail}${contactDetail}\n` +
+          `rewrite mode (default): ${info.rewriteMode}` +
+          (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: { ...info },
+        };
+      } catch (err) {
+        return errorResult(err, ctx.credentials.allSecrets());
+      }
     },
   );
 }

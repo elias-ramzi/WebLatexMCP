@@ -1076,7 +1076,7 @@ describe('ShadowStore', () => {
       expect(count()).toBe(6); // re-evaluated again — a new HEAD sha each time, no memo hit
     });
 
-    it('a record-time collision (no conflictHead yet) is fully evaluated once by the next refresh, then memoised', async () => {
+    it('a record-time collision is skipped by refresh outright — its shadow is incomplete, so there is nothing to evaluate', async () => {
       const { hasher, count } = countingHasher(identityHasher);
       const store = makeMemoStore('a', hasher);
 
@@ -1085,7 +1085,7 @@ describe('ShadowStore', () => {
       // A second record() call whose "before" no longer matches the shadow (a peer wrote to the
       // same line in the working tree between the two calls) and whose "after" changes it a third
       // way: shadow/before/after all differ on the same line, so record()'s own merge3 conflicts.
-      // This branch (record, not refresh) never sets conflictHead — see the class doc comment.
+      // The write is left out of the shadow, which marks the entry incomplete.
       await store.record(
         PROJECT,
         DIR,
@@ -1095,21 +1095,24 @@ describe('ShadowStore', () => {
       );
       expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
       // record()'s own raw-comparison-failed fallback (before the merge3 that finds the conflict)
-      // already spawns the hasher twice — this is what "no conflictHead yet" costs on its own,
-      // separate from what the next refresh costs.
+      // spawns the hasher twice.
       expect(count()).toBe(2);
 
-      // Move HEAD to yet another value on the same line, so refresh has real work to do.
       headCommit = 'c1';
       setHead(REL, BASE.replace('Alpha line.', 'Alpha per HEAD.'));
 
-      const first = await store.refresh(PROJECT, DIR);
-      expect(first.conflicted).toEqual([REL]);
-      expect(count()).toBe(4); // fully evaluated exactly once (settled-check fallback: +2)
-
-      const second = await store.refresh(PROJECT, DIR);
-      expect(second.conflicted).toEqual([REL]);
-      expect(count()).toBe(4); // memoised — the second call spawns nothing more
+      // Skipped before the memo check, like an unrecorded entry: no HEAD read, no hasher spawn,
+      // and no conflictHead stamped (nothing was judged).
+      for (let i = 0; i < 2; i++) {
+        const refreshed = await store.refresh(PROJECT, DIR);
+        expect(refreshed.conflicted).toEqual([REL]);
+        expect(count()).toBe(2);
+      }
+      const raw = JSON.parse(
+        await readFile(path.join(sessionDir(workspace, PROJECT, 'a'), 'shadow.json'), 'utf8'),
+      ) as { entries: Record<string, { conflictHead?: string; incomplete?: boolean }> };
+      expect(raw.entries[REL]?.conflictHead).toBeUndefined();
+      expect(raw.entries[REL]?.incomplete).toBe(true);
     });
 
     it('an old index entry with conflicted:true but no conflictHead is re-evaluated, not skipped', async () => {
@@ -1161,6 +1164,231 @@ describe('ShadowStore', () => {
         await readFile(path.join(sessionDir(workspace, PROJECT, 'a'), 'shadow.json'), 'utf8'),
       ) as { entries: Record<string, { conflictHead?: string }> };
       expect(raw.entries[REL]?.conflictHead).toBeUndefined();
+    });
+  });
+
+  /**
+   * A conflicted entry whose shadow is MISSING one of this session's writes — a record-time
+   * collision, or a write that reached the working tree while the entry was already conflicted —
+   * is known-incomplete, exactly like an `unrecorded` one: "the stale shadow merges cleanly onto
+   * the new HEAD" and "HEAD equals the shadow" are both statements about a shadow that lacks the
+   * write, so neither may clear the flag. Before this, `refresh` advanced/settled such an entry,
+   * the missing write was owned by nobody, and a live peer's `scope: "paths"` took it.
+   */
+  describe('an incomplete conflicted entry stays flagged through refresh', () => {
+    const betaB = BASE.replace('Beta line.', 'Beta line, by B.');
+
+    it('a record-time collision is not advanced when HEAD moves and the stale shadow merges cleanly', async () => {
+      const store = makeStore('b');
+      await store.record(PROJECT, DIR, REL, BASE, betaB);
+      // A peer changed Alpha in the working tree; this session rewrites that same line.
+      const peerAlpha = betaB.replace('Alpha line.', 'Alpha per A.');
+      await store.record(
+        PROJECT,
+        DIR,
+        REL,
+        peerAlpha,
+        peerAlpha.replace('Alpha per A.', 'Alpha per B.'),
+      );
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+
+      // The peer commits its Alpha line: shadow (BASE + Beta) merges cleanly onto it.
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed).toEqual({ advanced: [], conflicted: [REL], settled: [] });
+      const change = only(await store.changes(PROJECT));
+      expect(change.conflicted).toBe(true);
+      expect(change.content).toBe(betaB); // shadow untouched
+      expect(change.base).toBe(BASE); // base untouched
+    });
+
+    it('a write made while conflicted keeps the entry from settling when HEAD lands on the shadow', async () => {
+      const b = makeStore('b');
+      const mine = BASE.replace('Alpha line.', 'Alpha per B.');
+      await b.record(PROJECT, DIR, REL, BASE, mine);
+      const landed = BASE.replace('Alpha line.', 'Alpha per A.');
+      setHead(REL, landed);
+      await b.refresh(PROJECT, DIR);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      // A write while conflicted: never folded into the shadow.
+      await b.record(PROJECT, DIR, REL, landed, landed.replace('Beta line.', 'Beta line, by B.'));
+
+      // HEAD moves to exactly the (stale) shadow. Pre-fix this settled the entry and forgot the
+      // Beta write; it must stay flagged.
+      setHead(REL, mine);
+      const refreshed = await b.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+    });
+
+    it('a refresh-time conflict that received no write while conflicted can still settle (its shadow is complete)', async () => {
+      const b = makeStore('b');
+      const mine = BASE.replace('Alpha line.', 'Alpha per B.');
+      await b.record(PROJECT, DIR, REL, BASE, mine);
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+      await b.refresh(PROJECT, DIR);
+      expect(only(await b.changes(PROJECT)).conflicted).toBe(true);
+
+      setHead(REL, mine);
+      const refreshed = await b.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([REL]);
+      expect(await b.changes(PROJECT)).toEqual([]);
+    });
+
+    it('a binary record-time collision does not settle when HEAD lands on the shadow bytes', async () => {
+      const PNG_REL = 'figs/photo.png';
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, PNG_REL, null, PNG);
+      await store.record(
+        PROJECT,
+        DIR,
+        PNG_REL,
+        Buffer.from([0x01, 0x02, 0x03]),
+        Buffer.from([0x04, 0x05, 0x06]),
+      );
+      setHead(PNG_REL, PNG);
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.conflicted).toEqual([PNG_REL]);
+    });
+
+    it('changes() and peerEntries() report an incomplete entry conflicted even without the raw flag', async () => {
+      const dir = sessionDir(workspace, PROJECT, 'hand');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        path.join(dir, 'shadow.json'),
+        JSON.stringify({
+          entries: { [REL]: { deleted: false, baseExists: true, incomplete: true } },
+        }),
+        'utf8',
+      );
+      const store = makeStore('hand');
+      expect(only(await store.changes(PROJECT)).conflicted).toBe(true);
+      expect((await store.peerEntries(PROJECT, 'hand'))?.[0]?.conflicted).toBe(true);
+    });
+  });
+
+  describe('an edit reverted to HEAD settles without HEAD moving', () => {
+    it('drops a text entry whose shadow equals HEAD (and its base)', async () => {
+      const store = makeStore('a');
+      const edited = BASE.replace('Alpha line.', 'Alpha per A.');
+      await store.record(PROJECT, DIR, REL, BASE, edited);
+      await store.record(PROJECT, DIR, REL, edited, BASE);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([REL]);
+      expect(await store.hasChanges(PROJECT)).toBe(false);
+    });
+
+    it('drops a file this session created and then deleted again (absent at HEAD)', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, 'new.tex', null, 'x\n');
+      await store.record(PROJECT, DIR, 'new.tex', 'x\n', null);
+
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual(['new.tex']);
+      expect(await store.hasChanges(PROJECT)).toBe(false);
+    });
+
+    it('keeps an ordinary in-flight edit while HEAD stays put', async () => {
+      const store = makeStore('a');
+      await store.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed).toEqual({ advanced: [], conflicted: [], settled: [] });
+      expect(await store.hasChanges(PROJECT)).toBe(true);
+    });
+
+    it('never settles an unrecorded entry on HEAD == shadow == base', async () => {
+      const store = makeStore('a');
+      const edited = BASE.replace('Alpha line.', 'Alpha per A.');
+      await store.record(PROJECT, DIR, REL, BASE, edited);
+      await store.record(PROJECT, DIR, REL, edited, BASE);
+      await store.markUnrecorded(PROJECT, REL);
+      const refreshed = await store.refresh(PROJECT, DIR);
+      expect(refreshed.settled).toEqual([]);
+      expect(refreshed.conflicted).toEqual([REL]);
+    });
+  });
+
+  describe('refreshedChanges (the lock-free view status uses)', () => {
+    it('reports the refreshed picture but writes nothing', async () => {
+      const a = makeStore('a');
+      const b = makeStore('b');
+      const afterA = BASE.replace('Alpha line.', 'Alpha by A.');
+      const afterB = afterA.replace('Beta line.', 'Beta by B.');
+      await a.record(PROJECT, DIR, REL, BASE, afterA);
+      await b.record(PROJECT, DIR, REL, afterA, afterB);
+      await b.record(PROJECT, DIR, 'other.tex', null, 'o\n');
+      setHead(REL, afterA); // A's commit lands
+
+      const bDir = sessionDir(workspace, PROJECT, 'b');
+      const snapshot = async (): Promise<string[]> =>
+        Promise.all([
+          readFile(path.join(bDir, 'shadow.json'), 'utf8'),
+          readFile(path.join(bDir, 'shadow', REL), 'utf8'),
+          readFile(path.join(bDir, 'base', REL), 'utf8'),
+        ]);
+      const before = await snapshot();
+
+      const viewB = await b.refreshedChanges(PROJECT, DIR);
+      const rel = viewB.find((c) => c.path === REL);
+      expect(rel?.conflicted).toBe(false);
+      expect(rel?.content).toBe(afterB);
+      expect(rel?.base).toBe(afterA);
+      expect(viewB.map((c) => c.path)).toEqual(
+        ['other.tex', REL].sort((x, y) => x.localeCompare(y)),
+      );
+      expect(await snapshot()).toEqual(before);
+
+      // A settled entry is left out of the view, still without touching disk.
+      const aDir = sessionDir(workspace, PROJECT, 'a');
+      const aIndex = await readFile(path.join(aDir, 'shadow.json'), 'utf8');
+      expect(await a.refreshedChanges(PROJECT, DIR)).toEqual([]);
+      expect(await readFile(path.join(aDir, 'shadow.json'), 'utf8')).toBe(aIndex);
+      expect(await a.hasChanges(PROJECT)).toBe(true);
+    });
+
+    it('agrees with refresh() + changes() on a conflict', async () => {
+      const b = makeStore('b');
+      await b.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per B.'));
+      setHead(REL, BASE.replace('Alpha line.', 'Alpha per A.'));
+      const view = await b.refreshedChanges(PROJECT, DIR);
+      await b.refresh(PROJECT, DIR);
+      expect(view).toEqual(await b.changes(PROJECT));
+      expect(only(view).conflicted).toBe(true);
+    });
+  });
+
+  describe('index read-modify-writes are serialised in-process', () => {
+    /** A HEAD reader that stalls on one path, so a refresh holds the index across a real await. */
+    const slowStore = (sessionId: string, slowRel: string): ShadowStore =>
+      new ShadowStore(workspace, sessionId, async (_dir, rel) => {
+        if (rel === slowRel) await new Promise((r) => setTimeout(r, 40));
+        return head.get(rel) ?? null;
+      });
+
+    it("a record landing during this session's refresh is not overwritten by it", async () => {
+      const store = slowStore('a', 'seed.tex');
+      await store.record(PROJECT, DIR, 'seed.tex', null, 's\n');
+      const refreshing = store.refresh(PROJECT, DIR);
+      await new Promise((r) => setTimeout(r, 5));
+      await store.record(PROJECT, DIR, 'new.tex', null, 'n\n');
+      await refreshing;
+      expect((await store.changes(PROJECT)).map((c) => c.path)).toEqual(['new.tex', 'seed.tex']);
+    });
+
+    it("a peer store's settleAll during this session's refresh is not undone by it", async () => {
+      const a = slowStore('a', 'seed.tex');
+      const b = makeStore('b');
+      await a.record(PROJECT, DIR, 'seed.tex', null, 's\n');
+      await a.record(PROJECT, DIR, REL, BASE, BASE.replace('Alpha line.', 'Alpha per A.'));
+      const refreshing = a.refresh(PROJECT, DIR);
+      await new Promise((r) => setTimeout(r, 5));
+      await b.settleAll(PROJECT, [REL]);
+      await refreshing;
+      expect((await a.changes(PROJECT)).map((c) => c.path)).toEqual(['seed.tex']);
     });
   });
 });

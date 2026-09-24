@@ -664,16 +664,17 @@ describe('FileService write + edit', () => {
 
     // The "related case" named alongside the EOF bug: an oldString ending in a lone '\r' (its
     // own last byte, with no '\n' after it inside oldString) makes commentOut carry that '\r'
-    // through as the literal last character of the comment block (see commentOut's docstring —
-    // it only strips a '\r' as an end-of-line marker when a '\n' closes that same line *inside*
-    // the string being commented). Getting this wrong is easy in both directions: this session's
-    // own first attempt at the EOF fix (checking `oldString.endsWith('\r')` and forcing a full
-    // '\r\n' separator) doubled the '\r' into '\r\r\n' here, since commented's own trailing '\r'
-    // already supplies half the pair.
+    // through as the literal last character of the comment block. Getting this wrong is easy in
+    // both directions: this session's own first attempt at the EOF fix (checking
+    // `oldString.endsWith('\r')` and forcing a full '\r\n' separator) doubled the '\r' into
+    // '\r\r\n' here, since commented's own trailing '\r' already supplies a terminator. That '\r'
+    // is a whole one — the file ended that line with a bare CR — so it stays bare: completing it
+    // into the file's CRLF made naming it in oldString and leaving it in the file two spellings
+    // of one edit that wrote different bytes.
     it(
-      "an oldString ending in a lone '\\r' (its own trailing byte, no paired '\\n') still " +
-        'produces a single, correct CRLF pair before the replacement — never a doubled \\r and ' +
-        'never an LF-only ending',
+      "an oldString ending in a lone '\\r' (its own trailing byte, no paired '\\n') keeps " +
+        'that bare \\r as the separator — never doubled into \\r\\r\\n, never completed into ' +
+        'CRLF, never an LF-only ending',
       async () => {
         // The match ends at EOF; oldString's last byte is a bare '\r' with nothing after it.
         const content = 'x\r\nsome line\r';
@@ -682,7 +683,7 @@ describe('FileService write + edit', () => {
         await files.applyEdits(dir, crlfPath, [{ oldString: 'some line\r', newString: 'NEW' }], {
           preserve,
         });
-        expect(await readFile(path.join(dir, crlfPath), 'utf8')).toBe('x\r\n% some line\r\nNEW');
+        expect(await readFile(path.join(dir, crlfPath), 'utf8')).toBe('x\r\n% some line\rNEW');
       },
     );
   });

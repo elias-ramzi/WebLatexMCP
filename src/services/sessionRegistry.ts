@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { mkdir, readdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
+import { renameWithRetry } from '../lib/fileLock.js';
 import {
   currentBootStamp,
   isSameBoot,
@@ -257,18 +258,71 @@ export class SessionRegistry {
     return [...this.lastHeartbeat.keys()];
   }
 
+  /**
+   * The record in `dir`, or `null` when it is unreadable: missing, not JSON, not an object, or
+   * carrying no usable `pid` (a number) or `heartbeatAt` (a string) — the two fields liveness is
+   * judged on, without which the record could be neither kept live nor judged dead. A
+   * `heartbeatAt` string that does not parse as a date stays a record (its NaN age is already
+   * handled by `peers()`).
+   *
+   * Every other field is repaired rather than grounds for dropping the record, because dropping
+   * fails OPEN: a record with a live pid that `peers()` never lists is missing from `livePeers()`,
+   * so `commit scope: "paths"` and `push` see nobody to protect and take that session's lines.
+   *  - `sessionId` is always the directory's own name. The directory is the authority: every
+   *    caller turns the id back into it (`sessionDir`, which refuses anything but one path
+   *    segment), so a record claiming `../x` made `status`/`commit`/`push` throw for every session,
+   *    and one claiming another valid id would have peers read THAT session's shadow index as this
+   *    one's. A genuine record always agrees — `touch()` writes into `sessionDir(this.sessionId)`.
+   *  - `startedAt`, informational only, falls back to `heartbeatAt`.
+   *  - a `bootedAt` that is not a string is no stamp at all — no evidence either way, which is
+   *    what an absent stamp already means (`withinLegacyPidGrace`), not evidence against the pid.
+   *
+   * An unreadable record is treated the way it always has been by every caller: `peers()` does
+   * not list it, so it is never judged dead either and `collectGarbage` never reaps its directory.
+   */
   private async readRecord(dir: string): Promise<SessionRecord | null> {
+    let parsed: unknown;
     try {
-      return JSON.parse(await readFile(path.join(dir, 'session.json'), 'utf8')) as SessionRecord;
+      parsed = JSON.parse(await readFile(path.join(dir, 'session.json'), 'utf8'));
     } catch {
       return null;
     }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const r = parsed as Record<string, unknown>;
+    if (typeof r.pid !== 'number' || typeof r.heartbeatAt !== 'string') return null;
+    return {
+      sessionId: path.basename(dir),
+      pid: r.pid,
+      startedAt: typeof r.startedAt === 'string' ? r.startedAt : r.heartbeatAt,
+      heartbeatAt: r.heartbeatAt,
+      ...(typeof r.bootedAt === 'string' ? { bootedAt: r.bootedAt } : {}),
+    };
   }
 }
 
-/** Write via a temp file + rename, so a reader never sees a half-written record. */
-export async function writeAtomic(target: string, content: string): Promise<void> {
-  const tmp = `${target}.${process.pid}.tmp`;
+/** Distinguishes concurrent `writeAtomic` calls within one process — see its temp name. */
+let atomicWriteSeq = 0;
+
+/**
+ * Write via a temp file + rename, so a reader never sees a half-written record.
+ *
+ * The temp name carries the pid AND a per-process counter: named by pid alone, two in-flight
+ * writes to one target in one process (two concurrent `status` calls each rewriting the shadow
+ * index) shared one temp file, the first rename consumed it, and the second failed with ENOENT.
+ * The rename retries the transient refusals Windows gives two renames racing onto one target
+ * (`renameWithRetry`); `opts.rename` is a test seam.
+ */
+export async function writeAtomic(
+  target: string,
+  content: string,
+  opts: { rename?: (from: string, to: string) => Promise<void> } = {},
+): Promise<void> {
+  const tmp = `${target}.${process.pid}.${atomicWriteSeq++}.tmp`;
   await writeFile(tmp, content, 'utf8');
-  await rename(tmp, target);
+  try {
+    await renameWithRetry(tmp, target, opts.rename ?? rename);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
 }

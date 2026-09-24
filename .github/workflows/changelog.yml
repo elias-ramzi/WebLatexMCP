@@ -32,9 +32,13 @@ jobs:
         id: skip
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          # The back-merge comes from THIS repo's `main`. A fork's branch that happens to be named
+          # `main` is an ordinary contribution and must not skip the check on its name alone.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          if [ "$HEAD_REF" = "main" ]; then
+          if [ "$HEAD_REF" = "main" ] && [ "$HEAD_REPO" = "$THIS_REPO" ]; then
             echo "reason=back-merge from main" >> "$GITHUB_OUTPUT"
           elif echo "$LABELS" | grep -q '"no-changelog"'; then
             echo "reason=labelled no-changelog" >> "$GITHUB_OUTPUT"

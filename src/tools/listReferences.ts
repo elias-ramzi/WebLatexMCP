@@ -7,6 +7,7 @@ import { referenceSourceCandidates } from '../lib/referenceSources.js';
 import { planReferenceFields } from '../lib/referenceFieldsBudget.js';
 import { planReferenceRaw } from '../lib/referenceRawBudget.js';
 import { planReferenceTyped, renderReferenceLine } from '../lib/referenceTypedBudget.js';
+import { wholeSources } from '../lib/referenceBaseline.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -238,48 +239,6 @@ function matches(entry: Located, needle: string): boolean {
   return haystack.includes(needle);
 }
 
-/** The per-entry counters every budget sets when it cuts something out of an entry. */
-interface CuttableEntry {
-  path: string;
-  fieldsOmitted?: number;
-  rawOmitted?: number;
-  typedOmitted?: number;
-  authorsOmitted?: number;
-}
-
-/**
- * The files the caller genuinely received in full — the only ones this tool may claim the
- * out-of-band-edit baseline for (issue #171).
- *
- * The licence `FileService.read` grants is "the caller asked for this file and received ALL of
- * it", and `list_references` held it on the premise that it hands back every entry verbatim. Three
- * changes ate that premise: #147 made `raw` cuttable, #165 made the typed fields cuttable, and
- * #170 dropped the default `maxResults` from 200 to 50 — so on an ordinary 200-entry `.bib` the
- * default call now shows 50 entries and used to reset the baseline over the whole file.
- *
- * So the test is per file, and it is the conjunction of both ways a file can arrive short: every
- * entry it contributed reached the result (nothing lost to `filter` or `maxResults` — the counts
- * must match `sources[].count`, which is taken before either applies), and not one of those
- * entries carries a cut counter from any of the three budgets. Each clause only narrows, which is
- * the direction this has to err in: not recording costs the caller nothing they cannot see, while
- * recording wrongly disarms the guard for a file the user is editing by hand.
- *
- * A candidate that parsed to no entries at all never reaches `sources`, and so is never recorded:
- * the caller received none of its bytes.
- */
-function wholeSources(
-  sources: ReadonlyArray<{ path: string; count: number }>,
-  entries: readonly CuttableEntry[],
-): string[] {
-  const intact = new Map<string, number>();
-  for (const entry of entries) {
-    if (entry.rawOmitted !== undefined || entry.fieldsOmitted !== undefined) continue;
-    if (entry.typedOmitted !== undefined || entry.authorsOmitted !== undefined) continue;
-    intact.set(entry.path, (intact.get(entry.path) ?? 0) + 1);
-  }
-  return sources.filter((s) => (intact.get(s.path) ?? 0) === s.count).map((s) => s.path);
-}
-
 export function registerListReferences(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'list_references',
@@ -355,8 +314,10 @@ export function registerListReferences(server: McpServer, ctx: AppContext): void
         // bytes already in hand (#182), never by reading them again. A second read would record
         // whatever the file says NOW, so a hand edit landing between the two reads became the
         // baseline and the guard never fired for it; the bytes above are the ones the caller was
-        // actually shown, so that window does not exist.
-        const whole = new Set(wholeSources(sources, entries));
+        // actually shown, so that window does not exist. "Whole" is judged on the file's BYTES,
+        // not its entries: see `wholeSources` for why a `thebibliography`, a prose list, or a
+        // `.bib` carrying `@string`/`%` text between its entries never qualifies.
+        const whole = new Set(wholeSources(sources, entries, texts));
         for (const [candidate, text] of texts) {
           if (whole.has(candidate)) await ctx.files.recordBaseline(dir, candidate, text);
         }

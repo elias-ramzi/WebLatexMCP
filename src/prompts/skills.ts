@@ -1,6 +1,23 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Skill, SkillProjectUse } from '../lib/skills.js';
+import { escapeInvisibleChars, quoteId } from '../lib/projectId.js';
+
+/**
+ * `id` as a Markdown code span nothing in it can break out of. A registered id holds no backtick
+ * (`src/lib/projectId.ts` refuses one), but an `unknown`/`unverified` id is whatever the client
+ * sent: a backtick in it closed the span early, and a newline forged a line of the instruction.
+ * So invisible and line-breaking characters are written as `\u{…}` (`escapeInvisibleChars`), and
+ * the fence is one backtick longer than the longest run inside, padded with a space where the
+ * text itself starts or ends with one (CommonMark strips exactly one such space).
+ */
+function idCodeSpan(id: string): string {
+  const text = escapeInvisibleChars(id);
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = '`'.repeat(longest + 1);
+  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : '';
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
 
 /**
  * What the caller found out about the `project` argument it was handed, so
@@ -45,7 +62,7 @@ export function judgeProject(id: string, isRegisteredProject?: ProjectLookup): P
     return isRegisteredProject(id) ? 'known' : 'unknown';
   } catch (err) {
     console.error(
-      `[web-latex-mcp] could not check whether "${id}" is a registered project: ` +
+      `[web-latex-mcp] could not check whether ${quoteId(id)} is a registered project: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
     return 'unverified';
@@ -83,14 +100,14 @@ export function buildSkillMessage(
     scope = 'Ask which project to apply it to if that is not already clear from the conversation.';
   } else if (verdict === 'unknown') {
     scope =
-      `No project named \`${id}\` is registered with this server — do not assume it exists or ` +
-      'act on it. Ask which project to use; `list_projects` shows what is registered.';
+      `No project named ${idCodeSpan(id)} is registered with this server — do not assume it ` +
+      'exists or act on it. Ask which project to use; `list_projects` shows what is registered.';
   } else if (verdict === 'unverified') {
     scope =
-      `\`${id}\` was supplied as the project, but the registered projects could not be checked ` +
-      'just now — confirm it with `list_projects` before acting on it.';
+      `${idCodeSpan(id)} was supplied as the project, but the registered projects could not be ` +
+      'checked just now — confirm it with `list_projects` before acting on it.';
   } else {
-    scope = `Apply it to the project \`${id}\`.`;
+    scope = `Apply it to the project ${idCodeSpan(id)}.`;
   }
   return `${header} ${scope}\n\n${body}`;
 }

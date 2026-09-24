@@ -215,9 +215,16 @@ const VENUE_FIELDS = [
   'howpublished',
 ];
 
+/** An empty field map with no prototype — see `parseFields`. */
+function emptyFieldMap(): Record<string, string> {
+  return Object.create(null) as Record<string, string>;
+}
+
 /** Parse `name = value` pairs from an entry body (everything after the cite key). */
 function parseFields(body: string, macros: Map<string, string>): Record<string, string> {
-  const fields: Record<string, string> = {};
+  // Null-prototype: the keys are field names the document chose, so the map must answer only for
+  // the fields the entry declares — never for `constructor`/`toString` inherited from a `{}`.
+  const fields = emptyFieldMap();
   for (const chunk of splitTopLevel(body, ',')) {
     const eq = chunk.indexOf('=');
     if (eq === -1) continue;
@@ -260,7 +267,7 @@ export function parseBibtex(text: string): ReferenceEntry[] {
       const comma = body.indexOf(',');
       const key = (comma === -1 ? body : body.slice(0, comma)).trim();
       if (key) {
-        const fields = comma === -1 ? {} : parseFields(body.slice(comma + 1), macros);
+        const fields = comma === -1 ? emptyFieldMap() : parseFields(body.slice(comma + 1), macros);
         const { authors, truncated } = splitBibAuthors(fields.author ?? fields.editor ?? '');
         const year = /(\d{4})/.exec(fields.year ?? fields.date ?? '')?.[1];
         entries.push({
@@ -488,7 +495,11 @@ const REQUIRED_FIELDS: Record<string, string[]> = {
  */
 export function missingRequiredFields(entry: ReferenceEntry): string[] {
   if (entry.format !== 'bibtex' || !entry.fields || !entry.type) return [];
-  const required = REQUIRED_FIELDS[entry.type];
+  // Own keys only: the entry type is the document's (`@constructor{…}`), and an inherited member
+  // of a plain object is not a list of required fields — `.filter` on it threw.
+  const required = Object.hasOwn(REQUIRED_FIELDS, entry.type)
+    ? REQUIRED_FIELDS[entry.type]
+    : undefined;
   if (!required) return [];
   const fields = entry.fields;
   return required.filter((spec) => !spec.split('|').some((name) => fields[name]?.trim()));

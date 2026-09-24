@@ -50,11 +50,12 @@ interface ShadowIndexEntry {
    * (leaving the shadow and base exactly as they were) and `refresh` writes nothing on either
    * conflicting branch — so `refresh` skips recomputing it: no HEAD blob read, no shadow read, no
    * merge, no `sameAsGitSees` spawn. Absent on entries written before this field existed (simply
-   * re-evaluated once, which then sets it) and on a `record`-time collision: set only by
-   * `refresh`, and only on its three conflicting branches — so while HEAD still equals such an
-   * entry's base, each `refresh` reads HEAD's blob and the base, finds them equal and moves on
-   * (no merge, no spawn) without ever setting the memo; the field is first set by the `refresh`
-   * that runs after HEAD moves. Cleared wherever `conflicted` is cleared.
+   * re-evaluated once, which then sets it) and on a `record`-time collision: set only by a
+   * persisting `refresh`, and only on its three conflicting branches. A `record`-time collision
+   * never gets one at all — it is `incomplete`, which `refresh` skips before the memo check, as it
+   * does an `unrecorded` entry — and neither does an entry that becomes `incomplete` later: once
+   * set, `refresh` never re-judges it, so the stale memo is inert. Cleared wherever `conflicted`
+   * is cleared.
    */
   conflictHead?: string;
   /**
@@ -82,10 +83,56 @@ interface ShadowIndexEntry {
    * failed") in messages shown to the caller.
    */
   unrecorded?: boolean;
+  /**
+   * Set when `record` could not fold one of this session's writes into the shadow even though the
+   * record itself succeeded: a record-time collision (the write rewrote lines a peer had already
+   * changed in the working tree, so there is no honest merge) or a write that landed while the
+   * entry was already `conflicted` (its base is stale, so nothing can be folded in). Either way the
+   * shadow no longer holds this session's latest change to the file — the same known-incomplete
+   * state `unrecorded` describes, reached by a different cause — so `refresh` treats it exactly as
+   * it treats `unrecorded`: it never advances, settles or re-judges the entry, because "the stale
+   * shadow merges cleanly onto the new HEAD" and "HEAD equals the shadow" are both statements
+   * about a shadow that lacks the write. Clearing the flag there made the missing write owned by
+   * nobody, so a live peer's `commit scope: "paths"` took it. Always paired with `conflicted`.
+   *
+   * A separate flag rather than `unrecorded`, because `commit` reports `unrecorded` entries as
+   * "this session's own record failed" (and lists them under `unrecorded`), which is not what
+   * happened here: the record succeeded and found a collision — `commit`'s "collided" wording is
+   * the true one. Only a deliberate take (`settle`/`clear`: commit scope "all"/"paths") or a
+   * discard (`settleAll`/`clearAll`) ends this state, by dropping the entry.
+   *
+   * A `conflicted` entry WITHOUT this flag was flagged by `refresh` alone and received no write
+   * since, so its shadow still holds every write this session made (only its base is stale):
+   * `refresh` may still advance or settle it once HEAD moves so that the merge is clean or lands
+   * on the shadow — that is a verdict about a complete shadow, and it is the right one.
+   */
+  incomplete?: boolean;
 }
 
 interface ShadowIndex {
+  /**
+   * Keyed by project-relative path — a name the project's author chose — so this map is ALWAYS a
+   * null-prototype object (`entryMap`), never a `{}` literal: on an ordinary object a file named
+   * `constructor`/`toString` read back an inherited function as its "existing entry" (then dropped
+   * by `JSON.stringify`), and one named `__proto__` read back `Object.prototype` itself, which
+   * `record` then stamped `touchedAt`/`binary`/... onto — polluting every object in the process —
+   * while the entry was lost. On disk it stays a plain JSON object; only the in-memory copy changes.
+   */
   entries: Record<string, ShadowIndexEntry>;
+}
+
+/**
+ * A null-prototype copy of `from`'s own enumerable entries (or an empty one) — the only way a
+ * `ShadowIndex.entries` map is ever built. `JSON.parse` keeps a `"__proto__"` key as an own
+ * property but returns an ordinary object, so a loaded index is copied key by key; assignment into
+ * a null-prototype target defines `__proto__` as a plain data property rather than reaching a setter.
+ */
+function entryMap(from?: object): Record<string, ShadowIndexEntry> {
+  const out = Object.create(null) as Record<string, ShadowIndexEntry>;
+  if (from) {
+    for (const [key, value] of Object.entries(from)) out[key] = value as ShadowIndexEntry;
+  }
+  return out;
 }
 
 /** One entry of a session's shadow index, as read by a peer — no lock, no content resolved. */
@@ -119,11 +166,53 @@ export interface RefreshResult {
   advanced: string[];
   /**
    * Files left flagged: where this session's edits and a commit touched the same lines, plus every
-   * `unrecorded` entry, which `refresh` skips without reading HEAD (see the loop in `refresh`).
+   * `unrecorded` or `incomplete` entry, which `refresh` skips without reading HEAD (see
+   * `judgeEntry`).
    */
   conflicted: string[];
   /** Files dropped because the session's change is now part of HEAD (typically its own commit). */
   settled: string[];
+}
+
+/**
+ * What a refresh decides for one entry (`ShadowStore.judge`). `conflicted` with `flag: false`
+ * reports an entry that is already flagged and must be left exactly as it is (unrecorded,
+ * incomplete, or a memo hit); `flag: true` is a fresh verdict to write, stamping `conflictHead`
+ * when HEAD's sha is known.
+ */
+type Verdict =
+  | { kind: 'keep' }
+  | { kind: 'settled' }
+  | { kind: 'conflicted'; flag: false }
+  | { kind: 'conflicted'; flag: true; headSha: string | undefined }
+  | { kind: 'advanced'; shadow: Buffer; base: Buffer };
+
+/**
+ * Serialises every read-modify-write of one shadow index within this process, keyed by the
+ * session directory that holds it. Module-level, not per instance: two `ShadowStore`s in one
+ * process (two sessions' contexts, as the integration tests build them) write each other's indexes
+ * through `settleAll`, so a per-instance mutex would not see the other's writes. Across processes
+ * the project's `runExclusive` lock is what serialises writers — every index writer runs under it,
+ * and the one lock-free reader (`status`) goes through `refreshedChanges`, which writes nothing.
+ */
+const indexLocks = new Map<string, Promise<unknown>>();
+
+async function withIndexLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(dir);
+  const prior = indexLocks.get(key) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  // The chain continues whether `fn` resolves or rejects; the caller still sees its own outcome.
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  indexLocks.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    // Drop the key once nothing is queued behind this call, so the map does not grow forever.
+    if (indexLocks.get(key) === tail) indexLocks.delete(key);
+  }
 }
 
 /**
@@ -257,6 +346,18 @@ export class ShadowStore {
     before: string | Buffer | null,
     after: string | Buffer | null,
   ): Promise<void> {
+    await withIndexLock(this.dir(projectId), () =>
+      this.recordLocked(projectId, projectDir, relPath, before, after),
+    );
+  }
+
+  private async recordLocked(
+    projectId: string,
+    projectDir: string,
+    relPath: string,
+    before: string | Buffer | null,
+    after: string | Buffer | null,
+  ): Promise<void> {
     const index = await this.readIndex(projectId);
     const rel = this.entryKey(
       index,
@@ -288,7 +389,10 @@ export class ShadowStore {
       // Once a file is conflicted its shadow is anchored to a base that HEAD has moved past, so
       // no further edit can be folded in safely: committing it would revert whatever landed in
       // between. It stays flagged until the session resolves it deliberately (commit scope
-      // "all", or discard) — see `commit`'s error message.
+      // "all", or discard) — see `commit`'s error message. The write itself is left out of the
+      // shadow, so the shadow is now incomplete (unless the write changed nothing at all) —
+      // which is what stops a later `refresh` from clearing the flag (see `incomplete`).
+      if (!sameContent(before, after)) entry.incomplete = true;
       index.entries[rel] = entry;
       await this.writeIndex(projectId, index);
       return;
@@ -336,7 +440,9 @@ export class ShadowStore {
         delete entry.conflictHead;
         await this.writeShadow(projectId, rel, toBuffer(after));
       } else {
+        // The write is left out of the shadow — see `incomplete`.
         entry.conflicted = true;
+        entry.incomplete = true;
       }
     } else {
       const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
@@ -365,8 +471,10 @@ export class ShadowStore {
         if (conflicted) {
           // This session just edited lines a peer had already changed in the working tree. There
           // is no honest way to say which of the two the shadow should hold, so we keep it as it
-          // was and flag the file — writing markers into the shadow would commit them.
+          // was and flag the file — writing markers into the shadow would commit them. The write
+          // is therefore missing from the shadow: `incomplete`, so no `refresh` clears the flag.
           entry.conflicted = true;
+          entry.incomplete = true;
         } else {
           entry.deleted = false;
           entry.conflicted = false;
@@ -393,18 +501,20 @@ export class ShadowStore {
    * stamped too, since the session did write the file.
    */
   async markUnrecorded(projectId: string, relPath: string): Promise<void> {
-    const index = await this.readIndex(projectId);
-    const rel = this.entryKey(
-      index,
-      toPosix(relPath),
-      this.insensitiveByProject.get(projectId) ?? false,
-    );
-    const entry: ShadowIndexEntry = index.entries[rel] ?? { deleted: false, baseExists: false };
-    entry.conflicted = true;
-    entry.unrecorded = true;
-    entry.touchedAt = new Date(this.now()).toISOString();
-    index.entries[rel] = entry;
-    await this.writeIndex(projectId, index);
+    await withIndexLock(this.dir(projectId), async () => {
+      const index = await this.readIndex(projectId);
+      const rel = this.entryKey(
+        index,
+        toPosix(relPath),
+        this.insensitiveByProject.get(projectId) ?? false,
+      );
+      const entry: ShadowIndexEntry = index.entries[rel] ?? { deleted: false, baseExists: false };
+      entry.conflicted = true;
+      entry.unrecorded = true;
+      entry.touchedAt = new Date(this.now()).toISOString();
+      index.entries[rel] = entry;
+      await this.writeIndex(projectId, index);
+    });
   }
 
   /** Every change this session currently owns, resolved to content. */
@@ -412,21 +522,31 @@ export class ShadowStore {
     const index = await this.readIndex(projectId);
     const out: ShadowChange[] = [];
     for (const [rel, entry] of Object.entries(index.entries)) {
-      const binary = entry.binary === true;
       const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
       const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
-      out.push({
-        path: rel,
-        content: binary ? shadow : (shadow?.toString('utf8') ?? null),
-        base: binary ? base : (base?.toString('utf8') ?? null),
-        // Belt and braces: an unrecorded entry is reported conflicted regardless of the raw flag,
-        // so no future code path that clears `conflicted` can make it look committable.
-        conflicted: entry.conflicted === true || entry.unrecorded === true,
-        binary,
-        unrecorded: entry.unrecorded === true,
-      });
+      out.push(this.toChange(rel, entry, shadow, base));
     }
     return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /** One entry resolved to a `ShadowChange` — shared by `changes` and `refreshedChanges`. */
+  private toChange(
+    rel: string,
+    entry: ShadowIndexEntry,
+    shadow: Buffer | null,
+    base: Buffer | null,
+  ): ShadowChange {
+    const binary = entry.binary === true;
+    return {
+      path: rel,
+      content: binary ? shadow : (shadow?.toString('utf8') ?? null),
+      base: binary ? base : (base?.toString('utf8') ?? null),
+      // Belt and braces: an unrecorded or incomplete entry is reported conflicted regardless of
+      // the raw flag, so no future code path that clears `conflicted` can make it look committable.
+      conflicted: isFlagged(entry),
+      binary,
+      unrecorded: entry.unrecorded === true,
+    };
   }
 
   /** Whether this session is tracking any change at all (drives `commit`'s default scope). */
@@ -482,24 +602,33 @@ export class ShadowStore {
       .map(([p, entry]) => ({
         path: p,
         deleted: entry.deleted === true,
-        // Belt and braces, matching `changes()`: an unrecorded entry is reported conflicted
-        // regardless of the raw flag, so no future code path that clears `conflicted` can make a
-        // peer treat it as safe to route around.
-        conflicted: entry.conflicted === true || entry.unrecorded === true,
+        // Belt and braces, matching `changes()`: an unrecorded or incomplete entry is reported
+        // conflicted regardless of the raw flag, so no future code path that clears `conflicted`
+        // can make a peer treat it as safe to route around.
+        conflicted: isFlagged(entry),
         touchedAt: entry.touchedAt ?? null,
       }))
       .sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**
-   * Carry every tracked shadow onto the current HEAD.
+   * Carry every tracked shadow onto the current HEAD, and write the result back.
    *
    * Call after anything that moves HEAD or rewrites the tree — this session committing, a peer
-   * committing, a pull, a rebase. Files whose change is now in HEAD stop being tracked; files
-   * where HEAD and this session changed the same lines are marked conflicted and left alone,
-   * so nothing is resolved on the session's behalf. An `unrecorded` entry is skipped entirely —
-   * its shadow is known-incomplete, so neither a clean merge nor "HEAD equals the shadow" says
-   * anything about it — and reported under `conflicted` as it was.
+   * committing, a pull, a rebase — and **only while holding the project's `runExclusive` lock**:
+   * this is a read-modify-write of the shadow index, and the lock is what keeps a peer process's
+   * `record`/`settleAll` from landing between the read and the write (the in-process index mutex
+   * below covers this process only). A lock-free caller wants `refreshedChanges`, which computes
+   * the same picture and writes nothing.
+   *
+   * Files whose change is now in HEAD stop being tracked; files where HEAD and this session
+   * changed the same lines are marked conflicted and left alone, so nothing is resolved on the
+   * session's behalf. An `unrecorded` or `incomplete` entry is skipped entirely — its shadow is
+   * known not to hold every write this session made, so neither a clean merge nor "HEAD equals
+   * the shadow" says anything about it — and reported under `conflicted` as it was. An entry that
+   * is neither, and not conflicted, is also settled while HEAD has not moved when its shadow
+   * already equals HEAD (an edit reverted to the original text, or a file created and deleted
+   * again): there is nothing of it left to commit, and keeping it would claim the path forever.
    *
    * A conflicted entry whose `conflictHead` still matches the current HEAD is reported without
    * re-reading HEAD's blob, re-reading the shadow, re-running `merge3`, or spawning
@@ -509,93 +638,192 @@ export class ShadowStore {
    * wired.
    */
   async refresh(projectId: string, projectDir: string): Promise<RefreshResult> {
-    const index = await this.readIndex(projectId);
-    const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
+    return withIndexLock(this.dir(projectId), async () => {
+      const index = await this.readIndex(projectId);
+      const verdicts = await this.judge(projectId, projectDir, index);
+      const result: RefreshResult = { advanced: [], conflicted: [], settled: [] };
+      let changed = false;
+
+      for (const [rel, verdict] of verdicts) {
+        const entry = index.entries[rel] as ShadowIndexEntry;
+        switch (verdict.kind) {
+          case 'keep':
+            break;
+          case 'conflicted':
+            result.conflicted.push(rel);
+            if (verdict.flag) {
+              entry.conflicted = true;
+              if (verdict.headSha !== undefined) entry.conflictHead = verdict.headSha;
+              changed = true;
+            }
+            break;
+          case 'settled':
+            // Our change is what landed — there is nothing left of it to commit.
+            await this.forget(projectId, rel);
+            delete index.entries[rel];
+            result.settled.push(rel);
+            changed = true;
+            break;
+          case 'advanced':
+            await this.writeShadow(projectId, rel, verdict.shadow);
+            await this.writeBase(projectId, rel, verdict.base);
+            entry.baseExists = true;
+            entry.conflicted = false;
+            delete entry.conflictHead;
+            result.advanced.push(rel);
+            changed = true;
+            break;
+        }
+      }
+
+      if (changed) await this.writeIndex(projectId, index);
+      return result;
+    });
+  }
+
+  /**
+   * What `changes()` would return right after a `refresh()` — computed from the same verdicts,
+   * but **writing nothing**: no index, no shadow, no base, no `conflictHead` memo.
+   *
+   * For `status`, which is read-only and takes no project lock. A persisting refresh there was a
+   * read-modify-write of the index with git spawns in the middle and no lock around it: it wrote
+   * back the index it had read, so a `record` from this session's own concurrent write was lost
+   * (the file then showed as nobody's), and — across processes — an entry a peer's path-limited
+   * `discard` had just settled under its lock was resurrected. Only callers holding
+   * `runExclusive` may write the index; the picture here is carried forward for real by the next
+   * `commit`/`push`/`project_sync`, which refresh under the lock before acting.
+   */
+  async refreshedChanges(projectId: string, projectDir: string): Promise<ShadowChange[]> {
+    // The in-process mutex, not the project lock: it only keeps this read from interleaving with
+    // this process's own shadow/base writes, so the view never pairs a new index with a
+    // half-written shadow file.
+    return withIndexLock(this.dir(projectId), async () => {
+      const index = await this.readIndex(projectId);
+      const verdicts = await this.judge(projectId, projectDir, index);
+      const out: ShadowChange[] = [];
+      for (const [rel, verdict] of verdicts) {
+        const entry = index.entries[rel] as ShadowIndexEntry;
+        if (verdict.kind === 'settled') continue;
+        if (verdict.kind === 'advanced') {
+          out.push(
+            this.toChange(rel, { ...entry, conflicted: false }, verdict.shadow, verdict.base),
+          );
+          continue;
+        }
+        const flagged = verdict.kind === 'conflicted' ? { ...entry, conflicted: true } : entry;
+        out.push(
+          this.toChange(
+            rel,
+            flagged,
+            entry.deleted ? null : await this.readShadow(projectId, rel),
+            entry.baseExists ? await this.readBase(projectId, rel) : null,
+          ),
+        );
+      }
+      return out.sort((a, b) => a.path.localeCompare(b.path));
+    });
+  }
+
+  /**
+   * The per-entry verdicts a refresh reaches, computed without writing anything — shared by
+   * `refresh` (which applies them) and `refreshedChanges` (which only reports them), so the two
+   * can never disagree about what a refresh would do.
+   */
+  private async judge(
+    projectId: string,
+    projectDir: string,
+    index: ShadowIndex,
+  ): Promise<Array<[string, Verdict]>> {
     const headSha = this.resolveHeadSha ? await this.resolveHeadSha(projectDir) : undefined;
+    const out: Array<[string, Verdict]> = [];
 
     for (const [rel, entry] of Object.entries(index.entries)) {
-      if (entry.unrecorded === true) {
-        // This session's latest write to the file never made it into the shadow (`markUnrecorded`).
-        // A three-way merge onto a new HEAD only tells us the *shadow* reconciles cleanly — it says
-        // nothing about the write that is missing from it — and "HEAD equals the shadow" would be
-        // true only by ignoring that same gap. Either way, resolving anything here risks either
-        // reverting the session's own edit (advanced) or silently dropping its claim on an
-        // uncommitted change (settled/forgotten) — the exact gap `markUnrecorded` exists to close.
-        // So: touch nothing, leave the entry exactly as it is, and keep it flagged. Only a
-        // deliberate take (`settle`/`clear`, i.e. commit scope "all"/"paths") or a discard ends
-        // this state.
-        result.conflicted.push(rel);
-        continue;
-      }
+      out.push([rel, await this.judgeEntry(projectId, projectDir, rel, entry, headSha)]);
+    }
+    return out;
+  }
 
-      if (entry.conflicted === true && headSha !== undefined && entry.conflictHead === headSha) {
-        // HEAD has not moved since this entry was last judged conflicted, and a conflicted
-        // entry's shadow/base are frozen (`record` early-returns on it; `refresh` writes nothing
-        // on either conflicting branch below) — so the verdict is unchanged. Skip the HEAD read,
-        // the shadow read, the merge, and the `sameAsGitSees` spawns entirely.
-        result.conflicted.push(rel);
-        continue;
-      }
-
-      const head = await this.readHead(projectDir, rel);
-      const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
-      if (bytesEqual(head, base)) continue; // HEAD has not moved under this file
-
-      const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
-      const settled =
-        bytesEqual(head, shadow) ||
-        (head === null && entry.deleted) ||
-        // Raw bytes differ but both sides are present: ask git whether they'd clean-filter to the
-        // same blob (see the class doc comment) before concluding a peer changed this file.
-        (head !== null &&
-          shadow !== null &&
-          (await this.sameAsGitSees(projectDir, rel, head, shadow)));
-      if (settled) {
-        // Our change is what landed — there is nothing left of it to commit.
-        await this.forget(projectId, rel);
-        delete index.entries[rel];
-        result.settled.push(rel);
-        continue;
-      }
-
-      if (head === null || shadow === null) {
-        // One side is a delete: no text to merge, and picking a winner would be a guess.
-        entry.conflicted = true;
-        if (headSha !== undefined) entry.conflictHead = headSha;
-        result.conflicted.push(rel);
-        continue;
-      }
-
-      if (entry.binary) {
-        // A binary shadow whose HEAD moved to different bytes has no honest merge — there is no
-        // such thing as a merged PNG — so it is reported as a conflict, never merged.
-        entry.conflicted = true;
-        if (headSha !== undefined) entry.conflictHead = headSha;
-        result.conflicted.push(rel);
-        continue;
-      }
-
-      const { merged, conflicted } = await merge3(
-        head.toString('utf8'),
-        base?.toString('utf8') ?? '',
-        shadow.toString('utf8'),
-      );
-      if (conflicted) {
-        entry.conflicted = true;
-        if (headSha !== undefined) entry.conflictHead = headSha;
-        result.conflicted.push(rel);
-        continue;
-      }
-      await this.writeShadow(projectId, rel, Buffer.from(merged, 'utf8'));
-      await this.writeBase(projectId, rel, head);
-      entry.baseExists = true;
-      entry.conflicted = false;
-      delete entry.conflictHead;
-      result.advanced.push(rel);
+  private async judgeEntry(
+    projectId: string,
+    projectDir: string,
+    rel: string,
+    entry: ShadowIndexEntry,
+    headSha: string | undefined,
+  ): Promise<Verdict> {
+    if (entry.unrecorded === true || entry.incomplete === true) {
+      // This session's latest write to the file never made it into the shadow — its record
+      // failed (`markUnrecorded`), or `record` could not fold it in (`incomplete`: a record-time
+      // collision, or a write while already conflicted). A three-way merge onto a new HEAD only
+      // tells us the *shadow* reconciles cleanly — it says nothing about the write that is
+      // missing from it — and "HEAD equals the shadow" would be true only by ignoring that same
+      // gap. Either way, resolving anything here risks either reverting the session's own edit
+      // (advanced) or silently dropping its claim on an uncommitted change (settled/forgotten),
+      // after which a live peer's `commit scope: "paths"` takes it. So: touch nothing, leave the
+      // entry exactly as it is, and keep it flagged. Only a deliberate take (`settle`/`clear`,
+      // i.e. commit scope "all"/"paths") or a discard ends this state.
+      return { kind: 'conflicted', flag: false };
     }
 
-    await this.writeIndex(projectId, index);
-    return result;
+    if (entry.conflicted === true && headSha !== undefined && entry.conflictHead === headSha) {
+      // HEAD has not moved since this entry was last judged conflicted, and a conflicted
+      // entry's shadow/base are frozen (`record` early-returns on it; `refresh` writes nothing
+      // on either conflicting branch below) — so the verdict is unchanged. Skip the HEAD read,
+      // the shadow read, the merge, and the `sameAsGitSees` spawns entirely.
+      return { kind: 'conflicted', flag: false };
+    }
+
+    const head = await this.readHead(projectDir, rel);
+    const base = entry.baseExists ? await this.readBase(projectId, rel) : null;
+    if (bytesEqual(head, base)) {
+      // HEAD has not moved under this file. An ordinary entry whose shadow already equals HEAD
+      // has nothing left to commit — the session reverted its own edit, or created and deleted a
+      // file HEAD never had — so it settles here, or it would stay tracked forever (HEAD never
+      // moves under a change nobody commits) and every `commit` in the session would find
+      // nothing to stage while a peer's `scope: "paths"` refused the path as this session's.
+      // Raw comparison only: this runs for every in-flight entry on every refresh, and the
+      // clean-filter fallback costs two git spawns each — an edit reverted to text that differs
+      // from HEAD only by what the clean filter normalises stays tracked until HEAD moves, which
+      // is the pre-existing behaviour for it. Never for a conflicted entry: a refresh-time
+      // conflict's base is stale by definition, and an incomplete one was skipped above.
+      if (entry.conflicted !== true) {
+        const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
+        const reverted = entry.deleted
+          ? head === null
+          : head !== null && shadow !== null && head.equals(shadow);
+        if (reverted) return { kind: 'settled' };
+      }
+      return { kind: 'keep' };
+    }
+
+    const shadow = entry.deleted ? null : await this.readShadow(projectId, rel);
+    const settled =
+      bytesEqual(head, shadow) ||
+      (head === null && entry.deleted) ||
+      // Raw bytes differ but both sides are present: ask git whether they'd clean-filter to the
+      // same blob (see the class doc comment) before concluding a peer changed this file.
+      (head !== null &&
+        shadow !== null &&
+        (await this.sameAsGitSees(projectDir, rel, head, shadow)));
+    if (settled) return { kind: 'settled' };
+
+    if (head === null || shadow === null) {
+      // One side is a delete: no text to merge, and picking a winner would be a guess.
+      return { kind: 'conflicted', flag: true, headSha };
+    }
+
+    if (entry.binary) {
+      // A binary shadow whose HEAD moved to different bytes has no honest merge — there is no
+      // such thing as a merged PNG — so it is reported as a conflict, never merged.
+      return { kind: 'conflicted', flag: true, headSha };
+    }
+
+    const { merged, conflicted } = await merge3(
+      head.toString('utf8'),
+      base?.toString('utf8') ?? '',
+      shadow.toString('utf8'),
+    );
+    if (conflicted) return { kind: 'conflicted', flag: true, headSha };
+    return { kind: 'advanced', shadow: Buffer.from(merged, 'utf8'), base: head };
   }
 
   /**
@@ -630,17 +858,19 @@ export class ShadowStore {
   ): Promise<string[]> {
     // Same normal form as the tool layer's `settlePaths`: POSIX, leading `./` stripped.
     const wanted = paths.map((p) => toPosix(p).replace(/^(\.\/)+/, ''));
-    const index = await this.readIndex(projectId);
-    const dropped: string[] = [];
-    for (const rel of Object.keys(index.entries)) {
-      if (wanted.some((p) => coversPath(p, rel, fold))) {
-        await this.forget(projectId, rel);
-        delete index.entries[rel];
-        dropped.push(rel);
+    return withIndexLock(this.dir(projectId), async () => {
+      const index = await this.readIndex(projectId);
+      const dropped: string[] = [];
+      for (const rel of Object.keys(index.entries)) {
+        if (wanted.some((p) => coversPath(p, rel, fold))) {
+          await this.forget(projectId, rel);
+          delete index.entries[rel];
+          dropped.push(rel);
+        }
       }
-    }
-    await this.writeIndex(projectId, index);
-    return dropped;
+      await this.writeIndex(projectId, index);
+      return dropped;
+    });
   }
 
   /**
@@ -677,17 +907,19 @@ export class ShadowStore {
     const dropped: string[] = [];
     for (const sessionId of sessionIds) {
       const dir = path.join(root, sessionId);
-      const index = await this.readIndexAt(dir);
-      let changed = false;
-      for (const rel of Object.keys(index.entries)) {
-        if (wanted.some((p) => coversPath(p, rel, fold))) {
-          await this.forgetAt(dir, rel);
-          delete index.entries[rel];
-          dropped.push(rel);
-          changed = true;
+      await withIndexLock(dir, async () => {
+        const index = await this.readIndexAt(dir);
+        let changed = false;
+        for (const rel of Object.keys(index.entries)) {
+          if (wanted.some((p) => coversPath(p, rel, fold))) {
+            await this.forgetAt(dir, rel);
+            delete index.entries[rel];
+            dropped.push(rel);
+            changed = true;
+          }
         }
-      }
-      if (changed) await this.writeIndexAt(dir, index);
+        if (changed) await this.writeIndexAt(dir, index);
+      });
     }
     return dropped;
   }
@@ -700,7 +932,8 @@ export class ShadowStore {
    * next throttled heartbeat.
    */
   async clear(projectId: string): Promise<void> {
-    await this.clearShadowState(this.dir(projectId));
+    const dir = this.dir(projectId);
+    await withIndexLock(dir, () => this.clearShadowState(dir));
   }
 
   /**
@@ -718,7 +951,12 @@ export class ShadowStore {
     } catch {
       return;
     }
-    await Promise.all(sessions.map((id) => this.clearShadowState(path.join(root, id))));
+    await Promise.all(
+      sessions.map((id) => {
+        const dir = path.join(root, id);
+        return withIndexLock(dir, () => this.clearShadowState(dir));
+      }),
+    );
   }
 
   /** The shadow files under one session directory, leaving everything else there alone. */
@@ -755,10 +993,14 @@ export class ShadowStore {
   private async readIndexAt(dir: string): Promise<ShadowIndex> {
     try {
       const raw = await readFile(path.join(dir, 'shadow.json'), 'utf8');
-      const parsed = JSON.parse(raw) as ShadowIndex;
-      return parsed.entries ? parsed : { entries: {} };
+      const parsed = JSON.parse(raw) as Partial<ShadowIndex> | null;
+      if (typeof parsed !== 'object' || parsed === null || !parsed.entries) {
+        return { entries: entryMap() };
+      }
+      // Any other top-level key rides along unchanged, as it did before the copy.
+      return { ...parsed, entries: entryMap(parsed.entries) };
     } catch {
-      return { entries: {} };
+      return { entries: entryMap() };
     }
   }
 
@@ -803,6 +1045,20 @@ export class ShadowStore {
       rm(path.join(dir, 'base', rel), { force: true }),
     ]);
   }
+}
+
+/**
+ * Whether an entry must be reported conflicted: flagged outright, or known-incomplete (its shadow
+ * lacks a write this session made — `unrecorded` or `incomplete`), whatever the raw flag says.
+ */
+function isFlagged(entry: ShadowIndexEntry): boolean {
+  return entry.conflicted === true || entry.unrecorded === true || entry.incomplete === true;
+}
+
+/** Whether a mutation's two sides carry the same bytes (both absent counts as the same). */
+function sameContent(a: string | Buffer | null, b: string | Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return toBuffer(a).equals(toBuffer(b));
 }
 
 /** Narrows an arbitrary parsed JSON value to something `peerEntries` can safely read entries off. */

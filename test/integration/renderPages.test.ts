@@ -10,6 +10,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { toPosix } from '../../src/lib/paths.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const MAIN_TEX = [
@@ -68,10 +69,24 @@ async function setup(): Promise<Harness> {
  * `pageLabels` writes a `/PageLabels` tree with that printed label per page — the thing a real
  * `\frontmatter` document (or any `hyperref` document) carries and a plain `article` does not.
  */
-async function stagePdf(userDir: string, pages: number, pageLabels?: string[]): Promise<void> {
+async function stagePdf(
+  userDir: string,
+  pages: number,
+  pageLabels?: string[],
+  text?: (page: number) => string | undefined,
+): Promise<void> {
   const pdfPath = buildPdfPath(userDir, 'main.tex');
   await mkdir(path.dirname(pdfPath), { recursive: true });
-  await writeFile(pdfPath, minimalPdf(pages, 200, 100, { pageLabels }));
+  await writeFile(pdfPath, minimalPdf(pages, 200, 100, { pageLabels, text }));
+}
+
+/**
+ * Page text for a PDF with no /PageLabels: `caption` drawn mid-page on `page` only, between a
+ * body line and a folio. Without /PageLabels a printed page is accepted only when that page's
+ * own folio reads it, so every page ends on its page number, as a `plain` page style draws it.
+ */
+function captionOn(page: number, caption: string): (n: number) => string {
+  return (n) => (n === page ? `body\n${caption}\n${n}` : `body\n${n}`);
 }
 
 /** Stage the `.aux` the last compile would have left, without running latexmk. */
@@ -309,7 +324,7 @@ describe('render_pages', () => {
   });
   it('labels: renders the page the .aux records and echoes the label -> page mapping', async () => {
     const { client, userDir } = await setup();
-    await stagePdf(userDir, 5);
+    await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
     await stageAux(userDir, '\\newlabel{fig:one}{{1}{2}}\n\\newlabel{tab:results}{{2}{4}}\n');
 
     const res = await client.callTool({
@@ -332,7 +347,7 @@ describe('render_pages', () => {
 
   it('labels: two labels on one page render it once, and both are echoed', async () => {
     const { client, userDir } = await setup();
-    await stagePdf(userDir, 3);
+    await stagePdf(userDir, 3, undefined, captionOn(2, 'Table 1 and Figure 1 side by side'));
     await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n\\newlabel{fig:b}{{1}{2}}\n');
 
     const res = await client.callTool({
@@ -448,7 +463,9 @@ describe('render_pages', () => {
     expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
   });
 
-  it('names the stale .aux when a resolved page is past the end of the PDF on disk', async () => {
+  it('refuses a printed page past the end of the PDF, naming both causes it could have', async () => {
+    // Without /PageLabels, "printed 9 in a 3-page PDF" is a stale .aux OR a \setcounter{page}
+    // start, and the two cannot be told apart — so the refusal names both, and nothing renders.
     const { client, userDir } = await setup();
     await stagePdf(userDir, 3);
     await stageAux(userDir, '\\newlabel{tab:results}{{1}{9}}\n');
@@ -459,9 +476,31 @@ describe('render_pages', () => {
     });
     expect(res.isError).toBe(true);
     const text = textOf(res);
-    expect(text).toContain('out of range');
-    expect(text).toContain('tab:results -> page 9');
+    expect(text).toContain('tab:results');
+    expect(text).toContain('3 page(s)');
     expect(text).toMatch(/stale/);
+    expect(text).toMatch(/setcounter/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('refuses a label whose printed page is a title-page-shifted PDF page (no /PageLabels)', async () => {
+    // A report's \maketitle: the figure prints on page "1" but is PDF page 2, and PDF page 1 is
+    // the title page. Before the page-text check this rendered the title page.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 2, undefined, (n) =>
+      n === 1 ? 'T\nA\nSeptember 23, 2026' : 'Chapter 1\nOne\nFigure 1.1: Cap\n1',
+    );
+    await stageAux(userDir, '\\newlabel{fig:a}{{1.1}{1}}\n');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['fig:a'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('"1.1"');
+    expect(text).toContain('hyperref');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
   });
 
   it('says there is no .aux at all rather than calling the label undefined', async () => {
@@ -496,7 +535,7 @@ describe('render_pages', () => {
     // reusing that cap would answer "no such label" for a label plainly in the file — a wrong
     // answer, not a truncated one. LABEL_LOOKUP_MAX is why this resolves.
     const { client, userDir } = await setup();
-    await stagePdf(userDir, 3);
+    await stagePdf(userDir, 3, undefined, captionOn(3, 'Table 1: Results'));
     const filler = Array.from({ length: 250 }, (_, i) => `\\newlabel{sec:${i}}{{1}{1}}`);
     await stageAux(userDir, [...filler, '\\newlabel{tab:results}{{1}{3}}'].join('\n') + '\n');
 
@@ -586,7 +625,7 @@ describe('render_pages', () => {
 
   it('never writes inside the project directory when resolving labels', async () => {
     const { client, userDir } = await setup();
-    await stagePdf(userDir, 3);
+    await stagePdf(userDir, 3, undefined, captionOn(2, 'Table 1: Results'));
     await stageAux(userDir, '\\newlabel{tab:a}{{1}{2}}\n');
 
     const before = await listAllEntries(userDir);
@@ -596,5 +635,52 @@ describe('render_pages', () => {
     });
     expect(res.isError ?? false).toBe(false);
     expect(await listAllEntries(userDir)).toEqual(before);
+  });
+
+  it('creates only the project lock directory under the workspace, and no lock file', async () => {
+    // The lock is load-bearing (a peer's compile rewrites the build-dir PDF mid-read), and this
+    // is the observable trace of it: withFileLock's mkdir leaves <workspace>/.sessions/<id>/
+    // behind. Without runExclusive the workspace stays empty. Supplying the project via server
+    // config rather than register_project is what makes the before-snapshot genuinely empty —
+    // register_project takes that same lock itself. Same test as extract_text's and
+    // pdf_geometry's.
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-renderws-lock-'));
+    const localUserDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-renderdir-lock-'));
+    cleanups.push(
+      () => rm(workspace, { recursive: true, force: true }),
+      () => rm(localUserDir, { recursive: true, force: true }),
+      () => rm(buildDir(localUserDir), { recursive: true, force: true }),
+    );
+    await writeFile(path.join(localUserDir, 'main.tex'), MAIN_TEX);
+    await stagePdf(localUserDir, 1);
+
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      sessionId: 'test',
+      projects: [{ id: 'poster', mode: 'local', path: localUserDir }],
+    };
+    const ctx = createContext(
+      config,
+      new CredentialResolver({}),
+      { name: 'Test', email: 'test@example.com' },
+      new ProjectRegistry(workspace),
+    );
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+
+    expect((await listAllEntries(workspace)).map(toPosix)).toEqual([]);
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', inline: false },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect((await listAllEntries(workspace)).map(toPosix)).toEqual([
+      '.sessions',
+      '.sessions/poster',
+    ]);
   });
 });

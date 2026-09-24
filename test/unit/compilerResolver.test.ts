@@ -5,6 +5,7 @@ import {
   COMPILER_KINDS,
   missingMessage,
 } from '../../src/services/compilerResolver.js';
+import { UnrunnableCompilerError } from '../../src/services/compiler.js';
 import type { LatexCompiler } from '../../src/services/compiler.js';
 import type { CompilerKind } from '../../src/types.js';
 
@@ -215,6 +216,60 @@ describe('CompilerResolver.select — a probe that fails is not an absent backen
     const sel = await new CompilerResolver('latexmk', false, make).select();
     expect(sel.kind).toBe('tectonic');
     expect(sel.fallbackFrom).toBe('latexmk');
+  });
+});
+
+describe('CompilerResolver.select — the OTHER backend is on PATH but unrunnable', () => {
+  // Built the way `probeOnPath` builds it, so the resolver sees what production hands it.
+  const unrunnableTectonic = (): UnrunnableCompilerError =>
+    new UnrunnableCompilerError(
+      'tectonic',
+      Object.assign(new Error('spawn tectonic EACCES'), { code: 'EACCES' }),
+    );
+
+  it('still tells the user their asserted latexmk is missing', async () => {
+    const { make } = scripted({}, { tectonic: unrunnableTectonic() });
+    const err = await new CompilerResolver('latexmk', true, make).select().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MissingCompilerError);
+    const message = (err as Error).message;
+    // The fact the user needs first: the backend they chose is not there.
+    expect(message).toContain('latexmk is not on PATH');
+    // ...and the other one is present but broken, with its errno — never "not installed".
+    expect(message).toContain('tectonic is installed but could not be run (spawn tectonic EACCES)');
+    expect(message).not.toContain('neither is tectonic');
+    // Nothing runnable, so nothing to retry with.
+    expect(message).not.toContain('retry this call with compiler: "tectonic"');
+    expect((err as MissingCompilerError).installed).toEqual([]);
+    expect((err as MissingCompilerError).unrunnable).toEqual(['tectonic']);
+  });
+
+  it('says the same for a per-call request', async () => {
+    const { make } = scripted({}, { tectonic: unrunnableTectonic() });
+    const err = await new CompilerResolver('latexmk', false, make)
+      .select('latexmk')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MissingCompilerError);
+    expect((err as Error).message).toContain('compiler: "latexmk" was requested');
+    expect((err as Error).message).toContain('tectonic is installed but could not be run');
+  });
+
+  it('does not blame an unchosen default fallback on the user either', async () => {
+    // latexmk only the default and missing; the fallback candidate is broken. Reporting only
+    // "tectonic could not be run … no other backend was substituted for it" never says why
+    // tectonic was being run at all.
+    const { make } = scripted({}, { tectonic: unrunnableTectonic() });
+    const err = await new CompilerResolver('latexmk', false, make)
+      .select()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MissingCompilerError);
+    expect((err as Error).message).toContain('latexmk is not on PATH');
+    expect((err as Error).message).toContain('tectonic is installed but could not be run');
+  });
+
+  it('still propagates a probe failure that is not an UnrunnableCompilerError', async () => {
+    const boom = new Error('something else entirely');
+    const { make } = scripted({}, { tectonic: boom });
+    await expect(new CompilerResolver('latexmk', true, make).select()).rejects.toBe(boom);
   });
 });
 

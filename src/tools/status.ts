@@ -60,11 +60,24 @@ const outputSchema = {
       'Remote commits not local. Non-zero means origin moved since the last sync — a push may conflict.',
     ),
   syncState: z
-    .enum(['in-sync', 'ahead', 'behind', 'diverged'])
+    .enum(['in-sync', 'ahead', 'behind', 'diverged', 'remote-branch-missing'])
     .describe(
       'Clone state vs the tracked remote branch, from ahead/behind. "behind"/"diverged" mean ' +
-        'origin moved; sync (project_sync) before pushing. Counts reflect the last fetch, not a live remote.',
+        'origin moved; sync (project_sync) before pushing. "remote-branch-missing" means the ' +
+        'tracked branch is gone from the remote (see remoteBranchMissing). Counts reflect the ' +
+        'last fetch, not a live remote.',
     ),
+  remoteBranchMissing: z
+    .boolean()
+    .describe(
+      'The last fetch found the tracked branch gone from the remote — renamed or deleted ' +
+        'upstream. ahead/aheadCommits then count local commits on no remote branch, and behind ' +
+        'is 0 because there is nothing to compare against. Never true for an empty remote.',
+    ),
+  remoteBranchNote: z
+    .string()
+    .optional()
+    .describe('Present only when remoteBranchMissing: what the remote has now and what it means.'),
   clean: z
     .boolean()
     .describe(
@@ -78,8 +91,19 @@ const outputSchema = {
   aheadCommits: z
     .array(commitSchema)
     .describe(
-      'Local commits not yet on the remote (what a push would send). Complete — never capped, ' +
-        'unlike the text rendering below it, which shows the first few and says how many more.',
+      'Local commits not yet on the remote (what a push would send). Complete — never capped ' +
+        'while the tracked remote branch exists, unlike the text rendering below it, which shows ' +
+        'the first few and says how many more. The one exception: when origin/<branch> is absent ' +
+        '(remoteBranchMissing, a remote left with no branches, or a local branch never pushed), ' +
+        'ahead counts every commit on no remote branch — possibly the whole history — so this ' +
+        'list is then capped at 20 and aheadCommitsOmitted counts the rest.',
+    ),
+  aheadCommitsOmitted: z
+    .number()
+    .describe(
+      'Commits left out of aheadCommits; 0 whenever the tracked remote branch exists. Non-zero ' +
+        'only when origin/<branch> is absent and more than 20 local commits are on no remote ' +
+        'branch — ahead still gives the true total.',
     ),
   behindCommits: z
     .array(commitSchema)
@@ -217,8 +241,9 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
         'sessions currently working on the project. The path lists are bounded: a working tree ' +
         'with thousands of dirty or untracked files is cut to fit the result, with pathsOmitted ' +
         'saying how many went from each and truncated saying whether anything did. The commit ' +
-        'lists are not — aheadCommits and behindCommits are always complete, and only the text ' +
-        'rendering of them is shortened.',
+        'lists are not — aheadCommits and behindCommits are complete, and only the text rendering ' +
+        'of them is shortened — except aheadCommits when the tracked remote branch is absent, ' +
+        'which is capped with aheadCommitsOmitted counting the rest.',
       inputSchema,
       outputSchema,
     },
@@ -226,12 +251,14 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
       try {
         ctx.projectManager.requireGitProject(project, 'report status against');
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
-        const status = await ctx.git.status(dir);
+        const status = await ctx.git.status(dir, { withCommits: true });
         await ctx.sessions.touch(id);
-        // Carry this session's shadow onto the current HEAD first, so the split below reflects
-        // what a commit would actually do rather than a stale picture.
-        await ctx.shadows.refresh(id, dir);
-        const changes = await ctx.shadows.changes(id);
+        // This session's shadow as it stands on the current HEAD, so the split below reflects
+        // what a commit would actually do rather than a stale picture — computed, never written:
+        // `status` takes no lock, and a persisting refresh here overwrote a concurrent `record`
+        // and resurrected entries a peer's `discard` had just settled. The next locked
+        // `commit`/`push`/`project_sync` carries the shadow forward for real.
+        const changes = await ctx.shadows.refreshedChanges(id, dir);
         // git reports a dirty file in the index's spelling; on a `core.ignorecase` clone that can
         // differ in case from the spelling this session wrote it under (its shadow key), so the
         // split folds the way git does there and stays byte-exact everywhere else — the same
@@ -390,7 +417,13 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
             ? renderPathListLine(label, plan.lists[name], plan.omitted[name])
             : '';
         const text = [
-          `branch ${status.branch} — ${syncSummary(status.branch, status.ahead, status.behind)}`,
+          `branch ${status.branch} — ${syncSummary(
+            status.branch,
+            status.ahead,
+            status.behind,
+            status.remoteBranchMissing,
+          )}`,
+          status.remoteBranchNote ?? '',
           status.clean ? 'working tree clean' : 'working tree has changes',
           line('staged', 'staged'),
           line('unstaged', 'unstaged'),
@@ -398,7 +431,19 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
           behindCommits.length
             ? `landed upstream:\n${renderCommitBlock(behindText).join('\n')}`
             : '',
-          aheadCommits.length ? `to push:\n${renderCommitBlock(aheadText).join('\n')}` : '',
+          aheadCommits.length
+            ? `to push:\n${[
+                ...renderCommitBlock(aheadText),
+                // Commits the capped (absent-branch) log never returned: the text's own "… N more
+                // (see structuredContent)" covers only what structuredContent holds.
+                ...(status.aheadCommitsOmitted > 0
+                  ? [
+                      `  … ${status.aheadCommitsOmitted} more commit(s) on no remote branch, ` +
+                        'not listed anywhere (aheadCommitsOmitted)',
+                    ]
+                  : []),
+              ].join('\n')}`
+            : '',
           line('⚠ changed directly (not via tools)', 'externalChanges'),
           line(`this session ("${ctx.shadows.sessionId}") changed`, 'sessionChanges'),
           line('changed by others', 'otherChanges'),
@@ -417,11 +462,14 @@ export function registerStatus(server: McpServer, ctx: AppContext): void {
             staged: plan.lists.staged,
             unstaged: plan.lists.unstaged,
             untracked: plan.lists.untracked,
-            // Complete, deliberately: `conflictBudget.ts` caps a conflict's own `remoteCommits` and
-            // sends the caller here for the full list. Only their TEXT rendering is bounded.
+            // Not cut by the status budget: `conflictBudget.ts` caps a conflict's own
+            // `remoteCommits` and sends the caller here for the full list. `behindCommits` is
+            // complete; `aheadCommits` is complete while origin/<branch> exists, and capped at
+            // CONFLICT_MAX_COMMITS by GitService.status (the rest counted in `aheadCommitsOmitted`)
+            // when it is absent. Only their TEXT rendering is bounded here.
             aheadCommits,
             behindCommits,
-            syncState: syncState(status.ahead, status.behind),
+            syncState: syncState(status.ahead, status.behind, status.remoteBranchMissing),
             externalChanges: plan.lists.externalChanges,
             session: ctx.shadows.sessionId,
             sessionChanges: plan.lists.sessionChanges,

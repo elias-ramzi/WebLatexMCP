@@ -5,7 +5,24 @@ import { withFileLock } from '../lib/fileLock.js';
 import type { LockAcquisition } from '../lib/fileLock.js';
 import { projectLockPath } from '../lib/sessionPaths.js';
 import { gitUrlOf, isLocalProject, requireGitProject } from '../lib/projectMode.js';
-import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } from '../types.js';
+import {
+  assertValidProjectId,
+  childPathInside,
+  describeSkippedProject,
+  findSkippedProject,
+  listIds,
+  projectIdFold,
+  projectIdProblem,
+  quoteId,
+} from '../lib/projectId.js';
+import { redactGitUrlCredentials, stripGitUrlCredentials } from '../lib/gitUrlCredentials.js';
+import type {
+  GitProjectConfig,
+  ProjectConfig,
+  ProjectStatus,
+  ServerConfig,
+  SkippedProject,
+} from '../types.js';
 
 /**
  * Below this, a measured mutex wait is treated as scheduling noise rather than genuine
@@ -19,6 +36,24 @@ import type { GitProjectConfig, ProjectConfig, ProjectStatus, ServerConfig } fro
 const MUTEX_WAIT_NOISE_MS = 10;
 
 /**
+ * Whether a loaded (not caller-supplied) id is usable; reports one that is not and hands it to
+ * `record`, so a later call naming it can be told why.
+ */
+function usableLoadedId(
+  id: string,
+  source: string,
+  workspaceRoot: string,
+  record: (skipped: SkippedProject) => void,
+): boolean {
+  const problem = projectIdProblem(id);
+  if (problem === undefined) return true;
+  const skipped: SkippedProject = { id, source, kind: 'id', problem };
+  record(skipped);
+  console.error(`[web-latex-mcp] ${describeSkippedProject(skipped, workspaceRoot)}`);
+  return false;
+}
+
+/**
  * The persisted registry ProjectManager reads to pick up runtime registrations and writes to make
  * them durable. Kept as a narrow interface so the manager stays unit-testable without touching the
  * filesystem (see `src/services/projectRegistry.ts` for the real store).
@@ -28,6 +63,11 @@ export interface ProjectRegistryStore {
   /** Id of the persisted default project, or `undefined`. */
   readDefault(): string | undefined;
   upsert(cfg: ProjectConfig, opts?: { makeDefault?: boolean }): Promise<void>;
+  /**
+   * Entries the store holds but did not load, with why — read when a call names an unknown id, so
+   * it can say "skipped because …" instead of "Unknown project". Optional for test stores.
+   */
+  skipped?(): SkippedProject[];
 }
 
 /**
@@ -63,10 +103,28 @@ export class ProjectManager {
 
   /** One mutex per project, so concurrent mutating tool calls can't interleave. */
   private readonly locks = new Map<string, Mutex>();
+  /**
+   * Configured ids that were not loaded because `src/lib/projectId.ts` refuses them, with why —
+   * from `loadConfig` (`ServerConfig.skippedProjects`) and from the constructor's own check. The
+   * registry's skipped entries are not copied here: they are read fresh on a miss, since a peer
+   * or a hand edit can change the file at any time.
+   */
+  private readonly skippedProjects: SkippedProject[];
 
   constructor(config: ServerConfig, registry?: ProjectRegistryStore) {
-    this.projects = new Map(config.projects.map((p) => [p.id, p]));
     this.workspaceRoot = config.workspaceRoot;
+    this.skippedProjects = [...(config.skippedProjects ?? [])];
+    // `loadConfig` already drops (and reports) an id `src/lib/projectId.ts` refuses; this keeps a
+    // config built any other way from putting one where `projectPath` would throw on it.
+    this.projects = new Map(
+      config.projects
+        .filter((p) =>
+          usableLoadedId(p.id, 'the configuration', this.workspaceRoot, (s) =>
+            this.skippedProjects.push(s),
+          ),
+        )
+        .map((p) => [p.id, p]),
+    );
     this.defaultProject = config.defaultProject;
     this.defaultProjectExplicit = config.defaultProjectExplicit === true;
     this.sessionId = config.sessionId;
@@ -84,6 +142,10 @@ export class ProjectManager {
    * processes rewrite at once.
    */
   async runExclusive<T>(id: string, fn: (lock: LockAcquisition) => Promise<T>): Promise<T> {
+    // Before anything else: `withFileLock` creates the lock's directory first thing, so an id that
+    // walks out of `.sessions/` would otherwise create a directory wherever it points — and
+    // `register_project` takes this lock before the id has been registered anywhere.
+    assertValidProjectId(id);
     let lock = this.locks.get(id);
     if (!lock) {
       lock = new Mutex();
@@ -116,10 +178,85 @@ export class ProjectManager {
     });
   }
 
-  /** Register (or update) a project at runtime, in memory only. */
+  /**
+   * Register (or update) a project at runtime, in memory only. Every runtime registration —
+   * `register_project` (through `registerAndPersist`) and `project_sync { gitUrl }` — comes
+   * through here, so three rules hold for all of them:
+   *
+   * - the id must be usable as one directory name (`assertValidProjectId`, `src/lib/projectId.ts`);
+   * - a `gitUrl` is held trimmed, and an http(s) one without any password or token
+   *   (`stripGitUrlCredentials`; a plain login name stays): the config is persisted, listed, and
+   *   handed to `GitService.clone`, which writes it to the clone's `origin` — a token inside it
+   *   would be stored in plain text in both places. A caller that must report the removal asks
+   *   `strippedCredentialsNoteFor` with the URL it passed in, which judges by this same strip;
+   * - the working directory must not already belong to a different id (`assertDirUnclaimed`);
+   * - a NEW id must not differ from a known one only in case (`assertIdUnaliased`).
+   *
+   * Returns the config as actually registered (URL stripped), which may differ from `cfg`.
+   */
   registerProject(cfg: ProjectConfig): ProjectConfig {
-    this.projects.set(cfg.id, cfg);
-    return cfg;
+    assertValidProjectId(cfg.id);
+    const held: ProjectConfig = isLocalProject(cfg)
+      ? cfg
+      : { ...cfg, gitUrl: stripGitUrlCredentials(cfg.gitUrl).url };
+    this.assertDirUnclaimed(held);
+    this.assertIdUnaliased(held.id);
+    this.projects.set(held.id, held);
+    return held;
+  }
+
+  /**
+   * Refuse a registration whose working directory another project id already resolves to.
+   *
+   * `idForDir` maps a directory back to ONE id, and `followsUserLinks` asks it for the link
+   * policy — so a second local registration of the same directory had its `followSymlinks`
+   * silently ignored (or silently applied, depending on which id came first). Both ids also shared
+   * one working tree under two locks, which `runExclusive` exists to prevent. Checked against the
+   * registry too (a peer may have registered the directory since this process last looked). The
+   * same id at the same directory is an update, never a conflict.
+   */
+  private assertDirUnclaimed(cfg: ProjectConfig): void {
+    this.reloadFromRegistry();
+    const dir = path.resolve(this.dirOf(cfg));
+    const owner = this.knownIds().find(
+      (id) => id !== cfg.id && path.resolve(this.projectPath(id)) === dir,
+    );
+    if (owner !== undefined) {
+      throw new Error(
+        `Project ${quoteId(owner)} already uses ${dir}. One directory can belong to one project ` +
+          `only — use ${quoteId(owner)} (re-register it to change its settings), or pick a ` +
+          'different directory.',
+      );
+    }
+  }
+
+  /**
+   * Refuse a NEW id whose case fold (`projectIdFold`) equals a known id's — `Thèse` beside
+   * `thèse`, `Paper` beside `paper`. On a case-insensitive disk (macOS, Windows) both name one
+   * clone and one `.sessions/<id>/` under two in-process mutexes, which `assertDirUnclaimed`
+   * cannot see: it compares resolved paths byte for byte, and the two strings differ. Refused on
+   * every platform, so a configuration made on Linux still works when it moves. An id already
+   * known is an update and is never refused here, even where a hand-edited configuration holds
+   * two that fold together; `assertDirUnclaimed` has just reloaded the registry, so a peer's
+   * registration counts.
+   */
+  private assertIdUnaliased(id: string): void {
+    if (this.projects.has(id)) return;
+    const fold = projectIdFold(id);
+    const alias = this.knownIds().find((known) => projectIdFold(known) === fold);
+    if (alias !== undefined) {
+      throw new Error(
+        `Project id ${quoteId(id)} differs from the existing project ${quoteId(alias)} only in ` +
+          'letter case, and on a case-insensitive disk (macOS, Windows) both would name the same ' +
+          `directory. Use ${quoteId(alias)}, or pick an id that differs in more than case.`,
+      );
+    }
+  }
+
+  /** The working directory a config resolves to, whether or not it is registered yet. */
+  private dirOf(cfg: ProjectConfig): string {
+    if (isLocalProject(cfg)) return path.resolve(cfg.path);
+    return childPathInside(this.workspaceRoot, cfg.id, 'project id');
   }
 
   /**
@@ -138,10 +275,10 @@ export class ProjectManager {
     cfg: ProjectConfig,
     opts?: { makeDefault?: boolean },
   ): Promise<ProjectConfig> {
-    this.registerProject(cfg);
-    await this.registry?.upsert(cfg, opts);
-    if (opts?.makeDefault === true) this.applyMakeDefault(cfg.id);
-    return cfg;
+    const held = this.registerProject(cfg);
+    await this.registry?.upsert(held, opts);
+    if (opts?.makeDefault === true) this.applyMakeDefault(held.id);
+    return held;
   }
 
   /**
@@ -177,7 +314,7 @@ export class ProjectManager {
     // be env-configured, which takes precedence over the registry). Same rule as
     // `reloadFromRegistry`; without it `projectPath`/`isLocal` answer for a project the registry
     // read above found but this process had never loaded.
-    if (!this.projects.has(cfg.id)) this.registerProject(cfg);
+    if (!this.projects.has(cfg.id)) this.projects.set(cfg.id, cfg);
     await this.registry?.upsert(cfg, { makeDefault: true });
     this.applyMakeDefault(cfg.id);
     return cfg;
@@ -226,7 +363,14 @@ export class ProjectManager {
   private reloadFromRegistry(): void {
     if (!this.registry) return;
     for (const p of this.registry.read()) {
-      if (!this.projects.has(p.id)) this.projects.set(p.id, p);
+      // `readProjectRegistry` already skips (and records) an unusable id; this is the backstop
+      // for a store that does not, and what it finds is reported through `skipped()` if at all.
+      if (
+        !this.projects.has(p.id) &&
+        usableLoadedId(p.id, 'the registry', this.workspaceRoot, () => undefined)
+      ) {
+        this.projects.set(p.id, p);
+      }
     }
   }
 
@@ -272,7 +416,7 @@ export class ProjectManager {
           ? 'No project specified and no default project is configured. No projects are ' +
               'registered yet — use register_project (or WEB_LATEX_MCP_PROJECTS) first.'
           : 'No project specified and no default project is configured. Known projects: ' +
-              `${known.join(', ')}. Pass "project", set WEB_LATEX_MCP_DEFAULT_PROJECT, or ` +
+              `${listIds(known)}. Pass "project", set WEB_LATEX_MCP_DEFAULT_PROJECT, or ` +
               're-run register_project with default: true.',
       );
     }
@@ -283,8 +427,21 @@ export class ProjectManager {
       project = this.projects.get(resolvedId);
     }
     if (!project) {
-      const known = [...this.projects.keys()].join(', ') || '(none)';
-      throw new Error(`Unknown project "${resolvedId}". Known projects: ${known}.`);
+      const known = listIds([...this.projects.keys()]);
+      // A configured id that was skipped is not "unknown" to the user — they wrote it down. Say
+      // why it was skipped and how to fix it: the startup note went to stderr, which an MCP
+      // client never shows.
+      const skipped = findSkippedProject(
+        [...this.skippedProjects, ...(this.registry?.skipped?.() ?? [])],
+        resolvedId,
+      );
+      if (skipped !== undefined) {
+        throw new Error(
+          `Project ${quoteId(resolvedId)} is configured but was not loaded. ` +
+            `${describeSkippedProject(skipped, this.workspaceRoot)} Known projects: ${known}.`,
+        );
+      }
+      throw new Error(`Unknown project ${quoteId(resolvedId)}. Known projects: ${known}.`);
     }
     return project;
   }
@@ -297,7 +454,8 @@ export class ProjectManager {
   projectPath(id: string): string {
     const cfg = this.projects.get(id);
     if (cfg && isLocalProject(cfg)) return path.resolve(cfg.path);
-    return path.join(this.workspaceRoot, id);
+    // Throws rather than resolve `..` or a separator — see `src/lib/projectId.ts`.
+    return childPathInside(this.workspaceRoot, id, 'project id');
   }
 
   /** Whether a project is edited in place (no remote, no clone). */
@@ -327,8 +485,17 @@ export class ProjectManager {
    * project without every caller threading the id through.
    */
   idForDir(dir: string): string | undefined {
+    return this.idsForDir(dir)[0];
+  }
+
+  /**
+   * Every id whose working directory is `dir`. Registration refuses a second one
+   * (`assertDirUnclaimed`), but a hand-edited registry or env config can still hold two, and a
+   * policy question must not be answered by whichever happened to come first.
+   */
+  private idsForDir(dir: string): string[] {
     const resolved = path.resolve(dir);
-    return this.knownIds().find((id) => path.resolve(this.projectPath(id)) === resolved);
+    return this.knownIds().filter((id) => path.resolve(this.projectPath(id)) === resolved);
   }
 
   /**
@@ -341,10 +508,14 @@ export class ProjectManager {
    * user does — see `LocalProjectConfig.followSymlinks`.
    */
   followsUserLinks(dir: string): boolean {
-    const id = this.idForDir(dir);
-    if (id === undefined) return false;
-    const cfg = this.projects.get(id);
-    return cfg !== undefined && isLocalProject(cfg) && cfg.followSymlinks === true;
+    // Fails closed: when two ids share the directory (see `idsForDir`), links are followed only
+    // if EVERY one of them asserts it — one registration saying no is a no.
+    const ids = this.idsForDir(dir);
+    if (ids.length === 0) return false;
+    return ids.every((id) => {
+      const cfg = this.projects.get(id);
+      return cfg !== undefined && isLocalProject(cfg) && cfg.followSymlinks === true;
+    });
   }
 
   /** Whether a project's working directory is there: cloned (git) or simply present (local). */
@@ -362,8 +533,8 @@ export class ProjectManager {
     if (!(await this.isReady(cfg))) {
       throw new Error(
         isLocalProject(cfg)
-          ? `Project "${cfg.id}" is local, but its directory does not exist: ${dir}.`
-          : `Project "${cfg.id}" is not cloned yet. Run project_sync first.`,
+          ? `Project ${quoteId(cfg.id)} is local, but its directory does not exist: ${dir}.`
+          : `Project ${quoteId(cfg.id)} is not cloned yet. Run project_sync first.`,
       );
     }
     return { id: cfg.id, dir };
@@ -372,13 +543,18 @@ export class ProjectManager {
   /** All known projects with their current status. */
   async listProjects(): Promise<ProjectStatus[]> {
     return Promise.all(
-      [...this.projects.values()].map(async (p) => ({
-        project: p.id,
-        path: this.projectPath(p.id),
-        mode: isLocalProject(p) ? ('local' as const) : ('git' as const),
-        gitUrl: gitUrlOf(p),
-        cloned: await this.isReady(p),
-      })),
+      [...this.projects.values()].map(async (p) => {
+        // Redacted, not dropped: an env-configured or legacy registry URL may still embed a token
+        // (registration strips new ones), and the reader should see that it does — without it.
+        const gitUrl = gitUrlOf(p);
+        return {
+          project: p.id,
+          path: this.projectPath(p.id),
+          mode: isLocalProject(p) ? ('local' as const) : ('git' as const),
+          gitUrl: gitUrl === undefined ? undefined : redactGitUrlCredentials(gitUrl),
+          cloned: await this.isReady(p),
+        };
+      }),
     );
   }
 

@@ -10,7 +10,7 @@ to avoid backslash escaping.
 
 ```powershell
 winget install OpenJS.NodeJS.LTS    # Node.js >= 20
-winget install Git.Git              # git (includes Git Credential Manager)
+winget install Git.Git              # git 2.25 or newer (includes Git Credential Manager)
 winget install GitHub.cli           # optional: GitHub CLI
 ```
 

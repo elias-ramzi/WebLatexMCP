@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, readFile, writeFile, stat, readdir } from 'node:fs/promises';
-import { ShelfStore } from '../../src/services/shelfStore.js';
+import { mkdtemp, mkdir, rm, readFile, writeFile, stat, readdir, chmod } from 'node:fs/promises';
+import { ShelfStore, ShelfCorruptError } from '../../src/services/shelfStore.js';
 import type { ShelfFileInput } from '../../src/services/shelfStore.js';
 import { sessionStateDir } from '../../src/lib/sessionPaths.js';
 
@@ -198,7 +198,7 @@ describe('ShelfStore', () => {
     await expect(entry?.content('../../../../etc/passwd')).rejects.toThrow(/escapes/);
     await expect(entry?.content('/etc/passwd')).rejects.toThrow(/absolute/);
     await expect(entry?.content('..\\shelf.json')).rejects.toThrow(/not usable/);
-    await expect(entry?.content('main.tex .png')).rejects.toThrow(/not usable/);
+    await expect(entry?.content('main.tex\u0000.png')).rejects.toThrow(/not usable/);
   });
 
   it('refuses an invalid shelf id in read without touching the filesystem', async () => {
@@ -274,5 +274,106 @@ describe('ShelfStore', () => {
       'utf8',
     );
     expect(JSON.parse(raw)).toEqual(manifest);
+  });
+
+  describe('a side that cannot be read is never read as absent', () => {
+    // `null` from content()/base() is a VALUE — "the shelf recorded a deletion" / "the file was
+    // untracked" — and unshelve acts on it: a null content side is restored by DELETING the
+    // file. So a read that failed for any reason other than "there is no such file" must throw,
+    // or an intact-but-unreadable shelf deletes the user's file and is then removed itself.
+    const noChmod =
+      process.platform === 'win32' ||
+      (typeof process.getuid === 'function' && process.getuid() === 0);
+
+    it.skipIf(noChmod)(
+      'rethrows a non-ENOENT failure (EACCES) instead of returning null',
+      async () => {
+        await store.create(PROJECT, { label: null, headSha: 'x', files: [fileInput()] });
+        const contentFile = path.join(
+          store.shelvesDir(PROJECT),
+          'sh-1a2b3c4d',
+          'content',
+          'main.tex',
+        );
+        await chmod(contentFile, 0o000);
+        try {
+          const entry = await store.read(PROJECT, 'sh-1a2b3c4d');
+          await expect(entry!.content('main.tex')).rejects.toMatchObject({ code: 'EACCES' });
+        } finally {
+          await chmod(contentFile, 0o600);
+        }
+      },
+    );
+    // (A genuinely absent side still reads as null — 'stores nothing on the side a status says
+    // is absent' above already pins that, so the rethrow cannot overshoot unnoticed.)
+  });
+
+  describe('sides() checks what is on disk against what the manifest records', () => {
+    it('reads both sides of a consistent entry, once', async () => {
+      await store.create(PROJECT, {
+        label: null,
+        headSha: 'x',
+        files: [
+          fileInput({ path: 'm.tex' }),
+          fileInput({ path: 'a.tex', status: 'added', base: null }),
+          fileInput({ path: 'd.tex', status: 'deleted', content: null }),
+        ],
+      });
+      const entry = (await store.read(PROJECT, 'sh-1a2b3c4d'))!;
+      const [m, a, d] = entry.manifest.files;
+      const sm = await entry.sides(m!);
+      expect(sm.content?.toString('utf8')).toBe('working\n');
+      expect(sm.base?.toString('utf8')).toBe('head\n');
+      const sa = await entry.sides(a!);
+      expect(sa.content?.toString('utf8')).toBe('working\n');
+      expect(sa.base).toBeNull();
+      const sd = await entry.sides(d!);
+      expect(sd.content).toBeNull();
+      expect(sd.base?.toString('utf8')).toBe('head\n');
+    });
+
+    it.each([
+      ['modified', 'content'],
+      ['modified', 'base'],
+      ['added', 'content'],
+      ['deleted', 'base'],
+    ] as const)('refuses a %s entry whose %s side has gone missing', async (status, side) => {
+      await store.create(PROJECT, {
+        label: null,
+        headSha: 'x',
+        files: [
+          fileInput({
+            status,
+            content: status === 'deleted' ? null : Buffer.from('working\n'),
+            base: status === 'added' ? null : Buffer.from('head\n'),
+          }),
+        ],
+      });
+      await rm(path.join(store.shelvesDir(PROJECT), 'sh-1a2b3c4d', side, 'main.tex'));
+      const entry = (await store.read(PROJECT, 'sh-1a2b3c4d'))!;
+      await expect(entry.sides(entry.manifest.files[0]!)).rejects.toBeInstanceOf(ShelfCorruptError);
+    });
+
+    it.each([
+      ['added', 'base'],
+      ['deleted', 'content'],
+    ] as const)('refuses a %s entry that holds a %s side it should not', async (status, side) => {
+      await store.create(PROJECT, {
+        label: null,
+        headSha: 'x',
+        files: [
+          fileInput({
+            status,
+            content: status === 'deleted' ? null : Buffer.from('working\n'),
+            base: status === 'added' ? null : Buffer.from('head\n'),
+          }),
+        ],
+      });
+      const extra = path.join(store.shelvesDir(PROJECT), 'sh-1a2b3c4d', side, 'main.tex');
+      await mkdir(path.dirname(extra), { recursive: true });
+      await writeFile(extra, 'stray\n');
+      const entry = (await store.read(PROJECT, 'sh-1a2b3c4d'))!;
+      await expect(entry.sides(entry.manifest.files[0]!)).rejects.toThrow(/corrupt/i);
+    });
   });
 });

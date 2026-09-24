@@ -72,6 +72,20 @@ describe('commentOut', () => {
   it('handles an empty string', () => {
     expect(commentOut('')).toBe('%');
   });
+
+  // A bare '\r' ends a line for TeX, for `splitLines` and for `lineBoundsFrom`. Splitting on
+  // '\n' alone left every line after a bare CR uncommented: 'alpha\rbeta' came back as
+  // '% alpha\rbeta', and 'beta' compiled into the PDF.
+  it('comments every line of a CR-only block, keeping each bare \\r terminator verbatim', () => {
+    expect(commentOut('alpha\rbeta')).toBe('% alpha\r% beta');
+    expect(commentOut('a\rb\r')).toBe('% a\r% b\r');
+    expect(commentOut('a\r\rb')).toBe('% a\r%\r% b');
+  });
+
+  it('comments every line of a mixed-ending block, each terminator kept as it was', () => {
+    expect(commentOut('a\r\nb\nc\rd')).toBe('% a\r\n% b\n% c\r% d');
+    expect(commentOut('intro\nalpha\rbeta\n')).toBe('% intro\n% alpha\r% beta\n');
+  });
 });
 
 describe('classifyEdit', () => {
@@ -705,6 +719,96 @@ describe('createPreserveTransform', () => {
       );
       expect(result).not.toMatch(/[^\r]\n/); // no lone LF anywhere in this all-CRLF file
       expect(preserve.preservedEdits()).toBe(1);
+    });
+  });
+
+  // A preserved block is only worth anything if none of the old text stays live: every line the
+  // old text occupied must start with '%'. Lines are counted the way TeX counts them — a bare
+  // '\r' ends one — which is exactly what the pre-fix commentOut did not do.
+  describe('bare carriage returns (CR-only and stray-CR files)', () => {
+    /** The lines of `text` that contain `word`, split on every terminator TeX honours. */
+    const linesWith = (text: string, word: string): string[] =>
+      text.split(/\r\n|\n|\r/).filter((l) => l.includes(word));
+
+    it('comments out every line of a CR-only whole-file edit', () => {
+      const content = 'alpha\rbeta';
+      const edit: EditOp = { oldString: 'alpha\rbeta', newString: 'gamma' };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(linesWith(result, 'beta')).toEqual(['% beta']);
+      // A CR-only file stays CR-only: the separator is the file's own bare '\r', never a '\n'.
+      expect(result).toBe('% alpha\r% beta\rgamma');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('comments out the line after a stray CR in an otherwise-LF file', () => {
+      const content = 'intro\nalpha\rbeta\nend\n';
+      const edit: EditOp = { oldString: 'alpha\rbeta', newString: 'gamma' };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(linesWith(result, 'beta')).toEqual(['% beta']);
+      expect(result).toBe('intro\n% alpha\r% beta\ngamma\nend\n');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    it('treats a match right after a bare CR as starting a line, as lineBoundsFrom does', () => {
+      const content = 'intro\ralpha beta\nend\n';
+      const edit: EditOp = { oldString: 'alpha beta', newString: 'gamma' };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe('intro\r% alpha beta\ngamma\nend\n');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    // Preservation writes no '\n' into a CR-only file: the separator after a bare-'\r' line is
+    // '\r', and an oldString ending in its own bare '\r' is not "completed" into CRLF.
+    it('separates a CR-only block with a bare \\r, never LF or CRLF', () => {
+      const cases: [string, EditOp, string][] = [
+        ['a\rb\rc', { oldString: 'c', newString: 'C' }, 'a\rb\r% c\rC'],
+        ['a\rb\rc\r', { oldString: 'c\r', newString: 'C' }, 'a\rb\r% c\rC'],
+        ['a\rb\rc\rd', { oldString: 'c\r', newString: 'C' }, 'a\rb\r% c\rC\rd'],
+      ];
+      for (const [content, edit, expected] of cases) {
+        const preserve = createPreserveTransform('always');
+        expect(applyWithTransform(content, edit, preserve.transform)).toBe(expected);
+        expect(preserve.preservedEdits()).toBe(1);
+      }
+    });
+
+    // A stray bare '\r' in a CRLF file stays bare: naming it in oldString or leaving it in the
+    // file are two spellings of one edit and must write the same bytes. Consuming it used to
+    // "complete" it into CRLF ('% bb\r\nNN\r') while leaving it gave '% bb\rNN\r'.
+    it('keeps a stray bare \\r in a CRLF file bare, however oldString is spelled', () => {
+      const content = 'aa\nbb\rcc\r\n';
+      for (const oldString of ['bb\r', 'bb']) {
+        const preserve = createPreserveTransform('always');
+        expect(
+          applyWithTransform(content, { oldString, newString: 'NN' }, preserve.transform),
+        ).toBe('aa\n% bb\rNN\rcc\r\n');
+        expect(preserve.preservedEdits()).toBe(1);
+      }
+    });
+
+    // A bare '\r' after the match ends its line, exactly as lineBoundsFrom counts it; before,
+    // only '\n' or '\r\n' did, so a middle line of a CR-only file was never preserved.
+    it('treats a bare \\r after the match as a line end', () => {
+      const preserve = createPreserveTransform('always');
+      const edit: EditOp = { oldString: 'b', newString: 'B' };
+      expect(applyWithTransform('a\rb\rc\r', edit, preserve.transform)).toBe('a\r% b\rB\rc\r');
+      expect(preserve.preservedEdits()).toBe(1);
+    });
+
+    // Boundary of the rule above, not a regression test for the bug: the position between the
+    // two bytes of a CRLF pair is not a line start (lineBoundsFrom consumes '\r\n' as one
+    // terminator), so a match beginning with that '\n' stays declined — a '%' placed there would
+    // sit after the '\r' and before the '\n', on no line of its own.
+    it('does not treat the middle of a CRLF pair as a line start', () => {
+      const content = 'intro\r\nalpha\nend';
+      const edit: EditOp = { oldString: '\nalpha', newString: '\ngamma' };
+      const preserve = createPreserveTransform('always');
+      const result = applyWithTransform(content, edit, preserve.transform);
+      expect(result).toBe('intro\r\ngamma\nend');
+      expect(preserve.preservedEdits()).toBe(0);
     });
   });
 

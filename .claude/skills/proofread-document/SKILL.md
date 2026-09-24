@@ -1,6 +1,6 @@
 ---
 name: proofread-document
-description: Hunt typos and language errors in a LaTeX/markdown document — spelling, doubled or missing words, subject/verb agreement, punctuation, quotes, unescaped LaTeX characters, and inconsistent hyphenation or capitalization of repeated terms. Reports each finding with its line and an exact minimal replacement, and applies fixes only when asked. Use when the user asks to "proofread", "check for typos", "find spelling/grammar mistakes", or "correct the text" of a paper or draft. Never rewrites prose for style and never touches a .bib. Operates on projects served by the web-latex-mcp MCP server. In Claude Code, prefer the /hunt-typo command, which parallelizes this across sonnet agents; follow this procedure directly in clients without subagents.
+description: Hunt typos and language errors in a LaTeX/markdown document — spelling, doubled or missing words, subject/verb agreement, punctuation, quotes, unescaped LaTeX characters, and inconsistent hyphenation or capitalization of repeated terms. Reports each finding with its line and an exact minimal replacement, and applies fixes only when asked. Use when the user asks to "proofread", "check for typos", "find spelling/grammar mistakes", or "correct the text" of a paper or draft. Never rewrites prose for style and never touches a .bib. Operates on projects served by the web-latex-mcp MCP server.
 project: optional
 ---
 

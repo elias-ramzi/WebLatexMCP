@@ -3,13 +3,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
-import { locateProjectPdf } from '../lib/pdfLocate.js';
+import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
-import { MAX_TEXT_CHARS_PER_PAGE, MAX_TEXT_PAGES, PdfRenderError } from '../services/pdfRender.js';
+import { MAX_TEXT_PAGES, PdfRenderError } from '../services/pdfRender.js';
 import type { TextResult } from '../services/pdfRender.js';
 import { readAuxFloats } from '../lib/auxFloats.js';
 import {
-  planLabelPages,
+  resolveLabelPages,
+  pdfLabelPageReader,
   labelRefusalMessage,
   labelResolutionNote,
   labelPageRangeMessage,
@@ -18,6 +19,11 @@ import {
   MAX_LABELS_PER_CALL,
 } from '../lib/labelPages.js';
 import type { LabelPagePlan } from '../lib/labelPages.js';
+import {
+  EXTRACT_TEXT_CONTENT_BUDGET,
+  planExtractedText,
+  renderTextPageBlock,
+} from '../lib/extractTextBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -25,9 +31,11 @@ const inputSchema = {
     .string()
     .optional()
     .describe(
-      'Root .tex file, used to select the build-dir PDF to read when the surfaced workspace ' +
-        'copy is not being used (workspace-local mode prefers <workspace>/<id>.pdf and never ' +
-        'consults this). Auto-detected when omitted.',
+      'Root .tex file whose build this reads: its build-dir PDF (and, for `labels`, its ' +
+        '.aux), in every workspace mode — pass the same rootFile you compiled with to read a ' +
+        'non-default root. Auto-detected when omitted. Only when it is omitted and no .aux is ' +
+        'read does a missing build PDF fall back to the surfaced <workspace>/<id>.pdf ' +
+        '(workspace-local mode), which holds whichever root compiled last.',
     ),
   pages: z
     .array(z.number().int().positive())
@@ -67,9 +75,10 @@ const pageShape = z.object({
   linesOmitted: z
     .number()
     .describe(
-      `Lines the ${MAX_TEXT_CHARS_PER_PAGE}-character per-page budget left out. They are always ` +
-        'a suffix of the page, so `lines` is a contiguous prefix rather than a filtered ' +
-        'selection.',
+      `Lines left out of this page by the call's ${EXTRACT_TEXT_CONTENT_BUDGET}-character text ` +
+        'budget (shared by every page of the call, charged on the rendered text in both ' +
+        'channels). They are always a suffix of the page, so `lines` is a contiguous prefix ' +
+        'rather than a filtered selection.',
     ),
   charsOmitted: z
     .number()
@@ -110,8 +119,8 @@ const outputSchema = {
     .string()
     .optional()
     .describe(
-      'Present when something about the answer is not the default: which pages were budgeted ' +
-        'down, and — when `labels` was used — the provenance of the page numbers.',
+      'Present when something about the answer is not the default: which pages were cut, by ' +
+        'which budget, and — when `labels` was used — the provenance of the page numbers.',
     ),
 };
 
@@ -135,17 +144,19 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
         'What comes back is the PDF text layer, not the source: macros are expanded, ' +
         'hyphenation is applied, and a line break here is a typeset line, not a source line — ' +
         'use read_file or search_files for the source. Lines come in the order the PDF draws ' +
-        `them and are never re-sorted. At most ${MAX_TEXT_PAGES} pages per call and ` +
-        `${MAX_TEXT_CHARS_PER_PAGE} characters per page; whatever a budget cut is counted in ` +
-        'linesOmitted/charsOmitted, never dropped silently. ' +
+        `them and are never re-sorted. At most ${MAX_TEXT_PAGES} pages per call, and ONE ` +
+        `${EXTRACT_TEXT_CONTENT_BUDGET}-character budget for the whole call, charged on the ` +
+        'text as rendered in both channels (roughly half of it is page text) — every page is ' +
+        'guaranteed an equal share and a page that needs less passes the rest on, so ask for ' +
+        'fewer pages to read more of each. Each page is cut from its end, and whatever a budget ' +
+        'cut is counted in linesOmitted/charsOmitted, never dropped silently. ' +
         'Writes nothing into the project or its build directory, but it is NOT free of side ' +
         'effects: like render_pages and pdf_geometry it takes the per-project lock, because a ' +
         "peer session's compile can rewrite the build dir mid-read — so it creates " +
         '<workspace>/.sessions/<project>/ if absent, and can wait on or time out against a peer ' +
         'holding that lock. ' +
-        'Needs the optional native canvas backend (@napi-rs/canvas) even though it rasterizes ' +
-        'nothing — pdf.js cannot be imported in Node without it; `doctor` reports whether it is ' +
-        'installed. ' +
+        'It never rasterizes, so it does not need the optional native canvas backend ' +
+        '(@napi-rs/canvas) that render_pages does. ' +
         'Fails with a message to run compile first when nothing has been compiled yet.',
       inputSchema,
       outputSchema,
@@ -173,7 +184,11 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           // baseline would wrongly claim the caller could now base a write on a file it only
           // used to find a PDF. Same reasoning as render_pages.
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
-          const pdfPath = await locateProjectPdf(ctx.config, id, dir, root);
+          // The ROOT's build PDF — same rule and reason as render_pages (see locateRootPdf).
+          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
+            rootNamed: rootFile !== undefined,
+            readsAux: labels !== undefined,
+          });
           if (!pdfPath) {
             throw new Error(
               `No compiled PDF found for project "${id}". Run compile first, then extract_text.`,
@@ -182,12 +197,16 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
 
           // Inside the lock for the same reason render_pages resolves labels inside it: the .aux
           // and the PDF must come from the same build, or the page number and the page would be
-          // from different ones.
+          // from different ones. The lock keeps a peer's compile out; locateRootPdf is what makes
+          // them the same ROOT's build.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
             const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
-            const pageLabels = await ctx.pdfRenderer.pageLabels(pdfPath);
-            labelPlan = planLabelPages(labels, aux, pageLabels);
+            labelPlan = await resolveLabelPages(
+              labels,
+              aux,
+              pdfLabelPageReader(ctx.pdfRenderer, pdfPath),
+            );
             if (labelPlan.failed.length > 0) {
               throw new Error(labelRefusalMessage(labelPlan, aux));
             }
@@ -211,21 +230,13 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
             throw err;
           }
 
-          const budgeted = result.pages.filter((p) => p.linesOmitted > 0);
-          const budgetNote =
-            budgeted.length > 0
-              ? `The ${MAX_TEXT_CHARS_PER_PAGE}-character per-page budget cut the end of ` +
-                `${budgeted.length} page(s): ` +
-                budgeted
-                  .map((p) => `page ${p.page} (${p.linesOmitted} line(s), ${p.charsOmitted} chars)`)
-                  .join(', ') +
-                '. Ask for that page alone, or use pdf_geometry kinds: ["text"] to see where the ' +
-                'remaining lines sit.'
-              : undefined;
+          // One budget for the whole call, over both channels, and the only cut: the service
+          // returns every line whole, so the counters are the true gap (see extractTextBudget.ts).
+          const plan = planExtractedText(result.pages);
           // Joined, never overwritten — the two notes answer different questions and both can
           // hold at once. Same shape as render_pages' and pdf_geometry's note joining.
           const note =
-            [labelPlan ? labelResolutionNote(labelPlan) : undefined, budgetNote]
+            [labelPlan ? labelResolutionNote(labelPlan) : undefined, plan.note]
               .filter(Boolean)
               .join(' ') || undefined;
 
@@ -233,12 +244,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           const structuredContent = {
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
-            pages: result.pages.map((p) => ({
-              page: p.page,
-              lines: p.lines,
-              linesOmitted: p.linesOmitted,
-              charsOmitted: p.charsOmitted,
-            })),
+            pages: plan.pages,
             skippedPages: result.skippedPages,
             resolvedLabels: labelPlan ? labelPlan.resolved : undefined,
             note,
@@ -248,14 +254,9 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           const labelLine = labelPlan
             ? `  labels (from the last compile's .aux): ${describeResolvedLabels(labelPlan.resolved)}`
             : '';
-          const pageBlocks = result.pages.map((p) => {
-            const cut =
-              p.linesOmitted > 0
-                ? `  … ${p.linesOmitted} further line(s) (${p.charsOmitted} chars) cut by the ` +
-                  'per-page budget'
-                : '';
-            return [`--- page ${p.page} ---`, ...p.lines, cut].filter(Boolean).join('\n');
-          });
+          // Rendered from the already-cut plan, never from `result`: the text channel is the
+          // other half of what the budget charged.
+          const pageBlocks = plan.pages.map(renderTextPageBlock);
           const skippedLine =
             result.skippedPages.length > 0
               ? `  … ${result.skippedPages.length} page(s) not extracted (at most ` +

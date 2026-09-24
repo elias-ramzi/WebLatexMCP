@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CredentialResolver, authenticateUrl } from '../../src/services/auth.js';
+import { CredentialResolver } from '../../src/services/auth.js';
 import type { ExecResult } from '../../src/lib/exec.js';
 
 /** Fake exec that returns a gh token for `gh auth token`, and "no entry" for anything else. */
@@ -169,22 +169,5 @@ describe('CredentialResolver.storeCredential', () => {
     const r = new CredentialResolver({}, exec);
     await r.storeCredential('git.overleaf.com', 'git', 'olp_secret');
     expect(r.allSecrets()).toContain('olp_secret');
-  });
-});
-
-describe('authenticateUrl', () => {
-  it('injects credentials into a GitHub HTTPS URL', () => {
-    expect(
-      authenticateUrl('https://github.com/me/repo.git', {
-        username: 'x-access-token',
-        token: 'tok',
-      }),
-    ).toBe('https://x-access-token:tok@github.com/me/repo.git');
-  });
-
-  it('leaves file:// URLs untouched', () => {
-    expect(authenticateUrl('file:///tmp/x', { username: 'git', token: 'tok' })).toBe(
-      'file:///tmp/x',
-    );
   });
 });

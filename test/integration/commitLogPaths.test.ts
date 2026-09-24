@@ -49,7 +49,7 @@ describe('logCommits (via status) reports plain, unquoted paths', () => {
     await raw.raw(['mv', 'a.tex', 'b.tex']);
     await raw.raw(['commit', '-m', 'rename a.tex to b.tex']);
 
-    const status = await git.status(dir);
+    const status = await git.status(dir, { withCommits: true });
 
     expect(status.aheadCommits).toHaveLength(1);
     const paths = status.aheadCommits[0]?.files.map((f) => f.path).sort();
@@ -66,7 +66,7 @@ describe('logCommits (via status) reports plain, unquoted paths', () => {
     await raw.add(['résumé.tex']);
     await raw.raw(['commit', '-m', 'add résumé.tex']);
 
-    const status = await git.status(dir);
+    const status = await git.status(dir, { withCommits: true });
 
     expect(status.aheadCommits).toHaveLength(1);
     const paths = status.aheadCommits[0]?.files.map((f) => f.path);

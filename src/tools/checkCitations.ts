@@ -11,6 +11,8 @@ import {
 } from '../lib/references.js';
 import { citingDocumentCandidates, referenceSourceCandidates } from '../lib/referenceSources.js';
 import {
+  CITATIONS_FILES_BUDGET,
+  CITATIONS_MAX_FILES,
   CITATIONS_MAX_FINDINGS,
   CITATIONS_MAX_PLACES,
   CITATIONS_MAX_RESULTS,
@@ -63,8 +65,28 @@ const inputSchema = {
 const placeSchema = z.object({ path: z.string(), line: z.number() });
 
 const outputSchema = {
-  documents: z.array(z.string()).describe('Files whose citations were collected.'),
-  bibliographySources: z.array(z.string()).describe('Files the reference entries came from.'),
+  documents: z
+    .array(z.string())
+    .describe(
+      `Files whose citations were collected — capped at ${CITATIONS_MAX_FILES} paths and ` +
+        `${CITATIONS_FILES_BUDGET} characters (\`maxResults\` does not raise it); ` +
+        '`documentsOmitted` counts the rest. Every file was still scanned.',
+    ),
+  documentsOmitted: z
+    .number()
+    .describe('Scanned documents not listed in `documents`. 0 when the list is complete.'),
+  bibliographySources: z
+    .array(z.string())
+    .describe(
+      `Files the reference entries came from — capped at ${CITATIONS_MAX_FILES} paths and ` +
+        `${CITATIONS_FILES_BUDGET} characters (\`maxResults\` does not raise it); ` +
+        '`bibliographySourcesOmitted` counts the rest. Every entry was still checked.',
+    ),
+  bibliographySourcesOmitted: z
+    .number()
+    .describe(
+      'Bibliography files not listed in `bibliographySources`. 0 when the list is complete.',
+    ),
   bibliographyProject: z
     .string()
     .optional()
@@ -160,6 +182,17 @@ const outputSchema = {
 type Located = ReferenceEntry & { path: string };
 
 /**
+ * Join at most `max` names, appending `, … N more` for the rest — the house `capList` shape
+ * (`src/services/gitService.ts`, `src/lib/peerAttribution.ts`; exported from neither). Used for
+ * the keyless-bibliography refusal, whose file list is one name per prose document carrying a
+ * numbered reference list: document-controlled in length, so never joined in full.
+ */
+function capList(items: string[], max: number): string {
+  if (items.length <= max) return items.join(', ');
+  return `${items.slice(0, max).join(', ')}, … ${items.length - max} more`;
+}
+
+/**
  * Read and parse each named source, keeping the entries that carry a cite key.
  *
  * `keyless` counts the ones dropped for having none — a prose reference list is numbered, not keyed.
@@ -240,10 +273,11 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
           // There is nothing to cross-reference *by*, so say that rather than "none found".
           if (keyless > 0) {
             throw new Error(
-              `Found ${keyless} reference(s) in ${keylessIn.join(', ')}${where}, but none carry a cite ` +
-                'key — they are a numbered/prose reference list. check_citations matches cite keys, ' +
-                'so there is nothing here to cross-reference. Use list_references to read the list, ' +
-                'and verify each entry against DBLP, Crossref or OpenAlex with search_references.',
+              `Found ${keyless} reference(s) in ${capList(keylessIn, CITATIONS_MAX_FILES)}${where}, ` +
+                'but none carry a cite key — they are a numbered/prose reference list. ' +
+                'check_citations matches cite keys, so there is nothing here to cross-reference. ' +
+                'Use list_references to read the list, and verify each entry against DBLP, ' +
+                'Crossref or OpenAlex with search_references.',
             );
           }
           throw new Error(
@@ -320,15 +354,22 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
         // Every byte of all four lists is document-controlled, and a group .bib carried in the
         // project routinely makes `uncitedEntries` hundreds of rows long on a perfectly ordinary
         // paper. The planner cuts before anything is sent, counts what it cut, and decides the
-        // ORDER — advisory findings first, build-breaking ones last (issue #154).
+        // ORDER — advisory findings first, build-breaking ones last (issue #154). The two file
+        // lists go through it too: a project of many prose notes makes `documents` alone longer
+        // than any finding list.
         const plan = planCitationsPayload(
-          { undefinedCitations, uncitedEntries, duplicateKeys, incompleteEntries },
+          {
+            undefinedCitations,
+            uncitedEntries,
+            duplicateKeys,
+            incompleteEntries,
+            documents: scanned,
+            bibliographySources: sources,
+          },
           { maxResults },
         );
 
         const result = {
-          documents: scanned,
-          bibliographySources: sources,
           ...(foreign ? { bibliographyProject: bib.id } : {}),
           entryCount: entries.length,
           citationCount: uses.size,
@@ -357,8 +398,6 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
  * renderer's view of the payload the same type the planner produces, so it cannot drift again.
  */
 interface Report extends CitationsPlan {
-  documents: string[];
-  bibliographySources: string[];
   bibliographyProject?: string;
   entryCount: number;
   citationCount: number;
@@ -374,9 +413,15 @@ interface Report extends CitationsPlan {
  */
 function render(r: Report): string {
   const from = r.bibliographyProject ? ` (project "${r.bibliographyProject}")` : '';
+  // The file lists may be cut; the header still counts every file, and names the cut.
+  const sourceNames = [
+    ...r.bibliographySources,
+    ...(r.bibliographySourcesOmitted > 0 ? [`+${r.bibliographySourcesOmitted} more`] : []),
+  ];
   const lines = [
-    `${r.entryCount} entries in ${r.bibliographySources.join(', ') || '(none)'}${from} · ` +
-      `${r.citationCount} distinct keys cited across ${r.documents.length} document(s)`,
+    `${r.entryCount} entries in ${sourceNames.join(', ') || '(none)'}${from} · ` +
+      `${r.citationCount} distinct keys cited across ` +
+      `${r.documents.length + r.documentsOmitted} document(s)`,
   ];
   if (r.bibliographyProject) {
     lines.push(

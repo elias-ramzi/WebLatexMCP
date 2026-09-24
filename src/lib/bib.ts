@@ -1,8 +1,29 @@
 import path from 'node:path';
 
-/** Whether a path points at a BibTeX bibliography file. */
+/**
+ * Whether a path points at a BibTeX bibliography file.
+ *
+ * Judged twice, and a match on either counts, so this can only ever widen what is guarded:
+ *
+ *  - on the literal name, as before — on POSIX `refs.tex:x.bib` is a real file with a `.bib`
+ *    extension;
+ *  - on the name **Windows** would open. Win32 path normalisation strips trailing dots and spaces
+ *    from the final component, and `name:stream[:$DATA]` addresses an alternate data stream of
+ *    `name`, so `refs.bib.`, `refs.bib ` and `refs.bib::$DATA` all write `refs.bib` there — while
+ *    `extname` reads `.bib.`, `.bib ` and `.bib::$DATA`, and `write_file` skipped `confirmBibEdit`.
+ *    The final component is cut at its first `:` and then stripped of trailing dots and spaces.
+ *    Only the final component: a drive letter (`C:/…`) or a colon in a directory name is not a
+ *    stream suffix of the file.
+ *
+ * This runs on every platform. On POSIX the second reading calls a file literally named
+ * `refs.bib.` a bibliography, which costs one confirmation — the fail-safe direction.
+ */
 export function isBibFile(relPath: string): boolean {
-  return path.extname(relPath).toLowerCase() === '.bib';
+  if (path.extname(relPath).toLowerCase() === '.bib') return true;
+  const base = relPath.slice(Math.max(relPath.lastIndexOf('/'), relPath.lastIndexOf('\\')) + 1);
+  const colon = base.indexOf(':');
+  const windowsName = (colon === -1 ? base : base.slice(0, colon)).replace(/[. ]+$/, '');
+  return path.extname(windowsName).toLowerCase() === '.bib';
 }
 
 // BibTeX entry header, e.g. `@inproceedings{he2016deep,`. Non-citation directives

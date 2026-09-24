@@ -15,6 +15,13 @@ import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 import { registryPath } from '../../src/services/projectRegistry.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
 import { REFERENCE_SOURCES } from '../../src/lib/referenceKey.js';
+import {
+  projectLockPath,
+  rewriteModePath,
+  sessionDir,
+  sessionStateDir,
+} from '../../src/lib/sessionPaths.js';
+import { ShelfStore } from '../../src/services/shelfStore.js';
 
 describe('loadConfig', () => {
   const notInRepo = () => false;
@@ -646,11 +653,41 @@ describe('parseContactEmail', () => {
     'a@b.com/x', // query-altering character
     'a@b.com\npad', // newline
     'a@b@c.com', // two @
+    // Non-ASCII: the address goes into the User-Agent header, and fetch's ByteString check
+    // throws before any I/O on a code point above 255 — so every Crossref/OpenAlex request
+    // became "could not be reached" while server_info said a contact email was configured.
+    '用户@例子.广告',
+    // Latin-1 passes that check but is still not ASCII, which a header value has to be to be
+    // read the same way by every front. Refused on the same rule rather than a narrower one.
+    'josé@example.com',
+    // Characters that would break out of the `( ...; mailto:<email>)` User-Agent comment.
+    'a(b@c.com',
+    'a)b@c.com',
+    'a;b@c.com',
+    'a\\b@c.com',
   ])('rejects %j without throwing, returning undefined', (bad) => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(() => parseContactEmail(bad)).not.toThrow();
     expect(parseContactEmail(bad)).toBeUndefined();
     expect(spy).toHaveBeenCalled();
+  });
+
+  it('accepts only addresses that survive as a User-Agent header value', () => {
+    // The property the rejection list above approximates: whatever parseContactEmail lets
+    // through is interpolated into a header, and a header that cannot be built fails every
+    // request to the backend with a misleading "could not be reached".
+    for (const candidate of [
+      'me@example.com',
+      'first.last+tag@sub.example.org',
+      '用户@例子.广告',
+    ]) {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const email = parseContactEmail(candidate);
+      if (email === undefined) continue;
+      expect(
+        () => new Headers({ 'User-Agent': `web-latex-mcp/0 (+https://x.test; mailto:${email})` }),
+      ).not.toThrow();
+    }
   });
 
   it('logs the rejection to stderr, never stdout (stdout is the JSON-RPC channel)', () => {
@@ -783,5 +820,48 @@ describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused w
     vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(parseContactEmail('me@example.com')).toBe('me@example.com');
     expect(parseContactEmail(rejected)).toBeUndefined();
+  });
+});
+
+describe('WEB_LATEX_MCP_SESSION never names a directory the project state dir already uses', () => {
+  // A session's state lives at `<workspace>/.sessions/<project>/<sessionId>/`, beside the
+  // project-wide entries in that same directory. A session id equal to one of those names put
+  // its session.json/shadow/base INSIDE the shelf store (or onto the lock / rewrite-mode file).
+  // The reserved names are read off the real layout, not restated, so a new entry that forgets
+  // to reserve itself is caught by the `.every` guard at the bottom of this list rather than
+  // silently colliding.
+  const ws = path.join(os.tmpdir(), 'ws');
+  const stateDir = sessionStateDir(ws, 'p');
+  const projectLevel = [
+    new ShelfStore(ws, 'any').shelvesDir('p'),
+    projectLockPath(ws, 'p'),
+    rewriteModePath(ws, 'p'),
+  ];
+  const reserved = projectLevel.map((entry) => path.basename(entry));
+
+  it('reads every reserved name off an entry directly under the project state dir', () => {
+    expect(projectLevel.every((entry) => path.dirname(entry) === stateDir)).toBe(true);
+    expect(reserved).toEqual(['shelves', 'project.lock', 'rewrite-mode.json']);
+  });
+
+  it.each(reserved)('refuses a session id of %j, which would collide', (name) => {
+    // The collision is real, not hypothetical: the session dir IS the project-level entry.
+    expect(sessionDir(ws, 'p', name)).toBe(path.join(stateDir, name));
+    expect(() => loadConfig({ WEB_LATEX_MCP_SESSION: name })).toThrow(/WEB_LATEX_MCP_SESSION/);
+  });
+
+  it.each(['  shelves  ', '-shelves-', 'SHELVES', 'Project.Lock'])(
+    'judges the SANITISED id, case-folded, so %j is refused too',
+    (raw) => {
+      // Sanitising strips edge punctuation, and a case-insensitive disk (macOS, Windows) makes
+      // `Shelves/` the same directory as `shelves/`; refusing everywhere keeps it portable.
+      expect(() => loadConfig({ WEB_LATEX_MCP_SESSION: raw })).toThrow(/reserved/);
+    },
+  );
+
+  it('still accepts a name that merely contains a reserved one', () => {
+    // CONTROL: passes before and after — the refusal is by whole name, never by substring.
+    expect(loadConfig({ WEB_LATEX_MCP_SESSION: 'shelves-2' }).sessionId).toBe('shelves-2');
+    expect(loadConfig({ WEB_LATEX_MCP_SESSION: 'writer' }).sessionId).toBe('writer');
   });
 });

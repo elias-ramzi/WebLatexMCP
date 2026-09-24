@@ -6,9 +6,13 @@ import {
   CONFLICT_MAX_FILES,
   CONFLICT_MAX_COMMITS,
   FILE_HEADER_OVERHEAD,
+  FILE_JSON_OVERHEAD,
+  FILE_TEXT_LINE_BREAKS,
+  HUNKS_BLOCK_TEXT_OVERHEAD,
   HUNK_MARKER_OVERHEAD,
   HUNK_JSON_OVERHEAD,
   HUNK_LINE_ELEMENT_OVERHEAD,
+  SIDE_ABSENT_OVERHEAD,
   type ConflictRefs,
 } from '../../src/lib/conflictBudget.js';
 import { capRemoteCommits } from '../../src/lib/conflictText.js';
@@ -45,27 +49,26 @@ function file(overrides: Partial<ConflictFileDetail> = {}): ConflictFileDetail {
 
 describe('planConflictPayload', () => {
   it('allocates hunks before sides: hunks + sides over budget keeps hunks, loses sides', () => {
-    // Hunks alone: 15000 chars. Sides: 4000 chars each (12000 total). Combined (27000) exceeds the
-    // 20000 budget, but hunks fit on their own (15000 <= 20000) and are allocated first, leaving
-    // only 5000 for sides — not enough for even one 4000-char side plus the next.
+    // Every part ships in both channels, so it costs about twice its content. Hunks alone: 5000
+    // chars of content (~10k rendered). Sides: 3000 chars each (~6k rendered each). Together
+    // (~28k) they exceed the 20000 budget, but the hunks fit on their own and are allocated
+    // first, leaving ~9k — room for one side, not two.
     const f = file({
-      hunks: [hunk(7500, 7500)],
-      base: 'b'.repeat(4000),
-      ours: 'o'.repeat(4000),
-      theirs: 't'.repeat(4000),
+      hunks: [hunk(2500, 2500)],
+      base: 'b'.repeat(3000),
+      ours: 'o'.repeat(3000),
+      theirs: 't'.repeat(3000),
     });
     const plan = planConflictPayload([f], { detail: 'auto', refs: REFS });
     const fp = plan.files[0]!;
 
     expect(fp.hunks.included).toBe(true);
-    expect(fp.hunks.chars).toBe(15000);
-    // 5000 left: base (4000) fits, ours (4000) does not (5000-4000=1000 remaining, then theirs
-    // doesn't fit either).
+    expect(fp.hunks.chars).toBe(5000);
     expect(fp.base.included).toBe(true);
     expect(fp.ours.included).toBe(false);
     expect(fp.theirs.included).toBe(false);
-    expect(fp.ours.chars).toBe(4000); // true count, not truncated to 0
-    expect(fp.theirs.chars).toBe(4000);
+    expect(fp.ours.chars).toBe(3000); // true count, not truncated to 0
+    expect(fp.theirs.chars).toBe(3000);
     expect(plan.truncated).toBe(true);
     expect(plan.note).toBeDefined();
   });
@@ -131,18 +134,33 @@ describe('planConflictPayload', () => {
     // boilerplate (text channel) or JSON punctuation (structured channel) around it — so a hunk
     // could be "at budget" by content alone while its real rendered size blew well past it. This
     // derives the true boundary from the same named overhead constants the planner charges,
-    // rather than hand-picking a round content number the way the old (buggy) test did.
+    // rather than hand-picking a round content number the way the old (buggy) test did. The
+    // hunk ships in BOTH channels, so its content is charged twice and the two channels'
+    // framing adds — the old max(text, json) boundary let the caller receive nearly 2x budget.
     const path = 'main.tex';
     const startLine = 1;
     const endLine = 2;
     const digits = String(startLine).length + String(endLine).length;
     // One-element local/remote arrays: 2 line elements total.
-    const perHunkOverhead = Math.max(
-      HUNK_MARKER_OVERHEAD,
-      HUNK_JSON_OVERHEAD + 2 * HUNK_LINE_ELEMENT_OVERHEAD,
-    );
-    const budgetForHunks = CONFLICT_CONTENT_BUDGET - (FILE_HEADER_OVERHEAD + path.length);
-    const contentAtBudget = budgetForHunks - digits - perHunkOverhead;
+    const hunkFraming =
+      HUNKS_BLOCK_TEXT_OVERHEAD +
+      (digits + HUNK_MARKER_OVERHEAD) +
+      (digits + HUNK_JSON_OVERHEAD + 2 * HUNK_LINE_ELEMENT_OVERHEAD);
+    // Mandatory: the file's frame in both channels, the conflictFiles array brackets, and three
+    // absent sides. The `elided` wrapper is given back on the file's last decision when nothing
+    // was cut, so it does not narrow the boundary.
+    const frame =
+      FILE_HEADER_OVERHEAD +
+      path.length +
+      FILE_TEXT_LINE_BREAKS +
+      FILE_JSON_OVERHEAD +
+      JSON.stringify(path).length +
+      2;
+    const absentSides = 3 * (SIDE_ABSENT_OVERHEAD + 'null'.length);
+    const budgetForHunks = CONFLICT_CONTENT_BUDGET - frame - absentSides;
+    // Content is charged once per channel. With an odd remainder the largest admissible hunk
+    // lands one short of the budget; one more character still overruns it either way.
+    const contentAtBudget = Math.floor((budgetForHunks - hunkFraming) / 2);
 
     const makeFile = (localLen: number): ConflictFileDetail =>
       file({
@@ -165,16 +183,21 @@ describe('planConflictPayload', () => {
     expect(planOver.truncated).toBe(true);
   });
 
-  it('boundary: a side exactly at CONFLICT_SIDE_CAP is included; one char over is elided', () => {
+  it('boundary: a side exactly at CONFLICT_SIDE_CAP is not cut BY the cap; one char over is', () => {
+    // Under the both-channels charge a CONFLICT_SIDE_CAP-sized side (~24k rendered) no longer fits
+    // the 20000 aggregate budget on its own, so "at the cap it is included" is no longer a claim
+    // the planner can make — what the boundary still decides is WHICH limit cut it, and the note
+    // must name the one that fired.
     const atCap = file({
       base: 'a'.repeat(CONFLICT_SIDE_CAP),
       ours: null,
       theirs: null,
       hunks: [],
     });
-    expect(
-      planConflictPayload([atCap], { detail: 'auto', refs: REFS }).files[0]!.base.included,
-    ).toBe(true);
+    const planAt = planConflictPayload([atCap], { detail: 'auto', refs: REFS });
+    expect(planAt.files[0]!.base.included).toBe(false);
+    expect(planAt.note).not.toMatch(/over 12000 characters/);
+    expect(planAt.note).toMatch(new RegExp(`${CONFLICT_CONTENT_BUDGET}-char aggregate`));
 
     const overCap = file({
       base: 'a'.repeat(CONFLICT_SIDE_CAP + 1),
@@ -182,9 +205,10 @@ describe('planConflictPayload', () => {
       theirs: null,
       hunks: [],
     });
-    expect(
-      planConflictPayload([overCap], { detail: 'auto', refs: REFS }).files[0]!.base.included,
-    ).toBe(false);
+    const planOver = planConflictPayload([overCap], { detail: 'auto', refs: REFS });
+    expect(planOver.files[0]!.base.included).toBe(false);
+    expect(planOver.note).toMatch(/over 12000 characters/);
+    expect(planOver.note).not.toMatch(/aggregate/);
   });
 
   it('an absent side (null) is never elided and costs nothing', () => {
@@ -234,14 +258,15 @@ describe('planConflictPayload', () => {
       const f = file({ hunks: manyHunks, base: null, ours: null, theirs: null });
       // Force the hunks block to be elided by starving the budget with a prior file whose single
       // hunk consumes almost all of it (leaving far less than 200 tiny hunks' all-or-nothing
-      // block could ever fit in).
+      // block could ever fit in). Its content ships in both channels, so half the budget is
+      // nearly all of it.
       const hog = file({
         path: 'hog.tex',
         hunks: [
           {
             startLine: 1,
             endLine: 2,
-            local: ['x'.repeat(CONFLICT_CONTENT_BUDGET - 500)],
+            local: ['x'.repeat(CONFLICT_CONTENT_BUDGET / 2 - 1500)],
             remote: [''],
           },
         ],
@@ -407,8 +432,11 @@ describe('planConflictPayload', () => {
     const bigPath = (i: number): string => `${'x'.repeat(1100)}-${i}.tex`;
 
     it('20 files with 1,100-char paths + one small hunk each: note starts with the headers reason and still lists the aggregate reason', () => {
+      // 200+200-char hunks: bigger than the span note that would replace them. A hunk smaller than
+      // its own elision pointer is always inlined — cutting it would only grow the payload — so a
+      // 1+1-char hunk would no longer exercise the aggregate reason here.
       const files = Array.from({ length: CONFLICT_MAX_FILES }, (_, i) =>
-        file({ path: bigPath(i), hunks: [hunk(1, 1)], base: null, ours: null, theirs: null }),
+        file({ path: bigPath(i), hunks: [hunk(200, 200)], base: null, ours: null, theirs: null }),
       );
       const plan = planConflictPayload(files, { detail: 'auto', refs: REFS });
 

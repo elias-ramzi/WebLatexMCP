@@ -6,13 +6,22 @@
  * (label keys, printed numbers) ultimately comes from the document's own `\label`/`\ref` macros
  * and packages, so it must be treated the same way CLAUDE.md treats a compile log — never opened,
  * resolved, stat'd, or otherwise acted on as a path, and never interpolated into a shell command.
- * It is parsed into plain strings and returned as plain strings, nothing more. It also means a
+ * It is parsed into plain strings and returned as plain strings, nothing more. The one name in
+ * it that is followed at all — an `\@input{chap.aux}`, which is where `\include` puts each
+ * chapter's labels — is still never used as a path: each of its components is a key looked up
+ * in a directory listing of the (server-owned) build dir, one level at a time, so a name that
+ * leaves the build dir, or passes through a link inside it, finds nothing (see
+ * `findBuildDirAux`). It also means a
  * malformed or hand-crafted `.aux` must never cost more than a small, constant amount of work per
  * `\newlabel` marker it contains — see `MAX_GROUP_SCAN`/`GROUP_SKIP_SCAN`/`PARSE_BOUND` below.
  */
 
-import { readFile } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, readdir, readFile, realpath } from 'node:fs/promises';
+import path from 'node:path';
 import { buildAuxPath } from '../services/compiler.js';
+import { MAX_READ_BYTES } from '../services/fileService.js';
 import { toPosix } from './paths.js';
 
 export interface AuxLabel {
@@ -420,6 +429,14 @@ function skipWs(s: string, i: number, work?: ScanWork): number {
  * `'exhausted'` when it does not, and a counter that fired only past 4096 characters would be
  * drawing a distinction no caller could act on.
  */
+/** Shared, mutable scan state — see `scanAuxEntries`. */
+interface ScanCursor {
+  /** Markers scanned so far, counted against `PARSE_BOUND`. */
+  scans: number;
+  /** Index in the current file of the marker whose outcome was just yielded. */
+  at: number;
+}
+
 type ScanOutcome =
   | { kind: 'entry'; entry: AuxLabel }
   | { kind: 'dropped'; label: string; reason: 'fieldTooLong' | 'groupTooLong' | 'keyTooLong' }
@@ -507,12 +524,21 @@ type ScanOutcome =
  * already costs. Per marker the span check is amortized O(1) rather than worst-case O(1): a
  * marker far from the previous one pays for the gap, and the markers that gap contains do not
  * exist to pay for it.
+ *
+ * `cursor`, when given, is shared state for a scan that spans several files (`readAuxFloats`
+ * following `\@input`): `scans` is the marker budget, so `PARSE_BOUND` bounds the WHOLE index
+ * rather than each file of it, and `at` is set to each marker's index in `aux` before its outcome
+ * is yielded, so a lazy consumer can tell where that outcome sits relative to an `\@input` line.
+ * Neither changes what the scan yields.
  */
-function* scanAuxEntries(aux: string, work?: ScanWork): Generator<ScanOutcome> {
+function* scanAuxEntries(
+  aux: string,
+  work?: ScanWork,
+  cursor: ScanCursor = { scans: 0, at: 0 },
+): Generator<ScanOutcome> {
   let searchFrom = 0;
-  let scans = 0;
   let openSpan: OpenSpan | null = null;
-  while (scans < PARSE_BOUND) {
+  while (cursor.scans < PARSE_BOUND) {
     const markerIdx = aux.indexOf(NEWLABEL_MARKER, searchFrom);
     if (markerIdx === -1) {
       // The search still read everything left of end-of-file looking for one.
@@ -521,7 +547,8 @@ function* scanAuxEntries(aux: string, work?: ScanWork): Generator<ScanOutcome> {
     }
     // `indexOf` looked at every character from `searchFrom` through the end of the match.
     if (work) work.steps += markerIdx + NEWLABEL_MARKER.length - searchFrom;
-    scans++;
+    cursor.scans++;
+    cursor.at = markerIdx;
     // Advance past this marker regardless of what happens below, so a malformed entry cannot
     // wedge the scan in place.
     searchFrom = markerIdx + NEWLABEL_MARKER.length;
@@ -731,7 +758,10 @@ function isCleverefShadow(label: string): boolean {
 }
 
 export interface AuxFloatsResult {
-  /** Real (non-shadow) labels, capped at `opts.max` (default DEFAULT_MAX_FLOATS). */
+  /** Real (non-shadow) labels, capped at `opts.max` (default DEFAULT_MAX_FLOATS), in the order
+   *  LaTeX reads them — the root's records with each `\@input`-ed file's spliced in where the
+   *  root inputs it (see `scanWithInputs`). Because `\label` writes at shipout, that order is
+   *  page order; `labelPages.ts` relies on it to see an arabic numbering restart. */
   floats: AuxLabel[];
   /** Real labels found past the `max` cap — `total - floats.length`. Exact (computed against the
    *  TRUE total in `total`, not a smaller parse-time cutoff) as long as the file contains at most
@@ -741,7 +771,8 @@ export interface AuxFloatsResult {
    *  `floats.length + omitted`, before the `max` cap is applied. A label counted here always has
    *  a valid `AuxLabel` behind it; one dropped for an over-length field or an over-budget group
    *  (see `dropped` below) is deliberately excluded, the same way it always has been for the
-   *  former. Exact for any file with at most `PARSE_BOUND` `\newlabel` markers (shadow entries
+   *  former. Exact for any file (the root `.aux` and every file it `\@input`s, which share one
+   *  budget) with at most `PARSE_BOUND` `\newlabel` markers (shadow entries
    *  included in that count, since every marker costs a scan regardless of what it turns out to
    *  be) — a document with more markers than that is far past anything real, and both `total` and
    *  `omitted` saturate at whatever `PARSE_BOUND` allowed rather than reflecting the file's actual
@@ -778,8 +809,441 @@ export interface AuxFloatsResult {
    *  `.aux` is malformed or hostile. Optional for the same reason `refused` is — `readAuxFloats`
    *  always sets it. */
   indeterminate?: number;
-  /** Present only when no `.aux` was found in the build directory. */
+  /** How many `\@input`-ed `.aux` files (which `\include` writes, one per chapter) were named
+   *  but not read — not in the build directory, too large, past the file or depth cap — so the
+   *  index may be missing those chapters' labels. `note` names them; this is the count a caller
+   *  decides on, so no caller has to match the note's wording. Optional for the same reason
+   *  `refused` is — `readAuxFloats` always sets it. Never spread into a tool's
+   *  `structuredContent` (no tool spreads this result), so it needs no `outputSchema` entry. */
+  unreadInputs?: number;
+  /** Whether any `.aux` read carries beamer's navigation records (`\@writefile{nav}` lines,
+   *  see {@link isBeamerAux}) — the document is a beamer deck, whose `/PageLabels` number FRAMES
+   *  while every `\newlabel` records the SLIDE, so `labelPages.ts` must not look a printed page
+   *  up in that tree. Optional for the same reason `refused` is — `readAuxFloats` always sets it.
+   *  Never spread into a tool's `structuredContent`. */
+  beamerNav?: boolean;
+  /** beamer's own record of the slide each `\label` ran on (`\beamer@slide`, see
+   *  {@link BEAMER_SLIDE_LINE}): label -> the distinct slides recorded for it, in `.aux` order, at
+   *  most {@link MAX_SLIDES_PER_LABEL}. `labelPages.ts` refuses a deck's label whose `\newlabel`
+   *  printed page is not among them — the mark of a `pgfpages` layout that shifted every label.
+   *  Present only when some file read carries at least one record. Never spread into a tool's
+   *  `structuredContent`. */
+  beamerSlides?: ReadonlyMap<string, readonly string[]>;
+  /** Whether the build that wrote this `.aux` loaded `pgfpages` ({@link readPgfpagesEvidence}):
+   *  `true` when its recorder file (`.fls`) or its `.log` names `pgfpages.sty`, `false` when at
+   *  least one of the two was read and neither does, and absent when neither could be read (no
+   *  `.aux` at all, or a backend that wrote neither), which leaves label resolution as it was.
+   *  `labelPages.ts` refuses every label of a `true` build: a pgfpages layout shifts every
+   *  `\newlabel` a page late. Never spread into a tool's `structuredContent`. */
+  pgfpages?: boolean;
+  /** Present when no `.aux` was found in the build directory, or when the root `.aux` inputs
+   *  (`\@input`, which `\include` writes) a file that could not be read — so the index may be
+   *  missing that chapter's labels. Absent otherwise. */
   note?: string;
+}
+
+/**
+ * How many `\@input`-ed `.aux` files one `readAuxFloats` call reads, beyond the root. A book of
+ * `\include`d chapters has one per chapter — dozens, not hundreds — so this is far above anything
+ * real while keeping the bytes read bounded: each file is also capped at `MAX_READ_BYTES`, the
+ * same per-file cap `read_file` applies, and the markers of every file together share one
+ * `PARSE_BOUND`.
+ */
+export const MAX_AUX_INPUTS = 256;
+/** How deep `\@input`s nest. `\include` cannot nest, so a real document needs exactly 1. */
+export const MAX_AUX_INPUT_DEPTH = 8;
+/** How many path components an `\@input` name may have (see `findBuildDirAux`). A real
+ *  `\include{chapters/one}` has two. */
+const MAX_INPUT_PATH_DEPTH = 16;
+/** How many unread inputs a note names before it summarises the rest as a count. */
+const MAX_NOTED_INPUTS = 5;
+
+/**
+ * An `\@input{…}` at the start of a line — the shape `\include` writes into the root `.aux`
+ * (`\immediate\write\@mainaux{\string\@input{chap.aux}}`, always on its own line). Line-
+ * anchored so that the same text sitting inside a `\newlabel`'s caption group, which LaTeX
+ * stores but never executes, is not taken for an input.
+ */
+const AUX_INPUT_LINE = /^[ \t]*\\@input\{([^{}\r\n]*)\}/gm;
+
+/**
+ * A `\@writefile{nav}{...}` at the start of a line: beamer writes one per slide and frame into
+ * the `.aux` (to build its `.nav` file), and no other class writes to a `nav` stream. Line-
+ * anchored like {@link AUX_INPUT_LINE}, so the text inside a caption group is not taken for one
+ * — and a forged one only moves label resolution onto its stricter, folio-checked route.
+ */
+const BEAMER_NAV_LINE = /^[ \t]*\\@writefile\{nav\}/m;
+
+/** Whether one `.aux` file's content is a beamer deck's (see {@link BEAMER_NAV_LINE}). */
+export function isBeamerAux(content: string): boolean {
+  return BEAMER_NAV_LINE.test(content);
+}
+
+/**
+ * beamer's own record of the slide a `\label` ran on, `\@writefile{snm}{\beamer@slide {<label>}{<slide>}}`
+ * at the start of a line — written by `\beamer@nameslide`, which every `\label` in a deck calls
+ * beside LaTeX's own. The two records are written at different MOMENTS: `\newlabel` expands
+ * `\thepage` when the page SHIPS, while beamer's `\addtocontents` expands `\the\c@page` when the
+ * `\label` runs. They agree unless something moves the shipout — a `pgfpages` layout holds each
+ * page back until the next one is built, so every `\newlabel` records the page after its own
+ * while this record keeps the true slide. Line-anchored like {@link AUX_INPUT_LINE}, so the text
+ * inside a caption group is not taken for one. A forged record can only ADD a refusal — the check
+ * refuses when any record disagrees and never accepts on one — so line anchoring is enough here.
+ *
+ * Each field is read by {@link SLIDE_FIELD}: one level of balanced braces, and a backslash escaping
+ * the character after it — the rules `readBraceGroup` applies to a `\newlabel` key, as far as one
+ * level goes — so `\label{fig:{a}}` is recorded under `fig:{a}`, the key its `\newlabel` is
+ * stored under, and the check applies to it. A key nested deeper than that yields no record, and
+ * its label then keeps the folio route, as a label with no record always has (`lastpage`'s
+ * `LastPage`): nothing contradicts it, so that is not a pass on less evidence than before.
+ */
+const SLIDE_FIELD = String.raw`\{((?:\\.|[^{}\\\r\n]|\{(?:\\.|[^{}\\\r\n])*\})*)\}`;
+const BEAMER_SLIDE_LINE = new RegExp(
+  String.raw`^[ \t]*\\@writefile\{snm\}\{\\beamer@slide[ \t]*` +
+    SLIDE_FIELD +
+    SLIDE_FIELD +
+    String.raw`\}`,
+  'gm',
+);
+
+/**
+ * How many distinct slides are kept per label. Two already decide the check (at most one of them
+ * can equal the printed page); the rest are headroom for the refusal to name, and the cap keeps a
+ * hostile `.aux` repeating one label from growing an unbounded list.
+ */
+export const MAX_SLIDES_PER_LABEL = 8;
+
+/** Add one file's `\beamer@slide` records to `into` (see {@link BEAMER_SLIDE_LINE}). */
+function collectBeamerSlides(content: string, into: Map<string, string[]>): void {
+  for (const m of content.matchAll(BEAMER_SLIDE_LINE)) {
+    const label = m[1] ?? '';
+    const slide = m[2] ?? '';
+    // Past the cap no \newlabel field is ever reported (MAX_FIELD_LENGTH), so such a label has
+    // no entry to check; an over-long slide is cut but stays unequal to any reportable page.
+    if (label.length > MAX_FIELD_LENGTH) continue;
+    const kept = slide.length > MAX_FIELD_LENGTH ? `${slide.slice(0, MAX_FIELD_LENGTH)}…` : slide;
+    const slides = into.get(label);
+    if (!slides) {
+      into.set(label, [kept]);
+    } else if (!slides.includes(kept) && slides.length < MAX_SLIDES_PER_LABEL) {
+      slides.push(kept);
+    }
+  }
+}
+
+type UnreadReason = 'notInBuildDir' | 'caseMismatch' | 'tooLarge' | 'tooMany' | 'tooDeep';
+
+interface AuxInputWalk {
+  outcomes: ScanOutcome[];
+  /** Whether any file walked is a beamer deck's `.aux` ({@link isBeamerAux}). */
+  beamerNav: boolean;
+  /** Every walked file's `\beamer@slide` records ({@link collectBeamerSlides}). */
+  beamerSlides: Map<string, string[]>;
+  /** `found` is the build dir's own spelling of the component a `caseMismatch` stopped at. */
+  unread: { name: string; reason: UnreadReason; found?: string }[];
+}
+
+/** Where an `\@input` led: the file to read, or why there is none (see `findBuildDirAux`). */
+type BuildDirAuxLookup =
+  | { abs: string }
+  | { miss: 'notInBuildDir' }
+  | { miss: 'caseMismatch'; found: string };
+
+/**
+ * Find the `.aux` an `\@input` names, under the build dir, WITHOUT using the name as a path.
+ * The name (already POSIX-normalized) is split into components and each is looked up in a
+ * listing of the directory reached so far — an exact, literal match against a `readdir` entry —
+ * so `..`, an absolute name, an empty component, or anything the filesystem would interpret
+ * (a case fold, a trailing dot, a stream suffix) simply finds nothing. Every intermediate
+ * component must be a real directory and the last a regular file ending in `.aux`: symbolic
+ * links are neither followed into (a linked directory is not a directory to `Dirent`) nor read
+ * (a linked file is not a file to it).
+ *
+ * Looked up along the name's own path, rather than by enumerating the whole build dir, because
+ * that is all the question needs, and because the whole build dir is not the compiler's alone:
+ * `render_pages` writes one `render/page-<n>-<hash>.png` per distinct request and nothing
+ * prunes them. An enumeration under an entry budget let enough renders use the budget up before
+ * a chapter's subdirectory was reached. `listings` caches each directory's entries for the call,
+ * so a book of chapters in one subdirectory lists it once.
+ *
+ * A miss is diagnosed, never repaired: when the component that missed matches exactly ONE entry
+ * of the right kind case-insensitively, the result says so (`caseMismatch`, with the build dir's
+ * spelling). On Windows and macOS LaTeX itself opens `chapters/one.aux` in a `Chapters/` the build
+ * dir kept from an earlier compile (or mirrored from the source tree), so the generic "not
+ * compiled yet" advice sent the caller to recompile the whole document, which leaves every
+ * spelling as it is and so never helps. The entry is
+ * still not read — matching it would be the case fold this lookup refuses to perform, and with
+ * two candidates there is no telling which one LaTeX read.
+ */
+async function findBuildDirAux(
+  build: string,
+  key: string,
+  listings: Map<string, Dirent[] | null>,
+): Promise<BuildDirAuxLookup> {
+  const notFound = { miss: 'notInBuildDir' } as const;
+  const parts = key.split('/');
+  if (parts.length > MAX_INPUT_PATH_DEPTH) return notFound;
+  let abs = build;
+  for (const [i, part] of parts.entries()) {
+    if (part === '' || part === '.' || part === '..') return notFound;
+    let entries = listings.get(abs);
+    if (entries === undefined) {
+      try {
+        entries = await readdir(abs, { withFileTypes: true });
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw err;
+        entries = null;
+      }
+      listings.set(abs, entries);
+    }
+    const last = i === parts.length - 1;
+    const fits = (e: Dirent) => (last ? e.isFile() && e.name.endsWith('.aux') : e.isDirectory());
+    const entry = entries?.find((e) => e.name === part);
+    if (!entry) {
+      const folded = part.toLowerCase();
+      const near = (entries ?? []).filter((e) => e.name.toLowerCase() === folded && fits(e));
+      return near.length === 1 ? { miss: 'caseMismatch', found: near[0]!.name } : notFound;
+    }
+    if (!fits(entry)) return notFound;
+    abs = path.join(abs, part);
+  }
+  return { abs };
+}
+
+/**
+ * Read one listed `.aux`, re-checking at read time what the listing established: still a regular
+ * file (not swapped for a link since), its real path still inside the build dir's, and no larger
+ * than `MAX_READ_BYTES`. A file that vanished in between is reported as not in the build dir.
+ */
+async function readListedAux(
+  abs: string,
+  buildReal: string,
+): Promise<string | 'notInBuildDir' | 'tooLarge'> {
+  try {
+    const st = await lstat(abs);
+    if (!st.isFile()) return 'notInBuildDir';
+    const rel = path.relative(buildReal, await realpath(abs));
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return 'notInBuildDir';
+    if (st.size > MAX_READ_BYTES) return 'tooLarge';
+    return await readFile(abs, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'notInBuildDir';
+    throw err;
+  }
+}
+
+/**
+ * The scan outcomes of the root `.aux` and every file it `\@input`s, in the order LaTeX reads
+ * them: the root's own entries up to an `\@input` line, then that file's (recursively), then the
+ * root's again. The order is what LaTeX's own is because a label defined twice ends up with its
+ * LAST definition, so a consumer that has to pick one needs the sequence LaTeX saw. Each file is
+ * read at most once — a repeat or a cycle adds nothing a first read did not — and the build dir
+ * is listed only when an `\@input` is actually present, so an ordinary document pays nothing.
+ */
+async function scanWithInputs(
+  rootContent: string,
+  rootKey: string,
+  build: string,
+): Promise<AuxInputWalk> {
+  const cursor: ScanCursor = { scans: 0, at: 0 };
+  const outcomes: ScanOutcome[] = [];
+  const unread: AuxInputWalk['unread'] = [];
+  const seen = new Set<string>([rootKey]);
+  const listings = new Map<string, Dirent[] | null>();
+  let buildReal: string | undefined;
+  let filesRead = 0;
+  let beamerNav = false;
+  const beamerSlides = new Map<string, string[]>();
+
+  async function follow(name: string, depth: number): Promise<void> {
+    const key = path.posix.normalize(name.trim());
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (depth >= MAX_AUX_INPUT_DEPTH) {
+      unread.push({ name, reason: 'tooDeep' });
+      return;
+    }
+    if (filesRead >= MAX_AUX_INPUTS) {
+      unread.push({ name, reason: 'tooMany' });
+      return;
+    }
+    const found = await findBuildDirAux(build, key, listings);
+    if ('miss' in found) {
+      unread.push(
+        found.miss === 'caseMismatch'
+          ? { name, reason: 'caseMismatch', found: found.found }
+          : { name, reason: 'notInBuildDir' },
+      );
+      return;
+    }
+    const abs = found.abs;
+    buildReal ??= await realpath(build);
+    const content = await readListedAux(abs, buildReal);
+    if (content === 'notInBuildDir' || content === 'tooLarge') {
+      unread.push({ name, reason: content });
+      return;
+    }
+    filesRead++;
+    await walk(content, depth + 1);
+  }
+
+  async function walk(content: string, depth: number): Promise<void> {
+    beamerNav ||= isBeamerAux(content);
+    collectBeamerSlides(content, beamerSlides);
+    const inputs = [...content.matchAll(AUX_INPUT_LINE)].map((m) => ({
+      at: m.index,
+      name: m[1] ?? '',
+    }));
+    let next = 0;
+    // Lazily, so each outcome's position (`cursor.at`, set just before it is yielded) can be
+    // compared with the inputs' before it is placed. A nested walk moves the shared cursor, which
+    // is why `at` is read at once.
+    for (const outcome of scanAuxEntries(content, undefined, cursor)) {
+      const at = cursor.at;
+      while (next < inputs.length && inputs[next]!.at < at) {
+        await follow(inputs[next++]!.name, depth);
+      }
+      outcomes.push(outcome);
+    }
+    while (next < inputs.length) await follow(inputs[next++]!.name, depth);
+  }
+
+  await walk(rootContent, 0);
+  return { outcomes, beamerNav, beamerSlides, unread };
+}
+
+/** The note for inputs that were not read — each named (bounded), with why, and what to do. */
+function unreadInputsNote(walk: AuxInputWalk): string | undefined {
+  if (walk.unread.length === 0) return undefined;
+  const why: Record<UnreadReason, string> = {
+    notInBuildDir: 'not found in the build directory',
+    caseMismatch: 'spelled differently in the build directory',
+    tooLarge: `larger than the ${MAX_READ_BYTES}-byte cap`,
+    tooMany: `past the ${MAX_AUX_INPUTS}-file cap`,
+    tooDeep: `nested more than ${MAX_AUX_INPUT_DEPTH} \\@input levels deep`,
+  };
+  const bounded = (s: string) =>
+    JSON.stringify(s.length > MAX_FIELD_LENGTH ? `${s.slice(0, MAX_FIELD_LENGTH)}…` : s);
+  const named = walk.unread.slice(0, MAX_NOTED_INPUTS).map(({ name, reason, found }) => {
+    const holds = found === undefined ? '' : `, which holds ${bounded(found)}`;
+    return `${bounded(name)} (${why[reason]}${holds})`;
+  });
+  const more = walk.unread.length - named.length;
+  const parts = [
+    `The .aux lists ${walk.unread.length} \\@input file(s) that were not read, so any labels ` +
+      `they define are missing from this index: ${named.join(', ')}` +
+      (more > 0 ? `, and ${more} more.` : '.'),
+  ];
+  if (walk.unread.some((u) => u.reason === 'notInBuildDir')) {
+    parts.push(
+      "\\include writes each chapter's labels to its own .aux, so one missing from the build " +
+        'directory is a chapter this build directory has not compiled yet — compile the whole ' +
+        'document (with no \\includeonly leaving that chapter out) and retry. Only .aux files ' +
+        'inside the build directory are ever read, and never through a symbolic link.',
+    );
+  }
+  if (walk.unread.some((u) => u.reason === 'caseMismatch')) {
+    parts.push(
+      'A name that differs from a build-directory entry only in letter case is not read (on ' +
+        'Windows and macOS LaTeX opens it regardless). Where the differing part is a directory, ' +
+        "the build directory mirrors the project's own directory names, so spell the \\include " +
+        'the way the project spells that directory. Where it is the .aux file itself, the file ' +
+        'keeps the spelling of the compile that first wrote it: spell the \\include the way the ' +
+        'file is named, or compile with clean: true (latexmk deletes the files it generated, so ' +
+        'the next compile writes it anew under the current spelling).',
+    );
+  }
+  return parts.join(' ');
+}
+
+/**
+ * A recorder-file (`.fls`) line naming `pgfpages.sty` — or `pgfmorepages.sty`, its drop-in
+ * extension, which defines the same `\pgfpagesuselayout` and page-holding shipout without loading
+ * `pgfpages.sty` — as a file the engine opened, under any directory and either separator
+ * (`INPUT ./pgfpages.sty`, `INPUT C:\…\pgfpages.sty`). Anchored to the whole line, so neither
+ * `mypgfpages.sty` nor `pgfpages.sty.bak` is taken for it. The engine writes these lines itself
+ * (`-recorder`, which latexmk always passes), so the document cannot write one without opening
+ * the file.
+ */
+const FLS_PGFPAGES = /^INPUT (?:.*[\\/])?pgf(?:more)?pages\.sty\r?$/m;
+
+/**
+ * The marks `pgfpages.sty` (or `pgfmorepages.sty`, see {@link FLS_PGFPAGES}) leaves in a `.log`:
+ * TeX's file-open `(…/pgfpages.sty`, the `Package: pgfpages <date>` line its `\ProvidesPackage`
+ * writes, and the `\pgfpages@shipoutbox=\box<n>` register both packages allocate. More than one,
+ * because TeX wraps a log line at 79 characters and a long path can be cut inside the file name,
+ * while the other two are short and always start a line. Bounded on both sides like
+ * {@link FLS_PGFPAGES}, so another package whose name merely contains `pgfpages` (`mypgfpages`,
+ * `pgfpagesx`) is not taken for it.
+ *
+ * The log is document-controlled — `\typeout{(pgfpages.sty}` forges either mark — and that is
+ * acceptable here only because of what the answer is used for: `true` REFUSES every label
+ * (`labelPages.ts`), so a forged mark can only add a refusal, never resolve a page. What a
+ * document cannot do from inside the log is remove the marks the real package writes.
+ */
+const LOG_PGFPAGES =
+  /(?:^|[\s(/\\])pgf(?:more)?pages\.sty(?=[\s)]|$)|^Package: pgf(?:more)?pages\s|^\\pgfpages@shipoutbox=\\box/m;
+
+/**
+ * Up to `MAX_READ_BYTES` from the start of a build-dir file, as text, or `undefined` when there is
+ * no such regular file. Opened without following a symbolic link (where the platform can say so)
+ * and checked to be a regular file on the open handle. Only the start is read: `pgfpages` is a
+ * preamble package, so both of its marks sit near the top of either file, and a build large
+ * enough to reach the cap is not read in full for a question the preamble answers.
+ */
+async function readBuildFileHead(file: string): Promise<string | undefined> {
+  let handle;
+  try {
+    handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ELOOP' || code === 'ENOTDIR' || code === 'EISDIR') {
+      return undefined;
+    }
+    throw err;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) return undefined;
+    const length = Math.min(st.size, MAX_READ_BYTES);
+    const buf = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buf, 0, length, 0);
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Whether the build that wrote `auxPath` loaded `pgfpages` — which `labelPages.ts` must know,
+ * because every `\pgfpagesuselayout` (`resize to`, `2 on 1`, …) holds each page back until the
+ * next one is built, so every `\newlabel` records a page later than its own, in any document
+ * class, and hyperref's `/PageLabels` tree and the printed folios move with it: neither label
+ * route can see the shift. The `.aux` itself says nothing about packages, so the evidence is the
+ * build's other two records of what it read, beside the `.aux` under the same job name:
+ *
+ *  - the recorder file (`.fls`), which latexmk always asks for — the primary source, written by
+ *    the engine rather than the document;
+ *  - the `.log` ({@link LOG_PGFPAGES}), read as well rather than only when there is no `.fls`: a
+ *    `.fls` left by an earlier compile (a project `latexmkrc` that turned the recorder off since)
+ *    is stale, while the engine rewrites the `.log` on every run. Tectonic writes a `.log`
+ *    (`--keep-logs`) and no `.fls`; it keeps no `.aux` either, so no label resolves there anyway.
+ *
+ * Either one naming `pgfpages.sty` (or `pgfmorepages.sty`) is `true`: the answer only ever
+ * refuses, so the union is the safe reading. `false` needs at least one of the two read and neither naming it. `undefined` —
+ * neither readable — means nothing is known, and label resolution goes on as it did before this
+ * check existed; that is a known gap, not a verdict. Loading the package without calling
+ * `\pgfpagesuselayout` does not shift anything, and is still `true`: the build's records show the
+ * package, not the layout, and over-refusing is the direction to err in.
+ */
+export async function readPgfpagesEvidence(auxPath: string): Promise<boolean | undefined> {
+  const stem = auxPath.slice(0, -path.extname(auxPath).length);
+  const fls = await readBuildFileHead(`${stem}.fls`);
+  if (fls !== undefined && FLS_PGFPAGES.test(fls)) return true;
+  const log = await readBuildFileHead(`${stem}.log`);
+  if (log !== undefined && LOG_PGFPAGES.test(log)) return true;
+  return fls === undefined && log === undefined ? undefined : false;
 }
 
 /**
@@ -810,6 +1274,8 @@ export async function readAuxFloats(
         dropped: 0,
         refused: 0,
         indeterminate: 0,
+        unreadInputs: 0,
+        beamerNav: false,
         note:
           `No .aux found in the build directory (${toPosix(auxPath)}) — nothing has been ` +
           'compiled with this root file yet, or the compile backend in use did not write one.',
@@ -818,16 +1284,18 @@ export async function readAuxFloats(
     throw err;
   }
 
-  // A single pass over the whole file (bounded per MAX_GROUP_SCAN/GROUP_SKIP_SCAN/PARSE_BOUND
-  // above, never per-result) rather than parseAuxLabels + a post-hoc filter, so `total` reflects
-  // every real \newlabel in the file, not just the ones that fit under an earlier, smaller parse
-  // cutoff.
+  // A single pass over the whole file — and over every file it \@inputs, which is where
+  // \include puts a chapter's labels (bounded per MAX_GROUP_SCAN/GROUP_SKIP_SCAN/PARSE_BOUND
+  // above, never per-result, with PARSE_BOUND shared across the files) — rather than
+  // parseAuxLabels + a post-hoc filter, so `total` reflects every real \newlabel in the index,
+  // not just the ones that fit under an earlier, smaller parse cutoff.
+  const inputWalk = await scanWithInputs(auxContent, path.basename(auxPath), path.dirname(auxPath));
   const floats: AuxLabel[] = [];
   let total = 0;
   let dropped = 0;
   let refused = 0;
   let indeterminate = 0;
-  for (const outcome of scanAuxEntries(auxContent)) {
+  for (const outcome of inputWalk.outcomes) {
     if (outcome.kind === 'indeterminate') {
       // No key was parsed, so there is no label to test against isCleverefShadow — which is the
       // reason this is its own counter and not a `dropped`: a cleveref shadow record with an
@@ -856,5 +1324,19 @@ export async function readAuxFloats(
     }
   }
 
-  return { floats, omitted: total - floats.length, total, dropped, refused, indeterminate };
+  const note = unreadInputsNote(inputWalk);
+  const pgfpages = await readPgfpagesEvidence(auxPath);
+  return {
+    floats,
+    omitted: total - floats.length,
+    total,
+    dropped,
+    refused,
+    indeterminate,
+    unreadInputs: inputWalk.unread.length,
+    beamerNav: inputWalk.beamerNav,
+    ...(inputWalk.beamerSlides.size > 0 ? { beamerSlides: inputWalk.beamerSlides } : {}),
+    ...(pgfpages === undefined ? {} : { pgfpages }),
+    ...(note === undefined ? {} : { note }),
+  };
 }

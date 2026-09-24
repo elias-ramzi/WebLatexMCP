@@ -324,8 +324,8 @@ describe('shelve / unshelve / list_shelves', () => {
 
       const err = await callExpectingError(s, 'shelve', { paths: [REL] });
       expect(err).toContain('Staged');
-      // Pre-fix this returned success: `discard`'s path branch checks out from the INDEX, not
-      // HEAD, so the staged content stayed in the tree. The push this tool exists to unblock
+      // Pre-fix this returned success: `discard`'s path branch then checked out from the INDEX,
+      // not HEAD, so the staged content stayed in the tree. The push this tool exists to unblock
       // still refused, the work was duplicated into a shelf, and unshelve then saw a dirty tree
       // — so the shelf could never be reclaimed without a hand `git reset`.
       expect(await read(dir, REL)).toBe(`${BASE}staged work\n`);

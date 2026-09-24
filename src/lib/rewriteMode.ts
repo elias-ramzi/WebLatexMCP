@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { EditOp } from '../services/fileService.js';
+import type { EditOp, MatchOrigin, RangeMatch } from '../services/fileService.js';
 import { commentStartInRange } from './latexComments.js';
 
 /**
@@ -101,31 +101,45 @@ export function resolveRewriteMode(input: ResolveRewriteModeInput): ResolvedRewr
  *
  * An empty line becomes a bare `%` (no trailing space) — trailing whitespace is noise in a diff
  * and some linters/editors strip it on save, which would otherwise make a byte-for-byte preserved
- * block drift the moment someone saves the file. This holds for an empty CRLF line too: splitting
- * on bare `\n` leaves a segment that is just `"\r"` (see below), and that becomes a bare `"%\r"`,
- * not `"% \r"` — the `\r` is part of the line ending, not content, so it earns no space before it
- * either.
+ * block drift the moment someone saves the file. This holds for an empty CRLF line too: it becomes
+ * a bare `"%\r\n"`, not `"% \r\n"` — the terminator is not content, so it earns no space before
+ * it either.
  *
- * The trailing-newline shape of `text` is preserved. Splitting `"a\nb\n"` on `\n` yields
- * `["a", "b", ""]` — the final empty string is an artifact of the trailing newline, not a real
- * line, so it must NOT be turned into a stray `%` line; it is instead re-emitted as the trailing
- * newline on the joined result. `text` with no trailing newline gets none back either.
+ * Lines are the ones TeX, `splitLines` and `lineBoundsFrom` count: `\r\n`, bare `\n` **and bare
+ * `\r`** each end one, and every terminator is re-emitted verbatim after its commented line, so
+ * `"a\r\nb\nc\rd"` becomes `"% a\r\n% b\n% c\r% d"` and the only bytes added are the `% ` /
+ * `%` prefixes. The bare-`\r` case is not cosmetic: splitting on `\n` alone turned
+ * `"alpha\rbeta"` into `"% alpha\rbeta"`, and since TeX ends a line at a bare CR, `beta` stayed
+ * live in the compiled document while the edit reported it preserved. CRLF, and a CR-only file,
+ * both survive round-trip — the repo forces `core.autocrlf=false`, and a local project is never
+ * cloned at all, so any of these can genuinely be on disk.
  *
- * `\r\n` line endings are handled by splitting on bare `\n` and treating the segment as ending in
- * `\r`: the `\r` stays inside the segment content, appearing before the `\n` join, not before the
- * `% ` prefix. That way `"a\r\nb"` becomes `"% a\r\n% b"` — CRLF survives round-trip, which
- * matters since the repo forces `core.autocrlf=false` so CRLF bytes can genuinely be on disk.
+ * The trailing-terminator shape of `text` is preserved. A `text` ending in a terminator leaves an
+ * empty final segment that is an artifact of that terminator, not a real line, so it must NOT be
+ * turned into a stray `%` line; `text` with no trailing terminator gets none back either. An
+ * empty `text` is one empty line, and becomes `"%"`.
+ *
+ * `wholeLines` drops that artifact rule: `text` is then known to be whole lines with the
+ * terminator after the last one left off (a line-range edit's span, see `lineSpan`), so an empty
+ * final segment IS a line — the blank line a range ended on — and becomes `"%"` like any other.
+ * Without it, `"line0\n"` (lines 1-2 of `"line0\n\nline2\n"`) came back as `"% line0\n"`, and the
+ * blank line the caller named was neither preserved nor replaced but left live after the
+ * replacement.
  */
-export function commentOut(text: string): string {
-  const hadTrailingNewline = text.endsWith('\n');
-  const body = hadTrailingNewline ? text.slice(0, -1) : text;
-  const lines = body.split('\n');
-  // A segment that is empty, or is just the "\r" half of a CRLF empty line, becomes a bare "%"
-  // (or "%\r") — no trailing space. Without the "\r" case, an empty CRLF line ("\r\n" splits on
-  // "\n" to a "\r" segment) got "% \r" instead, leaving a trailing space the docstring promises
-  // never to leave.
-  const commented = lines.map((line) => (line === '' || line === '\r' ? `%${line}` : `% ${line}`));
-  return commented.join('\n') + (hadTrailingNewline ? '\n' : '');
+export function commentOut(text: string, opts: { wholeLines?: boolean } = {}): string {
+  // With a capture group, `split` interleaves each line with the terminator that ended it:
+  // [line, term, line, term, ..., line]. The last entry is the (possibly empty) unterminated tail.
+  const parts = text.split(/(\r\n|\n|\r)/);
+  const prefix = (line: string): string => (line === '' ? '%' : `% ${line}`);
+  let out = '';
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    out += prefix(parts[i] ?? '') + (parts[i + 1] ?? '');
+  }
+  const tail = parts[parts.length - 1] ?? '';
+  // An empty tail after at least one terminator is the artifact described above; an empty tail
+  // that is the whole of `text` is a real (empty) line, and so is every tail of whole lines.
+  if (tail !== '' || parts.length === 1 || opts.wholeLines) out += prefix(tail);
+  return out;
 }
 
 /**
@@ -602,73 +616,99 @@ export function classifyEdit(oldString: string, newString: string): 'prose' | 'm
   return 'prose';
 }
 
+/** A line terminator, in the three shapes `splitLines` and `lineBoundsFrom` split on. */
+type LineEnding = '\n' | '\r\n' | '\r';
+
 /**
  * Join a commented block with what follows it, using exactly one line terminator between them
  * and never doubling one `commentOut` already produced.
  *
  * `lineEnding` is the terminator to use when `commented` supplies none of its own — but
- * `commented` can already end in one of two ways `commentOut` produces without stripping:
+ * `commented` can already end in one, because `commentOut` re-emits every terminator verbatim
+ * and a string edit's `oldString` may end with its own:
  *
- *  - It already ends in `'\n'` (whether that `'\n'` is bare or the tail of a `'\r\n'` pair):
- *    nothing to add, or the file would gain a doubled terminator.
- *  - It ends in a **bare `'\r'`** with no paired `'\n'` after it. `commentOut` only strips a
- *    `'\r'` as part of an end-of-line when it is immediately followed, *within the same
- *    original string*, by the `'\n'` that closes that line (see `commentOut`'s own docstring on
- *    splitting on bare `'\n'`). When `oldString` itself ends in a lone `'\r'` — its own last byte,
- *    with no `'\n'` after it inside `oldString` — there is no such pairing to strip, so that
- *    `'\r'` survives into `commented` as its very last character. That `'\r'` is already half of
- *    the CRLF terminator this join is trying to place, so completing it takes only a `'\n'`,
- *    regardless of what `lineEnding` says — appending `lineEnding` in full here would double the
- *    `'\r'` (`'\r\r\n'`), not complete it.
+ *  - It ends in `'\n'` (bare, or the tail of a `'\r\n'` pair): nothing to add, or the file would
+ *    gain a doubled terminator.
+ *  - It ends in a `'\r'` that is **half of a split `'\r\n'` pair** (`splitPair`: the `'\n'` is
+ *    still in the file right after the match). Completing it takes only a `'\n'` — appending
+ *    `lineEnding` in full would double the `'\r'` (`'\r\r\n'`), not complete it.
+ *  - It ends in any other bare `'\r'` — a whole terminator, as every line of a CR-only file has:
+ *    nothing to add. Completing every trailing `'\r'` into CRLF wrote `'\r\n'` into CR-only
+ *    files (`"c\r"` in `"a\rb\rc\r"` came back `"% c\r\nC"`). That holds for a stray bare
+ *    `'\r'` in a CRLF file too: completing it "to the file's own convention" made naming the
+ *    `'\r'` in `oldString` and leaving it in the file two spellings of one edit that wrote
+ *    different bytes (`"% bb\r\nNN\r"` against `"% bb\rNN\r"`), and the file had a bare `'\r'`
+ *    there to begin with — the block keeps it.
+ *
+ * Telling those `'\r'` cases apart needs the byte after the match, which only the caller has.
  *
  * Only once neither of those applies does `lineEnding` (the caller's best guess at the line
  * ending the original match actually sat on) get used — the separator that keeps a CRLF file
  * from coming back with one stray LF-only line in an otherwise all-CRLF file (the repo forces
  * `core.autocrlf=false`, so a mixed-ending file is a real, persisted defect, not cosmetic).
  */
-function joinCommentedBlock(commented: string, rest: string, lineEnding: '\n' | '\r\n'): string {
+function joinCommentedBlock(
+  commented: string,
+  rest: string,
+  lineEnding: LineEnding,
+  splitPair: boolean,
+): string {
   if (commented.endsWith('\n')) return commented + rest;
-  if (commented.endsWith('\r')) return commented + '\n' + rest;
+  if (commented.endsWith('\r')) {
+    return commented + (splitPair ? '\n' : '') + rest;
+  }
   return commented + lineEnding + rest;
 }
 
 /**
  * The one place that decides which line terminator separates a preserved comment block from its
  * replacement (`computeResult`'s `separatorLineEnding`), for the cases `joinCommentedBlock`
- * itself cannot already resolve from `commented`'s own trailing bytes (see there for the bare-
- * `'\r'` and trailing-`'\n'` cases it handles unconditionally, regardless of what this returns).
- * Every remaining signal available at the match boundary is considered here, in order of how
- * much it can be trusted, so no caller has to re-derive this and risk disagreeing about it
- * elsewhere (the `parseCompilerChoice` lesson):
+ * itself cannot already resolve from `commented`'s own trailing bytes (see there for the cases
+ * it handles regardless of what this returns). Every remaining signal available at the match
+ * boundary is considered here, in order of how much it can be trusted, so no caller has to
+ * re-derive this and risk disagreeing about it elsewhere (the `parseCompilerChoice` lesson):
  *
  *  1. `content[end..end+1]` is literally `'\r\n'` — the strongest signal: the terminator is
  *     still sitting whole in `content`, right after the match.
- *  2. `content[end]` is `'\n'` alone, with no `'\r'` before it in `content` — a plain LF line.
- *     (A lone `'\r'` consumed as `oldString`'s own trailing byte, leaving just this `'\n'`
- *     behind, is not a case this function ever needs to tell apart from a bare LF line:
- *     `joinCommentedBlock` already produces the correct pairing for that shape unconditionally,
- *     from `commented`'s own trailing `'\r'`, whatever this function returns.)
- *  3. Neither of the above: the match ends at EOF, and there is nothing left in `content` to
- *     inspect at all (`content[end]` is `undefined`). The only remaining evidence is whether
- *     `oldString` itself contains a `'\r\n'` pair anywhere — if so, the match plainly sat in a
- *     CRLF-terminated stretch of text even though nothing survives after it to prove that.
- *  4. Truly no evidence anywhere at the boundary: fall back to whether `content` contains a
- *     `'\r\n'` pair *at all* rather than hardcoding `'\n'` — a file that is CRLF everywhere else
- *     but happens to have its very last line unterminated must not have that last line's
+ *  2. `content[end]` is `'\n'` alone — a plain LF line. (A lone `'\r'` consumed as `oldString`'s
+ *     own trailing byte, leaving just this `'\n'` behind, is a split pair `joinCommentedBlock`
+ *     completes on its own, whatever this returns.)
+ *  3. `content[end]` is a bare `'\r'` — the match sits on a line a bare CR ends, as every line of
+ *     a CR-only file does. Answering `'\n'` there put an LF into a file that had none.
+ *  4. None of the above: the match ends at EOF (or `oldString` consumed its own terminator). The
+ *     only remaining evidence at the boundary is whether `oldString` itself contains a `'\r\n'`
+ *     pair anywhere — if so, the match plainly sat in a CRLF-terminated stretch of text.
+ *  5. Truly no evidence anywhere at the boundary: fall back to the file as a whole (`whole`) rather
+ *     than hardcoding `'\n'` — CRLF if it contains a `'\r\n'` pair at all, bare CR if it has
+ *     `'\r'` but no `'\n'` (a CR-only file), else LF. A file that is CRLF everywhere else but
+ *     happens to have its very last line unterminated must not have that last line's
  *     replacement pushed back to LF. Note this is "any CRLF", not a majority vote: in a genuinely
  *     mixed file one CRLF elsewhere wins. That is deliberate — the repo forces
  *     `core.autocrlf=false`, so a mixed file is already defective, and guessing CRLF there costs a
  *     cosmetic diff line where guessing LF would corrupt an otherwise-CRLF file.
+ *
+ * `content`/`end` are where the boundary is read and `whole` is the file rule 5 falls back to.
+ * `applyEdits` passes the file **as the call found it** for both whenever it can place the match
+ * there (see `MatchOrigin`), so an earlier edit in the same call — a range deletion that took the
+ * terminator after the match, or removed the file's only CRLF or bare CR — cannot change the
+ * answer: the same edits give the same bytes in either order, and a CR-only file never gains LF.
  */
 function resolveSeparatorLineEnding(
   oldString: string,
   content: string,
   end: number,
-): '\n' | '\r\n' {
-  if (content[end] === '\r' && content[end + 1] === '\n') return '\r\n';
+  whole: string = content,
+): LineEnding {
+  if (content[end] === '\r') return content[end + 1] === '\n' ? '\r\n' : '\r';
   if (content[end] === '\n') return '\n';
   if (oldString.includes('\r\n')) return '\r\n';
-  return content.includes('\r\n') ? '\r\n' : '\n';
+  if (whole.includes('\r\n')) return '\r\n';
+  return whole.includes('\r') && !whole.includes('\n') ? '\r' : '\n';
+}
+
+/** Whether `text` ends in a line terminator of any shape. */
+function endsWithTerminator(text: string): boolean {
+  return text.endsWith('\n') || text.endsWith('\r');
 }
 
 /**
@@ -718,7 +758,13 @@ export function supportsLineComments(relPath: string): boolean {
  * `edit_file` so preservation is never silent. */
 export interface PreserveTransform {
   /** Pass the whole object as `opts.preserve` to `FileService.applyEdits`. */
-  transform: (edit: EditOp, matchIndex: number, content: string) => string;
+  transform: (
+    edit: EditOp,
+    matchIndex: number,
+    content: string,
+    range?: RangeMatch,
+    origin?: MatchOrigin,
+  ) => string;
   /** How many edits were actually preserved — call only after `applyEdits` has run. */
   preservedEdits: () => number;
   /**
@@ -731,6 +777,34 @@ export interface PreserveTransform {
    * matching inside text an earlier edit already commented out.
    */
   lastInsertion: () => number | undefined;
+  /**
+   * For the *most recent* `transform()` call only: where in the returned string sits the line
+   * terminator it put back after the replacement, in place of one `oldString` consumed (see
+   * `computeResult`) — `undefined` when it put none back. `applyEdits` lets its fused-pair repair
+   * rewrite those bytes as it would the original terminator they stand in for.
+   */
+  lastRestoredTerminator: () => { offset: number; length: number } | undefined;
+}
+
+/**
+ * Where a string edit's surroundings are judged: the file as the call found it when `origin`
+ * places the match there byte for byte — so an earlier edit of the same call cannot change
+ * whether its trailing `'\r'` is half of a CRLF, or whether anything follows it — else the current
+ * content, where the match is. Whether it starts and ends a line is required of the current
+ * content too (see `computeResult`).
+ */
+function judgedAt(
+  oldString: string,
+  matchIndex: number,
+  content: string,
+  origin: MatchOrigin | undefined,
+): { text: string; start: number; end: number } {
+  if (origin !== undefined && origin.start !== null && origin.end !== null) {
+    if (origin.original.slice(origin.start, origin.end) === oldString) {
+      return { text: origin.original, start: origin.start, end: origin.end };
+    }
+  }
+  return { text: content, start: matchIndex, end: matchIndex + oldString.length };
 }
 
 /**
@@ -749,9 +823,10 @@ export interface PreserveTransform {
  *  - the match found by `applyEdits` (`content.indexOf(edit.oldString)`, always the first
  *    occurrence — the same occurrence `applyEdits` itself replaces when the match is unique)
  *    is **line-aligned**: `oldString` starts at the beginning of a line, and ends at the end of
- *    a line — either because the character right after the match is a line terminator (`\n`, or
- *    `\r` immediately before `\n`) or end-of-file, OR because `oldString`'s own bytes already end
- *    with a line terminator (a caller can include the trailing newline in what it wants replaced
+ *    a line — either because the character right after the match is a line terminator (`\n`,
+ *    `\r\n`, or a bare `\r`, as `lineBoundsFrom` counts them) or end-of-file, OR because
+ *    `oldString`'s own bytes already end with a line terminator (a `\n`, or a `\r` not followed
+ *    by `\n` in `content`) (a caller can include the trailing newline in what it wants replaced
  *    or deleted; the match then consumes it, so there is nothing of that newline left in
  *    `content` right after `end` to check — the alignment is in `oldString` itself). A mid-line
  *    match has no reliable place to put a `%`-comment: a mid-line deletion would silently swallow
@@ -767,6 +842,17 @@ export interface PreserveTransform {
  *    `replaceAll` set. `transform` checks it again anyway (belt-and-braces, the same reasoning as
  *    the `oldString !== newString` check above): this function must never be the reason that
  *    guard goes quiet if the call order or a future caller ever changes.
+ *
+ * A **line-range** edit (`range` passed, see `RangeMatch`) skips the alignment test — it is
+ * whole lines by construction — comments every line of the range, a blank last one included,
+ * and takes its separator from the file as the call found it. A string edit is judged there too
+ * when `applyEdits` passes `origin` (see `MatchOrigin`) — its separator, and, when the match sits
+ * in that file byte for byte (`judgedAt`), whether it starts a line, a split CRLF, and whether a
+ * consumed terminator is put back — so an earlier edit of the same call cannot change the bytes
+ * it writes. Whether it starts and ends a line must hold in the current content as well: an
+ * earlier edit that took the terminator after it left live text there, which a preserved deletion
+ * would comment out, and one that took the terminator before it left live text in front of the
+ * block, whose line break the block would turn into a comment's.
  *
  * A deletion (`newString === ''`) is preserved as just the commented block, with no trailing
  * blank line after it — appending an empty `newString` behind the separator would otherwise leave
@@ -790,6 +876,9 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
   // reset (or set) on every call, never accumulated, since `applyEdits` reads it once immediately
   // after each `transform()` call and keeps its own ledger of every range across the whole call.
   let lastCommentedLength: number | undefined;
+  // Length of the terminator the most recent call put back at the end of its result, if any.
+  let lastRestoredLength: number | undefined;
+  let lastResultLength = 0;
 
   /** The actual transform logic, factored out so `transform` can stay a thin adapter that also
    * records `lastCommentedLength` for `lastInsertion()`. */
@@ -797,7 +886,9 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
     edit: EditOp,
     matchIndex: number,
     content: string,
-  ): { result: string; commentedLength?: number } {
+    range: RangeMatch | undefined,
+    origin: MatchOrigin | undefined,
+  ): { result: string; commentedLength?: number; restoredLength?: number } {
     if (mode === 'off') return { result: edit.newString };
     if (edit.oldString === edit.newString) return { result: edit.newString };
     // Belt-and-braces: FileService.applyEdits already never calls this hook for a replaceAll
@@ -810,16 +901,66 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
       mode === 'always' || classifyEdit(edit.oldString, edit.newString) === 'prose';
     if (!shouldPreserve) return { result: edit.newString };
 
-    const atLineStart = matchIndex === 0 || content[matchIndex - 1] === '\n';
-    const end = matchIndex + edit.oldString.length;
+    if (range) {
+      // A line-range edit: `oldString` is whole lines by construction — line-aligned at both ends,
+      // with the terminator after its last line left in the file — so there is no alignment to
+      // judge and no consumed terminator to put back. Every line of it is commented, a blank last
+      // line included (`wholeLines`), and the separator is judged where the line numbers were: in
+      // the file as the call found it, at the range's original offsets, so an earlier edit in the
+      // same call that removed the only evidence (the file's one CRLF) cannot change it.
+      preservedEdits++;
+      const commented = commentOut(edit.oldString, { wholeLines: true });
+      if (edit.newString === '') return { result: commented, commentedLength: commented.length };
+      const separator = resolveSeparatorLineEnding(
+        edit.oldString,
+        range.original,
+        range.start + edit.oldString.length,
+      );
+      return { result: commented + separator + edit.newString, commentedLength: commented.length };
+    }
+
+    // Everything below that reads around the match reads `at` — the file as the call found it
+    // whenever the match sits there unchanged (see `judgedAt`).
+    const at = judgedAt(edit.oldString, matchIndex, content, origin);
+    // A line starts after any terminator `lineBoundsFrom` honours — `\n`, or a bare `\r` — but
+    // not between the two bytes of a `\r\n` pair, which is one terminator, not a line boundary.
+    const prev = at.text[at.start - 1];
+    // The start must hold in the current content as well, like the end below: the block is
+    // spliced in after whatever precedes the match NOW. An earlier edit that took the terminator
+    // before the match — `'A\n'` → `'A '` — left live text in front of it, and a block opened
+    // there turns the terminator it now follows into a comment's: a newString starting with its
+    // own line break then leaves a blank line (a `\par`) that mode off, where that line break
+    // simply ends the live line, never writes. Loose in the current content (any terminator, or
+    // the start of the file): whether a `'\r'` there is half of a CRLF is judged in `at`, where a
+    // deletion earlier in the call cannot have brought a `'\n'` up against it.
+    const prevNow = content[matchIndex - 1];
+    const atLineStart =
+      (at.start === 0 || prev === '\n' || (prev === '\r' && at.text[at.start] !== '\n')) &&
+      (matchIndex === 0 || prevNow === '\n' || prevNow === '\r');
+    const end = at.end;
     // `oldString` can end with its own trailing line terminator (a caller including the
     // newline in what it wants replaced/deleted) — that terminator is then already consumed by
     // the match, so `content[end]` is the *next* line's first character, not a newline. That is
     // still a line-aligned match: the check must not rely solely on what follows in `content`.
-    const oldEndsWithNewline = edit.oldString.endsWith('\n');
-    const matchEndsWithCrlf = content[end] === '\r' && content[end + 1] === '\n';
+    // A trailing `'\r'` counts as a whole terminator unless a `'\n'` follows it (in `at`): then
+    // it is half of a `'\r\n'` pair the match split (`splitPair`), and the line ends at that
+    // `'\n'` instead. Judged in `at`, because a range deletion earlier in the call can leave a
+    // blank line's `'\n'` right after a bare `'\r'` — a pair `applyEdits` splits again at the end.
+    const splitPair = edit.oldString.endsWith('\r') && at.text[end] === '\n';
+    const oldEndsWithTerminator = endsWithTerminator(edit.oldString) && !splitPair;
+    // Any terminator right after the match ends its line — `'\n'`, `'\r\n'`, or a bare `'\r'`,
+    // exactly as `lineBoundsFrom` counts them. Leaving the bare `'\r'` out meant no middle line of
+    // a CR-only file was ever preserved.
+    const endsLine = (text: string, after: number) =>
+      endsWithTerminator(edit.oldString) ||
+      after === text.length ||
+      text[after] === '\n' ||
+      text[after] === '\r';
+    // The end must hold in the current content as well as in `at`, as the start does: a match that
+    // no longer ends its line there has live text right after it — an earlier edit took its
+    // terminator — and a preserved DELETION would comment that text out with it.
     const atLineEnd =
-      oldEndsWithNewline || end === content.length || content[end] === '\n' || matchEndsWithCrlf;
+      endsLine(at.text, end) && endsLine(content, matchIndex + edit.oldString.length);
     if (!atLineStart || !atLineEnd) return { result: edit.newString };
 
     preservedEdits++;
@@ -828,9 +969,20 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
 
     // Mirror the line ending the match sat on — see `resolveSeparatorLineEnding` for every signal
     // considered and in what order, including the EOF case where nothing follows the match in
-    // `content` to inspect directly.
-    const separatorLineEnding = resolveSeparatorLineEnding(edit.oldString, content, end);
-    const joined = joinCommentedBlock(commented, edit.newString, separatorLineEnding);
+    // `content` to inspect directly. Judged, like a range's, in the file as the call found it
+    // (`origin`), at the match's end there when `applyEdits` could place it; only a match ending
+    // inside text an earlier edit of this call inserted is read in `content`, and even then the
+    // whole-file fallback is the original's.
+    const separatorLineEnding =
+      origin && origin.end !== null
+        ? resolveSeparatorLineEnding(edit.oldString, origin.original, origin.end)
+        : resolveSeparatorLineEnding(
+            edit.oldString,
+            content,
+            matchIndex + edit.oldString.length,
+            origin?.original,
+          );
+    const joined = joinCommentedBlock(commented, edit.newString, separatorLineEnding, splitPair);
 
     // When oldString's own bytes already included its trailing terminator, the match consumed
     // it directly out of `content` — so if real content still follows, that terminator has to be
@@ -841,17 +993,46 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
     // Restore it only when `newString` does not already carry one. A caller replacing a whole
     // line naturally mirrors its oldString and ends `newString` with a newline too; adding a
     // second one there yields a blank line, which LaTeX reads as a paragraph break the edit
-    // never asked for. Testing `'\n'` covers `'\r\n'` as well, since CRLF ends in `\n`.
-    if (oldEndsWithNewline && end !== content.length && !edit.newString.endsWith('\n')) {
-      const restoredLineEnding: '\n' | '\r\n' = edit.oldString.endsWith('\r\n') ? '\r\n' : '\n';
-      return { result: joined + restoredLineEnding, commentedLength: commented.length };
+    // never asked for. A trailing `'\r'` counts too: in a CR-only file it is the terminator.
+    //
+    // "Real content still follows" is judged where the rest of the alignment is (`at`): a
+    // deletion earlier in the call that removed everything after the match must not decide it,
+    // or the file's last line lost its terminator in one order of the edits and kept it in the
+    // other. Its length is reported (`lastRestoredTerminator`) because it stands in for a byte the
+    // file had: a deletion that leaves this bare `'\r'` before a blank line's `'\n'` gets it
+    // turned into `'\n'`, exactly as it would the original `'\r'`.
+    if (oldEndsWithTerminator && end !== at.text.length && !endsWithTerminator(edit.newString)) {
+      const restoredLineEnding: LineEnding = edit.oldString.endsWith('\r\n')
+        ? '\r\n'
+        : edit.oldString.endsWith('\r')
+          ? '\r'
+          : '\n';
+      return {
+        result: joined + restoredLineEnding,
+        commentedLength: commented.length,
+        restoredLength: restoredLineEnding.length,
+      };
     }
     return { result: joined, commentedLength: commented.length };
   }
 
-  function transform(edit: EditOp, matchIndex: number, content: string): string {
-    const { result, commentedLength } = computeResult(edit, matchIndex, content);
+  function transform(
+    edit: EditOp,
+    matchIndex: number,
+    content: string,
+    range?: RangeMatch,
+    origin?: MatchOrigin,
+  ): string {
+    const { result, commentedLength, restoredLength } = computeResult(
+      edit,
+      matchIndex,
+      content,
+      range,
+      origin,
+    );
     lastCommentedLength = commentedLength;
+    lastRestoredLength = restoredLength;
+    lastResultLength = result.length;
     return result;
   }
 
@@ -859,5 +1040,9 @@ export function createPreserveTransform(mode: RewriteMode): PreserveTransform {
     transform,
     preservedEdits: () => preservedEdits,
     lastInsertion: () => lastCommentedLength,
+    lastRestoredTerminator: () =>
+      lastRestoredLength === undefined
+        ? undefined
+        : { offset: lastResultLength - lastRestoredLength, length: lastRestoredLength },
   };
 }

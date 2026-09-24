@@ -5,6 +5,7 @@ import type { AppContext } from '../context.js';
 import type { SafePushResult } from '../services/gitService.js';
 import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
+import { redactGitUrlCredentials } from '../lib/gitUrlCredentials.js';
 import {
   renderConflictText,
   renderLandedUpstream,
@@ -163,8 +164,11 @@ const inputSchema = {
     .min(1)
     .optional()
     .describe(
-      'With `resolutions`: the `remoteHead` from the conflict you merged against. If the remote ' +
-        'has advanced past it, the push is refused instead of merging over what just landed. ' +
+      'With `resolutions`: the `remoteHead` from the conflict you merged against — that commit ' +
+        'SHA (4 to 40 hex characters, full or abbreviated as the conflict text prints it); a ref ' +
+        'name such as "origin/master" is refused, since it would always match the remote it ' +
+        'names. If the remote has advanced past it, the push is refused instead of merging over ' +
+        'what just landed. ' +
         'Setting this also disables the automatic lost-race retry: a second remote move during ' +
         'this push is reported as "remote-moved" (nothing pushed) after one attempt, rather than ' +
         'retried up to 3 times.',
@@ -306,7 +310,7 @@ function safePushToolResult(
   const structured: Record<string, unknown> = {
     status: res.status,
     pushed: res.pushed,
-    remote: redact(res.remote, secrets),
+    remote: redact(redactGitUrlCredentials(res.remote), secrets),
     branch: res.branch,
     summary: res.summary,
   };
@@ -470,7 +474,7 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
               structuredContent: {
                 status: prep.status,
                 pushed: false,
-                remote: redact(cfg.gitUrl, secrets),
+                remote: redact(redactGitUrlCredentials(cfg.gitUrl), secrets),
                 branch: prep.branch,
                 base: prep.base,
                 summary: prep.summary,

@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
-import { locateProjectPdf } from '../lib/pdfLocate.js';
+import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import {
   MAX_GEOMETRY_PAGES,
@@ -13,6 +13,7 @@ import {
 import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
 import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
 import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
+import { planGeometryPayload, GEOMETRY_CONTENT_BUDGET } from '../lib/geometryBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -20,9 +21,11 @@ const inputSchema = {
     .string()
     .optional()
     .describe(
-      'Root .tex file, used to select the build-dir PDF (and, for kinds: ["floats"], the ' +
-        'build-dir .aux) to read. Auto-detected when omitted, exactly as for compile and ' +
-        'render_pages.',
+      'Root .tex file whose build this reads: its build-dir PDF (and, for kinds: ["floats"], ' +
+        'its .aux), in every workspace mode — pass the same rootFile you compiled with to read ' +
+        'a non-default root. Auto-detected when omitted. Only when it is omitted and no .aux is ' +
+        'read does a missing build PDF fall back to the surfaced <workspace>/<id>.pdf ' +
+        '(workspace-local mode), which holds whichever root compiled last.',
     ),
   pages: z
     .array(z.number().int().positive())
@@ -46,7 +49,7 @@ const inputSchema = {
         'what an \\includegraphics figure occupies — NOT vector drawing geometry: a frame drawn ' +
         'with \\fbox rules or a TikZ stroke and no embedded image is never reported by this tool. ' +
         'kinds: ["floats"] alone never opens the compiled PDF at all (it only reads the .aux), so ' +
-        'it works even without the optional native canvas backend installed.',
+        'it works even before any PDF exists (a compile that wrote an .aux and then died).',
     ),
 };
 
@@ -139,7 +142,9 @@ const geometryPageShape = z.object({
         'As for ' +
         'images, a line whose coordinates come out non-finite (a content stream whose operands ' +
         'overflow) is dropped rather than reported, and is not counted in textOmitted — that ' +
-        'field is the per-page cap alone — since a NaN is not a measurement.',
+        'field is the per-page cap alone — since a NaN is not a measurement. Lines cut by the ' +
+        'size budget are counted in textOmittedBySize, and are always a suffix: the lines kept ' +
+        'are the first ones in drawing order.',
     ),
   images: z
     .array(geometryBoxShape)
@@ -172,6 +177,28 @@ const geometryPageShape = z.object({
     .number()
     .describe(
       `Image rects past the ${MAX_IMAGE_RECTS_PER_PAGE}-per-page cap (MAX_IMAGE_RECTS_PER_PAGE).`,
+    ),
+  textOmittedBySize: z
+    .number()
+    .describe(
+      'Text lines cut from the END of this page because the page geometry hit its ' +
+        `${GEOMETRY_CONTENT_BUDGET}-character budget, charged on the JSON-encoded boxes of every ` +
+        'page in the result (each text label is document-controlled, so a count cap alone is not ' +
+        'a bound on what you receive). Every page is guaranteed an equal share, and what a sparse ' +
+        'page leaves unused is split among the rest, so one dense page never starves another. ' +
+        'Counted apart from textOmitted (the per-page count cap) because it is a different ' +
+        'cause; the cut lines are not fetchable from this result — ask for fewer pages or ' +
+        'fewer kinds to give each page more. 0 when the budget did not fire, and when "text" ' +
+        'was not requested.',
+    ),
+  imagesOmittedBySize: z
+    .number()
+    .describe(
+      'Image rects cut from the END of this page by the same size budget as ' +
+        "textOmittedBySize: every page's image list gets the same guaranteed share as its text " +
+        'list, and a page carries only a handful of figure frames, so this is almost always 0. ' +
+        'Counted apart from imagesOmitted (the per-page count cap) and annotationImagesSkipped ' +
+        '(never measured at all).',
     ),
   annotationImagesSkipped: z
     .number()
@@ -300,14 +327,29 @@ const outputSchema = {
         'missing, something that looked like an entry was declined", and this means neither. ' +
         'Almost always 0; a non-zero value says the .aux is malformed or hostile.',
     ),
+  floatsPagesShifted: z
+    .boolean()
+    .optional()
+    .describe(
+      'Present (true) only when "floats" was requested and the build loaded `pgfpages` (its .fls ' +
+        'or .log names pgfpages.sty or pgfmorepages.sty): a \\pgfpagesuselayout (`resize to`, ' +
+        '`2 on 1`) holds each page back until the next is built, so every `page` in `floats` is ' +
+        "likely LATER than the page the label is on — don't pass it to render_pages as `pages:`; " +
+        'find the page with extract_text instead. Label keys and numbers are unaffected. Loading ' +
+        'the package without a layout shifts nothing, but is flagged too. Absent when the build ' +
+        'shows no pgfpages, or when neither file could be read.',
+    ),
   note: z
     .string()
     .optional()
     .describe(
-      'Explains an unusual situation: "floats" requested but no .aux was found in the build ' +
-        'directory (nothing has been compiled with that root file yet, or the backend in use ' +
-        'does not write one), and/or the floats payload hit its size budget, in which case it ' +
-        'names the bound that fired. (There is a second, single-oversized-entry bound behind ' +
+      'Explains an unusual situation, several joined when more than one applies: the build ' +
+        'loaded pgfpages, so the floats pages are likely shifted (see floatsPagesShifted); the page ' +
+        'geometry hit its size budget (see textOmittedBySize); "floats" requested but no .aux ' +
+        'was found in the build directory (nothing has been compiled with that root file yet, ' +
+        'or the backend in use does not write one), or the .aux reader could not read an ' +
+        'included file; and/or the floats payload hit its size budget, in which case it names ' +
+        'the bound that fired. (There is a second, single-oversized-entry bound behind ' +
         'that one, but the .aux reader caps every field at 200 characters, so one entry cannot ' +
         'render anywhere near the whole budget and callers will not see it fire — it is ' +
         'defence in depth, not a case to code against.)',
@@ -362,14 +404,16 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         `Caps: ${MAX_GEOMETRY_PAGES} pages per call (MAX_GEOMETRY_PAGES, lower than render_pages’ ` +
         `cap — a page of boxes is a lot more output than one PNG), ${MAX_TEXT_LINES_PER_PAGE} text ` +
         `lines and ${MAX_IMAGE_RECTS_PER_PAGE} image rects per page, ${DEFAULT_MAX_FLOATS} floats ` +
-        'total — each with its own *Omitted count, so a truncated result is never silent. ' +
+        'total — each with its own *Omitted count, so a truncated result is never silent — and a ' +
+        `${GEOMETRY_CONTENT_BUDGET}-character budget on the page boxes (every page guaranteed a ` +
+        'share; cuts counted per page in textOmittedBySize / imagesOmittedBySize) and another on ' +
+        'the floats, because every text label and \\label key is document-controlled. ' +
         'Writes nothing into the project or its build directory. It does take the per-project ' +
         "lock, exactly as render_pages does (a peer session's compile can rewrite the build dir " +
         'mid-read), so it creates <workspace>/.sessions/<project>/ if that is not already there, ' +
         'and it can wait on — or time out against — a peer holding that lock. ' +
-        'Reading per-page geometry needs the optional native canvas backend @napi-rs/canvas, ' +
-        "same as render_pages and compile's pageCount reports — without it this fails naming " +
-        'that package, not the PDF as broken (kinds: ["floats"] alone is unaffected).',
+        'It never rasterizes, so it does not need the optional native canvas backend ' +
+        '(@napi-rs/canvas) that render_pages does.',
       inputSchema,
       outputSchema,
     },
@@ -389,9 +433,15 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // recording a baseline would wrongly claim the caller could now base a write on a file
           // it only used to locate a PDF/aux.
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
-          const pdfPath = await locateProjectPdf(ctx.config, id, dir, root);
-
           const requestedKinds = kinds ?? ['text', 'images'];
+          // The ROOT's build PDF, never the surfaced copy once a root is named or "floats" reads
+          // the .aux: the surfaced copy holds whichever root compiled last, and measuring it
+          // beside this root's float index would join two different documents (locateRootPdf).
+          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
+            rootNamed: rootFile !== undefined,
+            readsAux: requestedKinds.includes('floats'),
+          });
+
           const pageKinds = requestedKinds.filter((k): k is GeometryKind => k !== 'floats');
 
           // This tool writes nothing into the project or its build directory — no PNGs, no temp
@@ -401,9 +451,8 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // clone, and the same directory every other locking tool uses.)
           //
           // Skip opening the PDF entirely when no page-level kind was requested (kinds: ["floats"]
-          // alone): geometry() needs the native canvas backend just to open a document at all, so
-          // a pure .aux text parse would otherwise fail on a machine without it, or open the
-          // document to produce a result that discards text/images either way. pageCount is
+          // alone): a pure .aux text parse has no use for the document, and must keep working when
+          // a compile wrote an .aux and then died before any PDF existed. pageCount is
           // therefore honestly unknown in this path (see the schema field), not computed and
           // hidden. A page-level request, by contrast, needs the PDF and must fail loudly and
           // early when there isn't one — nested here (rather than as an earlier standalone guard)
@@ -422,6 +471,11 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           } else {
             result = { pageCount: undefined, pages: [], skippedPages: [] };
           }
+          // The size budget, over whatever survived the service's per-page count caps. Every text
+          // box carries a document-controlled label, so the count caps alone let a default call on
+          // an ordinary paper past the ~67k a client rejected undelivered (#68). The planner's
+          // pages are emitted as they are: they are the objects it charged. See geometryBudget.ts.
+          const geometryPlan = planGeometryPayload(result.pages);
 
           let floats: Array<{ label: string; number: string; page: string }> | undefined;
           let floatsOmitted: number | undefined;
@@ -429,7 +483,8 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           let floatsDropped: number | undefined;
           let floatsRefused: number | undefined;
           let floatsIndeterminate: number | undefined;
-          let note: string | undefined;
+          let floatsNote: string | undefined;
+          let floatsPagesShifted: true | undefined;
           if (requestedKinds.includes('floats')) {
             const auxResult = await readAuxFloats(dir, root);
             // The size budget is applied AFTER the reader's count cap, over whatever survived it,
@@ -462,12 +517,23 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // shadow record — excluded from the index by design — as a missing float. Until
             // #139 these markers were counted nowhere at all and simply vanished.
             floatsIndeterminate = auxResult.indeterminate;
-            // Joined, never overwritten. In practice they cannot both be set — the reader's note
-            // fires only when there is no .aux at all, which is also the case in which there are
-            // no floats for the budget to cut — but "cannot happen" is not a reason to write code
-            // that silently discards one of them if it ever does.
-            note = [auxResult.note, plan.note].filter(Boolean).join(' ') || undefined;
+            // Joined, never overwritten: the reader's note (no .aux at all, or an \@input file it
+            // could not read — the latter alongside floats the budget may well cut) and the budget
+            // note answer different questions, and both can be set at once.
+            // The same evidence that makes labels: refuse the build (labelPages.ts,
+            // 'pgfpagesLayout'). The index is still returned — its keys and numbers are true, and
+            // it is data the caller asked for — but its pages are not, so it says so, first.
+            floatsPagesShifted = auxResult.pgfpages === true ? true : undefined;
+            const shiftedNote = floatsPagesShifted
+              ? 'This build loaded pgfpages: a \\pgfpagesuselayout holds each page back until the ' +
+                'next is built, so every floats page is likely one later than the page the label ' +
+                'is on (see floatsPagesShifted). Find the page with extract_text rather than ' +
+                'passing these to render_pages.'
+              : undefined;
+            floatsNote =
+              [shiftedNote, auxResult.note, plan.note].filter(Boolean).join(' ') || undefined;
           }
+          const note = [geometryPlan.note, floatsNote].filter(Boolean).join(' ') || undefined;
 
           // The response boundary. It sits below the geometry() call deliberately: that call reads
           // the PDF off the real filesystem and needs the native spelling, and the `!pdfPath` throw
@@ -476,7 +542,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           const structuredContent = {
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
-            pages: result.pages,
+            pages: geometryPlan.pages,
             skippedPages: result.skippedPages,
             floats,
             floatsOmitted,
@@ -484,6 +550,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             floatsDropped,
             floatsRefused,
             floatsIndeterminate,
+            floatsPagesShifted,
             note,
           };
 
@@ -494,17 +561,23 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                 ? `${outPdfPath} (no page opened — kinds: floats only)`
                 : 'no PDF (kinds: floats only, and none was ever compiled)';
           const header = `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})`;
-          const pageLines = result.pages.map((p) => {
+          const pageLines = geometryPlan.pages.map((p) => {
             const parts = [
               `page ${p.page}: ${p.pageWidthPt.toFixed(1)}x${p.pageHeightPt.toFixed(1)} pt`,
             ];
             if (p.text !== undefined) {
               parts.push(`${p.text.length} text line(s)`);
               if (p.textOmitted > 0) parts.push(`${p.textOmitted} text line(s) omitted`);
+              if (p.textOmittedBySize > 0) {
+                parts.push(`${p.textOmittedBySize} text line(s) past the size budget`);
+              }
             }
             if (p.images !== undefined) {
               parts.push(`${p.images.length} image rect(s)`);
               if (p.imagesOmitted > 0) parts.push(`${p.imagesOmitted} image rect(s) omitted`);
+              if (p.imagesOmittedBySize > 0) {
+                parts.push(`${p.imagesOmittedBySize} image rect(s) past the size budget`);
+              }
               // Surfaced in the text channel as well as structuredContent, and named as a
               // different thing from the cap: a client reading only the text would otherwise see
               // "3 image rect(s)" on a page holding five figures and have no way to know two of
@@ -535,7 +608,8 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                 // floatsIndeterminate.
                 (floatsIndeterminate
                   ? ` (${floatsIndeterminate} marker(s) too malformed to judge)`
-                  : '')
+                  : '') +
+                (floatsPagesShifted ? ' (pages likely shifted by pgfpages — see the note)' : '')
               : '';
           const noteLine = note ? `  … ${note}` : '';
           const text = [header, ...pageLines, skippedLine, floatsLine, noteLine]

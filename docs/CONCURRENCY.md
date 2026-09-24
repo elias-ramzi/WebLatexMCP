@@ -174,10 +174,54 @@ works and is still isolated, but it shows up to the others under a generated id.
 
 Every mutating operation takes a lock file beside the clone for the duration, on top
 of the in-process mutex. A session that crashes cannot release its lock, so a lock is
-reclaimed once its owning process is gone, or once it stops being refreshed. Callers
-wait rather than fail for up to 30 seconds; a holder still busy past that (a long fetch)
-or a genuinely stuck one produces an error, and it names
-the session holding it.
+reclaimed once its owning process is gone — or, when the record cannot prove its holder
+alive on this boot (unreadable, or a pid that may be another boot's), once it stops being
+refreshed. A holder whose pid is alive on the boot that recorded it is **not** reclaimed on
+one look at its age: a laptop that slept past the staleness window wakes with every lock
+looking old before its holder has had a chance to refresh it, and stealing that lock puts
+two processes into git at once. Such a lock is reclaimed only once a waiter has seen the
+same record, unchanged in content and modification time, stale on two looks at least 10
+seconds apart — long enough for a woken holder's overdue heartbeat to land and move it.
+That is what a crashed holder whose pid another process has since reused looks like, and it
+must not wedge the lock for as long as that unrelated process lives. (A live holder whose
+heartbeat cannot land at all — a stopped process — is reclaimed the same way.) A lock this
+very process wrote is judged without guessing: it is live exactly while a call here still
+holds it. "This very process" is recognised by a random per-process nonce written into every
+record, not by pid alone — two containers sharing a workspace volume both run the server as
+pid 1, and without the nonce each would read the other's live lock as its own leftover and
+take it. A lock carrying this process's pid under another nonce is either that twin or this
+server's own predecessor — a container whose pid 1 crashed and restarted — and asking whether
+the pid is alive only asks about ourselves, so such a lock is judged by its heartbeat alone:
+it is reclaimed once it has gone 15 seconds without one and is then seen unchanged 10 seconds
+later, so a restarted server gets its predecessor's lock about 25 seconds after the crash,
+inside the 30-second wait. A live twin refreshes its lock every 5 seconds and is never taken;
+one whose process is frozen for that long (a blocked event loop, a stopped process) is, which
+is the same trade the stopped-holder case above makes, only sooner. Callers wait rather than fail for up to 30 seconds; a holder still busy past that
+(a long fetch) or a genuinely stuck one produces an error that names the session holding
+it, the lock file, and the manual way out — if no other web-latex-mcp session is running,
+the lock was left by a crash, and deleting that file is safe. Every server sharing a
+workspace must run a version with this protocol: an older one (0.6.x or earlier) deletes a
+lock it judges stale unconditionally.
+
+Removing a lock file is the step that has to be careful, since the filesystem has no
+"delete this file only if it is still the one I judged". Each lock record carries a unique
+token, and a record is removed — by its holder's release or by a reclaim — only by whoever
+first creates its removal marker (`project.lock.rm-…`) and then finds that same record
+still in place; a release removes only its own record. Without that, a waiter reclaiming a
+dead holder's lock could delete a faster waiter's fresh one and let two holders in. A crash
+part-way through a removal can leave a `project.lock.rm-…` or `project.lock.gone-…` file
+behind; it is harmless and is not cleaned up automatically.
+
+**The lock is sound only among servers on one host, in one pid namespace.** Whether a
+holder is alive is decided by asking the local process table about the pid in its record,
+and a pid means nothing outside the namespace that issued it. Two machines sharing a
+workspace over a network filesystem, or two containers with separate pid namespaces sharing
+a volume, cannot see each other's processes: a holder whose pid is absent here reads as
+crashed and its lock is taken at once, and one whose pid happens to name an unrelated live
+process here is judged by that process. The nonce closes only the case where the two
+processes carry the _same_ pid; it does not make pids comparable across namespaces. Run
+every server that shares a workspace on one host, in one pid namespace (for containers,
+share the host's or one another's pid namespace), or give each its own workspace.
 
 ### Committing only your own work
 
@@ -200,7 +244,10 @@ Two consequences worth knowing:
   not take. A file can appear there even though the commit included part of it; that
   is the two-sessions-one-file case, working as intended.
 - `commit scope: "all"` is the escape hatch: it commits the whole working tree, other
-  sessions' work included. Use it deliberately, not as a default.
+  sessions' work included. Use it deliberately, not as a default — and the default never
+  becomes it behind your back while someone else is working: an unscoped `commit` from a
+  session that tracks nothing falls back to the whole tree only when no other live session
+  shares the clone, and otherwise refuses and names them.
 - `commit scope: "paths"` is for work that never went through the server — a file a
   script produced, an edit made with the client's own tools. Nobody's shadow holds it,
   so a session-scoped commit cannot see it, and `scope: "all"` would take a peer's
@@ -216,7 +263,13 @@ surfaced, never guessed at. The file is flagged (`conflictedChanges` in `status`
 `conflicted` on a commit result) and excluded from commits, and it stays flagged —
 later edits do not quietly clear it, because that session's shadow is anchored to a
 base the file has since moved past, and committing it would revert whatever landed in
-between.
+between. Carrying the shadow onto a new HEAD clears it only where the shadow is known to
+be complete: a collision found while carrying it forward leaves this session's shadow
+exactly as it was, so when HEAD moves again and the change now merges cleanly, the entry is
+carried forward and unflagged. An entry whose shadow is missing a write this session made
+(a collision found while recording it, or a write made while already flagged) is marked
+incomplete, and no refresh ever clears that — only taking the file deliberately or
+discarding it does.
 
 There are three honest ways out, and all are the caller's decision: commit with
 `scope: "all"` to take the working tree as it stands, or discard those files to give
@@ -273,7 +326,20 @@ works again afterwards. What remains is the case where the index itself cannot b
 written (a full or unwritable `.sessions/`): then the edit is in the tree with no entry
 naming it, and it shows up as owned by nobody.
 `status` carries the same per-session `changes` and `lastWriteAt`, for checking
-without attempting a push.
+without attempting a push. It takes no lock and **writes nothing to the shadow index** (it
+only refreshes this session's own heartbeat in `session.json`): it reports this
+session's shadow as it would stand on the current HEAD without saving that view — saving it
+lock-free could overwrite a concurrent write's record, or bring back entries a peer's
+`discard` had just settled. The next locked `commit`, `push` or `project_sync` carries the
+shadow forward for real.
+
+Owning a file does not make it yours alone. A file this session edited is still disputed
+when a live peer's shadow lists it too — both edited it — or while any live peer's index
+cannot be read. The refusal says the file carries this session's edits as well, and names
+the route that takes only those: `commit` with its default scope, which stages this
+session's lines and never a peer's; then push without a `message` once the owner has
+committed. A `message` on push commits the whole tree (`git add -A`), which is exactly how the
+peer's lines in that file used to be pushed under this session's name.
 
 Not every peer `status` lists by name, though. A session that has died — no live process _from this
 boot_ behind its recorded pid, and a heartbeat older than the staleness window — whose heartbeat is

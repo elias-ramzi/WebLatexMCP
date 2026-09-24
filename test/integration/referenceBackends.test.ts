@@ -333,6 +333,29 @@ describe('multi-backend reference lookup through a real MCP client', () => {
     expect(text).toMatch(/WEB_LATEX_MCP_REFERENCE_SOURCE/);
   });
 
+  it('server_info and search_references quote an elided value alike, the count outside the quotes', async () => {
+    // config.ts cuts a long rejected value to `<head>… (N characters)`; the count is the server's
+    // note, not part of the value, so neither message may put it inside the quotes.
+    const elided = `${'x'.repeat(120)}… (300 characters)`;
+    const { client } = await setup(
+      backends({}),
+      { invalidSource: elided },
+      { referenceSourceInvalid: elided },
+    );
+
+    const info = await client.callTool({ name: 'server_info', arguments: {} });
+    const search = await client.callTool({
+      name: 'search_references',
+      arguments: { query: 'deep residual learning' },
+    });
+    const shown = `"${'x'.repeat(120)}"… (300 characters)`;
+    for (const res of [info, search]) {
+      const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
+      expect(text).toContain(shown);
+      expect(text).not.toContain('characters)"');
+    }
+  });
+
   it('server_info says nothing about an invalid source when there is none', async () => {
     const { client } = await setup(backends({}));
 

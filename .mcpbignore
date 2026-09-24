@@ -39,15 +39,22 @@ eslint.config.*
 *.d.mts
 *.d.cts
 
-# pdf.js (the live PDF viewer) ships a full second "legacy" build plus type defs and an
-# image-decoder entry the viewer never loads — it only serves build/, web/, cmaps/, wasm/,
-# and standard_fonts/. Dropping these cuts the bundle by ~26 MB with no functional change.
-node_modules/pdfjs-dist/legacy/
+# pdf.js is used twice. The live PDF viewer serves build/, web/, cmaps/, wasm/ and
+# standard_fonts/ to the browser; and the server itself imports the LEGACY build in Node —
+# legacy/build/pdf.mjs, which loads legacy/build/pdf.worker.mjs beside itself — for compile's
+# pageCount, /PageLabels, extract_text, pdf_geometry and render_pages. So legacy/build/ must ship:
+# 0.7.0 excluded all of legacy/ and every PDF tool in the extension died on "Cannot find module
+# …pdf.mjs" (test/unit/mcpbignore.test.ts pins it now). What neither user loads is the legacy
+# viewer and the image-decoder entries, plus the type defs.
+node_modules/pdfjs-dist/legacy/web/
+node_modules/pdfjs-dist/legacy/image_decoders/
 node_modules/pdfjs-dist/types/
 node_modules/pdfjs-dist/image_decoders/
 
 # pdf.js's OPTIONAL Node-side canvas renderer (@napi-rs/canvas) — a ~32 MB per-platform native
-# binary. We render in the browser and never import pdf.js in Node (the viewer only serves its
-# files), so it is never loaded; a per-platform binary in a cross-platform bundle would be useless
-# anyway. Dropping it saves ~33 MB.
+# binary. The bundle is built once, on ubuntu, for every platform, so the binary would be the wrong
+# one on macOS and Windows anyway; leaving it out saves ~33 MB. Only RASTERIZING needs it, so in
+# the extension render_pages refuses, naming this case, while pageCount, /PageLabels, extract_text
+# and pdf_geometry work: without the backend the server supplies the one DOM global
+# (`DOMMatrix`) pdf.js needs merely to be imported (src/services/pdfRender.ts).
 node_modules/@napi-rs/

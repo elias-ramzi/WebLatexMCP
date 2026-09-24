@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { DoctorService, isWritablePath } from '../../src/services/doctor.js';
+import { DoctorService, MIN_GIT_VERSION, isWritablePath } from '../../src/services/doctor.js';
 import type { ExecResult } from '../../src/lib/exec.js';
 
 /** Canned command output, keyed by `cmd` plus the first argument when it matters. */
@@ -12,11 +12,21 @@ function ok(stdout: string): ExecResult {
   return { code: 0, stdout, stderr: '', timedOut: false };
 }
 
+/** A spawn rejection shaped like node's own: `spawn <cmd> <CODE>`, with `code` set. */
+function spawnError(cmd: string, code: string): Error {
+  return Object.assign(new Error(`spawn ${cmd} ${code}`), { code });
+}
+
 /**
  * A stand-in for `execCapture`: known commands answer from the table, unknown ones reject the way
- * spawning a binary that is not on PATH does — which is exactly how the service detects absence.
+ * spawning a binary that is not on PATH does — `code: 'ENOENT'`, which is exactly how the service
+ * (like `probeOnPath`) detects absence. A command named in `unrunnable` rejects with that errno
+ * instead: present on PATH, but it could not be run (`EACCES` — not executable).
  */
-function runner(canned: Canned): {
+function runner(
+  canned: Canned,
+  unrunnable: Record<string, string> = {},
+): {
   run: (cmd: string, args: string[]) => Promise<ExecResult>;
   calls: string[];
 } {
@@ -25,8 +35,10 @@ function runner(canned: Canned): {
     calls,
     run: (cmd, args) => {
       calls.push([cmd, ...args].join(' '));
+      const errno = unrunnable[cmd];
+      if (errno !== undefined) return Promise.reject(spawnError(cmd, errno));
       const key = canned[`${cmd} ${args[0] ?? ''}`] ?? canned[cmd];
-      if (key === undefined) return Promise.reject(new Error('ENOENT'));
+      if (key === undefined) return Promise.reject(spawnError(cmd, 'ENOENT'));
       return Promise.resolve(ok(key));
     },
   };
@@ -299,6 +311,108 @@ describe('DoctorService', () => {
     expect(result.checks.find((c) => c.name === 'package-manager')?.detail).toMatch(/not used/i);
   });
 
+  it('does not call an end-of-life TeX Live a problem, or offer a tlmgr hint, when tectonic is what compiles', async () => {
+    // The same category error as the frozen-repository warning above, in the two places that
+    // escaped its gate: the distribution's age and the `tlmgr --usermode` route. Tectonic uses
+    // neither the system TeX nor tlmgr, so both send the user to fix something unused.
+    const canned = eolTeXLive(home, SYSTEM_TEXMF);
+    delete canned['latexmk -v'];
+    canned['tectonic --version'] = 'Tectonic 0.16.9';
+    const doctor = new DoctorService({
+      run: runner(canned).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf, // TEXMFHOME writable, system tree not: the --usermode shape
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    expect(result.ok).toBe(true);
+    expect(statusOf(result.checks, 'distribution')).toBe('ok');
+    const distribution = result.checks.find((c) => c.name === 'distribution')?.detail ?? '';
+    expect(distribution).not.toMatch(/end of life/i);
+    expect(distribution).toMatch(/not used/i);
+    expect(result.hints.join('\n')).not.toContain('--usermode');
+  });
+
+  it('still warns about an end-of-life TeX Live when latexmk is what compiles', async () => {
+    // The other side of the gate above: the same machine with latexmk present keeps both findings.
+    const doctor = new DoctorService({
+      run: runner(eolTeXLive(home, SYSTEM_TEXMF)).run,
+      now: NOW,
+      canWrite: rootOwnedSystemTexmf,
+    });
+
+    const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+    expect(statusOf(result.checks, 'distribution')).toBe('warn');
+    expect(result.hints.join('\n')).toContain('--usermode');
+  });
+
+  describe('a backend that is on PATH but cannot be run', () => {
+    // `compile` treats only ENOENT as "not installed" (`probeOnPath` rethrows everything else), so
+    // a non-executable latexmk is never substituted — the compile throws. `doctor` must say the
+    // same thing, not promise a fallback that will not happen.
+    it('fails, and promises no fallback, when a defaulted latexmk is not executable', async () => {
+      const canned = rhelTectonicOnly();
+      canned['latexmk -v'] = 'Latexmk, John Collins, 26 Dec. 2019. Version 4.67';
+      const doctor = new DoctorService({
+        run: runner(canned, { latexmk: 'EACCES' }).run,
+        now: NOW,
+        canWrite: () => Promise.resolve(true),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+      expect(result.ok).toBe(false);
+      expect(statusOf(result.checks, 'compiler')).toBe('fail');
+      const detail = result.checks.find((c) => c.name === 'compiler')?.detail ?? '';
+      expect(detail).toMatch(/could not be run/);
+      expect(detail).toContain('EACCES');
+      expect(detail).not.toMatch(/not found on PATH|falling back/);
+      // Nothing compiles, so nothing may be claimed on tectonic's behalf either.
+      expect(statusOf(result.checks, 'engines')).toBe('fail');
+      const hints = result.hints.join('\n');
+      expect(hints).not.toMatch(/falling back/);
+      // ...but the way out is named: fix the binary, or choose tectonic explicitly.
+      expect(hints).toContain('WEB_LATEX_MCP_COMPILER=tectonic');
+      expect(hints).toContain('compiler: "tectonic"');
+    });
+
+    it('says "could not be run", not "not found", when an explicit latexmk is not executable', async () => {
+      const doctor = new DoctorService({
+        run: runner(rhelTectonicOnly(), { latexmk: 'EACCES' }).run,
+        now: NOW,
+        canWrite: () => Promise.resolve(true),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: true });
+
+      expect(statusOf(result.checks, 'compiler')).toBe('fail');
+      const detail = result.checks.find((c) => c.name === 'compiler')?.detail ?? '';
+      expect(detail).toMatch(/could not be run/);
+      expect(detail).not.toMatch(/not found on PATH/);
+    });
+
+    it('names the fallback backend as unrunnable, not absent, when that is what breaks it', async () => {
+      // latexmk genuinely absent, tectonic present but EACCES: the resolver's probe of tectonic
+      // rethrows, so the compile throws — and "(nor is tectonic)" would be false.
+      const doctor = new DoctorService({
+        run: runner({ 'git --version': 'git version 2.39.3' }, { tectonic: 'EACCES' }).run,
+        now: NOW,
+        canWrite: () => Promise.resolve(true),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk', compilerExplicit: false });
+
+      expect(result.ok).toBe(false);
+      expect(statusOf(result.checks, 'compiler')).toBe('fail');
+      const detail = result.checks.find((c) => c.name === 'compiler')?.detail ?? '';
+      expect(detail).toMatch(/latexmk not found on PATH/);
+      expect(detail).toMatch(/tectonic is on PATH but could not be run/);
+      expect(detail).not.toMatch(/nor is tectonic|falling back/);
+    });
+  });
+
   it('warns, rather than failing, when a defaulted compiler is missing but the other is there', async () => {
     const doctor = new DoctorService({
       run: runner(tectonicOnly()).run,
@@ -405,6 +519,68 @@ describe('DoctorService', () => {
 
     expect(result.ok).toBe(false);
     expect(statusOf(result.checks, 'git')).toBe('fail');
+  });
+
+  describe('git version floor', () => {
+    async function diagnoseWithGit(banner: string) {
+      const canned = eolTeXLive(home, SYSTEM_TEXMF);
+      canned['git --version'] = banner;
+      const doctor = new DoctorService({
+        run: runner(canned).run,
+        now: NOW,
+        canWrite: rootOwnedSystemTexmf,
+      });
+      return doctor.diagnose({ compiler: 'latexmk' });
+    }
+
+    it('fails a git older than the minimum, naming the minimum and what needs it', async () => {
+      // `git commit --only --pathspec-from-file` is git 2.25; 2.24 rejects the option outright,
+      // so `commit` with scope "all" and `paths` fails there — `ok` must not promise otherwise.
+      const result = await diagnoseWithGit('git version 2.24.3');
+
+      expect(result.ok).toBe(false);
+      expect(statusOf(result.checks, 'git')).toBe('fail');
+      const detail = result.checks.find((c) => c.name === 'git')?.detail ?? '';
+      expect(detail).toContain('git version 2.24.3');
+      expect(detail).toContain(MIN_GIT_VERSION);
+      const hint = result.hints.find((h) => h.includes(MIN_GIT_VERSION)) ?? '';
+      expect(hint).toContain('--pathspec-from-file');
+      expect(hint).toContain('--no-overlay');
+      expect(hint).toContain('discard');
+    });
+
+    it('fails a git from before the 2.x series', async () => {
+      const result = await diagnoseWithGit('git version 1.9.1');
+      expect(statusOf(result.checks, 'git')).toBe('fail');
+    });
+
+    it.each([
+      'git version 2.25.0',
+      'git version 2.46.0',
+      'git version 2.39.3 (Apple Git-146)',
+      'git version 2.45.1.windows.1',
+      'git version 3.0.0',
+    ])('passes %s', async (banner) => {
+      const result = await diagnoseWithGit(banner);
+      expect(statusOf(result.checks, 'git')).toBe('ok');
+      // The banner is shown verbatim, as before.
+      expect(result.checks.find((c) => c.name === 'git')?.detail).toBe(banner);
+      expect(result.hints.some((h) => h.includes(MIN_GIT_VERSION))).toBe(false);
+    });
+
+    it('warns, never passes, when the version cannot be read', async () => {
+      const result = await diagnoseWithGit('some-git-wrapper');
+      expect(statusOf(result.checks, 'git')).toBe('warn');
+      const detail = result.checks.find((c) => c.name === 'git')?.detail ?? '';
+      expect(detail).toContain('some-git-wrapper');
+      expect(detail).toContain(MIN_GIT_VERSION);
+      // A warning, not a failure: the git is there, only its version is unknown.
+      expect(result.ok).toBe(true);
+    });
+
+    it('states the minimum as 2.25', () => {
+      expect(MIN_GIT_VERSION).toBe('2.25');
+    });
   });
 
   it('fails when the workspace root cannot be written to', async () => {
@@ -530,29 +706,67 @@ describe('DoctorService', () => {
       expect(result.hints.join('\n')).not.toContain('@napi-rs/canvas');
     });
 
-    it('warns — with a remedy — when no native canvas backend is installed', async () => {
+    it('warns — with both remedies — when only the native canvas backend is missing', async () => {
       const { run } = runner(eolTeXLive(home, '/usr/local/share/texmf'));
       const doctor = new DoctorService({
         run,
         now: NOW,
         canWrite: rootOwnedSystemTexmf,
         canRasterize: () => Promise.resolve(false),
+        canReadPdf: () => Promise.resolve({ ok: true }),
       });
 
       const result = await doctor.diagnose({ compiler: 'latexmk' });
 
       expect(statusOf(result.checks, 'pdf-render')).toBe('warn');
       const hint = result.hints.join('\n');
+      // The backend now disables rasterizing and nothing else, so render_pages is the one tool
+      // the hint may say is lost...
+      expect(hint).toContain('render_pages');
       expect(hint).toContain('npm i @napi-rs/canvas');
-      // Every tool the missing backend actually disables has to be named, or the hint quietly
-      // rots each time another one joins the set — which is how it came to list `render_pages`
-      // alone while `pdf_geometry` and then `extract_text` had joined it.
-      for (const tool of ['render_pages', 'pdf_geometry', 'extract_text']) {
+      // ...and `npm i` means nothing to a Desktop extension user, whose bundle can never carry a
+      // per-platform binary — that case has to be named, or doctor sends them after a remedy they
+      // cannot apply.
+      expect(hint).toContain('Desktop extension');
+      // What still works is said so, rather than lumped in with what does not — the old hint told
+      // a user extract_text, pdf_geometry and pageCount were gone when they were not.
+      const detail = result.checks.find((c) => c.name === 'pdf-render')?.detail ?? '';
+      for (const tool of ['extract_text', 'pdf_geometry', 'pageCount']) {
+        expect(detail).toContain(tool);
+      }
+      expect(detail).not.toMatch(/no extract_text|no pageCount/);
+    });
+
+    it('diagnoses an unusable pdf.js as a broken install, never as a missing canvas', async () => {
+      // The Desktop extension's 0.7.0 failure: the bundle shipped without pdf.js's Node build, the
+      // rasterize probe failed, and doctor told the user to `npm i @napi-rs/canvas` — a package
+      // that was never the problem, in an environment where npm is not even the install route.
+      const { run } = runner(eolTeXLive(home, '/usr/local/share/texmf'));
+      const doctor = new DoctorService({
+        run,
+        now: NOW,
+        canWrite: rootOwnedSystemTexmf,
+        canRasterize: () => Promise.resolve(false),
+        canReadPdf: () =>
+          Promise.resolve({
+            ok: false,
+            error:
+              "The PDF library (pdfjs-dist) is not usable here. Cause: Cannot find module '/b/node_modules/pdfjs-dist/legacy/build/pdf.mjs'.",
+          }),
+      });
+
+      const result = await doctor.diagnose({ compiler: 'latexmk' });
+
+      const check = result.checks.find((c) => c.name === 'pdf-render');
+      expect(check?.status).toBe('warn');
+      expect(check?.detail).toContain('pdfjs-dist');
+      const hint = result.hints.join('\n');
+      expect(hint).not.toContain('@napi-rs/canvas');
+      expect(hint).toContain('pdf.mjs'); // the actual cause, not a paraphrase of it
+      expect(hint).toMatch(/[Rr]einstall/);
+      for (const tool of ['render_pages', 'extract_text', 'pdf_geometry', 'pageCount']) {
         expect(hint).toContain(tool);
       }
-      // ...and the one capability that survives without it stays called out, since `floats`
-      // reads the .aux rather than the PDF.
-      expect(hint).toContain('floats');
     });
 
     it('never fails the whole toolchain just because rasterization is missing', async () => {

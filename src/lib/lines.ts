@@ -107,3 +107,24 @@ export function lineSpan(text: string, startLine: number, endLine: number): Span
   if (start < 0) return null;
   return { start, end };
 }
+
+/**
+ * Length of the line terminator that STARTS at `index` in `text` — 2 for `\r\n`, 1 for a lone
+ * `\n` or `\r`, 0 when no terminator starts there (including at the end of the text). The same
+ * three shapes `splitLines` splits on, so a caller deleting a line removes the file's own
+ * terminator, never an assumed `\n`.
+ */
+export function terminatorLengthAt(text: string, index: number): number {
+  if (text[index] === '\r') return text[index + 1] === '\n' ? 2 : 1;
+  return text[index] === '\n' ? 1 : 0;
+}
+
+/**
+ * Length of the line terminator that ENDS at `index` (i.e. occupies `[index - n, index)`) —
+ * the mirror of {@link terminatorLengthAt}, for taking the newline *before* a line.
+ */
+export function terminatorLengthBefore(text: string, index: number): number {
+  if (index <= 0) return 0;
+  if (text[index - 1] === '\n') return text[index - 2] === '\r' ? 2 : 1;
+  return text[index - 1] === '\r' ? 1 : 0;
+}

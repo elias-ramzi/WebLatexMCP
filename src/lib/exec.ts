@@ -51,7 +51,8 @@ export async function execCapture(
  * concatenated buffer as UTF-8, which is fine for text (git plumbing output, log lines);
  * this is the primitive to reach for when the output may not be valid UTF-8 at all (a PNG
  * read out of `git show`/`git cat-file`), since decoding *any* prefix of such bytes as text
- * is lossy. stderr is still a string, and the spawn/timeout/reject-only-on-spawn-failure
+ * is lossy. stderr is still a string (collected as bytes and decoded once, as stdout is in
+ * `execCapture`), and the spawn/timeout/reject-only-on-spawn-failure
  * behaviour is identical to `execCapture` — `execCapture` is now defined in terms of this.
  */
 export function execCaptureBytes(
@@ -62,7 +63,7 @@ export function execCaptureBytes(
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, windowsHide: true });
     const stdoutChunks: Buffer[] = [];
-    let stderr = '';
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     const timer = opts.timeoutMs
       ? setTimeout(() => {
@@ -74,8 +75,11 @@ export function execCaptureBytes(
     child.stdout.on('data', (d: Buffer) => {
       stdoutChunks.push(d);
     });
+    // Accumulated as bytes and decoded once at the end, like stdout: decoding each chunk on its
+    // own turns a multi-byte character split across two `data` events into two U+FFFD — and
+    // `PathBeyondSymlinkError` rebuilds a path out of git's stderr.
     child.stderr.on('data', (d: Buffer) => {
-      stderr += d.toString();
+      stderrChunks.push(d);
     });
     child.on('error', (err) => {
       if (timer) clearTimeout(timer);
@@ -83,7 +87,12 @@ export function execCaptureBytes(
     });
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ code, stdout: Buffer.concat(stdoutChunks), stderr, timedOut });
+      resolve({
+        code,
+        stdout: Buffer.concat(stdoutChunks),
+        stderr: Buffer.concat(stderrChunks).toString('utf8'),
+        timedOut,
+      });
     });
 
     if (opts.input !== undefined) {

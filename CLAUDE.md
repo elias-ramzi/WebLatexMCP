@@ -7,9 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An MCP server (stdio transport) that lets an MCP client read, edit, compile, and commit LaTeX
 in a git-hosted project (Overleaf, GitHub, or any git remote) — or compile and edit a plain local
 directory in place. It manages local clones of one or more
-projects, compiles locally with `latexmk`, and pushes changes back to the default branch. See
-[README.md](README.md) for user-facing setup (env vars, Claude Desktop/Code registration, the full tool
-list).
+projects, compiles locally with `latexmk`, and pushes changes back to the default branch.
+[README.md](README.md) is a landing page; the user-facing detail lives in `docs/`: environment
+variables in [docs/configuration.md](docs/configuration.md), the full tool list in
+[docs/tools.md](docs/tools.md), per-client registration in [docs/install/](docs/install/README.md),
+and the multi-session model in [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 
 ## Commands
 
@@ -23,24 +25,28 @@ npm test             # vitest run: unit + integration (TeX-gated smokes auto-ski
 npm run test:smoke   # only test/smoke/** (real latexmk compile; needs TeX installed)
 
 npx vitest run test/unit/logParser.test.ts          # a single file
-npx vitest run -t "refuses to push when behind"     # a single test by name
+npx vitest run -t "refuses to push while a live peer has uncommitted work"   # a single test by name
 ```
 
 The full local gate before considering work done: `typecheck` + `lint` + `format:check` + `test`.
 
 ## Git workflow
 
-**Before committing, always sync with the remote `main` and resolve any merge conflicts first** — so you
+**Before committing, always sync with the remote `dev` and resolve any merge conflicts first** — so you
 never clobber upstream work and conflicts surface early, not at push time:
 
 ```bash
 git fetch origin
-git rebase origin/main        # or: git merge origin/main
+git rebase origin/dev         # or: git merge origin/dev
 # resolve any conflicts, then re-run the full gate
 ```
 
-- The default branch is `main`. Only commit once the working tree is in sync with `origin/main` and all
-  conflicts are resolved.
+- `dev` is the integration branch: work branches off it and pull requests target it. `main` is the
+  release branch, and a guard workflow fails any pull request into it from a branch other than
+  `dev` (`.github/workflows/only-dev-into-main.yml`). Only commit once the working tree is in sync with
+  `origin/dev` and all conflicts are resolved.
+- A pull request into `dev` must change the `[Unreleased]` section of `CHANGELOG.md`; CI checks it
+  (`.github/workflows/changelog.yml`), and the local gate does not.
 - After resolving conflicts, **re-run the gate** (`typecheck` + `lint` + `format:check` + `test`) before
   committing.
 - Commit and push only when the user asks.
@@ -54,7 +60,8 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   (when the workspace is local) excludes the workspace-local clone dir from the host repo's git.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext`: the dependency bag (`projectManager`, `git`, `files`, `compiler`,
-  `references`) passed to every tool handler.
+  `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …) passed to
+  every tool handler.
 - `src/tools/*` — one file per tool: a zod `inputSchema`/`outputSchema` + a handler that calls services.
 - `src/prompts/skills.ts` — registers each bundled skill (`.claude/skills/*/SKILL.md`, loaded by
   `src/lib/skills.ts`) as an MCP prompt, so clients that don't read `.claude/skills` (Claude Desktop,
@@ -66,7 +73,8 @@ formatting; all logic lives in services so it is unit-testable without a live MC
   (search + canonical BibTeX fetch) and `OpenAlexService` (search + `resolveDoi` **only** — it
   publishes no BibTeX, so its records are fetched from Crossref by DOI; see below), each with an
   injectable `fetch` for tests, `SessionRegistry` +
-  `ShadowStore` (parallel sessions — see below), `logParser`, `auth`.
+  `ShadowStore` (parallel sessions — see below), `ShelfStore` (`shelve`/`unshelve`), `ProjectRegistry`
+  (`<workspace>/registry.json`), `logParser`, `auth`.
 
 **Two kinds of project.** `ProjectConfig` is a union (`src/types.ts`): a **git** project (`gitUrl`,
 cloned under the workspace) or a **local** one (`mode: 'local'`, `path` — a directory the user already
@@ -77,18 +85,39 @@ for local ones. Git-backed tools call `ctx.projectManager.requireGitProject(id, 
 refuse a local project — otherwise they would operate on whatever repository happens to contain the
 user's directory. `src/lib/projectMode.ts` holds the narrowing helpers.
 
-Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per project id.
+Project state: clones live under a workspace root (`WEB_LATEX_MCP_WORKSPACE`), one dir per git project
+id (a validated one — see the project-id bullet below), beside `registry.json` and `.sessions/`.
 When unset, the default is workspace-local — `<launch-dir>/.web_latex_mcp` (beside the agent's code;
 git-excluded via the host repo's `.git/info/exclude` — `src/lib/workspaceExclude.ts`) — whenever the
 launch dir is a git repo and not the home dir; otherwise it falls back to `~/.web-latex-mcp/projects`.
 `WEB_LATEX_MCP_WORKSPACE=cwd` forces workspace-local; any other value is a path. The git-repo detection
 (`resolveWorkspace` in `src/config.ts`) is injectable so tests stay hermetic. In workspace-local mode
 `compile` also surfaces the PDF at `<workspace>/<id>.pdf` beside the clone (`src/lib/pdfSurface.ts`) —
-build artifacts otherwise live in a temp dir. `ProjectManager` also supports runtime registration.
+build artifacts otherwise live in a temp dir. That copy is a **convenience for the user, never a
+source for a tool**: it holds whichever root compiled last, so `render_pages`/`extract_text`/
+`pdf_geometry` read `rootFile`'s own build-dir PDF in every mode (`locateRootPdf`,
+`src/lib/pdfLocate.ts`) and fall back to the surfaced copy only when no `rootFile` was named **and**
+no `.aux` is read (`labels`, `floats` are per root). The viewer follows the same rule
+(`locateViewerPdf`, one call for the page shown and the SyncTeX that maps a click): when it shows the
+surfaced fallback, `synctexPdf` is `null` and a comment is kept without a source location rather than
+mapped through another root's build. `ProjectManager` also supports runtime registration.
 
 ## Conventions that aren't obvious
 
 - **stdout is the JSON-RPC channel.** Never `console.log` from server code — log to **stderr** only.
+  That includes a worker thread: its `process.stdout` is piped into the parent's by default, so
+  `search_files`' worker is created with `stdout: true, stderr: true` and forwards both to
+  `process.stderr` (`src/lib/searchWorker.ts`).
+- **A value the user or a document supplied is quoted and escaped before it reaches a message.**
+  `JSON.stringify` escapes only C0, so a bidi override, a zero-width space or a newline in an id, an
+  env value or a path went through and could forge a log line. Ids go through `quoteId`/`listIds`
+  (`src/lib/projectId.ts`; `escapeInvisibleChars` writes control, bidi and invisible characters as
+  `\u{…}`, and every valid id displays verbatim), and rejected env values through `quoteEnvValue`
+  (`src/config.ts`, the same escaping, cut at 120 characters with the true length):
+  `WEB_LATEX_MCP_COMPILER`, `_VIEWER_TARGET`, `_VIEWER_PORT`, `_WRITING_GUIDE_EXTRA`,
+  `_REFERENCE_SOURCE`, `_REWRITE_MODE`, `_CONTACT_EMAIL`. The session recorder's stderr warnings quote
+  their file path the same way. A new message naming a caller- or config-supplied string uses one of
+  these, never a bare template literal.
 - **Tool return shape.** `CallToolResult` has an index signature that named types/consts don't satisfy,
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch
@@ -111,14 +140,51 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   form, since an explicitly-`undefined` key survives `InMemoryTransport` but not JSON and is not a
   hole.
 - **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`revert`/`project_sync`/
-  `reset_to_remote`, and `read_file` with a `ref`, all guard with `requireGitProject`. The confirmation
+  `reset_to_remote`/`shelve`/`unshelve`/`list_shelves`, and `read_file` with a `ref`, all guard with
+  `requireGitProject`. The confirmation
   diff in `write_file`/`edit_file`/`add_citation` goes through `changeDiff` (`src/lib/changeDiff.ts`),
   which returns `''` for a local project rather than diffing the user's own repo. The shadow/session
   recorder in `context.ts` skips them too (no HEAD of ours to three-way merge against). Compiled PDFs
   are surfaced into the workspace, never beside the user's source — keep it that way: in-place means
   read and edit in place, not litter in place.
-- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/revert/project_sync/add_citation)
-  must run inside `ctx.projectManager.runExclusive(id, ...)` to serialize per project. Read-only tools don't —
+- **A project id is a directory name, so it is validated as one** (`projectIdProblem`,
+  `src/lib/projectId.ts`, applied by `ProjectManager.registerProject`, `readProjectRegistry` and
+  `loadConfig`). An id becomes `<workspace>/<id>` and `.sessions/<id>/`, and `path.join` resolves
+  `..`, so `../../somewhere` cloned outside the workspace (and a local `../paper` put the lock inside
+  project `paper`'s clone, where `scope: "all"` staged it). The rule refuses **only what is unsafe as
+  one directory entry**, because every refusal strands an existing config — Unicode letters, spaces
+  and punctuation stay fine (`thèse`, `My Thesis`, `論文`): a separator or a Windows-forbidden
+  character (`: < > " | ? *`; `<`/`>` also because the id is embedded in the viewer's `<script>`), a
+  backtick (skill prompts put the id in a code span), a control, bidi-override or unpaired-surrogate
+  character, an invisible one (`\p{Cf}` or default-ignorable — except a ZWNJ/ZWJ between two
+  letters-or-marks of a script that spells with it, `isJoinerInWord`), a line or paragraph separator,
+  a space other than U+0020, a leading combining mark (so two ids can never look the same), text that
+  is not NFC (the NFC form is named, **never substituted**: macOS hands back NFD and Linux keeps bytes,
+  so normalising would make one key name two directories on two machines), a leading `.` or `-`,
+  leading or trailing whitespace, a trailing `.` (Windows drops it: `paper.` _is_ `paper`), a `~`
+  followed by a digit anywhere (an 8.3 short name such as `PAPER-~1` resolves to another directory),
+  `__proto__`/`constructor`/`prototype` (ids key plain objects in `registry.json`), more than 64
+  characters or **246 UTF-8 bytes** (255 minus the `-<8 hex>` of the `<id>-<hash>` build directory,
+  the longest name built from an id), and — compared under `projectIdFold`, a deliberately generous
+  full case fold (`regiſtry.json`) — a Windows device name with or without an extension,
+  `registry.json` or a name beginning `registry.json.`, and a `*.pdf` name (the surfaced PDF sits
+  beside the clones). A **new** id whose fold equals a known id's is refused too
+  (`assertIdUnaliased`), as is a second id for a directory another project already uses
+  (`assertDirUnclaimed`); an update of a known id never is. **An existing invalid id is skipped,
+  never fatal**: env and registry entries are judged one by one, a skipped one is remembered
+  (`ServerConfig.skippedProjects`, `ProjectRegistryStore.skipped`), and a call naming it — including
+  one that omits `project` while `WEB_LATEX_MCP_DEFAULT_PROJECT` names it, which no longer stops the
+  server starting — is told why and how to rename it (`describeSkippedProject`: the key, and both
+  `<workspace>/<old id>` and `.sessions/<old id>/`) instead of "Unknown project". `childPathInside`
+  refuses a non-single-segment name at every join (`projectPath`, `sessionStateDir`, `sessionDir`),
+  as defence in depth. **The registry is judged per entry too** (`src/services/projectRegistry.ts`):
+  one bad entry no longer reads the whole file as `{}` for the next upsert to destroy; an entry this
+  version cannot use is written back verbatim; an empty `registry.json` is an empty registry; and an
+  unparseable or unreadable one is **refused rather than overwritten** by `upsert`.
+- **Mutating tools** (write/edit/delete/add_asset/commit/push/discard/revert/reset_to_remote/
+  project_sync/add_citation/shelve/unshelve/set_rewrite_mode, `register_project`'s cloning branch, and
+  `compile`, which rewrites the build dir) must run inside `ctx.projectManager.runExclusive(id, ...)`
+  to serialize per project. Read-only tools don't (`search_files` and `list_shelves` included) —
   with three deliberate exceptions, `render_pages`, `pdf_geometry` and `extract_text`, which read
   the **temp build dir**
   a peer session's `compile` can rewrite underneath them. That is the whole test for the exception:
@@ -129,19 +195,79 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   The lock file lives outside the clone (`src/lib/sessionPaths.ts`), so `project_sync` takes it before a
   first clone too. The peer-refusal logic `push` and `project_sync` share (`guardPeerWork`,
   `enrichPullRefusal`) lives in `src/lib/peerRefusal.ts`, not in the tools.
-  `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`), because
-  sibling agent sessions are separate server processes over the same clone.
+  `runExclusive` is two layers: an in-process mutex **and** a lock file (`src/lib/fileLock.ts`,
+  `<workspace>/.sessions/<id>/project.lock`), because sibling agent sessions are separate server
+  processes over the same clone; it calls `assertValidProjectId` before either, since the lock
+  `mkdir`s its directory before anything else looks at the id. A persisting `ShadowStore.refresh`
+  may only be called under it (below).
+- **The lock file admits one holder only because nobody deletes a record they have not re-read
+  and own the right to remove.** Reclaiming a stale lock used to delete whatever sat at the path by
+  then — a faster waiter's fresh lock included, two holders in about half of trials with a crashed
+  holder and three waiters. So every record carries a random `token` (its identity; a legacy
+  token-less record is identified by a hash of its bytes), and **every removal, release or reclaim,
+  first takes a removal marker** `<lock>.rm-<identity>.<gen>` (created exclusively; only its creator
+  removes it; a dead marker is stepped past to `gen + 1`), then re-reads the record and removes it
+  only if it is still the same one, by **rename-then-verify** (`removeRecord`: rename aside to
+  `<lock>.gone-<pid>-<token>`, re-read the aside, and on a mismatch put it back with `link`, never a
+  rename that could overwrite a new lock). A release removes only its own record (`stillOurs`).
+  Crash litter (`.rm-*`, `.gone-*`) is harmless and deliberately not cleaned up. Whether a holder
+  is abandoned (`isAbandoned`) is decided in a fixed order: a record written by **this thread** —
+  same `processNonce`, pid and `worker_threads.threadId` — is live exactly while `heldTokens` holds
+  its token (added _before_ the file is created, so a peer call cannot judge a fresh record
+  abandoned); same pid under another nonce is a crashed predecessor restarted as the same pid (a
+  container's pid 1) or a twin in another namespace, judged by heartbeat alone against
+  `OWN_PID_STALE_MS` (15 s); a dead pid is abandoned; a live pid vouched for this boot is abandoned
+  only once the **same record, unchanged, has been seen stale twice at least `STALE_CONFIRM_MS`
+  (10 s) apart** on a monotonic clock (`staleAcrossSightings`) — a laptop waking from sleep has every
+  lock's mtime old before the holder's overdue heartbeat (`HEARTBEAT_MS`, 5 s) lands, so one look at
+  the age stole live locks. `processNonce` exists because pid + threadId repeat across pid
+  namespaces: two containers on one volume both run node as pid 1, thread 0. **The limit is stated,
+  not solved: one host, one pid namespace** — liveness is `process.kill(pid, 0)` on the local process
+  table — and every server sharing a workspace must run this version, since a 0.6.x server still
+  deletes a lock it judges stale unconditionally. `LockTimeoutError` (30 s) names the holder and ends
+  with the remedy: if no other server is running, the lock was left by a crash — delete the named
+  file and retry. On Windows a contended rename is retried (`renameWithRetry`), and atomic writes
+  (`writeAtomic`, `src/services/sessionRegistry.ts`) use a per-process counter in the temp name, since
+  two in-flight writes in one process used to share one temp file and the second rename hit ENOENT.
 - **Parallel sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names this process
-  (`config.sessionId`). `ShadowStore` (`src/services/shadowStore.ts`) keeps, per touched file, a shadow
+  (`config.sessionId`, sanitised by `parseSessionId` in `src/config.ts`; `shelves`, `project.lock` and
+  `rewrite-mode.json` are refused in any case, because each already names project-wide state beside
+  the session directories — a session called `shelves` wrote its records into the shelf store; a new
+  project-level entry under `.sessions/<id>/` must be added to `RESERVED_SESSION_IDS` by hand).
+  `ShadowStore` (`src/services/shadowStore.ts`) keeps, per touched file, a shadow
   holding `HEAD + only this session's edits`; `commit` stages that via `GitService.commitContents`
   (`read-tree --reset HEAD` + `hash-object` + `update-index`, never `git add`), so a peer's in-flight
   edits stay uncommitted in the working tree. The shadow is fed by `FileService.setMutationRecorder`
   (wired in `context.ts`) with the working-tree content **either side** of each write — it folds in the
   _change_, three-way merged, never the file the model happened to read, or peers' lines would leak in.
   After HEAD moves, `shadows.refresh(id, dir)` carries shadows forward (lazily, per session); tools that
-  rewrite the whole tree (`discard`, `reset_to_remote`) call `shadows.clearAll(id)` instead. A same-line
+  rewrite the whole tree (`discard`, `reset_to_remote`) call `shadows.clearAll(id)` instead, and the
+  path-limited ones (`discard` with `paths`, `revert`, `shelve`, `unshelve`) call `settleAll`.
+  **`refresh` is a read-modify-write of the index and runs only under `runExclusive`**: `status`, the
+  one lock-free reader, goes through `refreshedChanges`, which shares `judge()`/`judgeEntry()` with
+  `refresh` (so the two cannot disagree) and **persists nothing** — no index, shadow, base or memo;
+  `status`'s only write is its own heartbeat in `session.json`. It used to refresh without the lock,
+  which could overwrite a concurrent write's record or resurrect entries a peer's `discard` had just
+  settled. Within one process every index read-modify-write (`record`, `markUnrecorded`, `refresh`,
+  `refreshedChanges`, `settle`, `settleAll`, `clear`, `clearAll`) is also chained through
+  `withIndexLock`, a **module-level** map keyed by session directory, because two `ShadowStore`
+  instances in one process write each other's indexes through `settleAll`. `refresh` also **settles
+  an entry whose shadow equals an unmoved HEAD** (raw bytes; deleted ⇔ absent at HEAD): an edit undone
+  by hand or a file created then deleted through the tools otherwise stayed tracked forever, every
+  session commit found nothing, and a peer's `scope: "paths"` refused the path. Entry maps are
+  **null-prototype** (`entryMap()`; `readIndexAt` copies key by key): on a plain `{}` a file named
+  `constructor` read back an inherited function, and one named `__proto__` read back
+  `Object.prototype`, which `record` then stamped. A same-line
   collision flags the entry `conflicted` and it **stays** flagged — never clear it on a later edit, since
-  its base is stale and committing it would revert what landed. Shadows are stored as **bytes**, and an
+  its base is stale and committing it would revert what landed. The store enforces that with
+  **`incomplete`**, always paired with `conflicted`: it is set on a record-time collision (text
+  `merge3` or a binary `before` that does not match the shadow) and on any byte-changing write to an
+  entry that is already conflicted — the cases where the shadow is missing a write this session
+  made — and `judgeEntry` skips an `unrecorded` or `incomplete` entry before anything else, so no
+  refresh advances, settles or re-judges it; `refresh` had been clearing such a flag, after which a
+  peer's `scope: "paths"` took the file. `isFlagged` (`conflicted || unrecorded || incomplete`) is what
+  `changes()` and `peerEntries()` report as `conflicted`. A conflict found by `refresh` itself (not
+  `incomplete`) may still clear when HEAD moves. Shadows are stored as **bytes**, and an
   entry that has ever carried non-text bytes (`add_asset`, `writeBytes`) is flagged `binary` — stickily
   — and is **never three-way merged**: there is no such thing as a merged PNG, so a peer changing the
   same bytes is a `conflicted` entry, not a merge. `commit scope: "paths"` is the one deliberate
@@ -164,9 +290,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `coversPath`), whether or not git staged each one — deliberately, since an entry whose working tree
   already equals HEAD stages nothing yet must still un-wedge — and when git reports nothing to stage
   at all for an `"all"`/`"paths"` request that covers a tracked entry (the content is already at HEAD:
-  a `push` with `message` committed it, or a hand revert), `commit` settles those entries and returns
-  `committed: false` with them under `settled`, rather than refusing and leaving the only way out an
-  empty commit or a discard; a request covering nothing this session tracks still refuses as before.
+  a `push` with `message` committed it, or a hand revert made outside the server), `commit` settles
+  those entries and returns `committed: false` with them under `settled`, rather than refusing and
+  leaving the only way out an empty commit or a discard; a request covering nothing this session
+  tracks still refuses as before. Since the opening `refresh` now settles an entry whose shadow equals
+  an unmoved HEAD, that rescue (`settleNothingToCommit`) only ever sees what refresh cannot settle —
+  unrecorded, incomplete or conflicted entries, content equal only through the clean filter, a hand
+  revert the shadow never saw — and naming an already-settled path under `scope: "paths"` refuses
+  (`Nothing to commit at: …`).
   **A session commit skips what git ignores** (`GitService.ignoredPaths`, run once per commit):
   `commitContents` stages by `update-index`, which never consults `.gitignore`/`.git/info/exclude`,
   so the `summarize-paper` note that relies on the exclude was committed and pushed by the default
@@ -185,7 +316,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   used to get the file reported ignored, and the session's edit dropped, while the reset put it
   straight back); against the live index for `scope: "all"` with `paths`, whose `git add` runs over
   the index as it stands. Keep the two paired, or the filter passes a path `git add` then refuses
-  with its raw "Use -f" hint. When `core.ignorecase` is set, every by-name lookup against HEAD or
+  with its raw "Use -f" hint. That `scope: "all"` + `paths` commit then takes **only what its paths
+  cover**: it lists the staged names (`diff --cached --no-renames --name-only -z`), keeps those
+  `coversPath` covers, and commits them with
+  `git commit --only --pathspec-from-file=- --pathspec-file-nul` (stdin, NUL-joined) — anything else already staged stays staged and out of the
+  commit, where it used to ride along. That flag is why **the server needs git ≥ 2.25**
+  (`MIN_GIT_VERSION` in `src/services/doctor.ts`: older is a `fail`, unreadable a `warn`). When `core.ignorecase` is set, every by-name lookup against HEAD or
   the index folds ASCII case the way `git add` does — a literal pathspec and `git show ref:path`
   never do — with the exact spelling winning when both exist: the ignore filter (both bases),
   `readAtRef`/`readAtRefBytes` (the shadow's base) and `showAtRef` (`read_file` with a `ref`), and
@@ -212,21 +348,55 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `shadow/Notes.txt` — a second entry silently overwrote the first's shadow with HEAD's bytes and
   the commit found nothing staged (macOS CI). `commitContents` still refuses, before any index
   write, an index that spells one file two ways (a legacy one), rather than let the second
-  `update-index --cacheinfo` win silently. `GitService.commit` with
+  `update-index --cacheinfo` win silently — its remedy is a `scope: "paths"` commit naming the file,
+  never a discard of either spelling. **Every per-file refusal in `commitContents` runs before the
+  first index write**: it builds a `plan[]` (index mode, the still-a-link `lstat` check, the
+  `100644` typechange) for every file, then applies `update-index` in a second loop, because refusing
+  mid-loop left earlier files staged and a later `scope: "all"` committed the index as it stood. `GitService.commit` with
   `paths` resolves each one to the index's spelling too, since a literal pathspec never folds. The flag is never cleared on an edit, and
-  `refresh` never advances or settles an `unrecorded` entry (its shadow is known-incomplete); only a
-  deliberate take or a discard ends that state. A conflicted entry's shadow and base are frozen, so
+  `refresh` never advances or settles an `unrecorded` or `incomplete` entry (its shadow is
+  known-incomplete); only a deliberate take (`settle`/`clear`) or a `settleAll`/`clearAll` (discard,
+  revert, shelve) ends that state. A conflicted entry's shadow and base are frozen, so
   its `refresh` verdict depends only on HEAD and the clean filter: `refresh` resolves HEAD's commit once per call
   (`GitService.headSha`, wired as the store's `HeadShaReader`) and **skips a conflicted entry whose
   `conflictHead` is that commit** — otherwise every `status`/`commit`/`push` re-merged and re-hashed
-  (two `git hash-object` spawns) each permanently conflicted asset, forever. The memo never clears a
-  flag; a HEAD move re-evaluates in full, and an entry without the field (older index, or a
-  `record`-time collision) is evaluated once and then memoised. A `.gitattributes` edit that has not
+  (two `git hash-object` spawns) each permanently conflicted asset, forever. **Only the persisting,
+  locked `refresh` writes the memo** (on its three flagging branches: a side deleted, binary, a
+  `merge3` conflict); `refreshedChanges` computes the same verdict and stamps nothing, and `record`
+  only ever deletes it. The memo never clears a flag; a HEAD move re-evaluates in full, and an entry
+  without the field (an older index) is evaluated once and then memoised. A `record`-time collision
+  never gets one: it is `incomplete`, which is skipped before the memo is consulted. A `.gitattributes` edit that has not
   reached HEAD can leave a memo stale, and that is accepted: a stale memo can only keep a flag,
   never clear one.
+- **`commit` with no `scope` never widens to the whole tree while a live peer shares the clone.**
+  `resolveCommitScope` (`src/lib/commitScope.ts`) decides the default: this session tracks a change →
+  `"session"`; it tracks none and no peer is live → `"all"` (unchanged when alone); it tracks none and
+  **any** live peer exists → refuse, naming the peers and both explicit routes (`scope: "all"`,
+  `scope: "paths"`). "Any live peer", not "a peer that owns something": an unreadable or empty index
+  is not evidence of nothing. The fallback used to be unconditional, so a peer's in-flight lines were
+  swept into a commit nobody asked to widen — and after an ignored-only refusal left the session
+  tracking nothing, an identical retry widened. **The default is decided from `trackedAtStart`**,
+  read with `hasChanges` _before_ the opening `refresh`: that refresh can settle the session's last
+  entry (an edit undone by hand, content a HEAD move absorbed), and deciding afterwards turned "your
+  changes are already at HEAD" into `git add -A` over edits nobody offered. So a session that tracked
+  something and has nothing left gets
+  `Nothing to commit: this session's changes are already at HEAD`, which deliberately does not suggest `"all"`. `commit`'s `files` and `leftUncommitted` are
+  budgeted (`src/lib/commitBudget.ts`, `filesOmitted`/`leftUncommittedOmitted`) — a few thousand
+  untracked files made the result undeliverable _after_ the commit had landed — while `filesChanged`
+  and the headline's `+added -removed` still total every file committed. A `./`-prefixed path names
+  the same entry under every scope.
+- **A file both this session and a live peer edited is the peer's too.** `disputedPaths`
+  (`src/lib/peerRefusal.ts`, shared by `guardPeerWork` and `enrichPullRefusal`) marks a dirty path
+  disputed when this session does not own it, **or** when it does and a live peer's shadow also lists
+  it, **or** when it does and any live peer's index is unreadable (`sharedUnconfirmed`). The guard
+  used to subtract this session's own paths first, so a shared file counted as ours and a `push` with
+  `message` (`git add -A`) committed and pushed the peer's lines in it. `dirty` includes untracked
+  files, so a `message` push over an untracked file both sessions list refuses too; the advice
+  (`sharedAdvice`) is to land this session's lines with a session-scoped `commit`, then push without
+  `message`.
 - **`revert` settles the reverted paths in every session, then records them as this session's.**
-  A revert lands changes in the working tree that no session authored, so it is the one write whose
-  ownership has to be decided rather than observed. It is **not** `clearAll`: a revert is inherently
+  A revert lands changes in the working tree that no session authored, so it is a write whose
+  ownership has to be decided rather than observed (`unshelve` is the other — see its bullet). It is **not** `clearAll`: a revert is inherently
   path-limited (it touches only what the reverted commits touch), and dropping a peer's record for a
   file nothing happened to is exactly what lets a later `commit scope: "paths"` take that peer's
   lines — the same reasoning that makes path-limited `discard` a `settleAll` rather than a
@@ -241,11 +411,41 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   to provide — so `revert` also `record`s each touched path into **this** session's shadow, the
   session that asked for the revert. The recorded `before` is HEAD's bytes, and that is exact rather
   than convenient: the dirty-path preflight refuses the whole call unless the working tree already
-  equals HEAD for every touched path, so HEAD's bytes _are_ the pre-revert content. Baselines are
+  equals HEAD for every touched path, so HEAD's bytes _are_ the pre-revert content. "Equals HEAD"
+  includes **absent**: `git revert` silently overwrites an ignored file at a path it restores (a note
+  kept out of git through `.git/info/exclude` was replaced by old committed bytes), and `status`
+  never lists one, so `dirtyAmong` (`GitService`) judges every touched path HEAD does not track on
+  disk with `lstat`, ancestors included and any other error read as dirty, and reports what it adds
+  beyond `status` as `inTheWay` — the refusal says to move the file by hand, since `discard` never
+  removes an ignored file. Refusal path lists are capped at 20. Both sides go into the shadow through
+  **`asShadowContent`** (`src/lib/shadowContent.ts`, shared with `unshelve`): bytes are text only when
+  NUL-free **and** they survive a UTF-8 round trip, otherwise the Buffer is kept (a sticky `binary`,
+  never-merged entry) — decoding any NUL-free file as UTF-8 put U+FFFD into the next session commit
+  where a Latin-1 file had `é`. Baselines are
   reset the way `discard` resets them (`ctx.files.resetBaselines(dir)`), or the next `edit_file` on a
   reverted path would throw `ExternalChangeError` for a change the server itself made; that call is
   dir-wide, so it also drops the out-of-band-edit claim for files the revert never touched — an
   accepted over-reset, not an oversight, since `FileService` has no per-path variant.
+- **`shelve`/`unshelve` never lose work to an error they cannot see.** A shelf
+  (`<workspace>/.sessions/<id>/shelves/<shelfId>/`, `ShelfStore`) is written in full — manifest last —
+  **before** the tree is touched, so when clearing the tree fails `shelve` names the shelf and how to
+  restore it instead of implying the work is gone. On the way back, `ShelfEntry.sides()` reads both
+  sides of a file once and refuses a shelf that contradicts its own manifest (`ShelfCorruptError`,
+  nothing written, shelf left as it is), and **only ENOENT means absent**: every read error used to
+  be taken for "the shelf recorded a deletion", so an unreadable shelf deleted the user's file,
+  reported success and then removed the shelf. All sides, current bytes and HEAD's bytes are read,
+  and every merge is run, before the first write; the writes go through `writeWithRollback`
+  (`src/lib/shelfRestore.ts`), which rolls back per path and reports any path it could not restore.
+  **When HEAD moved under a shelved text file** and the tree is clean there, `planUnshelveFile` merges
+  the shelved change onto HEAD's new content with the shadows' `merge3` (reported under `merged`); it
+  still refuses, shelf intact, when the changes touch the same lines, the file is not text, or one
+  side added or deleted it. Its refusal payload is budgeted by `capUnshelveConflict`
+  (`src/lib/shelf.ts`, on `conflictBudget.ts`'s constants) with **`theirs` — the shelved content, the
+  one side no tool can read back — charged first and cut last**, and exempt from the per-side cap.
+  Ownership is decided as for `revert`: `settleAll` across every session, then `record` into this
+  one through `asShadowContent`, with the shelf's base as `before` for a restore and HEAD's bytes for
+  a merge (`resolveUnshelveFile` says why). A failed `record` there is only logged, not
+  `markUnrecorded` as `revert` does — a known gap, not a pattern to copy.
 - **`status` collapses a dead, change-free peer into a count — a report change, never a deletion.**
   A session record is removed only on a clean shutdown (`SessionRegistry.release()`), so a killed
   agent process leaves its record behind forever and `activeSessions` grew without bound with peers
@@ -288,7 +488,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   One accepted cost: a session killed between its working-tree write and `record()` leaves dirty
   lines with no shadow entry, and now collapses into a bare count instead of surfacing as a named
   suspect for them. The lines stay in `otherChanges` and no guard changes — `commit`/`push` consult
-  `livePeers()` — so this is diagnostic loss only.
+  `livePeers()` — so this is diagnostic loss only. **A malformed peer record is repaired on read,
+  never dropped** (`SessionRegistry.readRecord`): the session directory, not the record, is the
+  authority for its name (a record claiming `../x`, or another session's id, made `status`, `commit`
+  and `push` throw for every session), a missing `startedAt` falls back to the heartbeat, and only a
+  record with no usable `pid` or `heartbeatAt` is unreadable — dropping more would make a live peer
+  invisible to `livePeers()` and its lines unprotected, which is the fail-open direction.
 - **Which bibliography answers a lookup is one decision, and it lives in `ReferenceResolver`.**
   `search_references`/`add_citation` go through `ctx.references`, never a concrete backend.
   Selection is the `CompilerResolver` rule — **an assertion, never an inference**: an unset
@@ -324,23 +529,53 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   record with no DOI is _refused_, never assembled from metadata, because an entry composed from
   fields is exactly the model-authored text `add_citation` exists to keep out. For the same
   reason a fetched entry is cut to its own bytes and no further: `bibtexEntrySpan` finds the
-  leading run of line-anchored entries and `fetchBibtex` returns that slice, so neither a proxy
-  banner in front nor a `<script>` behind reaches a bibliography — while a body whose braces
-  never balance **fails open** — the span runs to the end of the text, so nothing after the
-  entry is cut — because a truncated entry is worse than an untidy one. Choosing a cut point in the service's bytes is allowed; inserting, reordering,
+  leading run of line-anchored entries (bridging `%` lines and `@string`/`@preamble`/`@comment`
+  blocks only when another entry follows) and `fetchBibtex` returns that slice, so a proxy banner in
+  front never reaches a bibliography, and junk behind reaches it only when the cut cannot be
+  believed. A closer is believed at depth 0 in one of two shapes: **alone on its line** (DBLP), or —
+  because Crossref sends a whole entry on one line, where no closer ever stands alone, so the cut
+  used to find no end and appended a trailing `<script>` to the `.bib` — **ending the header's own line** with only
+  whitespace after it **and no unmatched closer of the entry's pair anywhere after the cut**.
+  Everything else **fails open** — the span runs to the end of the text, so nothing after the entry
+  is cut — because a truncated entry is worse than an untidy one: braces that never balance, a
+  closer reached inside the other delimiter pair, and the documented residual, one-line junk that
+  itself carries an unmatched closer (`<script>}</script>`), which comes back whole, junk included.
+  Choosing a cut point in the service's bytes is allowed; inserting, reordering,
   reformatting or completing them is not, and that is the whole line. Record keys are
   namespaced (`dblp:conf/cvpr/HeZRS16`, `crossref:10.1109/CVPR.2016.90`, `openalex:W2194775991`)
   and parsed in one pure module, `src/lib/referenceKey.ts`, whose validation is a **security
   boundary** rather than a convenience: every id it returns is interpolated into a request URL
   path, so it never returns a partially-validated value, and a key the server _emits_ must
-  re-parse to the same record. `WEB_LATEX_MCP_CONTACT_EMAIL` (Crossref's and OpenAlex's polite
+  re-parse to the same record. **A key is never rewritten into a different record**:
+  `normalizeDblpKey` strips once and then refuses what still carries a `rec/` prefix or a
+  `.bib`/`.html`/`.xml` suffix, because `DblpService.fetchBibtex` normalises again and
+  `dblp:rec/rec/conf/x/y` parsed to one id and fetched another — the function must be idempotent on
+  everything it accepts; `search` drops a hit whose key would not round-trip (`keyRoundTrips`).
+  `WEB_LATEX_MCP_CONTACT_EMAIL` (Crossref's and OpenAlex's polite
   pool) is opt-in only — never derived from `git config user.email` — and `server_info` reports
-  only _whether_ one is set, never the address.
+  only _whether_ one is set, never the address. It must be printable ASCII without `(`, `)`, `;`,
+  `\`, `&`, `?`, `#` or `/`, at most 254 characters, one `@` (`isUsableContactEmail`): a non-ASCII
+  address cannot ride in a header, so every Crossref/OpenAlex request failed before any I/O while
+  `server_info` called it configured. A rejected value is ignored, noted on stderr (the only place the
+  address ever appears) and reported as the boolean `contactEmailInvalid`.
+- **Nothing keyed by a document- or user-supplied name may be a plain object.** File paths, BibTeX
+  entry types, remote hosts and project ids all turned up as `constructor`, `toString` or
+  `__proto__`, and a `{}` answered with `Object.prototype`'s members: a session's edit to a file named
+  `constructor` was recorded into nothing and left out of the default commit, one named `__proto__`
+  wrote the shadow bookkeeping onto `Object.prototype` itself, `@constructor` crashed
+  `list_references`/`check_citations` (`REQUIRED_FIELDS[entry.type]`), and a remote host named
+  `constructor` could be handed the value of an environment variable literally named `undefined`.
+  Use a null-prototype object (`Object.create(null)`: `entryMap`, `parseFields`/`emptyFieldMap`,
+  `nullProtoRecord`, the `kept` map in `referenceFieldsBudget.ts`) or a `Map`, and look a name up with
+  `Object.hasOwn` (`hostDefaults` in `src/services/auth.ts`). The on-disk JSON stays a plain object;
+  only the in-memory reader changes. `test/unit/protoKeyedMaps.test.ts`,
+  `test/unit/shadowStoreProtoKeys.test.ts` and `test/integration/protoNamedFiles.test.ts` pin it.
 
 - **A bibliography is not always a `.bib`.** `src/lib/references.ts` parses references out of three
   shapes — BibTeX (`@string` macros resolved), a LaTeX `thebibliography` of `\bibitem`s, and a prose
   reference list in a markdown/plain-text document — behind one `ReferenceEntry`. Every entry carries its
-  `format` and its verbatim `raw`, because only `bibtex` fields are exact; the prose extractor
+  `format` and its `raw` (a `bibtex` raw is an exact byte slice; a `bibitem` or prose raw is the
+  item's text trimmed), because only `bibtex` fields are exact; the prose extractor
   deliberately under-claims (a `title` only when the text delimits it, authors only before a
   parenthesized year) so a wrong guess never sends a bibliography lookup after the wrong paper. `list_references`
   and `check_citations` are the tools over it, and `src/lib/referenceSources.ts` decides which files to
@@ -366,13 +601,24 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
 
   `list_references` deliberately gets **no** equivalent: it already reads whichever project `project`
   names, and a cross-project listing is two calls with nothing to join. Only `check_citations` joins two
-  sets, so only it needs to name two projects.
+  sets, so only it needs to name two projects. Its own `documents` and `bibliographySources` lists are
+  capped at 20 paths and 2000 rendered characters each (`CITATIONS_MAX_FILES`,
+  `CITATIONS_FILES_BUDGET` in `src/lib/citationsBudget.ts`; `documentsOmitted`/
+  `bibliographySourcesOmitted`), and `maxResults` does not raise them — a local project of 1500
+  markdown notes returned ~84 KB of paths. The keyless-bibliography refusal caps its file list at 20
+  names (by count only).
 
 - **`.bib` files are guarded.** `write_file`/`edit_file`/`delete_file` reject a `.bib` target
-  (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. The sanctioned write path
+  (`isBibFile`, `src/lib/bib.ts`) unless `confirmBibEdit: true` — keep this. `isBibFile` also judges
+  the name Windows would open — the final component cut at its first `:`, trailing `.` and spaces
+  stripped — because `refs.bib.`, `refs.bib ` and `refs.bib::$DATA` all open `refs.bib` there and
+  passed as non-`.bib` names; it applies on every platform, since the extra matches on POSIX are the
+  fail-safe direction. The sanctioned write path
   is `add_citation`, which re-fetches BibTeX from the issuing bibliography service server-side so entry
   text never originates from the model. The guard lives in the tool layer, so `add_citation` writing via `FileService` is intentionally
-  not blocked. It judges the **link-resolved** name too (`FileService.linkTarget` — symlinks only: a hard
+  not blocked — but `add_citation` judges the link-resolved name in the **other** direction: a
+  `.bib`-named link to a file that is not one (a committed `refs.bib -> main.tex`) is refused, or the
+  entry lands in `main.tex`. The guard judges the **link-resolved** name too (`FileService.linkTarget` — symlinks only: a hard
   link is invisible to `realpath`, and git cannot commit one): an in-project
   `figures/x.png -> refs.bib` passes the escape check (it stays inside) and used to let `write_file`,
   `edit_file` and `add_asset` change the bibliography with no confirmation. `linkTarget` decides
@@ -396,8 +642,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   **every future startup**, so one unguarded call would persist model-authored text into every later
   session's system prompt. The check is `!== true` in the tool layer (an optional boolean, not a
   schema-level `z.literal(true)`), mirroring `confirmBibEdit`'s shape exactly; `appendWritingConvention`
-  itself stays unchanged and keeps writing only to `ctx.config.extraWritingGuidePath`, never a
-  caller-named path.
+  keeps writing only to `ctx.config.extraWritingGuidePath`, never a caller-named path. Because the
+  rule lands in Markdown that becomes a system prompt, it must not be able to forge structure: it is
+  split on every CommonMark line ending (`COMMONMARK_LINE_ENDING`, a lone CR included —
+  `rule\r# Heading` added a heading), and a leading `#`, `>`, fence (` ``` `/`~~~`) or setext `---`/`===`
+  underline is backslash-escaped (`escapeLeadingBlockMarker`); `countWritingConventions` splits the
+  same way.
 - **`add_asset` is the one _read_ from outside every project sandbox, and it is gated on both ends.**
   `sourcePath` names a file on the machine running the server, by design outside every sandbox, so
   `resolveInside` cannot apply; what makes the read accountable is the asset-extension allowlist
@@ -407,7 +657,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   implementation gated only the destination and was an arbitrary-file-read primitive
   (`sourcePath: "/etc/passwd"` → `figures/innocent.png`, echoed back by the confirmation diff), which is
   why `add_asset` deliberately returns **no diff** and why every syscall outcome on the source collapses
-  to found / not-found / unresolvable with no errno text. Widen `ASSET_EXT` only for a genuine figure
+  to found / not-found / not-a-regular-file / unresolvable with no errno text (`sourceSyscallError`).
+  **What was checked is what is read**: the realpath'd file is opened once (`O_NOFOLLOW` and
+  `O_NONBLOCK` where the platform has them), checked with `fstat`, and read through that handle up to
+  `MAX_ASSET_BYTES` (refused if it grows past the cap mid-read) — resolving, checking and then reading
+  by name let a swap in between substitute another file. `O_NOFOLLOW` covers the final component
+  only; an intermediate directory swapped after the `realpath` is not claimed. A Windows UNC or
+  device path (`\\…`, and `//…` on win32) is refused **before any syscall**
+  (`isUncOrDevicePath`), because merely resolving one connects this machine to that server. Widen `ASSET_EXT` only for a genuine figure
   format — it is a security gate, not a convenience — and keep the source-side check: the destination
   check alone constrains nothing about what is read. The destination is judged on its link-resolved name as well
   (`linkTarget`, above): a link named `figures/x.png` whose target is not an asset type is refused.
@@ -450,14 +707,27 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   identical/not-found/non-unique guards, with the actual match position and file content in hand
   (`src/lib/rewriteMode.ts`'s `createPreserveTransform`). That placement is load-bearing, not
   incidental: an edit with `oldString === newString` never reaches the hook at all (`applyEdits`
-  rejects it first as a no-op), so there is no risk of the hook turning it into `old` vs.
+  rejects it first as a no-op — a range edit at resolution, against the file as the call found it), so there is no risk of the hook turning it into `old` vs.
   `"% " + old + old` — a wrapping pass running _before_ that guard would silently disarm it. Two
   more restrictions on when preservation actually fires, both easy to miss because they read as
-  "preserve every edit" from the mode name alone: **only a line-aligned match is ever preserved**
-  — `oldString` must start at the beginning of a line and end at the end of one (in the file's
-  current content, or by ending with its own trailing newline), because a mid-line match has no
+  "preserve every edit" from the mode name alone: **only a line-aligned string match is ever
+  preserved** — `oldString` must start at the beginning of a line and end at the end of one (or end
+  with its own terminator: `\n`, `\r\n` or a bare `\r`; a trailing `\r` with `\n` next is half a
+  CRLF, not a terminator), because a mid-line match has no
   safe place to put a `%`-comment without swallowing or reflowing text that was never part of
-  `oldString`; and **a `replaceAll` edit is never preserved**, since there is no single match
+  `oldString`. Alignment, the separator, the split-CRLF test and whether a consumed terminator is put
+  back after the replacement are all **judged in the file as the call found it** (`judgedAt` in
+  `src/lib/rewriteMode.ts`, over the `MatchOrigin` that `applyEdits` maps back through its splice
+  log, used only when the original bytes at that origin are exactly `oldString`), so an earlier edit in
+  the same call cannot change what a later one writes — and line start and line end must **also**
+  hold in the current content, since an earlier edit that took a terminator left live text beside
+  the match, which a preserved deletion would comment out. A range edit is exempt from alignment
+  (whole lines by construction): its block comments out every line the range named, a blank one
+  included (`commentOut(…, { wholeLines: true })`), while a blank-line range _deletion_ skips the
+  hook and is deleted outright. `commentOut` splits on `\r\n`, `\n` and `\r` and keeps each line's own
+  terminator, so a CR-only file stays CR-only, and the separator after a block
+  (`resolveSeparatorLineEnding`) prefers the byte actually at the block's end, so a stray CR in an
+  LF file is not turned into CRLF; and **a `replaceAll` edit is never preserved**, since there is no single match
   position to comment above — `applyEdits` skips the hook entirely for one, and the hook itself
   checks `edit.replaceAll` again regardless, so neither call site can be the reason this guard
   goes quiet. As with `parseCompilerChoice`, the mode is resolved in exactly one function —
@@ -475,9 +745,37 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   runs no hook but still changes length, at every occurrence, and stale ranges fail in both directions:
   they miss a real hit (the original bug, back in full) and refuse edits that only touch live text. Keep
   the ledger in `applyEdits`, which is the only code that sees every splice offset; `FileService` stays on
-  pure integer offsets and learns nothing about `%`. The two halves — the hook and its ranges — are one
+  pure integer offsets and learns nothing about `%` (it does reason about `\r`/`\n` terminators, below).
+  The two halves — the hook and its ranges — are one
   option for that reason: passing a hook without its ranges silently restored the bug, so the type must
-  not permit it.
+  not permit it. Each ledger entry is a `PreservedBlock` (`start`, `end`, the edit that made it, the
+  last edit that touched it, `rewrittenTo`, `pairedNl`), and `splice` — the only place content
+  changes — shifts it along with the pending ranges, the cut points, the restored terminators and the
+  splice log. **At the end of the call `assertBlocksStillComments` refuses the whole call, writing
+  nothing**, when a later edit pulled live text onto a `%` line (`P` preserved, then `\nQ` → ` tail`
+  gave `% P tail`, which LaTeX silently drops) or when a block's own bare-`\r` terminator now meets a
+  `\n` it was not designed to pair with, which would swallow a blank line. Before that, `unfuse`
+  visits each range-deletion cut point, last to first, and turns a bare `\r` left directly before a
+  blank LF line into `\n`, so the two never read as one CRLF — but only bytes the file had before the
+  call, or terminators the hook reports putting back through `lastRestoredTerminator`. That third
+  member of `EditTransform` is **optional** in the type: a hook without it silently disables `unfuse`
+  for the terminators it restores.
+- **`edit_file` is order-independent within a call, and refuses a file it cannot round-trip.**
+  Ranges are resolved up front against the file as the call found it (`pendingRanges`: span, the
+  terminator after it, the one before it), and **whether a range edit is a no-op is judged there**,
+  never at apply time — deleting an unterminated last line and the line before it was refused as
+  "identical" in one of the two orders. An empty `newString` on a range **deletes the lines outright,
+  terminator included** (for an unterminated last line, the terminator before it — unless that one
+  sits inside a block preserved earlier in the call), instead of leaving a blank line, which in LaTeX
+  is a `\par`; and a range **always owns** the terminator after its `endLine`, so a string edit that
+  touches it is refused as an overlap. A range's `prev` terminator is invalidated when a splice
+  touches it and re-measured, with a following range inheriting a deleted range's `prevAtStart` —
+  in a mixed bare-CR/LF file an earlier deletion can leave a bare `\r` beside `\n`. **`applyEdits` and
+  `add_citation` refuse a file that is not valid UTF-8** (`decodeUtf8Exact`, `src/lib/utf8.ts`:
+  decoded text must re-encode to the same bytes; `FileService.readTextExact` for `add_citation`,
+  uncapped and baseline-free): both rewrite the whole file, and a lossy decode turned every invalid
+  byte of a Latin-1 file — not just the edited text — into U+FFFD. `write_file` is deliberately not
+  held to it; it is the documented way to replace such a file.
 - **`applyEdits` splices by index; it must never go back to `String.prototype.replace`.** A string
   _replacement_ argument is not literal — `replace` expands `$$`, `$&`, `` $` ``, `$'` and `$1` inside
   it — and LaTeX is full of literal `$`, so `content.replace(oldString, newString)` corrupts any
@@ -489,7 +787,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `split`/`join`, which hides the per-occurrence offsets the preserved-range ledger has to be shifted by
   — see the bullet above). Reverting either to
   `replace` reads as a harmless simplification and is not one — a test pins it, with `$`-patterns in
-  both `oldString` and `newString`. The same rule binds test helpers that stand in for `applyEdits`:
+  `newString` (`test/unit/editFile.test.ts`; `oldString` is matched with `indexOf`, where `$` was
+  never special). The same rule binds test helpers that stand in for `applyEdits`:
   one that used `replace` made the whole unit layer structurally unable to catch this regression.
 - **Out-of-band edits are guarded, and only the caller's reads arm the guard.** `FileService` holds a
   `FileRevisionTracker` (`src/services/fileRevisions.ts`) that hashes a file's bytes as the baseline for
@@ -500,15 +799,22 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   **`read`/`readText` record a baseline only when passed `recordBaseline: true`, and the default is
   false.** Recording is a claim that _the caller could now base a write on this file_, so record only
   when the caller asked for that file and got all of it: `read_file`, and `list_references` — the
-  latter only for a bibliography it returned WHOLE (#171), since its entries can be paged by
-  `maxResults` or cut by a budget. Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
+  latter only for a bibliography whose **bytes** it returned whole (#171; `wholeSources`,
+  `src/lib/referenceBaseline.ts`): every entry `bibtex`, none cut or dropped (by `maxResults`, a
+  filter or a budget), and their `raw`s, in order, covering the file apart from ASCII whitespace. A
+  `thebibliography`, a prose list, or a `.bib` with `@string`/`@comment` blocks or `%` comments holds
+  text no entry carries, and claiming it let a later `write_file` overwrite a hand edit there without
+  `ExternalChangeError`; a whitespace-only hand edit between entries is the accepted gap. Not "the bytes reached the caller" — a snippet's bytes do, and recording one is the bug this
   PR fixed. So: `detectRootFile` sniffing every `.tex` for `\documentclass` does not record (`compile`
   and the viewer's PDF poller both go through it); the five lines `compile`/`list_comments` fetch around
   a location the _log_ chose do not; `check_citations` does not, since it returns cite keys and line
   numbers and no content, and it scans _every_ document in the project. `add_citation` does not either:
   its read sits before the already-present early return, and a path that writes nothing must claim
   nothing — its write passes `overrideExternalChanges` instead, since what it writes is the bytes it just
-  read plus one entry and so cannot lose a hand edit. Wrong in the safe direction costs one refusal the
+  read plus one entry and so cannot lose a hand edit. That holds only because the read and the write
+  share one lock: `add_citation` fetches the entry **outside** `runExclusive` (an `openalex:` key costs
+  a DOI lookup plus a Crossref fetch, as long as a peer's whole lock wait), then resolves the `.bib`
+  again, reads and writes it under the lock — never read outside and write inside. Wrong in the safe direction costs one refusal the
   caller can override; the other way silently destroys a user's hand edits, which is what the guard
   exists to prevent.
   **Two refinements keep the rule enforceable rather than merely stated.** A **ranged** read claims
@@ -522,8 +828,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   the _kind_ of read that is eligible, never "record unconditionally". And
   `FileService.recordBaseline(projectDir, relPath, content, { strictLinks? })` records for bytes the
   caller **already holds** (#182), for the case `list_references` has: whether a file went over the wire
-  whole is decided by the budgets, which run after every candidate has been read, so the claim cannot be
-  made at read time. It closes a window as well as saving a read — re-reading absorbed a hand edit that
+  whole is decided by the budgets and `wholeSources`, which run after every candidate has been read,
+  so the claim cannot be made at read time. It closes a window as well as saving a read — re-reading absorbed a hand edit that
   landed between the two reads as the baseline, so the guard never fired for it. Its `strictLinks`
   defaults to **false**, like every read and unlike a server-initiative read: the seam records what a
   read just returned, so its link guard must agree with that read's, or it would refuse exactly the
@@ -537,12 +843,16 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
   **A link out is followed only where the project's owner said so** (`setLinkPolicy`, injected in
   `context.ts` from `ProjectManager.followsUserLinks`): `mode: 'local'` **plus** an explicit
-  `followSymlinks: true`. It is an assertion, never an inference — who ran `git clone` says nothing
+  `followSymlinks: true` — from **every** id that resolves to that directory, failing closed
+  (registration refuses a second id for a directory another project uses, so a shared one arises
+  only from a hand-edited registry or env). It is an assertion, never an inference — who ran `git clone` says nothing
   about who placed a link, a directory registered in place is usually a working tree with a remote, and
   a pull can bring in a mode-120000 entry at any time. The layout it exists for is a shared `refs.bib`
   or `figs/` linked into each paper, so `walk` follows linked entries under the same flag (cycle-guarded
   by realpath): `list` skipping what `read` follows made the same project both follow and not follow its
-  own links. A path the server picked up rather than the caller naming it passes `strictLinks: true` and
+  own links. The walk's **starting point** is judged too (`guardLinks` on `subdir`, for `list_files` and
+  `search_files`): it guarded the entries under `subdir` but not `subdir` itself, so a link to the
+  home directory passed as `subdir` listed it. A path the server picked up rather than the caller naming it passes `strictLinks: true` and
   is refused either way — every method takes the flag, so this stays honourable for a future
   server-initiative read _or_ write. And the guard does not stop at the read: a path the **document**
   named (a compile log, a synctex record) that leaves the project is not handed back as openable either
@@ -576,8 +886,14 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   neither `WEB_LATEX_MCP_COMPILER` nor the backend on their PATH that would have worked. What licenses
   a substitution is **`config.compilerExplicit`, not availability**: an unset `WEB_LATEX_MCP_COMPILER`
   leaves `latexmk` a _default_, so a missing one may be swapped for whatever is installed — reported
-  in the result's `hint`, never silently. Set — to anything, `latexmk` included — it is an
-  _assertion_, and a missing backend is an error; a per-call `compiler` argument is always an
+  in the result's `hint`, never silently. **Missing means ENOENT and nothing else**: a backend on PATH
+  that cannot run (EACCES, a broken shim) throws `UnrunnableCompilerError` from `probeOnPath`, which
+  `select` lets propagate — it is never substituted, default or not, and the message names the
+  backend, says no substitute was tried and why, and gives both ways to choose another (it used to
+  surface as a bare `spawn latexmk EACCES`). An unrunnable _other_ backend is collected into
+  `MissingCompilerError.unrunnable`, so when the needed backend is missing the message leads with it
+  and names the unrunnable one after, never offering it as a retry. With `WEB_LATEX_MCP_COMPILER` set — to anything, `latexmk`
+  included — the backend is an _assertion_, and a missing backend is an error; a per-call `compiler` argument is always an
   assertion. Same shape as `followSymlinks`: an assertion, never an inference. Derive both answers
   from one place (`parseCompilerChoice` in `src/config.ts`), or a whitespace-only env value makes
   `compiler` a default while `compilerExplicit` calls it a choice. Every refusal names what _is_
@@ -586,8 +902,11 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   behaviour change rather than an error: the fallback must not quietly undo the snippet guarantee the
   next bullet exists to make. `compile` returns the backend that actually ran as `compiler`;
   `server_info` reports only the _configured_ one and says so. **`doctor` grades the backend-dependent
-  checks — `engines` and `package-manager` — against the _effective_ backend, not the configured
-  one, and only when that backend is actually installed.** A substitutable missing backend is `warn`, not
+  checks — `engines`, `distribution` (the TeX age warning) and `package-manager`, plus the TEXMF
+  section's `tlmgr --usermode` hint — against the _effective_ backend, not the configured
+  one, and only when that backend is actually installed** (`tectonicRuns`). An unrunnable configured
+  backend is a `fail` ("compile will not fall back"), naming the other backend only if it is found;
+  so is a missing one whose alternative is unrunnable. A substitutable missing backend is `warn`, not
   `fail` — `ok` means "nothing the server needs is missing", and under a working fallback nothing
   is. But `ok` is `every(status !== 'fail')`, so any _other_ check that fails silently overrides
   that grade: a tectonic machine has no engine and no `tlmgr` on PATH, and reporting either as a
@@ -622,21 +941,26 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `Overfull \hbox` ships **twice** — structured into `warnings[]`, and again raw in `logTail`, since
   `KEEP_PATTERNS` keeps box lines and `logTail` is returned on every compile — so a filter narrowing
   only `warnings[]` would leave every excluded line sitting in the tail: half the feature, reading as
-  though it worked. `filterLog` takes a `keepWarning` predicate for exactly this, and `compile`
-  builds **one** `judgeWarning` and hands it to both `shownWarnings.filter` and `keepWarning`, so the
+  though it worked. `fitFilteredLog` takes a `keepWarning` predicate for exactly this (`filterLog` is
+  that function with `maxChars: Infinity`), and `compile` builds **one** `judgeWarning` and hands it to
+  both `shownWarnings.filter` and, through `planDiagnosticsPayload`'s `fitLogTail`, `keepWarning`, so the
   channels cannot disagree. That predicate applies `withoutUnopenableLocation` to its own candidate
   **first**: `logTail`'s side derives `file` from the log's paren stack, which knows nothing about a
   withheld path, so judging it directly let a `file` filter naming a withheld path empty
   `warnings[]` while leaving that warning in the tail. Matching is exact and literal — no globs, no
   prefixes, no case folding — for the same reason `--literal-pathspecs` is everywhere here: a typo
   must fail conspicuously. An **empty** array constrains nothing rather than matching nothing.
-  Inside `filterLog`, `ALWAYS_KEEP_PATTERNS` is checked **before** `isWarningLine`/`warningRuleOf`,
+  Inside `fitFilteredLog`, `ALWAYS_KEEP_PATTERNS` is checked **before** `isWarningLine`/`warningRuleOf`,
   because a line can be both: the `Label(s) may have changed. Rerun to get cross-references right.`
   hint matches a warning pattern _and_ the rerun-hint pattern, and the hint must win. It holds
   `FILE_LINE_ERROR` too, mirroring `parseLog`'s branch order — `parseLog` tests it first and
   `continue`s, so a `-file-line-error` line is an error whatever its message says, and without it a
   `./main.tex:12: Package foo Warning: …` was an error to one partition and a filterable warning to
-  the other. Keep the two partitions aligned: a new `KEEP_PATTERNS` entry that is neither
+  the other. An error _phrase_ is pinned only where it starts an error-shaped line
+  (`BARE_ERROR_LINE`: `LaTeX|Package <x>|Class <x> Error:` at line start, and never on a line
+  `PACKAGE_WARNING` matches — the lookahead is built from that regex's own source so the two cannot
+  drift): an unanchored `/Error:/` pinned `Package foo Warning: Error: …` in the tail while
+  `excludeRule: ["foo"]` dropped it from `warnings[]`. Keep the two partitions aligned: a new `KEEP_PATTERNS` entry that is neither
   always-kept nor a warning line is a bug in waiting. **This is `logTail`-only, deliberately**: a
   rerun hint is still a structured warning, so `excludeRule: ['LaTeX']` still drops it from
   `warnings[]` and counts it in `warningsOmitted` — protected in the tail, filterable in the list.
@@ -648,35 +972,138 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   everything"; keep them on separate branches. And **with `keepWarning` absent the output stays
   byte-identical and the paren-stack bookkeeping does not run at all** — not merely harmlessly —
   since this runs on every compile of every session; a differential test over generated logs pins
-  it, in the strong form that a filter accepting everything is a no-op.
+  it, in the strong form that a filter accepting everything is a no-op. **The tail is also bounded in
+  characters**, since its 80 lines are un-wrapped logical lines and one `\PackageWarning` could carry
+  hundreds of kilobytes: every tail line is cut at `LOG_TAIL_LINE_CAP` (500) with a marker — even at
+  `maxChars: Infinity` — and `diagnosticsBudget.ts` charges the tail against the 20000-character
+  diagnostics budget: errors first, then the tail and `warnings[]` (overlapping lanes) each guaranteed
+  half of what is left, the tail dropping its earliest lines first and always keeping its last,
+  cut further if need be but never below `LOG_TAIL_LAST_LINE_FLOOR` (80). The one error always kept
+  has its `message` cut to fit too (`fitFirstError`, floor 500), never its `file`, `line` or `snippet`.
+  So a warning-heavy build lists fewer warnings, still counted in `warningsOmittedByCap`.
+  `rawLog: true` is neither cut nor charged.
 
+- **Reading a PDF needs pdf.js; only rasterizing needs the canvas backend — keep those apart.**
+  The Desktop extension's `.mcpbignore` once dropped pdf.js's Node build (`legacy/build/`, which the
+  server imports as `PDFJS_SPECIFIER`) on the claim that nothing imported pdf.js in Node, and every PDF
+  tool failed with `Cannot find module` while `doctor` blamed the canvas; `test/unit/mcpbignore.test.ts`
+  pins what ships. pdf.js needs a `DOMMatrix` global merely to be imported, so when the native backend
+  (`@napi-rs/canvas`, a per-platform binary the one-for-every-platform `.mcpb` cannot carry) does not
+  load, `installDomMatrixStub` installs an inert class and everything but rasterizing works. The canvas
+  probe (`createCanvasProbe`, which resolves the backend **from pdf.js's own location**) does not
+  memoise a transient load failure (`TRANSIENT_LOAD_CODES`: EMFILE, ENOMEM, …, found by walking the
+  `cause` chain), but once the stub is installed it pins "unavailable" for the life of the process,
+  because pdf.js built its module-scope matrices over the stub. `render_pages` refuses inside
+  `render()` before opening anything, and checks pdf.js loads **before** blaming the backend
+  (`pdfjsUnavailableError` vs `nativeCanvasError`: the extension case, the npm install, restart the
+  server) — a broken pdf.js otherwise read as "no canvas". `doctor`'s `pdf-render` asks both
+  questions apart (`canReadPdf`, `canRasterize`), `warn` either way. **Every PDF tool reads the
+  requested root's own build**: see `locateRootPdf`/`locateViewerPdf` under Architecture — the
+  surfaced `<workspace>/<id>.pdf` holds whichever root compiled last, so a label resolved from one
+  root's `.aux` rendered the other root's page. `compile`'s viewer hint says which build the viewer
+  shows (`viewerShowsForCompile`: this build, only the surfaced copy, or another root), comparing
+  build-PDF **paths** through `samePath`, whose case fold is by platform (win32, darwin) — a
+  filesystem path, not a git name, so `core.ignorecase` is not the authority here. A clipped or
+  re-scaled render is named `page-<n>-<hash>.png` (`pngName`: 12 hex of SHA-256 over the exact clip
+  and `dpi`/`maxEdgePx`), because the rounded, scale-free name let two requests overwrite each other
+  in the shared build dir and an earlier `pngPath` named the later image.
+- **A `labels` lookup is believed only on evidence from the page itself.** Without `/PageLabels`
+  (`src/lib/labelPages.ts`), the printed page from the `.aux` was used as the page index on the
+  argument that nothing renumbered — but a `report` title page or `\setcounter{page}` shifts every
+  page while each printed number stays plausible, and the wrong page came back with a note calling it
+  correct. Now the printed page is only a **candidate**, accepted when that PDF page's own folio
+  (`readFolios`) reads exactly it: a bare number on the last line, else a whole-line foot form
+  (`FOOT_FORMS`: `Page N`, `N of M`, `Page N of M`, `N/M`, a number between equal dashes), which then
+  **wins over the running head** — else the head, where two different readings are
+  `ambiguousFolio`. The folio must be **corroborated** by a neighbour reading its own adjacent
+  number (`uncorroboratedFolio`), because a fancyhdr `Page \thepage` foot, an eso-pic mark or a `[b]`
+  table ending in a bare number made a section number or a table cell read as the folio; a one-page
+  PDF is the exception, its only page being the only place a label can be. A label's own number is
+  never consulted (an `article`'s single digits turn up on nearly every page). Whole documents are
+  refused on this route when their arabic numbering **restarts** — a printed page that goes down in
+  `.aux` order (`restarted`, every label, main paper included, since a supplement's folios confirm
+  the main paper's pages as readily as its own) — or when the last PDF page reads a decimal page
+  number other than the page count (`lastPageMismatch`: a restart, or a last page showing another
+  number). A label **defined twice** is refused on either route (`multiplyDefined`), not resolved to
+  its first record, which is not even the one LaTeX prints. **A beamer deck's tree is never used**: beamer labels each
+  page with its frame number, which every overlay slide repeats, so a deck (recognised by
+  line-anchored `\@writefile{nav}` records) always takes the folio route, where a footline printing
+  `\insertpagenumber` resolves it. Do not reinstate "an identity tree whose length is
+  `\beamer@documentpages`": `pgfpages` defeats it — `2 on 1` puts two slides on a sheet, and
+  `resize to` (one slide per sheet) defers each shipout a page, so every `\label` records the next
+  slide while the tree and the slide count match the PDF exactly (a release candidate shipped that
+  rule and rendered the next slide for every label). The same shift fooled the folio route when
+  the footline prints `\insertpagenumber` (each sheet shows its true slide), so a deck's label is refused first
+  (`slideMismatch`) when its `\newlabel` page disagrees with beamer's own line-anchored
+  `\@writefile{snm}{\beamer@slide {<label>}{<slide>}}` record (`AuxFloatsResult.beamerSlides`):
+  `\newlabel` expands `\thepage` at shipout, beamer's record `\the\c@page` when the `\label` runs,
+  so only a moved shipout separates them. Refuse on ANY disagreeing record, never accept on one — a
+  forged record can then only add a refusal; an `allowframebreaks` label whose page was right is
+  refused too, the accepted cost. A label with no record keeps the folio route. The record's key is
+  matched with one level of braces (`SLIDE_FIELD`, as `readBraceGroup` reads a `\newlabel` key), so
+  `fig:{a}` is checked rather than silently skipped.
+  **Every label of a build that loaded `pgfpages` is refused first, on either route and in any
+  class** (`pgfpagesLayout`): a `\pgfpagesuselayout` holds each page back a shipout, and the
+  `/PageLabels` tree and the printed folios move with the `\newlabel` pages, so neither route can
+  see the shift — an `article` under `resize to` rendered the next figure for every label, with or
+  without `hyperref`. The evidence (`readPgfpagesEvidence`, `AuxFloatsResult.pgfpages`) is the
+  build's `.fls` or `.log` naming `pgfpages.sty` or `pgfmorepages.sty` (a drop-in that holds pages
+  back the same way without loading `pgfpages.sty`), read from the start only, `O_NOFOLLOW`,
+  regular files only. It is tri-state and the three values must stay apart: `true` refuses;
+  `false` means a record was read and names neither package; `undefined` means neither was
+  readable, and nothing is checked (a documented gap, #194). The `.log` is read even when a `.fls`
+  exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
+  document-controlled, which is acceptable only because `true` can only ADD a refusal — never let
+  this evidence resolve a page. "Loaded" is wider than "layout in use" (the `.fls` even records a
+  file merely opened by `\IfFileExists`); that over-refusal is accepted, since a layout-specific
+  log line can be hidden by redefining `\wlog`, which errs the unsafe way. `slideMismatch` is
+  therefore the fallback for a deck whose records were unreadable, and its advice turns on
+  `pgfpages === false`. `pdf_geometry kinds: ["floats"]` does not refuse — the index is data the
+  caller asked for, and its keys and numbers are true — but flags `floatsPagesShifted: true` with a
+  note in both channels.
+  **Labels in `\include`d chapters** are found by following
+  line-anchored `\@input` lines (`findBuildDirAux`): each name is looked up component by component
+  in a `readdir` listing of the build dir, **never used as a path** (no symlinks, no `..`; re-checked at
+  read with `lstat`/`realpath`), bounded in count (256), depth (8) and bytes; one differing from a
+  listed entry only in case is **not read** and is reported as `caseMismatch` with the fix, and every
+  unread input is named in `note` (`unreadInputs`). The documented residuals — two adjacent forgeries
+  that each read as their own page, a number standing where the folio is looked for above an empty
+  foot, a restart whose last page shows no number — stay listed in the module header; load `hyperref`
+  (it writes `/PageLabels`) or pass `pages:` for an exact lookup.
 - **Every document-controlled payload is budgeted, and the budget is charged against the RENDERED
-  size in every channel it ships in.** Thirteen libs now solve the same problem —
+  size in every channel it ships in.** Sixteen `src/lib/*Budget.ts` libs now solve the same problem —
   `conflictBudget.ts`, `floatsBudget.ts`, `searchBudget.ts`, `inlineBudget.ts`,
   `referenceFieldsBudget.ts`, `referenceRawBudget.ts`, `citationsBudget.ts`, `diffBudget.ts`,
   `fileListBudget.ts`, `commentsBudget.ts`, `diagnosticsBudget.ts`, `referenceTypedBudget.ts`,
-  `statusBudget.ts` — and
+  `statusBudget.ts`, `commitBudget.ts`, `extractTextBudget.ts`, `geometryBudget.ts` (plus
+  `capUnshelveConflict` in `shelf.ts`, on `conflictBudget.ts`'s constants) — and
   they exist because of #68: a ~67k-character conflict payload a client rejected **undelivered**,
   which is worse than a cut one because the caller gets nothing and no reason. The rules they share
   are not stylistic:
   - **Charge what is rendered, not what is held.** The marker boilerplate, the JSON punctuation,
     the per-file headers and the elision text all cost bytes, and a payload that ships in both the
     text channel and `structuredContent` costs roughly twice its own length — `diff` did exactly
-    that. A budget that counts the content once is wrong by 2x. The strongest form is to put the
-    render template beside the cost function and have the cost function **call** it, so the two
-    cannot drift (`diffBudget.ts`); where the template has to live elsewhere, pin the constant with
+    that. A budget that counts the content once is wrong by 2x, and so is one that charges the
+    _larger_ of the two channels — the caller receives their **sum** (`conflictBudget.ts` did this
+    until its fourth round; `search_files` reached twice its budget the same way). The strongest form
+    is to put the render template beside the cost function and have the cost function **call** it, so
+    the two cannot drift (`diffBudget.ts`, `searchBudget.ts`'s `matchRenderCost`, `commitBudget.ts`,
+    `extractTextBudget.ts`); where the template has to live elsewhere, pin the constant with
     a test that renders a known input and bounds it from **both** sides, or it can be padded into
     meaninglessness.
   - **Render the text channel from the already-cut payload**, never from the full one, or the
     channel that was supposed to be trimmed reintroduces the payload the budget exists to prevent —
-    half the feature, reading as though it worked. `searchFiles.ts` states this; `compile`'s
-    `warningsFilter` is the same rule for `logTail` and `warnings[]`.
+    half the feature, reading as though it worked. `src/tools/searchFiles.ts` states this, and
+    `extract_text` and `commit` follow it; `compile`'s `warningsFilter` is the same rule for `logTail`
+    and `warnings[]`.
   - **Cut by declared priority, not in declaration order.** A single pool spent top-to-bottom cuts
     the finding that breaks the build because the advisory list ran first. Write the order down
     (`ALLOCATION_ORDER`, `hunks` before the sides) and say why each rank earns its place.
   - **Where the lanes OVERLAP, strict priority is the wrong reading of that rule** — guarantee every
     lane a share first, then spend the surplus in priority order (`statusBudget.ts`,
-    `commentsBudget.ts`). The distinction is whether one cause can populate several lanes at once. In
+    `commentsBudget.ts`; `extractTextBudget.ts` — an equal share per page, the surplus in page order;
+    `geometryBudget.ts` — water-filling across page × kind, crumbs in `ALLOCATION_ORDER`; and
+    `diagnosticsBudget.ts`'s tail/warnings pair). The distinction is whether one cause can populate several lanes at once. In
     `status` it can: an untracked tree of 400 files lands in `untracked`, `otherChanges` AND
     `externalChanges` (an untracked file has no baseline, so `externalModifications` reports every
     one), so a single pool spent top-to-bottom gave lane 1 the whole budget and left the rest at the
@@ -684,7 +1111,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
     merely inverted. A lane wanting less than its share releases the surplus upward, so the ordinary
     case — one big list, the rest small — still gives the big list nearly the whole budget; pin that
     with a test, or the guarantee quietly becomes an equal split nobody wanted. Where the lanes are
-    genuinely disjoint (`fileListBudget.ts`, `diffBudget.ts`), strict priority stays right.
+    genuinely disjoint (`fileListBudget.ts`, `diffBudget.ts`, `commitBudget.ts`), strict priority
+    stays right.
   - **Count what was cut, never cut silently**, in the house shape (`…Omitted`, `omittedByCap`), and
     keep "cut" structurally unconfusable from "absent" — a `null` that means elided carries a
     matching `elided` entry, and `diff: ''` still means only that there is no diff.
@@ -700,16 +1128,108 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
     `outputSchema`** — see the tool-return-shape bullet. Adding a budget is the change most likely
     to make a tool uncallable.
 
+- **`search_files` is bounded by a thread it can kill, not by the regex analyzer.** A regex `exec`
+  cannot be interrupted, and the deadline was checked between files only, so one slow line held the
+  server's only thread. A regex search now runs on **one worker thread per call**
+  (`RegexScanWorker`, `src/lib/searchWorker.ts`), started on the first file actually scanned and
+  **terminated at the deadline** (`SEARCH_TIME_BUDGET_MS`), mid-`exec` if need be; its source is an
+  inline string run with `eval: true` so it resolves the same in `dist/`, the `.mcpb`, tsx and vitest
+  (the cost: that code is not type-checked or linted), and it only returns each line's first match
+  index — splitting, the scan cap, comments and the window stay on the main thread. A worker that
+  errors or exits during a scan rejects: an error, never a partial answer presented as one. Progress
+  under-claims (`WORKER_PROGRESS_MS`), and a cut file is counted in `filesPartiallySearched` and named
+  in `note` with the line reached. A literal search never starts a worker; it checks the deadline
+  **before every line** (`firstHits`' `expired`), since an escaped literal scans linearly. The
+  analyzer (`assertLinearishRegex`, `src/lib/searchPattern.ts`) runs on every pattern, literals
+  included — one path in, no trusted mode, and `MAX_PATTERN_CHARS` (500) applies to the raw pattern in
+  both modes — and refuses a pattern whose **estimated** backtracking per line passes a fixed budget:
+  rule 1, no group repeated without bound, and no repeated group that can match more than one way (a
+  counted repeat of one, `(fig|tab){2}`, included; a backreference is never rigid); rule 2, no piece entered more than
+  `MAX_AMBIGUITY_PRODUCT` times per starting position; rule 3, weighted steps within `MAX_CHAIN_WORK`
+  scaled by how many places the pattern can start (`^` or leading written-out text narrows it) — with
+  **arrivals** charging a nullable piece once per stop of every open choice point before it
+  (`Piece.entry`), `loopHeavy` pricing a quantified capturing or nullable group's steps in full, and a
+  **convergence floor** multiplying everything after a place where runs of a _bounded_ choice point
+  converge; rule 4, the product of counted bounds. **Brackets must not earn acceptance**: the
+  floor carries into and out of groups, and a group that closes a bounded choice point before it
+  closes it there as the written-out spelling does — only when every alternative closes it and the
+  group cannot be skipped (`closedWithin`), settling the bounded runs that re-entered it
+  (`closesFirst`), since `absorbs` alone answers "some alternative" and survives a `?`. Inside a
+  group body the enclosing sequence holds part of that record, so there it stays open and
+  over-counts (`(?:\s?(\s*\\cite))(.*\\cite)` stays refused). A parity test compares bracketed and
+  written-out counts; a bracketed form accepted where its written-out form is refused is a finding.
+  Credits lower a choice point's factor only where
+  the text proves the runs are kept apart: a written-out run's period, a **bridge** repeat that can
+  match neither side of it, a **fence** letter the repeat cannot match, and an optional piece the next
+  character decides (**optional-disjoint**). A lookbehind is judged reversed (V8 runs it right to
+  left), Annex B escapes (`\01`, `\c` in a class) and — under `caseInsensitive` — case-fold partners
+  (`caseFoldSample`) are judged by what they actually match, and `$` earns no trailing credit because
+  a line can hold U+2028, which `.` does not match. A refusal names the constructs (with positions
+  when two are written alike) and suggests a rewrite (`dropAdvice`: drop a leading or trailing `.*`
+  — or, inside a lookaround, bound it, since dropping it would change what the lookaround asserts), with `regex: false` always the way out. **The estimate is not the
+  bound — the worker's deadline is**: the slowest accepted patterns known reach about 3x the reference cost,
+  and convergence from an _unbounded_ repeat is deliberately not floored. `ANALYZED_LINE_CHARS` (in
+  `searchPattern.ts`, deliberately not an import) must equal `MAX_LINE_SCAN_CHARS`
+  (`searchMatch.ts`) — a test asserts it — because the analyzer's range for an unbounded repeat _is_
+  the line cap: raise the cap without the model and every accepted pattern's worst case grows with
+  the square of the difference. `excludeComments` judges a hit by where the **match starts** (so a
+  leading `.*` starts every hit at column 0), and a file with no `%` comment syntax is named in
+  `note` instead of passing silently. The payload budget (`searchBudget.ts`) is charged on both
+  channels.
 - **Git auth is per-host and never persisted.** `CredentialResolver` (`src/services/auth.ts`) resolves a
   project's token by remote host (per-project `tokenEnv`/`username` override → host-default env → generic
   → `gh auth token` → `git credential fill`, cross-platform). Its subprocess runner is injectable for tests. Tools resolve it
-  (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into `GitService.clone/syncPull/push` per
-  call — `GitService` holds no credential. It's injected in-memory and `clone` resets origin to the
-  tokenless URL; never write credentials into `.git/config`. `index.ts` sets `GIT_TERMINAL_PROMPT=0` so
+  (`ctx.credentials.resolve(cfg)`) and pass the `AuthConfig` into `GitService` per call (`clone`,
+  `syncPull`, `safePush`/`resolvePush`/`landBranch`, `resetToRemote`) — `GitService` holds no
+  credential. **A token never touches `.git/config` or a command line**: every remote operation runs
+  through `runRemoteGit`, which spawns git directly via `execCapture` (not simple-git), with the token
+  and username only in the child's environment (`WEB_LATEX_MCP_GIT_TOKEN`/`_USERNAME`), read by an
+  inline `!` credential helper (sh-form, so it runs on Git for Windows too, and it holds only variable
+  names). `gitCredentialConfig` passes it as a process-scoped global `-c` keyed to the remote's own
+  scheme and host — `credential.<scheme>://<host>.helper`, first **empty** (git's "reset the helper
+  list", for that scheme and host only), then the inline helper — so for that host the user's own
+  helpers are neither asked nor told (nothing is stored into their keychain, as when the token sat in
+  the URL), while any other host (a submodule, an LFS store, a redirect) keeps them and never sees the
+  token. Fetch, pull, push and clone used to write the token-bearing URL into `.git/config` for the
+  length of the call (clone saved it as `origin` before fetching), so a kill mid-operation left it on
+  disk; now `clone` clones **from** the tokenless URL and `origin` is tokenless from the first byte. A
+  host outside `CREDENTIAL_HOST_RE` (`=`, `;`, `$`, `"`, …; `_` is allowed, for docker-compose names
+  such as `git_server`) and a username or token holding CR, LF or NUL are refused before anything is
+  sent. `index.ts` sets `GIT_TERMINAL_PROMPT=0` when it is unset (`??=`) so
   git fails fast rather than prompting; with no resolved token, git also falls through to its own
-  credential helpers (e.g. `gh auth setup-git`).
-- **`git pull` is ff-only.** Divergence is reported (`action: 'diverged'`), never auto-merged. `push`
-  refuses when behind. Keep this guarantee.
+  credential helpers (e.g. `gh auth setup-git`). **A URL-embedded secret is stripped before anything
+  is persisted, echoed or cloned** (`stripGitUrlCredentials`, `src/lib/gitUrlCredentials.ts`, applied in
+  `ProjectManager.registerProject`, so `register_project` and `project_sync` with a `gitUrl`): the URL
+  is trimmed first (whitespace defeated the `^` anchor), the scheme separator is any run of `/` and
+  `\` or none (`https:/tok@h`, `https:\tok@h` and `https:tok@h` all parse with a userinfo), and the
+  userinfo runs to the **last** `@`. `user:token@` keeps `user@` — a login name is not a secret, and
+  the user's credential helpers look the credential up by it — unless `looksLikeToken` says the name
+  itself is one, checked in this order: a known token prefix (`ghp_`, `glpat-`, `ATBB`, `hf_`, …) →
+  token; an `@` in it (an email) → login; `+`, `=` or `/` (base64) → token; a name the URL already
+  carries (`publishesName`: host labels case-insensitively, path segments exactly — Azure DevOps'
+  `<org>@dev.azure.com/<org>/…`) → login; an AWS CodeCommit `<user>-at-<12 digits>` → login; 20 or
+  more characters with a digit or mixed case → token. It errs toward removal. An env-configured or
+  legacy URL is **not** stripped (only a registration is), so it is shown with the secret as `***`
+  (`redactGitUrlCredentials`: `list_projects`, `push`'s `remote`, `set_credential`'s "no host"
+  error), and `redact` scrubs userinfo to the last `@`, so no part of a password containing a raw
+  `@` survives in an error.
+- **Syncing is ff-only, and `push` never force-pushes.** `project_sync` (`GitService.syncPull`) is
+  `fetch --prune` + `merge --ff-only origin/<branch>`, not `git pull`: divergence is reported
+  (`action: 'diverged'`), never auto-merged. `push` (direct mode) pull-rebases onto the fetched remote
+  and pushes; a push rejected as non-fast-forward is refetched and rebased again, up to
+  `PUSH_RETRY_ROUNDS` (3), then reported as `remote-moved` with nothing pushed; branch mode rebases
+  the feature branch and lands it with an ff-only merge, one attempt. Keep these guarantees. **Every
+  explicit fetch prunes** (`fetchOrigin`; the implicit fetch inside `pull --rebase` does not): a stale
+  `origin/<branch>` let a pinned `resolvePush` rebase onto a ghost and recreate a branch a
+  collaborator had renamed away. So a missing upstream is decided first, in its own terms
+  (`remoteBranchAbsence`): only a branch with a `branch.<b>.merge` upstream can be _missing_ — the
+  never-pushed review branch `push` in branch mode leaves the clone on reports `syncState: "ahead"`
+  — and then `project_sync` reports `remote-branch-missing` with a `note`, `status` reports
+  `remoteBranchMissing`/`remoteBranchNote`, and local commits on no remote branch count as unpushed
+  instead of the lenient count calling the clone up to date. `status` lists commits only with
+  `withCommits: true` (the `status` tool alone; `commit`, `shelve` and the peer guard skip the logs),
+  and with no `origin/<branch>` its `aheadCommits` is capped at 20 (`CONFLICT_MAX_COMMITS`) with
+  `aheadCommitsOmitted`; the missing-branch note clips and escapes the remote branch names it lists.
 - **Conflicts fail safe, then resolve through the tool — never auto-merge.** On a rebase conflict
   `push` aborts (clone back to pre-push state) and returns `status: 'conflict'` with a per-file
   payload (`base`/`ours`/`theirs` + marker `hunks`) plus
@@ -717,9 +1237,16 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   (`src/lib/conflictText.ts`), not only `structuredContent`, so an MCP-only client can resolve
   without a shell. The caller resolves by retrying `push` with `resolutions` (full merged content
   per file — used verbatim, applied _inside_ the rebase via add + `rebase --continue`); the set is
-  validated (missing/extra files named), `expectedRemoteHead` guards against a moved remote (compare
-  full SHAs — abbreviated input is `rev-parse`d first), and `.bib` stays gated behind
-  `confirmBibEdit`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs` directly.
+  validated (missing/extra files named), `expectedRemoteHead` guards against a moved remote, and
+  `.bib` stays gated behind `confirmBibEdit`. **The pin is a commit SHA and nothing else** (trimmed,
+  4–40 hex, checked before any commit or fetch): a ref name such as `origin/master` was resolved at
+  check time, which pins nothing. And **it is checked against the one fetch the rebase then targets**:
+  `resolvePush` fetches once, reads `origin/<branch>` once, prefix-matches the pin against that full
+  SHA, and rebases onto **that SHA** (`rebase --fork-point --onto <sha> origin/<branch>`), never
+  through a re-fetching `pull --rebase` — resolving used to fetch twice, so a commit landing between
+  the two was rebased onto after the pin had passed, and the verbatim resolution overwrote it. A
+  pinned push whose `origin/<branch>` is gone after the fetch is refused in words, and a pinned call
+  gets one push round, not `PUSH_RETRY_ROUNDS`. `read_file` accepts a `ref` (e.g. `origin/<branch>`) to read `theirs` directly.
   Keep the merged text originating from the caller. **A resolution is file content, so a path that
   is a symlink on _either_ side of the conflict is refused** (rebase aborted, clone back to its
   pre-push state) — `resolvePush` checks `lstat` in the paused rebase _and_ the ours/theirs index
@@ -734,7 +1261,7 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   file moved aside as an unmerged 120000 entry the stage check already refuses), but a link placed by
   hand while the rebase is paused would have `writeFile` follow it. Every exception raised inside the
   paused rebase — not only the deliberate refusals — aborts it before propagating, so a failed spawn
-  never leaves the clone mid-rebase — including the priming `pull --rebase` (`runRebaseStep`) and
+  never leaves the clone mid-rebase — including the priming rebase onto the pinned SHA (`runRebaseStep`) and
   `push`'s own attempt (`tryRebase`): both abort first when listing the unmerged paths fails, and
   `tryRebase` also when building the conflict report fails. `unmergedPaths` passes `-c core.quotePath=false` like every other
   path-returning git call: without it a conflict on `é.tex` came back C-quoted and could never be
@@ -749,7 +1276,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   `SIDE_LABEL_OVERHEAD`/`SIDE_ELISION_OVERHEAD`/`HUNK_ELISION_TEXT_OVERHEAD` name each piece (the last
   two are what an _elision_ itself costs — cutting is not free) and are pinned by tests that render a known input and check the
   constant still accounts for it, so `conflictText.ts`'s templates can't silently drift out from under
-  them. `hunks` are allocated first (least recoverable once the rebase aborts, so cut last) and
+  them. A fourth round found every charge taking `Math.max(textCost, jsonCost)`, which bounds each
+  channel alone and never what the caller receives: the per-file payload ships in **both**, so every
+  charge is now `text + json`, the per-file scaffolding (`FILE_JSON_OVERHEAD`,
+  `FILE_TEXT_LINE_BREAKS`, `HUNKS_BLOCK_TEXT_OVERHEAD`, the `null` a cut side still costs) is charged
+  too, and the pointer that would replace each cuttable part is reserved before any content is
+  admitted, so a cut can never overrun the budget that forced it. A conflict now inlines about half as
+  much before eliding. `hunks` are allocated first (least recoverable once the rebase aborts, so cut last) and
   `base`/`ours`/`theirs` next (individually cap at `CONFLICT_SIDE_CAP`, cut first — recoverable in one
   `read_file(path, ref)` call). `CONFLICT_MAX_FILES` (20, matching `capList`'s house style) caps how many
   conflicted files ever get a detailed block at all — the rest stay fully named in the never-capped,
@@ -766,10 +1299,12 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   (20) commits of `CONFLICT_MAX_COMMIT_FILES` (5) files each, the caps the text channel already applied,
   with `remoteCommitsOmitted` and per-commit `filesOmitted` counting what was cut and the text pointing
   at `status.behindCommits` (uncapped, and identical once the rebase has aborted) instead of at
-  `structuredContent`. `rebasedOver` on a successful push and `status`'s own commit lists stay uncapped,
+  `structuredContent`. `rebasedOver` on a successful push and `status`'s own commit lists stay uncapped
+  while `origin/<branch>` exists (with it gone, `aheadCommits` is capped — see the sync bullet),
   and `renderCommitLines`'s default "(see structuredContent)" pointer stays true for them.
 - **A pathspec handed to git is literal, never a glob.** Every `git add`, `ls-files`, `ls-tree`,
-  `diff` (patch and numstat) and `discard`'s `checkout`/`clean` call that takes a path the caller or
+  `diff` (patch and numstat), `status --porcelain`, `show`, `revert`, `commit --only` (paths on stdin,
+  NUL-separated) and `discard`'s `checkout`/`clean` call that takes a path the caller or
   a shadow named runs with `--literal-pathspecs` (the global option, _before_ the subcommand;
   `check-ignore --stdin` reads paths, not pathspecs, and needs none): without it `a[1].tex` is a glob that also matches `a1.tex`,
   and under `scope: "paths"` that staged a peer's dirty `a1.tex` past the ownership check, which had
@@ -777,10 +1312,13 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   the same rule in the `paths` description: matched literally, no globs — so a `sections/*.tex` is
   never expanded: `scope: "paths"` refuses it in server words ("not changed in the working tree"),
   every route refuses a path that is neither on disk nor tracked in server words before `git add`
-  sees it. `discard` with `paths` checks out only the tracked subset (resolved to the index's
-  spelling on an ignorecase clone, or a case-spelled request would silently discard nothing) and
-  runs `clean -f` over every requested path, so an untracked name is removed rather than tripping
-  `checkout`; and it settles only the named paths in every session's records (`ShadowStore.settleAll`)
+  sees it. `discard` **restores from HEAD, index and working tree in one write**
+  (`checkout --no-overlay HEAD -- <paths>`, git ≥ 2.22; `reset -q --` on an unborn HEAD) over every
+  path that covers a HEAD **or** index entry (resolved to that spelling on an ignorecase clone, or a
+  case-spelled request would silently discard nothing) — it restored from the index, so a staged
+  change survived under `discarded: true` — and runs `clean -f` over every requested path, so an
+  untracked name is removed rather than tripping `checkout`; the whole-tree form is
+  `checkout --no-overlay HEAD -- .` then `clean -fd`; and it settles only the named paths in every session's records (`ShadowStore.settleAll`)
   — `clearAll` is for the whole-tree discard alone, since dropping a peer's unrelated record is what
   lets a later `scope: "paths"` take its lines. **Both halves fold, and the report says what was
   actually reached.** The untracked half has no index entry to resolve against, so on an ignorecase
@@ -799,17 +1337,24 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   shadow entry that `ignoredPaths`' refusal sends the caller to `discard` to clear, so narrowing the
   settle to reached paths would close that escape hatch. That makes `discarded: false` with records
   settled a visible asymmetry rather than an invisible one; keep it, and keep it written down.
-- **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or an `a..b`
-  range (`GitService.resolveDiffRef` validates every endpoint up front, so an unknown ref is named
-  rather than surfacing a raw git error, and a leading `-` is refused); `ref` + `staged` is rejected,
-  not silently resolved. History is shared across sessions even though `commit` isn't, so a ref diff
+- **`diff` takes a `ref` too, and it is not session-scoped.** `diff` accepts a commit-ish or exactly
+  one two-dot `a..b` range (`GitService.resolveDiffRef` validates every endpoint up front, so an
+  unknown ref is named rather than surfacing a raw git error, and a leading `-` is refused; a
+  three-dot range, a second `..` or an empty end is refused in words rather than silently becoming a
+  different comparison); `ref` + `staged` is rejected, not silently resolved. The patch the tool
+  parses is forced plain
+  (`PLAIN_PATCH_FLAGS`: `--no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/`), since a user's `color.ui=always`, `diff.external` or `diff.noprefix` changed
+  it. History is shared across sessions even though `commit` isn't, so a ref diff
   spans peers' commits — it answers "what changed", never "what did I change". Say so wherever it is
   documented.
 - **`tsconfig.json` needs `"types": ["node"]`** (TS 6 + @types/node 25 won't auto-load node globals otherwise).
 - **verbatimModuleSyntax is on** — use `import type` for type-only imports; import paths carry `.js`.
 - **Cross-platform (macOS/Linux/Windows).** Tool output paths are POSIX via `toPosix` (`src/lib/paths.ts`);
-  clones force `core.autocrlf=false`. `execCapture` supports `input` (stdin) / `env` and sets
-  `windowsHide`. The bare-repo test helper builds its `file://` URL with `pathToFileURL` (string-concatenated
+  clones force `core.autocrlf=false`. `execCapture` supports `input` (stdin) / `env`, sets
+  `windowsHide`, and decodes stderr once, whole, so a multi-byte character split across two chunks is
+  not two replacement characters. Anything that passes many paths in one invocation is batched by
+  `chunkPathspecs` (Windows' command line), `shelve`/`unshelve`'s probes included; a contended rename
+  on Windows is retried (`renameWithRetry`). The bare-repo test helper builds its `file://` URL with `pathToFileURL` (string-concatenated
   `file://C:\…` is invalid on Windows). CI runs the gate on ubuntu + windows + macos; keep new code and
   tests separator-agnostic.
 
@@ -819,6 +1364,8 @@ build artifacts otherwise live in a temp dir. `ProjectManager` also supports run
   against real LaTeX log snippets).
 - **Integration** (`test/integration/`) runs real git against a **local bare repo** created by
   `helpers/bareRepo.ts` (a `file://` stand-in for the Overleaf remote) — **no network, no secrets**.
+  What `file://` cannot exercise — credential injection — runs against `helpers/authHttpRemote.ts`, a
+  local smart-HTTP `git http-backend` remote that demands Basic auth, still on loopback only.
   Branch is `master` to match Overleaf.
 - **The compile boundary is the `LatexCompiler` interface** so nothing needs TeX except the smokes.
   `test/smoke/**` is gated on `latexmk` being installed (`describe.skipIf(!available)`), so it skips

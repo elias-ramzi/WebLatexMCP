@@ -21,8 +21,13 @@
  *    grep return nothing is exactly the failure this exists to make visible.
  *  - **It is bounded in three independent directions**: the pattern cannot backtrack without
  *    bound (`searchPattern.ts`), one line's scan is capped (`searchMatch.ts`), and the whole
- *    search runs under a wall-clock deadline checked between lines. The payload is then bounded
- *    at rendered size by `searchBudget.ts`.
+ *    search runs under a wall-clock deadline. For a literal search that deadline is read between
+ *    LINES on this thread (`firstHits`); a regex search runs its `exec`s on a worker thread that
+ *    is terminated at the deadline (`searchWorker.ts`), because one `exec` of a pattern the
+ *    analyzer misjudged cannot be interrupted from the thread running it, and this thread is the
+ *    whole server's. Either way a file cut off part-way is reported as such
+ *    (`filesPartiallySearched`, and named in `note`), never as a file with no further matches.
+ *    The payload is then bounded at rendered size, in both channels, by `searchBudget.ts`.
  *
  * On symlinks: the file list comes from `FileService.list`, whose walk follows a link only where
  * the project's owner said so (`followSymlinks` on a local project), and each file is then read
@@ -40,16 +45,19 @@ import type { FileEntry, FileFilter } from '../services/fileService.js';
 import { MAX_READ_BYTES } from '../services/fileService.js';
 import { supportsLineComments } from './rewriteMode.js';
 import { buildSearchMatcher } from './searchPattern.js';
-import { matchFileLines } from './searchMatch.js';
+import { assembleFileMatches, firstHits, prepareScanLines } from './searchMatch.js';
 import { planSearchPayload } from './searchBudget.js';
+import { RegexScanWorker } from './searchWorker.js';
 
 /**
  * Wall-clock budget for one search, in milliseconds.
  *
- * Checked between lines, so the real bound is this plus one line's worst case (~10ms, see
- * `MAX_LINE_SCAN_CHARS`). Five seconds is long enough that no realistic project times out and
- * short enough that a runaway one still answers within a tool call's patience — and, unlike a
- * file-count cap, it bounds the thing that actually varies: total bytes times pattern cost.
+ * For a literal search it is checked between lines, so the real bound is this plus one line's
+ * scan. For a regex search it is a timer that terminates the worker running the scan, so the
+ * real bound is this plus the time to tear the thread down — whatever the pattern. Five seconds
+ * is long enough that no realistic project times out and short enough that a runaway one still
+ * answers within a tool call's patience — and, unlike a file-count cap, it bounds the thing that
+ * actually varies: total bytes times pattern cost.
  */
 export const SEARCH_TIME_BUDGET_MS = 5000;
 
@@ -100,9 +108,17 @@ export interface SearchOutcome {
   commentMatches: number;
   /** Lines too long to scan whole; their tails were not searched. */
   linesTruncatedForScan: number;
-  /** The time budget ran out: the files below were never reached. */
+  /** The time budget ran out: the file(s) counted below were cut off or never reached. */
   timedOut: boolean;
   filesNotReached: number;
+  /**
+   * Files the deadline cut off PART-WAY: opened and scanned from the top, and stopped before the
+   * end — possibly with no line finished at all, when one line's regex match is what ran out the
+   * clock (the worker scanning it is terminated mid-`exec`). Counted in `filesSearched` too
+   * (their matches so far are reported), and named with the lines reached in `note`. At most
+   * one, since files are searched one at a time.
+   */
+  filesPartiallySearched: number;
   note?: string;
 }
 
@@ -175,100 +191,131 @@ export async function searchProject(
   let linesTruncatedForScan = 0;
   let timedOut = false;
   let filesNotReached = 0;
+  let filesPartiallySearched = 0;
+  let partial: { path: string; linesScanned: number; totalLines: number } | undefined;
+  let filesWithoutCommentSyntax = 0;
 
   const skip = (entry: FileEntry, reason: SkipReason): void => {
     skippedByReason[reason]++;
     skipped.push({ path: entry.path, reason });
   };
 
-  for (const [i, entry] of entries.entries()) {
-    // Checked before each file as well as between lines: a project of many small files must be
-    // as interruptible as one file of many lines.
-    if (expired()) {
-      timedOut = true;
-      filesNotReached = entries.length - i;
-      break;
-    }
-    // Decided from the listing, before anything is opened: `FileService.read` classifies the
-    // same two cases (an asset extension, or over the text read cap) by returning empty content
-    // with a note, but deciding here keeps the two reasons distinct in the report instead of
-    // collapsing them into one note the caller has to parse.
-    if (entry.type === 'asset') {
-      skip(entry, 'asset');
-      continue;
-    }
-    if (entry.sizeBytes > MAX_READ_BYTES) {
-      skip(entry, 'too-large');
-      continue;
-    }
-
-    let content: string;
-    try {
-      // No recordBaseline (the default is false, and that is the point — see this module's
-      // header) and no strictLinks (the walk that produced this path already applied the
-      // project's link policy).
-      const read = await files.read(projectDir, { path: entry.path });
-      if (read.truncated && read.content === '') {
-        // Defensive: `read` refused it as binary or oversized on a rule of its own. Reported as
-        // not searched rather than as nothing found.
+  // One worker per call, started on the first file that needs it. A literal pattern never does:
+  // it has no quantifiers, so its scan is linear and the between-lines deadline bounds it.
+  const worker = request.regex ? new RegexScanWorker(matcher) : undefined;
+  try {
+    for (const [i, entry] of entries.entries()) {
+      // Checked before each file as well as between lines: a project of many small files must
+      // be as interruptible as one file of many lines.
+      if (expired()) {
+        timedOut = true;
+        filesNotReached = entries.length - i;
+        break;
+      }
+      // Decided from the listing, before anything is opened: `FileService.read` classifies the
+      // same two cases (an asset extension, or over the text read cap) by returning empty
+      // content with a note, but deciding here keeps the two reasons distinct in the report
+      // instead of collapsing them into one note the caller has to parse.
+      if (entry.type === 'asset') {
+        skip(entry, 'asset');
+        continue;
+      }
+      if (entry.sizeBytes > MAX_READ_BYTES) {
         skip(entry, 'too-large');
         continue;
       }
-      content = read.content;
-    } catch {
-      // Deleted between the walk and the read, unreadable, a dangling link — the errno text is
-      // not reported: what a caller can act on is that this path was not searched.
-      skip(entry, 'unreadable');
-      continue;
-    }
 
-    // A NUL byte means these bytes are not text: a naive line scan over them reports nothing,
-    // which reads as "no matches" rather than "not searched", and any `text` reported from them
-    // would be mojibake in the client's JSON. An extension-based rule alone would miss it — this
-    // is a `.tex` holding a compiled blob, or a `.txt` that is really a database.
-    if (content.includes('\u0000')) {
-      skip(entry, 'binary');
-      continue;
-    }
+      let content: string;
+      try {
+        // No recordBaseline (the default is false, and that is the point — see this module's
+        // header) and no strictLinks (the walk that produced this path already applied the
+        // project's link policy).
+        const read = await files.read(projectDir, { path: entry.path });
+        if (read.truncated && read.content === '') {
+          // Defensive: `read` refused it as binary or oversized on a rule of its own. Reported
+          // as not searched rather than as nothing found.
+          skip(entry, 'too-large');
+          continue;
+        }
+        content = read.content;
+      } catch {
+        // Deleted between the walk and the read, unreadable, a dangling link — the errno text
+        // is not reported: what a caller can act on is that this path was not searched.
+        skip(entry, 'unreadable');
+        continue;
+      }
 
-    filesSearched++;
-    const commentAware = supportsLineComments(entry.path);
-    const found = matchFileLines(content, matcher, {
-      contextLines: request.contextLines,
-      excludeComments: request.excludeComments,
-      commentAware,
-      maxLineScanChars: request.maxLineScanChars,
-    });
-    commentMatches += found.commentMatches;
-    linesTruncatedForScan += found.linesTruncatedForScan;
-    if (found.matches.length > 0) matchedFiles++;
-    totalMatches += found.matches.length;
-    for (const m of found.matches) {
-      if (collected.length >= MAX_COLLECTED_MATCHES) break;
-      collected.push({ path: entry.path, ...m });
-    }
+      // A NUL byte means these bytes are not text: a naive line scan over them reports nothing,
+      // which reads as "no matches" rather than "not searched", and any `text` reported from
+      // them would be mojibake in the client's JSON. An extension-based rule alone would miss it
+      // — this is a `.tex` holding a compiled blob, or a `.txt` that is really a database.
+      if (content.includes('\u0000')) {
+        skip(entry, 'binary');
+        continue;
+      }
 
-    // A whole file's lines are scanned between two deadline checks, which is why
-    // `matchFileLines` caps each line: the overshoot is bounded by one file's line count times
-    // the per-line cap, not by the size of the largest file in the project.
-    if (expired() && i + 1 < entries.length) {
-      timedOut = true;
-      filesNotReached = entries.length - (i + 1);
-      break;
+      const prepared = prepareScanLines(content, request.maxLineScanChars);
+      const scanned = worker
+        ? await worker.scan(prepared.scans, budgetMs - (now() - startedAt))
+        : firstHits(prepared.scans, matcher, expired);
+      const commentAware = supportsLineComments(entry.path);
+      const found = assembleFileMatches(prepared, scanned.hits, {
+        contextLines: request.contextLines,
+        excludeComments: request.excludeComments,
+        commentAware,
+      });
+
+      filesSearched++;
+      if (request.excludeComments && !commentAware) filesWithoutCommentSyntax++;
+      commentMatches += found.commentMatches;
+      linesTruncatedForScan += found.linesTruncatedForScan;
+      if (found.matches.length > 0) matchedFiles++;
+      totalMatches += found.matches.length;
+      for (const m of found.matches) {
+        if (collected.length >= MAX_COLLECTED_MATCHES) break;
+        collected.push({ path: entry.path, ...m });
+      }
+
+      if (!found.complete) {
+        timedOut = true;
+        filesPartiallySearched = 1;
+        partial = {
+          path: entry.path,
+          linesScanned: found.linesScanned,
+          totalLines: found.totalLines,
+        };
+        filesNotReached = entries.length - (i + 1);
+        break;
+      }
     }
+  } finally {
+    worker?.close();
   }
 
   const plan = planSearchPayload(collected, skipped, {
     contentBudget: request.contentBudget,
     maxMatches: request.maxMatches,
+    contextLines: request.contextLines,
   });
 
   const notes: string[] = [];
   if (plan.note) notes.push(plan.note);
   if (timedOut) {
+    const cutOff = partial
+      ? ` ${partial.path} was cut off after ${partial.linesScanned} of its ` +
+        `${partial.totalLines} line(s) (a match further down it was not looked for), and`
+      : '';
     notes.push(
-      `The ${budgetMs}ms search budget ran out with ${filesNotReached} file(s) still to go — ` +
-        'this is a partial answer. Narrow it with subdir or filter, or use a cheaper pattern.',
+      `The ${budgetMs}ms search budget ran out:${cutOff} ${filesNotReached} file(s) were ` +
+        'never reached — this is a partial answer. Narrow it with subdir or filter, or use a ' +
+        'cheaper pattern.',
+    );
+  }
+  if (filesWithoutCommentSyntax > 0) {
+    notes.push(
+      `excludeComments applies only where % starts a comment (.tex/.sty/.cls/.bbl/.ltx/.latex): ` +
+        `${filesWithoutCommentSyntax} searched file(s) have no % comment syntax, so every hit ` +
+        'in them was reported, % or not. filter: "tex" searches .tex files only.',
     );
   }
   if (linesTruncatedForScan > 0) {
@@ -292,6 +339,7 @@ export async function searchProject(
     linesTruncatedForScan,
     timedOut,
     filesNotReached,
+    filesPartiallySearched,
     ...(notes.length > 0 ? { note: notes.join(' ') } : {}),
   };
 }

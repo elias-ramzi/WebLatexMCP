@@ -375,7 +375,9 @@ describe('output contract: the local-project read and write tools', () => {
       contentBase64: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
       createDirs: true,
     });
-    await auditCall(client, 'register_project', { project: 'doc-again', path: userDir });
+    // Re-registers `doc` itself: a second id for the same directory is refused (one directory,
+    // one project — `ProjectManager.assertDirUnclaimed`), and the same id is an update.
+    await auditCall(client, 'register_project', { project: 'doc', path: userDir });
     await auditCall(client, 'add_writing_convention', {
       rule: "Always write 'lidar', never 'LiDAR'.",
       confirmGuideEdit: true,
