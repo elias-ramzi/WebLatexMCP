@@ -6,6 +6,7 @@ import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
   ProjectRegistry,
   readProjectRegistry,
+  readProjectRegistryDefault,
   registryPath,
 } from '../../src/services/projectRegistry.js';
 
@@ -108,7 +109,71 @@ describe('ProjectRegistry', () => {
       registryPath(workspaceRoot),
       JSON.stringify({ cv: { mode: 'local' }, thesis: { gitUrl: 'https://git.example/x' } }),
     );
-    // The whole file is rejected as invalid — the same fail-safe as any other malformed registry.
-    expect(readProjectRegistry(workspaceRoot)).toEqual([]);
+    // Only the bad entry is skipped: validation is per entry, so one hand-edit mistake no longer
+    // hides every other registration (see test/unit/projectRegistrationSafety.test.ts).
+    expect(readProjectRegistry(workspaceRoot)).toEqual([
+      { id: 'thesis', gitUrl: 'https://git.example/x' },
+    ]);
+  });
+
+  describe('default project', () => {
+    it('readProjectRegistryDefault is undefined when no registry file exists', () => {
+      expect(readProjectRegistryDefault(workspaceRoot)).toBeUndefined();
+    });
+
+    it('upsert with makeDefault persists the flag and readDefault reports it', async () => {
+      const reg = new ProjectRegistry(workspaceRoot);
+      await reg.upsert(
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { makeDefault: true },
+      );
+
+      expect(reg.readDefault()).toBe('thesis');
+      expect(readProjectRegistryDefault(workspaceRoot)).toBe('thesis');
+      const raw = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8'));
+      expect(raw.thesis.default).toBe(true);
+    });
+
+    it('read() entries never carry a default key', async () => {
+      const reg = new ProjectRegistry(workspaceRoot);
+      await reg.upsert(
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { makeDefault: true },
+      );
+
+      expect(reg.read()).toEqual([{ id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' }]);
+    });
+
+    it('a second makeDefault displaces the first — only one entry stays default: true', async () => {
+      const reg = new ProjectRegistry(workspaceRoot);
+      await reg.upsert(
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { makeDefault: true },
+      );
+      await reg.upsert(
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
+        { makeDefault: true },
+      );
+
+      expect(reg.readDefault()).toBe('paper');
+      const raw = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8'));
+      expect(raw.thesis.default).toBeUndefined();
+      expect(raw.paper.default).toBe(true);
+    });
+
+    it('re-upserting the default project without opts keeps the flag', async () => {
+      const reg = new ProjectRegistry(workspaceRoot);
+      await reg.upsert(
+        { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
+        { makeDefault: true },
+      );
+      // A plain re-register (e.g. updating rootFile) must not silently drop the default.
+      await reg.upsert({ id: 'thesis', gitUrl: 'https://git.overleaf.com/NEW' });
+
+      expect(reg.readDefault()).toBe('thesis');
+      const raw = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8'));
+      expect(raw.thesis.gitUrl).toBe('https://git.overleaf.com/NEW');
+      expect(raw.thesis.default).toBe(true);
+    });
   });
 });

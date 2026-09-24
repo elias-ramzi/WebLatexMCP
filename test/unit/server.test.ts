@@ -1,14 +1,22 @@
 import { describe, it, expect } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { WRITING_GUIDE_URI } from '../../src/resources/writingGuide.js';
 import { CONCURRENCY_GUIDE_URI } from '../../src/resources/concurrencyGuide.js';
+import { composeWritingGuide } from '../../src/lib/writingGuide.js';
 import type { AppContext } from '../../src/context.js';
 import type { Skill } from '../../src/lib/skills.js';
 
-// Tool/resource registration never touches the context (handlers do, lazily), so an
-// empty stand-in is enough to exercise the server's initialization surface.
+// Registration is *almost* context-free — handlers read the bag lazily — so an empty stand-in
+// exercises the server's initialization surface. The one exception is `search_references`,
+// whose description and `source` field text depend on how this server is configured and are
+// therefore built at registration: it reads `ctx.config` and tolerates it being absent,
+// describing the default, precisely so this stand-in keeps working. If another tool ever
+// needs the context that early, it has to tolerate the same thing or this fake grows a field.
 const fakeCtx = {} as unknown as AppContext;
 
 async function connect(
@@ -77,6 +85,31 @@ describe('createServer writing guide', () => {
 
     await client.close();
   });
+
+  it('surfaces the SAME composed text (base + extra) to instructions AND the writing-guide resource', async () => {
+    const { text: composed, hasExtra } = composeWritingGuide(
+      '# Base guide\n\nUse the present tense.',
+      'Write lidar, never LiDAR.',
+    );
+    expect(hasExtra).toBe(true);
+    const server = createServer(fakeCtx, composed, undefined, undefined, hasExtra);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const instructions = client.getInstructions();
+    expect(instructions).toContain('Write lidar, never LiDAR.');
+    expect(instructions).toContain('Use the present tense.');
+
+    const read = await client.readResource({ uri: WRITING_GUIDE_URI });
+    const content = read.contents[0];
+    const resourceText = content && 'text' in content ? content.text : undefined;
+    expect(resourceText).toBe(composed);
+    // The resource text must be a substring of instructions too (same string, not a re-derivation).
+    expect(instructions).toContain(resourceText as string);
+
+    await client.close();
+  });
 });
 
 describe('createServer tool registration', () => {
@@ -88,6 +121,13 @@ describe('createServer tool registration', () => {
     expect(names).toContain('add_citation');
     expect(names).toContain('list_references');
     expect(names).toContain('check_citations');
+    await client.close();
+  });
+
+  it('registers the add_asset tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('add_asset');
     await client.close();
   });
 
@@ -105,6 +145,20 @@ describe('createServer tool registration', () => {
     await client.close();
   });
 
+  it('registers the pdf_geometry tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('pdf_geometry');
+    await client.close();
+  });
+
+  it('registers the extract_text tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('extract_text');
+    await client.close();
+  });
+
   it('registers the comment tools', async () => {
     const client = await connect();
     const names = (await client.listTools()).tools.map((t) => t.name);
@@ -117,6 +171,13 @@ describe('createServer tool registration', () => {
     const client = await connect();
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name)).toContain('server_info');
+    await client.close();
+  });
+
+  it('registers the add_writing_convention tool', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toContain('add_writing_convention');
     await client.close();
   });
 
@@ -142,10 +203,145 @@ describe('createServer tool registration', () => {
   });
 });
 
+describe('add_writing_convention confirmGuideEdit gate', () => {
+  async function connectWithGuide(): Promise<{ client: Client; target: string; dir: string }> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-guide-gate-'));
+    const target = path.join(dir, 'conventions.md');
+    const ctx = {
+      config: { extraWritingGuidePath: target, sessionId: 'test-session' },
+      credentials: { allSecrets: () => [] },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return { client, target, dir };
+  }
+
+  async function notCreated(target: string): Promise<boolean> {
+    try {
+      await stat(target);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  it('refuses without confirmGuideEdit and does not touch the target file', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR' },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('confirmGuideEdit');
+      expect(await notCreated(target)).toBe(true);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses with confirmGuideEdit: false identically to an absent flag', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR', confirmGuideEdit: false },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('confirmGuideEdit');
+      expect(await notCreated(target)).toBe(true);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses without confirmGuideEdit and leaves an existing guide file byte-identical', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    const original = '# Existing conventions\n\n- an existing hand-written rule\n';
+    await writeFile(target, original, 'utf8');
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR' },
+      });
+      expect(res.isError).toBe(true);
+      // Not-created alone would pass a regression that appends before checking the gate as long
+      // as the file already existed — this proves the existing content is untouched, not just
+      // that the file wasn't freshly created.
+      expect(await readFile(target, 'utf8')).toBe(original);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('appends the rule when confirmGuideEdit is true', async () => {
+    const { client, target, dir } = await connectWithGuide();
+    try {
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'always write lidar, never LiDAR', confirmGuideEdit: true },
+      });
+      expect(res.isError).toBeFalsy();
+      const structured = res.structuredContent as Record<string, unknown>;
+      expect(structured.created).toBe(true);
+      const contents = await readFile(target, 'utf8');
+      expect(contents).toContain('- always write lidar, never LiDAR');
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the unconfigured-guide error, not the confirm gate, when no guide is configured', async () => {
+    const ctx = {
+      config: { extraWritingGuidePath: undefined, sessionId: 'test-session' },
+      credentials: { allSecrets: () => [] },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      // Called WITHOUT confirmGuideEdit: with no configured path there is nothing to confirm,
+      // so the unconfigured-guide check must win outright rather than asking for a confirmation
+      // that could never lead anywhere.
+      const res = await client.callTool({
+        name: 'add_writing_convention',
+        arguments: { rule: 'a rule' },
+      });
+      expect(res.isError).toBe(true);
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('WEB_LATEX_MCP_WRITING_GUIDE_EXTRA');
+      expect(text).toContain('nowhere to remember this convention');
+      // The confirm gate never fires in this case.
+      expect(text).not.toContain('confirmGuideEdit');
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('createServer skill prompts', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('advertises each skill as a prompt carrying its description', async () => {
@@ -241,6 +437,217 @@ describe('server_info', () => {
 
     await client.close();
   });
+
+  it('omits the extra writing guide fields when not configured', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBeUndefined();
+    expect(structured.writingGuideExtraLoaded).toBeUndefined();
+
+    await client.close();
+  });
+
+  it('reports the extra writing guide path when configured and loaded', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        extraWritingGuidePath: '/home/user/paper/conventions.md',
+        extraWritingGuideLoaded: true,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBe('/home/user/paper/conventions.md');
+    expect(structured.writingGuideExtraLoaded).toBe(true);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('/home/user/paper/conventions.md');
+    expect(text.toLowerCase()).toContain('loaded');
+
+    await client.close();
+  });
+
+  it('reports the extra writing guide as NOT in effect when it failed to load', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        extraWritingGuidePath: '/home/user/paper/conventions.md',
+        extraWritingGuideLoaded: false,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraPath).toBe('/home/user/paper/conventions.md');
+    expect(structured.writingGuideExtraLoaded).toBe(false);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('/home/user/paper/conventions.md');
+    // The critical case: a user must be able to see that their conventions are NOT in effect.
+    expect(text.toLowerCase()).toContain('not in effect');
+
+    await client.close();
+  });
+
+  it('reports envConfigured false when WEB_LATEX_MCP_REWRITE_MODE is unset', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        rewriteMode: 'off',
+        rewriteModeExplicit: false,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.rewriteMode).toBe('off');
+    expect(structured.envConfigured).toBe(false);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('built-in');
+
+    await client.close();
+  });
+
+  it('omits writingGuideExtraRuleCount when no guide is configured', async () => {
+    const ctx = {
+      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    expect(structured.writingGuideExtraRuleCount).toBeUndefined();
+
+    await client.close();
+  });
+
+  it('reports envConfigured true when WEB_LATEX_MCP_REWRITE_MODE=off is explicitly set', async () => {
+    const ctx = {
+      config: {
+        workspaceRoot: '/tmp/ws',
+        workspaceIsLocal: false,
+        compiler: 'latexmk',
+        rewriteMode: 'off',
+        rewriteModeExplicit: true,
+      },
+    } as unknown as AppContext;
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const res = await client.callTool({ name: 'server_info', arguments: {} });
+    const structured = res.structuredContent as Record<string, unknown>;
+    // Byte-identical rewriteMode to the unset case above ('off') — envConfigured is the ONLY
+    // signal that distinguishes a deliberate server-wide `off` from nobody configuring anything.
+    expect(structured.rewriteMode).toBe('off');
+    expect(structured.envConfigured).toBe(true);
+    const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+    expect(text).toContain('WEB_LATEX_MCP_REWRITE_MODE');
+
+    await client.close();
+  });
+
+  it('reports a live writingGuideExtraRuleCount that reflects a rule appended after server construction', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-server-info-guide-'));
+    const guidePath = path.join(dir, 'conventions.md');
+    try {
+      await writeFile(guidePath, '- rule one\n- rule two\n', 'utf8');
+
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          workspaceIsLocal: false,
+          compiler: 'latexmk',
+          extraWritingGuidePath: guidePath,
+          extraWritingGuideLoaded: true,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const first = await client.callTool({ name: 'server_info', arguments: {} });
+      const firstStructured = first.structuredContent as Record<string, unknown>;
+      expect(firstStructured.writingGuideExtraRuleCount).toBe(2);
+      const firstText = (first.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(firstText).toContain('2 conventions');
+
+      // A rule appended AFTER the server (and its startup snapshot) were built must still show
+      // up: this is the whole point of reading the file live rather than from that snapshot.
+      await writeFile(guidePath, '- rule one\n- rule two\n- rule three\n', 'utf8');
+
+      const second = await client.callTool({ name: 'server_info', arguments: {} });
+      const secondStructured = second.structuredContent as Record<string, unknown>;
+      expect(secondStructured.writingGuideExtraRuleCount).toBe(3);
+
+      await client.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('includes the conventions count in the text even when the guide did not load', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wlm-server-info-guide-notloaded-'));
+    const guidePath = path.join(dir, 'conventions.md');
+    try {
+      await writeFile(guidePath, '- rule one\n- rule two\n', 'utf8');
+
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          workspaceIsLocal: false,
+          compiler: 'latexmk',
+          extraWritingGuidePath: guidePath,
+          extraWritingGuideLoaded: false,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const result = await client.callTool({ name: 'server_info', arguments: {} });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.writingGuideExtraRuleCount).toBe(2);
+      const text = (result.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('NOT loaded');
+      expect(text).toContain('2 conventions');
+
+      await client.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('doctor', () => {
@@ -283,8 +690,18 @@ describe('doctor', () => {
 
 describe('list_skills', () => {
   const skills: Skill[] = [
-    { name: 'verify-citations', description: 'Audit the .bib against DBLP.', body: 'STEP ONE' },
-    { name: 'summarize-paper', description: 'Write a local summary.', body: 'STEP TWO' },
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+    {
+      name: 'summarize-paper',
+      description: 'Write a local summary.',
+      body: 'STEP TWO',
+      project: 'optional',
+    },
   ];
 
   it('lists every bundled skill with its description', async () => {
@@ -338,5 +755,87 @@ describe('list_skills', () => {
     expect((res.content as Array<{ text: string }>)[0]?.text).toContain('No skills are bundled');
 
     await client.close();
+  });
+});
+
+describe('createServer wires the registered-project lookup into the skill prompts', () => {
+  const skills: Skill[] = [
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+  ];
+
+  // A context whose ProjectManager actually answers, unlike `fakeCtx` above (which throws and so
+  // only ever exercises the `unverified` branch). Without `createServer` passing
+  // `isRegisteredProject` through, every id renders as known and the second case below turns back
+  // into a confident instruction to act on a project that does not exist — the #105 finding 6 bug
+  // one layer in. This test is what makes dropping that argument fail rather than go quiet.
+  async function connectWithProjects(known: string[]): Promise<Client> {
+    const ctx = { projectManager: { knownIds: () => known } } as unknown as AppContext;
+    const server = createServer(ctx, undefined, undefined, skills);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return client;
+  }
+
+  async function promptText(client: Client, project: string): Promise<string | undefined> {
+    const got = await client.getPrompt({ name: 'verify-citations', arguments: { project } });
+    const message = got.messages[0];
+    return message && 'text' in message.content ? message.content.text : undefined;
+  }
+
+  it('asserts a registered project and refuses to assert an unregistered one', async () => {
+    const client = await connectWithProjects(['pictura']);
+
+    expect(await promptText(client, 'pictura')).toContain('Apply it to the project `pictura`');
+
+    const unknown = await promptText(client, 'please');
+    expect(unknown).not.toContain('Apply it to the project `please`');
+    expect(unknown).toContain('No project named `please` is registered');
+
+    await client.close();
+  });
+});
+
+describe('list_skills reports an unregistered project rather than asserting it', () => {
+  const skills: Skill[] = [
+    {
+      name: 'verify-citations',
+      description: 'Audit the .bib against DBLP.',
+      body: 'STEP ONE',
+      project: 'optional',
+    },
+  ];
+
+  // `list_skills` renders the same instruction text as the prompt path, so it needs the same
+  // verdict. The positional mis-binding behind #105 finding 6 cannot happen here — a tool gets
+  // named arguments — but a caller can still name a project that does not exist, and
+  // "Apply it to the project `X`" is just as false a claim on this route as on the other one.
+  async function callWithProjects(known: string[], project: string): Promise<string> {
+    const ctx = { projectManager: { knownIds: () => known } } as unknown as AppContext;
+    const server = createServer(ctx, undefined, undefined, skills);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const res = await client.callTool({
+      name: 'list_skills',
+      arguments: { skill: 'verify-citations', project },
+    });
+    await client.close();
+    return (res.structuredContent as { instructions: string }).instructions;
+  }
+
+  it('asserts a registered project and refuses to assert an unregistered one', async () => {
+    expect(await callWithProjects(['pictura'], 'pictura')).toContain(
+      'Apply it to the project `pictura`',
+    );
+
+    const unknown = await callWithProjects(['pictura'], 'ghost');
+    expect(unknown).not.toContain('Apply it to the project `ghost`');
+    expect(unknown).toContain('No project named `ghost` is registered');
   });
 });

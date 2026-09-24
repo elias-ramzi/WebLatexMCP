@@ -6,10 +6,16 @@ import { registerRegisterProject } from './tools/registerProject.js';
 import { registerSetCredential } from './tools/setCredential.js';
 import { registerCredentialPortal } from './tools/credentialPortal.js';
 import { registerListFiles } from './tools/listFiles.js';
+import { registerSearchFiles } from './tools/searchFiles.js';
 import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
+import { registerAddAsset } from './tools/addAsset.js';
 import { registerEditFile } from './tools/editFile.js';
+import { registerSetRewriteMode } from './tools/setRewriteMode.js';
 import { registerCompile } from './tools/compile.js';
+import { registerRenderPages } from './tools/renderPages.js';
+import { registerPdfGeometry } from './tools/pdfGeometry.js';
+import { registerExtractText } from './tools/extractText.js';
 import { registerViewer } from './tools/viewer.js';
 import { registerListComments } from './tools/listComments.js';
 import { registerResolveComments } from './tools/resolveComments.js';
@@ -19,12 +25,15 @@ import { registerCommit } from './tools/commit.js';
 import { registerPush } from './tools/push.js';
 import { registerDeleteFile } from './tools/deleteFile.js';
 import { registerDiscard } from './tools/discard.js';
+import { registerRevert } from './tools/revert.js';
+import { registerShelve, registerUnshelve, registerListShelves } from './tools/shelve.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
 import { registerAddCitation } from './tools/addCitation.js';
 import { registerListReferences } from './tools/listReferences.js';
 import { registerCheckCitations } from './tools/checkCitations.js';
 import { registerServerInfo } from './tools/serverInfo.js';
+import { registerAddWritingConvention } from './tools/addWritingConvention.js';
 import { registerListSkills } from './tools/listSkills.js';
 import { registerDoctor } from './tools/doctor.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
@@ -32,6 +41,8 @@ import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { registerSkillPrompts } from './prompts/skills.js';
 import { buildInstructions } from './lib/writingGuide.js';
 import { getServerVersion } from './lib/version.js';
+import { installToolCallProbe } from './lib/sessionProbe.js';
+import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
 
 /**
@@ -45,14 +56,22 @@ import type { Skill } from './lib/skills.js';
  * `skills` are the bundled `.claude/skills` procedures. They are surfaced twice: as MCP prompts
  * for the user to invoke (see ./prompts/skills.ts) and through the `list_skills` tool so the model
  * can discover and follow one on its own.
+ *
+ * `probe` is the opt-in session-identity instrument (`src/lib/sessionProbe.ts`, off unless
+ * `WEB_LATEX_MCP_SESSION_PROBE` is set). Passed, it wraps `registerTool` **before** any tool is
+ * registered, so every tool below reports its call's `_meta` to stderr. Omitted — which is the
+ * default and every existing call site — nothing at all is installed: `registerTool` is still the
+ * prototype's own method and the server behaves exactly as it did before the probe existed.
  */
 export function createServer(
   ctx: AppContext,
   writingGuide?: string,
   concurrencyGuide?: string,
   skills: Skill[] = [],
+  writingGuideHasExtra = false,
+  probe?: SessionProbe,
 ): McpServer {
-  const instructions = buildInstructions(writingGuide, concurrencyGuide);
+  const instructions = buildInstructions(writingGuide, concurrencyGuide, writingGuideHasExtra);
   const server = new McpServer(
     {
       name: 'web-latex-mcp',
@@ -61,17 +80,26 @@ export function createServer(
     instructions ? { instructions } : undefined,
   );
 
+  // Before the registrations below: the wrapper only covers tools registered after it.
+  if (probe) installToolCallProbe(server, probe);
+
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);
   registerRegisterProject(server, ctx);
   registerSetCredential(server, ctx);
   registerCredentialPortal(server, ctx);
   registerListFiles(server, ctx);
+  registerSearchFiles(server, ctx);
   registerReadFile(server, ctx);
   registerWriteFile(server, ctx);
+  registerAddAsset(server, ctx);
   registerEditFile(server, ctx);
+  registerSetRewriteMode(server, ctx);
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
+  registerRenderPages(server, ctx);
+  registerPdfGeometry(server, ctx);
+  registerExtractText(server, ctx);
   registerViewer(server, ctx);
   registerListComments(server, ctx);
   registerResolveComments(server, ctx);
@@ -80,18 +108,33 @@ export function createServer(
   registerCommit(server, ctx);
   registerPush(server, ctx);
   registerDiscard(server, ctx);
+  registerRevert(server, ctx);
+  // The third exit from push's dirty-tree refusal: neither publishes the work nor
+  // destroys it. Registered beside discard/revert because that is the family it belongs
+  // to — path-limited operations that rewrite the working tree under the caller.
+  registerShelve(server, ctx);
+  registerUnshelve(server, ctx);
+  registerListShelves(server, ctx);
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
   registerAddCitation(server, ctx);
   registerListReferences(server, ctx);
   registerCheckCitations(server, ctx);
   registerServerInfo(server, ctx);
-  registerListSkills(server, skills);
+  registerAddWritingConvention(server, ctx);
+  registerListSkills(server, skills, {
+    isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
+  });
   registerDoctor(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
-  registerSkillPrompts(server, skills);
+  // The lookup is what keeps a mis-bound argument from becoming an instruction: a client that
+  // binds free text positionally can put any word in `project`, so an id that names nothing
+  // must render as a question rather than as `Apply it to the project \`please\``.
+  registerSkillPrompts(server, skills, {
+    isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
+  });
 
   return server;
 }

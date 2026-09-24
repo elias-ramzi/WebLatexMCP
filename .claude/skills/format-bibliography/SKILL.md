@@ -1,6 +1,7 @@
 ---
 name: format-bibliography
 description: Normalize and reformat a project's .bib bibliography — find and merge duplicate entries, rename cite keys to a consistent firstauthorYEARtag scheme (e.g. smith2024fastnet), harmonize venue names (CVPR ↔ "Computer Vision and Pattern Recognition"), and apply one consistent field policy (strip or add url/doi/pages, etc.). Use when the user asks to "format", "reformat", "normalize", "tidy", "clean up", "harmonize", or "deduplicate" the bibliography / .bib / bibtex / citation keys. This skill EDITS the .bib (and the \cite keys in the .tex): it is permission-gated and uses compile as a guardrail. Operates on projects served by the web-latex-mcp MCP server.
+project: optional
 ---
 
 # Normalize and reformat a project's `.bib` bibliography
@@ -31,9 +32,10 @@ and the `.tex`.** Treat it accordingly.
   didn't reach the `.tex`. Reformatting deliberately changes how the bibliography _renders_ (e.g. `CVPR`
   vs the full name); what must **not** change is the _set of papers_ cited or the project's ability to
   compile.
-- **Prefer DBLP as the source of truth.** When a value needs to be added or corrected (a venue's canonical
-  name, a missing `doi`/`pages`, an author list), pull it from DBLP via `search_references` rather than
-  inventing it — same principle as the rest of this server: bibliographic data comes from DBLP, not the
+- **Prefer a bibliography service as the source of truth.** When a value needs to be added or corrected
+  (a venue's canonical name, a missing `doi`/`pages`, an author list), pull it via `search_references`
+  — which answers from DBLP, Crossref or OpenAlex, and reports which in its `source` — rather than
+  inventing it. Same principle as the rest of this server: bibliographic data comes from a service, not the
   model. Mechanical transforms (renaming a key, deleting a field, fixing whitespace) you may do directly.
 - **Idempotent.** Skip entries already carrying a `% formatted-by-claude:` comment (see the marker
   section) unless the user asks to redo them.
@@ -54,7 +56,7 @@ Run in order. Stop and report if a step fails.
 5. **Agree the policy with the user.** Use **AskUserQuestion** to settle, in one go:
    - **Venue style** — short acronyms or full names?
    - **Optional fields** — for each of `url`, `doi`, `pages` (and `isbn`/`publisher`/`address`/`eprint`):
-     strip them, add-where-missing (from DBLP), or leave as-is?
+     strip them, add-where-missing (from a bibliography service), or leave as-is?
    - **Cite-key scheme** — confirm `firstauthorYEARtag` (the default below) or take their variant.
    - **Duplicates** — confirm the merge strategy (which version wins; see _Detecting duplicates_).
 6. **Compute and preview.** Produce the full change set _without writing yet_: the key-rename map
@@ -62,7 +64,7 @@ Run in order. Stop and report if a step fails.
    the user and get a clear go-ahead. For a big bibliography, summarize and show a representative sample.
 7. **Apply.** With approval: edit the `.bib` entries (`confirmBibEdit: true`), and **propagate every key
    rename/merge into the `.tex`** in the same pass (see _Renaming keys_). Re-fetch added field values from
-   DBLP. Do all edits within the one project so the per-project mutex serializes them.
+   a bibliography service. Do all edits within the one project so the per-project mutex serializes them.
 8. **Recompile and verify.** `compile` again. It must succeed with **zero `Citation … undefined`**
    warnings and the same count of distinct papers cited as the baseline. If anything broke, fix it; if you
    can't, `discard` and report.
@@ -104,12 +106,12 @@ whitespace):
 To merge: **keep the published version over the preprint** (confirm with the user when unsure), repoint
 every `\cite` of the dropped key to the kept key, and delete the dropped entry. Note the merge in your
 report. When both carry useful fields, prefer the kept entry's values but fill gaps from the other (or
-from DBLP).
+from a bibliography service).
 
 ## Harmonizing venues
 
 Apply the user's chosen style (short or long) to every `booktitle`/`journal`. Treat these as the same
-venue in either direction — DBLP's venue field is the canonical short form; derive the long form from it:
+venue in either direction — a record's venue field is the canonical short form; derive the long form from it:
 
 - **CVPR** = (Proceedings of the IEEE/CVF Conference on) Computer Vision and Pattern Recognition
 - **ICCV** = International Conference on Computer Vision · **ECCV** = European Conference on Computer Vision
@@ -117,7 +119,7 @@ venue in either direction — DBLP's venue field is the canonical short form; de
 - **ICML** = International Conference on Machine Learning · **ICLR** = International Conference on Learning Representations
 - **AAAI**, **IJCAI**, **ACL**, **EMNLP**, **NAACL**, **KDD**, **SIGIR**, **WWW**, **SIGGRAPH**, **MICCAI**; journals **TPAMI**, **IJCV**, **JMLR**
 
-The list isn't exhaustive — for anything not on it, confirm the canonical name against DBLP rather than
+The list isn't exhaustive — for anything not on it, confirm the canonical name against a service rather than
 guessing. Don't change which venue an entry claims; only its **spelling/style**. (If an entry's venue
 looks _wrong_, that's a `verify-citations` job, not this one — flag it, don't silently "fix" it here.)
 
@@ -127,13 +129,13 @@ Apply one rule per field across the whole bibliography, per the user's choice in
 
 - **Strip** — remove the field from every entry (mechanical; common for `url`/`note`/`eprint` when a venue
   forbids them).
-- **Add where missing** — fill the field from the **DBLP record** for that paper (so `doi`/`pages`/`url`
-  come from the API, not the model). If DBLP doesn't have it, leave it absent and note which entries
+- **Add where missing** — fill the field from the **service's record** for that paper (so `doi`/`pages`/`url`
+  come from the API, not the model). If no service has it, leave it absent and note which entries
   couldn't be completed.
 - **Leave as-is** — don't touch it.
 
 Keep this surgical: change only the fields the policy covers, plus the cite key. Don't rewrite an entry
-wholesale unless the user asked you to re-fetch it from DBLP.
+wholesale unless the user asked you to re-fetch it from a bibliography service.
 
 ## Renaming keys without breaking `\cite`
 
@@ -166,13 +168,14 @@ After reformatting an entry, add one comment line **immediately above** it so a 
 - Record the final cite key and today's date.
 - It's a `.bib` write like any other: `edit_file` with `confirmBibEdit: true`.
 - This marker is independent of `verify-citations`' `% verified-by-claude:` line; an entry can carry both,
-  and renaming its cite key doesn't invalidate the verified marker (that one records the DBLP key).
+  and renaming its cite key doesn't invalidate the verified marker (that one records the namespaced
+  record key, e.g. `dblp:conf/cvpr/HeZRS16` or `crossref:10.1109/CVPR.2016.90`).
 - Step 4 skips entries that already have this marker — that's what makes re-runs cheap and stops a second
   invocation from re-formatting the same entries.
 
 ## After you finish
 
 Report concisely: how many entries were deduplicated (and into which keys), how many keys were renamed
-(with the corresponding `.tex` updates), the venue style and field policy applied, and any entries DBLP
-couldn't complete. Confirm it still compiles with no undefined citations, and point the user at the `diff`
+(with the corresponding `.tex` updates), the venue style and field policy applied, and any entries no
+bibliography service could complete. Confirm it still compiles with no undefined citations, and point the user at the `diff`
 for both the `.bib` and the `.tex`. Remind them nothing is committed or pushed until they ask.

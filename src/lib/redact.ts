@@ -10,6 +10,9 @@ export function redact(text: string, secrets: Array<string | undefined> = []): s
       out = out.split(secret).join('***');
     }
   }
-  out = out.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1***@');
+  // Userinfo runs to the LAST "@" before the authority ends (a raw "@" inside a password is
+  // common enough), so match "@"-separated runs greedily — never across "/", "?", "#" or
+  // whitespace, which end the authority in a URL and the URL itself in free text.
+  out = out.replace(/(https?:\/\/)[^/?#@\s]*(?:@[^/?#@\s]*)*@/gi, '$1***@');
   return out;
 }

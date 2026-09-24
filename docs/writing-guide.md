@@ -71,10 +71,11 @@ where $\hat{x}_i$ is the reconstruction.
 
 - **Never hand-write or invent references.** Do not fabricate BibTeX entries or
   `\cite` keys for works you cannot verify. The only sanctioned way to add a
-  reference is the `add_citation` tool, which fetches the BibTeX from DBLP
-  server-side — use it when the author asks for a citation. If a passage seems to
-  need a citation and you cannot find the work on DBLP, flag it for the author
-  rather than guessing — a hallucinated reference is worse than a missing one.
+  reference is the `add_citation` tool, which fetches the BibTeX from DBLP,
+  Crossref or OpenAlex server-side — use it when the author asks for a
+  citation. If a passage seems to need a citation and you cannot find the work
+  on any of these services, flag it for the author rather than guessing — a
+  hallucinated reference is worse than a missing one.
 - **`.bib` files are protected.** Direct `write_file` / `edit_file` /
   `delete_file` on a `.bib` file is refused; add references through
   `add_citation`. Any other change to a `.bib` (removing or fixing an entry)
@@ -172,6 +173,14 @@ directly. To get clean, reviewable results:
   usually localized and the log points to the offending line.
 - **Review the diff before pushing.** Treat edits like a collaborator's pull
   request: read `git diff`, then commit and push deliberately.
+- **When rewriting prose, replace the text directly — unless you are asked to
+  keep the old wording.** If the project has `edit_file`'s rewrite-preservation
+  mode turned on (`set_rewrite_mode`; off by default), the server comments the
+  original out above the replacement on its own, byte-exact — in that case do
+  not hand-type `%`-commented copies, which duplicate it and are not provably
+  the original. With the mode off and a preserved copy wanted, say so and offer
+  `set_rewrite_mode` or `edit_file`'s `preserveOriginal: true` rather than
+  retyping the paragraph as comments.
 
 ---
 

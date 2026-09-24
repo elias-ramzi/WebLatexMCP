@@ -21,9 +21,17 @@ The lowest-friction way onto **Claude Desktop**: a single [MCP Bundle](https://g
 
 4. Enable the extension. That's it — the server is registered.
 
-Node.js is bundled with Claude Desktop, so there's nothing else to install for editing and git. Only
-**`compile`** needs a TeX toolchain (`latexmk` or `tectonic`) on your `PATH` — see the per-OS guides
+Node.js is bundled with Claude Desktop, so for editing and git the only other thing to install is
+**git 2.25 or newer** on your `PATH` (`doctor` checks the version). Only **`compile`** needs a TeX
+toolchain (`latexmk` or `tectonic`) on your `PATH` — see the per-OS guides
 ([macOS](macos.md), [Windows](windows.md), [Linux](linux.md)) for that and the macOS GUI-`PATH` note.
+
+**One tool is unavailable in the extension: `render_pages`.** Rasterizing pages to PNG needs the native
+canvas backend `@napi-rs/canvas`, a per-platform binary, and the extension is a single bundle built for
+every platform, so it is left out — `render_pages` refuses with a message that says so. Everything else
+works, PDFs included: `compile` (and its `pageCount`), `extract_text`, `pdf_geometry` and the viewer. If
+you need page images, install the server from npm instead (see the [install guides](README.md));
+`doctor` reports which case you are in.
 
 ## Add your project — from the chat, not the config
 

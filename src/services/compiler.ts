@@ -45,6 +45,21 @@ export interface CompileOutcome {
    * it to hand back paths a caller can open.
    */
   logBaseDir: string;
+  /**
+   * Whether the backend actually wrote a fresh PDF during this run. The build dir is stable per
+   * project path and shared by every session on a clone, so when a peer session just compiled the
+   * same clone, latexmk can find nothing to do and finish near-instantly — `success: true` but
+   * `pdfPath` pointing at a previous run's output, not this call's. `false` means exactly that:
+   * derived by comparing the build-dir PDF's mtime and size from just before this run's exec
+   * against just after — never from parsing backend stdout (discarded once a `.log` exists,
+   * worded differently per backend, and tectonic emits none of it) and never from the wall clock.
+   * A filesystem that truncates mtime to whole seconds can only miss a genuine rebuild that lands
+   * in the same second as the previous write AND produces a byte-identical PDF — the narrowest
+   * failure this comparison can have.
+   */
+  rebuilt: boolean;
+  /** ISO 8601 mtime of the build-dir PDF, read before any surfacing copy is made. Absent with no PDF. */
+  pdfMtime?: string;
 }
 
 export interface LatexCompiler {
@@ -59,6 +74,76 @@ const ENGINE_FLAG: Record<Engine, string> = {
   xelatex: '-pdfxe',
   lualatex: '-pdflua',
 };
+
+/**
+ * Whether a spawn rejection means "the binary is not there" — `ENOENT`, which is also what a
+ * missing binary surfaces as on Windows. Exported because it is the whole of the availability
+ * decision: everything else `spawn` can reject with (`EACCES` — present but not executable,
+ * `EAGAIN`/`EMFILE` — process or fd exhaustion) is a real fault on a machine that *does* have
+ * the backend, and must never be read as "not installed".
+ */
+export function isNotFound(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT';
+}
+
+/**
+ * What a spawn failure that is NOT "not found" said, for a report: node's own message
+ * (`spawn latexmk EACCES`), which already carries the errno. Shared with `doctor`, so the two
+ * places that describe an unrunnable backend describe it in the same words.
+ */
+export function spawnFailureReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A backend binary that is on PATH but could not be run (`EACCES`, `EAGAIN`, …). Deliberately
+ * not a `MissingCompilerError`: it is never read as "not installed", so it never licenses a
+ * substitution. It keeps the original errno as `code` (so `isNotFound` still answers false for
+ * it) and the original error as `cause`.
+ */
+export class UnrunnableCompilerError extends Error {
+  readonly code: unknown;
+
+  constructor(cmd: string, err: unknown) {
+    super(
+      `${cmd} is on PATH but could not be run (${spawnFailureReason(err)}). A backend that is ` +
+        'present but fails to start is a fault, not a missing default, so no other backend was ' +
+        'substituted for it. Make sure it is executable and runs from a shell, or choose a ' +
+        'different backend: pass compiler: "<backend>" on this call, or set ' +
+        'WEB_LATEX_MCP_COMPILER for every compile. Run the doctor tool for a full toolchain report.',
+      { cause: err },
+    );
+    this.name = 'UnrunnableCompilerError';
+    this.code = typeof err === 'object' && err !== null && 'code' in err ? err.code : undefined;
+  }
+}
+
+/**
+ * Probe a backend binary by running its version flag. Resolves `true` if it ran at all (a
+ * non-zero exit still means the binary is there), `false` only when it is absent — and
+ * **rethrows** any other spawn failure. Swallowing those into `false` is what would let a
+ * transient `EAGAIN` under fork pressure silently switch a healthy machine's engine, which is
+ * precisely the silent substitution `CompilerResolver` exists to prevent: only the caller can
+ * be told that latexmk is installed but unrunnable. The rethrow is wrapped in
+ * {@link UnrunnableCompilerError} so the caller is told that in words, not by a bare errno.
+ *
+ * `run` is injectable so the rethrow can be tested: a real non-ENOENT spawn failure needs fd or
+ * process exhaustion to reproduce, and a test that cannot cause one cannot pin the branch that
+ * matters most here.
+ */
+export async function probeOnPath(
+  cmd: string,
+  versionArg: string,
+  run: typeof execCapture = execCapture,
+): Promise<boolean> {
+  try {
+    await run(cmd, [versionArg], { timeoutMs: 5000 });
+    return true;
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw new UnrunnableCompilerError(cmd, err);
+  }
+}
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -167,16 +252,59 @@ export function buildPdfPath(projectDir: string, rootFile: string): string {
 }
 
 /**
+ * The path a compile would write its `.aux` to (the build-dir `<jobname>.aux`). Lets the
+ * read-only `pdf_geometry` tool locate the last build's float labels without re-compiling, mirroring
+ * `buildPdfPath` exactly.
+ */
+export function buildAuxPath(projectDir: string, rootFile: string): string {
+  const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
+  return path.join(buildDir(projectDir), `${rootBase}.aux`);
+}
+
+/**
+ * A PDF's mtime and size — the two cheap markers `collectOutcome` compares from before a run to
+ * after, to tell "the backend rewrote this file" from "found nothing to do and left it alone"
+ * without any wall-clock assumption.
+ */
+export interface PdfStat {
+  mtimeMs: number;
+  size: number;
+}
+
+/** `stat` a path for its `PdfStat`, or `null` when it does not exist. */
+async function statOrNull(p: string): Promise<PdfStat | null> {
+  try {
+    const info = await stat(p);
+    return { mtimeMs: info.mtimeMs, size: info.size };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the `.log` and `.pdf` a run produced. Both backends write `<jobname>.{log,pdf}`
  * into the build dir, where jobname is the root file's basename. Falls back to captured
  * stdout/stderr when no `.log` was written (e.g. the engine died before opening one).
+ *
+ * `rebuilt` and `pdfMtime` are derived from the PDF's own mtime and size, never parsed out of
+ * backend stdout/log wording (discarded once a `.log` exists, differs per backend, and tectonic
+ * has none) and never from the wall clock: `before` is a stat of the build-dir PDF taken just
+ * before the exec (`null` when it did not exist yet). The PDF changed during this run —
+ * `rebuilt: true` — when it exists now and either its mtime or its size differs from `before`. A
+ * filesystem that truncates mtime to whole seconds can only miss a genuine rebuild that lands in
+ * the same second as the previous write AND produces a byte-identical PDF — the narrowest failure
+ * this comparison can have.
+ *
+ * Exported for unit tests, which drive it directly against a temp build dir and a fake
+ * `ExecResult` rather than a real compile.
  */
-async function collectOutcome(
+export async function collectOutcome(
   buildDir: string,
   rootFile: string,
   res: ExecResult,
   durationSec: number,
   logBase: string,
+  before: PdfStat | null,
 ): Promise<CompileOutcome> {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
   const logPath = path.join(buildDir, `${rootBase}.log`);
@@ -191,28 +319,29 @@ async function collectOutcome(
     log = `${res.stdout}\n${res.stderr}`;
   }
 
-  const pdfExists = await exists(pdfPath);
+  const after = await statOrNull(pdfPath);
+  const rebuilt =
+    after !== null &&
+    (before === null || after.mtimeMs !== before.mtimeMs || after.size !== before.size);
   return {
-    success: res.code === 0 && pdfExists && !res.timedOut,
-    pdfPath: pdfExists ? pdfPath : undefined,
+    success: res.code === 0 && after !== null && !res.timedOut,
+    pdfPath: after !== null ? pdfPath : undefined,
     durationSec,
     log,
     logPath: resolvedLogPath,
     timedOut: res.timedOut,
     logBaseDir: logBase,
+    rebuilt,
+    // `mtimeMs` is a float derived from nanoseconds; `new Date(x)` truncates it, so an mtime set
+    // to an exact millisecond can read back one ms early (seen on CI). Round to the nearest ms.
+    pdfMtime: after !== null ? new Date(Math.round(after.mtimeMs)).toISOString() : undefined,
   };
 }
 
 /** Compiles a project locally with latexmk. Build artifacts go to a temp dir, keeping the clone clean. */
 export class LatexmkCompiler implements LatexCompiler {
-  async isAvailable(): Promise<boolean> {
-    try {
-      // Resolves regardless of exit code; rejects only if latexmk is not found.
-      await execCapture('latexmk', ['-v'], { timeoutMs: 5000 });
-      return true;
-    } catch {
-      return false;
-    }
+  isAvailable(): Promise<boolean> {
+    return probeOnPath('latexmk', '-v');
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
@@ -220,6 +349,7 @@ export class LatexmkCompiler implements LatexCompiler {
     await mirrorSubdirs(req.projectDir, buildDir);
     const args = latexmkArgs(req, buildDir);
 
+    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('latexmk', args, {
       cwd: req.projectDir,
@@ -232,6 +362,7 @@ export class LatexmkCompiler implements LatexCompiler {
       res,
       (Date.now() - start) / 1000,
       logBaseDir(req.rootFile),
+      before,
     );
   }
 }
@@ -248,13 +379,8 @@ export class LatexmkCompiler implements LatexCompiler {
  * (`--keep-logs`), which the parser needs.
  */
 export class TectonicCompiler implements LatexCompiler {
-  async isAvailable(): Promise<boolean> {
-    try {
-      await execCapture('tectonic', ['--version'], { timeoutMs: 5000 });
-      return true;
-    } catch {
-      return false;
-    }
+  isAvailable(): Promise<boolean> {
+    return probeOnPath('tectonic', '--version');
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
@@ -266,13 +392,14 @@ export class TectonicCompiler implements LatexCompiler {
     // shell escape here; only an explicit `shellEscape` enables system calls.
     if (req.shellEscape) args.push('-Z', 'shell-escape');
 
+    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('tectonic', args, {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
     // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are.
-    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '');
+    return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '', before);
   }
 }
 

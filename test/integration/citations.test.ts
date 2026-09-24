@@ -8,16 +8,20 @@ import { createFakeRemote, type FakeRemote } from './helpers/bareRepo.js';
 import { createServer } from '../../src/server.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
-import { LatexmkCompiler } from '../../src/services/compiler.js';
+import { CompilerResolver } from '../../src/services/compilerResolver.js';
+import { PdfRenderer } from '../../src/services/pdfRender.js';
 import { ViewerService } from '../../src/services/viewer.js';
 import { SyncTexService } from '../../src/services/synctex.js';
 import { CommentStore } from '../../src/services/commentStore.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { DblpService, type FetchResponse } from '../../src/services/dblp.js';
+import { ReferenceResolver } from '../../src/services/referenceResolver.js';
 import { DoctorService } from '../../src/services/doctor.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import { SessionRegistry } from '../../src/services/sessionRegistry.js';
+import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
+import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -71,7 +75,9 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       projectManager: pm,
       git,
       files: new FileService(),
-      compiler: new LatexmkCompiler(),
+      // Never used here (no compile in this suite) — the resolver is inert until `select` is called.
+      compiler: new CompilerResolver('latexmk', false),
+      pdfRenderer: new PdfRenderer(),
       viewer: new ViewerService({
         knownIds: () => [],
         resolvePdfPath: async () => null,
@@ -87,12 +93,29 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       synctex: new SyncTexService(),
       comments: new CommentStore(),
       credentials: new CredentialResolver({}),
-      dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+      // Only DBLP is stubbed: every key in this suite is a DBLP one, and the resolver routes by
+      // the key. The other two backends throw if consulted, so a routing regression that sent a
+      // dblp: key to Crossref would fail loudly here rather than quietly fetching nothing.
+      references: new ReferenceResolver({
+        dblp: new DblpService(() => Promise.resolve(ok(BIBTEX))),
+        crossref: {
+          search: () => Promise.reject(new Error('crossref must not be consulted in this suite')),
+          fetchBibtex: () =>
+            Promise.reject(new Error('crossref must not be consulted in this suite')),
+        },
+        openalex: {
+          search: () => Promise.reject(new Error('openalex must not be consulted in this suite')),
+          resolveDoi: () =>
+            Promise.reject(new Error('openalex must not be consulted in this suite')),
+        },
+      }),
       doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),
+      shelves: new ShelfStore(workspace, config.sessionId),
       shadows: new ShadowStore(workspace, config.sessionId, (d, rel) =>
-        git.readAtRef(d, 'HEAD', rel),
+        git.readAtRefBytes(d, 'HEAD', rel),
       ),
+      rewriteModes: new RewriteModeStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
     };
     ctx.files.setMutationRecorder({

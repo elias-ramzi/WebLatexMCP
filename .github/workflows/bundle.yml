@@ -45,6 +45,68 @@ jobs:
           timeout 60 node /tmp/mcpb-smoke/dist/index.js < /dev/null > /tmp/mcpb-smoke.log 2>&1 || true
           cat /tmp/mcpb-smoke.log
           grep -q 'server ready on stdio' /tmp/mcpb-smoke.log
+      # Starting is not enough: 0.7.0's bundle started fine and then failed every PDF tool, because
+      # .mcpbignore had dropped pdf.js's Node build (the server imports it for pageCount,
+      # /PageLabels, extract_text and pdf_geometry). Drive that path from the unpacked bundle's own
+      # dist/ and node_modules/ — /tmp is outside the checkout, so nothing resolves from the
+      # workspace's install — and WITHOUT the native canvas, which the bundle leaves out: reading
+      # must work, and render_pages must refuse naming the Desktop extension, not "npm i".
+      - name: Smoke-test the PDF path in the packed bundle
+        run: |
+          cat > /tmp/mcpb-pdf-smoke.mjs <<'SMOKE'
+          import { existsSync, writeFileSync } from 'node:fs';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+
+          const bundle = path.resolve(process.argv[2]);
+          const check = (ok, what) => {
+            if (!ok) throw new Error(`bundle PDF smoke: ${what}`);
+            console.log(`ok - ${what}`);
+          };
+          check(!existsSync(path.join(bundle, 'node_modules/@napi-rs')), 'no native canvas in the bundle');
+
+          // Two pages, a text layer and /PageLabels; xref offsets computed so they cannot rot.
+          const page = (content) =>
+            `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 3 0 R >> >> /Contents ${content} 0 R >>`;
+          const stream = (s) => `<< /Length ${s.length} >>\nstream\n${s}\nendstream`;
+          const objs = [
+            '<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /P (iv) >> 1 << /P (1) >>] >> >>',
+            '<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>',
+            '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+            page(5),
+            stream('BT /F1 12 Tf 20 170 Td (Hello from page 1) Tj ET'),
+            page(7),
+            stream('BT /F1 12 Tf 20 170 Td (Hello from page 2) Tj ET'),
+          ];
+          let pdf = '%PDF-1.4\n';
+          const offsets = objs.map((o, i) => {
+            const at = pdf.length;
+            pdf += `${i + 1} 0 obj\n${o}\nendobj\n`;
+            return at;
+          });
+          const xref = pdf.length;
+          pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+          for (const off of offsets) pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
+          pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+          const pdfPath = path.join(bundle, '..', 'bundle-smoke.pdf');
+          writeFileSync(pdfPath, pdf, 'latin1');
+
+          const mod = await import(pathToFileURL(path.join(bundle, 'dist/services/pdfRender.js')).href);
+          const r = new mod.PdfRenderer();
+          check((await r.pageCount(pdfPath)) === 2, 'pageCount reads the PDF');
+          check(JSON.stringify(await r.pageLabels(pdfPath)) === '["iv","1"]', '/PageLabels read');
+          const text = await r.text({ pdfPath, pages: [2] });
+          check(text.pages[0]?.lines[0] === 'Hello from page 2', 'extract_text reads the text layer');
+          const geo = await r.geometry({ pdfPath, pages: [1], kinds: ['text', 'images'] });
+          check(geo.pages[0]?.text?.[0]?.text === 'Hello from page 1', 'pdf_geometry measures text');
+          check((await r.canReadPdf()).ok === true, "doctor's read probe passes");
+          const refusal = await r.render({ pdfPath, outDir: path.join(bundle, '..', 'png'), pages: [1] }).then(
+            () => '',
+            (e) => String(e.message),
+          );
+          check(/Desktop extension/.test(refusal), 'render_pages refuses, naming the Desktop extension');
+          SMOKE
+          node /tmp/mcpb-pdf-smoke.mjs /tmp/mcpb-smoke
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:

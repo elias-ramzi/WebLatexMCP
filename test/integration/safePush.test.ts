@@ -1,13 +1,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
-import { GitService } from '../../src/services/gitService.js';
+import { GitService, UntrackedOverwriteError } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
 import type { ServerConfig } from '../../src/types.js';
+import { planConflictPayload, CONFLICT_SIDE_CAP } from '../../src/lib/conflictBudget.js';
+import { renderConflictText, buildConflictFilePayload } from '../../src/lib/conflictText.js';
 
 describe('safe push (pull-rebase + branch review) against a bare-repo stand-in', () => {
   const cleanups: Array<() => Promise<void>> = [];
@@ -18,6 +20,7 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
 
   async function setup(
     files: Record<string, string>,
+    hooks?: { beforePush?: (attempt: number) => Promise<void> },
   ): Promise<{ remote: FakeRemote; git: GitService; files: FileService; dir: string }> {
     const remote = await createFakeRemote(files);
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-sp-'));
@@ -29,7 +32,7 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       defaultProject: 'demo',
     };
     const pm = new ProjectManager(config);
-    const git = new GitService();
+    const git = hooks ? new GitService(undefined, hooks) : new GitService();
     const dir = pm.projectPath('demo');
     await git.clone(remote.url, dir, { username: 'git' });
     return { remote, git, files: new FileService(), dir };
@@ -95,6 +98,8 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     expect(await readFromRemote(remote, 'main.tex')).toBe('ALPHA\nbeta\nGAMMA\n');
     // The clean push reports the remote commit it rebased over.
     expect(res.rebasedOver?.map((c) => c.message)).toContain('remote edits line 3');
+    // That commit's payload names the file it touched.
+    expect(res.rebasedOver?.[0]?.files[0]?.path).toBe('main.tex');
   });
 
   it('aborts the rebase and surfaces both sides when edits overlap', async () => {
@@ -128,6 +133,142 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
   });
 
+  // Regression: `conflictResult`'s summary used to join `conflictPaths` uncapped
+  // (`report.conflictPaths.join(', ')`), so a many-file conflict repeated the full path list a
+  // second time on top of the already-uncapped `conflictPaths` in structuredContent and the
+  // text's own "Conflicted file(s) (N): ..." line. It must use the same `capList(…, 20)` house
+  // cap as everywhere else in this file, while `conflictPaths` itself — the one thing a caller
+  // needs to act — stays uncapped.
+  it('caps the summary at 20 conflicted paths while conflictPaths stays uncapped at 25', async () => {
+    const fileNames = Array.from({ length: 25 }, (_, i) => `f${String(i).padStart(2, '0')}.tex`);
+    const initial = Object.fromEntries(fileNames.map((n) => [n, 'alpha\nbeta\ngamma\n']));
+    const { remote, git, files, dir } = await setup(initial);
+
+    for (const n of fileNames) {
+      await files.applyEdits(dir, n, [{ oldString: 'beta', newString: 'beta-local' }]);
+    }
+    await git.commit(dir, { message: 'local edits to every file' });
+
+    // Remote edits the SAME line in every file — a genuine overlap in all 25.
+    const remoteEdited = Object.fromEntries(
+      fileNames.map((n) => [n, 'alpha\nbeta-remote\ngamma\n']),
+    );
+    await pushCommit(remote, remoteEdited, 'remote edits every file');
+
+    const res = await git.safePush(dir, remote.url, { username: 'git' });
+    expect(res.status).toBe('conflict');
+    const conflict = res.conflict!;
+
+    // The one thing a caller needs in order to act stays uncapped.
+    expect(conflict.conflictPaths).toHaveLength(25);
+
+    // The summary is capped: it names the first 20 and appends the house "… N more" tail — not
+    // a 25-entry repeat of conflictPaths.
+    expect(res.summary).toMatch(/… 5 more/);
+    for (const n of fileNames.slice(0, 20)) expect(res.summary).toContain(n);
+    for (const n of fileNames.slice(20)) expect(res.summary).not.toContain(n);
+  });
+
+  describe('conflict payload budget (large sides do not blow past a tool result cap)', () => {
+    // A single file whose base/ours/theirs are each well past CONFLICT_SIDE_CAP (12000 chars) —
+    // the shape of the real-world failure: one conflicted file's sides alone produced a
+    // 67,485-character tool result, past the client's cap, so it was never delivered.
+    function bigContent(lines: number): string {
+      return (
+        Array.from({ length: lines }, (_, i) => `line ${i} of the document body`).join('\n') + '\n'
+      );
+    }
+
+    async function setupBigConflict(): Promise<{
+      remote: FakeRemote;
+      git: GitService;
+      dir: string;
+    }> {
+      const original = bigContent(600); // ~18k chars — comfortably over CONFLICT_SIDE_CAP
+      const { remote, git, files, dir } = await setup({ 'main.tex': original });
+      await files.applyEdits(dir, 'main.tex', [
+        { oldString: 'line 10 of the document body', newString: 'line 10 LOCAL' },
+      ]);
+      await git.commit(dir, { message: 'local edits line 10' });
+
+      // Remote edits the SAME line, so this stays a genuine (small) overlap — only the sides
+      // (the whole file, on each side) are large, not the hunk itself.
+      const remoteEdited = original.replace('line 10 of the document body', 'line 10 REMOTE');
+      await pushCommit(remote, { 'main.tex': remoteEdited }, 'remote edits line 10');
+
+      return { remote, git, dir };
+    }
+
+    it('bounds both channels, keeps the essential fields, and restores full sides on request', async () => {
+      const { remote, git, dir } = await setupBigConflict();
+      const before = await headSha(dir);
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(res.status).toBe('conflict');
+      const conflict = res.conflict!;
+      // Sanity: this really is the large-sides shape the budget exists for.
+      const f = conflict.files.find((x) => x.path === 'main.tex')!;
+      expect(f.base!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+      expect(f.ours!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+      expect(f.theirs!.length).toBeGreaterThan(CONFLICT_SIDE_CAP);
+
+      // --- auto (default): both channels bounded well under the 67,485 chars that failed. ---
+      // (A raw size ceiling here would be vacuous either way: this shape — one file, three huge
+      // sides, zero/tiny hunks — was already bounded by CONFLICT_SIDE_CAP alone before the
+      // rendered-size budgeting fix, so a `text.length < N` assertion would pass whether or not
+      // that fix is present. What genuinely distinguishes "budgeted" from "not" for THIS shape is
+      // the elision metadata itself: every oversized side must be marked `elided`, with its TRUE
+      // size, and a working `read_file(path, ref)` pointer — see the worst-case shapes in
+      // `conflictText.test.ts` for the rendered-size regression coverage this fix is really for.
+      const plan = planConflictPayload(conflict.files, {
+        detail: 'auto',
+        refs: { mergeBase: conflict.mergeBase, rebasedOnto: conflict.rebasedOnto },
+      });
+      const text = renderConflictText(res.summary, conflict, { detail: 'auto' });
+      const structuredFiles = buildConflictFilePayload(conflict, plan);
+      expect(plan.truncated).toBe(true);
+      const entry = structuredFiles.find((sf) => sf.path === 'main.tex')!;
+      expect(entry.elided?.base).toBeDefined();
+      expect(entry.elided?.ours).toBeDefined();
+      expect(entry.elided?.theirs).toBeDefined();
+      expect(entry.elided?.base?.chars).toBe(f.base!.length);
+      expect(entry.elided?.ours?.chars).toBe(f.ours!.length);
+      expect(entry.elided?.theirs?.chars).toBe(f.theirs!.length);
+      expect(entry.base).toBeNull();
+      expect(entry.ours).toBeNull();
+      expect(entry.theirs).toBeNull();
+
+      // --- the ~3% a caller needs to act must never be what gets cut. ---
+      expect(conflict.conflictPaths).toEqual(['main.tex']);
+      expect(conflict.remoteHead).toBeTruthy();
+      expect(conflict.mergeBase).toBeTruthy();
+      expect(conflict.remoteCommits.map((c) => c.message)).toContain('remote edits line 10');
+      expect(text).toContain(conflict.remoteHead);
+      expect(text).toContain('remote edits line 10');
+
+      // --- conflictDetail: 'full' restores the complete sides. ---
+      const fullPlan = planConflictPayload(conflict.files, {
+        detail: 'full',
+        refs: { mergeBase: conflict.mergeBase, rebasedOnto: conflict.rebasedOnto },
+      });
+      const fullText = renderConflictText(res.summary, conflict, { detail: 'full' });
+      const fullStructured = buildConflictFilePayload(conflict, fullPlan);
+      expect(fullPlan.truncated).toBe(false);
+      expect(fullText).toContain(f.base!);
+      expect(fullText).toContain(f.ours!);
+      expect(fullText).toContain(f.theirs!);
+      expect(fullStructured[0]!.base).toBe(f.base);
+      expect(fullStructured[0]!.ours).toBe(f.ours);
+      expect(fullStructured[0]!.theirs).toBe(f.theirs);
+      expect(fullStructured[0]!.elided).toBeUndefined();
+
+      // --- the clone is still at its pre-push state after the aborted conflict. ---
+      expect(await headSha(dir)).toBe(before);
+      expect((await git.status(dir)).clean).toBe(true);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+    });
+  });
+
   it('commits pending work first when a message is given', async () => {
     const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
     await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
@@ -149,8 +290,340 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
     const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
     await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
     await expect(git.safePush(dir, remote.url, { username: 'git' })).rejects.toThrow(
-      /uncommitted changes/,
+      /uncommitted changes.*main\.tex/is,
     );
+  });
+
+  it('refuses a dirty tree with both a modified tracked file and an untracked file, naming each', async () => {
+    const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
+    await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
+    await writeFile(path.join(dir, 'main.pdf'), 'binary-stub', 'utf8');
+
+    let message: string;
+    try {
+      await git.safePush(dir, remote.url, { username: 'git' });
+      throw new Error('expected safePush to reject');
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/uncommitted changes/i);
+    // main.tex is named as the blocking (tracked, modified) file...
+    expect(message).toMatch(/tracked file\(s\):\s*main\.tex/i);
+    // ...while main.pdf is named only in the untracked reassurance, never as a reason to block.
+    expect(message).toMatch(/untracked.*never block.*main\.pdf/is);
+  });
+
+  it('pushes over untracked files nobody owns and leaves them in place', async () => {
+    const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
+    await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
+    await git.commit(dir, { message: 'edit two' });
+
+    await writeFile(path.join(dir, 'main.pdf'), 'binary-stub', 'utf8');
+    await mkdir(path.join(dir, 'notes'), { recursive: true });
+    await writeFile(path.join(dir, 'notes', 'scratch.txt'), 'scratch notes\n', 'utf8');
+
+    const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+    expect(res.status).toBe('pushed');
+    expect(await readFile(path.join(dir, 'main.pdf'), 'utf8')).toBe('binary-stub');
+    expect(await readFile(path.join(dir, 'notes', 'scratch.txt'), 'utf8')).toBe('scratch notes\n');
+    await expect(readFromRemote(remote, 'main.pdf')).rejects.toThrow();
+    await expect(readFromRemote(remote, 'notes/scratch.txt')).rejects.toThrow();
+  });
+
+  it('reports by name an untracked file the incoming commit would overwrite, clone intact', async () => {
+    const { remote, git, files, dir } = await setup({ 'main.tex': 'one\ntwo\n' });
+    await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
+    await git.commit(dir, { message: 'edit two' });
+
+    await pushCommit(remote, { 'figs/new.tex': 'remote\n' }, 'adds figure');
+
+    await mkdir(path.join(dir, 'figs'), { recursive: true });
+    await writeFile(path.join(dir, 'figs', 'new.tex'), 'local\n', 'utf8');
+
+    const before = await headSha(dir);
+    let caught: unknown;
+    try {
+      await git.safePush(dir, remote.url, { username: 'git' });
+      throw new Error('expected safePush to reject');
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(UntrackedOverwriteError);
+    expect((caught as UntrackedOverwriteError).paths).toContain('figs/new.tex');
+    expect(await noRebaseInProgress(dir)).toBe(true);
+    expect(await headSha(dir)).toBe(before);
+    expect(await readFile(path.join(dir, 'figs', 'new.tex'), 'utf8')).toBe('local\n');
+  });
+
+  describe('push retry on a lost fast-forward race', () => {
+    it('retries the pull-rebase when the remote moves between fetch and push', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed mid-push');
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'one', newString: 'ONE' }]);
+      await git.commit(dir, { message: 'edit line 1' });
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(res.status).toBe('pushed');
+      expect(res.rebasedOver?.map((c) => c.message)).toContain('landed mid-push');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('ONE\ntwo\nthree\n');
+      expect(await readFromRemote(remote, 'other.tex')).toBe('x\n');
+      expect(calls).toBe(2);
+    });
+
+    it('carries the fresh ahead count and the post-rebase HEAD as pushedSha on a real retry', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed mid-push');
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'one', newString: 'ONE' }]);
+      await git.commit(dir, { message: 'edit line 1' });
+      const preHead = await headSha(dir);
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(res.status).toBe('pushed');
+      // The rebase replays a real (non-empty) commit, so the fresh post-rebase ahead count is
+      // still 1 — and pushedSha is the HEAD *after* that rebase, not the pre-push HEAD.
+      expect(res.pushedCommits).toBe(1);
+      const postRebaseHead = await headSha(dir);
+      expect(postRebaseHead).not.toBe(preHead);
+      expect(res.pushedSha).toBe(postRebaseHead);
+      expect(calls).toBe(2);
+    });
+
+    it('reports nothing-to-push, not a phantom pushed result, when a retry round drops our commit as empty (identical remote change)', async () => {
+      // Regression for the finding: pushWithRetry used to push (attempt 2) without re-reading
+      // ahead/behind after the round-1 rebase. When a collaborator lands a change IDENTICAL to
+      // ours, that rebase drops our replayed commit as empty (already-applied), so there is
+      // nothing left to send — but the stale pre-read `ab.ahead` (from before the retry) still
+      // said "1", and `git push` on an up-to-date branch is a silent no-op success, so the old
+      // code reported `status: "pushed"` with the collaborator's own sha as `pushedSha`.
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              // A collaborator lands the exact same edit we're about to push.
+              await pushCommit(
+                remoteBox.remote!,
+                { 'main.tex': 'one\nTWO\nthree\n' },
+                'identical edit landed',
+              );
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'two', newString: 'TWO' }]);
+      await git.commit(dir, { message: 'edit line 2' });
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      const collaboratorSha = (await simpleGit(remote.bareDir).revparse(['master'])).trim();
+      expect(res.status).toBe('nothing-to-push');
+      expect(res.pushed).toBe(false);
+      // nothing-to-push never carries a pushedSha; in particular it must never be the
+      // collaborator's sha the old buggy code reported it as.
+      expect(res.pushedSha).toBeUndefined();
+      expect(res.pushedSha).not.toBe(collaboratorSha);
+      // The retry round's landing still shows up as something we rebased over.
+      expect(res.rebasedOver?.map((c) => c.message)).toContain('identical edit landed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('one\nTWO\nthree\n');
+      // Only attempt 1's push was ever tried; attempt 2 was skipped once the fresh ahead-count
+      // came back zero, so its beforePush hook never fired.
+      expect(calls).toBe(1);
+      // The generic "already up to date" wording doesn't tell the caller their own just-made
+      // commit was the thing that got replayed empty and dropped — say so explicitly.
+      expect(res.summary).toMatch(/dropped/i);
+      expect(res.summary).toMatch(/already there|identical change/i);
+    });
+
+    it('gives up with remote-moved after 3 rounds, clone intact, nothing pushed', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'one\ntwo\nthree\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            await pushCommit(
+              remoteBox.remote!,
+              { [`other-${attempt}.tex`]: 'x\n' },
+              `landed ${attempt}`,
+            );
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'one', newString: 'ONE' }]);
+      await git.commit(dir, { message: 'edit line 1' });
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(res.status).toBe('remote-moved');
+      expect(res.pushed).toBe(false);
+      const remoteTip = (await simpleGit(remote.bareDir).revparse(['master'])).trim();
+      expect(res.remoteHead).toBe(remoteTip);
+      expect(res.rebasedOver?.length ?? 0).toBeGreaterThanOrEqual(1);
+      // `rebasedOver` accounts for the *final* landing too — the one whose commit is what
+      // `remoteHead` actually names — not just the ones from earlier retry rounds.
+      const finalLanding = res.rebasedOver?.find((c) => c.message === 'landed 3');
+      expect(finalLanding).toBeDefined();
+      expect(finalLanding?.hash).toBe(res.remoteHead);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      expect((await git.aheadBehind(dir)).ahead).toBeGreaterThanOrEqual(1);
+      expect(calls).toBe(3);
+      await expect(readFromRemote(remote, 'main.tex')).resolves.not.toContain('ONE');
+    });
+
+    it('a conflict during a retry round is reported as conflict, not retried', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'alpha\nbeta\ngamma\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(
+                remoteBox.remote!,
+                { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+                'remote edits line 2',
+              );
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+
+      const res = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(res.status).toBe('conflict');
+      expect(res.conflict?.files[0]?.path).toBe('main.tex');
+      expect(calls).toBe(1);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+    });
+
+    it('resolvePush: resolves, then retries when the remote moves before the push', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'alpha\nbeta\ngamma\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed mid-resolve');
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'main.tex', content: 'alpha\nbeta-local-and-remote\ngamma\n' }],
+        },
+      );
+
+      expect(res.status).toBe('pushed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe(
+        'alpha\nbeta-local-and-remote\ngamma\n',
+      );
+      expect(await readFromRemote(remote, 'other.tex')).toBe('x\n');
+      expect(calls).toBeGreaterThanOrEqual(2);
+    });
+
+    it('resolvePush with expectedRemoteHead refuses (remote-moved) instead of retrying past it', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let calls = 0;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'alpha\nbeta\ngamma\n' },
+        {
+          beforePush: async (attempt) => {
+            calls++;
+            if (attempt === 1) {
+              await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed mid-resolve');
+            }
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+      const expectedRemoteHead = conflict.conflict!.remoteHead;
+
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'main.tex', content: 'alpha\nbeta-local-and-remote\ngamma\n' }],
+          expectedRemoteHead,
+        },
+      );
+
+      // The pin means "refuse rather than rebase over a second remote move": the beforePush hook
+      // pushes a non-overlapping commit on attempt 1, and there is no attempt 2 — one round only.
+      expect(res.status).toBe('remote-moved');
+      expect(res.pushed).toBe(false);
+      expect(calls).toBe(1);
+      expect(await noRebaseInProgress(dir)).toBe(true);
+      await expect(readFromRemote(remote, 'main.tex')).resolves.not.toContain(
+        'beta-local-and-remote',
+      );
+    });
   });
 
   describe('conflict resolution (resolvePush)', () => {
@@ -185,6 +658,36 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       );
       expect(await noRebaseInProgress(dir)).toBe(true);
       expect((await git.status(dir)).clean).toBe(true);
+    });
+
+    it('resolves and pushes with an untracked file left on disk, untouched and unpushed', async () => {
+      const { remote, git, files, dir } = await setup({ 'main.tex': 'alpha\nbeta\ngamma\n' });
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'beta', newString: 'beta-local' }]);
+      await git.commit(dir, { message: 'local edits line 2' });
+      await pushCommit(
+        remote,
+        { 'main.tex': 'alpha\nbeta-remote\ngamma\n' },
+        'remote edits line 2',
+      );
+
+      const conflict = await git.safePush(dir, remote.url, { username: 'git' });
+      expect(conflict.status).toBe('conflict');
+
+      // An untracked build artifact nobody owns, present before we resolve.
+      await writeFile(path.join(dir, 'main.pdf'), 'binary-stub', 'utf8');
+
+      const res = await git.resolvePush(
+        dir,
+        remote.url,
+        { username: 'git' },
+        {
+          resolutions: [{ path: 'main.tex', content: 'alpha\nbeta-local-and-remote\ngamma\n' }],
+        },
+      );
+
+      expect(res.status).toBe('pushed');
+      expect(await readFile(path.join(dir, 'main.pdf'), 'utf8')).toBe('binary-stub');
+      await expect(readFromRemote(remote, 'main.pdf')).rejects.toThrow();
     });
 
     it('surfaces the still-unresolved files when a resolution is missing (and aborts)', async () => {
@@ -348,6 +851,9 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       const remoteHeadSha = (await simpleGit(dir).revparse(['origin/master'])).trim();
       expect(report.remoteHead).toBe(remoteHeadSha);
       expect(report.remoteCommits.map((c) => c.message)).toContain('remote edits line 2');
+      // The landed-upstream commit names the file it touched.
+      const landed = report.remoteCommits.find((c) => c.message === 'remote edits line 2');
+      expect(landed?.files.map((f) => f.path)).toContain('main.tex');
 
       // mergeBase is the common ancestor sha, and `base` is fetchable at that ref.
       const mergeBaseSha = (
@@ -509,11 +1015,17 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       await pushCommit(remote, { 'main.tex': 'alpha\nbeta\nGAMMA\n' }, 'their remote commit');
       await simpleGit(dir).fetch(['origin']);
 
-      const status = await git.status(dir);
+      const status = await git.status(dir, { withCommits: true });
       expect(status.ahead).toBe(1);
       expect(status.behind).toBe(1);
       expect(status.aheadCommits.map((c) => c.message)).toContain('my local commit');
       expect(status.behindCommits.map((c) => c.message)).toContain('their remote commit');
+
+      // Each reported commit also lists the file(s) it touched, with line counts.
+      const ahead = status.aheadCommits.find((c) => c.message === 'my local commit');
+      expect(ahead?.files).toEqual([{ path: 'main.tex', added: 1, removed: 1 }]);
+      const behind = status.behindCommits.find((c) => c.message === 'their remote commit');
+      expect(behind?.files).toEqual([{ path: 'main.tex', added: 1, removed: 1 }]);
     });
   });
 
@@ -648,6 +1160,49 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       expect((await simpleGit(dir).revparse(['review/z'])).trim()).toBe(branchSha);
       expect((await git.status(dir)).branch).toBe('master');
       expect(await readFromRemote(remote, 'main.tex')).toBe('alpha\nbeta-remote\ngamma\n');
+    });
+
+    it('landBranch remote-moved recovers via a direct-mode safePush (base is already fast-forwarded)', async () => {
+      const remoteBox: { remote?: FakeRemote } = {};
+      let landed = false;
+      const { remote, git, files, dir } = await setup(
+        { 'main.tex': 'alpha\nbeta\ngamma\n' },
+        {
+          beforePush: async () => {
+            // Fires once: landBranch always calls with attempt 1, and the later recovery
+            // safePush must push cleanly with no further interference.
+            if (landed) return;
+            landed = true;
+            await pushCommit(remoteBox.remote!, { 'other.tex': 'x\n' }, 'landed during land');
+          },
+        },
+      );
+      remoteBox.remote = remote;
+      await files.applyEdits(dir, 'main.tex', [{ oldString: 'alpha', newString: 'ALPHA' }]);
+      const prep = await git.prepareBranch(dir, { branch: 'review/w', message: 'edit line 1' });
+
+      const res = await git.landBranch(
+        dir,
+        remote.url,
+        { username: 'git' },
+        { branch: 'review/w', base: prep.base },
+      );
+
+      expect(res.status).toBe('remote-moved');
+      expect(res.summary).toContain('direct mode');
+      // Local base was already fast-forwarded onto the feature branch tip before the push failed.
+      expect((await git.status(dir)).branch).toBe(prep.base);
+      expect((await simpleGit(dir).revparse(['review/w'])).trim()).toBe(
+        (await simpleGit(dir).revparse([prep.base])).trim(),
+      );
+
+      // The prescribed recovery: run push in direct mode (plain safePush) to pull-rebase base
+      // onto the new remote tip and push.
+      const recovered = await git.safePush(dir, remote.url, { username: 'git' });
+
+      expect(recovered.status).toBe('pushed');
+      expect(await readFromRemote(remote, 'main.tex')).toBe('ALPHA\nbeta\ngamma\n');
+      expect(await readFromRemote(remote, 'other.tex')).toBe('x\n');
     });
   });
 });

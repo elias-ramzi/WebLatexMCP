@@ -1,8 +1,17 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-/** Content hash used as a file's revision fingerprint. */
-function hash(content: string): string {
+/**
+ * Content hash used as a file's revision fingerprint. A Buffer is hashed byte-exactly; a string
+ * is hashed as UTF-8. These two paths MUST agree for content that is valid UTF-8 both ways — the
+ * same file can be written through the text path (`write`) and re-read through the byte path
+ * (`readBytes`), or vice versa, and a mismatch here would silently disarm the out-of-band-edit
+ * guard for that file.
+ */
+function hash(content: string | Buffer): string {
+  if (Buffer.isBuffer(content)) {
+    return createHash('sha256').update(content).digest('hex');
+  }
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
@@ -19,7 +28,7 @@ export class FileRevisionTracker {
   private readonly baselines = new Map<string, string>();
 
   /** Record the current content as the baseline for `absPath`. */
-  record(absPath: string, content: string): void {
+  record(absPath: string, content: string | Buffer): void {
     this.baselines.set(path.resolve(absPath), hash(content));
   }
 
@@ -47,7 +56,7 @@ export class FileRevisionTracker {
    * i.e. the file changed since the server last touched it. A file with no baseline is not
    * "stale" (the server never promised anything about it), so this returns false.
    */
-  isStale(absPath: string, currentContent: string): boolean {
+  isStale(absPath: string, currentContent: string | Buffer): boolean {
     const baseline = this.baselines.get(path.resolve(absPath));
     return baseline !== undefined && baseline !== hash(currentContent);
   }
@@ -57,7 +66,7 @@ export class FileRevisionTracker {
    * because the server never saw the file (no baseline) or because it changed since. Used to
    * flag files a human edited directly, as opposed to changes the tools themselves made.
    */
-  isExternal(absPath: string, currentContent: string): boolean {
+  isExternal(absPath: string, currentContent: string | Buffer): boolean {
     const baseline = this.baselines.get(path.resolve(absPath));
     return baseline === undefined || baseline !== hash(currentContent);
   }

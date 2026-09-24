@@ -5,17 +5,32 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { toPosix } from '../lib/paths.js';
+import { toPosix, toPosixOut } from '../lib/paths.js';
+import { gitUrlOf, isLocalProject } from '../lib/projectMode.js';
+import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
+import { quoteId } from '../lib/projectId.js';
 import type { ProjectConfig } from '../types.js';
 
 const inputSchema = {
-  project: z.string().min(1).describe('Project id used in tool calls and as the clone dir name.'),
+  project: z
+    .string()
+    .min(1)
+    .describe(
+      'Project id used in tool calls and as the clone dir name (at most 64 characters). Any ' +
+        'letters, digits, spaces and punctuation, except: / \\ : < > " | ? *, control and ' +
+        'bidi characters, a leading "." or "-", a leading/trailing space, a trailing ".", ' +
+        'Windows device names (con, nul, com1, …), "registry.json…" and names ending ".pdf". ' +
+        'Must be NFC-normalised.',
+    ),
   gitUrl: z
     .string()
     .min(1)
     .optional()
     .describe(
-      'Git remote URL (Overleaf, GitHub, or any git host) — stored tokenless. Give this OR `path`.',
+      'Git remote URL (Overleaf, GitHub, or any git host). Stored tokenless: a password or ' +
+        'token embedded in an https URL (user:token@, token@) is removed, never stored — supply ' +
+        'it with set_credential or `tokenEnv` instead; a plain login name (org@) is kept. Give ' +
+        'this OR `path`.',
     ),
   path: z
     .string()
@@ -65,6 +80,14 @@ const inputSchema = {
     .boolean()
     .optional()
     .describe('Clone the project right away if it is not present locally (default true).'),
+  default: z
+    .boolean()
+    .optional()
+    .describe(
+      'Make this the project used when a call omits `project`: takes effect now and is ' +
+        'persisted for later sessions. Only one project is the default; setting it here ' +
+        'replaces the previous one. WEB_LATEX_MCP_DEFAULT_PROJECT, when set, always wins.',
+    ),
 };
 
 const outputSchema = {
@@ -77,7 +100,106 @@ const outputSchema = {
   cloned: z
     .boolean()
     .describe('Git: whether the clone is present. Local: whether the directory is there.'),
+  default: z
+    .boolean()
+    .describe('Whether this project is now the default in this process (may reflect a peer’s).'),
 };
+
+/**
+ * The one-clause addendum to the result text when `default: true` was asked for: says whether it
+ * took effect in this process, or only got persisted because an explicit
+ * `WEB_LATEX_MCP_DEFAULT_PROJECT` outranks it (see `ProjectManager.registerAndPersist`).
+ */
+function defaultRegistrationNote(ctx: AppContext, makeDefault: boolean | undefined): string {
+  if (!makeDefault) return '';
+  if (ctx.config.defaultProjectExplicit) {
+    return (
+      ` Persisted as the default for later sessions, but WEB_LATEX_MCP_DEFAULT_PROJECT ` +
+      `(${quoteId(ctx.config.defaultProject ?? '')}) wins in every session that sets it.`
+    );
+  }
+  return ' It is now the default project — calls may omit `project`.';
+}
+
+/**
+ * Which optional fields a re-registration is about to drop relative to what was already stored,
+ * so `register_project` can say so instead of silently losing them. `ProjectRegistry.upsert`
+ * replaces the whole stored entry on a re-registration with `gitUrl`/`path` (documented,
+ * intentional — docs/configuration.md: "pass every field you want kept") — this helper computes
+ * the loss, it never changes what gets persisted.
+ *
+ * Compares only the fields the STORED (`previous`) entry actually had: a field the new
+ * registration also sets is never reported, even when its value changed — this is a loss check,
+ * not a diff. `previous` undefined (first-time registration) drops nothing, of course.
+ *
+ * One rule for every field, kind change or not: it is dropped only when `previous` had it AND
+ * `next` does not carry the same value forward. `rootFile` exists on both kinds, so it survives a
+ * kind change too, when repeated. `branch`/`username`/`tokenEnv` (git-only) and `followSymlinks`
+ * (local-only) cannot be *set* on the other kind at all, so a kind change drops every one of them
+ * `previous` had — not because kind changes are special-cased, but because `next` can never carry
+ * a git-only field forward onto a local config or vice versa. `followSymlinks: false` is never
+ * reported even when omitted next: the effective value is false either way, so nothing was lost.
+ *
+ * Exported so it is unit-testable without going through the MCP client.
+ */
+export function droppedRegistrationFields(
+  previous: ProjectConfig | undefined,
+  next: ProjectConfig,
+): string[] {
+  if (!previous) return [];
+
+  const dropped: string[] = [];
+  const note = (name: string, value: string | boolean): void => {
+    dropped.push(`${name}=${String(value)}`);
+  };
+
+  // Shared by both kinds: dropped whenever `next` doesn't set it too, kind change or not.
+  if (previous.rootFile !== undefined && next.rootFile === undefined) {
+    note('rootFile', previous.rootFile);
+  }
+
+  if (isLocalProject(previous)) {
+    // Local-only. `next` can carry it forward only if it is itself a local config that sets it —
+    // a git `next` never has the field at all, so this is also how a kind change drops it.
+    if (previous.followSymlinks === true && !(isLocalProject(next) && next.followSymlinks)) {
+      note('followSymlinks', previous.followSymlinks);
+    }
+  } else {
+    // Git-only. Same shape: `next` carries a field forward only as a git config that sets it.
+    if (previous.branch !== undefined && !(!isLocalProject(next) && next.branch !== undefined)) {
+      note('branch', previous.branch);
+    }
+    if (
+      previous.username !== undefined &&
+      !(!isLocalProject(next) && next.username !== undefined)
+    ) {
+      note('username', previous.username);
+    }
+    if (
+      previous.tokenEnv !== undefined &&
+      !(!isLocalProject(next) && next.tokenEnv !== undefined)
+    ) {
+      note('tokenEnv', previous.tokenEnv);
+    }
+  }
+  return dropped;
+}
+
+/**
+ * The result-text addendum for a re-registration that silently dropped stored fields — empty
+ * string when nothing was dropped (a first registration, or one that repeated every field).
+ *
+ * Worded around "configuration", not "registry entry": `previous` may come from either — a
+ * registry entry, or a project this process only ever held in memory (env-configured, or
+ * registered in-session via `project_sync { gitUrl }`) — and the loss reads the same either way.
+ */
+function droppedFieldsNote(id: string, dropped: string[]): string {
+  if (dropped.length === 0) return '';
+  return (
+    ` Replaced the previous configuration of "${id}", dropping its ${dropped.join(', ')} ` +
+    '— re-register with them to keep them.'
+  );
+}
 
 /** Expand a leading `~`, then resolve against the server's launch dir, so any input form works. */
 function resolveLocalPath(input: string): string {
@@ -144,8 +266,9 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
         'editing env config is awkward: just paste the git URL in the chat. Or pass `path` for a ' +
         'directory already on this machine, compiled and edited IN PLACE — the right choice for a ' +
         '.tex that lives in a repo of your own, since cloning that repo to reach one file leaves ' +
-        'two copies of the document to drift apart. Exactly one of the two. Tokens are never ' +
-        'stored; they are resolved per host at git time (see the auth docs).',
+        'two copies of the document to drift apart. Exactly one of the two. Pass `default: true` ' +
+        'to make this the project used when a call omits `project`. Tokens are never stored; ' +
+        'they are resolved per host at git time (see the auth docs).',
       inputSchema,
       outputSchema,
     },
@@ -159,6 +282,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
       username,
       tokenEnv,
       clone = true,
+      default: makeDefault,
     }) => {
       try {
         if (followSymlinks !== undefined && !localPath) {
@@ -173,13 +297,76 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           );
         }
         if (!gitUrl && !localPath) {
-          throw new Error(
-            'Give a gitUrl (a remote to clone) or a path (a directory already on this machine).',
-          );
+          if (makeDefault !== true) {
+            throw new Error(
+              'Give a gitUrl (a remote to clone) or a path (a directory already on this ' +
+                'machine). To make an already-registered project the default without repeating ' +
+                'either, pass `default: true` alone (no gitUrl, no path).',
+            );
+          }
+
+          // The default-only form updates nothing but the default flag: rootFile/branch/username/
+          // tokenEnv are accepted by the schema (they're shared with the gitUrl/path branches
+          // below) but this branch would otherwise silently drop them instead of applying them —
+          // updating them needs gitUrl or path, which re-registers the project from the given
+          // arguments. `clone` defaults to `true` on omission, so only an EXPLICIT `false` is
+          // distinguishable from "not given"; an explicit `true` is indistinguishable from the
+          // default and ignoring it changes nothing, so it is not flagged.
+          const ignoredFields: string[] = [];
+          if (rootFile !== undefined) ignoredFields.push('rootFile');
+          if (branch !== undefined) ignoredFields.push('branch');
+          if (username !== undefined) ignoredFields.push('username');
+          if (tokenEnv !== undefined) ignoredFields.push('tokenEnv');
+          if (clone === false) ignoredFields.push('clone');
+          if (ignoredFields.length > 0) {
+            throw new Error(
+              `default: true with neither gitUrl nor path ignores ${ignoredFields.join(', ')} ` +
+                '(the default-only form only changes which project is the default). To update ' +
+                'those, pass gitUrl or path, which re-registers the project from the given ' +
+                'arguments.',
+            );
+          }
+
+          // The documented "make an existing project the default" flow: neither gitUrl nor path
+          // is needed again, since setDefaultProject re-persists the FULL config already on file
+          // (see ProjectManager.setDefaultProject) rather than rebuilding one from these (absent)
+          // args — which is what would otherwise wipe rootFile/branch/username/tokenEnv.
+          //
+          // No runExclusive here: this branch clones nothing, and ProjectRegistry.upsert takes
+          // its own registry file lock — wrapping it in runExclusive(project) would create
+          // <workspace>/.sessions/<project>/ (the lock dir) even for an unknown project id, before
+          // setDefaultProject gets a chance to reject it.
+          const cfg = await ctx.projectManager.setDefaultProject(project);
+          const local = isLocalProject(cfg);
+          const dir = ctx.projectManager.projectPath(cfg.id);
+          const cloned = await ctx.projectManager.hasClone(cfg.id);
+          // The response boundary. `dir` is reported and nothing else here, so the conversion can
+          // sit at the top of the payload — but it is one call for the whole result all the same,
+          // and it is unconditional: the same field of the same tool came back POSIX for a local
+          // project and native for a git one, which is a ternary nobody decided, not a rule.
+          const { path: outPath } = toPosixOut({ path: dir });
+          const payload = {
+            project: cfg.id,
+            path: outPath,
+            mode: local ? ('local' as const) : ('git' as const),
+            persisted: true,
+            cloned,
+            default: ctx.projectManager.defaultProjectId() === cfg.id,
+          };
+          const text = `"${cfg.id}" is already registered.${defaultRegistrationNote(ctx, true)}`;
+          return {
+            content: [{ type: 'text', text }],
+            structuredContent: { ...payload },
+          };
         }
 
         return await ctx.projectManager.runExclusive(project, async () => {
           if (localPath !== undefined) {
+            // Read before persisting: what is already on file, so a silent re-registration can be
+            // reported — the registry's own entry when there is one (a peer may have updated it),
+            // else this process's in-memory config for an env-configured or session-registered
+            // project with no registry entry at all. See `ProjectManager.previousRegistration`.
+            const previous = ctx.projectManager.previousRegistration(project);
             const target = await resolveLocalTarget(localPath);
             const dir = target.dir;
             // An explicit rootFile always wins over the one inferred from the file pointed at.
@@ -191,13 +378,20 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               rootFile: resolvedRoot,
               followSymlinks,
             };
-            await ctx.projectManager.registerAndPersist(cfg);
+            const dropped = droppedRegistrationFields(previous, cfg);
+            await ctx.projectManager.registerAndPersist(cfg, { makeDefault });
+            // The response boundary, and it sits BELOW `cfg` and `registerAndPersist` on purpose:
+            // the config is persisted to the workspace registry and read back into `fs` calls in
+            // every later session, so its `path` stays the host's own spelling. One converted
+            // value from here on, so the payload and the result text cannot disagree.
+            const { path: outPath } = toPosixOut({ path: dir });
             const payload = {
               project,
-              path: toPosix(dir),
+              path: outPath,
               mode: 'local' as const,
               persisted: true,
               cloned: true,
+              default: ctx.projectManager.defaultProjectId() === project,
             };
             // Say which directory was registered when they named a file: the project is the whole
             // folder, so that is what is readable and editable — not just the file they pointed at.
@@ -213,43 +407,70 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               : ' A symlink pointing out of that folder is not followed (re-register with ' +
                 'followSymlinks: true if the links in it are yours).';
             const text =
-              `Registered "${project}" -> ${toPosix(dir)} (local, persisted to the workspace ` +
+              `Registered "${project}" -> ${outPath} (local, persisted to the workspace ` +
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
-              `workspace, not into that directory.${links}`;
+              `workspace, not into that directory.${links}` +
+              defaultRegistrationNote(ctx, makeDefault) +
+              droppedFieldsNote(project, dropped);
             return {
               content: [{ type: 'text', text }],
               structuredContent: { ...payload },
             };
           }
 
-          const cfg = await ctx.projectManager.registerAndPersist({
-            id: project,
-            // Narrowed by the guards above; `localPath` is undefined here.
-            gitUrl: gitUrl as string,
-            rootFile,
-            branch,
-            username,
-            tokenEnv,
-          });
+          // Read before persisting, same reasoning as the local branch above.
+          const previous = ctx.projectManager.previousRegistration(project);
+          const cfg = await ctx.projectManager.registerAndPersist(
+            {
+              id: project,
+              // Narrowed by the guards above; `localPath` is undefined here.
+              gitUrl: gitUrl as string,
+              rootFile,
+              branch,
+              username,
+              tokenEnv,
+            },
+            { makeDefault },
+          );
+          const dropped = droppedRegistrationFields(previous, cfg);
+          // The registered URL is the caller's with any http(s) secret removed
+          // (`ProjectManager.registerProject`); the caller must hear about a removal — the next
+          // git operation needs the credential from somewhere else — and only about what was
+          // actually removed (a login name stays in the URL).
+          const heldUrl = gitUrlOf(cfg) ?? '';
+          const credentialsNote = strippedCredentialsNoteFor(gitUrl);
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
           if (clone && !cloned) {
             const git = ctx.projectManager.requireGitProject(cfg.id, 'clone');
             const auth = await ctx.credentials.resolve(git);
-            await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
+            try {
+              await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
+            } catch (err) {
+              // A clone that fails right after its token was stripped most likely failed on auth;
+              // say why the token the caller gave was not used.
+              if (!credentialsNote) throw err;
+              throw new Error(`${(err as Error).message}${credentialsNote}`, { cause: err });
+            }
             ctx.files.resetBaselines(dir);
             cloned = true;
           }
 
+          // The response boundary. It sits below `ctx.git.clone` and `ctx.files.resetBaselines`
+          // deliberately: the first spawns git at that directory and the second resolves against
+          // the revision tracker's own native keys, so both need the host's spelling. Past this
+          // point the path is a display value, converted once for both channels.
+          const { path: outPath } = toPosixOut({ path: dir });
           const payload = {
             project: cfg.id,
-            path: dir,
+            path: outPath,
             mode: 'git' as const,
             persisted: true,
             cloned,
+            default: ctx.projectManager.defaultProjectId() === cfg.id,
           };
           // The clone dir sits inside the user's own repo in workspace-local mode. The server
           // already excluded it at startup; say so, or the caller cannot tell and adds a
@@ -260,11 +481,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               'entry needed.'
             : '';
           const text =
-            `Registered "${cfg.id}" -> ${gitUrl} (persisted to the workspace registry). ` +
+            `Registered "${cfg.id}" -> ${heldUrl} (persisted to the workspace registry). ` +
             (cloned
-              ? `Cloned at ${dir}.`
+              ? `Cloned at ${outPath}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
-            excludeNote;
+            excludeNote +
+            credentialsNote +
+            defaultRegistrationNote(ctx, makeDefault) +
+            droppedFieldsNote(cfg.id, dropped);
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },

@@ -57,4 +57,36 @@ describe('FileRevisionTracker', () => {
     t.reset('/tmp/proj');
     expect(t.hasBaseline(sibling)).toBe(true);
   });
+
+  it('accepts a Buffer baseline and detects staleness against other Buffers', () => {
+    const t = new FileRevisionTracker();
+    const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+    const other = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]);
+    t.record(abs('fig.png'), buf);
+    expect(t.isStale(abs('fig.png'), buf)).toBe(false);
+    expect(t.isStale(abs('fig.png'), other)).toBe(true);
+  });
+
+  it(
+    'hashes a string and its identical UTF-8 Buffer the same way — a disagreement here would ' +
+      'silently disarm the out-of-band-edit guard for a file written as text and re-read as bytes',
+    () => {
+      const t = new FileRevisionTracker();
+      t.record(abs('main.tex'), 'héllo');
+      expect(t.isStale(abs('main.tex'), Buffer.from('héllo', 'utf8'))).toBe(false);
+
+      const t2 = new FileRevisionTracker();
+      t2.record(abs('main.tex'), Buffer.from('héllo', 'utf8'));
+      expect(t2.isStale(abs('main.tex'), 'héllo')).toBe(false);
+    },
+  );
+
+  it('isExternal with a Buffer: no baseline is external, a matching Buffer is not', () => {
+    const t = new FileRevisionTracker();
+    const buf = Buffer.from([0x00, 0xff, 0xfe]);
+    expect(t.isExternal(abs('fig.png'), buf)).toBe(true);
+    t.record(abs('fig.png'), buf);
+    expect(t.isExternal(abs('fig.png'), buf)).toBe(false);
+    expect(t.isExternal(abs('fig.png'), Buffer.from([0x01]))).toBe(true);
+  });
 });

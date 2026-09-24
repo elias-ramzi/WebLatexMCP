@@ -189,6 +189,50 @@ describe('local (in-place) projects: symlinks', () => {
     expect(textOf(cites)).toContain('refs.bib');
   });
 
+  it('refuses a subdir that is a link out of the project, unless the owner opted in', async () => {
+    // `subdir` is only string-checked by resolveInside, and readdir follows a link — so a
+    // co-author's committed `figs -> $HOME` turned list_files({subdir: "figs"}) into a listing
+    // of every name and size under the home directory, and search_files into a list of them.
+    const { client, userDir } = await setup();
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-subdir-outside-'));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    await writeFile(path.join(outside, 'id_rsa'), 'PRIVATE KEY BYTES\n', 'utf8');
+    await symlink(outside, path.join(userDir, 'figs'), 'dir');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir },
+    });
+    const listed = await client.callTool({
+      name: 'list_files',
+      arguments: { project: 'cv', subdir: 'figs' },
+    });
+    expect(listed.isError).toBe(true);
+    expect(textOf(listed)).toContain('symlink');
+    expect(textOf(listed)).not.toContain('id_rsa');
+
+    const searched = await client.callTool({
+      name: 'search_files',
+      arguments: { project: 'cv', pattern: 'PRIVATE', subdir: 'figs' },
+    });
+    expect(searched.isError).toBe(true);
+    expect(textOf(searched)).not.toContain('id_rsa');
+
+    await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'cv', path: userDir, followSymlinks: true },
+    });
+    const followed = await client.callTool({
+      name: 'list_files',
+      arguments: { project: 'cv', subdir: 'figs' },
+    });
+    expect(followed.isError ?? false).toBe(false);
+    const paths = (followed.structuredContent as { files: Array<{ path: string }> }).files.map(
+      (f) => f.path,
+    );
+    expect(paths).toEqual(['figs/id_rsa']);
+  });
+
   it('refuses the opt-in on a git project, and persists it on a local one', async () => {
     const { client, workspace, userDir } = await setup();
     const onGit = await client.callTool({

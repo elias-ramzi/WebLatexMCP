@@ -4,7 +4,7 @@
 
 # WebLatexMCP
 
-**Read, edit, compile, and commit LaTeX in any git-hosted project — straight from Claude.**
+**Edit, compile, and sync your Overleaf projects with Claude.**
 
 [![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
@@ -29,112 +29,54 @@
 </div>
 
 > [!WARNING]
-> **Public beta — very early development.** WebLatexMCP is now public, but it's in its early stages and
+> **Public beta — early development.** WebLatexMCP is now public, but it's in its early stages and
 > under active development. Expect bugs, rough edges, and incomplete features. Editing and git operations
 > touch real projects, so review diffs before you push. Please
 > [report anything you run into](https://github.com/elias-ramzi/WebLatexMCP/issues) — bug reports and
-> feedback are hugely welcome.
+> feedback are hugely welcome. Run [`/session-feedback`](.claude/skills/session-feedback/SKILL.md) at
+> the end of a session and it writes the report for you.
 
 ---
 
-An MCP server that lets Claude **read, edit, compile, and commit LaTeX** in a git-hosted project —
-**Overleaf**, **GitHub**, or any git remote. It keeps a local clone, compiles locally (TeX Live +
-`latexmk`, or `tectonic`) so you see errors and PDFs without round-tripping, and sends changes back through an explicit
-commit → push you review first. Works with **Claude Desktop** and **Claude Code** over stdio, on
-**macOS, Linux, and Windows**.
-
-Already have the `.tex` on your machine? Point it at that folder — or straight at the file — and it
-reads, edits and compiles the real files **in place** — no remote, no clone, no second copy of the
-document.
+**WebLatexMCP lets Claude work on your paper the way a co-author would** — rewriting the paragraph
+you point at, compiling to find out what actually broke, checking a citation in databases like
+Crossref or OpenAlex, looking at the typeset page before it tells you the figure fits. You review
+every change, and nothing reaches Overleaf until you say so.
 
 ## Highlights
 
-- 🗂️ **Any project, with or without a remote** — Overleaf, GitHub, or any git remote, side by side, each with its own credentials — or a folder you already have, worked on **in place**, so what Claude compiles is the file your editor has open.
-- 🧪 **Local compiles** — `latexmk` (or `tectonic`) runs on your machine and returns structured errors/warnings + the PDF. Each error comes with the 5 source lines around it, so a bare `Undefined control sequence` is readable on the spot. A package your TeX installation lacks is named outright, and `doctor` reports what that installation actually has.
-- 👀 **Live PDF viewer + review comments** — a local viewer that hot-reloads on every compile (a browser window, or a **VS Code** tab); select text in the PDF to leave notes, and Claude applies them at the right source line via SyncTeX.
-- ✏️ **Surgical edits, reviewable pushes** — atomic, exact-match string replacements; `commit` and `push` stay separate, so nothing leaves your machine implicitly.
-- 👥 **Parallel sessions** — run a session per section on one clone; each commits only its own edits, so
-  nobody sweeps up anyone else's half-written paragraph.
+- 🗂️ **Any project, with or without a remote** — Overleaf, GitHub, or a local folder.
+- 🧪 **Local compiles** — two backends run on your machine: `latexmk`, which is what Overleaf runs, or `tectonic`.
+- 👀 **Live PDF viewer + review comments** — a viewer that hot-reloads on every compile, in a browser or a **VS Code** tab. Select text in the PDF to leave a note, and Claude applies it at the right source line.
+- 📚 **Citations checked, not trusted** — API (CrossRef, OpenAlex) calls to verify, or add citations.
+- 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
-- 📚 **Citations checked, not trusted** — `check_citations` catches what the draft cites but the bibliography never defines (and the reverse), and the `/verify-citations` skill audits every entry against DBLP. Works on a `.bib`, a LaTeX `thebibliography`, or a prose reference list in a markdown draft.
-- 🧩 **Bundled Claude Code skills** — project cleanup, DBLP citation audits, bibliography normalization.
 
 ## Install
 
-Pick your client below. Either way, editing, git, and the PDF viewer work without TeX — only `compile`
-needs `latexmk` (default) or `tectonic` on your `PATH`. Not sure what you have? Ask Claude to run
-`doctor` and it reports your engines, TeX distribution, and where packages can be installed.
-
 ### Claude Code (CLI or the VS Code extension)
 
-Install the **plugin** — it registers the server **and** the [skills](#skills) in every session, from
-any directory:
+Point Claude at this repo — the plugin registers the server **and** the [skills](#skills) in every
+session, from any directory:
 
-```bash
-# In Claude Code:
-/plugin marketplace add elias-ramzi/WebLatexMCP
-/plugin install web-latex-mcp@web-latex-tools
-```
-
-Prefer just the server? Register the npm package in one line (skills still come through as
-[prompts](docs/skills.md#two-ways-a-skill-runs)):
-
-```bash
-claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
-```
-
-💡 Launch Claude Code **from your paper's own repo** so the LaTeX clone lands right beside your code. The
-step-by-step [VS Code quickstart](docs/install/vscode-quickstart.md) is the most-tested path.
+> 👽 Please setup the following MCP server https://github.com/elias-ramzi/WebLatexMCP
 
 ### Claude Desktop — one-click extension
 
 Download **`web-latex-mcp.mcpb`** from the
 [latest release](https://github.com/elias-ramzi/WebLatexMCP/releases/latest) and drag it onto the Claude
 Desktop window (or **Settings → Extensions → Install Extension**). No cloning, building, or JSON editing —
-Desktop shows a short, all-optional form (tokens, clone folder). See the
-[Desktop Extension guide](docs/install/desktop-extension.md).
+Desktop shows a short, all-optional form (tokens, clone folder).
 
-### Add your token and your project — from the chat
+### Then, from the chat
 
-However you installed, the server needs a token for your git host — for Overleaf, a **Git authentication
-token** from [Account Settings → Git integration](https://www.overleaf.com/user/settings). The private
-way to hand it over, which **never puts the token in the chat**: ask Claude to open the credential portal.
+Hand over a token and add your project. The token goes through a local page straight into your **OS
+keychain** — never through the conversation:
 
-> 👽 Open the credential portal for my Overleaf token.
+> 👽 Open the credential portal for my Overleaf token, then add https://git.overleaf.com/… as "thesis".
 
-`credential_portal` opens a local `127.0.0.1` page where you type the token; it goes straight into your
-**OS keychain**, never through the conversation. (Happy to paste it once instead? `set_credential` stores
-it in the keychain in a single step.)
-
-Then add your project by just giving Claude the git URL — it registers it with `register_project`, and it
-persists across restarts and sessions:
-
-> 👽 Add my Overleaf project https://git.overleaf.com/… and call it "thesis".
-
-Working on a `.tex` that is already on this machine? Give it a folder instead — no token, no remote, and
-nothing is cloned ([details](docs/tools.md#local-in-place-projects)):
-
-> 👽 Add the folder ~/papers/neurips as a local project called "paper".
-
-### Other clients & full configuration
-
-Prefer env vars (`WEB_LATEX_MCP_PROJECTS`, per-host tokens, workspace, compiler), or using **Gemini** /
-**GitHub Copilot**? It's all in the docs: [Configuration](docs/configuration.md) · per-OS guides for
-[macOS](docs/install/macos.md) / [Linux](docs/install/linux.md) / [Windows](docs/install/windows.md) ·
-[Gemini](docs/install/gemini.md) · [Copilot](docs/install/copilot.md).
-
-## What you can do
-
-Once connected, ask Claude to work on your project — it drives these [tools](docs/tools.md):
-
-- **Set up** — register a project from the chat (a git URL, or a local folder), sync it, browse and read files.
-- **Edit** — create, overwrite, or make surgical string-replacement edits, with the out-of-band-edit guard on.
-- **Compile** — `latexmk` or `tectonic`, locally, with structured errors and warnings, the source lines around each error, and a clickable link to the PDF. `doctor` explains what your TeX installation is missing.
-- **Cite** — search [DBLP](https://dblp.org) and add verified BibTeX entries; list the references you already have from a `.bib`, a `thebibliography`, or a markdown draft; and cross-check what the document cites against what the bibliography defines — including a shared bibliography in another registered project.
-- **Review & push** — `status` and `diff` (over a `ref`, so a whole session is reviewable at once), then `commit` and `push`: rebase, never force, and a conflict comes back with both sides for you to resolve.
-
-See the [full tool reference](docs/tools.md) for every parameter, the safety guards, and how conflicts,
-shell-escape, and parallel sessions work.
+Everything else — the npm package on its own, per-OS setup, TeX backends, other clients, iPad and
+browser — is in the [installation guides](docs/install/README.md).
 
 ## Skills
 
@@ -143,54 +85,34 @@ unless you ask:
 
 - **`/format-latex-project`** — split the main file into per-section `\input`s, move each figure/table into its own `\input` file, and reflow to one sentence per line.
 - **`/arxiv-clean-project`** — run [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip comments and draft macros (`\todo`, notes) for arXiv, as a separate submission copy or applied in place.
-- **`/verify-citations`** — audit a document's references against DBLP, flag discrepancies, and write a local audit report (read-only for the bibliography). Works on a `.bib`, a LaTeX `thebibliography`, or a markdown reference list — and on a local folder with no git remote.
+- **`/verify-citations`** — audit a document's references against DBLP, Crossref or OpenAlex, flag discrepancies, and write a local audit report.
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
+- **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
+- **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
-- **`/session-feedback`** — run it at the _end_ of a session to review what happened and write up what would improve the server itself: what broke, what took too many calls, what was missing, what the docs got wrong. Ranked by impact, scrubbed of your paper and your tokens, and emitted as ready-to-file issue bodies — the environment (version, OS, client, model, install method, toolchain) measured rather than guessed ([contributing](CONTRIBUTING.md#feedback-from-a-session)).
 
 **How you get them depends on the client:**
 
-- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension)
-  (or launch Claude Code from a clone of this repo). Claude picks a skill up on its own when your request
-  matches it.
-- **Any MCP client** — nothing to install. Every skill is also registered as an **MCP prompt**, so it
-  ships with the server; pick it from the client's prompt menu (in Claude Desktop, the `+` in the
-  composer) instead of typing `/`. Claude can also find and follow one on its own through the
-  `list_skills` tool, without the skills being installed anywhere.
-- **Claude Desktop / claude.ai**, for the same automatic behavior Claude Code gets — upload the skills to
-  your account: zip each folder under [`.claude/skills/`](.claude/skills/), then upload them under
-  **Customize → Skills → + → Create skill**. Needs a paid plan with code execution enabled, and an
-  uploaded copy is a snapshot, so re-upload when a skill changes.
+- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension), and Claude picks a skill up when your request matches it.
+- **Any MCP client** — nothing to install: every skill ships with the server as an **MCP prompt**, in the client's prompt menu.
+- **Claude Desktop / claude.ai** — for the same automatic behavior, zip each folder under [`.claude/skills/`](.claude/skills/) and upload them under **Customize → Skills**.
 
 See the [skills guide](docs/skills.md) for what each skill does, [step-by-step installation](docs/skills.md#installing),
 and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 
 ## Documentation
 
-- [Configuration](docs/configuration.md) — environment variables, per-host token resolution, in-context guides, cross-platform notes.
-- [Tools](docs/tools.md) — full tool reference, the DBLP citation flow, and how safe pushes work.
-- [Skills](docs/skills.md) — what each bundled skill does, how to install it per client, and the two ways one runs.
-- [Concurrency](docs/CONCURRENCY.md) — how the server pushes without clobbering edits made elsewhere, and how parallel sessions share one clone.
-- [Writing guide](docs/writing-guide.md) — the LaTeX style conventions surfaced to the client.
-- [Contributing](CONTRIBUTING.md) — how to build, test, and open a pull request.
+Everything above in depth: [Configuration](docs/configuration.md), [Tools](docs/tools.md), [Skills](docs/skills.md), [Concurrency](docs/CONCURRENCY.md), [Writing guide](docs/writing-guide.md)
 
 ## Contributing
 
 This repo **accepts pull requests** — bug reports, feature ideas, docs fixes, and code changes are all
 welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up, run the local gate, and open a PR.
 
-**Telling us how a session went is a contribution too**, and the fastest one to make. At the end of a
-session spent working through the server, run the [`/session-feedback`](.claude/skills/session-feedback/SKILL.md)
-skill: it looks back over the tool calls that actually ran — the ones that failed, the detours, the
-guard that fired for the wrong reason, the thing you wanted and could not do — and writes a short,
-ranked write-up. What comes back is **one ready-to-file issue body per finding**, in the same field
-order as this repo's issue forms, carrying an environment block it _measured_ — server version (and
-whether that is the latest), OS and architecture, Node, MCP client, model, install method, TeX
-toolchain — asking you for the few facts a session cannot read about itself rather than inventing them.
-It reports on the _server_, never on your paper: it edits nothing, commits nothing, pushes nothing, and
-it strips tokens, paths, and manuscript content before printing, because the report is written to be
-handed to a stranger. Paste a block into an issue, or say the word and `gh` files it. See
-[Feedback from a session](CONTRIBUTING.md#feedback-from-a-session).
+**Telling us how a session went is a contribution too**: run the
+[`/session-feedback`](.claude/skills/session-feedback/SKILL.md) skill at the end of a session and it
+writes up what to improve as ready-to-file issue bodies
+([details](CONTRIBUTING.md#feedback-from-a-session)).
 
 A note on maturity: this project is largely vibe-coded, so treat it as best-effort rather than
 battle-tested. Robustness isn't guaranteed — expect rough edges, and please report them. It has been

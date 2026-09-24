@@ -1,0 +1,5 @@
+# Session feedback reports written by the session-feedback skill when `gh` is
+# unavailable or unauthenticated. The directory is tracked; its contents are not.
+*
+!.gitignore
+!.gitkeep

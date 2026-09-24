@@ -36,12 +36,14 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
     {
       title: 'Open a live PDF viewer (browser or VSCode tab)',
       description:
-        'Start (if needed) a local viewer for the compiled PDF and return its URL. The page renders ' +
-        'the PDF with pdf.js (zoom/scroll/search, select-to-comment) and hot-reloads on every ' +
-        'compile, preserving your page and scroll position. For clients without a PDF surface ' +
-        '(e.g. Claude Desktop) it auto-opens your browser; in VSCode pass target:"vscode" (or set ' +
-        'WEB_LATEX_MCP_VIEWER_TARGET=vscode) to get the URL to open as a Simple Browser tab. The ' +
-        'server binds to loopback only and starts on demand. Run compile to populate it.',
+        'Start (if needed) a local viewer for the compiled PDF and return its URL. It shows the ' +
+        'auto-detected root file (main.tex, else the first .tex with a \\documentclass) and ' +
+        'renders it with pdf.js (zoom/scroll/search, select-to-comment), hot-reloading whenever ' +
+        'that root is recompiled and preserving your page and scroll position. For clients ' +
+        'without a PDF surface (e.g. Claude Desktop) it auto-opens your browser; in VSCode pass ' +
+        'target:"vscode" (or set WEB_LATEX_MCP_VIEWER_TARGET=vscode) to get the URL to open as a ' +
+        'Simple Browser tab. The server binds to loopback only and starts on demand. Run compile ' +
+        'to populate it.',
       inputSchema,
       outputSchema,
     },

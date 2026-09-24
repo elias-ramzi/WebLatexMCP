@@ -3,7 +3,11 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import {
-  formatSnippet,
+  COMMENT_NOTE_CAP,
+  planCommentsPayload,
+  renderCommentsText,
+} from '../lib/commentsBudget.js';
+import {
   readSourceLines,
   sliceSnippet,
   unopenablePaths,
@@ -28,8 +32,32 @@ const commentShape = z.object({
         'number remembered from an earlier listing.',
     ),
   page: z.number(),
-  note: z.string(),
-  quote: z.string().optional().describe('The PDF text the user selected, if any.'),
+  note: z
+    .string()
+    .describe(
+      "The user's own typed note. Never dropped — it is the one field with no copy anywhere " +
+        `else a tool can reach — but clipped past ${COMMENT_NOTE_CAP} characters, and then ` +
+        '`noteOmittedChars` says how many went.',
+    ),
+  noteOmittedChars: z
+    .number()
+    .optional()
+    .describe('Characters cut from the end of `note`. Absent when the note is complete.'),
+  quote: z
+    .string()
+    .optional()
+    .describe(
+      'The PDF text the user selected, if any — clipped, or dropped entirely, when the result ' +
+        'budget runs short. Absent WITHOUT `quoteOmittedChars` means the user selected no text; ' +
+        'absent WITH one means it was cut, and the selection is still highlighted in the viewer.',
+    ),
+  quoteOmittedChars: z
+    .number()
+    .optional()
+    .describe(
+      'Characters of `quote` not shown — a clip when `quote` is present, the whole quote when it ' +
+        'is absent. Absent when nothing was cut.',
+    ),
   file: z
     .string()
     .optional()
@@ -50,11 +78,47 @@ const commentShape = z.object({
     .number()
     .optional()
     .describe("1-based source line of `snippet`'s first line, so the caller can number it."),
+  snippetOmittedChars: z
+    .number()
+    .optional()
+    .describe(
+      'Characters of `snippet` not shown. A snippet is all-or-nothing, so this is its full ' +
+        'length, and its presence is what tells a budget cut apart from the innocent reasons a ' +
+        'snippet can be absent (no synctex location, a file that moved, a withheld path). ' +
+        'read_file at `file`:`line` fetches it back.',
+    ),
   resolved: z.boolean(),
 });
 
 const outputSchema = {
   comments: z.array(commentShape),
+  commentsOmitted: z
+    .number()
+    .describe(
+      'Comments not listed at all, because even their identity and note did not fit the budget. ' +
+        'They are still in the viewer: resolve the ones already handled and list again to reach ' +
+        'them. 0 whenever every comment is listed.',
+    ),
+  quotesOmitted: z
+    .number()
+    .describe(
+      'Listed comments whose `quote` was dropped entirely. A clipped-but-shown quote is not ' +
+        'counted here; it is reported per comment as `quoteOmittedChars`.',
+    ),
+  snippetsOmitted: z.number().describe('Listed comments whose source `snippet` was dropped.'),
+  truncated: z
+    .boolean()
+    .describe(
+      'True iff anything at all was cut, clips included. Never inferred from an empty ' +
+        '`comments`: an empty list means there are no open comments.',
+    ),
+  budgetNote: z
+    .string()
+    .optional()
+    .describe(
+      'What was cut and how to get it back. Present only when something actually was. Called ' +
+        "`budgetNote` rather than `note` because `comments[].note` is the user's own text.",
+    ),
 };
 
 export function registerListComments(server: McpServer, ctx: AppContext): void {
@@ -66,7 +130,10 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
         'List the comments the user attached to the compiled PDF in the viewer. Each comment has ' +
         'the note, the selected PDF text (`quote`), and — when SyncTeX resolved it — the source ' +
         '`file`/`line` plus a snippet of surrounding source. Use these to make the requested edits, ' +
-        'then call resolve_comments so the viewer marks them done. Default lists only open comments.',
+        'then call resolve_comments so the viewer marks them done. Default lists only open ' +
+        'comments. The result is budgeted: on a long review pass the snippets go first, then the ' +
+        'quotes, and only then whole comments — every listed comment keeps its id, location and ' +
+        'note, and `truncated`/`budgetNote` say what went.',
       inputSchema,
       outputSchema,
     },
@@ -116,20 +183,14 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
           }),
         );
 
-        const text = enriched.length
-          ? enriched
-              .map((c) => {
-                const loc = c.file ? `${c.file}:${c.line}` : `(unresolved — page ${c.page})`;
-                const quote = c.quote ? `\n   quote: "${c.quote}"` : '';
-                const snip = c.snippet ? `\n   source:\n${formatSnippet(c, c.line, '     ')}` : '';
-                return `#${c.number} [${c.id}] ${loc}\n   note: ${c.note}${quote}${snip}`;
-              })
-              .join('\n\n')
-          : 'No open comments.';
+        // The budget runs LAST, over comments the unopenable-path guard has already stripped, and
+        // it only ever removes fields — so no withheld `file`/`line`/`snippet` can come back
+        // through it. Both channels are rendered from the plan and from nothing else (#163).
+        const plan = planCommentsPayload(enriched);
 
         return {
-          content: [{ type: 'text', text }],
-          structuredContent: { comments: enriched },
+          content: [{ type: 'text', text: renderCommentsText(plan) }],
+          structuredContent: { ...plan },
         };
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());

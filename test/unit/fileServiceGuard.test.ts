@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, realpath } from 'node:fs/promises';
 import { FileService } from '../../src/services/fileService.js';
+import { toPosix } from '../../src/lib/paths.js';
 
 /** Simulate a user editing the clone directly, outside the server's tools. */
 async function editOnDisk(dir: string, rel: string, content: string): Promise<void> {
@@ -63,6 +64,55 @@ describe('FileService out-of-band edit guard', () => {
     expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
   });
 
+  it('a ranged read does not claim a baseline over the lines it never showed', async () => {
+    // Issue #181. The ordering here is the only one that discriminates, and it is easy to get
+    // wrong: recording RESETS the guard rather than arming it, so "ranged read → hand edit →
+    // write" passes on the broken code too (with no baseline at all, a write is not refused, it
+    // is silent). The whole-file read is what arms the guard; the ranged read is what used to
+    // disarm it.
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
+    await editOnDisk(dir, 'main.tex', 'line one\nline two\nedited by the user\n');
+
+    const ranged = await files.read(dir, {
+      path: 'main.tex',
+      startLine: 1,
+      endLine: 1,
+      recordBaseline: true,
+    });
+    expect(ranged.content).toBe('line one');
+    expect(ranged.truncated).toBe(true);
+
+    // One line is not an acknowledgement of the other two — the bytes a baseline vouches for are
+    // the whole file's, and `write_file` replaces the whole file.
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+    expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe(
+      'line one\nline two\nedited by the user\n',
+    );
+  });
+
+  it('refuses the claim for a range that happens to cover the file — the test is the request', async () => {
+    await files.read(dir, { path: 'main.tex', recordBaseline: true });
+    await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+
+    // `startLine: 1` with no end does hand back every byte, trailing newline and all…
+    const covering = await files.read(dir, {
+      path: 'main.tex',
+      startLine: 1,
+      recordBaseline: true,
+    });
+    expect(covering.content).toBe('edited by the user\n');
+    expect(covering.truncated).toBe(false);
+
+    // …and is still refused the baseline, because the rule is about what was ASKED for. A second
+    // way to derive "whole" is a second place for this rule to drift, and the cost of erring here
+    // is one re-read to acknowledge the change, where erring the other way destroys the edit.
+    await expect(
+      files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+    ).rejects.toThrow(/changed on disk/);
+  });
+
   it('keeps one identity for a project reached through a symlink', async () => {
     // macOS hands out /var/folders/… for a real /private/var/folders/…, and Windows a short 8.3
     // path — so resolving reads through realpath while writes resolve the given string filed the
@@ -104,6 +154,12 @@ describe('FileService out-of-band edit guard', () => {
         files.applyEdits(dir, 'notes.tex', [{ oldString: 'PRIVATE', newString: 'PWNED' }]),
       ).rejects.toThrow(/symlink/);
       await expect(files.delete(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+      // The byte-exact counterparts of read/write must refuse the same escape — they run the same
+      // guardLinks() call in the same position, but that was never actually proven here.
+      await expect(files.readBytes(dir, { path: 'notes.tex' })).rejects.toThrow(/symlink/);
+      await expect(
+        files.writeBytes(dir, { path: 'notes.tex', bytes: Buffer.from('PWNED') }),
+      ).rejects.toThrow(/symlink/);
 
       expect(await readFile(secret, 'utf8')).toBe('PRIVATE KEY\n');
     } finally {
@@ -165,6 +221,16 @@ describe('FileService out-of-band edit guard', () => {
         await expect(local.delete(dir, 'notes.tex', { strictLinks: true })).rejects.toThrow(
           /symlink/,
         );
+        await expect(
+          local.readBytes(dir, { path: 'notes.tex', strictLinks: true }),
+        ).rejects.toThrow(/symlink/);
+        await expect(
+          local.writeBytes(dir, {
+            path: 'notes.tex',
+            bytes: Buffer.from('PWNED'),
+            strictLinks: true,
+          }),
+        ).rejects.toThrow(/symlink/);
         expect(await readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('PRIVATE KEY\n');
       } finally {
         await rm(outside, { recursive: true, force: true });
@@ -291,6 +357,283 @@ describe('FileService out-of-band edit guard', () => {
     await expect(
       files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
     ).resolves.toMatchObject({ path: 'main.tex' });
+  });
+
+  describe('recordBaseline, the seam for bytes already in hand', () => {
+    it('arms the guard from bytes the caller holds, with no read of its own', async () => {
+      // Issue #182. `list_references` cannot know at read time whether a bibliography will reach
+      // the caller whole, so it used to re-read the files that qualified just to record them.
+      const shown = await readFile(path.join(dir, 'main.tex'), 'utf8');
+      await files.recordBaseline(dir, 'main.tex', shown);
+      await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+
+      await expect(
+        files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+      ).rejects.toThrow(/changed on disk/);
+      expect(await readFile(path.join(dir, 'main.tex'), 'utf8')).toBe('edited by the user\n');
+    });
+
+    it('records the bytes it is handed, never the bytes on disk — the window it exists to close', async () => {
+      // This is the whole correctness argument for the seam, and a re-read cannot satisfy it: the
+      // hand edit lands AFTER the caller was shown `shown` and BEFORE the claim is made, which is
+      // exactly the window between `list_references`' two reads. A re-read would hash the edited
+      // bytes as the baseline and the guard would never fire for them.
+      const shown = await readFile(path.join(dir, 'main.tex'), 'utf8');
+      await editOnDisk(dir, 'main.tex', 'edited by the user\n');
+      await files.recordBaseline(dir, 'main.tex', shown);
+
+      await expect(
+        files.write(dir, { path: 'main.tex', content: 'agent version\n' }),
+      ).rejects.toThrow(/changed on disk/);
+    });
+
+    it('keys it the way a read does, for a project reached through a symlink', async () => {
+      // The identity rule: the key is the `resolveInside` string, unchanged. Re-spelling it files
+      // the baseline under a name no write looks up — macOS `/var` → `/private/var`, Windows 8.3.
+      const real = await mkdtemp(path.join(os.tmpdir(), 'ovl-real-'));
+      const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-link-'));
+      const link = path.join(parent, 'project');
+      try {
+        await writeFile(path.join(real, 'main.tex'), 'original\n', 'utf8');
+        await symlink(real, link, 'dir');
+
+        await files.recordBaseline(link, 'main.tex', 'original\n');
+        await writeFile(path.join(real, 'main.tex'), 'edited by the user\n', 'utf8');
+
+        await expect(
+          files.write(link, { path: 'main.tex', content: 'agent version\n' }),
+        ).rejects.toThrow(/changed on disk/);
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+        await rm(real, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses a path that leaves the project through a link, exactly as a read does', async () => {
+      // The seam pairs with a read, so it runs the same guard in the same position: a path no
+      // read could reach must not get a baseline filed for it either.
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+
+        await expect(files.recordBaseline(dir, 'notes.tex', 'PRIVATE KEY\n')).rejects.toThrow(
+          /symlink/,
+        );
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('honours the project link policy by default, as every read does', async () => {
+      // A `followSymlinks: true` project reads its shared refs.bib through a link, so the seam
+      // must be able to record what that read returned; a stricter default here would refuse the
+      // claim for exactly the files the read allowed.
+      const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-shared-'));
+      try {
+        await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+        await symlink(path.join(shared, 'refs.bib'), path.join(dir, 'refs.bib'));
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+        const shown = await local.readText(dir, 'refs.bib');
+        await local.recordBaseline(dir, 'refs.bib', shown);
+
+        await writeFile(path.join(shared, 'refs.bib'), '@misc{a, title={B}}\n', 'utf8');
+        await expect(
+          local.write(dir, { path: 'refs.bib', content: '@misc{a, title={C}}\n' }),
+        ).rejects.toThrow(/changed on disk/);
+
+        // …and `strictLinks` is still available for a record the server makes on its own.
+        await expect(
+          local.recordBaseline(dir, 'refs.bib', shown, { strictLinks: true }),
+        ).rejects.toThrow(/symlink/);
+      } finally {
+        await rm(shared, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('linkTarget', () => {
+    it('returns null for a plain file (no link involved)', async () => {
+      expect(await files.linkTarget(dir, 'main.tex')).toBeNull();
+    });
+
+    it('names the real target of a link to a file inside the project', async () => {
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+      await symlink(path.join('..', 'refs.bib'), path.join(dir, 'figures', 'x.png'));
+
+      expect(await files.linkTarget(dir, 'figures/x.png')).toBe('refs.bib');
+    });
+
+    it('resolves the project-relative path through a linked directory', async () => {
+      await mkdir(path.join(dir, 'realfigs'), { recursive: true });
+      await writeFile(path.join(dir, 'realfigs', 'a.png'), 'not really png', 'utf8');
+      await symlink('realfigs', path.join(dir, 'figs'), 'dir');
+
+      expect(await files.linkTarget(dir, 'figs/a.png')).toBe('realfigs/a.png');
+    });
+
+    it('throws the same symlink error a write would raise for a link that leaves the project', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE\n', 'utf8');
+        await symlink(path.join(outside, 'secret.txt'), path.join(dir, 'notes.tex'));
+
+        await expect(files.linkTarget(dir, 'notes.tex')).rejects.toThrow(/symlink/);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('under a local project with followSymlinks, returns the absolute outside target', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-outside2-'));
+      try {
+        await writeFile(path.join(outside, 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+        await symlink(path.join(outside, 'refs.bib'), path.join(dir, 'shared.bib'));
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+
+        const target = await local.linkTarget(dir, 'shared.bib');
+        // toPosix'd so an outside target lands verbatim in tool text the same way as every other
+        // path — the raw realpath is native (backslashes on Windows), and comparing against it
+        // directly would only happen to match on POSIX platforms.
+        expect(target).toBe(toPosix(await realpath(path.join(outside, 'refs.bib'))));
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('returns null for a case-mismatched path to a plain file (no link involved), on any platform', async () => {
+      // On a case-insensitive filesystem (win32/darwin), "Figures/x.png" resolves via realpath to
+      // the real "figures/x.png" — a bare string compare would wrongly report that as a target
+      // pointing somewhere else; this is the scenario samePath's case-insensitive branch exists
+      // for. On a case-sensitive filesystem (linux), "Figures" does not exist at all, so
+      // resolveThroughLinks's ENOENT fallback (real parent + literal re-attached basename) joins
+      // right back onto the exact same string the "expected" side computes — still null, because
+      // no path component was ever actually a symlink. Assert null either way; don't skip.
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'figures', 'x.png'), 'png', 'utf8');
+
+      expect(await files.linkTarget(dir, 'Figures/x.png')).toBeNull();
+    });
+
+    it('reports a dangling link to a not-yet-existing .bib as its target', async () => {
+      // A write through this link would CREATE refs.bib at the far end — the tool layer needs the
+      // target even though nothing is there yet to gate that write behind confirmBibEdit.
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await symlink(path.join('..', 'refs.bib'), path.join(dir, 'figures', 'x.png'));
+
+      expect(await files.linkTarget(dir, 'figures/x.png')).toBe('refs.bib');
+    });
+
+    it('resolves through a linked directory to a .bib one level further in', async () => {
+      // aliased -> real (a linked directory), and figures/chain.png -> ../aliased/refs.bib: the
+      // resolved target has to walk through the linked directory component too, landing on
+      // real/refs.bib rather than stopping at the literal (aliased-relative) spelling.
+      await mkdir(path.join(dir, 'real'), { recursive: true });
+      await mkdir(path.join(dir, 'figures'), { recursive: true });
+      await writeFile(path.join(dir, 'real', 'refs.bib'), '@misc{a, title={A}}\n', 'utf8');
+      await symlink('real', path.join(dir, 'aliased'), 'dir');
+      await symlink(path.join('..', 'aliased', 'refs.bib'), path.join(dir, 'figures', 'chain.png'));
+
+      expect(await files.linkTarget(dir, 'figures/chain.png')).toBe('real/refs.bib');
+    });
+
+    it('still returns null for a plain file when the project is reached through a symlinked parent', async () => {
+      // Same macOS-/var-vs-/private/var scenario as "keeps one identity" above.
+      const real = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-real-'));
+      const parent = await mkdtemp(path.join(os.tmpdir(), 'ovl-linktarget-link-'));
+      const link = path.join(parent, 'project');
+      try {
+        await writeFile(path.join(real, 'main.tex'), 'original\n', 'utf8');
+        await symlink(real, link, 'dir');
+
+        expect(await files.linkTarget(link, 'main.tex')).toBeNull();
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+        await rm(real, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('applyEdits on a file that is not UTF-8', () => {
+    // applyEdits decodes the file as UTF-8 and writes the result back, so an edit to ONE line of
+    // a Latin-1 .tex replaced every non-ASCII byte in the WHOLE file with U+FFFD (ef bf bd).
+    const LATIN1 = Buffer.from('caf\xe9\nHello\n', 'latin1');
+
+    it('refuses the edit and leaves every byte of the file as it was', async () => {
+      await writeFile(path.join(dir, 'latin1.tex'), LATIN1);
+
+      await expect(
+        files.applyEdits(dir, 'latin1.tex', [{ oldString: 'Hello', newString: 'Bye' }]),
+      ).rejects.toThrow(/not valid UTF-8/);
+      await expect(
+        files.applyEdits(dir, 'latin1.tex', [{ startLine: 2, endLine: 2, newString: 'Bye' }]),
+      ).rejects.toThrow(/not valid UTF-8/);
+      expect((await readFile(path.join(dir, 'latin1.tex'))).equals(LATIN1)).toBe(true);
+    });
+
+    it('still lets write_file replace it with fresh content, deliberately', async () => {
+      await writeFile(path.join(dir, 'latin1.tex'), LATIN1);
+      await files.write(dir, { path: 'latin1.tex', content: 'café\nHello\n' });
+      expect(await readFile(path.join(dir, 'latin1.tex'), 'utf8')).toBe('café\nHello\n');
+    });
+
+    it('edits a UTF-8 file with a byte-order mark and multibyte text as before', async () => {
+      await writeFile(path.join(dir, 'bom.tex'), '\ufeffcafé — ünïcode\nHello\n', 'utf8');
+      await files.applyEdits(dir, 'bom.tex', [{ oldString: 'Hello', newString: 'Bye' }]);
+      expect(await readFile(path.join(dir, 'bom.tex'), 'utf8')).toBe('\ufeffcafé — ünïcode\nBye\n');
+    });
+  });
+
+  describe('list with a subdir that is itself a symlink', () => {
+    // `resolveInside` only compares strings, so `subdir: "figs"` passes it even when `figs` is a
+    // committed link to the user's home directory — and `readdir` follows the link. The walk's own
+    // link rule only governs entries it meets INSIDE the tree, never the directory it starts at.
+    it('refuses a subdir that leaves the project, under the default link policy', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-list-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(outside, path.join(dir, 'figs'), 'dir');
+
+        await expect(files.list(dir, { subdir: 'figs' })).rejects.toThrow(/symlink/);
+        // A path BENEATH the link is the same escape, one component further down.
+        await mkdir(path.join(outside, 'deeper'));
+        await expect(files.list(dir, { subdir: 'figs/deeper' })).rejects.toThrow(/symlink/);
+        // Listing the project root still works: the walk skips the link rather than following it.
+        const root = await files.list(dir);
+        expect(root.map((e) => e.path)).not.toContain('figs/secret.txt');
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('still lists a subdir linked to a directory INSIDE the project', async () => {
+      await mkdir(path.join(dir, 'realfigs'));
+      await writeFile(path.join(dir, 'realfigs', 'a.png'), 'png', 'utf8');
+      await symlink('realfigs', path.join(dir, 'figs'), 'dir');
+
+      const listed = await files.list(dir, { subdir: 'figs' });
+      expect(listed.map((e) => e.path)).toEqual(['figs/a.png']);
+    });
+
+    it('follows it for a project whose owner says its links are theirs', async () => {
+      const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-list-shared-'));
+      try {
+        await writeFile(path.join(shared, 'plot.png'), 'png', 'utf8');
+        await symlink(shared, path.join(dir, 'figs'), 'dir');
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+        const listed = await local.list(dir, { subdir: 'figs' });
+        expect(listed.map((e) => e.path)).toEqual(['figs/plot.png']);
+      } finally {
+        await rm(shared, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('externalModifications', () => {

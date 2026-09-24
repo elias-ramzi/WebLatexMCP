@@ -73,6 +73,101 @@ describe('ViewerService', () => {
     for (const name of used) expect(pdfSrc).toContain(name);
   });
 
+  // Clicking the PDF dismisses the comment panel; everything named in PANEL_KEEP leaves it open.
+  // A rename that leaves an id out of that list turns "click the note popup" into "close the
+  // panel under me", which no parse check would catch.
+  it('keeps the comment panel open only for chrome that still exists in the page', async () => {
+    const html = await (await fetch(`${base}/p/demo`)).text();
+    const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
+    const pointerdown = /document\.addEventListener\('pointerdown',[\s\S]*?\n\}\);/.exec(
+      script,
+    )?.[0];
+    expect(pointerdown).toBeTruthy();
+    // Strip the handler's own comments first: a guard named only in the rationale above it is not
+    // a guard, and deleting the `if` while leaving that comment behind must still fail here.
+    const body = pointerdown!.replace(/^\s*\/\/.*$/gm, '');
+    // Wiring alone is not the behaviour: an empty handler body would satisfy a listener check.
+    expect(body).toContain('setPanel(false)');
+    // An incidental click must not close the panel over an in-progress note edit — that strands
+    // editingId, and every later refreshComments() early-returns for the rest of the session.
+    // Matched line-aligned: the comment strip above is line-leading only, so a *trailing* decoy
+    // (`const el = e.target; // if (editingId) return;`) survives it and satisfies a loose probe
+    // while the real guard is gone. Widening the strip to `//[^\n]*$` is not the fix — it would
+    // eat `'http://'`-shaped string literals — so pin the guard's own line instead.
+    expect(body).toMatch(/^\s*if \(editingId\) return;$/m);
+    // Only a primary-button press dismisses, or right-clicking the PDF for the context menu (or
+    // middle-clicking to autoscroll) would close the panel behind it.
+    expect(body).toMatch(/^\s*if \(e\.button !== 0\) return;$/m);
+    // Presence is not enough: a guard that runs after the statement it guards is not a guard. Both
+    // of these sitting below `setPanel(false)` is dead code that disarms them while reading as
+    // present, so pin the position too.
+    expect(body.indexOf('if (editingId) return;')).toBeLessThan(body.indexOf('setPanel(false)'));
+    expect(body.indexOf('if (e.button !== 0) return;')).toBeLessThan(
+      body.indexOf('setPanel(false)'),
+    );
+    const keep = /const PANEL_KEEP = '([^']+)'/.exec(script)?.[1];
+    expect(keep).toBeTruthy();
+    const ids = keep!.split(',').map((s) => s.trim());
+    // Pinned exactly, so dropping any one of the four fails here: `#bar` because the toggle would
+    // otherwise close the panel it just opened, `#panel` because a click inside the list would
+    // dismiss it, and `#fab`/`#pop` because clicking the Comment button or typing in the note
+    // popup would close the panel underneath.
+    expect(ids).toEqual(['#bar', '#panel', '#fab', '#pop']);
+    // Check the ids against the markup half only. The script holds no attribute-shaped `id="…"`
+    // literal today, but one future string there would let PANEL_KEEP corroborate itself.
+    const scriptAt = html.indexOf('<script type="module">');
+    expect(scriptAt).toBeGreaterThan(0);
+    const markup = html.slice(0, scriptAt);
+    for (const sel of ids) {
+      expect(sel).toMatch(/^#[\w-]+$/);
+      expect(markup).toContain(`id="${sel.slice(1)}"`);
+    }
+    // The popup's own Escape is bound to its textarea, so a click on the scrollable quote leaves
+    // the key unhandled. Cancelling the popup has to come *before* the panel branch, or one
+    // keypress closes the panel behind a popup that stays on screen.
+    // Anchored on the Escape guard, not on the first `keydown` listener — the zoom shortcuts
+    // register one earlier in the script. The anchor is *checked*, not trusted: `lastIndexOf`
+    // never returns -1 here, so if this listener's spelling ever changes (`window.` → `document.`,
+    // the natural consistency edit next to the `document.`-bound pointerdown handler two lines
+    // above), the search silently falls back to the zoom listener and the slice widens from a few
+    // hundred bytes to several kB — swallowing the popnote textarea handler and the pointerdown
+    // handler, whose own `getElementById('popcancel')` and `setPanel(false)` then satisfy every
+    // assertion below on code that is not this handler. Two independent checks close that, since
+    // they fail for different reasons: nothing registers a listener between the anchor and the
+    // guard, and each probed call appears exactly once in the slice.
+    const escapeAt = script.indexOf("e.key !== 'Escape'");
+    expect(escapeAt).toBeGreaterThan(0);
+    const KEYDOWN_ANCHOR = "window.addEventListener('keydown'";
+    const kdStart = script.lastIndexOf(KEYDOWN_ANCHOR, escapeAt);
+    expect(kdStart).toBeGreaterThan(0);
+    expect(script.slice(kdStart + KEYDOWN_ANCHOR.length, escapeAt)).not.toContain(
+      'addEventListener',
+    );
+    const keydown = script
+      .slice(kdStart, script.indexOf('\n});', escapeAt))
+      // Comment-stripped like the pointerdown body above, and probed on the whole call rather than
+      // the bare `popcancel` token: a rationale comment naming popcancel above the panel branch
+      // satisfied both otherwise, with the branch itself moved below it.
+      .replace(/^\s*\/\/.*$/gm, '');
+    // Exactly one of each, so a slice that widened past this handler fails on the count instead of
+    // passing on some other handler's occurrence.
+    expect(keydown.match(/setPanel\(false\)/g)).toHaveLength(1);
+    expect(keydown.match(/getElementById\('popcancel'\)/g)).toHaveLength(1);
+    // Both Escape guards, since deleting either is what costs a user the note they were typing —
+    // asserted on the comment-stripped slice, line-aligned, and *ahead of* what they guard. A
+    // guard sitting below `setPanel(false)` is not a guard: every keypress would then cancel the
+    // popup and close the panel, which is a live bug that presence alone reads as fixed.
+    expect(keydown).toMatch(/e\.key !== 'Escape' \|\| e\.defaultPrevented \|\| editingId/);
+    expect(keydown).toMatch(
+      /^\s*if \(e\.key !== 'Escape' \|\| e\.defaultPrevented \|\| editingId\) return;$/m,
+    );
+    expect(keydown.indexOf("e.key !== 'Escape'")).toBeLessThan(keydown.indexOf('setPanel(false)'));
+    expect(keydown).toContain("getElementById('popcancel').click()");
+    expect(keydown.indexOf("getElementById('popcancel')")).toBeLessThan(
+      keydown.indexOf('setPanel(false)'),
+    );
+  });
+
   it('404s an unknown project', async () => {
     const r = await fetch(`${base}/p/nope`);
     expect(r.status).toBe(404);

@@ -8,7 +8,7 @@ with no code changes — only registration.
 > thing — they only reach **remote** servers over HTTPS — so this server does not plug into Le Chat
 > directly (see [Le Chat](#a-note-on-le-chat) at the end).
 
-For **prerequisites** (Node.js ≥ 20, git, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
+For **prerequisites** (Node.js ≥ 20, git 2.25 or newer, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
 and for **authentication** (per-host token resolution: env var → `gh auth token` → git credential
 helper), follow steps 1–3 of your platform guide — they are client-agnostic:
 [macOS](macos.md) · [Linux](linux.md) · [Windows](windows.md). This guide picks up at registration.
@@ -110,7 +110,7 @@ It logs `server ready on stdio` to **stderr** and waits for JSON-RPC (Ctrl-C to 
 ## Notes specific to Mistral
 
 - **The PDF viewer works here.** `viewer` starts a local, loopback-only viewer and opens it in your
-  browser — handy from a terminal agent. It hot-reloads on every compile, and you can select text in
+  browser — handy from a terminal agent. It hot-reloads whenever the auto-detected root file is recompiled, and you can select text in
   the PDF to leave review comments for the model to apply. See [Tools](../tools.md).
 - **In-context guides.** The writing and concurrency guides are surfaced both as MCP `instructions`
   and as fetchable **resources** (`guide://latex/writing-guide`, `guide://latex/concurrency`), so they

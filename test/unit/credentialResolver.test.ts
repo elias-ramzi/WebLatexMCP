@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CredentialResolver, authenticateUrl } from '../../src/services/auth.js';
+import { CredentialResolver } from '../../src/services/auth.js';
 import type { ExecResult } from '../../src/lib/exec.js';
 
 /** Fake exec that returns a gh token for `gh auth token`, and "no entry" for anything else. */
@@ -121,7 +121,7 @@ describe('CredentialResolver', () => {
 describe('CredentialResolver.storeCredential', () => {
   /** Records `git credential approve` input, and replays it on the next `fill` (a fake keychain). */
   function keychainExec(): {
-    exec: (cmd: string, args: string[], opts?: { input?: string }) => Promise<ExecResult>;
+    exec: (cmd: string, args: string[], opts?: { input?: string | Buffer }) => Promise<ExecResult>;
     approved: string[];
   } {
     let stored: string | undefined;
@@ -130,8 +130,11 @@ describe('CredentialResolver.storeCredential', () => {
       approved,
       async exec(cmd, args, opts) {
         if (cmd === 'git' && args[0] === 'credential' && args[1] === 'approve') {
-          approved.push(opts?.input ?? '');
-          stored = /^password=(.*)$/m.exec(opts?.input ?? '')?.[1];
+          // `ExecOptions.input` also carries Buffers now (binary blobs into `git hash-object`);
+          // a credential payload is always text, so normalize before matching.
+          const input = opts?.input === undefined ? '' : opts.input.toString();
+          approved.push(input);
+          stored = /^password=(.*)$/m.exec(input)?.[1];
           return { code: 0, stdout: '', stderr: '', timedOut: false };
         }
         if (cmd === 'git' && args[0] === 'credential' && args[1] === 'fill') {
@@ -166,22 +169,5 @@ describe('CredentialResolver.storeCredential', () => {
     const r = new CredentialResolver({}, exec);
     await r.storeCredential('git.overleaf.com', 'git', 'olp_secret');
     expect(r.allSecrets()).toContain('olp_secret');
-  });
-});
-
-describe('authenticateUrl', () => {
-  it('injects credentials into a GitHub HTTPS URL', () => {
-    expect(
-      authenticateUrl('https://github.com/me/repo.git', {
-        username: 'x-access-token',
-        token: 'tok',
-      }),
-    ).toBe('https://x-access-token:tok@github.com/me/repo.git');
-  });
-
-  it('leaves file:// URLs untouched', () => {
-    expect(authenticateUrl('file:///tmp/x', { username: 'git', token: 'tok' })).toBe(
-      'file:///tmp/x',
-    );
   });
 });

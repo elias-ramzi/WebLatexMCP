@@ -67,7 +67,11 @@ export function registerReadFile(server: McpServer, ctx: AppContext): void {
         }
 
         // The one read whose bytes go back to the caller, so the one read that may claim the
-        // out-of-band-edit baseline — see FileService.read.
+        // out-of-band-edit baseline. Asking for it is not getting it: `FileService.read` grants
+        // the claim only for a WHOLE-file read, and refuses it for a `startLine`/`endLine` one
+        // (#181) — the recorded bytes are the whole file's, which a ranged read never showed. The
+        // rule lives there rather than here on purpose, so no caller can get it wrong; this flag
+        // says only that a caller-named read is the kind of read that is eligible for it.
         const result = await ctx.files.read(dir, {
           path: relPath,
           startLine,

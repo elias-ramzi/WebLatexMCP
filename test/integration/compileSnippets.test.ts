@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { logBaseDir } from '../../src/services/compiler.js';
+import { CompilerResolver } from '../../src/services/compilerResolver.js';
 import { MAX_REPORTED_PATH_CHECKS } from '../../src/lib/sourceSnippet.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ServerConfig } from '../../src/types.js';
@@ -35,6 +36,7 @@ function stubCompiler(log: string) {
       log,
       timedOut: false,
       logBaseDir: logBaseDir(req.rootFile),
+      rebuilt: true,
     }),
   };
 }
@@ -66,7 +68,9 @@ async function setup(
     { name: 'Test', email: 'test@example.com' },
     new ProjectRegistry(workspace),
   );
-  ctx.compiler = stubCompiler(log);
+  // `ctx.compiler` is the backend *resolver*; hand it a factory that always yields the stub, so
+  // these tests exercise the real selection path (latexmk, present, no fallback) with no TeX.
+  ctx.compiler = new CompilerResolver('latexmk', false, () => stubCompiler(log));
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test', version: '0.0.0' });
@@ -92,7 +96,12 @@ describe('compile: source context', () => {
     await client.callTool({ name: 'read_file', arguments: { project: 'doc', path: 'paper.tex' } });
     // The user edits the file directly, in their own editor.
     await writeFile(path.join(userDir, 'paper.tex'), 'EDITED BY HAND\n', 'utf8');
-    await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const compiled = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    // This test asserts the *absence* of a recorded baseline, so it would pass just as well if
+    // compile never ran at all — and backend preflight gave compile a new way to bail out before
+    // touching a file. Pin that it really got as far as compiling, or the guard below is vacuous.
+    expect(compiled.isError).toBeFalsy();
+    expect((compiled.structuredContent as { rootFile?: string }).rootFile).toBe('paper.tex');
 
     const write = await client.callTool({
       name: 'write_file',
@@ -282,29 +291,44 @@ describe('compile: source context', () => {
     // Resolving where a log's paths lead is capped, and past the cap a location is withheld. That
     // is caution about a path nobody looked at — reporting it as a symlink escape accuses the
     // document of something the server never checked, and sends the caller hunting for a link
-    // that does not exist. The withheld location must also take its snippet with it: the excerpt
-    // is rendered against `line`, so source with no line is source with nowhere to go.
+    // that does not exist.
+    //
+    // The diagnostic that lands past the cap is a WARNING here, and that is forced rather than
+    // chosen (#162): paths are resolved in the order `[...errors, ...warnings]`, so an ERROR past
+    // the 200-path cap sits at index 200+ of `errors[]` — which is now past the 20-error result
+    // cap by construction, so it is not in the result to assert on at all. The other half of the
+    // original claim, that a withheld location takes its snippet with it (the excerpt is rendered
+    // against `line`, so source with no line is source with nowhere to go), is pinned directly on
+    // `withoutUnopenableLocation` in test/unit/sourceSnippet.test.ts, and on the escaped-path
+    // branch by the symlink test above, which sits at index 0 and is unaffected by any cap.
     const noise = Array.from(
       { length: MAX_REPORTED_PATH_CHECKS },
       (_, i) => `./aux-${i}.log:1: Undefined control sequence.`,
     );
     const { client } = await setup(
       { 'main.tex': '\\documentclass{article}\n\\begin{document}\nhi $x\n\\end{document}\n' },
-      [...noise, './main.tex:3: Missing $ inserted.', ''].join('\n'),
+      [
+        ...noise,
+        '(./main.tex',
+        "LaTeX Warning: Reference `fig:x' undefined on input line 3.",
+        ')',
+        '',
+      ].join('\n'),
     );
 
     const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
     const structured = res.structuredContent as {
       errors: Array<{ file?: string; line?: number; message: string; snippet?: string }>;
+      warnings: Array<{ file?: string; line?: number; message: string }>;
       omittedSnippetLocations: number;
     };
-    const real = structured.errors.find((e) => e.message.includes('Missing $'));
+    // The noise itself was resolved and is fine, so it keeps its locations.
+    expect(structured.errors[0]?.file).toBe('aux-0.log');
+    const real = structured.warnings.find((w) => w.message.includes('fig:x'));
     expect(real).toBeDefined();
     // Withheld, because it sits past the cap — an in-project file that is perfectly fine.
     expect(real?.file).toBeUndefined();
     expect(real?.line).toBeUndefined();
-    // …and the snippet the server had already read goes with the location it belongs to.
-    expect(real?.snippet).toBeUndefined();
 
     const text = textOf(res);
     expect(text).toContain('never checked');

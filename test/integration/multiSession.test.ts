@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -10,6 +10,8 @@ import { createContext } from '../../src/context.js';
 import { createServer } from '../../src/server.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { GitService } from '../../src/services/gitService.js';
+import { sessionDir } from '../../src/lib/sessionPaths.js';
+import { bootStampFrom, currentBootStamp } from '../../src/lib/bootIdentity.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -268,6 +270,175 @@ describe('two sessions sharing one clone', () => {
     expect(res.files.map((f) => f.path)).toEqual(['notes.txt']);
   });
 
+  it('scope "paths" commits exactly the named paths, leaving a live peer\'s work untouched', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    await editB(b);
+    await writeFile(path.join(dir, 'notes.txt'), 'hand written\n', 'utf8');
+
+    const res = await call<{
+      scope: string;
+      files: Array<{ path: string }>;
+      leftUncommitted: string[];
+    }>(a, 'commit', { message: 'A: notes', scope: 'paths', paths: ['notes.txt'] });
+    expect(res.scope).toBe('paths');
+    expect(res.files.map((f) => f.path)).toEqual(['notes.txt']);
+    expect(res.leftUncommitted).toContain(REL);
+
+    // B's in-flight paragraph was never touched, and can still be committed on its own.
+    const second = await call<{ sha: string }>(b, 'commit', { message: 'B: revise the loss' });
+    const final = await simpleGit(dir).show([`${second.sha}:${REL}`]);
+    expect(final).toContain('per B.');
+  });
+
+  it('scope "paths" refuses without a non-empty paths list', async () => {
+    const { session } = await setup();
+    const a = await session('alpha');
+
+    const noPaths = await callExpectingError(a, 'commit', { message: 'x', scope: 'paths' });
+    expect(noPaths).toContain('non-empty');
+
+    const emptyPaths = await callExpectingError(a, 'commit', {
+      message: 'x',
+      scope: 'paths',
+      paths: [],
+    });
+    expect(emptyPaths).toContain('non-empty');
+  });
+
+  it('scope "paths" refuses a path a live peer owns', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    await editB(b);
+    const headBefore = (await simpleGit(dir).revparse(['HEAD'])).trim();
+
+    const err = await callExpectingError(a, 'commit', {
+      message: 'A: take method',
+      scope: 'paths',
+      paths: [REL],
+    });
+    expect(err).toContain('beta');
+    expect(err).toContain(REL);
+
+    // Nothing moved: B's paragraph is still on disk, and HEAD is unchanged.
+    expect(await readFile(path.join(dir, REL), 'utf8')).toContain('per B.');
+    expect((await simpleGit(dir).revparse(['HEAD'])).trim()).toBe(headBefore);
+  });
+
+  it('scope "paths" refuses a path that is not dirty', async () => {
+    const { session } = await setup();
+    const a = await session('alpha');
+
+    const err = await callExpectingError(a, 'commit', {
+      message: 'nothing changed',
+      scope: 'paths',
+      paths: [REL],
+    });
+    expect(err).toContain('Nothing to commit at');
+  });
+
+  it('scope "paths" fails closed when a live peer\'s shadow index is unreadable', async () => {
+    const { dir, workspace, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    // Registers beta as live (a heartbeat) without giving it a shadow index of its own.
+    await call(b, 'status', {});
+    const shadowFile = path.join(sessionDir(workspace, 'demo', 'beta'), 'shadow.json');
+    await mkdir(path.dirname(shadowFile), { recursive: true });
+    await writeFile(shadowFile, 'not json', 'utf8');
+    await writeFile(path.join(dir, 'notes.txt'), 'hand written\n', 'utf8');
+
+    const err = await callExpectingError(a, 'commit', {
+      message: 'A: notes',
+      scope: 'paths',
+      paths: ['notes.txt'],
+    });
+    expect(err).toContain('unreadable');
+  });
+
+  it('scope "paths" refuses a path that escapes the clone', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+    const headBefore = (await simpleGit(dir).revparse(['HEAD'])).trim();
+
+    const err = await callExpectingError(a, 'commit', {
+      message: 'escape',
+      scope: 'paths',
+      paths: ['../outside.txt'],
+    });
+    // Assert on the escape-specific message, not merely that *some* error occurred — a schema
+    // rejection of "paths" itself would also count as "an error" and mask the guard not running.
+    expect(err).toContain('escapes');
+    expect((await simpleGit(dir).revparse(['HEAD'])).trim()).toBe(headBefore);
+  });
+
+  it('scope "paths" given a directory commits every file under it', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+    await mkdir(path.join(dir, 'figs'), { recursive: true });
+    await writeFile(path.join(dir, 'figs', 'a.txt'), 'a\n', 'utf8');
+    await writeFile(path.join(dir, 'figs', 'b.txt'), 'b\n', 'utf8');
+    await writeFile(path.join(dir, 'notes.txt'), 'hand written\n', 'utf8');
+
+    const res = await call<{
+      files: Array<{ path: string }>;
+      leftUncommitted: string[];
+    }>(a, 'commit', { message: 'figs', scope: 'paths', paths: ['figs'] });
+    expect(res.files.map((f) => f.path).sort()).toEqual(['figs/a.txt', 'figs/b.txt']);
+    expect(res.leftUncommitted).toContain('notes.txt');
+  });
+
+  it('scope "paths" does not sweep up a peer\'s line staged directly in the shared index', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+
+    // Simulate a peer's in-flight `commitContents` call that threw between `update-index` and
+    // `commit` (or a hand `git add` in the clone): a file is staged in the shared index without
+    // going through any session's shadow.
+    await writeFile(path.join(dir, 'peer.tex'), 'PEER IN-FLIGHT LINE\n', 'utf8');
+    await simpleGit(dir).add(['peer.tex']);
+    await writeFile(path.join(dir, 'notes.txt'), 'hand written\n', 'utf8');
+
+    const res = await call<{
+      scope: string;
+      files: Array<{ path: string }>;
+      leftUncommitted: string[];
+    }>(a, 'commit', { message: 'A: notes only', scope: 'paths', paths: ['notes.txt'] });
+
+    expect(res.scope).toBe('paths');
+    expect(res.files.map((f) => f.path)).toEqual(['notes.txt']);
+
+    const shown = await simpleGit(dir).raw(['show', '--name-only', '--format=', 'HEAD']);
+    expect(
+      shown
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ).toEqual(['notes.txt']);
+
+    // The peer's staged-but-uncommitted line is still on disk, untouched, and reported as left
+    // behind rather than silently swept into A's commit.
+    expect(await readFile(path.join(dir, 'peer.tex'), 'utf8')).toContain('PEER IN-FLIGHT LINE');
+    expect(res.leftUncommitted).toContain('peer.tex');
+  });
+
+  it('scope "paths" commits a path that is dirty only in the index (staged, working tree clean)', async () => {
+    const { dir, session } = await setup();
+    const a = await session('alpha');
+
+    await writeFile(path.join(dir, 'out.txt'), 'staged only\n', 'utf8');
+    await simpleGit(dir).add(['out.txt']);
+
+    const res = await call<{ files: Array<{ path: string }> }>(a, 'commit', {
+      message: 'A: staged out.txt',
+      scope: 'paths',
+      paths: ['out.txt'],
+    });
+    expect(res.files.map((f) => f.path)).toEqual(['out.txt']);
+  });
+
   it('refuses to push while a live peer has uncommitted work', async () => {
     const { session } = await setup();
     const a = await session('alpha');
@@ -281,6 +452,107 @@ describe('two sessions sharing one clone', () => {
     const err = await callExpectingError(a, 'push', { message: 'push A', confirm: true });
     expect(err).toContain('not this session');
     expect(err).toContain('beta');
+  });
+
+  it('pushes over untracked files left by a peer that has exited', async () => {
+    const { remote, dir, workspace, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+
+    // Beta registers itself (a heartbeat) and writes a new file, but never commits it.
+    await call(b, 'status', {});
+    await call(b, 'write_file', {
+      path: 'sections/extra.tex',
+      content: 'A stray section beta never committed.\n',
+    });
+
+    // Simulate beta's process having exited: an unreachable pid and a heartbeat well past stale.
+    const recordPath = path.join(sessionDir(workspace, 'demo', 'beta'), 'session.json');
+    const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(
+      recordPath,
+      JSON.stringify(
+        {
+          ...record,
+          pid: 999999999,
+          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    // Alpha edits and commits only its own paragraph; beta's untracked file stays in the clone,
+    // owned by nobody live.
+    await editA(a);
+    await call(a, 'commit', { message: 'A: revise the assumption' });
+
+    const pushed = await call<{ status: string }>(a, 'push', { confirm: true });
+    expect(pushed.status).toBe('pushed');
+
+    // Beta's file rides through untouched and was never pushed.
+    expect(await readFile(path.join(dir, 'sections', 'extra.tex'), 'utf8')).toBe(
+      'A stray section beta never committed.\n',
+    );
+    const verify = await mkdtemp(path.join(os.tmpdir(), 'wlm-verify-'));
+    cleanups.push(() => rm(verify, { recursive: true, force: true }));
+    await simpleGit().clone(remote.url, verify);
+    await expect(readFile(path.join(verify, 'sections', 'extra.tex'), 'utf8')).rejects.toThrow();
+  });
+
+  it('pushes over untracked files left by a boot-reused-pid ghost (a pid that is alive again, but not the same process)', async () => {
+    const { remote, dir, workspace, session } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+
+    // Beta registers itself (a heartbeat) and writes a new file, but never commits it.
+    await call(b, 'status', {});
+    await call(b, 'write_file', {
+      path: 'sections/extra.tex',
+      content: 'A stray section beta never committed.\n',
+    });
+
+    // Simulate beta's process having exited across a reboot: its pid is alive again (reused by an
+    // unrelated process — here, this very test process, which is guaranteed alive), the boot that
+    // recorded it is not the current one, and its heartbeat is well past stale. Before boot-scoping
+    // this was the exact defect (#pid-reuse): `pidAlive` alone stayed true forever and `push`
+    // refused indefinitely with no way to clear it but deleting the session file by hand.
+    const boot = currentBootStamp();
+    const priorBoot = bootStampFrom(Date.parse(boot) - 24 * 60 * 60 * 1000, 0);
+    const recordPath = path.join(sessionDir(workspace, 'demo', 'beta'), 'session.json');
+    const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(
+      recordPath,
+      JSON.stringify(
+        {
+          ...record,
+          pid: process.pid,
+          bootedAt: priorBoot,
+          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    // Alpha edits and commits only its own paragraph; beta's untracked file stays in the clone,
+    // owned by nobody live.
+    await editA(a);
+    await call(a, 'commit', { message: 'A: revise the assumption' });
+
+    const pushed = await call<{ status: string }>(a, 'push', { confirm: true });
+    expect(pushed.status).toBe('pushed');
+
+    // Beta's file rides through untouched and was never pushed.
+    expect(await readFile(path.join(dir, 'sections', 'extra.tex'), 'utf8')).toBe(
+      'A stray section beta never committed.\n',
+    );
+    const verify = await mkdtemp(path.join(os.tmpdir(), 'wlm-verify-'));
+    cleanups.push(() => rm(verify, { recursive: true, force: true }));
+    await simpleGit().clone(remote.url, verify);
+    await expect(readFile(path.join(verify, 'sections', 'extra.tex'), 'utf8')).rejects.toThrow();
   });
 
   it('pushes once the peer has committed', async () => {

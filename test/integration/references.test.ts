@@ -1,14 +1,20 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
-import { createContext } from '../../src/context.js';
+import { createContext, type AppContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
+import { expectDeclaredField } from '../helpers/outputSchema.js';
+import {
+  REFERENCE_FIELDS_BUDGET,
+  REFERENCE_MAX_FIELD_VALUE_LENGTH,
+} from '../../src/lib/referenceFieldsBudget.js';
+import { REFERENCE_MAX_RAW_LENGTH } from '../../src/lib/referenceRawBudget.js';
 
 /**
  * The case this exists for: a document that is neither on a git remote nor a `.bib`. A proposal
@@ -82,7 +88,7 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-async function setup(): Promise<{ client: Client; userDir: string }> {
+async function setup(): Promise<{ client: Client; userDir: string; ctx: AppContext }> {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-ws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-refs-dir-'));
   cleanups.push(
@@ -108,7 +114,7 @@ async function setup(): Promise<{ client: Client; userDir: string }> {
     name: 'register_project',
     arguments: { project: 'proposal', path: userDir },
   });
-  return { client, userDir };
+  return { client, userDir, ctx };
 }
 
 /** A second project, registered in place, so a cross-project call has somewhere to reach. */
@@ -465,5 +471,332 @@ describe('a bibliography in another project', () => {
     // Not foreign, so nothing is narrowed: the uncited entry is still dead weight worth reporting.
     expect(report.bibliographyProject).toBeUndefined();
     expect(report.uncitedEntries.map((e) => e.key)).toEqual(['never2019cited']);
+  });
+});
+
+/**
+ * Issue #137: `entries[].fields` was emitted and never declared. The MCP SDK validates a result
+ * against the advertised `outputSchema` and throws the parse result away — and a zod object strips
+ * rather than rejects — so the key travelled unvalidated and unstripped, and no client was ever
+ * told it exists. These assertions therefore go through `tools/list`: asserting on
+ * `structuredContent` alone is what let the hole stand for as long as it did (#130).
+ */
+describe('the raw BibTeX field map is declared, and budgeted', () => {
+  it('advertises `entries[].fields` and its budget reporting in the schema clients read', async () => {
+    const { client, userDir } = await setup();
+    await writeFile(path.join(userDir, 'ref.bib'), BIB);
+
+    await expectDeclaredField(client, 'list_references', 'entries[].fields', {
+      required: false,
+      description: /raw BibTeX fields/,
+    });
+    await expectDeclaredField(client, 'list_references', 'entries[].fieldsOmitted', {
+      required: false,
+    });
+    await expectDeclaredField(client, 'list_references', 'fieldsNote', { required: false });
+
+    // And the declaration matches the behaviour: a real `.bib` entry still carries its field map,
+    // with the `@string` macro expanded, exactly as before this was declared.
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib', filter: 'he2016deep' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ fields?: Record<string, string>; fieldsOmitted?: number }>;
+      fieldsNote?: string;
+    };
+    expect(entries[0]!.fields).toMatchObject({
+      booktitle: 'IEEE/CVF Conference on Computer Vision and Pattern Recognition',
+      year: '2016',
+    });
+    expect(entries[0]!.fieldsOmitted).toBeUndefined();
+    // Nothing was cut, so the report keys are absent rather than present-and-zero.
+    expect(fieldsNote).toBeUndefined();
+  });
+
+  it('sends no field map at all for a prose entry, which has none to send', async () => {
+    const { client } = await setup();
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal' },
+    });
+    const { entries } = res.structuredContent as { entries: Array<Record<string, unknown>> };
+    expect(entries.every((e) => e.format === 'prose')).toBe(true);
+    expect(entries.some((e) => 'fields' in e)).toBe(false);
+  });
+
+  it('drops an over-long field whole rather than shortening it, and says which bound fired', async () => {
+    const { client, userDir } = await setup();
+    const abstract = `A ${'very '.repeat(REFERENCE_MAX_FIELD_VALUE_LENGTH / 4)}long abstract.`;
+    await writeFile(
+      path.join(userDir, 'ref.bib'),
+      [
+        '@article{verbose2024,',
+        '  title    = {A Modest Title},',
+        `  abstract = {${abstract}},`,
+        '  year     = {2024},',
+        '}',
+        '',
+      ].join('\n'),
+    );
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ fields?: Record<string, string>; fieldsOmitted?: number; raw: string }>;
+      fieldsNote?: string;
+    };
+    const entry = entries[0]!;
+    expect(Object.keys(entry.fields!)).toEqual(['title', 'year']);
+    // Dropped, never truncated: no shortened `abstract` posing as an exact BibTeX value.
+    expect(Object.values(entry.fields!).join('')).not.toContain('very very');
+    expect(entry.fieldsOmitted).toBe(1);
+    expect(fieldsNote).toContain('dropped whole');
+    // And the remedy the note names actually works — `raw` still has every byte.
+    expect(entry.raw).toContain('very very');
+    // The text channel says so too; a client reading only prose must not think `fields` is whole.
+    expect(textOf(res)).toContain('dropped whole');
+  });
+
+  it('holds the whole result inside one budget, cutting a tail it counts', async () => {
+    const { client, userDir } = await setup();
+    // Twenty entries, each carrying ~1900 characters of `note`: ~38k of field maps, well past the
+    // 20000-char budget, so the later entries lose theirs entirely.
+    const bulky = Array.from({ length: 20 }, (_, i) =>
+      [
+        `@article{bulk${i},`,
+        `  title = {Entry ${i}},`,
+        `  note  = {${'n'.repeat(REFERENCE_MAX_FIELD_VALUE_LENGTH - 100)}},`,
+        '}',
+        '',
+      ].join('\n'),
+    ).join('\n');
+    await writeFile(path.join(userDir, 'ref.bib'), bulky);
+
+    const res = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'proposal', path: 'ref.bib' },
+    });
+    const { entries, fieldsNote } = res.structuredContent as {
+      entries: Array<{ key: string; fields?: Record<string, string>; fieldsOmitted?: number }>;
+      fieldsNote?: string;
+    };
+    expect(entries).toHaveLength(20);
+
+    // Every entry is still returned in full but for its field map, which is a cut TAIL: the first
+    // N carry theirs, the rest carry a count. No holes, and nothing reordered.
+    const withFields = entries.map((e) => 'fields' in e);
+    const firstCut = withFields.indexOf(false);
+    expect(firstCut).toBeGreaterThan(0);
+    expect(withFields.slice(firstCut).some(Boolean)).toBe(false);
+    expect(entries.map((e) => e.key)).toEqual(entries.map((_, i) => `bulk${i}`));
+    expect(entries[19]!.fieldsOmitted).toBe(2);
+    expect(fieldsNote).toContain(`${REFERENCE_FIELDS_BUDGET}-char budget`);
+
+    const rendered = entries.reduce(
+      (sum, e) => (e.fields ? sum + JSON.stringify(e.fields).length + 10 : sum),
+      0,
+    );
+    expect(rendered).toBeLessThanOrEqual(REFERENCE_FIELDS_BUDGET);
+  });
+});
+
+/** Two BibTeX entries per file, so a `maxResults` boundary can fall cleanly between two files. */
+function bibOf(prefix: string, count: number): string {
+  return Array.from({ length: count }, (_, i) =>
+    [
+      `@article{${prefix}${i},`,
+      `  title = {Entry ${i} of ${prefix}},`,
+      '  year  = {2016},',
+      '}',
+      '',
+    ].join('\n'),
+  ).join('\n');
+}
+
+/**
+ * Issue #171: `list_references` used to claim the out-of-band-edit baseline over every file it
+ * opened, on the premise that it hands back every entry verbatim. #147, #165 and #170 killed that
+ * premise, and recording does not ARM the guard — it RESETS it, so the claim disarmed the guard
+ * for files the caller had only seen part of.
+ *
+ * Note what "the guard" means here: a write refuses only when a baseline EXISTS and is stale, so
+ * each of these has to arm one with `read_file` first. That is also why the fix is to narrow the
+ * claim rather than drop it: with no baseline at all, a write is not refused, it is silent.
+ */
+describe('the out-of-band-edit baseline a listing may claim', () => {
+  it('leaves the guard armed for a bibliography it returned only one page of', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    const original = bibOf('paged', 4);
+    await writeFile(path.join(dir, 'refs.bib'), original);
+
+    // The agent reads the file, which is what arms the guard.
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'refs.bib' } });
+    // The user then hand-edits it in their own editor.
+    const handEdited = `${original}\n@article{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'refs.bib'), handEdited);
+
+    // The listing shows two of the five entries, so the caller never sees the hand edit.
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib', maxResults: 2 },
+    });
+    const { truncated, entries } = listed.structuredContent as {
+      truncated: boolean;
+      entries: Array<{ key: string }>;
+    };
+    expect(truncated).toBe(true);
+    expect(entries.map((e) => e.key)).not.toContain('typed2026byhand');
+
+    // So the next blind write is still refused, and the hand edit is still on disk.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'refs.bib',
+        content: original,
+        confirmBibEdit: true,
+      },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(handEdited);
+  });
+
+  it('leaves it armed when a budget cut an entry, even with every entry listed', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    // One entry whose verbatim text is past the per-entry `raw` cap: nothing is paged out here,
+    // and the caller still does not receive this file whole.
+    const original = [
+      '@article{bulky2024,',
+      '  title = {A Modest Title},',
+      `  note  = {${'n'.repeat(REFERENCE_MAX_RAW_LENGTH)}},`,
+      '}',
+      '',
+    ].join('\n');
+    await writeFile(path.join(dir, 'refs.bib'), original);
+
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'refs.bib' } });
+    const handEdited = `${original}\n@misc{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'refs.bib'), handEdited);
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib' },
+    });
+    const { truncated, entries } = listed.structuredContent as {
+      truncated: boolean;
+      entries: Array<{ key: string; rawOmitted?: number }>;
+    };
+    // Every entry is listed — the hand-typed one included — but one of them arrived cut.
+    expect(truncated).toBe(false);
+    expect(entries.map((e) => e.key)).toContain('typed2026byhand');
+    expect(entries[0]!.rawOmitted).toBeGreaterThan(0);
+
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'bibs', path: 'refs.bib', content: original, confirmBibEdit: true },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+  });
+
+  it('claims it per file: the one returned whole, never the one cut beside it', async () => {
+    const { client } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    // `.bib` files are listed first and then alphabetically, so `a.bib` fills the page and
+    // `z.bib` gets none of it.
+    await writeFile(path.join(dir, 'a.bib'), bibOf('alpha', 2));
+    await writeFile(path.join(dir, 'z.bib'), bibOf('zeta', 2));
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'a.bib' } });
+    await client.callTool({ name: 'read_file', arguments: { project: 'bibs', path: 'z.bib' } });
+
+    // The user hand-edits both, so neither baseline matches the disk any more.
+    const alpha = `${bibOf('alpha', 2)}\n@misc{alphaHand,\n  title = {Typed By Hand},\n}\n`;
+    const zeta = `${bibOf('zeta', 2)}\n@misc{zetaHand,\n  title = {Typed By Hand},\n}\n`;
+    await writeFile(path.join(dir, 'a.bib'), alpha);
+    await writeFile(path.join(dir, 'z.bib'), zeta);
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', maxResults: 3 },
+    });
+    const { sources, entries } = listed.structuredContent as {
+      sources: Array<{ path: string; count: number }>;
+      entries: Array<{ path: string }>;
+    };
+    expect(sources.map((s) => `${s.path}:${s.count}`)).toEqual(['a.bib:3', 'z.bib:3']);
+    expect(entries.every((e) => e.path === 'a.bib')).toBe(true);
+
+    // `z.bib` contributed nothing to the page, so its baseline is untouched and stale.
+    const refused = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'z.bib',
+        content: bibOf('zeta', 2),
+        confirmBibEdit: true,
+      },
+    });
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain('changed on disk');
+
+    // `a.bib` came back whole, hand edit and all, so the caller CAN base a write on it: the
+    // narrowing must not become a blanket refusal to record.
+    const allowed = await client.callTool({
+      name: 'write_file',
+      arguments: {
+        project: 'bibs',
+        path: 'a.bib',
+        content: bibOf('alpha', 2),
+        confirmBibEdit: true,
+      },
+    });
+    expect(allowed.isError).toBeFalsy();
+  });
+
+  it('records the bytes the caller was shown, not what the file says a moment later', async () => {
+    // Issue #182. The old fix re-read every fully-shipped bibliography just to record it, and a
+    // hand edit landing between the two reads was recorded AS the baseline — so the guard never
+    // fired for it. Here the edit lands the instant the parse read returns, which is exactly that
+    // window; recording the bytes already in hand is what closes it.
+    const { client, ctx } = await setup();
+    const dir = await registerLocalProject(client, 'bibs');
+    const original = bibOf('paged', 2);
+    await writeFile(path.join(dir, 'refs.bib'), original);
+    const handEdited = `${original}\n@misc{typed2026byhand,\n  title = {Typed By Hand},\n}\n`;
+
+    const realReadText = ctx.files.readText.bind(ctx.files);
+    let armed = true;
+    ctx.files.readText = async (projectDir, relPath, opts) => {
+      const out = await realReadText(projectDir, relPath, opts);
+      if (armed && relPath === 'refs.bib') {
+        armed = false;
+        await writeFile(path.join(dir, 'refs.bib'), handEdited);
+      }
+      return out;
+    };
+
+    const listed = await client.callTool({
+      name: 'list_references',
+      arguments: { project: 'bibs', path: 'refs.bib' },
+    });
+    const { entries } = listed.structuredContent as { entries: Array<{ key: string }> };
+    // What the caller received is the pre-edit file, whole — the hand-typed entry is not in it.
+    expect(entries.map((e) => e.key)).toEqual(['paged0', 'paged1']);
+
+    // So the baseline is those bytes, the disk no longer matches, and a blind write is refused.
+    const wrote = await client.callTool({
+      name: 'write_file',
+      arguments: { project: 'bibs', path: 'refs.bib', content: original, confirmBibEdit: true },
+    });
+    expect(wrote.isError).toBe(true);
+    expect(textOf(wrote)).toContain('changed on disk');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(handEdited);
   });
 });

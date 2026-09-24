@@ -1,0 +1,238 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createFakeRemote, pushCommit, type FakeRemote } from './helpers/bareRepo.js';
+import { createContext, type AppContext } from '../../src/context.js';
+import { createServer } from '../../src/server.js';
+import { CredentialResolver } from '../../src/services/auth.js';
+import { GitService } from '../../src/services/gitService.js';
+import type { ServerConfig } from '../../src/types.js';
+
+/**
+ * `project_sync`'s pull-refusal attribution (finding 2, issue review on #60-62): when
+ * `LocalChangesOverwriteError` names a tracked file blocking the fast-forward, the tool used to
+ * attribute EVERY named path to a live peer without first subtracting this session's own edits —
+ * so a file this very session had just edited (via `edit_file`) was reported as "not this
+ * session's", which is false. The fix mirrors `guardPeerWork` (`src/lib/peerRefusal.ts`): subtract this session's
+ * own shadow paths before attributing, and append nothing when nothing foreign remains.
+ *
+ * Harness copied from test/integration/pushAttribution.test.ts (real MCP clients, a local bare
+ * repo, no network).
+ */
+
+const REL = 'sections/method.tex';
+
+const BASE = [
+  '\\section{Method}',
+  'The first paragraph opens the method.',
+  'It then states the assumption.',
+  '',
+].join('\n');
+
+const IDENTITY = { name: 'Test', email: 'test@example.com' };
+
+interface Session {
+  client: Client;
+  close: () => Promise<void>;
+}
+
+describe('project_sync pull-refusal attribution', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  async function setup(): Promise<{
+    remote: FakeRemote;
+    dir: string;
+    session: (id: string, patchCtx?: (ctx: AppContext) => void) => Promise<Session>;
+  }> {
+    const remote = await createFakeRemote({ [REL]: BASE });
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-syncattr-'));
+    cleanups.push(remote.cleanup, () => rm(workspace, { recursive: true, force: true }));
+
+    const baseConfig = {
+      workspaceRoot: workspace,
+      projects: [{ id: 'demo', gitUrl: remote.url }],
+      defaultProject: 'demo',
+    };
+    const dir = path.join(workspace, 'demo');
+    await new GitService(IDENTITY).clone(remote.url, dir, { username: 'git' });
+
+    const session = async (id: string, patchCtx?: (ctx: AppContext) => void): Promise<Session> => {
+      const config: ServerConfig = { ...baseConfig, sessionId: id };
+      const ctx = createContext(config, new CredentialResolver({}), IDENTITY);
+      patchCtx?.(ctx);
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: `test-${id}`, version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const close = (): Promise<void> => client.close();
+      cleanups.push(close);
+      return { client, close };
+    };
+
+    return { remote, dir, session };
+  }
+
+  async function call<T = Record<string, unknown>>(
+    session: Session,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<T> {
+    const res = await session.client.callTool({ name, arguments: args });
+    if (res.isError) throw new Error(`${name} failed: ${JSON.stringify(res.content)}`);
+    return res.structuredContent as T;
+  }
+
+  async function callExpectingError(
+    session: Session,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const res = await session.client.callTool({ name, arguments: args });
+    expect(res.isError, `${name} was expected to fail`).toBe(true);
+    return JSON.stringify(res.content);
+  }
+
+  const editMethod = (s: Session, newString: string): Promise<unknown> =>
+    call(s, 'edit_file', {
+      path: REL,
+      edits: [{ oldString: 'It then states the assumption.', newString }],
+    });
+
+  it("does not claim this session's own uncommitted edit is not its own", async () => {
+    const { remote, session } = await setup();
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // alpha edits the file itself (uncommitted) — this is its own in-flight work.
+    await editMethod(alpha, 'It states the assumption, per alpha.');
+    // beta registers as a live peer without touching the file.
+    await call(beta, 'status', {});
+
+    // The remote gains a commit on the same file, so alpha's pull will be refused.
+    await pushCommit(
+      remote,
+      { [REL]: BASE.replace('opens the method.', 'opens it, remotely.') },
+      'remote edit',
+    );
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    // The plain typed LocalChangesOverwriteError message names the file...
+    expect(err).toContain(REL);
+    // ...but since the only colliding path is alpha's own edit, no peer-attribution block should
+    // have been appended: it must not say the change "is not this session's", and must not name
+    // beta as an owner of it.
+    expect(err).not.toContain("not this session's");
+    expect(err).not.toContain('beta');
+  });
+
+  it("attributes the colliding path to a live peer when it is that peer's uncommitted edit", async () => {
+    const { remote, session } = await setup();
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // beta edits the file itself (uncommitted) — alpha never touches it.
+    await editMethod(beta, 'It states the assumption, per beta.');
+
+    await pushCommit(
+      remote,
+      { [REL]: BASE.replace('opens the method.', 'opens it, remotely.') },
+      'remote edit',
+    );
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    expect(err).toContain(REL);
+    expect(err).toContain("not this session's");
+    expect(err).toContain('beta\\" owns');
+    expect(err).toContain(REL);
+
+    // The composed closing must retract `discard` for beta's owned file too — the typed
+    // LocalChangesOverwriteError this refusal is appended to already says "discard" earlier (it
+    // prescribes `discard, paths: [...]` as one of its two named routes for the collision as a
+    // whole), so asserting the word appears anywhere would pass without the retraction. Assert
+    // instead that a retraction sentence appears strictly AFTER the peer-ownership line.
+    const peerLineIdx = err.indexOf('beta\\" owns');
+    expect(peerLineIdx).toBeGreaterThanOrEqual(0);
+    const after = err.slice(peerLineIdx);
+    expect(after).toContain('discard');
+    expect(after).toMatch(/no ownership guard/);
+  });
+
+  it('decorates the pull-worded untracked refusal too, when a live peer owns the new file', async () => {
+    // `enrichPullRefusal` used to decorate only `LocalChangesOverwriteError` (a tracked file's
+    // local modification). `syncPull` also throws a pull-worded `UntrackedOverwriteError` when the
+    // incoming fast-forward would overwrite a file that already sits untracked in the working
+    // tree — and an untracked file CAN be a live peer's: `write_file` of a brand-new path puts it
+    // straight into that peer's shadow. Before the fix this refusal reached the caller plain, with
+    // no attribution at all.
+    const NEW_REL = 'sections/new.tex';
+    const { remote, session } = await setup();
+    const alpha = await session('alpha');
+    const beta = await session('beta');
+
+    // beta writes a brand-new file through the server — its shadow claims it, and it sits
+    // untracked in the shared clone.
+    await call(beta, 'write_file', { path: NEW_REL, content: 'Beta wrote this section.\n' });
+
+    // The remote gains a commit ADDING a file at the same path — the untracked-overwrite
+    // collision `syncPull`'s ff-only merge refuses.
+    await pushCommit(remote, { [NEW_REL]: 'Remote wrote this section.\n' }, 'remote adds new.tex');
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    // The pull-worded UntrackedOverwriteError's own opener and the colliding path.
+    expect(err).toContain('The pull was refused; nothing changed');
+    expect(err).toContain(NEW_REL);
+    // Attributed to the live peer that owns it.
+    expect(err).toContain('beta\\" owns');
+
+    // The composed closing (scope "all" advice with the discard retraction) appears after the
+    // peer-ownership line, worded in project_sync's own (pull) vocabulary.
+    const peerLineIdx = err.indexOf('beta\\" owns');
+    expect(peerLineIdx).toBeGreaterThanOrEqual(0);
+    const after = err.slice(peerLineIdx);
+    expect(after).toContain('scope \\"all\\"');
+    expect(after).toMatch(/no ownership guard/);
+    // Fix 2: the closing no longer tells the caller to "sync again" — a committed collision makes
+    // syncPull report `diverged`, so pull can never land it; push is the route that goes forward.
+    expect(after).toContain('Then push');
+    expect(after).not.toContain('Then sync again.');
+  });
+
+  it('falls back to the plain typed refusal when the peer-attribution enrichment itself fails', async () => {
+    // A rejection from ctx.sessions.livePeers (or ctx.shadows.changes/collectPeerShadows) — an
+    // unreadable session dir, a transient fs error — must not replace the typed
+    // LocalChangesOverwriteError the caller needs to act on; it should just mean the refusal isn't
+    // decorated with peer attribution this time.
+    const { remote, session } = await setup();
+    const alpha = await session('alpha', (ctx) => {
+      ctx.sessions.livePeers = async () => {
+        throw new Error('boom');
+      };
+    });
+
+    await editMethod(alpha, 'It states the assumption, per alpha (broken attribution).');
+
+    await pushCommit(
+      remote,
+      { [REL]: BASE.replace('opens the method.', 'opens it, remotely, again.') },
+      'remote edit 2',
+    );
+
+    const err = await callExpectingError(alpha, 'project_sync', {});
+
+    // Precondition: the typed error named the path, so the enrichment entered its `try` (an
+    // empty `paths` returns before it) and the stubbed `livePeers` really did throw.
+    expect(err).toContain(REL);
+    expect(err).toContain('The pull was refused; nothing changed');
+    expect(err).not.toContain('boom');
+  });
+});

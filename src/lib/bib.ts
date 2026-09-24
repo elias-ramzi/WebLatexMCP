@@ -1,8 +1,29 @@
 import path from 'node:path';
 
-/** Whether a path points at a BibTeX bibliography file. */
+/**
+ * Whether a path points at a BibTeX bibliography file.
+ *
+ * Judged twice, and a match on either counts, so this can only ever widen what is guarded:
+ *
+ *  - on the literal name, as before — on POSIX `refs.tex:x.bib` is a real file with a `.bib`
+ *    extension;
+ *  - on the name **Windows** would open. Win32 path normalisation strips trailing dots and spaces
+ *    from the final component, and `name:stream[:$DATA]` addresses an alternate data stream of
+ *    `name`, so `refs.bib.`, `refs.bib ` and `refs.bib::$DATA` all write `refs.bib` there — while
+ *    `extname` reads `.bib.`, `.bib ` and `.bib::$DATA`, and `write_file` skipped `confirmBibEdit`.
+ *    The final component is cut at its first `:` and then stripped of trailing dots and spaces.
+ *    Only the final component: a drive letter (`C:/…`) or a colon in a directory name is not a
+ *    stream suffix of the file.
+ *
+ * This runs on every platform. On POSIX the second reading calls a file literally named
+ * `refs.bib.` a bibliography, which costs one confirmation — the fail-safe direction.
+ */
 export function isBibFile(relPath: string): boolean {
-  return path.extname(relPath).toLowerCase() === '.bib';
+  if (path.extname(relPath).toLowerCase() === '.bib') return true;
+  const base = relPath.slice(Math.max(relPath.lastIndexOf('/'), relPath.lastIndexOf('\\')) + 1);
+  const colon = base.indexOf(':');
+  const windowsName = (colon === -1 ? base : base.slice(0, colon)).replace(/[. ]+$/, '');
+  return path.extname(windowsName).toLowerCase() === '.bib';
 }
 
 // BibTeX entry header, e.g. `@inproceedings{he2016deep,`. Non-citation directives
@@ -54,12 +75,22 @@ export function mergeBibEntry(existing: string, entry: string): BibMergeResult {
 /**
  * Why direct .bib mutation is refused, and the two sanctioned ways forward. Returned
  * from write/edit/delete when the target is a .bib file and `confirmBibEdit` is unset.
+ *
+ * `target`, when given, means `relPath` is not itself named `.bib` — it is a symlink (possibly
+ * through a linked directory) that lands on one, per `FileService.linkTarget`. The opening
+ * sentence then names both: the path the caller gave, and the .bib it actually resolves to,
+ * so the refusal is not mistaken for a false positive on a `.png`-named path.
  */
-export function bibEditBlockedMessage(relPath: string): string {
+export function bibEditBlockedMessage(relPath: string, target?: string): string {
+  const subject =
+    target === undefined
+      ? `"${relPath}" is a .bib bibliography file and is protected from direct changes.`
+      : `"${relPath}" is a link to "${target}", a .bib bibliography file, and is protected from direct changes.`;
   return (
-    `"${relPath}" is a .bib bibliography file and is protected from direct changes. ` +
+    `${subject} ` +
     'To add a reference, use search_references then add_citation, which fetch verified ' +
-    'BibTeX from DBLP. To change the .bib another way (e.g. remove or fix an entry), ' +
+    'BibTeX from DBLP, Crossref or OpenAlex. To change the .bib another way (e.g. remove or fix ' +
+    'an entry), ' +
     'first ask the user to approve the change, then retry with confirmBibEdit: true.'
   );
 }

@@ -5,7 +5,11 @@ import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createContext } from './context.js';
 import { createServer } from './server.js';
 import { ProjectRegistry } from './services/projectRegistry.js';
-import { loadWritingGuide } from './lib/writingGuide.js';
+import {
+  loadWritingGuide,
+  loadExtraWritingGuide,
+  composeWritingGuide,
+} from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
 import { loadSkills } from './lib/skills.js';
 import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
@@ -14,6 +18,11 @@ import {
   isIncompatibleClient,
   outputSchemaMode,
 } from './lib/outputSchemaCompat.js';
+import {
+  createSessionProbe,
+  installConnectionProbe,
+  sessionProbeEnabled,
+} from './lib/sessionProbe.js';
 
 async function main(): Promise<void> {
   // Fail fast instead of hanging on an interactive credential prompt when no token or
@@ -35,10 +44,31 @@ async function main(): Promise<void> {
   const identity = loadIdentity(process.env);
   const registry = new ProjectRegistry(config.workspaceRoot);
   const ctx = createContext(config, credentials, identity, registry);
-  const writingGuide = await loadWritingGuide(process.env);
+  const baseWritingGuide = await loadWritingGuide(process.env);
+  const extraWritingGuide = await loadExtraWritingGuide(config.extraWritingGuidePath);
+  config.extraWritingGuideLoaded = extraWritingGuide !== undefined;
+  const { text: writingGuide, hasExtra: writingGuideHasExtra } = composeWritingGuide(
+    baseWritingGuide,
+    extraWritingGuide,
+  );
   const concurrencyGuide = await loadConcurrencyGuide(process.env);
   const skills = await loadSkills(process.env);
-  const server = createServer(ctx, writingGuide, concurrencyGuide, skills);
+  // Opt-in session-identity instrumentation for #18's spike. Unset (the default) leaves `probe`
+  // undefined, so nothing is installed anywhere and no line is written: see src/lib/sessionProbe.ts.
+  const probe = sessionProbeEnabled(process.env)
+    ? // Read lazily: the resolver learns a project's token when that project is first touched, so
+      // a list snapshotted here would scrub almost nothing.
+      createSessionProbe({ secrets: () => credentials.allSecrets() })
+    : undefined;
+  probe?.startup(config.sessionId);
+  const server = createServer(
+    ctx,
+    writingGuide,
+    concurrencyGuide,
+    skills,
+    writingGuideHasExtra,
+    probe,
+  );
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
@@ -56,6 +86,9 @@ async function main(): Promise<void> {
         `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
     );
   };
+  // Chained after the handler above, and deliberately so: the probe runs first inside that chain
+  // (see installConnectionProbe), so a firing is counted even if the compatibility logger throws.
+  if (probe) installConnectionProbe(server.server, probe);
   // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
   // session that dies without this is detected as gone by pid instead.
   const release = (): void => {
@@ -69,6 +102,7 @@ async function main(): Promise<void> {
   console.error(
     `[web-latex-mcp] server ready on stdio as session "${config.sessionId}"` +
       `${writingGuide ? ' (writing guide loaded)' : ''}` +
+      `${config.extraWritingGuideLoaded ? ' (extra writing guide loaded)' : ''}` +
       `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}` +
       `${skills.length > 0 ? ` (${skills.length} skills as prompts)` : ''}`,
   );

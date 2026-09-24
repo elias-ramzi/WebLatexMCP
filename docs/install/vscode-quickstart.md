@@ -11,7 +11,7 @@ Claude Code CLI). For the manual, per-OS reference, see
 
 ## Before you start
 
-- **Node.js ≥ 20** and **git** installed.
+- **Node.js ≥ 20** and **git 2.25 or newer** installed.
 - The **Claude Code extension** in VS Code ([get it here](https://marketplace.visualstudio.com/items?itemName=Anthropic.claude-code)).
 - An **Overleaf premium account** — Overleaf's git integration is a premium-only feature.
 
@@ -112,7 +112,7 @@ steps, so nothing leaves your machine implicitly.
 ## See the PDF as a tab in VS Code
 
 The `viewer` tool serves a live PDF viewer on `http://127.0.0.1:<port>` (renders with pdf.js —
-zoom, scroll, search, select-to-comment; hot-reloads on every compile). VS Code can show that URL
+zoom, scroll, search, select-to-comment; hot-reloads whenever the auto-detected root is recompiled). VS Code can show that URL
 as an **editor tab** via its built-in **Simple Browser**, so you never leave the editor.
 
 **1 · Tell the server you're in VS Code.** In your MCP server config's `env`, set:
@@ -124,7 +124,8 @@ as an **editor tab** via its built-in **Simple Browser**, so you never leave the
 
 **2 · Open it.** Ask Claude to `compile`, then “open the viewer”. It returns a `127.0.0.1` URL.
 Open the **Command Palette** (`Cmd/Ctrl+Shift+P`) → **“Simple Browser: Show”** → paste the URL.
-The tab stays live and refreshes on every compile — dock it beside your `.tex`.
+The tab stays live and refreshes whenever the auto-detected root is recompiled — dock it beside
+your `.tex`.
 
 **One-key open (optional).** With the port pinned, add a keybinding (`Cmd/Ctrl+Shift+P` →
 “Preferences: Open Keyboard Shortcuts (JSON)”) so a single chord opens the tab:
@@ -147,6 +148,6 @@ selection or the clipboard button misbehaves, fall back to your OS browser (`tar
 ## Where to go next
 
 - **[Configuration](../configuration.md)** — every env var, how tokens resolve per host, project options.
-- **[Tools](../tools.md)** — the full tool list, the DBLP citation flow, how safe pushes work.
+- **[Tools](../tools.md)** — the full tool list, the citation flow, how safe pushes work.
 - **[Skills](../skills.md)** — `/format-latex-project`, `/verify-citations`, and friends.
 - Per-OS manual setup: [macOS](macos.md) · [Linux](linux.md) · [Windows](windows.md).

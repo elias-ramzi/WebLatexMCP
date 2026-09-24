@@ -170,6 +170,28 @@ describe('parseLog', () => {
     expect(warnings[1]).toMatchObject({ severity: 'warning', rule: 'natbib', line: 12 });
   });
 
+  it('parses a package or class warning whose name carries a dot or a hyphen', () => {
+    // `\w+` matches neither `.` nor `-`, so a warning from `pdftex.def` (pdfTeX's own driver file,
+    // one of the most common warning sources in a real log) or `tikz-cd` matched nothing at all —
+    // not misclassified, just invisible to warnings[], and so to warningsOmitted too.
+    const log = [
+      "Package pdftex.def Warning: Option `width' ignored for bitmap image on input line 7.",
+      'Class foo-bar Warning: something happened on input line 3.',
+    ].join('\n');
+    const { warnings } = parseLog(log);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatchObject({ severity: 'warning', rule: 'pdftex.def', line: 7 });
+    expect(warnings[1]).toMatchObject({ severity: 'warning', rule: 'foo-bar', line: 3 });
+  });
+
+  it('does not let a dotted name swallow the space before "Warning:"', () => {
+    // The space is outside the name class on purpose; pin it, or `[\w.-]+` could drift to `[\S]+`.
+    const { warnings } = parseLog(
+      'Package hyperref Warning: plain names still work on input line 2.',
+    );
+    expect(warnings[0]).toMatchObject({ rule: 'hyperref', line: 2 });
+  });
+
   it('parses overfull boxes', () => {
     const { warnings } = parseLog('Overfull \\hbox (12.0pt too wide) in paragraph at lines 5--6');
     expect(warnings[0]).toMatchObject({ severity: 'warning', line: 5, rule: 'Overfull \\hbox' });
@@ -316,6 +338,89 @@ describe('filterLog (Task 1: de-noise)', () => {
   it('falls back to a short raw tail when nothing matched', () => {
     const noise = Array.from({ length: 50 }, (_, i) => `boring line ${i}`).join('\n');
     expect(filterLog(noise)).toBe(logTail(noise, 15));
+  });
+});
+
+describe('filterLog: the -file-line-error message line (issue #78, finding 4)', () => {
+  /**
+   * Under latexmk — which is passed `-file-line-error` — the line naming *what* went wrong is
+   * `./main.tex:5: Undefined control sequence.`: no leading `! `, no inline `Error:`. It matched no
+   * `KEEP_PATTERNS` entry, so the de-noiser kept only the `l.<n>` echo beneath it and the tail said
+   * *where* without ever saying *what*. `structuredContent.errors` was unaffected (`parseLog` tests
+   * `FILE_LINE_ERROR` first), so the gap hit exactly the client the text channel exists for.
+   */
+  it('keeps the message line latexmk prints, not only the l.<n> echo below it', () => {
+    const tail = filterLog(
+      [
+        './main.tex:5: Undefined control sequence.',
+        'l.5 \\bad',
+        'Overfull \\hbox (10pt too wide) in paragraph at lines 1--2',
+      ].join('\n'),
+    );
+    expect(tail).toContain('./main.tex:5: Undefined control sequence.');
+    expect(tail).toContain('l.5 \\bad'); // the position context still rides along
+  });
+
+  /**
+   * The same form raised inside a package, which is what latexmk prints when a `.sty` throws — and
+   * the case the `KEEP_PATTERNS` entry must cover by being the shared `FILE_LINE_ERROR` rather than
+   * a narrower `\.tex`-only rewrite of it. Every other `-file-line-error` literal in these tests
+   * names a `.tex`, so without this one such a rewrite passes them all.
+   */
+  it('keeps the message line for an error raised in a .sty, not only in a .tex', () => {
+    const errorLine = '/usr/share/texlive/tex/latex/foo.sty:9: Undefined control sequence.';
+    const tail = filterLog([errorLine, 'l.9 \\bad'].join('\n'));
+    expect(tail).toContain(errorLine);
+    // And the other partition agrees it is an error, exactly as for a `.tex`.
+    expect(parseLog(errorLine).errors.map((e) => e.file)).toContain(
+      '/usr/share/texlive/tex/latex/foo.sty',
+    );
+  });
+
+  /**
+   * Just outside the gap above, and pinning the two partitions against each other: `parseLog` tests
+   * `FILE_LINE_ERROR` first and `continue`s, so a `-file-line-error` line is an ERROR whatever its
+   * message says — including one that says "Warning:". This line already reached the tail through
+   * `KEEP_PATTERNS`' literal `/Warning:/` and was already in `ALWAYS_KEEP_PATTERNS`, so it is a
+   * regression guard on the partition, not evidence for the fix above.
+   */
+  it('never lets a -file-line-error line whose message says "Warning:" be filtered as a warning', () => {
+    const errorLine = './main.tex:12: Package foo Warning: something is badly wrong';
+    const log = [
+      '(./main.tex',
+      errorLine,
+      'Overfull \\hbox (1.0pt too wide) in paragraph at lines 1--2',
+      ')',
+    ].join('\n');
+
+    expect(filterLog(log)).toContain(errorLine);
+    expect(filterLog(log, { keepWarning: () => false })).toContain(errorLine);
+
+    // ...and the other partition agrees: an error, never a filterable warning.
+    const { errors, warnings } = parseLog(log);
+    expect(errors.map((e) => e.message)).toContain('Package foo Warning: something is badly wrong');
+    expect(warnings.map((w) => w.message)).not.toContain(
+      'Package foo Warning: something is badly wrong',
+    );
+  });
+
+  /**
+   * The new entry is `FILE_LINE_ERROR` itself, not a loosened "looks like path:line", so a line
+   * shaped almost like the `-file-line-error` form stays noise. Both near-misses below match no
+   * other `KEEP_PATTERNS` entry either, and the log carries real diagnostics so the raw-tail
+   * fallback (which would return everything and make this vacuous) cannot fire.
+   */
+  it('does not over-keep a line that only looks like -file-line-error', () => {
+    const noSecondColon = './main.tex:5 Undefined control sequence.';
+    const noFileExtension = 'Memory: 5:12: nothing to see';
+    const realError = './main.tex:9: Undefined control sequence.';
+    const tail = filterLog(
+      ['(./main.tex', noSecondColon, noFileExtension, realError, 'l.9 \\bad', ')'].join('\n'),
+    );
+
+    expect(tail).toContain(realError); // not the raw-tail fallback: the de-noiser did keep something
+    expect(tail).not.toContain(noSecondColon);
+    expect(tail).not.toContain(noFileExtension);
   });
 });
 

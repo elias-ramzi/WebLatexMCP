@@ -1,3 +1,6 @@
+import type { RewriteMode } from './lib/rewriteMode.js';
+import type { ReferenceSourceId } from './lib/referenceKey.js';
+
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
  * document are separate jobs: a **git** project is a remote the server clones and pushes back to,
@@ -7,6 +10,20 @@
  * git project before local mode existed, so existing env config and registry entries keep parsing.
  */
 export type ProjectConfig = GitProjectConfig | LocalProjectConfig;
+
+/**
+ * A configured project that was NOT loaded, and why — so a call naming it can say so. `kind` is
+ * `'id'` when the key itself is unusable as a project id (`src/lib/projectId.ts`), `'entry'` when
+ * the id is fine but its configuration does not parse.
+ */
+export interface SkippedProject {
+  id: string;
+  /** Where it was configured: `WEB_LATEX_MCP_PROJECTS`, or the registry file's path. */
+  source: string;
+  kind: 'id' | 'entry';
+  /** What is wrong, as a clause (`it contains a path separator …`, or the parse error). */
+  problem: string;
+}
 
 /** A project backed by a git remote (Overleaf, GitHub, or any host): cloned, synced, pushed. */
 export interface GitProjectConfig {
@@ -105,14 +122,118 @@ export interface ServerConfig {
   sessionId: string;
   /** Registered projects. */
   projects: ProjectConfig[];
+  /**
+   * `WEB_LATEX_MCP_PROJECTS` entries `loadConfig` did not load because their id is unusable
+   * (`src/lib/projectId.ts`). Kept so a call naming one is told why, not merely "Unknown project" —
+   * the stderr note at startup is invisible to an MCP client. Optional; undefined means none.
+   */
+  skippedProjects?: SkippedProject[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
+  /**
+   * True when `defaultProject` came from `WEB_LATEX_MCP_DEFAULT_PROJECT` rather than a persisted
+   * registry default. An explicit env default is an assertion — like `compilerExplicit` — and a
+   * `register_project { default: true }` call never overrides it in this process. Optional so the
+   * many test fixtures constructing `ServerConfig` need no change; undefined means false.
+   */
+  defaultProjectExplicit?: boolean;
   /** Local compile backend. `loadConfig` always resolves this; omit to default to `latexmk`. */
   compiler?: CompilerKind;
+  /**
+   * True when `WEB_LATEX_MCP_COMPILER` named the backend. False means `compiler` is only a
+   * default, which is what licenses `compile` to fall back to whichever backend is actually
+   * installed. An explicit choice is an assertion and is never substituted.
+   */
+  compilerExplicit?: boolean;
   /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
   viewerPort?: number;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
+  /**
+   * Default rewrite-preservation mode from `WEB_LATEX_MCP_REWRITE_MODE`, used by
+   * `resolveRewriteMode` (`src/lib/rewriteMode.ts`) when a project has no stored mode of its
+   * own. `loadConfig` always resolves this (falling back to `DEFAULT_REWRITE_MODE` on an unset
+   * or invalid value); optional here (like `compiler`) only so existing hand-built configs in
+   * tests still type-check — callers should treat a missing value as `DEFAULT_REWRITE_MODE`.
+   * `server_info` reports it and says it is only the default.
+   */
+  rewriteMode?: RewriteMode;
+  /**
+   * Whether `WEB_LATEX_MCP_REWRITE_MODE` actually named a mode, as opposed to `rewriteMode`
+   * merely holding the built-in default. `rewriteMode` is populated either way, so this is the
+   * only way a reporting tool can avoid presenting the default as the user's own configuration.
+   */
+  rewriteModeExplicit?: boolean;
+  /**
+   * Absolute path to an ADDITIONAL writing guide, appended to (never replacing) the base one.
+   * From `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, which accepts a path or a `file://` URL.
+   */
+  extraWritingGuidePath?: string;
+  /**
+   * Set at startup once the file has been read: whether the extra guide actually loaded.
+   * `server_info` reports it, because a typo'd path otherwise means the model silently ignores
+   * the user's conventions with no signal.
+   */
+  extraWritingGuideLoaded?: boolean;
+  /**
+   * Reference-lookup backend named by `WEB_LATEX_MCP_REFERENCE_SOURCE`, from
+   * `parseReferenceSource` in `src/config.ts`. Unlike `compiler`, `loadConfig` does NOT default
+   * this to one of `dblp` / `crossref` / `openalex` when unset: an unset value stays `undefined`
+   * so the reference-lookup resolver owns fallback order across the three backends, rather than
+   * config naming a winner the resolver would then have to un-name.
+   */
+  referenceSource?: ReferenceSourceId;
+  /**
+   * True when `WEB_LATEX_MCP_REFERENCE_SOURCE` actually named a backend, as opposed to
+   * `referenceSource` being unset. Mirrors `compilerExplicit`/`rewriteModeExplicit`: an assertion
+   * is never reported as a default, and (here) there is no default to conflate it with.
+   */
+  referenceSourceExplicit?: boolean;
+  /**
+   * The value `WEB_LATEX_MCP_REFERENCE_SOURCE` held when it named no known backend — remembered
+   * rather than discarded, and NOT merged into `referenceSource`.
+   *
+   * Remembered, because the refusal has to name it: `parseReferenceSource` does not throw (the
+   * setting governs `search_references` and nothing else, so a typo must not cost the user every
+   * other tool), so the only thing that tells a user why searching refuses is a message quoting
+   * what they actually typed, in the tool's error and in `server_info`. Discarding it would leave
+   * the server behaving differently from a default install with nothing to explain the
+   * difference — the silent-failure shape `extraWritingGuideLoaded` exists to prevent.
+   *
+   * Not merged into `referenceSource`, because that field is typed `ReferenceSourceId` and the
+   * whole point is that this value is not one — and because a rejected value is not a choice:
+   * `referenceSourceExplicit` stays false, so nothing downstream can read a typo as an assertion
+   * and pin the resolver to a backend that does not exist. Set means refuse; unset means normal.
+   * Already trimmed and elided by `parseReferenceSource`, since it is echoed to a model.
+   */
+  referenceSourceInvalid?: string;
+  /**
+   * Contact address from `WEB_LATEX_MCP_CONTACT_EMAIL`, offered to Crossref/OpenAlex for their
+   * faster "polite pool". A privacy boundary: this is read ONLY from that env var by
+   * `parseContactEmail` — never derived from `git config user.email` or any other source — so
+   * nothing reaches a third-party service unless the user deliberately opted in.
+   */
+  contactEmail?: string;
+  /**
+   * True when `WEB_LATEX_MCP_CONTACT_EMAIL` was set to something `parseContactEmail` could not
+   * use. Same silent-failure doctrine as `referenceSourceInvalid` above: dropping the rejection
+   * entirely would leave the server behaving differently from a default install — the polite
+   * pool off, `contactEmailConfigured: false`, no clause in `server_info`'s text — with nothing
+   * a tool can reach to explain the difference, the one startup stderr line being invisible in
+   * most MCP clients.
+   *
+   * A BOOLEAN, and deliberately never the value, which is the one place this field diverges
+   * from `referenceSourceInvalid`. That one carries the user's own typo of a backend id, which
+   * is safe to echo and has to be echoed for the refusal to name it. This one would carry an
+   * email address: personal data, and `server_info`'s output is read by a model and travels
+   * into its context. Whether the value was rejected is the most that may be said, and it is
+   * enough — the user knows what they typed, and the full value is already in the stderr line
+   * on their own terminal. Do not "improve" this into a string.
+   *
+   * Set only when a value was present and rejected; unset (never `false`) otherwise, so it
+   * cannot be read as "a value was considered" on a default install.
+   */
+  contactEmailInvalid?: boolean;
 }
 
 /** Where the `viewer` tool expects the PDF viewer to be opened. */

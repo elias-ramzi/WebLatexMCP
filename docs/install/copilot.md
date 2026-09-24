@@ -4,7 +4,7 @@ WebLatexMCP is a standard MCP server over **stdio**, so it works with GitHub Cop
 with no code changes — only registration. The most tested surface is **Copilot in VS Code**; the same
 server also works with **Copilot in Visual Studio 2022** (see the note at the end).
 
-For **prerequisites** (Node.js ≥ 20, git, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
+For **prerequisites** (Node.js ≥ 20, git 2.25 or newer, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
 and for **authentication** (per-host token resolution: env var → `gh auth token` → git credential
 helper), follow steps 1–3 of your platform guide — they are client-agnostic:
 [macOS](macos.md) · [Linux](linux.md) · [Windows](windows.md). This guide picks up at registration.
