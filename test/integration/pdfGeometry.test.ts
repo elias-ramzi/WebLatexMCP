@@ -136,6 +136,7 @@ interface GeometryOut {
   floatsOmittedBySize?: number;
   floatsDropped?: number;
   floatsRefused?: number;
+  floatsPagesShifted?: boolean;
   note?: string;
 }
 
@@ -221,6 +222,47 @@ describe('pdf_geometry', () => {
     expect(withOut.pageCount).toBeUndefined();
   });
 
+  it('flags the floats of a build that loaded pgfpages as shifted, in both channels', async () => {
+    // A \pgfpagesuselayout holds each page back until the next is built, so every \newlabel
+    // records a later page than its own — the reason labels: lookups refuse such a build
+    // (labelPages.ts, pgfpagesLayout). The floats index hands the same pages back as data, so it
+    // must say so rather than invite a render_pages call on the wrong page.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 1);
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{3}}\n');
+    const stem = buildAuxPath(userDir, 'main.tex').slice(0, -'.aux'.length);
+    await writeFile(
+      `${stem}.fls`,
+      'PWD /build\nINPUT /texmf/tex/latex/pgf/utilities/pgfpages.sty\n',
+    );
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['floats'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structuredOf(res);
+    // Reported, not withheld: the entries are the .aux's own, and the label keys and numbers
+    // stay true; only the page field is suspect.
+    expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
+    expect(out.floatsPagesShifted).toBe(true);
+    expect(out.note).toMatch(/pgfpages/);
+    const text = (res.content as Array<{ text?: string }>).map((c) => c.text ?? '').join('\n');
+    expect(text).toMatch(/pgfpages/);
+    await expectDeclaredField(client, 'pdf_geometry', 'floatsPagesShifted');
+
+    // A build whose recorder names no pgfpages carries neither the flag nor the note.
+    await writeFile(`${stem}.fls`, 'PWD /build\nINPUT /texmf/tex/latex/base/article.cls\n');
+    const clean = structuredOf(
+      await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'poster', kinds: ['floats'] },
+      }),
+    );
+    expect(clean.floatsPagesShifted).toBeUndefined();
+    expect(clean.note).toBeUndefined();
+  });
+
   it('reports floatsDropped through the tool for an .aux entry whose field ran past the cap', async () => {
     // The lib half (readAuxFloats/AuxFloatsResult.dropped) is covered by
     // test/unit/auxFloats.test.ts; this is the tool's own boundary — that the count reaches the
@@ -302,7 +344,7 @@ describe('pdf_geometry', () => {
   it('kinds: ["floats"] alone never opens the compiled PDF (FIX8)', async () => {
     const { client, userDir } = await setup();
     // Deliberately NOT a real PDF: opening this would fail (no @napi-rs/canvas DOM globals aside,
-    // this content isn't even parseable as a PDF at all). locateProjectPdf only stats the path, so
+    // this content isn't even parseable as a PDF at all). locateRootPdf only stats the path, so
     // this still counts as "something has been compiled" for the purposes of finding it.
     const pdfPath = buildPdfPath(userDir, 'main.tex');
     await mkdir(path.dirname(pdfPath), { recursive: true });

@@ -220,10 +220,11 @@ const BOX_WARNING = /^(Overfull|Underfull) \\([hv])box/;
  * The `{ file, rule }` shape `keepWarning` judges, derived from one log line the same way
  * `parseLog` derives a *warning's* `rule` — kept as one function so the two stay in step.
  *
- * It speaks only for lines that reach the filter at all. An *error* line never does: a `! `, an
- * inline `Error:`, and — because `parseLog` tests {@link FILE_LINE_ERROR} first and `continue`s,
- * so a `-file-line-error` line is an error whatever its message says — a `-file-line-error` line
- * are all excluded by {@link ALWAYS_KEEP_PATTERNS} before `warningRuleOf` is ever consulted. That
+ * It speaks only for lines that reach the filter at all. An *error* line never does: a `! ` line
+ * and — because `parseLog` tests {@link FILE_LINE_ERROR} first and `continue`s, so a
+ * `-file-line-error` line is an error whatever its message says — a `-file-line-error` line are
+ * both excluded by {@link ALWAYS_KEEP_PATTERNS} before `warningRuleOf` is ever consulted (as is a
+ * bare error-shaped line `parseLog` does not call a warning — see {@link BARE_ERROR_LINE}). That
  * exclusion is what keeps the two partitions aligned; this function makes no claim about a line
  * `parseLog` would call an error, and would derive the wrong `rule` for one
  * (`./main.tex:12: Package foo Warning: …` → `"foo"`, where `parseLog` derives
@@ -250,6 +251,168 @@ function warningRuleOf(line: string): { matched: boolean; rule?: string } {
 function isWarningLine(line: string): boolean {
   return /Warning:/.test(line) || /pdfTeX warning/.test(line) || BOX_WARNING.test(line);
 }
+
+/**
+ * An error-shaped line with no `! ` in front — `LaTeX Error:`, `Package foo Error:`,
+ * `Class foo Error:` at the START of the line — that `parseLog` does not structure as a warning.
+ *
+ * This replaces an unanchored `/Error:/` in {@link ALWAYS_KEEP_PATTERNS}, which pinned any line
+ * whose text merely CONTAINED "Error:" — so `Package foo Warning: Error: …`, a warning to
+ * `parseLog` with rule `foo`, was dropped from `warnings[]` by `excludeRule: ["foo"]` and kept in
+ * `logTail`: the two partitions disagreeing about one line, the asymmetry `warningsFilter` exists to
+ * remove. The log is document-controlled, so that is reachable from any `\PackageWarning`.
+ *
+ * Two things keep this entry aligned with `parseLog` rather than merely narrower:
+ *  - `parseLog`'s error branches are `! …` and {@link FILE_LINE_ERROR}, both already in
+ *    {@link ALWAYS_KEEP_PATTERNS} on their own, so no line `parseLog` calls an error depends on
+ *    this entry. (A real TeX error always prints behind `! ` or `file:line:` — `\errmessage` starts
+ *    a fresh line with one or the other — so a bare error shape is not something `parseLog` has a
+ *    branch for at all.)
+ *  - The lookahead refuses any line {@link PACKAGE_WARNING} matches ANYWHERE, built from that very
+ *    regex's source so the two cannot drift: `PACKAGE_WARNING` is unanchored, so
+ *    `Package foo Error: see LaTeX Warning: …` is a `LaTeX`-rule warning to `parseLog`, and an
+ *    anchor on the prefix alone would pin it straight back onto the wrong side.
+ *
+ * What it still pins is a bare error shape `parseLog` reports as neither — which only ever matters
+ * when such a line also carries a warning marker `isWarningLine` sees (a `LaTeX Font Warning:`, a
+ * `pdfTeX warning`), since a line with none is never filtered anyway.
+ */
+const BARE_ERROR_LINE = new RegExp(
+  `^(?!.*${PACKAGE_WARNING.source})(?:LaTeX|Package [\\w.-]+|Class [\\w.-]+) Error:`,
+);
+
+/**
+ * Longest `logTail` line kept, in characters, before an elision marker.
+ *
+ * `filterLog` bounds the tail in LINES (80), but each is a *logical* line — {@link unwrapLines}
+ * rejoins TeX's 79-column wrap — so a single `\PackageWarning` with a long message was one kept line
+ * of any length, and 80 of them put ~400k characters into `structuredContent`. 500 is ~6 physical
+ * lines of a wrapped log: past the head of any real message (which package, what went wrong, the
+ * `on input line N`), which is the part a reader acts on, while the rest stays in `logPath`. It is
+ * a per-line bound, not the total's: `compile` charges the rendered tail against its diagnostics
+ * budget and trims whole lines to fit (`fitFilteredLog`). What this cap guarantees is that no one
+ * line can spend that whole share — the tail keeps at least its last line — and that a line under
+ * it comes back byte-identical, since only a longer line is ever touched.
+ */
+export const LOG_TAIL_LINE_CAP = 500;
+
+/**
+ * `text` cut to its first `keep` characters plus a marker saying how many went and where they are
+ * — or `text` itself, untouched, when it is no longer than that. The cut is on a character
+ * boundary: one landing between the halves of an astral character would leave a lone surrogate,
+ * which is not text (the same care `sourceSnippet.ts` takes over its snippet lines), so it backs
+ * off by one. Shared by the `logTail` line cap and `compile`'s diagnostics budget, which cuts a
+ * kept-regardless error's message with it, so a cut reads the same wherever it was made.
+ */
+export function elideAt(text: string, keep: number): string {
+  if (text.length <= keep) return text;
+  const last = text.charCodeAt(keep - 1);
+  const cut = keep - (last >= 0xd800 && last <= 0xdbff ? 1 : 0);
+  return `${text.slice(0, cut)} … [${text.length - cut} more characters — see logPath]`;
+}
+
+/** One `logTail` line cut to {@link LOG_TAIL_LINE_CAP}; see {@link elideAt}. */
+function capLogLine(line: string): string {
+  return elideAt(line, LOG_TAIL_LINE_CAP);
+}
+
+/**
+ * What a string costs once it is a JSON string value, without the two enclosing quotes. JSON
+ * escapes character by character, so the cost of a `\n`-joined text is the sum of its pieces' plus
+ * 2 per separator — which is what lets {@link fitLines} price a candidate without rendering it.
+ */
+function jsonCost(s: string): number {
+  return JSON.stringify(s).length - 2;
+}
+
+/**
+ * The fewest characters of the last line {@link fitLines} will cut it to, when even that one line
+ * does not fit its budget on its own. 80 is one terminal line — about one TeX wrap — which is the
+ * head a reader acts on (which package, what went wrong); a line no longer than this is never
+ * cut further. A floor rather than zero because the last line is kept regardless, so it is the one
+ * place the lane can overshoot: this bounds by how much (worst case ~80 control characters at six
+ * rendered characters each, plus the marker), where the 500-character cap alone let it reach ~3.3k.
+ */
+export const LOG_TAIL_LAST_LINE_FLOOR = 80;
+
+/**
+ * The earliest lines of `lines` dropped until the JSON rendering of what is left — `header(n)` for
+ * the `n` lines gone, then the survivors, `\n`-joined — fits `maxChars`, always keeping the last
+ * line. `alreadyOmitted` is what an earlier bound (`maxLines`) cut before this one saw the list, so
+ * the header counts both. `Infinity` fits everything and returns exactly the legacy rendering.
+ *
+ * `lines` arrive UNCAPPED and are cut to {@link LOG_TAIL_LINE_CAP} here, so that when the last line
+ * alone still does not fit — the cap bounds characters, but a control character renders as a
+ * six-character `\u00XX` escape, so a capped line can cost ~3.3k — it can be cut further from the
+ * original, with a marker that counts against the original rather than against the capped copy.
+ * That further cut never goes below {@link LOG_TAIL_LAST_LINE_FLOOR} and never splits a surrogate
+ * pair ({@link elideAt}). It only ever fires on the kept-regardless last line, and only when that
+ * line does not fit, so every other result — `Infinity` above all — is byte-identical to before.
+ */
+function fitLines(
+  originals: readonly string[],
+  alreadyOmitted: number,
+  maxChars: number,
+  header: (omitted: number) => string,
+): { text: string; trimmed: number } {
+  const lines = originals.map(capLogLine);
+  const render = (start: number): string => {
+    const omitted = alreadyOmitted + start;
+    const body = lines.slice(start);
+    return (omitted > 0 ? [header(omitted), ...body] : body).join('\n');
+  };
+  if (maxChars === Infinity) return { text: render(0), trimmed: 0 };
+  // Suffix sums of each line's cost plus its `\n` separator, so each candidate is priced in O(1).
+  const suffix = new Array<number>(lines.length + 1).fill(0);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    suffix[i] = (suffix[i + 1] as number) + jsonCost(lines[i] as string) + 2;
+  }
+  const cost = (start: number): number => {
+    const omitted = alreadyOmitted + start;
+    // Every kept line carries a separator except the last; a header adds itself plus one.
+    const body = (suffix[start] as number) - 2;
+    return 2 + body + (omitted > 0 ? jsonCost(header(omitted)) + 2 : 0);
+  };
+  let start = 0;
+  while (start < lines.length - 1 && cost(start) > maxChars) start++;
+  const last = lines.length - 1;
+  if (last >= 0 && start === last && cost(start) > maxChars) {
+    lines[last] = fitLastLine(
+      originals[last] as string,
+      lines[last] as string,
+      // Everything but the line's own content: quotes, the header and its separator.
+      maxChars - (cost(start) - jsonCost(lines[last] as string)),
+    );
+  }
+  return { text: render(start), trimmed: start };
+}
+
+/**
+ * `original` cut (by {@link elideAt}) to the longest keep whose JSON cost fits `room`, searched
+ * between {@link LOG_TAIL_LAST_LINE_FLOOR} and the capped line's own keep. The floor is kept whatever
+ * it costs; and if cutting to the floor would cost more than `capped` already does (a short line,
+ * where the marker outweighs what it saves), `capped` is returned unchanged.
+ */
+function fitLastLine(original: string, capped: string, room: number): string {
+  const lo0 = Math.min(LOG_TAIL_LAST_LINE_FLOOR, original.length);
+  const floorCut = elideAt(original, lo0);
+  if (jsonCost(floorCut) >= jsonCost(capped)) return capped;
+  let lo = lo0;
+  // `hi` is the capped line's keep, known not to fit (that is why we are here).
+  let hi = Math.min(original.length, LOG_TAIL_LINE_CAP);
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (jsonCost(elideAt(original, mid)) <= room) lo = mid;
+    else hi = mid;
+  }
+  return elideAt(original, lo);
+}
+
+const keptLinesHeader = (omitted: number): string =>
+  `… (${omitted} earlier diagnostic line(s) omitted — see logPath for the full log)`;
+
+const rawLinesHeader = (omitted: number): string =>
+  `… (${omitted} earlier raw log line(s) omitted — see logPath for the full log)`;
 
 /**
  * What `filterLog` returns when every diagnostic line it found was rejected by `keepWarning`. A
@@ -289,7 +452,7 @@ const ALWAYS_KEEP_PATTERNS: RegExp[] = [
   /^l\.\d+/,
   /^Runaway /,
   /^(Emergency stop|Fatal error|No pages of output)/,
-  /Error:/,
+  BARE_ERROR_LINE,
   /(may have changed|Rerun to get|Please rerun)/,
   // biblatex phrases its rerun hint as `Please (re)run Biber on the file:` — literal parentheses,
   // so `Please rerun` above does not match it. On a biblatex paper it is the only line saying the
@@ -492,9 +655,11 @@ const KEEP_PATTERNS: RegExp[] = [
  * Distil a raw compile log down to only diagnostically useful lines (see {@link KEEP_PATTERNS}),
  * scanning the whole log (not just its tail, so an error early in a long log is not lost) after
  * un-wrapping TeX's 79-column hard-wrapping. Bounds the result to `maxLines` (keeping the most
- * recent, where a fatal error and the output summary sit) and notes any omission. Falls back to a
- * short raw tail if nothing matched, so the caller always sees something. The full log stays on disk
- * at `logPath`; `compile`'s `rawLog: true` returns the unfiltered tail.
+ * recent, where a fatal error and the output summary sit) and notes any omission, and cuts every
+ * line — kept or fallback — to {@link LOG_TAIL_LINE_CAP} characters, since an un-wrapped line has no
+ * length limit of its own. Falls back to a short raw tail if nothing matched, so the caller always
+ * sees something. The full log stays on disk at `logPath`; `compile`'s `rawLog: true` returns the
+ * unfiltered tail. A character bound on the whole result is {@link fitFilteredLog}'s `maxChars`.
  *
  * `keepWarning`, when given, additionally drops a *warning* line (an `Overfull \hbox`/
  * `Underfull \vbox`, or anything else kept only via a `Warning:`/`pdfTeX warning` match — see
@@ -510,14 +675,43 @@ const KEEP_PATTERNS: RegExp[] = [
  * bookkeeping behind its `if` anyway, since this runs on every compile of every session. `baseDir` rebases a filtered warning's `file` onto the project root exactly as
  * `parseLog` does (see {@link rebase}); it is ignored when `keepWarning` is absent.
  */
-export function filterLog(
+export function filterLog(log: string, opts: FilterLogOptions = {}): string {
+  return fitFilteredLog(log, { ...opts, maxChars: Infinity }).text;
+}
+
+export interface FilterLogOptions {
+  maxLines?: number;
+  baseDir?: string;
+  keepWarning?: (w: { file?: string; rule?: string }) => boolean;
+}
+
+/** {@link fitFilteredLog}'s result: the tail, and how many lines `maxChars` alone cut from it. */
+export interface FittedLogTail {
+  text: string;
+  /**
+   * Lines dropped from the front to fit `maxChars` — on top of, and counted apart from, what
+   * `maxLines` dropped. The tail's own header line counts both; this is how a caller can say which
+   * bound fired.
+   */
+  trimmed: number;
+}
+
+/**
+ * {@link filterLog}, additionally fitted to `maxChars` measured on the JSON-rendered result — the
+ * form it ships in inside `structuredContent` — by dropping the EARLIEST lines (the tail keeps the
+ * most recent, where a fatal error and the output summary sit, exactly as `maxLines` does) and
+ * folding the count into the same "earlier diagnostic line(s) omitted" header. At least the last
+ * line is always kept, and that line is bounded by {@link LOG_TAIL_LINE_CAP}; the one-sentence
+ * "filter matched nothing" result is short and fixed, and is returned as is.
+ *
+ * `maxChars: Infinity` is `filterLog` exactly — which is how `filterLog` is implemented, so the two
+ * cannot drift and the byte-identity guarantee above holds for both.
+ */
+export function fitFilteredLog(
   log: string,
-  opts: {
-    maxLines?: number;
-    baseDir?: string;
-    keepWarning?: (w: { file?: string; rule?: string }) => boolean;
-  } = {},
-): string {
+  opts: FilterLogOptions & { maxChars: number },
+): FittedLogTail {
+  const maxChars = opts.maxChars;
   const maxLines = opts.maxLines ?? 80;
   const keepWarning = opts.keepWarning;
   const baseDir =
@@ -544,6 +738,9 @@ export function filterLog(
       const file = openFile ? rebase(openFile, baseDir) : undefined;
       if (!keepWarning({ file, rule })) continue;
     }
+    // Kept whole and capped only later, by `fitLines`: every pattern above judged the whole line,
+    // so a cut can never change which side of the error/warning partition a line lands on — and
+    // `fitLines` needs the original to cut the last line further than the cap when it must.
     kept.push(line);
   }
   if (kept.length === 0) {
@@ -553,17 +750,16 @@ export function filterLog(
     // back the very lines it was asked to drop — plus the font/`.pfb`/PDF-statistics noise
     // `filterLog` exists to strip. That is the feature inverted, and silently, which is why the
     // two cases are told apart by `matchedBeforeFilter` rather than by `kept` alone.
-    if (matchedBeforeFilter > 0) return NOTHING_MATCHED_FILTER;
-    return logTail(log, 15);
+    if (matchedBeforeFilter > 0) return { text: NOTHING_MATCHED_FILTER, trimmed: 0 };
+    // Physical lines, but not therefore short: a log written with a large `max_print_line` has no
+    // wrap at all. `logTail` joins with `\n`, so this split recovers its lines exactly.
+    const raw = logTail(log, 15).split('\n');
+    return fitLines(raw, 0, maxChars, rawLinesHeader);
   }
-  if (kept.length > maxLines) {
-    const omitted = kept.length - maxLines;
-    return [
-      `… (${omitted} earlier diagnostic line(s) omitted — see logPath for the full log)`,
-      ...kept.slice(-maxLines),
-    ].join('\n');
-  }
-  return kept.join('\n');
+  // Written as the legacy `maxLines` branch was, `slice(-maxLines)` quirks included.
+  const overCap = kept.length > maxLines;
+  const shown = overCap ? kept.slice(-maxLines) : kept;
+  return fitLines(shown, overCap ? kept.length - maxLines : 0, maxChars, keptLinesHeader);
 }
 
 function dedupe(items: ParsedDiagnostic[]): ParsedDiagnostic[] {

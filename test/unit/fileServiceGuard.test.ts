@@ -559,6 +559,83 @@ describe('FileService out-of-band edit guard', () => {
     });
   });
 
+  describe('applyEdits on a file that is not UTF-8', () => {
+    // applyEdits decodes the file as UTF-8 and writes the result back, so an edit to ONE line of
+    // a Latin-1 .tex replaced every non-ASCII byte in the WHOLE file with U+FFFD (ef bf bd).
+    const LATIN1 = Buffer.from('caf\xe9\nHello\n', 'latin1');
+
+    it('refuses the edit and leaves every byte of the file as it was', async () => {
+      await writeFile(path.join(dir, 'latin1.tex'), LATIN1);
+
+      await expect(
+        files.applyEdits(dir, 'latin1.tex', [{ oldString: 'Hello', newString: 'Bye' }]),
+      ).rejects.toThrow(/not valid UTF-8/);
+      await expect(
+        files.applyEdits(dir, 'latin1.tex', [{ startLine: 2, endLine: 2, newString: 'Bye' }]),
+      ).rejects.toThrow(/not valid UTF-8/);
+      expect((await readFile(path.join(dir, 'latin1.tex'))).equals(LATIN1)).toBe(true);
+    });
+
+    it('still lets write_file replace it with fresh content, deliberately', async () => {
+      await writeFile(path.join(dir, 'latin1.tex'), LATIN1);
+      await files.write(dir, { path: 'latin1.tex', content: 'café\nHello\n' });
+      expect(await readFile(path.join(dir, 'latin1.tex'), 'utf8')).toBe('café\nHello\n');
+    });
+
+    it('edits a UTF-8 file with a byte-order mark and multibyte text as before', async () => {
+      await writeFile(path.join(dir, 'bom.tex'), '\ufeffcafé — ünïcode\nHello\n', 'utf8');
+      await files.applyEdits(dir, 'bom.tex', [{ oldString: 'Hello', newString: 'Bye' }]);
+      expect(await readFile(path.join(dir, 'bom.tex'), 'utf8')).toBe('\ufeffcafé — ünïcode\nBye\n');
+    });
+  });
+
+  describe('list with a subdir that is itself a symlink', () => {
+    // `resolveInside` only compares strings, so `subdir: "figs"` passes it even when `figs` is a
+    // committed link to the user's home directory — and `readdir` follows the link. The walk's own
+    // link rule only governs entries it meets INSIDE the tree, never the directory it starts at.
+    it('refuses a subdir that leaves the project, under the default link policy', async () => {
+      const outside = await mkdtemp(path.join(os.tmpdir(), 'ovl-list-outside-'));
+      try {
+        await writeFile(path.join(outside, 'secret.txt'), 'PRIVATE KEY\n', 'utf8');
+        await symlink(outside, path.join(dir, 'figs'), 'dir');
+
+        await expect(files.list(dir, { subdir: 'figs' })).rejects.toThrow(/symlink/);
+        // A path BENEATH the link is the same escape, one component further down.
+        await mkdir(path.join(outside, 'deeper'));
+        await expect(files.list(dir, { subdir: 'figs/deeper' })).rejects.toThrow(/symlink/);
+        // Listing the project root still works: the walk skips the link rather than following it.
+        const root = await files.list(dir);
+        expect(root.map((e) => e.path)).not.toContain('figs/secret.txt');
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it('still lists a subdir linked to a directory INSIDE the project', async () => {
+      await mkdir(path.join(dir, 'realfigs'));
+      await writeFile(path.join(dir, 'realfigs', 'a.png'), 'png', 'utf8');
+      await symlink('realfigs', path.join(dir, 'figs'), 'dir');
+
+      const listed = await files.list(dir, { subdir: 'figs' });
+      expect(listed.map((e) => e.path)).toEqual(['figs/a.png']);
+    });
+
+    it('follows it for a project whose owner says its links are theirs', async () => {
+      const shared = await mkdtemp(path.join(os.tmpdir(), 'ovl-list-shared-'));
+      try {
+        await writeFile(path.join(shared, 'plot.png'), 'png', 'utf8');
+        await symlink(shared, path.join(dir, 'figs'), 'dir');
+
+        const local = new FileService();
+        local.setLinkPolicy(() => true);
+        const listed = await local.list(dir, { subdir: 'figs' });
+        expect(listed.map((e) => e.path)).toEqual(['figs/plot.png']);
+      } finally {
+        await rm(shared, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('externalModifications', () => {
     it('flags files the user changed but not files the tools wrote', async () => {
       // tool-written file: baseline matches disk

@@ -65,6 +65,25 @@ describe('execCapture', () => {
     expect(res.stdout).toBe('é');
   });
 
+  // Same hazard as the stdout test above, on the other stream: stderr was decoded one `data`
+  // chunk at a time, and `PathBeyondSymlinkError` rebuilds paths from git's stderr, so a
+  // non-ASCII path split across two chunks came back with U+FFFD in place of its character.
+  it('decodes a multi-byte UTF-8 character split across two stderr chunks', async () => {
+    const script = [
+      'process.stderr.write(Buffer.from([0xc3]));',
+      'setTimeout(() => {',
+      '  process.stderr.write(Buffer.from([0xa9]));',
+      '  process.exit(0);',
+      '}, 20);',
+    ].join(' ');
+    const [viaCapture, viaBytes] = await Promise.all([
+      execCapture(process.execPath, ['-e', script]),
+      execCaptureBytes(process.execPath, ['-e', script]),
+    ]);
+    expect(viaCapture.stderr).toBe('é');
+    expect(viaBytes.stderr).toBe('é');
+  });
+
   it('kills the child and sets timedOut on timeout', async () => {
     const res = await execCapture(
       process.execPath,

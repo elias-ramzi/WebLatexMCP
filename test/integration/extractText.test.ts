@@ -160,7 +160,9 @@ describe('extract_text', () => {
 
   it('reads the page a \\label landed on, through the same resolution render_pages uses', async () => {
     const { client, userDir } = await setup();
-    await stagePdf(userDir, 3, { text: (n) => `caption on page ${n}` });
+    // A footer folio under the caption: without /PageLabels the printed page is accepted only
+    // when that page's own folio reads it.
+    await stagePdf(userDir, 3, { text: (n) => `Table 1 caption on page ${n}\n${n}` });
     await stageAux(userDir, '\\newlabel{tab:results}{{1}{3}}\n');
 
     const res = await client.callTool({
@@ -170,7 +172,7 @@ describe('extract_text', () => {
     expect(res.isError ?? false).toBe(false);
     const out = structuredOf(res);
     expect(out.pages.map((p) => p.page)).toEqual([3]);
-    expect(out.pages[0]?.lines).toEqual(['caption on page 3']);
+    expect(out.pages[0]?.lines).toEqual(['Table 1 caption on page 3', '3']);
     expect(out.resolvedLabels).toEqual([{ label: 'tab:results', printedPage: '3', page: 3 }]);
     expect(out.note).toContain('LAST COMPILE');
   });

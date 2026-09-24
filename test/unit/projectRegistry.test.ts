@@ -109,8 +109,11 @@ describe('ProjectRegistry', () => {
       registryPath(workspaceRoot),
       JSON.stringify({ cv: { mode: 'local' }, thesis: { gitUrl: 'https://git.example/x' } }),
     );
-    // The whole file is rejected as invalid — the same fail-safe as any other malformed registry.
-    expect(readProjectRegistry(workspaceRoot)).toEqual([]);
+    // Only the bad entry is skipped: validation is per entry, so one hand-edit mistake no longer
+    // hides every other registration (see test/unit/projectRegistrationSafety.test.ts).
+    expect(readProjectRegistry(workspaceRoot)).toEqual([
+      { id: 'thesis', gitUrl: 'https://git.example/x' },
+    ]);
   });
 
   describe('default project', () => {

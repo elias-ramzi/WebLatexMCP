@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import path from 'node:path';
-import { readFile, writeFile, rm, mkdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
@@ -9,9 +8,17 @@ import { coversPath, peerOwnership } from '../lib/commitPaths.js';
 import { collectPeerShadows } from '../lib/peerAttribution.js';
 import { isBibFile } from '../lib/bib.js';
 import { resolveInside, toPosix } from '../lib/paths.js';
-import { capUnshelveConflict, countLines, planUnshelveFile } from '../lib/shelf.js';
-import type { ShelfFileStatus, ShelfManifest, UnshelveConflictFile } from '../lib/shelf.js';
-import type { ShelfFileInput } from '../services/shelfStore.js';
+import { capUnshelveConflict, countLines, resolveUnshelveFile } from '../lib/shelf.js';
+import { merge3 } from '../lib/merge3.js';
+import { asShadowContent } from '../lib/shadowContent.js';
+import { writeWithRollback } from '../lib/shelfRestore.js';
+import type {
+  ShelfFileStatus,
+  ShelfManifest,
+  UnshelveConflictFile,
+  UnshelveResolution,
+} from '../lib/shelf.js';
+import type { ShelfFileInput, ShelfSides } from '../services/shelfStore.js';
 import {
   CONFLICT_MAX_FILES,
   CONFLICT_SIDE_CAP,
@@ -281,22 +288,24 @@ export function registerShelve(server: McpServer, ctx: AppContext): void {
           await refuseOnGuardedPaths(ctx, dir, covered, confirmBibEdit);
           await refuseOnPeerOwnership(ctx, id, covered, fold, 'shelve');
 
-          // A STAGED path is refused outright, before anything is written. `discard`'s
-          // path-limited branch runs `git checkout -- <paths>` with no index reset, so it
-          // restores from the INDEX, not HEAD — and `clean -f` cannot remove a staged new file.
-          // Shelving a staged path therefore reported success while leaving the content in the
-          // tree: the push this tool exists to unblock still refused, the work was duplicated,
-          // and the shelf could never be reclaimed because unshelve then saw a dirty tree.
+          // A STAGED path is refused outright, before anything is written, because the shelf
+          // does not capture what is staged. It stores the WORKING-TREE bytes against HEAD, and
+          // the `discard` below restores the path to HEAD in the index and the tree together —
+          // so a staged version that differs from the working tree (a partial `git add`, or a
+          // file edited again after staging) would be destroyed with nothing holding it, and
+          // even an identical one would come back from unshelve unstaged. (Before discard
+          // restored from HEAD it restored from the index, and a staged path survived the
+          // shelve outright — a different failure; the refusal predates, and outlives, it.)
           // `revert` already refuses anything staged, for its own reasons; this refuses only the
           // paths it was asked about, and says how to get out.
           const staged = new Set(status.staged.map(toPosix));
           const stagedCovered = covered.filter((p) => staged.has(p));
           if (stagedCovered.length > 0) {
             throw new Error(
-              `Staged, so shelve refuses: ${stagedCovered.join(', ')}. Shelving restores a path ` +
-                'to HEAD, and a staged change would survive that and leave the work in the tree ' +
-                'with a shelf that can never be reclaimed. Unstage first (`git reset` those ' +
-                'paths), or commit them.',
+              `Staged, so shelve refuses: ${stagedCovered.join(', ')}. A shelf keeps only the ` +
+                'working-tree bytes, and shelving restores the path to HEAD in the index too, so ' +
+                'staged content would not be kept. Unstage first (`git reset` those paths), or ' +
+                'commit them.',
             );
           }
 
@@ -343,11 +352,36 @@ export function registerShelve(server: McpServer, ctx: AppContext): void {
             files,
           });
 
-          // Reuses discard rather than growing a second path-limited checkout: it already
-          // resolves case onto the index spelling, restricts `checkout` to the tracked subset,
-          // `clean -f`s the untracked remainder, and carries --literal-pathspecs everywhere. The
+          // Reuses discard rather than growing a second path-limited restore: it already
+          // resolves case onto the index spelling, restores what HEAD or the index knows from
+          // HEAD (index and tree together — nothing staged is left, which is why a staged path
+          // was refused above), `clean -f`s the untracked remainder, and carries
+          // --literal-pathspecs everywhere. The
           // covered set came from `git status`, so it and discard's pathspecs agree exactly.
-          await ctx.git.discard(dir, covered);
+          //
+          // A failure HERE is reported in shelve's words, not discard's. Discard's own message
+          // says the content it already reset "is gone and cannot be recovered" — true for a
+          // bare discard, false here: every byte is in the shelf just written. Passing that on
+          // would send the caller hunting for lost work, or giving up on it, when one unshelve
+          // puts it all back (paths the discard never reached are a no-op to restore). Nothing
+          // below runs after the failure — the baseline reset and the settle stay tied to a
+          // tree that was actually reset, the same safe direction discard itself takes.
+          try {
+            await ctx.git.discard(dir, covered);
+          } catch (err) {
+            const cause = err instanceof Error && err.cause instanceof Error ? err.cause : err;
+            const reason = cause instanceof Error ? cause.message : String(cause);
+            throw new Error(
+              `Shelf ${manifest.id} was written in full BEFORE the tree was touched and holds ` +
+                `all ${manifest.files.length} file(s) — nothing is lost. Resetting those ` +
+                `paths to HEAD then failed (${reason}), possibly part way, so some may already ` +
+                'be at HEAD while others still hold their changes (run `status`). To put ' +
+                `everything back as it was: unshelve { id: "${manifest.id}" }. To finish ` +
+                'shelving instead: discard the paths still changed — their content is in ' +
+                'the shelf.',
+              { cause: err },
+            );
+          }
           // The tree was rewritten under the caller; without this the next edit_file throws
           // ExternalChangeError for a change the server itself made.
           ctx.files.resetBaselines(dir);
@@ -397,19 +431,6 @@ function asText(b: Buffer | null): string | null {
   return b === null ? null : b.toString('utf8');
 }
 
-/**
- * What to hand `ShadowStore.record` — text when the bytes are text, the Buffer only when they
- * are genuinely binary. The same transform `revert` applies, and for the same reason:
- * `record` sets a STICKY `binary` flag for any `Buffer` argument, and a binary entry is never
- * three-way merged. Passing a `.tex` file's Buffer through therefore makes every later
- * same-file/different-paragraph edit by a peer a permanent `conflicted` entry instead of the
- * silent merge the shadow design exists to do — and nothing would say so except `shadow.json`.
- */
-function asShadowContent(bytes: Buffer | null): string | Buffer | null {
-  if (bytes === null) return null;
-  return bytes.includes(0) ? bytes : bytes.toString('utf8');
-}
-
 export function registerUnshelve(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'unshelve',
@@ -418,12 +439,20 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
       description:
         'Restore a shelf taken by shelve. Any session on the project can unshelve any of its ' +
         'shelves — they are project-scoped by design. ' +
-        'REFUSES rather than overwrites: if the working tree has changed under a shelved path, ' +
-        'or HEAD has moved so the shelved edit no longer applies to the content it was made ' +
-        'against, nothing is written, the tree is left exactly as it was, and the SHELF IS LEFT ' +
-        'INTACT. The refusal reports base/ours/theirs per file the way a push conflict does, ' +
-        'rather than writing conflict markers into your files — so resolving the collision and ' +
-        'calling unshelve again recovers every byte, including any the report had to elide. ' +
+        'If HEAD has moved under a shelved TEXT file since the shelve (a pull brought in a ' +
+        "co-author's commit touching it) and the tree is clean there, the shelved change is " +
+        "three-way merged onto HEAD's new content, so both land. " +
+        'REFUSES rather than overwrites: if the working tree has changed under a shelved path ' +
+        '("dirty"), or HEAD moved and the shelved change cannot be merged onto it ("head-moved": ' +
+        'the two changes touch the same lines, the file is not text, or one side added or ' +
+        'deleted it), nothing is written, the tree is left exactly as it was, and the SHELF IS ' +
+        'LEFT INTACT. The refusal reports base/ours/theirs per file the way a push conflict ' +
+        'does, never conflict markers in your files. theirs is the shelved content — the one ' +
+        'side no other tool can read, since a shelf lives outside the project — so it is charged ' +
+        'against the size budget first and cut last; ours is the working tree (read_file) and ' +
+        "base is HEAD when the shelf was taken (read_file with ref = the shelf's headSha). For " +
+        '"dirty", clearing the live edit and calling unshelve again restores (or merges) every ' +
+        'byte. For "head-moved", resolve by hand from theirs and ours. ' +
         'A successful unshelve REMOVES the shelf; an unshelve that refuses does not. ' +
         'Refuses a .bib without confirmBibEdit, a path that is a symbolic link on any side, and ' +
         "a path a live peer session owns (or one it cannot read that peer's index to judge). " +
@@ -444,6 +473,15 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
           .array(z.string())
           .optional()
           .describe('Paths written (or removed, for a "deleted" entry). Absent on a refusal.'),
+        merged: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Present only when some path was three-way merged: HEAD's content for it had moved " +
+              'since the shelve, so the file now holds the shelved change AND what landed, not ' +
+              "the shelf's bytes verbatim. Recorded as this session's change against the new " +
+              'HEAD, so a session commit carries the shelved lines alone.',
+          ),
         conflicts: z
           .array(
             z.object({
@@ -453,8 +491,9 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
                 .describe(
                   '"dirty" — the working tree changed under this path since the shelve, so ' +
                     'restoring would overwrite live content. "head-moved" — HEAD\'s content for ' +
-                    'this path is no longer what the shelved edit was made against, so ' +
-                    'restoring would silently drop whatever landed in between.',
+                    'this path is no longer what the shelved edit was made against, and the ' +
+                    'shelved change could not be three-way merged onto it: the two touch the ' +
+                    'same lines, the file is not text, or one side added or deleted it.',
                 ),
               base: z
                 .string()
@@ -464,7 +503,11 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
               theirs: z
                 .string()
                 .nullable()
-                .describe('The shelved content; null if the shelf recorded a deletion.'),
+                .describe(
+                  'The shelved content; null if the shelf recorded a deletion. The ONLY copy ' +
+                    'a caller can reach — no tool reads a shelf — so it is charged against the ' +
+                    'size budget first and cut last.',
+                ),
               elided: z
                 .object({
                   base: z.number().optional(),
@@ -475,7 +518,9 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
                 .describe(
                   "Present only for sides CUT for size, giving each one's true character " +
                     'count. A null side WITHOUT an entry here means the side is genuinely ' +
-                    'absent (the file was added, or deleted) — never confuse the two.',
+                    'absent (the file was added, or deleted) — never confuse the two. The ' +
+                    'budget is charged on the RENDERED (JSON) size, so a side full of control ' +
+                    'characters is cut well before its character count reaches the cap.',
                 ),
             }),
           )
@@ -530,8 +575,19 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
           // Read every side BEFORE writing anything: the conflict check and the rollback both
           // need the current bytes, and a check that read as it wrote could leave half a shelf
           // applied over a collision it had not reached yet.
+          //
+          // The shelf's own sides are read here too, ONCE, through `sides()`, which refuses a
+          // side that is missing where the manifest says it exists (or unreadable at all) as a
+          // corrupt shelf — before anything is written, so the tree and the shelf both stay as
+          // they are. A bare `null` from `content()` would be read as "the shelf recorded a
+          // deletion" and restored by deleting the file. The same bytes then serve the conflict
+          // check, the write and the shadow record, so all three act on one reading.
           const current = new Map<string, Buffer | null>();
           const headNow = new Map<string, Buffer | null>();
+          const stored = new Map<string, ShelfSides>();
+          for (const file of manifest.files) {
+            stored.set(file.path, await shelf.sides(file));
+          }
           for (const rel of rels) {
             current.set(
               rel,
@@ -544,24 +600,32 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
           }
 
           const conflicts: UnshelveConflictFile[] = [];
+          const resolved = new Map<string, Extract<UnshelveResolution, { kind: 'restore' }>>();
           for (const file of manifest.files) {
             const rel = file.path;
-            const shelved = await shelf.content(rel);
-            const base = await shelf.base(rel);
+            const { content: shelved, base } = stored.get(rel)!;
             // The decision is a pure function over bytes (src/lib/shelf.ts), deliberately: it
             // used to be inline here, had no seam anyone could unit-test, and silently
             // overwrote a user's file at a path `git status` declines to report. `dirty` is
             // git's own answer rather than a byte comparison, because only git applies the
-            // path's clean filter (the #63 defect); everything else planUnshelveFile decides
-            // from the bytes themselves.
-            const verdict = planUnshelveFile({
-              base,
-              shelved,
-              current: current.get(rel) ?? null,
-              headNow: headNow.get(rel) ?? null,
-              dirty: dirtyNow.has(key(rel)),
-            });
-            if (verdict.kind !== 'conflict') continue;
+            // path's clean filter (the #63 defect); everything else is decided from the bytes
+            // themselves — including the three-way merge a text file gets when HEAD moved
+            // under it (merge3, the shadow store's own primitive). Every merge runs BEFORE any
+            // write, so one collision still leaves every file untouched.
+            const verdict = await resolveUnshelveFile(
+              {
+                base,
+                shelved,
+                current: current.get(rel) ?? null,
+                headNow: headNow.get(rel) ?? null,
+                dirty: dirtyNow.has(key(rel)),
+              },
+              merge3,
+            );
+            if (verdict.kind === 'restore') {
+              resolved.set(rel, verdict);
+              continue;
+            }
             conflicts.push({
               path: rel,
               reason: verdict.reason,
@@ -579,6 +643,7 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
               // 20 files x 3 sides x 12000 characters through with nothing individually over a
               // cap — 720k, `truncated: false`, and the result undeliverable.
               totalBudget: CONFLICT_CONTENT_BUDGET,
+              baseRef: manifest.headSha,
             });
             const header =
               `unshelve refused: ${plan.paths.length} path(s) would be overwritten or no ` +
@@ -603,35 +668,18 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
           }
 
           // No conflicts. Write, with a rollback that puts every touched path back exactly as it
-          // was if any write fails — the same unwind rule resolvePush follows, so a failed
-          // restore never leaves the tree half-applied.
-          const written: string[] = [];
-          try {
-            for (const file of manifest.files) {
-              const rel = file.path;
-              // Pushed BEFORE the write, not after. `writeFile` can fail part-way (ENOSPC, EIO)
-              // and leave a truncated file, and the path most likely to be damaged is exactly
-              // the one that threw — which an after-the-write push excludes from the rollback.
-              written.push(rel);
-              const abs = resolveInside(dir, rel);
-              const shelved = await shelf.content(rel);
-              if (shelved === null) {
-                // The shelf recorded a deletion: restoring it deletes the file again.
-                await rm(abs, { force: true });
-              } else {
-                await mkdir(path.dirname(abs), { recursive: true });
-                await writeFile(abs, shelved);
-              }
-            }
-          } catch (err) {
-            for (const rel of written) {
-              const abs = resolveInside(dir, rel);
-              const before = current.get(rel) ?? null;
-              if (before === null) await rm(abs, { force: true });
-              else await writeFile(abs, before);
-            }
-            throw err;
-          }
+          // was if any write fails (src/lib/shelfRestore.ts — guarded per path, original error
+          // primary). A null content side is a shelved deletion, restored by deleting the file;
+          // `sides()` above has already proved the manifest says so. A merged file writes the
+          // merge, not the shelf's bytes.
+          await writeWithRollback(
+            dir,
+            manifest.files.map((file) => ({
+              rel: file.path,
+              bytes: resolved.get(file.path)!.bytes,
+              before: current.get(file.path) ?? null,
+            })),
+          );
 
           // The tree was rewritten under the caller — without this the next edit_file throws
           // ExternalChangeError for a change the server itself made.
@@ -658,16 +706,21 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
             process.stderr.write(`unshelve: settling peer records failed: ${String(err)}\n`);
           }
           for (const file of manifest.files) {
+            const res = resolved.get(file.path)!;
             try {
               await ctx.shadows.record(
                 id,
                 dir,
                 file.path,
-                // `before` is the bytes actually captured immediately before the write — exact,
-                // not convenient. A three-way merge against the wrong base is how a shadow ends
-                // up carrying lines nobody wrote.
-                asShadowContent(current.get(file.path) ?? null),
-                asShadowContent(await shelf.content(file.path)),
+                // `recordBefore` is decided in resolveUnshelveFile (src/lib/shelf.ts), which says
+                // why at length: the shelf's BASE for a restore or a no-op, so the recorded
+                // change is exactly the shelved edit (the working-tree bytes would record nothing
+                // on a no-op); the tree's pre-write bytes — HEAD, by the clean dirty check — for
+                // a merge, so the settled shadow (fresh at the new HEAD) takes the shelved lines
+                // and none of HEAD's. When HEAD moved under a no-op restore, the shadow three-way
+                // merges base -> shelved onto HEAD, keeping what landed.
+                asShadowContent(res.recordBefore),
+                asShadowContent(res.bytes),
               );
             } catch (err) {
               process.stderr.write(`unshelve: recording ${file.path} failed: ${String(err)}\n`);
@@ -692,18 +745,39 @@ export function registerUnshelve(server: McpServer, ctx: AppContext): void {
             );
           }
 
+          const merged = rels.filter((rel) => resolved.get(rel)!.merged);
+          // What a second unshelve of a shelf left behind would do (src/lib/shelf.ts's
+          // `planUnshelveFile`): a path already holding the shelf's own bytes is a no-op
+          // restore, so after a plain restore it succeeds, writes nothing new and removes the
+          // shelf; a MERGED path holds the merge, not the shelf's bytes, over a HEAD that moved
+          // since the shelve — so it is refused as dirty against the content restored here.
+          const lingering =
+            merged.length > 0
+              ? 'Unshelving it again will be refused as dirty at ' +
+                `${merged.join(', ')}, against the merged content restored here — that is ` +
+                'this, not lost work.'
+              : 'Unshelving it again is harmless: the content already matches, so it writes ' +
+                'nothing new and removes the shelf.';
           const text = [
             `unshelved ${manifest.id}` + (manifest.label ? ` — "${manifest.label}"` : ''),
-            ...manifest.files.map((f) => `  ${f.path} (${f.status})`),
+            ...manifest.files.map(
+              (f) =>
+                `  ${f.path} (${f.status}` +
+                (resolved.get(f.path)!.merged ? ", merged onto HEAD's new content)" : ')'),
+            ),
             shelfRemoved
               ? '  the shelf has been removed'
               : `  NOTE: the content is restored, but shelf ${manifest.id} could not be removed ` +
-                'and will still appear in list_shelves. Unshelving it again will report a ' +
-                'conflict whose sides are identical — that is this, not lost work.',
+                `and will still appear in list_shelves. ${lingering}`,
           ].join('\n');
           return {
             content: [{ type: 'text' as const, text }],
-            structuredContent: { restored: true, shelf: { ...manifest }, files: rels },
+            structuredContent: {
+              restored: true,
+              shelf: { ...manifest },
+              files: rels,
+              ...(merged.length > 0 ? { merged } : {}),
+            },
           };
         });
       } catch (err) {

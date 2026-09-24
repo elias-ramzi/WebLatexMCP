@@ -87,12 +87,45 @@ export function isNotFound(err: unknown): boolean {
 }
 
 /**
+ * What a spawn failure that is NOT "not found" said, for a report: node's own message
+ * (`spawn latexmk EACCES`), which already carries the errno. Shared with `doctor`, so the two
+ * places that describe an unrunnable backend describe it in the same words.
+ */
+export function spawnFailureReason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A backend binary that is on PATH but could not be run (`EACCES`, `EAGAIN`, …). Deliberately
+ * not a `MissingCompilerError`: it is never read as "not installed", so it never licenses a
+ * substitution. It keeps the original errno as `code` (so `isNotFound` still answers false for
+ * it) and the original error as `cause`.
+ */
+export class UnrunnableCompilerError extends Error {
+  readonly code: unknown;
+
+  constructor(cmd: string, err: unknown) {
+    super(
+      `${cmd} is on PATH but could not be run (${spawnFailureReason(err)}). A backend that is ` +
+        'present but fails to start is a fault, not a missing default, so no other backend was ' +
+        'substituted for it. Make sure it is executable and runs from a shell, or choose a ' +
+        'different backend: pass compiler: "<backend>" on this call, or set ' +
+        'WEB_LATEX_MCP_COMPILER for every compile. Run the doctor tool for a full toolchain report.',
+      { cause: err },
+    );
+    this.name = 'UnrunnableCompilerError';
+    this.code = typeof err === 'object' && err !== null && 'code' in err ? err.code : undefined;
+  }
+}
+
+/**
  * Probe a backend binary by running its version flag. Resolves `true` if it ran at all (a
  * non-zero exit still means the binary is there), `false` only when it is absent — and
  * **rethrows** any other spawn failure. Swallowing those into `false` is what would let a
  * transient `EAGAIN` under fork pressure silently switch a healthy machine's engine, which is
  * precisely the silent substitution `CompilerResolver` exists to prevent: only the caller can
- * be told that latexmk is installed but unrunnable.
+ * be told that latexmk is installed but unrunnable. The rethrow is wrapped in
+ * {@link UnrunnableCompilerError} so the caller is told that in words, not by a bare errno.
  *
  * `run` is injectable so the rethrow can be tested: a real non-ENOENT spawn failure needs fd or
  * process exhaustion to reproduce, and a test that cannot cause one cannot pin the branch that
@@ -108,7 +141,7 @@ export async function probeOnPath(
     return true;
   } catch (err) {
     if (isNotFound(err)) return false;
-    throw err;
+    throw new UnrunnableCompilerError(cmd, err);
   }
 }
 

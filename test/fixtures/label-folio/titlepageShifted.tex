@@ -1,0 +1,13 @@
+\documentclass[titlepage]{article}
+\usepackage{lipsum}
+\title{T}\author{A}
+\newcommand\para[1]{\lipsum[#1] Prior work [1, 2] reports 3 runs.\par}
+\begin{document}
+\maketitle
+\section{Intro}
+\para{1}\para{2}\para{3}\para{4}\para{5}\para{6}
+\begin{figure}[t]\centering\rule{4cm}{3cm}\caption{First}\label{fig:a}\end{figure}
+\para{7}\para{8}\para{9}\para{10}
+\begin{figure}[t]\centering\rule{4cm}{3cm}\caption{Second}\label{fig:b}\end{figure}
+\para{11}\para{12}\para{13}\para{14}\para{15}\para{16}
+\end{document}

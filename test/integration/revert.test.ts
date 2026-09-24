@@ -599,6 +599,81 @@ describe('revert, staged peer work, and session attribution', () => {
   });
 });
 
+// A refusal names the paths it is about — but a commit can touch hundreds, and the refusal
+// text used to join every one of them, so a revert of a wide commit over a busy tree produced an
+// unbounded error message. The house cap: 20 names, then a count of the rest.
+describe('revert refusal path lists are capped', () => {
+  const N = 30;
+  const names = Array.from({ length: N }, (_, i) => `sec/f${String(i).padStart(2, '0')}.tex`);
+  const shown = (message: string): number => names.filter((n) => message.includes(n)).length;
+
+  it('caps the uncommitted-changes list', async () => {
+    const h = await setup({ 'main.tex': 'alpha\n' });
+    const sha = await commitInClone(
+      h,
+      Object.fromEntries(names.map((n) => [n, 'one\n'])),
+      'add thirty sections',
+    );
+    for (const n of names) await writeFile(path.join(h.clone, n), 'one\nPEER\n');
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toMatch(/uncommitted/i);
+    expect(shown(outcome.message)).toBe(20);
+    expect(outcome.message).toContain('… 10 more');
+  });
+
+  it('caps the in-the-way list', async () => {
+    const h = await setup(
+      Object.fromEntries([['main.tex', 'alpha\n'], ...names.map((n) => [n, 'one\n'])]),
+    );
+    // The sections stay tracked despite the pattern; once deleted, what reappears there is
+    // ignored, so `status` does not list it — the in-the-way case, not the uncommitted one.
+    await commitInClone(h, { '.gitignore': 'sec/\n' }, 'ignore sec/');
+    await h.git.rm(names);
+    await h.git.commit('drop thirty sections');
+    const sha = (await h.git.revparse(['HEAD'])).trim();
+    await mkdir(path.join(h.clone, 'sec'), { recursive: true });
+    for (const n of names) await writeFile(path.join(h.clone, n), 'someone else\n');
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toMatch(/in the way/i);
+    expect(shown(outcome.message)).toBe(20);
+    expect(outcome.message).toContain('… 10 more');
+  });
+
+  it('caps the staged-changes list', async () => {
+    const h = await setup(
+      Object.fromEntries([['main.tex', 'alpha\n'], ...names.map((n) => [n, 'one\n'])]),
+    );
+    const sha = await commitInClone(h, { 'main.tex': 'alpha\nbeta\n' }, 'add beta');
+    for (const n of names) await writeFile(path.join(h.clone, n), 'one\nstaged\n');
+    await h.git.add(names);
+
+    const outcome = await attempt(h.client, 'revert', {
+      project: 'demo',
+      commits: [sha],
+      confirm: true,
+    });
+
+    expect(wasRefused(outcome)).toBe(true);
+    expect(outcome.message).toMatch(/Staged changes/);
+    expect(shown(outcome.message)).toBe(20);
+    expect(outcome.message).toContain('… 10 more');
+  });
+});
+
 // 11. Reverting a merge commit needs `-m` to say which parent is "the change", and `revert`
 //     deliberately takes no mainline parameter rather than guessing for the user. Without this
 //     guard the call reaches git, which fails `fatal: revert failed` — a raw git error naming

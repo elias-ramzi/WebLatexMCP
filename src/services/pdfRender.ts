@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import type { Box, Matrix, TextItemLike } from '../lib/pdfGeometry.js';
 import {
@@ -16,21 +18,25 @@ export const MAX_PAGES_PER_CALL = 8;
 /** Pages per pdf_geometry call. Lower than MAX_PAGES_PER_CALL: a page of text lines is a lot of
  *  structured output, where a page of PNG is one image. */
 export const MAX_GEOMETRY_PAGES = 4;
-/** Per-page caps, so a dense page cannot produce unbounded output. */
+/**
+ * Per-page COUNT caps. They bound the work and the number of boxes, not what a client receives:
+ * every text box carries a document-controlled label, so `pdf_geometry` also charges the boxes
+ * that survive these caps against a rendered-size budget (`src/lib/geometryBudget.ts`), counted
+ * apart from these caps as `textOmittedBySize` / `imagesOmittedBySize`.
+ */
 export const MAX_TEXT_LINES_PER_PAGE = 300;
 export const MAX_IMAGE_RECTS_PER_PAGE = 100;
 
 /** Pages per extract_text call. Matches MAX_GEOMETRY_PAGES rather than MAX_PAGES_PER_CALL for the
  *  same reason: a page of text is a lot of output where a page of PNG is one image. */
 export const MAX_TEXT_PAGES = 4;
-/**
- * The character budget for one page's extracted text, counted over the line strings themselves.
- * A page of a dense two-column paper is roughly 5000 characters, so this leaves headroom for a
- * poster or a wide table while still bounding what a document-controlled text layer can spend:
- * a PDF can carry arbitrarily much invisible text (an OCR layer, a `\phantom` block), and the
- * line cap alone bounds the number of strings, never their length.
- */
-export const MAX_TEXT_CHARS_PER_PAGE = 20_000;
+// There is deliberately no per-page character cap on `text`. What a document-controlled text
+// layer can spend is bounded where it reaches a client — `extract_text`'s call-wide rendered
+// budget (`src/lib/extractTextBudget.ts`), which cuts a suffix of each page and counts it — and a
+// cap here only ever changed what that budget's counters said: it truncated a single over-long
+// line to the cap plus "…", so the gap was reported at the cap plus one, not at its length (PB3).
+// Nor did it bound memory: pdf.js has already materialised every item of the page, and the merged
+// lines are those same strings joined.
 
 /** A crop, as fractions of the page box, origin top-left, both ends in [0,1]. */
 export interface ClipFractions {
@@ -170,8 +176,9 @@ export interface TextPage {
    * order, never re-sorted, since sorting would invent a reading order the PDF does not state.
    */
   lines: string[];
-  /** Lines the per-page character budget left out. They are always a SUFFIX of the page, so what
-   *  comes back is a contiguous prefix in drawing order rather than a filtered selection. */
+  /** Lines this service left out of `lines`. Always 0 today — the service returns every merged
+   *  line and leaves the cut to the consumer's budget — but kept in the shape so a consumer's
+   *  budget composes with it: any cut here would be a SUFFIX, counted at the lines' true length. */
   linesOmitted: number;
   /** How many characters those omitted lines held — the size of the gap, not just its length. */
   charsOmitted: number;
@@ -291,16 +298,37 @@ export function selectPages(
 }
 
 /**
- * Deterministic file name. Unclipped: `page-3.png`. Clipped: the fractions x1000, zero-padded to
- * 4 digits, so two different crops of one page never overwrite each other and nothing in the name
- * is illegal on Windows: `page-3-clip-0000-0000-0500-0300.png`.
+ * Deterministic file name, unique per distinct render request. A default render (no clip, no
+ * `dpi`, no `maxEdgePx`) is `page-3.png`; anything else is `page-3-<hash>.png`, where the hash
+ * covers the EXACT clip fractions and the requested `dpi`/`maxEdgePx` — every input that changes
+ * the pixels. Nothing in either form is illegal on Windows.
+ *
+ * Why a hash and not a readable encoding: the build directory is shared by every session, so two
+ * requests that map to one name overwrite each other, and an earlier result's `pngPath` then
+ * silently names a later image. The previous name rounded the clip to three decimals and left the
+ * scale out entirely, so two crops closer than 0.0005 — or any two renders of one page at
+ * different `dpi` — collided. A readable encoding exact enough to rule that out is a 17-digit
+ * float per edge; twelve hex digits of SHA-256 over the exact values is shorter and still reads as
+ * "page 3, some variant". (Two requests for the same pixels under different spellings — `maxEdgePx`
+ * omitted vs. its default given explicitly — get two names for one image, which costs a file, not
+ * a wrong answer.)
  */
-export function pngName(page: number, clip?: ClipFractions): string {
-  if (!clip) {
+export function pngName(
+  page: number,
+  clip?: ClipFractions,
+  scale: { dpi?: number; maxEdgePx?: number } = {},
+): string {
+  if (!clip && scale.dpi === undefined && scale.maxEdgePx === undefined) {
     return `page-${page}.png`;
   }
-  const part = (v: number) => String(Math.round(v * 1000)).padStart(4, '0');
-  return `page-${page}-clip-${part(clip.x0)}-${part(clip.y0)}-${part(clip.x1)}-${part(clip.y1)}.png`;
+  // JSON.stringify of a finite number is its shortest round-trip spelling, so two different
+  // doubles never hash the same input. `null` stands for "not given", apart from every number.
+  const key = JSON.stringify([
+    clip ? [clip.x0, clip.y0, clip.x1, clip.y1] : null,
+    scale.dpi ?? null,
+    scale.maxEdgePx ?? null,
+  ]);
+  return `page-${page}-${createHash('sha256').update(key).digest('hex').slice(0, 12)}.png`;
 }
 
 const FULL_CLIP: ClipFractions = { x0: 0, y0: 0, x1: 1, y1: 1 };
@@ -324,31 +352,25 @@ interface CanvasFactoryLike {
 /**
  * Whether a thrown error means "the native canvas backend is not installed".
  *
- * Two shapes, because the backend is load-bearing in two different places. The obvious one is the
- * `require('@napi-rs/canvas')` inside pdf.js's `NodeCanvasFactory`, which fails with
- * MODULE_NOT_FOUND when a page is rendered. The non-obvious one is that **importing pdf.js at
- * all** fails: it evaluates `const SCALE_MATRIX = new DOMMatrix();` at module scope, and
- * `@napi-rs/canvas` is what installs `DOMMatrix` in Node — so with the backend absent the very
- * `await import('pdfjs-dist/...')` throws `DOMMatrix is not defined`, long before any document is
- * opened or any canvas asked for. Measured against the installed pdfjs-dist 6.1.200 by running it
- * with the backend removed from the module graph, not inferred.
- *
- * That is why `pageCount`, `pageLabels` and `text` need the backend exactly as much as `render`
- * does even though none of them rasterizes anything, and why none of them may report the failure
- * as a broken PDF. The dependency is incidental rather than intrinsic — given stub `DOMMatrix` /
- * `Path2D` globals the same build opens documents, reads `/PageLabels` and extracts text with no
- * canvas anywhere — but shipping a polyfill for someone else's module-scope global is a separate
- * decision from this file's, so what the code does today is report it accurately.
+ * The backend is load-bearing in exactly one place now: the `require('@napi-rs/canvas')` inside
+ * pdf.js's `NodeCanvasFactory`, which runs when a page is rasterized. It used to be load-bearing
+ * in a second, non-obvious one — pdf.js evaluates `const SCALE_MATRIX = new DOMMatrix();` at
+ * module scope and relies on the backend to install `DOMMatrix` in Node, so without it the very
+ * import threw "DOMMatrix is not defined" and page counts, `/PageLabels` and text extraction died
+ * with rendering. `loadPdfjsDefault` now supplies a stub for that one global when the backend does
+ * not load (see `installDomMatrixStub`), so the DOM-global shapes below should no longer occur;
+ * they stay classified as defence in depth, so that if a future pdf.js reaches for another global
+ * at import time the failure is still never reported as a broken PDF.
  */
 export function isNativeCanvasMissing(err: unknown): boolean {
   if (!(err instanceof Error)) {
     return false;
   }
   // Deliberately keyed on the message naming the backend, NOT on a bare MODULE_NOT_FOUND code:
-  // `openDocument` imports pdfjs-dist first, so a broken install of *that* also arrives here with
-  // ERR_MODULE_NOT_FOUND, and telling the user to install @napi-rs/canvas — which is already there
-  // — sends them after the wrong package. Node's message always names the module it could not
-  // find, so the narrower test loses nothing.
+  // a broken install of pdfjs-dist itself also arrives with ERR_MODULE_NOT_FOUND, and telling the
+  // user to install @napi-rs/canvas — which is already there — sends them after the wrong
+  // package. Node's message always names the module it could not find, so the narrower test loses
+  // nothing.
   const code = (err as NodeJS.ErrnoException).code;
   if (
     (code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND') &&
@@ -363,17 +385,53 @@ export function isNativeCanvasMissing(err: unknown): boolean {
   return /\b(DOMMatrix|ImageData|Path2D|OffscreenCanvas) is not defined\b/.test(err.message);
 }
 
+/**
+ * The refusal `render` gives without the backend. Rasterizing is the one thing that genuinely
+ * needs it, so this names render_pages alone — page counts, `/PageLabels`, `extract_text` and
+ * `pdf_geometry` all work without it — and names BOTH ways a machine ends up here, because the
+ * remedy differs: `npm i` is meaningless inside a Claude Desktop extension, whose bundle is built
+ * once for every platform and so can never carry a per-platform native binary. It also says to
+ * restart, because the refusal can outlive its cause: the probe memoizes a definitive "no", and
+ * pins "no" once the `DOMMatrix` stub was installed ({@link CanvasProbe.pinUnavailable}), so a
+ * backend installed — or recovered from a transient load failure — mid-process is never used by it.
+ * `render` sees only a boolean, not whether the probe is pinned, so the advice is unconditional.
+ */
 function nativeCanvasError(cause: unknown): PdfRenderError {
   return new PdfRenderError(
-    'Reading the PDF needs the native canvas backend @napi-rs/canvas, which is not installed on ' +
-      'this machine (it is an optional dependency, skipped on unsupported platforms or by ' +
-      "--omit=optional). Install it with `npm i @napi-rs/canvas` in the server's directory. " +
-      'This affects render_pages, pdf_geometry, extract_text, and the pageCount compile ' +
-      'reports, and nothing else — compiling, the viewer, editing and the whole git side work ' +
-      'without it. extract_text and /PageLabels reading need it too even though neither ' +
-      'rasterizes anything: pdfjs-dist evaluates `new DOMMatrix()` at module scope, and this ' +
-      'backend is what supplies that global in Node, so the module cannot even be imported ' +
-      'without it.',
+    'Rendering pages to PNG needs the native canvas backend @napi-rs/canvas, which is not ' +
+      'available here, so render_pages cannot run. In the Claude Desktop extension (.mcpb) it is ' +
+      'never available: the bundle is built once for every platform and this backend is a ' +
+      'per-platform native binary, so it is left out — install the server from npm instead ' +
+      '(`npx -y web-latex-mcp`) if you need page images. On an npm install it is an optional ' +
+      'dependency, skipped on unsupported platforms or by --omit=optional: run ' +
+      "`npm i @napi-rs/canvas` in the server's directory. If it is already installed (or you " +
+      'just installed it), restart the server: once this process has found the backend ' +
+      'unavailable it can keep that answer until it restarts. Nothing else needs it — compile (and ' +
+      'its pageCount), extract_text, pdf_geometry and the viewer all work without it.',
+    { cause },
+  );
+}
+
+/**
+ * pdf.js itself is not usable. Never a statement about the PDF — every document fails the same
+ * way — so it must not read as "Failed to open PDF", which sends the caller to look for a corrupt
+ * document that is perfectly fine. The Desktop extension once shipped without pdf.js's Node build
+ * at all, and "Failed to open PDF at …: Cannot find module …pdf.mjs" read as exactly that. Nor is
+ * it the render-only `nativeCanvasError`, whose "nothing else needs it" would be false here —
+ * except that a DOM global going missing is still the backend's to supply, so that one cause says
+ * so, as the only workaround there is.
+ */
+function pdfjsUnavailableError(cause: unknown): PdfRenderError {
+  const why = (cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, '');
+  const canvasNote = isNativeCanvasMissing(cause)
+    ? ' pdf.js reached for a DOM global that the native canvas backend @napi-rs/canvas supplies ' +
+      "in Node; on an npm install, `npm i @napi-rs/canvas` in the server's directory works " +
+      'around it.'
+    : '';
+  return new PdfRenderError(
+    'The PDF library (pdfjs-dist) is not usable here, so no PDF can be read — this is a broken ' +
+      'or incomplete install of the server, not a problem with the document. Reinstall the ' +
+      `server (or its Claude Desktop extension). Cause: ${why}.${canvasNote}`,
     { cause },
   );
 }
@@ -450,8 +508,155 @@ interface PdfjsLike {
  */
 export type PdfjsLoader = () => Promise<PdfjsLike>;
 
-const loadPdfjsDefault: PdfjsLoader = async () =>
-  (await import('pdfjs-dist/legacy/build/pdf.mjs')) as unknown as PdfjsLike;
+/** The pdf.js build this service loads in Node. Also where pdf.js resolves the backend from. */
+export const PDFJS_SPECIFIER = 'pdfjs-dist/legacy/build/pdf.mjs';
+
+/**
+ * Errno codes (and their `dlopen` wording) that say the machine was momentarily out of something —
+ * file descriptors, memory, processes — and nothing about whether the backend is installed.
+ */
+const TRANSIENT_LOAD_CODES = new Set(['EMFILE', 'ENFILE', 'EAGAIN', 'ENOMEM', 'EBUSY', 'EINTR']);
+const TRANSIENT_LOAD_TEXT =
+  /too many open files|resource temporarily unavailable|cannot allocate memory|interrupted system call/i;
+
+/**
+ * Whether a failed load of the backend was transient. Walks the `cause` chain because the napi-rs
+ * loader does not rethrow what `require` of the binary threw: it collects every attempt and throws
+ * one "Cannot find native binding" whose `cause` links them, so an EMFILE from `dlopen` sits a
+ * level or two down. Anything not recognised here is treated as definitive — the memo's behaviour
+ * before this distinction existed — so an unknown failure costs a restart, never a retry storm.
+ */
+function isTransientLoadFailure(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let cur: unknown = err;
+  while (cur instanceof Error && !seen.has(cur) && seen.size < 32) {
+    seen.add(cur);
+    const code = (cur as NodeJS.ErrnoException).code;
+    if (typeof code === 'string' && TRANSIENT_LOAD_CODES.has(code)) return true;
+    if (TRANSIENT_LOAD_TEXT.test(cur.message)) return true;
+    cur = cur.cause;
+  }
+  return false;
+}
+
+/** The answer to "does the native canvas backend load?", with the memo made explicit. */
+export interface CanvasProbe {
+  loadable(): boolean;
+  /**
+   * Answer `false` for the rest of the process. Called once the `DOMMatrix` stub has been installed
+   * and pdf.js imported over it: pdf.js polyfills `DOMMatrix` from the backend only when the global
+   * is undefined, and it has already built its module-scope `SCALE_MATRIX` from the stub, so a
+   * backend that loads later could not be used by this process's pdf.js — rasterizing would reach
+   * for an inert matrix. Saying "unavailable" keeps `render`'s up-front refusal honest.
+   */
+  pinUnavailable(): void;
+}
+
+/**
+ * A memoized probe over `tryLoad`. Success and a definitive failure (package not installed,
+ * per-platform binary missing, pdf.js itself not resolvable) are remembered, since neither changes
+ * within a process and pdf.js's own `require` hits the same module cache. A transient failure
+ * ({@link isTransientLoadFailure}) is not: caching an EMFILE disabled render_pages until restart.
+ * The one thing that turns a transient "no" permanent is the stub — see {@link CanvasProbe.pinUnavailable}.
+ * Exported, with `tryLoad` injectable, because the real backend is installed on every test machine.
+ */
+export function createCanvasProbe(tryLoad: () => unknown): CanvasProbe {
+  let memo: boolean | undefined;
+  return {
+    loadable(): boolean {
+      if (memo !== undefined) return memo;
+      try {
+        tryLoad();
+        memo = true;
+        return true;
+      } catch (err) {
+        if (!isTransientLoadFailure(err)) memo = false;
+        return false;
+      }
+    },
+    pinUnavailable(): void {
+      memo = false;
+    },
+  };
+}
+
+/**
+ * Whether `@napi-rs/canvas` actually loads, resolved from pdf.js's OWN location — the place its
+ * `NodeCanvasFactory` will `require` it from, which under a nested or pnpm layout need not be the
+ * place this module would find it. Loading, not just resolving: a package whose per-platform
+ * binary is missing resolves fine and then throws "Cannot find native binding". Memoized as
+ * {@link createCanvasProbe} describes.
+ *
+ * A `false` here is not proof the canvas is the missing piece: resolving pdf.js is the first step,
+ * so a broken pdfjs-dist answers `false` too. `render` therefore asks pdf.js first before it blames
+ * the canvas.
+ */
+const defaultCanvasProbe = createCanvasProbe(() => {
+  const req = createRequire(import.meta.url);
+  createRequire(req.resolve(PDFJS_SPECIFIER))(NAPI_CANVAS);
+});
+export function nativeCanvasLoadable(): boolean {
+  return defaultCanvasProbe.loadable();
+}
+
+/**
+ * Stand-in for the one DOM global pdf.js's legacy Node build needs merely to be IMPORTED. It
+ * evaluates `new DOMMatrix()` at module scope and normally takes `DOMMatrix` from
+ * `@napi-rs/canvas`; without the backend the import throws, which took page counts, `/PageLabels`,
+ * `extract_text` and `pdf_geometry` down with rasterizing — none of which touch a matrix object.
+ *
+ * Measured, not inferred, against pdfjs-dist 6.1.200 with the backend removed: an empty class for
+ * `DOMMatrix` is the whole requirement. `Path2D` is only warned about at import (it is used by the
+ * canvas drawing code alone), and page count, labels, `getTextContent()`, `getOperatorList()` and
+ * viewports came back byte-identical to a run with the real backend on three documents, one with
+ * embedded images and math. The stub is deliberately inert — no methods — so anything that ever
+ * did reach for it would fail loudly rather than compute with a fake matrix; and nothing can,
+ * because rasterizing is refused up front without the backend (`render` checks first).
+ */
+class DomMatrixStub {}
+
+/**
+ * Install the stub — only when the backend does not load and nothing already defines the global.
+ * With the backend present pdf.js installs the real `DOMMatrix` itself, and a stub there would
+ * shadow it and break rendering; with a global already defined (another polyfill, a future Node
+ * that ships one) there is nothing to supply. Exported with its inputs injectable so both refusals
+ * are unit-testable: the real process has long since imported pdf.js.
+ */
+export function installDomMatrixStub(
+  canvasLoadable: () => boolean,
+  globals: { DOMMatrix?: unknown } = globalThis as { DOMMatrix?: unknown },
+): boolean {
+  if (globals.DOMMatrix !== undefined || canvasLoadable()) {
+    return false;
+  }
+  globals.DOMMatrix = DomMatrixStub;
+  return true;
+}
+
+/**
+ * The pdf.js loader over a canvas probe: install the stub when the backend does not load, and pin
+ * the probe unavailable when it did — so a transient "no" that the stub acted on can never turn
+ * into a later "yes" that `render` would trust (see {@link CanvasProbe.pinUnavailable}). Exported
+ * with every input injectable so that pairing is unit-testable; the real process imported pdf.js
+ * long ago.
+ */
+export function createPdfjsLoader(
+  probe: CanvasProbe,
+  importPdfjs: () => Promise<PdfjsLike>,
+  globals: { DOMMatrix?: unknown } = globalThis as { DOMMatrix?: unknown },
+): PdfjsLoader {
+  return async () => {
+    if (installDomMatrixStub(() => probe.loadable(), globals)) {
+      probe.pinUnavailable();
+    }
+    return importPdfjs();
+  };
+}
+
+const loadPdfjsDefault: PdfjsLoader = createPdfjsLoader(
+  defaultCanvasProbe,
+  async () => (await import(PDFJS_SPECIFIER)) as unknown as PdfjsLike,
+);
 
 /**
  * A one-page, empty PDF used only to probe that pdf.js can open and rasterize on this machine.
@@ -478,9 +683,19 @@ function probePdf(): Uint8Array {
 
 export class PdfRenderer implements PdfRenderService {
   private readonly loadPdfjs: PdfjsLoader;
+  private readonly canvasAvailable: () => boolean;
 
-  constructor(loadPdfjs: PdfjsLoader = loadPdfjsDefault) {
+  /**
+   * @param canvasAvailable Whether the native canvas backend loads — asked by `render` before it
+   *   opens anything. Injectable because the real answer is a property of the machine, and the
+   *   refusal on the other side of it has to be testable where the backend IS installed.
+   */
+  constructor(
+    loadPdfjs: PdfjsLoader = loadPdfjsDefault,
+    canvasAvailable: () => boolean = nativeCanvasLoadable,
+  ) {
     this.loadPdfjs = loadPdfjs;
+    this.canvasAvailable = canvasAvailable;
   }
 
   async pageCount(pdfPath: string): Promise<number> {
@@ -498,6 +713,21 @@ export class PdfRenderer implements PdfRenderService {
       validateClip(clip);
     }
     const effectiveClip = clip ?? FULL_CLIP;
+    // Refused before anything is opened: without the backend nothing below can succeed, and the
+    // failure it would otherwise hit — pdf.js's `NodeCanvasFactory` requiring the package — can
+    // surface as "Cannot find native binding", which names no package at all.
+    if (!this.canvasAvailable()) {
+      // pdf.js first: the default probe resolves the backend FROM pdf.js's location, so a broken
+      // pdfjs-dist answers "no canvas" too, and the canvas refusal would then send the user to
+      // install a package that is already there. Loading pdf.js opens no document and writes
+      // nothing, so this is still a refusal before any work.
+      try {
+        await this.loadPdfjs();
+      } catch (err) {
+        throw pdfjsUnavailableError(err);
+      }
+      throw nativeCanvasError(undefined);
+    }
 
     const { doc, destroy } = await this.openDocument(req.pdfPath);
     try {
@@ -593,11 +823,11 @@ export class PdfRenderer implements PdfRenderService {
    * The requested pages' text layer, as merged lines.
    *
    * Deliberately the SAME walk `geometry`'s "text" kind uses — `getTextContent()` fed through
-   * `mergeTextLines` — with the boxes dropped and the per-line character cap raised: a second
+   * `mergeTextLines` — with the boxes dropped and the per-line character cap lifted: a second
    * text extractor in this codebase would be a defect, since the two would then disagree about
    * what one line is. The only differences are budgets, and they are budgets because the two
    * answer different questions: geometry labels a box (160 characters is plenty to identify one),
-   * while this returns the content itself.
+   * while this returns the content itself, whole, for the consumer's budget to cut and count.
    */
   async text(req: TextRequest): Promise<TextResult> {
     const { doc, destroy } = await this.openDocument(req.pdfPath);
@@ -629,31 +859,20 @@ export class PdfRenderer implements PdfRenderService {
     const page = await doc.getPage(pageNum);
     try {
       const content = await page.getTextContent();
-      const items = textItemsOf(content);
-      // The per-line cap is the page budget, so `mergeTextLines`' own truncation can only fire on
-      // a single line that already exhausts the page — at which point the budget below reports
-      // every following line as omitted anyway, and the cut is never silent either way.
-      const lines = mergeTextLines(items, { maxTextChars: MAX_TEXT_CHARS_PER_PAGE });
-
-      // Cut a SUFFIX, not a subset: the caller is reading, and a prefix of the page in drawing
-      // order is readable where a budget-packed selection of scattered lines is not. So the
-      // first line that does not fit ends the page, rather than being skipped in favour of a
-      // shorter one behind it.
-      const kept: string[] = [];
-      let chars = 0;
-      let cut = 0;
-      let charsOmitted = 0;
-      for (const line of lines) {
-        if (cut === 0 && chars + line.text.length <= MAX_TEXT_CHARS_PER_PAGE) {
-          kept.push(line.text);
-          chars += line.text.length;
-          continue;
-        }
-        cut += 1;
-        charsOmitted += line.text.length;
-      }
-
-      return { page: pageNum, lines: kept, linesOmitted: cut, charsOmitted };
+      // Every merged line, whole: `mergeTextLines` truncates to a box LABEL's length unless told
+      // otherwise, and any finite cap here would reach the caller as a line ending in "…" whose
+      // length is not the document's. The cut — a suffix of each page, counted — belongs to the
+      // consumer's budget (`extractTextBudget.ts` for `extract_text`), which can only count a gap
+      // correctly if it is handed the lines as they are. See the note by MAX_TEXT_PAGES.
+      const lines = mergeTextLines(textItemsOf(content), {
+        maxTextChars: Number.POSITIVE_INFINITY,
+      });
+      return {
+        page: pageNum,
+        lines: lines.map((l) => l.text),
+        linesOmitted: 0,
+        charsOmitted: 0,
+      };
     } finally {
       page.cleanup();
     }
@@ -781,6 +1000,28 @@ export class PdfRenderer implements PdfRenderService {
     }
   }
 
+  /**
+   * Open the probe document and count its pages: the question `doctor` has to ask apart from
+   * `canRasterize`, because reading a PDF needs pdf.js and no canvas, while rasterizing needs
+   * both. Asking only `canRasterize` is how a Desktop extension missing pdf.js entirely was told
+   * to install the canvas. Never throws — a failure comes back as its message, so the report can
+   * say which of the two it was.
+   */
+  async canReadPdf(): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      const { doc, destroy } = await this.openBytes(probePdf(), '<probe>');
+      try {
+        return doc.numPages === 1
+          ? { ok: true }
+          : { ok: false, error: `the probe PDF read as ${doc.numPages} page(s), not 1` };
+      } finally {
+        await destroy();
+      }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   private async openDocument(
     pdfPath: string,
   ): Promise<{ doc: PdfjsDocument; destroy: () => Promise<void> }> {
@@ -800,8 +1041,15 @@ export class PdfRenderer implements PdfRenderService {
     data: Uint8Array,
     label: string,
   ): Promise<{ doc: PdfjsDocument; destroy: () => Promise<void> }> {
+    let pdfjs: PdfjsLike;
     try {
-      const pdfjs = await this.loadPdfjs();
+      pdfjs = await this.loadPdfjs();
+    } catch (err) {
+      // A loader failure is never the document's fault — every PDF would fail identically — so
+      // it is reported apart from "Failed to open PDF" below.
+      throw pdfjsUnavailableError(err);
+    }
+    try {
       // `verbosity: 0` (ERRORS) because stdout is this server's JSON-RPC channel and pdf.js's
       // `info()` writes to `console.info`, which in Node is stdout. It is defence in depth
       // rather than a live fix: `info()` only fires at verbosity >= INFOS (5) and the default is
@@ -811,10 +1059,10 @@ export class PdfRenderer implements PdfRenderService {
       const doc = await loadingTask.promise;
       return { doc, destroy: () => loadingTask.destroy() };
     } catch (err) {
-      // Ask this first: with the backend absent every PDF fails here, and calling that "failed to
-      // open" sends the caller to look for a corrupt document that is perfectly fine.
+      // Ask this first: a missing DOM global fails every PDF here alike, and calling that "failed
+      // to open" sends the caller to look for a corrupt document that is perfectly fine.
       if (isNativeCanvasMissing(err)) {
-        throw nativeCanvasError(err);
+        throw pdfjsUnavailableError(err);
       }
       throw new PdfRenderError(`Failed to open PDF at ${label}: ${(err as Error).message}`, {
         cause: err,
@@ -862,7 +1110,13 @@ export class PdfRenderer implements PdfRenderService {
         }
 
         const png = entry.canvas.toBuffer('image/png');
-        const pngPath = path.join(outDir, pngName(pageNum, clip === FULL_CLIP ? undefined : clip));
+        const pngPath = path.join(
+          outDir,
+          pngName(pageNum, clip === FULL_CLIP ? undefined : clip, {
+            dpi: opts.dpi,
+            maxEdgePx: opts.maxEdgePx,
+          }),
+        );
         await writeFile(pngPath, png);
 
         return {

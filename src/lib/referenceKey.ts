@@ -159,7 +159,22 @@ export function normalizeDblpKey(raw: string, original: string = raw): string {
   key = key.replace(/\.(bib|html|xml)$/i, '');
   // Judged *after* the strip sequence, on the value that is actually interpolated into the
   // request path — `dblp:https://dblp.org/rec/conf/./x.bib` only reveals its dot segment here.
-  if (!key || !DBLP_KEY.test(key) || hasDotSegmentInKey(key)) {
+  //
+  // And refused when a SECOND pass of that strip would still change it, so this function is
+  // idempotent on everything it accepts. That is not tidiness: `parseRecordKey` returns this
+  // value as the id, and `DblpService.fetchBibtex` normalises that id again before building the
+  // URL, so a key carrying the prefix or suffix twice parsed to one id and fetched another —
+  // `dblp:rec/rec/conf/x/y` parsed to `rec/conf/x/y` and requested `conf/x/y`, a different record
+  // reported under the caller's key. No real DBLP key begins `rec/` or ends in one of these
+  // suffixes, so refusing costs nothing a caller could mean; rewriting is the silent kind of
+  // failure this boundary never allows.
+  if (
+    !key ||
+    !DBLP_KEY.test(key) ||
+    hasDotSegmentInKey(key) ||
+    /^rec\//i.test(key) ||
+    /\.(bib|html|xml)$/i.test(key)
+  ) {
     throw new Error(acceptedFormsMessage(original));
   }
   return key;

@@ -2,7 +2,6 @@ import { ProjectManager } from './services/projectManager.js';
 import type { ProjectRegistryStore } from './services/projectManager.js';
 import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
-import { buildPdfPath } from './services/compiler.js';
 import { CompilerResolver } from './services/compilerResolver.js';
 import { PdfRenderer } from './services/pdfRender.js';
 import { ViewerService } from './services/viewer.js';
@@ -21,7 +20,7 @@ import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
 import { detectRootFile } from './lib/rootFile.js';
-import { locateProjectPdf } from './lib/pdfLocate.js';
+import { locateViewerPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
 import type { ServerConfig } from './types.js';
@@ -123,17 +122,22 @@ export function createContext(
     }),
   );
 
-  // The viewer resolves a project's current PDF the same way `compile` surfaces it, and (for
-  // comments) resolves a clicked PDF point to source via synctex against the build-dir PDF, which
-  // is where the `.synctex.gz` lives. Constructed here but not listening — it binds a port only
-  // when the `viewer` tool is first called.
+  // The viewer shows a project's PDF and (for comments) resolves a clicked PDF point to source via
+  // synctex. Both come from ONE `locateViewerPdf` call, so the page a click lands on and the
+  // synctex that maps it are the same root's build: the detected root's build-dir PDF, where its
+  // `.synctex.gz` lives, or — when that build is gone — the surfaced copy with no synctex mapping,
+  // since that copy holds whichever root compiled last. Constructed here but not listening — it
+  // binds a port only when the `viewer` tool is first called.
+  const viewerPdf = async (id: string) => {
+    const { dir } = await projectManager.requireProjectDir(id);
+    const root = await detectRootFile(files, dir);
+    return { dir, located: await locateViewerPdf(config, id, dir, root) };
+  };
   const viewer = new ViewerService({
     knownIds: () => projectManager.knownIds(),
     resolvePdfPath: async (id) => {
       try {
-        const { dir } = await projectManager.requireProjectDir(id);
-        const root = await detectRootFile(files, dir);
-        return (await locateProjectPdf(config, id, dir, root)) ?? null;
+        return (await viewerPdf(id)).located?.pdf ?? null;
       } catch {
         return null; // not cloned / no root / no PDF yet — page waits for a compile
       }
@@ -142,16 +146,14 @@ export function createContext(
       let file: string | undefined;
       let line: number | undefined;
       try {
-        const { dir } = await projectManager.requireProjectDir(id);
-        const root = await detectRootFile(files, dir);
-        const loc = await synctex.resolve(
-          buildPdfPath(dir, root),
-          dir,
-          input.page,
-          input.x,
-          input.y,
-        );
-        if (loc) ({ file, line } = loc);
+        const { dir, located } = await viewerPdf(id);
+        // No synctex source (the surfaced fallback may be another root's): keep the note
+        // unlocated rather than map the click through a different document.
+        const synctexPdf = located?.synctexPdf;
+        if (synctexPdf) {
+          const loc = await synctex.resolve(synctexPdf, dir, input.page, input.x, input.y);
+          if (loc) ({ file, line } = loc);
+        }
       } catch {
         // Leave the location unresolved — the note is still kept (Claude can use the quote/page).
       }

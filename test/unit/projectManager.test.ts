@@ -91,7 +91,7 @@ describe('ProjectManager', () => {
       ],
     });
     expect(pm.getProjectConfig().id).toBe('thesis'); // sanity: the fixture itself still resolves
-    expect(() => noDefault.getProjectConfig()).toThrow(/Known projects: thesis, paper/);
+    expect(() => noDefault.getProjectConfig()).toThrow(/Known projects: "thesis", "paper"/);
     expect(() => noDefault.getProjectConfig()).toThrow(/WEB_LATEX_MCP_DEFAULT_PROJECT/);
     expect(() => noDefault.getProjectConfig()).toThrow(/register_project/);
   });
@@ -288,7 +288,7 @@ describe('ProjectManager', () => {
     it('throws on an unknown project, naming the known ids', async () => {
       const pm = new ProjectManager(makeConfig());
       await expect(pm.setDefaultProject('ghost')).rejects.toThrow(/Unknown project/);
-      await expect(pm.setDefaultProject('ghost')).rejects.toThrow(/thesis, paper/);
+      await expect(pm.setDefaultProject('ghost')).rejects.toThrow(/"thesis", "paper"/);
     });
 
     it('persists the registry’s current entry, not a stale in-process snapshot', async () => {

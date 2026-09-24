@@ -13,7 +13,8 @@ Setup for **Claude Code** (and notes for **Claude Desktop**, which has no offici
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
   ```
 
-- **git** (and optionally **gh**):
+- **git 2.25 or newer** (and optionally **gh**). Ubuntu 20.04+ and Debian 11+ package one; on an
+  older release (Ubuntu 18.04, Debian 10, CentOS 7) the stock git is too old — install a newer one:
 
   ```bash
   sudo apt install -y git gh

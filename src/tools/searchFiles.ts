@@ -5,7 +5,7 @@ import { errorResult } from '../lib/errors.js';
 import { toPosix } from '../lib/paths.js';
 import { searchProject, type SearchOutcome } from '../lib/searchFiles.js';
 import { MAX_CONTEXT_LINES, MAX_LINE_SCAN_CHARS } from '../lib/searchMatch.js';
-import { SEARCH_MAX_MATCHES } from '../lib/searchBudget.js';
+import { SEARCH_MAX_MATCHES, renderMatchesText } from '../lib/searchBudget.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -23,11 +23,18 @@ const inputSchema = {
     .describe(
       'Read `pattern` as a JavaScript regular expression. Default false. Some shapes are ' +
         'REFUSED with an explanation rather than run — a group repeated without bound ' +
-        '(`(a+)+`), or two repeats that can match what follows them and so trade input ' +
-        '(`.*a.*b`, `a+a+b`) — because a regex match cannot be interrupted once started and ' +
-        'those take seconds to forever on one long line. Anchor each repeat to something it ' +
-        'cannot match itself (`[^}]*\\}` rather than `.*\\}`), and drop a leading or trailing ' +
-        '`.*`: a match anywhere in the line counts, so it never changes which lines match.',
+        '(`(a+)+`); a group that can match in more than one way repeated by a count ' +
+        '(`(fig|tab){2}`, `(?:a|aa){0,40}`); repeats and alternations that can match what ' +
+        'follows them, and so trade input, multiplying past a fixed cost (`.*a.*b`, `a+a+b`, ' +
+        '`.*a{999}b` — one such `.*` alone is fine, as in `.*a{0,2}b`); or pieces that can ' +
+        'match nothing piled after such repeats (`x{0,75}x*a*b*c*d*\\}`), or runs that all end ' +
+        'at one place and hand on to the same costly piece (`x{0,30}x*a+a{11}b`) — because a ' +
+        'regex match cannot be interrupted once started, and those take seconds to forever on ' +
+        "one long line, which would use up the search's time budget. Anchor each repeat to " +
+        'something it cannot match itself (`[^}]*\\}` rather than `.*\\}`), and drop a leading or trailing `.*`: a match anywhere in the line ' +
+        'counts, so it does not change which lines match — except with excludeComments, where ' +
+        'a leading `.*` starts every hit at the beginning of the line, so dropping it is what ' +
+        'lets a hit inside a `%` comment be seen as commented.',
     ),
   caseInsensitive: z.boolean().optional().describe('Match without regard to case. Default false.'),
   filter: z
@@ -128,8 +135,22 @@ const outputSchema = {
         'match further along one of them was not found.',
     ),
   timedOut: z.boolean().describe('The search budget ran out — this is a partial answer.'),
-  filesNotReached: z.number(),
-  note: z.string().optional().describe('Present only when something was cut; names what.'),
+  filesNotReached: z.number().describe('Files the time budget ran out before opening.'),
+  filesPartiallySearched: z
+    .number()
+    .describe(
+      'Files the time budget cut off part-way (at most 1): counted in filesSearched, their ' +
+        'matches so far reported, and named with the line reached in `note` — a match further ' +
+        'down such a file was not looked for.',
+    ),
+  note: z
+    .string()
+    .optional()
+    .describe(
+      'Present only when something was cut or not searched as asked (the time budget, the ' +
+        'payload budget, the per-line scan cap, excludeComments meeting files with no % ' +
+        'comment syntax); names what.',
+    ),
 };
 
 export function registerSearchFiles(server: McpServer, ctx: AppContext): void {
@@ -151,7 +172,9 @@ export function registerSearchFiles(server: McpServer, ctx: AppContext): void {
         'takes NO project lock, so it never waits on a peer session and creates no session ' +
         'state. No git remote needed — works on a local project. Bounded on every axis: some ' +
         'regex shapes are refused outright, long lines are searched only up to a cap, the ' +
-        'search runs under a time budget, and the payload is cut to a character budget — ' +
+        'search runs under a time budget (a regex search runs on a worker thread that is ' +
+        'stopped at the deadline, so no pattern can stall the server), and the payload is cut ' +
+        'to a character budget — ' +
         'whatever is cut is counted and named in `note`, never dropped silently.',
       inputSchema,
       outputSchema,
@@ -230,19 +253,9 @@ function render(r: SearchOutcome, contextLines: number): string {
     `${r.totalMatches} matching line(s) in ${r.matchedFiles} of ${r.filesSearched} file(s) ` +
       `searched${r.matches.length < r.totalMatches ? `, showing ${r.matches.length}` : ''}`,
   ];
-  let currentPath = '';
-  for (const m of r.matches) {
-    if (m.path !== currentPath) {
-      lines.push(m.path);
-      currentPath = m.path;
-    }
-    // Context lines are numbered off the match, which is exactly where they were sliced from.
-    const before = m.before ?? [];
-    before.forEach((t, i) => lines.push(`  ${m.line - before.length + i}- ${t}`));
-    lines.push(`  ${m.line}: ${m.text}`);
-    (m.after ?? []).forEach((t, i) => lines.push(`  ${m.line + 1 + i}- ${t}`));
-    if (contextLines > 0) lines.push('  --');
-  }
+  // The template lives beside the budget's cost function, which calls it: what each match is
+  // charged for is exactly what is rendered here.
+  lines.push(...renderMatchesText(r.matches, contextLines));
 
   if (r.commentMatches > 0) {
     lines.push(`${r.commentMatches} matching line(s) were % comments.`);

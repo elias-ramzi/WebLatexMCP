@@ -8,7 +8,7 @@ code changes — only registration. This guide covers both surfaces:
 
 Both read MCP servers from the **same** `settings.json`, so one config serves both.
 
-For **prerequisites** (Node.js ≥ 20, git, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
+For **prerequisites** (Node.js ≥ 20, git 2.25 or newer, and TeX + `latexmk`/`tectonic` for the `compile` tool only)
 and for **authentication** (per-host token resolution: env var → `gh auth token` → git credential
 helper), follow steps 1–3 of your platform guide — they are client-agnostic:
 [macOS](macos.md) · [Linux](linux.md) · [Windows](windows.md). This guide picks up at registration.

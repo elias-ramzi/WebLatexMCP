@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from 'node:fs/promises';
-import { SessionRegistry } from '../../src/services/sessionRegistry.js';
+import { mkdtemp, mkdir, writeFile, readFile, rm, readdir, rename } from 'node:fs/promises';
+import { SessionRegistry, writeAtomic } from '../../src/services/sessionRegistry.js';
 import type { SessionRecord } from '../../src/services/sessionRegistry.js';
 import { sessionDir, sessionStateDir } from '../../src/lib/sessionPaths.js';
 import {
@@ -595,10 +595,11 @@ describe('SessionRegistry', () => {
     it('dedupes concurrent touch() calls on one registry, rather than colliding in writeAtomic', async () => {
       // The synchronous `lastHeartbeat.set` *before* the first `await` inside touch() is what makes
       // the throttle dedupe **concurrent** callers, not merely sequential ones — and that is
-      // load-bearing, because `writeAtomic`'s temp name is `${target}.${process.pid}.tmp`, which is
-      // unique per *process*, not per *call*. Let two concurrent touches past the throttle and they
-      // race for one shared temp file: the first rename consumes it and every other one rejects
-      // with ENOENT. touch() is not wrapped in a catch at three of its four call sites
+      // what kept it safe while `writeAtomic`'s temp name was `${target}.${process.pid}.tmp`, unique
+      // per *process* rather than per *call*: two concurrent touches past the throttle raced for
+      // one shared temp file, the first rename consumed it and every other one rejected with
+      // ENOENT. The temp name now carries a per-call counter as well (see the writeAtomic test);
+      // the dedupe still saves the redundant writes. touch() is not wrapped in a catch at three of its four call sites
       // (src/tools/status.ts, src/tools/commit.ts, src/tools/push.ts; only
       // src/lib/mutationRecorder.ts swallows), so that surfaces as a hard tool failure out of a
       // registry whose stated contract is that "a missing or stale registry only ever costs
@@ -700,6 +701,135 @@ describe('SessionRegistry', () => {
       expect(await readFile(path.join(unreadableDir, 'shadow.json'), 'utf8')).toBe(shadowJson);
     });
 
+    it('skips a record with no usable pid or heartbeatAt, and repairs the rest rather than dropping it', async () => {
+      // Valid JSON of the wrong shape was returned as a SessionRecord with `heartbeatAt`/`sessionId`
+      // undefined; `status` then built a session path from `undefined` and failed for every
+      // session sharing the project. A record lacking what liveness is judged on (pid,
+      // heartbeatAt) is unreadable — not listed, and, as the collectGarbage test above pins, never
+      // reaped as dead either. Anything else is repaired: dropping a record fails open when its
+      // pid is live (see the sessionId-mismatch test below).
+      const registry = new SessionRegistry(root, 'me');
+      const fresh = new Date().toISOString();
+      for (const [id, body] of [
+        ['no-heartbeat', { sessionId: 'no-heartbeat', pid: 1, startedAt: 'x' }],
+        ['pid-string', { sessionId: 'pid-string', pid: '1', startedAt: 'x', heartbeatAt: 'y' }],
+        ['array', []],
+        ['null', null],
+        // Repaired: the id comes from the directory, a missing startedAt from heartbeatAt, and a
+        // non-string bootedAt is no stamp at all.
+        ['no-session-id', { pid: DEFINITELY_DEAD_PID, heartbeatAt: fresh }],
+        [
+          'booted-number',
+          {
+            sessionId: 'booted-number',
+            pid: DEFINITELY_DEAD_PID,
+            startedAt: 'x',
+            heartbeatAt: fresh,
+            bootedAt: 5,
+          },
+        ],
+      ] as const) {
+        const dir = sessionDir(root, PROJECT, id);
+        await mkdir(dir, { recursive: true });
+        await writeFile(path.join(dir, 'session.json'), JSON.stringify(body), 'utf8');
+      }
+      await writePeerRecord('good', {
+        sessionId: 'good',
+        pid: process.pid,
+        startedAt: fresh,
+        heartbeatAt: fresh,
+        bootedAt: currentBootStamp(),
+      });
+
+      const peers = await registry.peers(PROJECT);
+      expect(peers.map((p) => p.sessionId).sort()).toEqual([
+        'booted-number',
+        'good',
+        'no-session-id',
+      ]);
+      const repaired = peers.find((p) => p.sessionId === 'no-session-id');
+      expect(repaired?.startedAt).toBe(fresh);
+      expect(peers.find((p) => p.sessionId === 'booted-number')?.bootedAt).toBeUndefined();
+      // Fresh heartbeats: all live, so nothing is reaped.
+      expect(await registry.collectGarbage(PROJECT)).toEqual([]);
+    });
+
+    it('lists a record whose sessionId is not its directory under the directory name (a path, or another session)', async () => {
+      // Callers turn a listed peer's `sessionId` back into a directory (`sessionDir`), which throws
+      // for anything but a single path segment — so a record claiming `../x` made `status`,
+      // `commit` and `push` fail for every session. And a record claiming a DIFFERENT, valid id
+      // would have peers read that other session's shadow index as this directory's. The
+      // directory is the authority; genuine records, written by `touch()` into
+      // `sessionDir(sessionId)`, always agree with it.
+      const registry = new SessionRegistry(root, 'me');
+      const fresh = new Date().toISOString();
+      for (const [dirName, claimed] of [
+        ['escape', '../x'],
+        ['nested', 'a/b'],
+        ['forged', 'good'],
+      ] as const) {
+        const dir = sessionDir(root, PROJECT, dirName);
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          path.join(dir, 'session.json'),
+          JSON.stringify({
+            sessionId: claimed,
+            pid: DEFINITELY_DEAD_PID,
+            startedAt: fresh,
+            heartbeatAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+          }),
+          'utf8',
+        );
+      }
+      await writePeerRecord('good', {
+        sessionId: 'good',
+        pid: process.pid,
+        startedAt: fresh,
+        heartbeatAt: fresh,
+        bootedAt: currentBootStamp(),
+      });
+
+      const peers = await registry.peers(PROJECT);
+      // Equal heartbeats tie, and ties keep readdir order, which no platform promises: sort.
+      expect(peers.map((p) => `${p.sessionId}:${p.live}`).sort()).toEqual([
+        'escape:false',
+        'forged:false',
+        'good:true',
+        'nested:false',
+      ]);
+      // Dead, so reaped — each by its OWN directory, never by the id it claimed: `good` survives
+      // `forged`'s claim to be it, and nothing is thrown on the way.
+      expect((await registry.collectGarbage(PROJECT)).sort()).toEqual([
+        'escape',
+        'forged',
+        'nested',
+      ]);
+      expect(await readdir(sessionStateDir(root, PROJECT))).toEqual(['good']);
+    });
+
+    it('keeps a live-pid record whose sessionId disagrees with its directory, under the directory name', async () => {
+      // Dropping it (round 1) omitted a LIVE session from livePeers, so its shadow entries went
+      // unprotected: `commit scope: "paths"` and `push` saw no live peer. Before that it threw. The
+      // directory is the authority for the id — every caller turns the id back into it.
+      const registry = new SessionRegistry(root, 'me');
+      const dir = sessionDir(root, PROJECT, 'escape');
+      await mkdir(dir, { recursive: true });
+      const stale = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      await writeFile(
+        path.join(dir, 'session.json'),
+        JSON.stringify({
+          sessionId: '../x',
+          pid: process.pid,
+          startedAt: stale,
+          heartbeatAt: stale,
+          bootedAt: currentBootStamp(),
+        }),
+        'utf8',
+      );
+      const live = await registry.livePeers(PROJECT);
+      expect(live.map((p) => p.sessionId)).toEqual(['escape']);
+    });
+
     it('touch() over an existing corrupt session.json (our own) re-seeds it rather than rejecting', async () => {
       // `existing` inside touch() comes from the same readRecord() that treats unparseable JSON as
       // null everywhere else. A throw here would fail every future heartbeat for this session after
@@ -723,6 +853,46 @@ describe('SessionRegistry', () => {
       // nothing valid in them to carry.
       expect(typeof written.startedAt).toBe('string');
       expect(Date.parse(written.startedAt)).toBeGreaterThan(Date.now() - 5_000);
+    });
+  });
+
+  describe('writeAtomic', () => {
+    it('survives concurrent writes to one target from one process', async () => {
+      // The temp name was `${target}.${pid}.tmp`: two in-flight writes in one process shared it,
+      // the first rename consumed it and the second rejected with ENOENT.
+      const target = path.join(root, 'shadow.json');
+      const results = await Promise.allSettled(
+        Array.from({ length: 8 }, (_, i) => writeAtomic(target, JSON.stringify({ i }))),
+      );
+      expect(
+        results
+          .filter((r) => r.status === 'rejected')
+          .map((r) => String((r as PromiseRejectedResult).reason)),
+      ).toEqual([]);
+      const written = JSON.parse(await readFile(target, 'utf8')) as { i: number };
+      expect(written.i).toBeGreaterThanOrEqual(0);
+      expect(await readdir(root)).toEqual(['shadow.json']);
+    });
+
+    it('retries a rename Windows refuses transiently (EPERM while another handle closes)', async () => {
+      // MoveFileExW with REPLACE_EXISTING fails EPERM/EACCES/EBUSY while a concurrent rename onto
+      // the same target still holds it; a single attempt surfaced that as a failed heartbeat or a
+      // failed shadow-index write.
+      const target = path.join(root, 'shadow.json');
+      let calls = 0;
+      const flaky = async (from: string, to: string): Promise<void> => {
+        calls++;
+        if (calls <= 2) {
+          const err = new Error('scripted EPERM') as NodeJS.ErrnoException;
+          err.code = 'EPERM';
+          throw err;
+        }
+        await rename(from, to);
+      };
+      await writeAtomic(target, '{"ok":true}', { rename: flaky });
+      expect(calls).toBe(3);
+      expect(await readFile(target, 'utf8')).toBe('{"ok":true}');
+      expect(await readdir(root)).toEqual(['shadow.json']);
     });
   });
 

@@ -1,6 +1,6 @@
 /**
  * Deciding how much of `search_files`' payload may be returned, against a character budget on the
- * RENDERED (JSON-encoded) result. A pure planner over plain data, the same shape as
+ * RENDERED result — in BOTH channels it ships in. A pure planner over plain data, the same shape as
  * `src/lib/floatsBudget.ts` for `pdf_geometry` and `src/lib/conflictBudget.ts` (issue #68) for a
  * rebase conflict report: a budget, a plan, a human-readable `note`, and a tool layer that only
  * maps the plan onto response shapes.
@@ -15,25 +15,33 @@
  *
  * Two departures from `floatsBudget.ts`, both deliberate:
  *
- *  1. **Each entry is charged its own `JSON.stringify(entry).length`, not a pinned per-entry
- *     constant.** A float entry is three fixed string fields, so a constant can be measured and
- *     pinned. A match entry is not: `before`/`after` are present only when context was asked for,
- *     hold a caller-chosen number of lines, and every one of them is document text whose escaped
- *     width (`\\`, `\"`, `\t`, `\u001b`) is nothing like its raw width. Stringifying the entry
- *     that will actually be sent is the exact cost and cannot drift when a field is added — which
- *     is the property the pinned constant was there to protect, obtained directly instead.
+ *  1. **Each entry is charged its own `JSON.stringify(entry).length` PLUS its own rendered text
+ *     lines, not a pinned per-entry constant.** A float entry is three fixed string fields, so a
+ *     constant can be measured and pinned. A match entry is not: `before`/`after` are present only
+ *     when context was asked for, hold a caller-chosen number of lines, and every one of them is
+ *     document text whose escaped width (`\\`, `\"`, `\t`, `\u001b`) is nothing like its raw
+ *     width. Stringifying the entry that will actually be sent is the exact cost and cannot drift
+ *     when a field is added — which is the property the pinned constant was there to protect,
+ *     obtained directly instead. The text channel renders every kept entry a SECOND time (path
+ *     header, numbered context, the match line), and charging the JSON alone let a whole result
+ *     reach twice the budget (39,675 characters observed against 20000). So the text template
+ *     lives here, {@link renderMatchLines}, the tool renders with it, and the cost function calls
+ *     it — the `diffBudget.ts` technique: the charge and the text are one piece of code.
  *  2. **`skipped` has its own budget rather than sharing the matches' one.** It is the record of
  *     files that were NOT searched (a binary, an oversized file, an unreadable one), and "not
  *     searched" must not be crowded out by a long list of hits: those are different claims, and
  *     losing the second turns "not searched" into an indistinguishable "no match".
  *
  * The planner charges exactly what the tool sends, so the tool must hand these very objects
- * through to `structuredContent` — a test pins `JSON.stringify(plan.matches).length` against the
- * budget to keep that honest.
+ * through to `structuredContent` and build its text with {@link renderMatchesText} from the SAME
+ * cut list — tests pin the JSON plus the rendered text against the budget to keep that honest.
  */
 
 /**
- * Total character budget for the `matches` array as JSON-encoded into `structuredContent`.
+ * Total character budget for the matches as rendered in BOTH channels: the `matches` array
+ * JSON-encoded into `structuredContent`, plus each kept match's lines in the text channel. The
+ * rest of the text (the summary line, the skipped-files line, the notes) is bounded prose and is
+ * not charged here.
  *
  * 20000 is this codebase's house figure for "one document-controlled field's share of a tool
  * result" — `CONFLICT_CONTENT_BUDGET`, and `FLOATS_CONTENT_BUDGET` after it — sized so the worst
@@ -69,6 +77,72 @@ const ARRAY_JSON_OVERHEAD = 2;
 /** The comma between two elements, charged per element (over-charging the last by one). */
 const ELEMENT_SEPARATOR_OVERHEAD = 1;
 
+/** The `\n` that joins each rendered text line to the next, charged per line. */
+const TEXT_LINE_SEPARATOR_OVERHEAD = 1;
+
+/** What the text channel needs of a match. `SearchMatch` satisfies it. */
+export interface RenderableMatch {
+  path: string;
+  line: number;
+  text: string;
+  before?: readonly string[];
+  after?: readonly string[];
+}
+
+/**
+ * One match's lines in the text channel. A path header is printed when the path differs from the
+ * previous entry's (`prevPath`), context lines are numbered off the match (which is exactly where
+ * they were sliced from), and a `--` separator follows each entry when context was asked for.
+ *
+ * The cost function below CALLS this, so the text a match is charged for and the text the tool
+ * sends cannot drift apart.
+ */
+export function renderMatchLines(
+  m: RenderableMatch,
+  prevPath: string | undefined,
+  contextLines: number,
+): string[] {
+  const lines: string[] = [];
+  if (m.path !== prevPath) lines.push(m.path);
+  const before = m.before ?? [];
+  before.forEach((t, i) => lines.push(`  ${m.line - before.length + i}- ${t}`));
+  lines.push(`  ${m.line}: ${m.text}`);
+  (m.after ?? []).forEach((t, i) => lines.push(`  ${m.line + 1 + i}- ${t}`));
+  if (contextLines > 0) lines.push('  --');
+  return lines;
+}
+
+/** Every kept match's text lines, in order — what the tool puts in its text channel. */
+export function renderMatchesText(
+  matches: readonly RenderableMatch[],
+  contextLines: number,
+): string[] {
+  const out: string[] = [];
+  let prevPath: string | undefined;
+  for (const m of matches) {
+    out.push(...renderMatchLines(m, prevPath, contextLines));
+    prevPath = m.path;
+  }
+  return out;
+}
+
+/**
+ * What one match costs once rendered: its JSON in `structuredContent.matches` (plus the comma
+ * after it) and its lines in the text (plus the newline after each).
+ */
+export function matchRenderCost(
+  m: RenderableMatch,
+  prevPath: string | undefined,
+  contextLines: number,
+): number {
+  const text = renderMatchLines(m, prevPath, contextLines);
+  return (
+    JSON.stringify(m).length +
+    ELEMENT_SEPARATOR_OVERHEAD +
+    text.reduce((n, line) => n + line.length + TEXT_LINE_SEPARATOR_OVERHEAD, 0)
+  );
+}
+
 export interface SearchPlan<M, S> {
   /** The kept matches, in the order given — never reordered, never cherry-picked by size. */
   matches: M[];
@@ -85,6 +159,8 @@ export interface SearchPlan<M, S> {
 }
 
 export interface SearchBudgetOptions {
+  /** As passed to the search: whether each rendered entry carries a `--` separator. */
+  contextLines?: number;
   contentBudget?: number;
   skippedBudget?: number;
   maxMatches?: number;
@@ -106,7 +182,7 @@ export interface SearchBudgetOptions {
  * the `note` says the budget fired. The exception cannot compound: the running total absorbs the
  * full cost, so everything after it is cut.
  */
-export function planSearchPayload<M, S>(
+export function planSearchPayload<M extends RenderableMatch, S>(
   matches: readonly M[],
   skipped: readonly S[],
   opts: SearchBudgetOptions = {},
@@ -116,8 +192,18 @@ export function planSearchPayload<M, S>(
   const maxMatches = opts.maxMatches ?? SEARCH_MAX_MATCHES;
   const maxSkipped = opts.maxSkipped ?? SEARCH_MAX_SKIPPED;
 
-  const kept = fill(matches, contentBudget, maxMatches);
-  const keptSkipped = fill(skipped, skippedBudget, maxSkipped);
+  const contextLines = opts.contextLines ?? 0;
+
+  const kept = fill(matches, contentBudget, maxMatches, (m, prev) =>
+    matchRenderCost(m, prev?.path, contextLines),
+  );
+  // `skipped` appears in the text only as a count by reason, so its JSON is its whole cost.
+  const keptSkipped = fill(
+    skipped,
+    skippedBudget,
+    maxSkipped,
+    (s) => JSON.stringify(s).length + ELEMENT_SEPARATOR_OVERHEAD,
+  );
 
   const plan: SearchPlan<M, S> = {
     matches: kept.kept,
@@ -152,7 +238,12 @@ interface FillResult<T> {
  * kept, and nothing is kept after the size budget has cut one. That is what lets the `note`
  * name a single bound without having to choose between two that both fired.
  */
-function fill<T>(items: readonly T[], budget: number, maxItems: number): FillResult<T> {
+function fill<T>(
+  items: readonly T[],
+  budget: number,
+  maxItems: number,
+  costOf: (item: T, prevKept: T | undefined) => number,
+): FillResult<T> {
   const kept: T[] = [];
   let used = ARRAY_JSON_OVERHEAD;
   let omittedByCap = 0;
@@ -164,9 +255,11 @@ function fill<T>(items: readonly T[], budget: number, maxItems: number): FillRes
       omittedByCap++;
       continue;
     }
-    // Exactly what this element will contribute to the encoded array: its own JSON, escapes and
-    // all, plus the comma that separates it from the next.
-    const cost = JSON.stringify(item).length + ELEMENT_SEPARATOR_OVERHEAD;
+    // Exactly what this element will contribute to the rendered result: its own JSON, escapes
+    // and all, plus the comma that separates it from the next — and, for a match, its text lines.
+    // The previous KEPT entry decides whether a path header is printed; since only the tail is
+    // ever cut, that is also the entry rendered just before this one.
+    const cost = costOf(item, kept[kept.length - 1]);
     if (omittedBySize === 0 && used + cost <= budget) {
       used += cost;
       kept.push(item);
@@ -220,7 +313,8 @@ function describe<M, S>(
             `${ctx.oversizedFirst} chars, over the whole ${ctx.contentBudget}-char payload ` +
             'budget — it is returned regardless, and everything after it was cut.'
         : `${plan.omittedBySize} ${of} were omitted: the ${ctx.contentBudget}-char payload ` +
-            'budget (charged on the JSON-encoded size of the matches array, escaping included) ' +
+            'budget (charged on the matches as rendered in BOTH the JSON and the text, escaping ' +
+            'included) ' +
             'was reached. Narrow the search, or lower contextLines.',
     );
   }

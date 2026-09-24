@@ -228,7 +228,9 @@ describe('capUnshelveConflict', () => {
   });
 
   it('keeps a side exactly at the cap', () => {
-    const exact = 'x'.repeat(10);
+    // The cap is charged on the RENDERED side — its JSON string, quotes included — since that is
+    // what ships in structuredContent: 8 characters render as exactly 10.
+    const exact = 'x'.repeat(8);
     const plan = capUnshelveConflict([file({ ours: exact })], {
       maxFiles: 20,
       sideCap: 10,
@@ -296,14 +298,17 @@ describe('capUnshelveConflict', () => {
       totalBudget: 3500,
     });
     expect(plan.truncated).toBe(true);
-    const kept = plan.files.flatMap((f) => [f.base, f.ours, f.theirs]).filter((s) => s !== null);
-    expect(kept.join('').length).toBeLessThanOrEqual(3500);
-    // A tail, not a hole: the first file comes back whole rather than every file half.
-    expect(plan.files[0]!.base).toBe(side);
-    expect(plan.files[0]!.ours).toBe(side);
+    // Bounded on what actually ships, the rendered JSON, not on the characters held.
+    expect(JSON.stringify(plan.files).length).toBeLessThanOrEqual(3500);
+    // Charged by priority, theirs across every file first (the shelved content, which no other
+    // tool can read), and within that lane a tail rather than a hole: the first files' theirs
+    // come back whole, the last one's is cut, and the recoverable sides go before any theirs.
+    expect(plan.files.slice(0, 3).map((f) => f.theirs)).toEqual([side, side, side]);
     expect(plan.files[3]!.theirs).toBeNull();
+    expect(plan.files[0]!.base).toBeNull();
     // Cut sides carry their TRUE length, so nothing is lost silently.
     expect(plan.files[3]!.elided?.theirs).toBe(1000);
+    expect(plan.files[0]!.elided?.base).toBe(1000);
     // Every path stays named, whatever was cut.
     expect(plan.paths).toEqual(['a.tex', 'b.tex', 'c.tex', 'd.tex']);
   });
@@ -388,8 +393,13 @@ describe('planUnshelveFile', () => {
     ).toEqual({ kind: 'conflict', reason: 'dirty' });
   });
 
-  it('conflicts as head-moved when HEAD changed under the path, tree clean', () => {
-    expect(planUnshelveFile(tracked({ current: B('H2\n'), headNow: B('H2\n') }))).toEqual({
+  it('conflicts as head-moved when HEAD changed under a NON-TEXT path, tree clean', () => {
+    // A text file in this position is three-way merged instead (see
+    // test/unit/unshelveConflictBudget.test.ts); bytes that are not text never are.
+    const bin = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]);
+    expect(
+      planUnshelveFile(tracked({ shelved: bin, current: B('H2\n'), headNow: B('H2\n') })),
+    ).toEqual({
       kind: 'conflict',
       reason: 'head-moved',
     });

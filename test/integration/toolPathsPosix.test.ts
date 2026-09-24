@@ -522,8 +522,9 @@ describe('add_asset: paths at the response boundary', () => {
     expect(text).not.toContain(nativeSource);
 
     // The consumer proof, and the reason the conversion sits at the emission point and not one
-    // line earlier. `source` is the realpath'd path `resolveAssetSource` opened: realpath, stat,
-    // the extension check on the resolved target and the read all take the host's own spelling.
+    // line earlier. `source` is the realpath'd path `resolveAssetSource` opened: realpath, the
+    // extension check on the resolved target, then one open of it whose handle is fstat'd and
+    // read — every step takes the host's own spelling.
     // Converted any earlier, `realpath` would be handed `…/out/dir/plot.png` — nothing is there
     // on this host — and the call would fail outright instead of copying anything. So assert the
     // bytes landed, byte-identically, at the NATIVE destination: a `source` string that merely

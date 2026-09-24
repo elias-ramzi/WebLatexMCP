@@ -378,6 +378,8 @@ describe('readAuxFloats', () => {
       dropped: 0,
       refused: 0,
       indeterminate: 0,
+      unreadInputs: 0,
+      beamerNav: false,
     });
   });
 
@@ -748,6 +750,73 @@ describe('readAuxFloats', () => {
     expect(result.indeterminate).toBe(1);
     expect(result.refused).toBe(1);
     expect(result.dropped).toBe(0);
+  });
+
+  it("collects beamer's own slide records (\\beamer@slide), line-anchored, across \\@input", async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    await writeFile(
+      auxPath,
+      [
+        '\\relax ',
+        '\\newlabel{fig:f1}{{1}{2}{}{Doc-Start}{}}',
+        '\\@writefile{snm}{\\beamer@slide {fig:f1}{1}}',
+        '\\@writefile{nav}{\\headcommand {\\slideentry {0}{0}{1}{1/1}{}{0}}}',
+        // A record may precede its \newlabel (an equation's label is named before it ships).
+        '\\@writefile{snm}{\\beamer@slide {eq:e1}{3}}',
+        '\\newlabel{eq:e1}{{1}{4}{}{Doc-Start}{}}',
+        // Inside a caption group on a \newlabel line: stored text, never executed — not a record.
+        '\\newlabel{fig:f2}{{2}{3}{Cap \\@writefile{snm}{\\beamer@slide {fig:f2}{9}}}{Doc-Start}{}}',
+        '\\@input{chap.aux}',
+        '',
+      ].join('\n'),
+    );
+    await writeFile(
+      path.join(path.dirname(auxPath), 'chap.aux'),
+      '\\newlabel{fig:c}{{3}{6}{}{Doc-Start}{}}\n\\@writefile{snm}{\\beamer@slide {fig:c}{5}}\n',
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.beamerNav).toBe(true);
+    expect(result.beamerSlides).toEqual(
+      new Map([
+        ['fig:f1', ['1']],
+        ['eq:e1', ['3']],
+        ['fig:c', ['5']],
+      ]),
+    );
+  });
+
+  it('keys a slide record by the same text the \\newlabel parser stores, one brace level deep', async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'auxfloats-'));
+    const auxPath = buildAuxPath(dir, 'main.tex');
+    await mkdir(path.dirname(auxPath), { recursive: true });
+    const records: Array<[key: string, slide: string]> = [
+      ['fig:{a}', '1'],
+      ['fig:\\}b', '2'],
+      ['fig:{\\{c}', '3'],
+      ['{x}{y}', '4'],
+    ];
+    const deep = 'fig:{{d}}';
+    await writeFile(
+      auxPath,
+      [
+        '\\@writefile{nav}{\\headcommand {\\beamer@documentpages {5}}}',
+        ...records.flatMap(([key, slide]) => [
+          `\\newlabel{${key}}{{${slide}}{${slide}}{}{Doc-Start}{}}`,
+          `\\@writefile{snm}{\\beamer@slide {${key}}{${slide}}}`,
+        ]),
+        // Two levels deep: past what the line pattern reads, so no record — never a wrong key.
+        `\\newlabel{${deep}}{{5}{5}{}{Doc-Start}{}}`,
+        `\\@writefile{snm}{\\beamer@slide {${deep}}{5}}`,
+        '',
+      ].join('\n'),
+    );
+
+    const result = await readAuxFloats(dir, 'main.tex');
+    expect(result.floats.map((f) => f.label)).toEqual([...records.map(([key]) => key), deep]);
+    expect(result.beamerSlides).toEqual(new Map(records.map(([key, slide]) => [key, [slide]])));
   });
 
   it('respects an explicit max override', async () => {

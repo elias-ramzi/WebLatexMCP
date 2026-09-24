@@ -7,18 +7,33 @@ import { z } from 'zod';
 import {
   readProjectRegistry,
   readProjectRegistryDefault,
+  readProjectRegistrySkipped,
   registryPath,
 } from './services/projectRegistry.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
 import { COMPILER_KINDS } from './services/compilerResolver.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from './lib/rewriteMode.js';
+import {
+  describeSkippedProject,
+  escapeInvisibleChars,
+  findSkippedProject,
+  listIds,
+  projectIdProblem,
+  quoteId,
+} from './lib/projectId.js';
 import type { RewriteMode } from './lib/rewriteMode.js';
 // One list of ids, shared with the reference-lookup resolver: a private copy here could accept
 // an id the resolver never tries (or reject one it does) — the same reasoning as COMPILER_KINDS.
 import { REFERENCE_SOURCES } from './lib/referenceKey.js';
 import type { ReferenceSourceId } from './lib/referenceKey.js';
-import type { CompilerKind, ProjectConfig, ServerConfig, ViewerTarget } from './types.js';
+import type {
+  CompilerKind,
+  ProjectConfig,
+  ServerConfig,
+  SkippedProject,
+  ViewerTarget,
+} from './types.js';
 
 /**
  * `WEB_LATEX_MCP_PROJECTS` entries: a git remote to clone, or a directory to use in place. An entry
@@ -118,8 +133,12 @@ function resolveWorkspace(
   return { workspaceRoot: path.resolve(cwd, expandHome(value)), workspaceIsLocal: false };
 }
 
-function parseProjects(raw: string | undefined, cwd: string): ProjectConfig[] {
-  if (!raw || !raw.trim()) return [];
+function parseProjects(
+  raw: string | undefined,
+  cwd: string,
+  workspaceRoot: string,
+): { projects: ProjectConfig[]; skipped: SkippedProject[] } {
+  if (!raw || !raw.trim()) return { projects: [], skipped: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -128,17 +147,49 @@ function parseProjects(raw: string | undefined, cwd: string): ProjectConfig[] {
       cause: err,
     });
   }
-  const result = projectsSchema.safeParse(parsed);
+  // An id `src/lib/projectId.ts` refuses would name a directory outside the workspace (or inside
+  // another project's clone). Skip it with a report rather than throw: one bad entry must not take
+  // down every tool in the server — the same call the registry makes for a bad persisted entry.
+  // The skip is also remembered (`ServerConfig.skippedProjects`), so a call naming the id is told
+  // why: this stderr line never reaches an MCP client.
+  //
+  // Judged on the RAW keys, before the schema: `JSON.parse` keeps a "__proto__" key as an own
+  // property, but the schema's record parse drops it on the way to its output object — so judged
+  // after, `{"__proto__": …}` vanished with no report at all. The usable entries go to the schema
+  // in a null-prototype object, so no key can reach `Object.prototype`'s setter on the way.
+  const skipped: SkippedProject[] = [];
+  let toValidate: unknown = parsed;
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    const usableRaw = Object.create(null) as Record<string, unknown>;
+    for (const [id, value] of Object.entries(parsed)) {
+      const problem = projectIdProblem(id);
+      if (problem === undefined) {
+        Object.defineProperty(usableRaw, id, {
+          value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+        continue;
+      }
+      const entry: SkippedProject = { id, source: 'WEB_LATEX_MCP_PROJECTS', kind: 'id', problem };
+      skipped.push(entry);
+      console.error(`[web-latex-mcp] ${describeSkippedProject(entry, workspaceRoot)}`);
+    }
+    toValidate = usableRaw;
+  }
+  const result = projectsSchema.safeParse(toValidate);
   if (!result.success) {
     throw new Error(`WEB_LATEX_MCP_PROJECTS is invalid: ${result.error.message}`);
   }
-  return Object.entries(result.data).map(([id, cfg]) =>
+  const projects = Object.entries(result.data).map(([id, cfg]) =>
     cfg.mode === 'local'
       ? // A path from the environment may be `~`-prefixed or relative to the launch dir, the same
         // as WEB_LATEX_MCP_WORKSPACE. Resolve it once here so everything downstream sees absolute.
         { id, ...cfg, path: path.resolve(cwd, expandHome(cfg.path)) }
       : { id, ...cfg },
   );
+  return { projects, skipped };
 }
 
 /**
@@ -156,7 +207,7 @@ function parseCompilerChoice(raw: string | undefined): {
   if (!value) return { kind: 'latexmk', explicit: false };
   if (!(COMPILER_KINDS as readonly string[]).includes(value)) {
     throw new Error(
-      `WEB_LATEX_MCP_COMPILER "${raw}" is invalid; expected one of: ${COMPILER_KINDS.join(', ')}.`,
+      `WEB_LATEX_MCP_COMPILER ${quoteEnvValue(raw ?? '')} is invalid; expected one of: ${COMPILER_KINDS.join(', ')}.`,
     );
   }
   return { kind: value as CompilerKind, explicit: true };
@@ -189,10 +240,10 @@ function parseCompilerChoice(raw: string | undefined): {
  * "proportionate" means here: refuse the thing configured, not the process.
  *
  * The rejection is logged to stderr — never stdout, which is the JSON-RPC channel — in the same
- * shape `parseContactEmail` uses, and the value is `elide`d. It is elided in the RETURNED
- * `invalid` too, not only in the log: unlike the contact email, this value is echoed onward into
- * the tool's refusal message and into `server_info`, so a pasted multi-kilobyte env var would
- * otherwise reach a model's context three times over. The elision says how much was cut.
+ * shape `parseContactEmail` uses, the value `quoteEnvValue`d (escaped and elided). It is elided
+ * in the RETURNED `invalid` too, not only in the log: unlike the contact email, this value is
+ * echoed onward into the tool's refusal message and into `server_info`, so a pasted
+ * multi-kilobyte env var would otherwise reach a model's context three times over. The elision says how much was cut.
  *
  * One deliberate difference from `parseCompilerChoice`, worth not "fixing" later: an unset value
  * here returns `source: undefined`, never a default id. `parseCompilerChoice` can default to
@@ -215,7 +266,7 @@ export function parseReferenceSource(raw: string | undefined): {
   }
   const shown = elide(trimmed);
   console.error(
-    `WEB_LATEX_MCP_REFERENCE_SOURCE "${shown}" is invalid; expected one of: ` +
+    `WEB_LATEX_MCP_REFERENCE_SOURCE ${quoteEnvValue(trimmed)} is invalid; expected one of: ` +
       `${REFERENCE_SOURCES.join(', ')}. search_references will refuse to search until this is ` +
       'fixed or unset (a per-call source: still works); every other tool is unaffected.',
   );
@@ -274,9 +325,9 @@ function resolveContactEmail(raw: string | undefined): {
   // the ONLY place the rejected address appears: stderr is the operator's own terminal, whereas
   // `server_info` is read by a model, so the flag below is all that travels onward.
   console.error(
-    `WEB_LATEX_MCP_CONTACT_EMAIL "${elide(raw ?? '')}" is not usable as a contact address; ` +
-      'ignoring it. Expected a plain email address (no query-altering characters, no ' +
-      `whitespace, at most ${MAX_CONTACT_EMAIL_LENGTH} characters).`,
+    `WEB_LATEX_MCP_CONTACT_EMAIL ${quoteEnvValue(raw ?? '')} is not usable as a contact address; ` +
+      'ignoring it. Expected a plain ASCII email address (no query-altering characters, no ' +
+      `whitespace or "();\\", at most ${MAX_CONTACT_EMAIL_LENGTH} characters).`,
   );
   return { email: undefined, invalid: true };
 }
@@ -287,19 +338,39 @@ function elide(value: string, max = 120): string {
 }
 
 /**
+ * A raw environment value as an error or stderr message shows it: `quoteId`'d, so a newline
+ * cannot forge a second log line nor a bidi control reorder the rest of it, and shortened past
+ * `max` characters the way `elide` does, the count outside the quotes.
+ */
+function quoteEnvValue(value: string, max = 120): string {
+  return value.length <= max
+    ? quoteId(value)
+    : `${quoteId(value.slice(0, max))}… (${value.length} characters)`;
+}
+
+/**
  * RFC 5321's limit on a forward path, and the cap on a usable contact address. Anything longer
  * is a paste accident, not an address, and it would be sent in a header and a query parameter.
  */
 const MAX_CONTACT_EMAIL_LENGTH = 254;
 
-/** True when `value` is a plausible, URL-query-safe email address. See `parseContactEmail`. */
+/**
+ * True when `value` is a plausible email address that is safe both in a URL query string and
+ * inside a User-Agent header comment. See `parseContactEmail`.
+ */
 function isUsableContactEmail(value: string): boolean {
   // Measured on the trimmed value, like every check below it.
   if (value.length > MAX_CONTACT_EMAIL_LENGTH) return false;
-  // Reject anything that could alter a URL query string, or that is not a single flat token.
-  if (/[\s&?#/]/.test(value)) return false;
-  // eslint-disable-next-line no-control-regex
-  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  // Printable ASCII only (0x21-0x7E), which also excludes whitespace and control characters.
+  // The address is interpolated into a User-Agent header, and fetch refuses a header value with
+  // a code point above 255 before any I/O — so a non-ASCII address turned every Crossref and
+  // OpenAlex request into "could not be reached" while `server_info` reported it configured.
+  // Latin-1 would pass that check, but a header value is only portably ASCII, so it goes too.
+  if (!/^[\x21-\x7e]+$/.test(value)) return false;
+  // Reject anything that could alter a URL query string (`&?#/`), or break out of the
+  // `(+url; mailto:<email>)` comment the User-Agent carries it in (`()` delimit a comment, `\`
+  // escapes inside one, `;` separates its parts).
+  if (/[&?#/()\\;]/.test(value)) return false;
   const at = value.split('@');
   if (at.length !== 2) return false;
   const [local, domain] = at;
@@ -330,8 +401,10 @@ export function parseRewriteMode(raw: string | undefined): {
   if ((REWRITE_MODES as readonly string[]).includes(value)) {
     return { mode: value as RewriteMode, explicit: true };
   }
+  // Echoed trimmed and `quoteEnvValue`d, as `parseReferenceSource` does: the typo stays visible, but a
+  // pasted multi-kilobyte value costs one bounded line rather than kilobytes of stderr.
   console.error(
-    `WEB_LATEX_MCP_REWRITE_MODE "${raw}" is invalid; expected one of: ${REWRITE_MODES.join(
+    `WEB_LATEX_MCP_REWRITE_MODE ${quoteEnvValue((raw ?? '').trim())} is invalid; expected one of: ${REWRITE_MODES.join(
       ', ',
     )}. Falling back to "${DEFAULT_REWRITE_MODE}".`,
   );
@@ -397,7 +470,7 @@ function isFilesystemRoot(resolved: string): boolean {
 
 function warnMalformedWritingGuideExtra(raw: string, reason: string): void {
   console.error(
-    `[web-latex-mcp] WEB_LATEX_MCP_WRITING_GUIDE_EXTRA "${raw}" is not usable: ${reason}. ` +
+    `[web-latex-mcp] WEB_LATEX_MCP_WRITING_GUIDE_EXTRA ${quoteEnvValue(raw)} is not usable: ${escapeInvisibleChars(reason)}. ` +
       'Accepted forms: a plain path (e.g. /path/to/conventions.md) or a file:// URL with the ' +
       'authority form (e.g. file:///path/to/conventions.md). Ignoring it; no extra writing ' +
       'guide will be loaded.',
@@ -405,10 +478,12 @@ function warnMalformedWritingGuideExtra(raw: string, reason: string): void {
 }
 
 /**
- * Build the server configuration from environment variables. Reads the filesystem for three
+ * Build the server configuration from environment variables. Reads the filesystem for four
  * things: whether the launch dir is a git repo (for the workspace default), the persisted
- * project registry's project list, and the persisted registry's `default: true` flag. All three
- * reads are injectable (`insideRepo`, `readRegistry`, `readRegistryDefault`) so unit tests stay
+ * project registry's project list, the persisted registry's `default: true` flag, and — only
+ * when `WEB_LATEX_MCP_DEFAULT_PROJECT` names no loaded project — the registry entries it
+ * skipped. All four reads are injectable (`insideRepo`, `readRegistry`, `readRegistryDefault`,
+ * `readRegistrySkipped`) so unit tests stay
  * hermetic — a real on-disk registry (e.g. a developer's actual workspace) must never leak into a
  * test that didn't ask for it.
  */
@@ -418,6 +493,7 @@ export function loadConfig(
   insideRepo?: (dir: string) => boolean,
   readRegistry: (workspaceRoot: string) => ProjectConfig[] = readProjectRegistry,
   readRegistryDefault: (workspaceRoot: string) => string | undefined = readProjectRegistryDefault,
+  readRegistrySkipped: (workspaceRoot: string) => SkippedProject[] = readProjectRegistrySkipped,
 ): ServerConfig {
   const { workspaceRoot, workspaceIsLocal } = resolveWorkspace(
     env.WEB_LATEX_MCP_WORKSPACE,
@@ -427,20 +503,41 @@ export function loadConfig(
 
   // Env projects are the explicit source of truth and always win; persisted (runtime-registered)
   // projects fill in the rest, so a git URL added from the chat is still here after a restart.
-  const envProjects = parseProjects(env.WEB_LATEX_MCP_PROJECTS, cwd);
+  const { projects: envProjects, skipped: skippedProjects } = parseProjects(
+    env.WEB_LATEX_MCP_PROJECTS,
+    cwd,
+    workspaceRoot,
+  );
   const byId = new Map<string, ProjectConfig>();
   for (const p of readRegistry(workspaceRoot)) byId.set(p.id, p);
   for (const p of envProjects) byId.set(p.id, p);
   const projects = [...byId.values()];
 
   const envDefault = env.WEB_LATEX_MCP_DEFAULT_PROJECT?.trim() || undefined;
-  const knownProjectIds = () => (projects.length ? projects.map((p) => p.id).join(', ') : '(none)');
+  const knownProjectIds = () => listIds(projects.map((p) => p.id));
 
   if (envDefault && !projects.some((p) => p.id === envDefault)) {
-    throw new Error(
-      `WEB_LATEX_MCP_DEFAULT_PROJECT "${envDefault}" is not a known project. Known (from ` +
-        `WEB_LATEX_MCP_PROJECTS and the workspace registry at ${registryPath(workspaceRoot)}): ` +
-        `${knownProjectIds()}.`,
+    // A default naming an entry that IS configured but was skipped (an id the rule refuses, or a
+    // registry entry this version cannot use) is not a typo, and must not stop the server: the
+    // skip was already reported, and every other tool — and every call that names its project —
+    // still works. It stays the default, so a call that omits `project` gets the same
+    // explanation from `ProjectManager.getProjectConfig` (which the stderr note never reaches).
+    // Only a name configured nowhere at all is still refused at startup.
+    const skipped = findSkippedProject(
+      [...skippedProjects, ...readRegistrySkipped(workspaceRoot)],
+      envDefault,
+    );
+    if (skipped === undefined) {
+      throw new Error(
+        `WEB_LATEX_MCP_DEFAULT_PROJECT ${quoteId(envDefault)} is not a known project. Known ` +
+          `(from WEB_LATEX_MCP_PROJECTS and the workspace registry at ` +
+          `${registryPath(workspaceRoot)}): ${knownProjectIds()}.`,
+      );
+    }
+    console.error(
+      `[web-latex-mcp] WEB_LATEX_MCP_DEFAULT_PROJECT ${quoteId(envDefault)} names a project ` +
+        `that was skipped (${skipped.problem}); it stays the default, and a call that omits ` +
+        '"project" is told why and how to fix it.',
     );
   }
 
@@ -453,7 +550,7 @@ export function loadConfig(
     persistedDefault = persistedDefaultCandidate;
   } else if (persistedDefaultCandidate) {
     console.error(
-      `[web-latex-mcp] ignoring persisted default project "${persistedDefaultCandidate}" ` +
+      `[web-latex-mcp] ignoring persisted default project ${quoteId(persistedDefaultCandidate)} ` +
         `(registry.json at ${registryPath(workspaceRoot)}): not a known project (from ` +
         `WEB_LATEX_MCP_PROJECTS and the workspace registry): ${knownProjectIds()}.`,
     );
@@ -488,6 +585,7 @@ export function loadConfig(
     workspaceIsLocal,
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
+    ...(skippedProjects.length > 0 ? { skippedProjects } : {}),
     defaultProject,
     defaultProjectExplicit,
     compiler,
@@ -517,15 +615,35 @@ export function loadConfig(
  */
 function parseSessionId(raw: string | undefined): string {
   const value = raw?.trim();
-  if (!value) return `session-${randomBytes(4).toString('hex')}`;
+  if (raw === undefined || !value) return `session-${randomBytes(4).toString('hex')}`;
   const safe = value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
   if (!safe) {
     throw new Error(
-      `WEB_LATEX_MCP_SESSION "${raw}" has no usable characters; use letters, digits, ".", "_" or "-".`,
+      `WEB_LATEX_MCP_SESSION ${quoteId(raw)} has no usable characters; use letters, digits, ".", "_" or "-".`,
     );
   }
-  return safe.slice(0, 64);
+  const id = safe.slice(0, 64);
+  // Judged on the id actually used, case-folded: on a case-insensitive disk `Shelves/` IS
+  // `shelves/`, and refusing on every platform keeps a config portable between them.
+  if (RESERVED_SESSION_IDS.includes(id.toLowerCase())) {
+    throw new Error(
+      `WEB_LATEX_MCP_SESSION ${quoteId(raw)} is reserved: "${id}" names project-wide state beside the ` +
+        `session directories (${RESERVED_SESSION_IDS.join(', ')}); choose another name.`,
+    );
+  }
+  return id;
 }
+
+/**
+ * Names a session id may not take, because each is already an entry directly under
+ * `<workspace>/.sessions/<projectId>/`, where every session's own directory also lives
+ * (`src/lib/sessionPaths.ts`): the shelf store's `shelves/` (`ShelfStore.shelvesDir`), the
+ * cross-process lock (`projectLockPath`) and the sticky rewrite mode (`rewriteModePath`). A session
+ * named `shelves` wrote its session.json/shadow/base into the shelf store. Lower-case, compared
+ * against the lower-cased id. `test/unit/config.test.ts` reads each name off the real layout, so
+ * a renamed entry fails there; a NEW project-level entry must be added here by hand.
+ */
+const RESERVED_SESSION_IDS: readonly string[] = ['shelves', 'project.lock', 'rewrite-mode.json'];
 
 /** Parse the default viewer target from env; undefined (the default) means the OS browser. */
 function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
@@ -533,7 +651,7 @@ function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
   if (!v) return undefined;
   if (v === 'browser' || v === 'vscode') return v;
   throw new Error(
-    `WEB_LATEX_MCP_VIEWER_TARGET "${raw}" is invalid; expected "browser" or "vscode".`,
+    `WEB_LATEX_MCP_VIEWER_TARGET ${quoteEnvValue(raw ?? '')} is invalid; expected "browser" or "vscode".`,
   );
 }
 
@@ -543,7 +661,9 @@ function parseViewerPort(raw: string | undefined): number | undefined {
   if (!value) return undefined;
   const port = Number(value);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
-    throw new Error(`WEB_LATEX_MCP_VIEWER_PORT "${raw}" is invalid; expected a port 0-65535.`);
+    throw new Error(
+      `WEB_LATEX_MCP_VIEWER_PORT ${quoteEnvValue(raw ?? '')} is invalid; expected a port 0-65535.`,
+    );
   }
   return port;
 }

@@ -102,8 +102,12 @@ const inputSchema = {
             newString: z
               .string()
               .describe(
-                'Text those lines become. Empty deletes them (or, under a rewrite-preservation ' +
-                  'mode, leaves them %-commented in place).',
+                'Text those lines become. Empty deletes them outright, line terminator included, ' +
+                  'so no blank line is left behind (or, under a rewrite-preservation mode, leaves ' +
+                  'them %-commented in place). In a file mixing bare-CR and LF endings, a deletion ' +
+                  'that would leave a bare \\r right before a blank LF line turns that \\r (and ' +
+                  'any bare \\r run just before it) into \\n, so the blank line is not swallowed ' +
+                  'into one CRLF.',
               ),
           })
           .strict(),
@@ -115,11 +119,17 @@ const inputSchema = {
         '{oldString, newString} OR a line range {startLine, endLine, newString} — never both in ' +
         'one object. A line range replaces those lines whatever they say, for a change defined ' +
         'by where it is rather than what it says (1-based, endLine inclusive, exactly like ' +
-        "read_file; the line terminator after endLine is not part of the range, so the file's " +
-        'last newline survives a whole-file range). Line numbers always refer to the file as it ' +
+        "read_file; the line terminator after endLine is not replaced, so the file's last " +
+        'newline survives a whole-file range — unless newString is empty, which deletes the ' +
+        'lines together with that terminator). Line numbers always refer to the file as it ' +
         'was BEFORE this call — the content read_file returned — never to the state an earlier ' +
         'edit in this same array left behind; if two edits in one call would touch the same ' +
-        'text, the whole call is refused rather than applied to shifted lines.',
+        'text (a range counts the line terminator after endLine as its own), the whole call is ' +
+        'refused rather than applied to shifted lines. A STRING edit, unlike a range, matches ' +
+        'the text as the earlier edits in the array left it, so it fails as not found when an ' +
+        'earlier edit already removed what it names — including the newline before an ' +
+        'unterminated last line, which deleting that line takes. A file that is not valid UTF-8 is ' +
+        'refused: the edit rewrites the whole file as UTF-8.',
     ),
 };
 

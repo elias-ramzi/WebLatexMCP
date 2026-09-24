@@ -27,6 +27,11 @@ import {
   SIDE_LABEL_OVERHEAD,
   SIDE_ELISION_OVERHEAD,
   HUNK_ELISION_TEXT_OVERHEAD,
+  FILE_TEXT_LINE_BREAKS,
+  HUNKS_BLOCK_TEXT_OVERHEAD,
+  FILE_JSON_OVERHEAD,
+  ELIDED_JSON_WRAPPER_OVERHEAD,
+  SIDE_ABSENT_OVERHEAD,
   type ConflictPayloadPlan,
   type ConflictRefs,
 } from '../../src/lib/conflictBudget.js';
@@ -656,6 +661,269 @@ describe('escape-heavy content stays bounded once JSON-encoded (finding 1 regres
 
     expect(plan.truncated).toBe(true);
     expect(json.length).toBeLessThan(ESCAPE_CEILING);
+  });
+});
+
+describe('CONFLICT_CONTENT_BUDGET bounds BOTH channels combined, not the larger of the two', () => {
+  // The per-file payload ships twice: as the file blocks of the result text and again as
+  // `structuredContent.conflictFiles`. Charging `max(text, json)` per part bounded each channel
+  // on its own at best — never what the caller receives — and the per-file JSON scaffold (keys,
+  // `null` sides, the `elided` wrapper), the text channel's line breaks, `overlap:` label and
+  // absent-side lines were never charged at all: 20 backslash-heavy files reached 23,485
+  // characters of JSON alone, past the 20000 budget, and ~40k across the two channels.
+
+  /** The file blocks of the text channel — everything `renderConflictText` renders per detailed
+   * file (from the blank line before the first header onward), i.e. what the plan decides. The
+   * report-level prelude (summary, guidance, refs, landed commits, the never-capped conflictPaths
+   * list, the note) is outside the budget by design. Valid for reports within CONFLICT_MAX_FILES,
+   * where no "… N more" trailer follows the last block. */
+  function fileBlocksText(text: string, rep: ConflictReport): string {
+    const start = text.indexOf('\n\n' + fileHeaderLine(rep.files[0]!.path));
+    expect(start).toBeGreaterThan(0);
+    return text.slice(start);
+  }
+
+  function renderedPerFileSize(rep: ConflictReport): { total: number; truncated: boolean } {
+    const plan = planConflictPayload(rep.files, {
+      detail: 'auto',
+      refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+    });
+    const text = renderConflictText('summary', rep, { plan });
+    const json = JSON.stringify(buildConflictFilePayload(rep, plan));
+    return { total: fileBlocksText(text, rep).length + json.length, truncated: plan.truncated };
+  }
+
+  /** `n` characters of `ch`, broken into 80-column lines — a realistic side. */
+  function side(n: number, ch: string): string {
+    return (ch.repeat(79) + '\n').repeat(Math.ceil(n / 80)).slice(0, n);
+  }
+
+  function manyFiles(opts: {
+    files: number;
+    sideChars: number;
+    ch: string;
+    hunks: ConflictHunk[];
+    mergeBase?: string | null;
+  }): ConflictReport {
+    const files: ConflictFileDetail[] = Array.from({ length: opts.files }, (_, i) => ({
+      path: `sections/s${i}.tex`,
+      base: side(opts.sideChars, opts.ch),
+      ours: side(opts.sideChars, opts.ch),
+      theirs: side(opts.sideChars, opts.ch),
+      hunks: opts.hunks,
+    }));
+    return report({
+      files,
+      conflictPaths: files.map((f) => f.path),
+      mergeBase: opts.mergeBase === undefined ? MERGE_BASE : opts.mergeBase,
+      guidance: 'g'.repeat(700),
+    });
+  }
+
+  const probeHunk: ConflictHunk = {
+    startLine: 1,
+    endLine: 5,
+    local: ['x'.repeat(40)],
+    remote: ['y'.repeat(40)],
+  };
+
+  it('20 backslash-heavy files: text file blocks + conflictFiles JSON stay within the budget', () => {
+    const { total, truncated } = renderedPerFileSize(
+      manyFiles({ files: 20, sideChars: 300, ch: '\\', hunks: [probeHunk] }),
+    );
+    expect(truncated).toBe(true);
+    expect(total).toBeLessThanOrEqual(CONFLICT_CONTENT_BUDGET);
+  });
+
+  it('20 plain-text files: text file blocks + conflictFiles JSON stay within the budget', () => {
+    const { total, truncated } = renderedPerFileSize(
+      manyFiles({ files: 20, sideChars: 300, ch: 'a', hunks: [probeHunk] }),
+    );
+    expect(truncated).toBe(true);
+    expect(total).toBeLessThanOrEqual(CONFLICT_CONTENT_BUDGET);
+  });
+
+  /**
+   * The same report with EVERY cuttable part cut — the smallest thing the per-file payload can be
+   * rendered as short of dropping files. Built by hand from the plan's own shape, not by the
+   * planner, so it is an independent oracle for whether the budget is honourable at all.
+   */
+  function allCutSize(rep: ConflictReport): number {
+    const plan: ConflictPayloadPlan = {
+      truncated: true,
+      files: rep.files.map((f) => ({
+        path: f.path,
+        hunks: {
+          included: f.hunks.length === 0,
+          chars: f.hunks.reduce(
+            (n, h) => n + h.local.join('\n').length + h.remote.join('\n').length,
+            0,
+          ),
+          count: f.hunks.length,
+          spans: f.hunks.slice(0, 20).map((h) => ({ startLine: h.startLine, endLine: h.endLine })),
+        },
+        base: { included: f.base === null, chars: f.base?.length ?? 0 },
+        ours: { included: f.ours === null, chars: f.ours?.length ?? 0 },
+        theirs: { included: f.theirs === null, chars: f.theirs?.length ?? 0 },
+      })),
+    };
+    const text = renderConflictText('summary', rep, { plan });
+    return (
+      fileBlocksText(text, rep).length + JSON.stringify(buildConflictFilePayload(rep, plan)).length
+    );
+  }
+
+  it('holds across a sweep of sizes, escape densities, file counts, hunk shapes and merge bases', () => {
+    const tinyHunks = Array.from({ length: 30 }, (_, i) => ({
+      startLine: i * 3 + 1,
+      endLine: i * 3 + 2,
+      local: ['a\\b'],
+      remote: ['"c"'],
+    }));
+    const bigHunk: ConflictHunk = {
+      startLine: 7,
+      endLine: 70,
+      local: [side(2000, '\\')],
+      remote: [side(1500, 'r')],
+    };
+    const failures: string[] = [];
+    let honourable = 0;
+    for (const files of [1, 3, 20])
+      for (const sideChars of [50, 3000, 11900])
+        for (const ch of ['a', '\\', '"\n'])
+          for (const [hunkLabel, hunks] of [
+            ['none', []],
+            ['big', [bigHunk]],
+            ['tiny30', tinyHunks],
+          ] as const)
+            for (const mergeBase of [MERGE_BASE, null]) {
+              const rep = manyFiles({ files, sideChars, ch, hunks: [...hunks], mergeBase });
+              const label =
+                `${files} file(s) x ${sideChars} ${JSON.stringify(ch)} hunks=${hunkLabel} ` +
+                `mergeBase=${mergeBase ? 'set' : 'null'}`;
+              const plan = planConflictPayload(rep.files, {
+                detail: 'auto',
+                refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+              });
+              const { total } = renderedPerFileSize(rep);
+              if (allCutSize(rep) <= CONFLICT_CONTENT_BUDGET) {
+                honourable++;
+                if (total > CONFLICT_CONTENT_BUDGET) failures.push(`${label}: ${total}`);
+              } else if (!/pointers standing in|headers alone/.test(plan.note ?? '')) {
+                // No plan can fit (20 files x 30 hunks: the span notes and read_file pointers
+                // alone exceed the budget) — then the note must say so, not claim a budget held.
+                failures.push(`${label}: over budget (${total}) without saying why: ${plan.note}`);
+              }
+            }
+    expect(failures).toEqual([]);
+    // The exemption above must stay the exception, or this sweep proves nothing.
+    expect(honourable).toBeGreaterThanOrEqual(90);
+  });
+});
+
+describe('per-file framing constants stay pinned to the real render, from both sides', () => {
+  const PATH = 'sections/04.tex';
+
+  function oneFile(overrides: Partial<ConflictFileDetail>): ConflictReport {
+    const f: ConflictFileDetail = {
+      path: PATH,
+      base: null,
+      ours: null,
+      theirs: null,
+      hunks: [],
+      ...overrides,
+    };
+    return report({ files: [f], conflictPaths: [PATH] });
+  }
+
+  function blocksAndEntry(
+    rep: ConflictReport,
+    plan?: ConflictPayloadPlan,
+  ): { blocks: string; entry: string } {
+    const p =
+      plan ??
+      planConflictPayload(rep.files, {
+        detail: 'auto',
+        refs: { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto },
+      });
+    const text = renderConflictText('summary', rep, { plan: p });
+    const start = text.indexOf('\n\n' + fileHeaderLine(PATH));
+    return {
+      blocks: text.slice(start),
+      entry: JSON.stringify(buildConflictFilePayload(rep, p)[0]),
+    };
+  }
+
+  const absentLines = (['base', 'ours', 'theirs'] as const).reduce(
+    (n, k) => n + renderSide(SIDE_LABELS[k], null, { included: true, chars: 0 }, '').length,
+    0,
+  );
+
+  it('SIDE_ABSENT_OVERHEAD matches renderSide for an absent side under the longest label', () => {
+    expect(
+      renderSide(SIDE_LABELS.theirs, null, { included: true, chars: 0 }, 'unused').length,
+    ).toBe(SIDE_ABSENT_OVERHEAD);
+  });
+
+  it('FILE_TEXT_LINE_BREAKS: a hunkless, all-absent file block is header + breaks + side lines', () => {
+    const { blocks } = blocksAndEntry(oneFile({}));
+    expect(blocks.length).toBe(
+      FILE_HEADER_OVERHEAD + PATH.length + FILE_TEXT_LINE_BREAKS + absentLines,
+    );
+  });
+
+  it('HUNKS_BLOCK_TEXT_OVERHEAD: a shown overlap block adds exactly its markers plus the constant', () => {
+    const h: ConflictHunk = { startLine: 3, endLine: 9, local: ['abc'], remote: ['de'] };
+    const without = blocksAndEntry(oneFile({})).blocks.length;
+    const withHunk = blocksAndEntry(oneFile({ hunks: [h] })).blocks.length;
+    expect(withHunk - without).toBe(HUNKS_BLOCK_TEXT_OVERHEAD + renderHunkMarkers([h]).length);
+  });
+
+  it('FILE_JSON_OVERHEAD: an all-absent, hunkless entry is the scaffold + path + three nulls', () => {
+    const { entry } = blocksAndEntry(oneFile({}));
+    expect(entry.length).toBe(FILE_JSON_OVERHEAD + JSON.stringify(PATH).length + 3 * 'null'.length);
+  });
+
+  it('ELIDED_JSON_WRAPPER_OVERHEAD: the elided wrapper costs the constant plus key, value and comma per member', () => {
+    const rep = oneFile({ base: 'b'.repeat(10), ours: 'o'.repeat(20), theirs: 't'.repeat(30) });
+    const refs: ConflictRefs = { mergeBase: rep.mergeBase, rebasedOnto: rep.rebasedOnto };
+    const planWith = (cut: Array<'base' | 'ours' | 'theirs'>): ConflictPayloadPlan => ({
+      truncated: cut.length > 0,
+      files: [
+        {
+          path: PATH,
+          hunks: { included: true, chars: 0, count: 0, spans: [] },
+          base: { included: !cut.includes('base'), chars: 10 },
+          ours: { included: !cut.includes('ours'), chars: 20 },
+          theirs: { included: !cut.includes('theirs'), chars: 30 },
+        },
+      ],
+    });
+    for (const cut of [['ours'], ['base', 'ours', 'theirs']] as Array<
+      Array<'base' | 'ours' | 'theirs'>
+    >) {
+      const withCut = JSON.parse(blocksAndEntry(rep, planWith(cut)).entry) as Record<
+        string,
+        unknown
+      >;
+      const { elided, ...rest } = withCut;
+      const members = cut.reduce(
+        (n, k) =>
+          n +
+          JSON.stringify(k).length +
+          1 +
+          JSON.stringify({
+            chars: rep.files[0]![k]!.length,
+            ref: sideElisionHint(PATH, k, refs, false).json,
+          }).length +
+          1,
+        0,
+      );
+      expect(elided).toBeDefined();
+      expect(JSON.stringify(withCut).length - JSON.stringify(rest).length).toBe(
+        ELIDED_JSON_WRAPPER_OVERHEAD + members,
+      );
+    }
   });
 });
 

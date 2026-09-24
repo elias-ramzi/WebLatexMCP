@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { asShadowContent } from './shadowContent.js';
+import type { Merge3Result } from './merge3.js';
 
 /**
  * The pure core of `shelve` / `unshelve` / `list_shelves`: the shelf id, the on-disk manifest
@@ -6,7 +8,8 @@ import { randomUUID } from 'node:crypto';
  * the conflict-payload cap).
  *
  * Pure by design — no fs, no git, no process/env access — so every rule below is unit-testable
- * without a workspace. `ShelfStore` (`src/services/shelfStore.ts`) is the only thing that turns
+ * without a workspace. The one step that needs git, the three-way merge `unshelve` runs when HEAD
+ * moved under a text entry, is injected ({@link UnshelveMerge}) rather than imported. `ShelfStore` (`src/services/shelfStore.ts`) is the only thing that turns
  * these values into paths.
  */
 
@@ -211,32 +214,92 @@ export interface UnshelveConflictPlan {
   note: string;
 }
 
+type ConflictSide = keyof UnshelveSideElision;
+
+/**
+ * The order sides are charged against the aggregate budget — ACROSS every detailed file, one side
+ * at a time, not file by file — so the side that is cut first is the one the caller can best get
+ * back:
+ *
+ * 1. `theirs` — the shelved content. The shelf lives under `<workspace>/.sessions/`, outside every
+ *    project sandbox, so no tool can read it: this payload is the ONLY copy a caller can reach.
+ *    Charged first, and exempt from the per-side cap (bounded by the aggregate alone), because a
+ *    cut `theirs` is the one side nothing else recovers.
+ * 2. `ours` — what is in the working tree now; one `read_file` away.
+ * 3. `base` — HEAD's content when the shelf was taken; `read_file` with `ref` = the shelf's
+ *    `headSha` reads it, so it is the cheapest to lose.
+ *
+ * An earlier version charged base, ours, theirs — declaration order — and so cut `theirs` first:
+ * two 9000-character sides filled a 20000 budget and the only unrecoverable one was dropped.
+ */
+export const UNSHELVE_ALLOCATION_ORDER: readonly ConflictSide[] = ['theirs', 'ours', 'base'];
+
+/**
+ * Literal characters of ONE `structuredContent.conflicts[]` entry's JSON scaffold —
+ * `{"path":,"reason":,"base":,"ours":,"theirs":}` plus the comma that separates it from the next
+ * array element — EXCLUDING the path's and reason's own JSON strings and the three side values
+ * (charged with each side). Pinned against `JSON.stringify` of a real planned entry in
+ * `test/unit/unshelveConflictBudget.test.ts`, so a new key cannot land uncharged.
+ */
+export const UNSHELVE_FILE_JSON_OVERHEAD =
+  '{"path":,"reason":,"base":,"ours":,"theirs":}'.length + 1;
+
+/**
+ * Literal characters of the `,"elided":{}` wrapper an entry grows once a side is cut, LESS ONE:
+ * each elided side is charged its key, its value and one separating comma, and `k` parts need
+ * only `k - 1` commas. Same accounting as `ELIDED_JSON_WRAPPER_OVERHEAD` in `conflictBudget.ts`.
+ */
+export const UNSHELVE_ELIDED_WRAPPER_OVERHEAD = ',"elided":{}'.length - 1;
+
+/** What `null` costs in JSON — an absent or cut side's value. */
+const JSON_NULL = 'null'.length;
+
+/** `"<side>":<count>,` — what one entry under `elided` costs. */
+function elisionCost(side: ConflictSide, count: number): number {
+  return JSON.stringify(side).length + 1 + String(count).length + 1;
+}
+
 /**
  * Cap a conflict payload so it fits in one tool result.
  *
  * Three bounds, each reported only when it actually fired: how many files get a detailed block,
- * how long any ONE side may be, and — the one an earlier version of this omitted — how much
- * every side of every file may come to in TOTAL. A per-side cap without an aggregate is not a
- * bound on the result: 20 files x 3 sides x 12000 characters clears every individual cap and
- * still renders 720000 characters with `truncated: false`.
+ * how long any ONE recoverable side may be, and how much every side of every file may come to in
+ * TOTAL. A per-side cap without an aggregate is not a bound on the result: 20 files x 3 sides x
+ * 12000 characters clears every individual cap and still renders 720000 characters with
+ * `truncated: false`.
+ *
+ * **Both caps are charged against the RENDERED size**, the JSON string the side ships as, not the
+ * characters held. The sides reach the caller only in `structuredContent` (the text channel names
+ * paths and reasons, never content), and JSON escapes every control character as `\u00XX` — six
+ * characters for one. Charged on held length, 9000 control characters cleared a 20000 budget and
+ * rendered 54002; a binary side, lossily decoded, did the same at scale (~120k, `truncated:
+ * false`). The entry scaffold, the `null` an absent or cut side still costs and the `elided`
+ * entries are charged too ({@link UNSHELVE_FILE_JSON_OVERHEAD}), so whenever the mandatory
+ * scaffolding fits, `JSON.stringify(plan.files).length <= totalBudget`. The one approximation is
+ * on the safe side: an entry's `elided` wrapper stays reserved until its last contested side is
+ * decided, so a payload within that wrapper's few characters of the budget can be cut where an
+ * oracle would not. A side too small to be worth cutting (reporting it cut would cost more than
+ * its JSON) is always shown.
+ *
+ * Sides are charged in {@link UNSHELVE_ALLOCATION_ORDER} — `theirs`, `ours`, `base` — across every
+ * detailed file; see that constant for why.
  *
  * The first `maxFiles` files get a detailed block; the rest are named in `paths` only, which is
  * never capped and never elided — the path list is the one thing a caller needs in order to act.
- * Each side is capped at `sideCap` characters; a cut side comes back `null` with its **true**
- * character count under `elided.<side>`.
+ * A cut side comes back `null` with its **true** character count under `elided.<side>`.
  *
  * `null` with **no** matching `elided` entry keeps meaning what it always meant — the side is
  * absent (the file was added, so there is no base; or deleted, so there are no shelved bytes).
  * That distinction must never blur: one says "there was nothing here", the other says "there
- * were N characters here and you can still get them".
+ * were N characters here".
  *
- * Eliding is safe here in a way it is not for a push conflict: a conflicting `unshelve` writes
- * nothing and **leaves the shelf intact**, so every elided byte stays recoverable by resolving
- * the collision and calling `unshelve` again.
+ * A conflicting `unshelve` writes nothing and **leaves the shelf intact**, so a cut `theirs` is
+ * still held by the shelf — but no tool reads a shelf, which is exactly why it is charged first.
+ * `baseRef` (the shelf's `headSha`) lets the note say where a cut `base` can be read.
  */
 export function capUnshelveConflict(
   files: UnshelveConflictFile[],
-  opts: { maxFiles: number; sideCap: number; totalBudget: number },
+  opts: { maxFiles: number; sideCap: number; totalBudget: number; baseRef?: string },
 ): UnshelveConflictPlan {
   const maxFiles = Math.max(0, opts.maxFiles);
   const sideCap = Math.max(0, opts.sideCap);
@@ -244,49 +307,97 @@ export function capUnshelveConflict(
   const paths = files.map((f) => f.path);
   const kept = files.slice(0, maxFiles);
   const droppedFiles = files.length - kept.length;
-  let anySideElided = false;
+  let sideCapFired = false;
   let budgetFired = false;
-  // Charged across every side of every file, not per side. The per-side cap alone is only half
-  // of the mechanism #68 built, and the missing half is the one that matters: 20 files x 3 sides
-  // x 12000 characters is 720000 characters with nothing individually over its cap, so nothing
-  // is elided, `truncated` is false and the note is empty — a payload an order of magnitude past
-  // the ~67k that was rejected undelivered in the first place. Five shelved 8 kB sections
-  // rebased over reach ~120k without an adversary anywhere.
-  let used = 0;
+  let theirsCut = false;
 
-  const out = kept.map((file) => {
-    const elided: UnshelveSideElision = {};
-    const cut = (value: string | null, side: keyof UnshelveSideElision): string | null => {
-      // A genuinely absent side stays absent: `null` in, `null` out, and no `elided` entry.
-      if (value === null) return null;
-      if (value.length > sideCap) {
-        elided[side] = value.length;
-        anySideElided = true;
-        return null;
-      }
-      // The aggregate. Charged in the order sides are visited, so the cut is a tail rather than
-      // a hole: a caller reading the first files in full is better off than one reading every
-      // file half. An over-budget side is elided with its true length, exactly as an
-      // over-the-side-cap one is, and stays recoverable because the shelf is left intact.
-      if (used + value.length > totalBudget) {
-        elided[side] = value.length;
-        budgetFired = true;
-        return null;
-      }
-      used += value.length;
-      return value;
-    };
+  // `[` + `]`, less the comma the last entry charged but does not render.
+  let used = kept.length > 0 ? 1 : 0;
+  const planned = kept.map((file) => {
     const entry: UnshelveConflictFile & { elided?: UnshelveSideElision } = {
       path: file.path,
       reason: file.reason,
-      base: cut(file.base, 'base'),
-      ours: cut(file.ours, 'ours'),
-      theirs: cut(file.theirs, 'theirs'),
+      base: null,
+      ours: null,
+      theirs: null,
     };
-    if (Object.keys(elided).length > 0) entry.elided = elided;
-    return entry;
+    const elided: UnshelveSideElision = {};
+    // Sides the budget still has to decide, as [side, rendered cost if kept, cost if cut].
+    const contested: Array<[ConflictSide, number, number]> = [];
+    used +=
+      UNSHELVE_FILE_JSON_OVERHEAD +
+      JSON.stringify(file.path).length +
+      JSON.stringify(file.reason).length;
+    for (const side of UNSHELVE_ALLOCATION_ORDER) {
+      const value = file[side];
+      // A genuinely absent side stays absent: `null` in, `null` out, and no `elided` entry.
+      if (value === null) {
+        used += JSON_NULL;
+        continue;
+      }
+      const keptCost = JSON.stringify(value).length;
+      const cutCost = JSON_NULL + elisionCost(side, value.length);
+      if (side !== 'theirs' && keptCost > sideCap) {
+        // The per-side cap bounds only the sides another tool can fetch; `theirs` has no such
+        // route, so it answers to the aggregate alone.
+        elided[side] = value.length;
+        sideCapFired = true;
+        used += cutCost;
+      } else if (keptCost <= cutCost) {
+        // Reporting it cut would cost more than showing it: never a saving, so never cut.
+        entry[side] = value;
+        used += keptCost;
+      } else {
+        // Reserve what a cut would cost; keeping it later charges only the difference, so the
+        // running total only ever rises toward what renders and a cut can never overshoot.
+        contested.push([side, keptCost, cutCost]);
+        used += cutCost;
+      }
+    }
+    // The `elided` wrapper: certain once a side is cut, reserved while one might be, and given
+    // back when the entry's last contested side is kept with nothing of it cut.
+    if (Object.keys(elided).length > 0 || contested.length > 0) {
+      used += UNSHELVE_ELIDED_WRAPPER_OVERHEAD;
+    }
+    return { file, entry, elided, contested };
   });
 
+  for (const side of UNSHELVE_ALLOCATION_ORDER) {
+    for (const p of planned) {
+      const at = p.contested.findIndex(([s]) => s === side);
+      if (at < 0) continue;
+      const [, keptCost, cutCost] = p.contested[at]!;
+      p.contested.splice(at, 1);
+      const wrapperBack =
+        p.contested.length === 0 && Object.keys(p.elided).length === 0
+          ? UNSHELVE_ELIDED_WRAPPER_OVERHEAD
+          : 0;
+      const keepCost = keptCost - cutCost - wrapperBack;
+      if (used + keepCost > totalBudget) {
+        p.elided[side] = p.file[side]!.length;
+        budgetFired = true;
+        if (side === 'theirs') theirsCut = true;
+        continue;
+      }
+      used += keepCost;
+      p.entry[side] = p.file[side];
+    }
+  }
+
+  const out = planned.map(({ entry, elided }) => {
+    if (Object.keys(elided).length === 0) return entry;
+    // Keys in a fixed order, whatever order the passes cut them in.
+    const ordered: UnshelveSideElision = {};
+    for (const side of ['base', 'ours', 'theirs'] as const) {
+      if (elided[side] !== undefined) ordered[side] = elided[side];
+    }
+    return { ...entry, elided: ordered };
+  });
+
+  const baseHint =
+    opts.baseRef && opts.baseRef !== 'unborn'
+      ? `read_file with ref "${opts.baseRef}"`
+      : 'read_file with a ref';
   const notes: string[] = [];
   if (droppedFiles > 0) {
     notes.push(
@@ -294,10 +405,10 @@ export function capUnshelveConflict(
         `one of them is listed under "paths"`,
     );
   }
-  if (anySideElided) {
+  if (sideCapFired) {
     notes.push(
-      `a base, ours or theirs over ${sideCap} characters was elided; the shelf is left intact, ` +
-        `so resolving the collision and unshelving again recovers every byte`,
+      `a base or ours rendering to over ${sideCap} characters was elided — ours is the ` +
+        `working tree (read_file), base is HEAD when the shelf was taken (${baseHint})`,
     );
   }
   // Named apart from the per-side cap, and only when it actually fired: reporting "a side was
@@ -306,15 +417,20 @@ export function capUnshelveConflict(
   if (budgetFired) {
     notes.push(
       `the ${totalBudget}-character total budget across every side of every file was reached, ` +
-        `so later sides were elided; the shelf is left intact, so resolving the collision and ` +
-        `unshelving again recovers every byte`,
+        `and sides are charged theirs first, then ours, then base, so what did not fit was ` +
+        `elided — ours is the working tree ` +
+        `(read_file), base is HEAD when the shelf was taken (${baseHint})` +
+        (theirsCut
+          ? '; a cut theirs is the shelved content itself, which no other tool can read — the ' +
+            'shelf is intact and still holds it, and a later unshelve that applies writes it out'
+          : ''),
     );
   }
 
   return {
     files: out,
     paths,
-    truncated: droppedFiles > 0 || anySideElided || budgetFired,
+    truncated: droppedFiles > 0 || sideCapFired || budgetFired,
     note: notes.join('; '),
   };
 }
@@ -323,6 +439,8 @@ export function capUnshelveConflict(
 export type UnshelveVerdict =
   | { kind: 'apply' }
   | { kind: 'noop' }
+  /** HEAD moved under a TEXT entry and the tree is clean: three-way merge the shelved change on. */
+  | { kind: 'merge'; ours: string; base: string; theirs: string }
   | { kind: 'conflict'; reason: UnshelveConflictReason };
 
 /** One file's inputs to {@link planUnshelveFile}, all as raw bytes (or absent). */
@@ -365,6 +483,21 @@ export interface UnshelveFileState {
  * real case rather than a tidy one: a crash between writing the shelf and clearing the tree
  * leaves exactly that state, and calling it a conflict makes the shelf permanently unreclaimable
  * with `ours` and `theirs` byte-identical.
+ *
+ * **HEAD moved under the file: merge a text entry, refuse the rest.** Refusing every such file
+ * wedged the shelf for good — the ordinary "shelve section B, pull a co-author's commit touching
+ * it" case — because the only exit left was making the tree byte-equal to the shelved bytes,
+ * which throws away every line HEAD gained, and no tool can read a shelf to do even that. So a
+ * file whose base, shelved and current bytes are all TEXT (`asShadowContent`: no NUL, lossless
+ * UTF-8 — the same test the shadow store's three-way merge rests on) and whose tree is clean is
+ * returned as `merge`: the caller three-way merges base -> shelved onto the tree
+ * ({@link resolveUnshelveFile}). The merge's `ours` is the TREE's bytes, not HEAD's blob: they
+ * are what the write replaces, and `dirty === false` is git's own word — filters included — that
+ * they are HEAD. Everything else stays `head-moved`: bytes that are not text are never merged
+ * (there is no such thing as a merged PNG — the ShadowStore rule), and a side that is absent
+ * (added or deleted on either end) has no text to merge, so picking a winner would be a guess.
+ * A mergeable file over a DIRTY tree is `dirty`, not `head-moved`: the collision the caller has
+ * to clear is the live edit, and once it is cleared the merge runs.
  */
 export function planUnshelveFile(state: UnshelveFileState): UnshelveVerdict {
   const { base, shelved, current, headNow, dirty } = state;
@@ -375,7 +508,16 @@ export function planUnshelveFile(state: UnshelveFileState): UnshelveVerdict {
   // HEAD moved UNDER THIS FILE, so the shelved edit no longer applies to what it was made
   // against. Both sides are blob bytes here, so this comparison is filter-free and exact; a HEAD
   // that advanced without touching this path compares equal and is correctly not a conflict.
-  if (!bytesEqual(headNow, base)) return { kind: 'conflict', reason: 'head-moved' };
+  if (!bytesEqual(headNow, base)) {
+    const b = asShadowContent(base);
+    const t = asShadowContent(shelved);
+    const o = asShadowContent(current);
+    const mergeable =
+      headNow !== null && typeof b === 'string' && typeof t === 'string' && typeof o === 'string';
+    if (!mergeable) return { kind: 'conflict', reason: 'head-moved' };
+    if (dirty) return { kind: 'conflict', reason: 'dirty' };
+    return { kind: 'merge', ours: o, base: b, theirs: t };
+  }
 
   // Untracked when shelved: the shelve removed the path, so anything present now is live work
   // that `git status` may or may not be willing to mention. See the doc comment.
@@ -383,6 +525,67 @@ export function planUnshelveFile(state: UnshelveFileState): UnshelveVerdict {
 
   if (dirty) return { kind: 'conflict', reason: 'dirty' };
   return { kind: 'apply' };
+}
+
+/** The three-way merge `unshelve` runs — `merge3` (`src/lib/merge3.ts`, `git merge-file`), the
+ *  primitive ShadowStore's `refresh`/`record` use, injected so this module stays pure. */
+export type UnshelveMerge = (ours: string, base: string, theirs: string) => Promise<Merge3Result>;
+
+/** What `unshelve` does with one file, once any merge has run. */
+export type UnshelveResolution =
+  | {
+      kind: 'restore';
+      /** The bytes to leave at the path; `null` = remove it (a shelved deletion). */
+      bytes: Buffer | null;
+      /**
+       * The `before` to hand `ShadowStore.record` (with `after` = `bytes`), so the change this
+       * session is recorded as owning is exactly the shelved edit — nothing of HEAD's, nothing
+       * of a peer's. See {@link resolveUnshelveFile}.
+       */
+      recordBefore: Buffer | null;
+      /** True when the bytes are a three-way merge rather than the shelf's own. */
+      merged: boolean;
+    }
+  | { kind: 'conflict'; reason: UnshelveConflictReason };
+
+/**
+ * {@link planUnshelveFile}, with the merge it asks for actually run.
+ *
+ * **What the session is recorded as owning.** For an ordinary restore and a no-op, `recordBefore`
+ * is the shelf's BASE, so the recorded change is base -> shelved, exactly the shelved edit (on an
+ * applied restore the base IS what the tree held; on a no-op the tree already holds the shelved
+ * bytes, and recording tree -> tree would record nothing and leave the lines out of a session
+ * commit). For a MERGE it is the TREE's bytes as they stood — which the clean dirty check proved
+ * are HEAD — and NOT the base: the settled shadow starts at the new HEAD, so recording
+ * HEAD -> merged hands it the shelved lines and nothing else, while recording base -> merged
+ * would make the shadow re-merge a change that already contains HEAD's new lines against a base
+ * HEAD has moved past, which can collide on the very lines the merge just placed side by side.
+ *
+ * A collision (`git merge-file` reports conflicts) is `head-moved`, and no markers are ever
+ * written: the caller gets base/ours/theirs, and the shelf stays intact.
+ */
+export async function resolveUnshelveFile(
+  state: UnshelveFileState,
+  merge: UnshelveMerge,
+): Promise<UnshelveResolution> {
+  const verdict = planUnshelveFile(state);
+  switch (verdict.kind) {
+    case 'conflict':
+      return verdict;
+    case 'apply':
+    case 'noop':
+      return { kind: 'restore', bytes: state.shelved, recordBefore: state.base, merged: false };
+    case 'merge': {
+      const { merged, conflicted } = await merge(verdict.ours, verdict.base, verdict.theirs);
+      if (conflicted) return { kind: 'conflict', reason: 'head-moved' };
+      return {
+        kind: 'restore',
+        bytes: Buffer.from(merged, 'utf8'),
+        recordBefore: state.current,
+        merged: true,
+      };
+    }
+  }
 }
 
 /** Byte equality where `null` (absent) is a value distinct from empty. */

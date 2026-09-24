@@ -45,7 +45,8 @@ export function registerDoctor(server: McpServer, ctx: AppContext): void {
         'is missing, whether the other supported backend (latexmk/tectonic) is installed and ' +
         'whether compiles fall back to it — which engines are installed, the TeX distribution ' +
         'and its age, the package manager and the repository it would install from, where a ' +
-        'package can be installed without root, git, and whether the workspace is writable. ' +
+        'package can be installed without root, git (and whether it is 2.25 or newer), and ' +
+        'whether the workspace is writable. ' +
         'Read-only and local — pass checkRepository: true to also test ' +
         'the repository over the network. Call this when a compile fails for a reason that is ' +
         'about the machine rather than the document (missing package, unknown engine), instead of ' +

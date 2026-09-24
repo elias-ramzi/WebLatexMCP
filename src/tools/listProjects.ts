@@ -22,7 +22,13 @@ const outputSchema = {
           '"git": a clone of a remote, with the full sync/commit/push workflow. "local": a ' +
             'directory edited in place, which the git tools do not apply to.',
         ),
-      gitUrl: z.string().optional().describe('The remote — git projects only.'),
+      gitUrl: z
+        .string()
+        .optional()
+        .describe(
+          'The remote — git projects only. Credentials embedded in an http(s) URL (from the ' +
+            'environment or an older registration) are shown as `***`, never in full.',
+        ),
       cloned: z
         .boolean()
         .describe('Git: whether it is cloned yet. Local: whether the directory is there.'),

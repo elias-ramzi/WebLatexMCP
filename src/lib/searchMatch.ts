@@ -14,12 +14,20 @@ import { commentStartIndex } from './latexComments.js';
 /**
  * How much of one line is ever handed to the regex engine.
  *
- * This is the "base" half of the denial-of-service bound whose "exponent" half lives in
- * `searchPattern.ts`: an accepted pattern carries at most one ambiguous unbounded quantifier, so
- * its worst case is quadratic in the length of the text it is run against. 2000 characters keeps
- * that worst case around ten milliseconds (measured: `a*b` against 2000 `a`s is 9ms, against
- * 4000 it is 40ms), which is what makes the between-lines deadline in `searchFiles.ts` a real
- * bound rather than one that can be overshot by an arbitrary amount inside a single `exec`.
+ * This is the "positions" half of the cost estimate whose "work per position" half lives in
+ * `searchPattern.ts`: the analyzer counts an unbounded repeat at this line cap
+ * (`ANALYZED_LINE_CHARS`, pinned equal to it by a unit test) and caps the estimated steps per
+ * starting position, so a line's cost grows with its length times that cap. At 2000 characters
+ * the costliest accepted families (`\w*\w{19}!`, `.*a?a{9}b`) take 0.13-0.3s per line, and
+ * the slowest accepted patterns known about 2 to 3 times the first of those (0.3-0.45s, and
+ * over a second on a machine under heavy load) — the worst found, not a bound; `a*b` against
+ * 2000 `a`s takes a few milliseconds, and what the analyzer refuses mostly takes seconds or
+ * more.
+ * That estimate is an approximation, not a proof, and for a
+ * regex search it is not what bounds the time taken: the scans run in a worker the search
+ * terminates at its deadline (`searchWorker.ts`), so one `exec` the analyzer misjudged costs at
+ * most the deadline. For a literal search, whose escaped pattern has no quantifiers and scans a
+ * line in linear time, the between-lines deadline ({@link MatchOptions.expired}) is the bound.
  *
  * A line longer than this is searched up to the cap and COUNTED (`linesTruncatedForScan`), never
  * silently half-searched: "no match" and "not fully searched" are different answers.
@@ -72,8 +80,21 @@ export interface FileMatches {
    * caller gets it without a second call.
    */
   commentMatches: number;
-  /** Lines longer than {@link MAX_LINE_SCAN_CHARS}, whose tail was therefore never searched. */
+  /**
+   * Lines longer than {@link MAX_LINE_SCAN_CHARS}, whose tail was therefore never searched.
+   * Counted over the lines actually scanned only.
+   */
   linesTruncatedForScan: number;
+  /** Lines scanned, from the top. Less than `totalLines` exactly when `complete` is false. */
+  linesScanned: number;
+  /** Lines in the file, counted as `splitLines` counts. */
+  totalLines: number;
+  /**
+   * Every line was scanned. False when the deadline cut the scan short — the matches above are
+   * then those of the first `linesScanned` lines only, and "no match further down" is unknown,
+   * not "no".
+   */
+  complete: boolean;
 }
 
 export interface MatchOptions {
@@ -88,6 +109,56 @@ export interface MatchOptions {
   commentAware?: boolean;
   /** Test seam for {@link MAX_LINE_SCAN_CHARS}. */
   maxLineScanChars?: number;
+  /**
+   * The search's deadline, read before EVERY line: once it returns true the scan stops and the
+   * result says how far it got (`linesScanned`, `complete: false`). Every line rather than every
+   * N: a read of the clock costs nanoseconds against an `exec` that costs at least as much, and
+   * checking every N lines would multiply the overshoot by N for a quadratic pattern on long
+   * lines — the case the per-line cap exists to bound.
+   */
+  expired?: () => boolean;
+}
+
+/** One file's text, split into lines and cut to what the regex engine is ever handed. */
+export interface ScanLines {
+  /** The file's lines, whole — context lines are taken from these. */
+  lines: string[];
+  /** `lines`, each cut to the per-line scan cap: exactly what is passed to `exec`. */
+  scans: string[];
+}
+
+/**
+ * Split `text` into lines and cut each to the scan cap. Split out from {@link matchFileLines} so a
+ * caller that runs the `exec`s elsewhere (a worker thread — `searchWorker.ts`) hands that engine
+ * exactly the strings the inline path would, and assembles the answer with the same code.
+ */
+export function prepareScanLines(text: string, maxLineScanChars?: number): ScanLines {
+  const scanCap = maxLineScanChars ?? MAX_LINE_SCAN_CHARS;
+  const lines = splitLines(text);
+  const scans = lines.map((full) => (full.length > scanCap ? full.slice(0, scanCap) : full));
+  return { lines, scans };
+}
+
+/**
+ * The index of the first match on each line, or -1 — in line order, stopping early (and saying
+ * so) when `expired` reports the deadline passed. The only place on the inline path where the
+ * regex engine runs.
+ *
+ * `matcher` must carry the `g` flag; its `lastIndex` is reset before every line.
+ */
+export function firstHits(
+  scans: readonly string[],
+  matcher: RegExp,
+  expired?: () => boolean,
+): { hits: number[]; complete: boolean } {
+  const hits: number[] = [];
+  for (const scan of scans) {
+    if (expired?.()) return { hits, complete: false };
+    matcher.lastIndex = 0;
+    const hit = matcher.exec(scan);
+    hits.push(hit === null ? -1 : hit.index);
+  }
+  return { hits, complete: true };
 }
 
 /**
@@ -104,6 +175,11 @@ export interface MatchOptions {
  * A match that STARTS in live text and runs on past a `%` counts as live: it begins in code, and
  * it is the occurrence a caller has to judge.
  *
+ * The inline composition of {@link prepareScanLines}, {@link firstHits} and
+ * {@link assembleFileMatches}: `search_files` runs a LITERAL search this way, with the deadline
+ * in `opts.expired`, and a regex search through the same three with `firstHits` replaced by a
+ * worker (`searchWorker.ts`), because an `exec` on this thread cannot be interrupted.
+ *
  * `matcher` must carry the `g` flag ({@link buildSearchMatcher} always sets it); its `lastIndex`
  * is reset before every line, so the same compiled matcher is reused across files without
  * carrying state between them.
@@ -113,24 +189,39 @@ export function matchFileLines(
   matcher: RegExp,
   opts: MatchOptions = {},
 ): FileMatches {
+  const prepared = prepareScanLines(text, opts.maxLineScanChars);
+  const { hits } = firstHits(prepared.scans, matcher, opts.expired);
+  return assembleFileMatches(prepared, hits, opts);
+}
+
+/**
+ * Turn first-match indices into the reported matches: comment handling, the reported window and
+ * the context lines. `hits[i]` belongs to line `i`; `hits` may be SHORTER than the file (a scan
+ * the deadline cut short), and then only its prefix is assembled and the result says so.
+ */
+export function assembleFileMatches(
+  prepared: ScanLines,
+  hits: readonly number[],
+  opts: Omit<MatchOptions, 'expired'> = {},
+): FileMatches {
   const contextLines = opts.contextLines ?? 0;
-  const scanCap = opts.maxLineScanChars ?? MAX_LINE_SCAN_CHARS;
-  const lines = splitLines(text);
+  const { lines, scans } = prepared;
   const matches: LineMatch[] = [];
   let commentMatches = 0;
   let linesTruncatedForScan = 0;
+  const linesScanned = Math.min(hits.length, lines.length);
 
-  for (const [i, full] of lines.entries()) {
-    const truncated = full.length > scanCap;
+  for (let i = 0; i < linesScanned; i++) {
+    const full = lines[i] ?? '';
+    const scan = scans[i] ?? '';
+    const truncated = scan.length < full.length;
     if (truncated) linesTruncatedForScan++;
-    const scan = truncated ? full.slice(0, scanCap) : full;
 
-    matcher.lastIndex = 0;
-    const hit = matcher.exec(scan);
-    if (hit === null) continue;
+    const index = hits[i] ?? -1;
+    if (index < 0) continue;
 
     const commentStart = opts.commentAware ? commentStartIndex(scan) : -1;
-    const inComment = commentStart !== -1 && hit.index >= commentStart;
+    const inComment = commentStart !== -1 && index >= commentStart;
     if (inComment) {
       commentMatches++;
       if (opts.excludeComments) continue;
@@ -138,7 +229,7 @@ export function matchFileLines(
 
     const entry: LineMatch = {
       line: i + 1,
-      text: windowAround(scan, hit.index, truncated),
+      text: windowAround(scan, index, truncated),
     };
     if (contextLines > 0) {
       const before = lines.slice(Math.max(0, i - contextLines), i).map(clip);
@@ -149,7 +240,14 @@ export function matchFileLines(
     matches.push(entry);
   }
 
-  return { matches, commentMatches, linesTruncatedForScan };
+  return {
+    matches,
+    commentMatches,
+    linesTruncatedForScan,
+    linesScanned,
+    totalLines: lines.length,
+    complete: linesScanned === lines.length,
+  };
 }
 
 /** A context line, cut from the front and marked when it does not fit. */

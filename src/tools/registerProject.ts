@@ -6,17 +6,31 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, toPosixOut } from '../lib/paths.js';
-import { isLocalProject } from '../lib/projectMode.js';
+import { gitUrlOf, isLocalProject } from '../lib/projectMode.js';
+import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
+import { quoteId } from '../lib/projectId.js';
 import type { ProjectConfig } from '../types.js';
 
 const inputSchema = {
-  project: z.string().min(1).describe('Project id used in tool calls and as the clone dir name.'),
+  project: z
+    .string()
+    .min(1)
+    .describe(
+      'Project id used in tool calls and as the clone dir name (at most 64 characters). Any ' +
+        'letters, digits, spaces and punctuation, except: / \\ : < > " | ? *, control and ' +
+        'bidi characters, a leading "." or "-", a leading/trailing space, a trailing ".", ' +
+        'Windows device names (con, nul, com1, …), "registry.json…" and names ending ".pdf". ' +
+        'Must be NFC-normalised.',
+    ),
   gitUrl: z
     .string()
     .min(1)
     .optional()
     .describe(
-      'Git remote URL (Overleaf, GitHub, or any git host) — stored tokenless. Give this OR `path`.',
+      'Git remote URL (Overleaf, GitHub, or any git host). Stored tokenless: a password or ' +
+        'token embedded in an https URL (user:token@, token@) is removed, never stored — supply ' +
+        'it with set_credential or `tokenEnv` instead; a plain login name (org@) is kept. Give ' +
+        'this OR `path`.',
     ),
   path: z
     .string()
@@ -101,7 +115,7 @@ function defaultRegistrationNote(ctx: AppContext, makeDefault: boolean | undefin
   if (ctx.config.defaultProjectExplicit) {
     return (
       ` Persisted as the default for later sessions, but WEB_LATEX_MCP_DEFAULT_PROJECT ` +
-      `("${ctx.config.defaultProject}") wins in every session that sets it.`
+      `(${quoteId(ctx.config.defaultProject ?? '')}) wins in every session that sets it.`
     );
   }
   return ' It is now the default project — calls may omit `project`.';
@@ -421,13 +435,26 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             { makeDefault },
           );
           const dropped = droppedRegistrationFields(previous, cfg);
+          // The registered URL is the caller's with any http(s) secret removed
+          // (`ProjectManager.registerProject`); the caller must hear about a removal — the next
+          // git operation needs the credential from somewhere else — and only about what was
+          // actually removed (a login name stays in the URL).
+          const heldUrl = gitUrlOf(cfg) ?? '';
+          const credentialsNote = strippedCredentialsNoteFor(gitUrl);
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
           if (clone && !cloned) {
             const git = ctx.projectManager.requireGitProject(cfg.id, 'clone');
             const auth = await ctx.credentials.resolve(git);
-            await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
+            try {
+              await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
+            } catch (err) {
+              // A clone that fails right after its token was stripped most likely failed on auth;
+              // say why the token the caller gave was not used.
+              if (!credentialsNote) throw err;
+              throw new Error(`${(err as Error).message}${credentialsNote}`, { cause: err });
+            }
             ctx.files.resetBaselines(dir);
             cloned = true;
           }
@@ -454,11 +481,12 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               'entry needed.'
             : '';
           const text =
-            `Registered "${cfg.id}" -> ${gitUrl} (persisted to the workspace registry). ` +
+            `Registered "${cfg.id}" -> ${heldUrl} (persisted to the workspace registry). ` +
             (cloned
               ? `Cloned at ${outPath}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
+            credentialsNote +
             defaultRegistrationNote(ctx, makeDefault) +
             droppedFieldsNote(cfg.id, dropped);
           return {

@@ -26,13 +26,48 @@ export interface ShelfFileInput {
   base: Buffer | null;
 }
 
+/** Both stored sides of one shelved file, as {@link ShelfEntry.sides} reads them. */
+export interface ShelfSides {
+  /** The working-tree bytes taken; `null` iff the manifest says `'deleted'`. */
+  content: Buffer | null;
+  /** HEAD's bytes at shelve time; `null` iff the manifest says `'added'`. */
+  base: Buffer | null;
+}
+
+/**
+ * A shelf whose stored bytes contradict its own manifest, or cannot be read at all. Thrown
+ * rather than returned, because every consumer's fallback for a missing side is an ACTION — a
+ * missing content side is restored by deleting the file — and a corrupt shelf must never be
+ * acted on.
+ */
+export class ShelfCorruptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ShelfCorruptError';
+  }
+}
+
 /** A shelf read back off disk: its manifest, plus lazy access to the bytes it holds. */
 export interface ShelfEntry {
   manifest: ShelfManifest;
-  /** The stored working-tree bytes for a path, or `null` when the shelf holds none (a `'deleted'` file). */
+  /**
+   * The stored working-tree bytes for a path, or `null` when the shelf holds none (a
+   * `'deleted'` file). `null` means ENOENT and only ENOENT: any other read failure throws.
+   */
   content(relPath: string): Promise<Buffer | null>;
-  /** The stored HEAD bytes for a path, or `null` when the shelf holds none (an `'added'` file). */
+  /**
+   * The stored HEAD bytes for a path, or `null` when the shelf holds none (an `'added'` file).
+   * `null` means ENOENT and only ENOENT: any other read failure throws.
+   */
   base(relPath: string): Promise<Buffer | null>;
+  /**
+   * Both sides of one manifest record, read once and checked against the record's `status`:
+   * `'modified'` must hold both, `'added'` content and no base, `'deleted'` base and no content.
+   * A side that is missing where the manifest says it exists (or present where it says it does
+   * not) throws {@link ShelfCorruptError}. This is the read `unshelve` uses, because a bare
+   * `null` cannot tell "recorded as absent" from "lost".
+   */
+  sides(file: ShelfFileRecord): Promise<ShelfSides>;
 }
 
 /**
@@ -170,10 +205,27 @@ export class ShelfStore {
     const dir = path.join(this.shelvesDir(projectId), shelfId);
     const manifest = await this.readManifest(dir, shelfId);
     if (!manifest) return null;
+    const content = (relPath: string): Promise<Buffer | null> =>
+      readUnder(path.join(dir, 'content'), relPath);
+    const base = (relPath: string): Promise<Buffer | null> =>
+      readUnder(path.join(dir, 'base'), relPath);
     return {
       manifest,
-      content: (relPath: string) => readUnder(path.join(dir, 'content'), relPath),
-      base: (relPath: string) => readUnder(path.join(dir, 'base'), relPath),
+      content,
+      base,
+      sides: async (file: ShelfFileRecord): Promise<ShelfSides> => {
+        const sides = { content: await content(file.path), base: await base(file.path) };
+        const problem = sidesContradiction(file.status, sides);
+        if (problem) {
+          throw new ShelfCorruptError(
+            `Shelf ${manifest.id} is corrupt at ${file.path}: the manifest records it as ` +
+              `"${file.status}", but ${problem}. Nothing was written and the shelf was left ` +
+              `exactly as it is, so whatever it still holds can be recovered by hand from ` +
+              `${toPosix(dir)}.`,
+          );
+        }
+        return sides;
+      },
     };
   }
 
@@ -267,11 +319,34 @@ async function writeUnder(root: string, relPath: string, bytes: Buffer): Promise
   await writeFile(target, bytes);
 }
 
+/**
+ * Where a side's presence contradicts the manifest `status` that `create` stored it under, the
+ * reason as a phrase; otherwise `null`. `create` writes exactly the sides its input has, and
+ * `shelve` derives `status` from those very sides, so any mismatch here is damage after the fact.
+ */
+export function sidesContradiction(status: ShelfFileStatus, sides: ShelfSides): string | null {
+  const wantContent = status !== 'deleted';
+  const wantBase = status !== 'added';
+  if (wantContent && sides.content === null) return 'its stored content is missing';
+  if (wantBase && sides.base === null) return "its stored copy of HEAD's version is missing";
+  if (!wantContent && sides.content !== null) return 'it holds content for a deleted file';
+  if (!wantBase && sides.base !== null) return 'it holds a HEAD version for an untracked file';
+  return null;
+}
+
+/**
+ * Read one stored side. **`null` means ENOENT and nothing else.** `null` is a value here —
+ * "the shelf holds no such side" — and `unshelve` acts on it (a null content side is restored by
+ * DELETING the file), so reading EACCES, EIO, EMFILE or a Windows sharing violation as `null`
+ * turned an intact-but-unreadable shelf into the deletion of the user's file, reported as a
+ * successful restore, followed by the removal of the shelf itself. Every other failure throws.
+ */
 async function readUnder(root: string, relPath: string): Promise<Buffer | null> {
   const target = resolveShelfPath(root, relPath);
   try {
     return await readFile(target);
-  } catch {
-    return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
   }
 }

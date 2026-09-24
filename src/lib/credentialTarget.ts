@@ -1,5 +1,6 @@
 import { defaultUsernameForHost, hostFromGitUrl } from '../services/auth.js';
 import type { ProjectManager } from '../services/projectManager.js';
+import { redactGitUrlCredentials } from './gitUrlCredentials.js';
 
 /** A resolved host + HTTPS username to store or fetch a credential for. */
 export interface CredentialTarget {
@@ -34,7 +35,12 @@ export function resolveCredentialTarget(
     const cfg = pm.requireGitProject(input.project, 'store a credential for');
     host = hostFromGitUrl(cfg.gitUrl);
     if (!host) {
-      throw new Error(`Could not determine a host from project "${cfg.id}" (${cfg.gitUrl}).`);
+      // Redacted: an env-configured or legacy registry URL may still embed a token (registration
+      // strips new ones), and `allSecrets()` does not know a URL's own password.
+      throw new Error(
+        `Could not determine a host from project "${cfg.id}" ` +
+          `(${redactGitUrlCredentials(cfg.gitUrl)}).`,
+      );
     }
     username = username || cfg.username;
   }

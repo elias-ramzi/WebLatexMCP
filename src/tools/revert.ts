@@ -6,6 +6,21 @@ import { errorResult } from '../lib/errors.js';
 import { foldCase } from '../lib/caseFold.js';
 import { isBibFile, bibEditBlockedMessage } from '../lib/bib.js';
 import { toPosix } from '../lib/paths.js';
+// Text only when the decode is lossless — see the helper for why a NUL test alone corrupted a
+// latin-1 `.tex` on its way into the shadow.
+import { asShadowContent } from '../lib/shadowContent.js';
+
+/** How many paths a refusal names before counting the rest — the house cap for a listed set. */
+const REFUSAL_LIST_CAP = 20;
+
+/**
+ * Join at most {@link REFUSAL_LIST_CAP} paths, then `… N more`: a revert of a wide commit over a
+ * busy tree would otherwise put every touched path into one error message, unbounded.
+ */
+function capList(items: string[]): string {
+  if (items.length <= REFUSAL_LIST_CAP) return items.join(', ');
+  return `${items.slice(0, REFUSAL_LIST_CAP).join(', ')}, … ${items.length - REFUSAL_LIST_CAP} more`;
+}
 
 const inputSchema = {
   project: z.string().optional(),
@@ -53,24 +68,6 @@ const outputSchema = {
   theirsRef: z.string().nullable(),
 };
 
-/**
- * A shadow entry's content, as TEXT whenever the bytes are text. `ShadowStore.record` flags an
- * entry `binary` when EITHER side arrives as a Buffer, stickily and for the life of the entry —
- * and a binary entry is never three-way merged: `refresh` marks it `conflicted` outright as soon
- * as HEAD moves to different bytes. Handing it Buffers unconditionally would therefore wedge
- * every reverted `.tex`: one peer commit touching that file and this session's revert is excluded
- * from `scope: "session"` permanently, escapable only by `scope: "all"` or a discard. The
- * "no such thing as a merged PNG" rationale for `binary` does not apply to a reverted LaTeX file,
- * so decode when the content IS text and keep the Buffer only when it genuinely is not.
- *
- * A NUL byte is the test, the same one git itself uses to call a blob binary — cheap, and it
- * never mis-reads UTF-8 text as binary.
- */
-function asShadowContent(bytes: Buffer | null): string | Buffer | null {
-  if (bytes === null) return null;
-  return bytes.includes(0) ? bytes : bytes.toString('utf8');
-}
-
 export function registerRevert(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'revert',
@@ -108,14 +105,17 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             );
           }
           if (pre.linkPaths.length > 0) {
+            const more = pre.linkPaths.length - REFUSAL_LIST_CAP;
             const named = pre.linkPaths
+              .slice(0, REFUSAL_LIST_CAP)
               .map(
                 (p) =>
                   `"${p}" is a symbolic link (or lies under one); reverting it would write ` +
                   'outside the project.',
               )
               .join(' ');
-            throw new Error(`${named} Refused — a link out is never followed here.`);
+            const rest = more > 0 ? ` … and ${more} more such path(s).` : '';
+            throw new Error(`${named}${rest} Refused — a link out is never followed here.`);
           }
           const bibPaths = pre.touchedPaths.filter((p) => isBibFile(p));
           // Same `!== true` shape as every other `confirmBibEdit` gate in the tool layer: an
@@ -125,17 +125,37 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
             throw new Error(
               `${bibEditBlockedMessage(first)}${
                 bibPaths.length > 1
-                  ? ` The reverted commits also touch: ${bibPaths.slice(1).join(', ')}.`
+                  ? ` The reverted commits also touch: ${capList(bibPaths.slice(1))}.`
                   : ''
               }`,
             );
           }
           if (pre.dirtyPaths.length > 0) {
-            throw new Error(
-              `Uncommitted changes at: ${pre.dirtyPaths.join(', ')}. Reverting would overwrite ` +
-                "them (they may be another session's in-flight work), and git itself refuses to " +
-                'do that. Commit or discard those paths first, then retry.',
-            );
+            // Two different situations, two different ways out. An uncommitted change is one git
+            // itself refuses to overwrite, and commit/discard clears it. A path HEAD does not
+            // track with something on disk in the way (typically git-ignored, so `status` never
+            // lists it) is one git WOULD silently overwrite, and `discard` cannot clear it (its
+            // `clean` skips ignored files) — only the user moving it can.
+            const inTheWay = new Set(pre.inTheWayPaths);
+            const uncommitted = pre.dirtyPaths.filter((p) => !inTheWay.has(p));
+            const parts: string[] = [];
+            if (uncommitted.length > 0) {
+              parts.push(
+                `Uncommitted changes at: ${capList(uncommitted)}. Reverting would overwrite ` +
+                  "them (they may be another session's in-flight work), and git itself refuses " +
+                  'to do that. Commit or discard those paths first, then retry.',
+              );
+            }
+            if (pre.inTheWayPaths.length > 0) {
+              parts.push(
+                'Something on disk that is not in HEAD is in the way at: ' +
+                  `${capList(pre.inTheWayPaths)} — the file itself, or a file or folder ` +
+                  'where the revert must write, possibly git-ignored ' +
+                  '(so `status` does not list it). Reverting would overwrite it. Move or delete ' +
+                  'it by hand, then retry.',
+              );
+            }
+            throw new Error(parts.join(' '));
           }
 
           // Staged content ANYWHERE in the clone, not only under the reverted paths. A revert
@@ -149,7 +169,7 @@ export function registerRevert(server: McpServer, ctx: AppContext): void {
           // time a conflict is known the damage would already be unavoidable.
           if (pre.stagedPaths.length > 0) {
             throw new Error(
-              `Staged changes at: ${pre.stagedPaths.join(', ')}. If this revert conflicted it ` +
+              `Staged changes at: ${capList(pre.stagedPaths)}. If this revert conflicted it ` +
                 "would have to be aborted, and git's abort resets the whole index — that staged " +
                 "work (possibly another session's) would be lost. Land it with `commit` and " +
                 'scope: "all" (or scope: "paths" naming them) — the DEFAULT session scope stages ' +

@@ -6,7 +6,7 @@ absolute path wherever it appears.
 ## 1. Prerequisites
 
 ```bash
-brew install node git        # Node.js >= 20 and git
+brew install node git        # Node.js >= 20 and git 2.25 or newer
 brew install gh              # optional: GitHub CLI for token-free auth
 ```
 

@@ -11,7 +11,11 @@ import {
   chmod,
   symlink,
 } from 'node:fs/promises';
-import { FileService, MAX_READ_BYTES } from '../../src/services/fileService.js';
+import {
+  ExternalChangeError,
+  FileService,
+  MAX_READ_BYTES,
+} from '../../src/services/fileService.js';
 import { MAX_ASSET_BYTES, MAX_BINARY_READ_BYTES } from '../../src/lib/assets.js';
 import { toPosix } from '../../src/lib/paths.js';
 
@@ -307,11 +311,22 @@ describe('FileService out-of-band guard: byte vs string baseline agreement', () 
     });
   });
 
-  it('applyEdits on a file just imported via writeBytes (non-UTF-8) must succeed', async () => {
+  it('applyEdits on a file just imported via writeBytes (non-UTF-8) is not mistaken for an external edit', async () => {
+    // This used to assert the edit SUCCEEDED — which rewrote the 0xE9 byte as ef bf bd, the
+    // whole-file corruption applyEdits now refuses. What it exists to pin is the baseline
+    // agreement: the out-of-band guard runs first, so the refusal being the ENCODING one (and not
+    // ExternalChangeError) still proves the byte baseline writeBytes recorded was honoured.
     await files.writeBytes(dir, { path: 'figures/icon.svg', bytes: SVG_NON_UTF8 });
-    await expect(
-      files.applyEdits(dir, 'figures/icon.svg', [{ oldString: '<svg>', newString: '<img>' }]),
-    ).resolves.toMatchObject({ path: 'figures/icon.svg', appliedEdits: 1 });
+    const err = await files
+      .applyEdits(dir, 'figures/icon.svg', [{ oldString: '<svg>', newString: '<img>' }])
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ExternalChangeError);
+    expect((err as Error).message).toMatch(/not valid UTF-8/);
+    expect((await readFile(path.join(dir, 'figures/icon.svg'))).equals(SVG_NON_UTF8)).toBe(true);
   });
 
   it('text write on a file just imported via writeBytes (non-UTF-8) must succeed', async () => {

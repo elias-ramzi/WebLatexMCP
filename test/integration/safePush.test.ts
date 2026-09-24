@@ -1015,7 +1015,7 @@ describe('safe push (pull-rebase + branch review) against a bare-repo stand-in',
       await pushCommit(remote, { 'main.tex': 'alpha\nbeta\nGAMMA\n' }, 'their remote commit');
       await simpleGit(dir).fetch(['origin']);
 
-      const status = await git.status(dir);
+      const status = await git.status(dir, { withCommits: true });
       expect(status.ahead).toBe(1);
       expect(status.behind).toBe(1);
       expect(status.aheadCommits.map((c) => c.message)).toContain('my local commit');

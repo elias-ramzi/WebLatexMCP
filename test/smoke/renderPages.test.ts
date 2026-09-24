@@ -101,7 +101,10 @@ describe.skipIf(!available)('render_pages smoke (real latexmk PDF)', () => {
     // The assertion that separates "rendered" from "wrote a blank canvas".
     expect(await distinctGrays(page!.png)).toBeGreaterThan(1);
 
-    expect(await readdir(outDir)).toContain('page-1.png');
+    // A non-default scale (maxEdgePx) is part of the name, so this render cannot overwrite — or be
+    // overwritten by — a default one of the same page in the shared build dir.
+    expect(page!.pngPath).toMatch(/page-1-[0-9a-f]{12}\.png$/);
+    expect(await readdir(outDir)).toContain(path.basename(page!.pngPath));
   }, 30_000);
 
   it('crops to a clip without changing the resolution', async () => {

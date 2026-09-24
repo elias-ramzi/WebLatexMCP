@@ -213,7 +213,11 @@ export function planReferenceFields<E extends FieldsBearing>(
     }
     entriesWithFields++;
     const source = Object.entries(entry.fields);
-    const kept: Record<string, string> = {};
+    // Null-prototype, as defence in depth: the keys are the document's field names, and on a `{}`
+    // literal a key `__proto__` would hit the prototype setter and vanish while still counted as
+    // kept. `parseFields` admits only `^[a-z][\w-]*$` names, so no such key reaches here today;
+    // this keeps it that way for any other producer of `fields`.
+    const kept = Object.create(null) as Record<string, string>;
     let keptCount = 0;
     let omitted = 0;
     // The map wrapper is owed only once, and only by an entry that ends up sending a map, so it

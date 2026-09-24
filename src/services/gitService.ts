@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
-import { authenticateUrl, type AuthConfig, type CommitIdentity } from './auth.js';
+import type { AuthConfig, CommitIdentity } from './auth.js';
 import { parseConflictHunks, type ConflictHunk } from '../lib/conflictParser.js';
 import { isBibFile } from '../lib/bib.js';
 import { resolveInside, toPosix } from '../lib/paths.js';
@@ -9,16 +9,23 @@ import { execCapture, execCaptureBytes } from '../lib/exec.js';
 import { canonicalNames, foldCase } from '../lib/caseFold.js';
 import { coversPath } from '../lib/commitPaths.js';
 import { REFUSAL_PATH_CAP } from '../lib/peerAttribution.js';
+import { remoteBranchMissingNote } from '../lib/syncState.js';
+import { CONFLICT_MAX_COMMITS } from '../lib/conflictBudget.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
-export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged';
+export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged' | 'remote-branch-missing';
 
 export interface SyncResult {
   action: SyncAction;
   ahead: number;
   behind: number;
   diverged: boolean;
+  /**
+   * Present only with `action: 'remote-branch-missing'`: what happened to the branch and what it
+   * means for the unpushed work (see `remoteBranchMissingNote`).
+   */
+  note?: string;
 }
 
 export interface StatusResult {
@@ -29,10 +36,28 @@ export interface StatusResult {
   staged: string[];
   unstaged: string[];
   untracked: string[];
-  /** Local commits not yet on the remote (newest first) — what a push would send. */
+  /**
+   * Local commits not yet on the remote (newest first) — what a push would send. Empty unless the
+   * caller asked for the lists (`withCommits`). Complete while `origin/<branch>` resolves; when it
+   * is absent the count can be the clone's whole history, so the list is capped at
+   * `CONFLICT_MAX_COMMITS` and `aheadCommitsOmitted` counts the rest.
+   */
   aheadCommits: RemoteCommit[];
-  /** Remote commits not yet local (newest first) — what landed upstream since the last sync. */
+  /** Commits `aheadCommits` left out (only ever when `origin/<branch>` is absent); 0 otherwise. */
+  aheadCommitsOmitted: number;
+  /**
+   * Remote commits not yet local (newest first) — what landed upstream since the last sync. Empty
+   * unless the caller asked for the lists (`withCommits`).
+   */
   behindCommits: RemoteCommit[];
+  /**
+   * `origin/<branch>` is gone after the last fetch while the remote has other branches this
+   * clone's history came from — renamed or deleted upstream. `ahead`/`aheadCommits` then count the
+   * local commits on no remote branch, and `behind` is 0 because there is nothing to be behind.
+   */
+  remoteBranchMissing: boolean;
+  /** Present only when `remoteBranchMissing`: the same explanation `project_sync` gives. */
+  remoteBranchNote?: string;
 }
 
 export interface ResetToRemoteResult {
@@ -578,6 +603,16 @@ export interface RevertPreflight {
   touchedPaths: string[];
   /** Touched paths with uncommitted working-tree, index or untracked state. Empty when clean. */
   dirtyPaths: string[];
+  /**
+   * The subset of `dirtyPaths` that `status` does NOT list: a touched path HEAD does not track
+   * with something on disk in the way — the path itself, a directory holding untracked or
+   * ignored files, or a file where one of its parent directories must go — typically git-ignored
+   * (or, failing closed, a path whose `lstat` could not be judged). Reported apart because the
+   * way out differs: git itself refuses to overwrite an uncommitted change, but silently
+   * overwrites an ignored file, and `discard` (whose `clean` skips ignored files) cannot remove
+   * it — it has to be moved or deleted by hand.
+   */
+  inTheWayPaths: string[];
   /** Touched paths that are a symlink in HEAD, in a reverted commit or its parent, or on disk, or that lie under a symlinked directory. */
   linkPaths: string[];
   /**
@@ -675,6 +710,9 @@ export class GitService {
       // yet), where `read-tree --reset HEAD` would otherwise fail with "Not a valid object name".
       await this.resetIndexToHead(dir, git);
     }
+    // Set only for `paths` over the LIVE index (no `fromHead` — `scope: "all"` with `paths`):
+    // what was requested, as staged below. See the commit step for why it is needed.
+    let onlyPaths: string[] | null = null;
     if (opts.paths && opts.paths.length > 0) {
       // A literal pathspec never folds case (verified against real git), so on a
       // case-insensitive repository (`core.ignorecase = true`, git's own default on macOS/Windows
@@ -747,18 +785,46 @@ export class GitService {
           await git.raw(['--literal-pathspecs', 'add', '--', ...chunk]);
         }
       });
+      if (!opts.fromHead) onlyPaths = paths;
     } else {
       await git.add(['-A']);
     }
-    const staged = (await git.diff(['--cached', '--no-renames', '--name-only']))
-      .split('\n')
+    // `-z` + `core.quotePath=false`: these names are matched against the requested paths below,
+    // and a C-quoted `"r\303\251sum\303\251.tex"` would match nothing.
+    let staged = (
+      await git.raw([
+        '-c',
+        'core.quotePath=false',
+        'diff',
+        '--cached',
+        '--no-renames',
+        '--name-only',
+        '-z',
+      ])
+    )
+      .split('\0')
       .filter(Boolean);
+    // Capture the staged per-file line counts before committing — once committed, the
+    // `--cached` diff is empty. Drives the diffstat surfaced by the commit tool.
+    let files = await this.numstat(git, ['--cached']);
+    if (onlyPaths !== null) {
+      // Over the live index, whatever was ALREADY staged — a hand `git add`, a peer's leftover —
+      // is in the index next to what this call staged, and a bare `git commit` takes the whole
+      // index: an unrelated file rode along although `paths` promises "limit the commit to these
+      // paths". So count, report and commit only what the requested paths cover, and leave the
+      // rest staged exactly as it was. `paths` were resolved to the index's own spelling above,
+      // so this is exact in practice; it still folds on an ignorecase clone, like every other
+      // by-name comparison there, so a directory named in another case covers what `git add`
+      // staged beneath it. The names handed to `--only` below are the index's own either way.
+      const requested = onlyPaths;
+      const fold = (await this.isCaseInsensitive(dir)) ? foldCase : undefined;
+      const covered = (name: string): boolean => requested.some((p) => coversPath(p, name, fold));
+      staged = staged.filter(covered);
+      files = files.filter((f) => covered(f.path));
+    }
     if (staged.length === 0 && !opts.allowEmpty) {
       throw new NothingToCommitError();
     }
-    // Capture the staged per-file line counts before committing — once committed, the
-    // `--cached` diff is empty. Drives the diffstat surfaced by the commit tool.
-    const files = await this.numstat(git, ['--cached']);
     // Identity is supplied per-invocation with -c, so we never mutate the repo config.
     const args = [
       '-c',
@@ -770,7 +836,27 @@ export class GitService {
       opts.message,
     ];
     if (opts.allowEmpty) args.push('--allow-empty');
-    await git.raw(args);
+    if (onlyPaths === null) {
+      await git.raw(args);
+    } else {
+      // `--only` commits exactly the named paths and leaves every other staged entry staged (git
+      // builds the commit from HEAD plus just those paths). It takes their WORKING-TREE bytes,
+      // not their index entries — the same bytes here: the batched `git add` of these very paths
+      // ran just before, inside the caller's `runExclusive`, so nothing of ours changed them in
+      // between. The names are the staged entries under the request — each one known to git, so
+      // none can fail to match — read from stdin NUL-separated, so no command line grows with the
+      // list (#110) and a name needs no quoting; `--literal-pathspecs` keeps `a[1].tex` from also
+      // meaning `a1.tex`. An empty list with `allowEmpty` is an empty commit that takes nothing
+      // staged, as intended.
+      const res = await execCapture(
+        'git',
+        ['--literal-pathspecs', ...args, '--only', '--pathspec-from-file=-', '--pathspec-file-nul'],
+        { cwd: dir, input: staged.join('\0') },
+      );
+      if (res.code !== 0) {
+        throw new Error(`git commit failed: ${(res.stderr || res.stdout).trim()}`);
+      }
+    }
     const sha = (await git.revparse(['HEAD'])).trim();
     return { committed: true, sha, filesChanged: staged.length, files };
   }
@@ -788,10 +874,12 @@ export class GitService {
    * staged file came from.
    *
    * It is bounded, too: the only content that can be staged is what this call itself named, and
-   * every other route into a commit resets the index to HEAD before staging (`commitContents`,
-   * and `commit` with `fromHead` — i.e. scope "session" and scope "paths"), so a leftover partial
-   * stage cannot ride along into some later, unrelated commit. Hence "retrying is safe", stated
-   * plainly, instead of the revert's "do NOT simply retry".
+   * no later commit can take a leftover partial stage it did not ask for. Scope "session" and
+   * scope "paths" reset the index to HEAD before staging (`commitContents`, and `commit` with
+   * `fromHead`); scope "all" with `paths` commits only the staged entries its own `paths` cover
+   * (`--only`); and scope "all" without `paths` re-stages the whole working tree anyway, so it
+   * takes exactly what it would have taken with no leftover at all. Hence "retrying is safe",
+   * stated plainly, instead of the revert's "do NOT simply retry".
    */
   private async stageOrExplain<T>(paths: string[], step: () => Promise<T>): Promise<T> {
     try {
@@ -802,8 +890,10 @@ export class GitService {
         `Staging the requested path(s) failed: ${reason}. NOTHING was committed and no file on ` +
           `disk changed, but the index may already hold some of the ${paths.length} path(s) ` +
           'named — a long path list is split across several `git add` calls and one of them ' +
-          'failed. Only what this call named can be staged, and every other commit scope resets ' +
-          'the index to HEAD first, so nothing else can ride along. Inspect it with ' +
+          'failed. Only what this call named can be staged, and no later commit takes a ' +
+          'leftover it did not ask for: scopes "session" and "paths" reset the index to HEAD ' +
+          'first, scope "all" with `paths` commits only what its own paths cover, and scope ' +
+          '"all" without `paths` re-stages the whole working tree anyway. Inspect it with ' +
           '`status`/`diff`; re-running `commit` is safe and stages the rest.',
         { cause: err },
       );
@@ -881,26 +971,41 @@ export class GitService {
         const key = foldCase(rel);
         const other = bySpelling.get(key);
         if (other !== undefined && other !== posixPath) {
+          // The way out is NOT a discard: on this clone both spellings name one file, so
+          // discarding "one of them" restores (or, for a new file, deletes) that one file for
+          // every session, both of this session's edits included. The working-tree file already
+          // holds what was written under both names, so a `scope: "paths"` commit of it stages it
+          // once and settles both records (`settle` folds case here like every other by-name
+          // comparison) — and still refuses if a live peer has recorded edits to it.
           const message = canonical?.has(rel)
             ? `"${other}" and "${posixPath}" are two spellings of one file ("${rel}") on this ` +
-              'case-insensitive repository, and this session changed both — committing both ' +
-              'would silently keep only one. Discard one of them, or commit the working tree ' +
-              'with scope "all".'
+              'case-insensitive repository, and this session recorded an edit under each — ' +
+              'committing both would silently keep only one. Both names are the same file on ' +
+              `disk, which already holds both edits: commit it with scope "paths" and paths ` +
+              `["${rel}"], which stages it once and settles both records. Do not discard either ` +
+              'spelling — that restores the one file for every session, both edits included.'
             : `"${other}" and "${posixPath}" are two spellings of one new file on this ` +
               'case-insensitive repository — neither is tracked yet, and committing both would ' +
-              'create two tree entries for what this filesystem treats as one file. Discard one ' +
-              'of them, or commit the working tree with scope "all".';
+              'create two tree entries for what this filesystem treats as one file. Commit it ' +
+              'with scope "paths", naming the file as it is spelled on disk: that stages it ' +
+              'once and settles both records. Do not discard either spelling — that deletes ' +
+              'the one file.';
           throw new Error(message);
         }
         bySpelling.set(key, posixPath);
       }
     }
 
+    // Every file's mode is judged — and the still-a-link refusal below raised — BEFORE the first
+    // `update-index`, the same way the two-spellings check above runs before touching the index:
+    // refusing from inside the staging loop left every earlier file of this call staged, and
+    // `scope: "all"` commits the index as it stands, so those blobs would ride into it.
+    const plan: Array<{ rel: string; content: string | Buffer | null; mode: string }> = [];
     for (const file of opts.files) {
       const posixPath = toPosix(file.path);
       const rel = canonical ? canonical.resolve(posixPath) : posixPath;
       if (file.content === null) {
-        await git.raw(['update-index', '--force-remove', '--', rel]);
+        plan.push({ rel, content: null, mode: '' });
         continue;
       }
       let mode = (await this.indexMode(git, rel)) ?? '100644';
@@ -929,7 +1034,14 @@ export class GitService {
         }
         mode = '100644';
       }
-      const sha = await this.hashObject(dir, rel, file.content);
+      plan.push({ rel, content: file.content, mode });
+    }
+    for (const { rel, content, mode } of plan) {
+      if (content === null) {
+        await git.raw(['update-index', '--force-remove', '--', rel]);
+        continue;
+      }
+      const sha = await this.hashObject(dir, rel, content);
       await git.raw(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`]);
     }
 
@@ -1214,6 +1326,9 @@ export class GitService {
       'core.quotePath=false',
       '--literal-pathspecs',
       'diff',
+      // Counts are git's own: no external diff tool, no colour (see PLAIN_PATCH_FLAGS).
+      '--no-color',
+      '--no-ext-diff',
       '--no-renames',
       '--numstat',
       ...args,
@@ -1255,43 +1370,49 @@ export class GitService {
     const git = simpleGit(dir);
     const links = new Set<string>();
 
-    // HEAD's tree: `<mode> <type> <sha>\t<path>`. Skipped entirely on an unborn HEAD.
-    if ((await this.revParseOrNull(git, 'HEAD')) !== null) {
-      const out = await git.raw([
+    // Both listings are {@link chunkPathspecs}-batched: `shelve` hands this every path it is about
+    // to take, and a few hundred long ones overflowed Windows' command line in one spawn. The
+    // chunks partition `paths`, so the union of their records is what one call would list.
+    const headBorn = (await this.revParseOrNull(git, 'HEAD')) !== null;
+    for (const chunk of chunkPathspecs(paths)) {
+      // HEAD's tree: `<mode> <type> <sha>\t<path>`. Skipped entirely on an unborn HEAD.
+      if (headBorn) {
+        const out = await git.raw([
+          '-c',
+          'core.quotePath=false',
+          '--literal-pathspecs',
+          'ls-tree',
+          '-z',
+          'HEAD',
+          '--',
+          ...chunk,
+        ]);
+        for (const entry of out.split('\0')) {
+          const tab = entry.indexOf('\t');
+          if (tab < 0) continue;
+          if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
+          links.add(toPosix(entry.slice(tab + 1)));
+        }
+      }
+
+      // The index: `<mode> <sha> <stage>\t<path>` — a different record shape from `ls-tree`'s,
+      // but the mode is still the leading field.
+      const staged = await git.raw([
         '-c',
         'core.quotePath=false',
         '--literal-pathspecs',
-        'ls-tree',
+        'ls-files',
+        '-s',
         '-z',
-        'HEAD',
         '--',
-        ...paths,
+        ...chunk,
       ]);
-      for (const entry of out.split('\0')) {
+      for (const entry of staged.split('\0')) {
         const tab = entry.indexOf('\t');
         if (tab < 0) continue;
         if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
         links.add(toPosix(entry.slice(tab + 1)));
       }
-    }
-
-    // The index: `<mode> <sha> <stage>\t<path>` — a different record shape from `ls-tree`'s, but
-    // the mode is still the leading field.
-    const staged = await git.raw([
-      '-c',
-      'core.quotePath=false',
-      '--literal-pathspecs',
-      'ls-files',
-      '-s',
-      '-z',
-      '--',
-      ...paths,
-    ]);
-    for (const entry of staged.split('\0')) {
-      const tab = entry.indexOf('\t');
-      if (tab < 0) continue;
-      if (entry.slice(0, entry.indexOf(' ')) !== '120000') continue;
-      links.add(toPosix(entry.slice(tab + 1)));
     }
 
     for (const raw of paths) {
@@ -1317,9 +1438,9 @@ export class GitService {
    * Per-file added/removed line counts for `paths` against HEAD — `git diff HEAD -- <paths>`, for
    * the TRACKED paths among them.
    *
-   * A thin public wrapper over the private {@link numstat}, which already carries
-   * `--literal-pathspecs` and `core.quotePath=false`; the flags are deliberately not repeated
-   * here.
+   * A thin public wrapper over the private {@link numstatBatched} (and so {@link numstat}, which
+   * already carries `--literal-pathspecs` and `core.quotePath=false`; the flags are deliberately
+   * not repeated here).
    *
    * **Untracked files never appear in `git diff HEAD` at all.** That is expected, not a gap: the
    * caller (`shelve`) counts an untracked file's lines itself, from the bytes it is taking. Do not
@@ -1333,7 +1454,13 @@ export class GitService {
     if (paths.length === 0) return [];
     const git = simpleGit(dir);
     if ((await this.revParseOrNull(git, 'HEAD')) === null) return [];
-    return this.numstat(git, ['HEAD', '--', ...paths.map((p) => toPosix(p))]);
+    // Batched ({@link numstatBatched}): `shelve` passes every path it takes, and one `diff` over a
+    // few hundred long paths overflowed Windows' command line.
+    return this.numstatBatched(
+      git,
+      ['HEAD'],
+      paths.map((p) => toPosix(p)),
+    );
   }
 
   /**
@@ -1476,12 +1603,25 @@ export class GitService {
       // first, the same way `commit`'s `paths` branch does; a path the index does not track keeps
       // the caller's spelling unchanged, so an untracked scratch file still falls through to
       // `clean` exactly as before. On a case-sensitive repository this costs nothing extra.
+      //
+      // The spelling is resolved against HEAD's tree as well as the index: `discard` restores to
+      // the last COMMIT (see the restore below), so a path staged for deletion — gone from the
+      // index, still at HEAD — is one this call reaches, and must fold onto HEAD's spelling too.
       const caseInsensitive = await this.isCaseInsensitive(dir);
       const fold = caseInsensitive ? foldCase : undefined;
+      const born = (await this.revParseOrNull(git, 'HEAD')) !== null;
       let resolvedPaths = paths;
+      let indexNames: string[] = [];
       if (caseInsensitive) {
-        const indexNames = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean);
-        const canonical = canonicalNames(indexNames);
+        indexNames = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean);
+        const headNames = born
+          ? (await git.raw(['ls-tree', '-r', '-z', '--name-only', 'HEAD']))
+              .split('\0')
+              .filter(Boolean)
+          : [];
+        // Index first: `canonicalNames` keeps the first spelling it meets for a folded key, and
+        // the index's is the one the restore below will be matching against.
+        const canonical = canonicalNames([...indexNames, ...headNames]);
         resolvedPaths = paths.map((p) => canonical.resolve(toPosix(p)));
       }
       // The UNTRACKED half of the same question (#127). The index fold above left `clean` running
@@ -1504,46 +1644,87 @@ export class GitService {
         .filter(Boolean);
       let cleanPaths = paths;
       if (caseInsensitive) {
-        const canonicalUntracked = canonicalNames(untracked);
+        // On an unborn HEAD a STAGED new file is untracked once the `reset` below has run, but
+        // it is not in the untracked listing yet — it is an index entry. Include the index names
+        // so `clean` sees the spelling it will find on disk then. (On a born HEAD the restore
+        // removes such a file itself, and `clean` matching nothing there is a no-op.)
+        const canonicalUntracked = canonicalNames([...untracked, ...indexNames]);
         cleanPaths = paths.map((p) => canonicalUntracked.resolve(toPosix(p)));
       }
-      // All three calls below are {@link chunkPathspecs}-batched (#110), every chunk keeping
-      // `--literal-pathspecs`. The listing combines as a concatenation — the chunks partition
-      // the list, each chunk prints the index entries ITS pathspecs match, and a chunk printing
-      // nothing means none of its own paths are tracked, never that none are.
+      // All the listings and destructive calls below are {@link chunkPathspecs}-batched (#110),
+      // every chunk keeping `--literal-pathspecs`. A listing combines as a concatenation — the
+      // chunks partition the list, each chunk prints the entries ITS pathspecs match, and a chunk
+      // printing nothing means none of its own paths are listed, never that none are.
       const indexed: string[] = [];
+      const headed: string[] = [];
       for (const chunk of chunkPathspecs(resolvedPaths)) {
         indexed.push(
           ...(await git.raw(['--literal-pathspecs', 'ls-files', '-z', '--', ...chunk]))
             .split('\0')
             .filter(Boolean),
         );
+        if (born) {
+          headed.push(
+            ...(
+              await git.raw([
+                '--literal-pathspecs',
+                'ls-tree',
+                '-r',
+                '-z',
+                '--name-only',
+                'HEAD',
+                '--',
+                ...chunk,
+              ])
+            )
+              .split('\0')
+              .filter(Boolean),
+          );
+        }
       }
-      const tracked = resolvedPaths.filter((p) =>
-        indexed.some((name) => coversPath(p, name, fold)),
+      // `discard` promises the LAST COMMIT, not the index. `checkout -- <paths>` restored from
+      // the index, so a STAGED modification used to survive as the file's content, and `clean`
+      // never removes an index entry, so a staged NEW file survived outright — both under
+      // `discarded: true`, and `revert`'s own recovery text sends callers here for a revert that
+      // may still be staged. So every path either side knows is restored from HEAD, index and
+      // working tree together, in ONE index write per chunk: `checkout --no-overlay HEAD --`
+      // puts back HEAD's bytes for a staged modification or deletion and removes (index entry
+      // and file) what the index has under the path but HEAD does not — a staged new file.
+      // One write rather than `reset` then `checkout`: `status` takes no project lock and
+      // refreshes the index under `index.lock`, so every extra index-writing spawn here is one
+      // more window for a peer's `status` to make this call fail part way. An unborn HEAD has
+      // no tree to name, so there the index entries are dropped with `reset --` instead (which
+      // reads an unborn HEAD as the empty tree), leaving the files untracked for `clean`.
+      // Only paths that cover a HEAD or index entry are named: `checkout` refuses a pathspec
+      // "known to git" nowhere, which is what `clean` below is for.
+      const indexedOrHeaded = [...indexed, ...headed];
+      const toRestore = resolvedPaths.filter((p) =>
+        indexedOrHeaded.some((name) => coversPath(p, name, fold)),
       );
-      // What this call will reach: every requested path that covers an index entry or an
-      // untracked working-tree file (`coversPath`'s directory rule, so naming a directory counts
-      // for what lies under it). Reported in the CALLER's own spelling — that is the string they
-      // typed and the one they have to correct. Computed BEFORE the destructive steps: afterwards
-      // a path that was reached looks exactly like one that never matched, since its file is gone
-      // or back at HEAD.
+      // What this call will reach: every requested path that covers a HEAD entry, an index entry
+      // or an untracked working-tree file (`coversPath`'s directory rule, so naming a directory
+      // counts for what lies under it). Reported in the CALLER's own spelling — that is the
+      // string they typed and the one they have to correct. Computed BEFORE the destructive
+      // steps: afterwards a path that was reached looks exactly like one that never matched,
+      // since its file is gone or back at HEAD.
       const missed = paths.filter((p) => {
         const rel = toPosix(p);
         return (
-          !indexed.some((name) => coversPath(rel, name, fold)) &&
+          !indexedOrHeaded.some((name) => coversPath(rel, name, fold)) &&
           !untracked.some((name) => coversPath(rel, name, fold))
         );
       });
-      // The two DESTRUCTIVE steps share one wrapper, so a failure in `clean` also reports the
-      // `checkout` chunks that already landed — see `discardedOrExplain`. Each chunk restores or
+      // The DESTRUCTIVE steps share one wrapper, so a failure in `clean` also reports the
+      // restore chunks that already landed — see `discardedOrExplain`. Each chunk restores or
       // removes only its own paths, with no cross-path state, so the chunks compose into exactly
-      // the discard one pair of calls would have performed.
+      // the discard one call of each would have performed.
       await this.discardedOrExplain(async () => {
-        if (tracked.length > 0) {
-          for (const chunk of chunkPathspecs(tracked)) {
-            await git.raw(['--literal-pathspecs', 'checkout', '--', ...chunk]);
-          }
+        for (const chunk of chunkPathspecs(toRestore)) {
+          await git.raw(
+            born
+              ? ['--literal-pathspecs', 'checkout', '--no-overlay', 'HEAD', '--', ...chunk]
+              : ['--literal-pathspecs', 'reset', '-q', '--', ...chunk],
+          );
         }
         for (const chunk of chunkPathspecs(cleanPaths)) {
           await git.raw(['--literal-pathspecs', 'clean', '-f', '--', ...chunk]);
@@ -1558,9 +1739,17 @@ export class GitService {
         ...(missed.length > 0 ? { missed } : {}),
       };
     }
-    // The whole-tree branch names no path, so nothing can be missed: `checkout -- .` plus
-    // `clean -fd` always leaves the tree at HEAD, which is the whole of what it promises.
-    await git.checkout(['--', '.']);
+    // The whole-tree branch names no path, so nothing can be missed: restoring from HEAD plus
+    // `clean -fd` always leaves the tree at HEAD, which is the whole of what it promises. From
+    // HEAD, not the index, for the path-limited branch's reason (`checkout -- .` left a staged
+    // modification in place and a staged new file on disk) and in one index write for the same
+    // reason too. On an unborn HEAD there is no tree to restore from: `reset` empties the index
+    // and `clean` removes what it held.
+    if ((await this.revParseOrNull(git, 'HEAD')) !== null) {
+      await git.raw(['checkout', '--no-overlay', 'HEAD', '--', '.']);
+    } else {
+      await git.raw(['reset', '-q']);
+    }
     await git.clean('fd');
     return { discarded: true };
   }
@@ -1617,7 +1806,7 @@ export class GitService {
 
     // Fetch so we land on the *current* remote head, not a stale one — the whole point is to redo
     // edits against what actually landed upstream.
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    await this.fetchOrigin(dir, gitUrl, auth);
     const remoteRef = `origin/${branch}`;
     if ((await this.revParseOrNull(git, remoteRef)) === null) {
       throw new Error(
@@ -1675,10 +1864,10 @@ export class GitService {
     }
 
     // Fetch first so we can record what our change will rebase over (surfaced on success).
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    await this.fetchOrigin(dir, gitUrl, auth);
     const rebasedOver = await this.logCommits(git, `HEAD..origin/${branch}`);
     const first = await this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-      this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+      this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
     );
     if (!first.ok) return this.conflictResult(gitUrl, first.report);
 
@@ -1695,9 +1884,10 @@ export class GitService {
 
     const retryRebase = (): Promise<RebaseOutcome> =>
       this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-        this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+        this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
       );
     const pushResult = await this.pushWithRetry(
+      dir,
       git,
       gitUrl,
       auth,
@@ -1771,6 +1961,21 @@ export class GitService {
       expectedRemoteHead?: string;
     },
   ): Promise<SafePushResult> {
+    // `expectedRemoteHead` is a pin on ONE commit, so it must name one: a hex SHA (full, or the
+    // abbreviated form the conflict text prints). Any rev used to be accepted and resolved in
+    // this clone, so `origin/<branch>`, `FETCH_HEAD` or `@{u}` — each of which names whatever the
+    // remote is NOW — always "matched" and the guard was silently off. Refused before anything
+    // is committed or fetched, so a bad pin costs the clone nothing.
+    const expectedPin = opts.expectedRemoteHead?.trim();
+    if (opts.expectedRemoteHead !== undefined && !/^[0-9a-f]{4,40}$/i.test(expectedPin ?? '')) {
+      throw new Error(
+        `expectedRemoteHead must be a commit SHA (4 to 40 hex characters) — the \`remoteHead\` ` +
+          `the conflict reported — not "${opts.expectedRemoteHead}". A ref name such as ` +
+          'origin/<branch>, FETCH_HEAD or @{u} names wherever the remote is now, so it would ' +
+          'always match and pin nothing. Nothing was pushed.',
+      );
+    }
+
     // Index resolutions by path; reject duplicates and unconfirmed .bib targets up front.
     const byPath = new Map<string, string>();
     for (const r of opts.resolutions) {
@@ -1809,25 +2014,45 @@ export class GitService {
       }
     }
 
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    await this.fetchOrigin(dir, gitUrl, auth);
     const rebasedOver = await this.logCommits(git, `HEAD..origin/${branch}`);
+
+    // The remote head THIS call checks and rebases onto — read once, from the fetch above. The
+    // rebase below targets this sha rather than re-running `pull --rebase`, which fetched a
+    // SECOND time: a commit landing between the two fetches was then rebased onto after the pin
+    // had already passed, and the caller's verbatim resolution (merged against the older
+    // `theirs`) overwrote it. With no second fetch, a later move surfaces on the push itself —
+    // a non-fast-forward, reported `remote-moved` when pinned (one round) or retried as a fresh
+    // conflict-reporting rebase otherwise, never merged over.
+    const remoteSha = await this.revParseOrNull(git, `origin/${branch}^{commit}`);
 
     // Race guard: if the caller merged against a specific remote head and the remote has advanced
     // since, `theirs` may now be stale — refuse rather than silently merge over what just landed.
-    if (opts.expectedRemoteHead) {
-      const currentRemote = await this.revParseOrNull(git, `origin/${branch}`);
-      // Resolve the caller's value to a full SHA before comparing — it may be an abbreviated SHA
-      // (e.g. the 8-char form we print), which must not be misread as a move from a commit to
-      // itself. Fall back to a prefix match if it can't be resolved as a ref.
-      const expectedFull = (await this.revParseOrNull(git, opts.expectedRemoteHead)) ?? null;
-      const matches = currentRemote
-        ? currentRemote === expectedFull ||
-          (opts.expectedRemoteHead.length >= 4 && currentRemote.startsWith(opts.expectedRemoteHead))
-        : false;
-      if (currentRemote && !matches) {
+    // A pin with NO remote head to check it against (the branch was deleted or renamed upstream)
+    // is refused as well: it cannot be verified, and there is nothing to rebase onto — left to
+    // the rebase, it surfaced as git's raw "invalid upstream".
+    if (expectedPin !== undefined && remoteSha === null) {
+      throw new Error(
+        `There is no origin/${branch} after fetching, so expectedRemoteHead ${expectedPin} ` +
+          'cannot be checked and there is nothing to rebase onto — the branch may have been ' +
+          'deleted or renamed on the remote. Nothing was pushed. Check where the remote branch ' +
+          'went (project_sync, status) before resolving again.',
+      );
+    }
+    if (expectedPin !== undefined && remoteSha !== null) {
+      // The pin is hex (checked above), so "is it the current remote head" is a prefix test on
+      // the full sha — which also covers an abbreviation this clone finds ambiguous. The
+      // `rev-parse --verify` only improves the message: the full sha the pin names, when this
+      // clone knows exactly one.
+      const matches = remoteSha.startsWith(expectedPin.toLowerCase());
+      if (!matches) {
+        const expectedFull = await git
+          .raw(['rev-parse', '--verify', `${expectedPin}^{commit}`])
+          .then((out) => out.trim() || null)
+          .catch(() => null);
         throw new Error(
           `Remote moved since you computed the merge (origin/${branch} was ` +
-            `${expectedFull ?? opts.expectedRemoteHead}, now ${currentRemote}). ` +
+            `${expectedFull ?? expectedPin}, now ${remoteSha}). ` +
             'Nothing was pushed. Re-run push to fetch the current conflict, recompute the merge ' +
             'against the fresh "theirs", and resolve again.',
         );
@@ -1839,8 +2064,21 @@ export class GitService {
     const used = new Set<string>();
 
     // Kick off the rebase; then loop: apply resolutions to whatever is unmerged and continue.
+    // Onto `remoteSha` (see above), with `pull --rebase`'s own shape otherwise: `--fork-point`
+    // against `origin/<branch>` picks the same commits to replay that the conflicting `push`
+    // did (the upstream's reflog, as `pull` consults it), so the conflict resolved here is the
+    // conflict that was reported. `origin/<branch>` is not re-fetched, so it still names
+    // `remoteSha`. With no remote branch at all an UNPINNED call passes the ref name and git's
+    // own "invalid upstream" surfaces through `runRebaseStep`, as `pull` failed before (a pinned
+    // one was refused above).
     let step = await this.runRebaseStep(git, () =>
-      this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+      git.raw([
+        'rebase',
+        '--fork-point',
+        '--onto',
+        remoteSha ?? `origin/${branch}`,
+        `origin/${branch}`,
+      ]),
     );
     // Bound the loop by the number of resolutions (+ slack) so a file that keeps re-conflicting
     // can never spin forever.
@@ -1960,13 +2198,14 @@ export class GitService {
     // and is reported — never silently retried again with stale content.
     const retryRebase = (): Promise<RebaseOutcome> =>
       this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-        this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+        this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
       );
     // When the caller pinned `expectedRemoteHead`, they asked to be refused rather than have their
     // merge silently rebased over a second remote move — one round only, so a lost race here is
     // reported as `remote-moved` (nothing pushed, clone intact) instead of retried.
     const rounds = opts.expectedRemoteHead ? 1 : PUSH_RETRY_ROUNDS;
     const pushResult = await this.pushWithRetry(
+      dir,
       git,
       gitUrl,
       auth,
@@ -2026,7 +2265,10 @@ export class GitService {
     const committed = await this.commit(dir, { message: opts.message, paths: opts.paths });
 
     const range = `${base}...${opts.branch}`;
-    const [diff, files] = await Promise.all([git.diff([range]), this.numstat(git, [range])]);
+    const [diff, files] = await Promise.all([
+      git.raw(['diff', ...PLAIN_PATCH_FLAGS, range]),
+      this.numstat(git, [range]),
+    ]);
 
     return {
       status: 'awaiting-approval',
@@ -2055,7 +2297,7 @@ export class GitService {
     const git = simpleGit(dir);
     const base = opts.base ?? (await this.resolveDefaultBranch(git));
 
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    await this.fetchOrigin(dir, gitUrl, auth);
 
     await git.raw(['checkout', opts.branch]);
     const rebased = await this.tryRebase(dir, git, opts.branch, `origin/${base}`, () =>
@@ -2077,11 +2319,11 @@ export class GitService {
     // is reported as `remote-moved` rather than retried (one attempt, not `PUSH_RETRY_ROUNDS`).
     await this.hooks.beforePush?.(1);
     try {
-      await this.withAuth(git, gitUrl, auth, () => git.push(['origin', base]));
+      await this.withAuth(dir, gitUrl, auth, ['push', 'origin', base]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!isNonFastForwardRejection(message)) throw err;
-      await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+      await this.fetchOrigin(dir, gitUrl, auth);
       const remoteHead = (await this.revParseOrNull(git, `origin/${base}`)) ?? '';
       const rebasedOver = await this.logCommits(git, `HEAD..origin/${base}`);
       return this.remoteMovedResult(
@@ -2106,21 +2348,45 @@ export class GitService {
     };
   }
 
-  /** Clone a project, then reset origin to the tokenless URL so no credential is persisted. */
+  /**
+   * Clone a project from its tokenless URL, so origin never holds a credential — not even for
+   * the length of the clone (it used to clone from the token-bearing URL and reset origin
+   * afterwards, so a kill mid-clone left the token in `.git/config`). The credential reaches git
+   * through {@link runRemoteGit} instead.
+   */
   async clone(gitUrl: string, targetDir: string, auth: AuthConfig, branch?: string): Promise<void> {
     await mkdir(path.dirname(targetDir), { recursive: true });
-    const authUrl = authenticateUrl(gitUrl, auth);
-    // Keep repo line endings (LF) so edit_file's exact match is deterministic on Windows.
+    // Keep repo line endings (LF) so edit_file's exact match is deterministic on Windows. This is
+    // the clone's OWN `-c` (after the subcommand), which git persists into the new repository —
+    // deliberately; the credential config from `gitCredentialConfig` is the global kind, which is not.
     const options = ['-c', 'core.autocrlf=false', ...(branch ? ['-b', branch] : [])];
-    await simpleGit().clone(authUrl, targetDir, options);
-    await simpleGit(targetDir).remote(['set-url', 'origin', gitUrl]);
+    // `--` ends the options, so a gitUrl can never be read as one.
+    await runRemoteGit(undefined, gitUrl, auth, ['clone', ...options, '--', gitUrl, targetDir]);
   }
 
   /** Fetch and fast-forward (ff-only). Surfaces divergence instead of merging. */
   async syncPull(gitUrl: string, dir: string, auth: AuthConfig): Promise<SyncResult> {
     const git = simpleGit(dir);
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
-    const ab = await this.aheadBehindOf(git);
+    await this.fetchOrigin(dir, gitUrl, auth);
+    // The fetch prunes, so a branch renamed or deleted upstream leaves no `origin/<branch>` to
+    // count against — and the lenient count below would read that as "0 ahead, 0 behind",
+    // `up-to-date` over an unpushed commit. Decide the absence first, in its own terms.
+    const branch = await this.currentBranch(git);
+    const absence = await this.remoteBranchAbsence(git, branch);
+    if (absence) {
+      return absence.missing
+        ? {
+            action: 'remote-branch-missing',
+            ahead: absence.unpushed,
+            behind: 0,
+            diverged: false,
+            note: remoteBranchMissingNote(absence.branch, absence.remoteBranches, absence.unpushed),
+          }
+        : // An empty remote (or one this clone shares no history with): nothing to pull, and
+          // nothing this can call missing — but local commits are still counted as unpushed.
+          { action: 'up-to-date', ahead: absence.unpushed, behind: 0, diverged: false };
+    }
+    const ab = await this.aheadBehindOf(git, branch);
     if (ab.behind === 0) {
       return { action: 'up-to-date', ahead: ab.ahead, behind: 0, diverged: false };
     }
@@ -2132,7 +2398,7 @@ export class GitService {
     } catch (err) {
       throw pullRefusalFromError(err);
     }
-    const after = await this.aheadBehindOf(git);
+    const after = await this.aheadBehindOf(git, branch);
     return { action: 'pulled', ahead: after.ahead, behind: after.behind, diverged: false };
   }
 
@@ -2141,21 +2407,47 @@ export class GitService {
     return this.aheadBehindOf(simpleGit(dir));
   }
 
-  async status(dir: string): Promise<StatusResult> {
+  /**
+   * `withCommits` (default false) also lists the commits behind `ahead`/`behind`: a
+   * `log --numstat` per direction, which only the `status` tool reads. Every internal caller
+   * (`commit`, `shelve`, the peer-refusal guard) wants the file lists and counts alone, so it no
+   * longer pays for that log — which, with `origin/<branch>` absent, ran over the whole history.
+   */
+  async status(dir: string, opts: { withCommits?: boolean } = {}): Promise<StatusResult> {
     const git = simpleGit(dir);
     const s = await git.status();
-    const ab = await this.aheadBehindOf(git);
+    const branch = await this.currentBranch(git);
+    // Same absence check as `syncPull`: with `origin/<branch>` pruned, the lenient count reports
+    // 0/0 and the clone reads as in sync while its commits are on no remote branch.
+    const absence = await this.remoteBranchAbsence(git, branch);
+    const ab = absence
+      ? { branch, ahead: absence.unpushed, behind: 0 }
+      : await this.aheadBehindOf(git, branch);
     const staged = s.files.filter((f) => f.index !== ' ' && f.index !== '?').map((f) => f.path);
     const unstaged = s.files
       .filter((f) => f.working_dir !== ' ' && f.working_dir !== '?')
       .map((f) => f.path);
     // Show *what* diverged, not just how far. Uses the last-fetched `origin/<branch>` (status does
     // not fetch), so these reflect known divergence — run project_sync to refresh.
+    // With `origin/<branch>` absent, `ahead` counts commits on no remote branch, which after the
+    // remote lost every branch is the clone's whole history — not the session's own work, and not
+    // bounded by it. That list is capped at the house commit cap and the rest counted.
+    const want = opts.withCommits === true;
     const [aheadCommits, behindCommits] =
-      ab.ahead > 0 || ab.behind > 0
+      want && (ab.ahead > 0 || ab.behind > 0)
         ? await Promise.all([
             ab.ahead > 0
-              ? this.logCommits(git, `origin/${ab.branch}..${ab.branch}`)
+              ? this.logCommits(
+                  git,
+                  absence
+                    ? [
+                        `--max-count=${CONFLICT_MAX_COMMITS}`,
+                        `refs/heads/${ab.branch}`,
+                        '--not',
+                        '--remotes=origin',
+                      ]
+                    : `origin/${ab.branch}..${ab.branch}`,
+                )
               : Promise.resolve([]),
             ab.behind > 0
               ? this.logCommits(git, `${ab.branch}..origin/${ab.branch}`)
@@ -2171,7 +2463,19 @@ export class GitService {
       unstaged,
       untracked: s.not_added,
       aheadCommits,
+      // Only the capped (absent-branch) log can leave commits out; the ordinary range lists all.
+      aheadCommitsOmitted: absence && want ? Math.max(0, ab.ahead - aheadCommits.length) : 0,
       behindCommits,
+      remoteBranchMissing: absence?.missing ?? false,
+      ...(absence?.missing
+        ? {
+            remoteBranchNote: remoteBranchMissingNote(
+              absence.branch,
+              absence.remoteBranches,
+              absence.unpushed,
+            ),
+          }
+        : {}),
     };
   }
 
@@ -2226,7 +2530,7 @@ export class GitService {
     // confirmation diff passes) named "a[1].tex" would also diff a dirty "a1.tex" that nobody
     // asked about. Must precede the subcommand, so this bypasses `git.diff()` for a raw call.
     const [diff, files] = await Promise.all([
-      git.raw(['--literal-pathspecs', 'diff', ...patchArgs]),
+      git.raw(['--literal-pathspecs', 'diff', ...PLAIN_PATCH_FLAGS, ...patchArgs]),
       this.numstat(git, [...base, ...tail]),
     ]);
     return { diff, files };
@@ -2238,8 +2542,31 @@ export class GitService {
    * only make the error messages harder to recognise.
    */
   private async resolveDiffRef(git: SimpleGit, ref: string): Promise<string> {
-    const range = /^(.+?)\.{2,3}(.+)$/.exec(ref);
-    const endpoints = range ? [range[1] ?? '', range[2] ?? ''] : [ref];
+    // A git ref name can never contain `..`, so every `..` here is a range operator. Only the
+    // documented shapes pass: one commit-ish, or ONE two-dot range with both ends named. A
+    // second operator used to slip through (the lazy split handed `HEAD..HEAD` to `rev-parse` as
+    // a single "endpoint", which accepts it as a range) and surface git's raw "bad revision";
+    // a three-dot range was accepted although nothing promised it.
+    if (ref.includes('...')) {
+      throw new Error(
+        `Three-dot ranges ("${ref}") are not supported: \`ref\` takes one commit-ish or one ` +
+          'two-dot range "A..B". To diff from where two lines of history diverged, pass their ' +
+          'merge base explicitly as "<merge-base sha>..B".',
+      );
+    }
+    const parts = ref.split('..');
+    if (parts.length > 2) {
+      throw new Error(
+        `"${ref}" has more than one \`..\`: \`ref\` takes one commit-ish or one two-dot range ` +
+          '"A..B".',
+      );
+    }
+    if (parts.length === 2 && parts.some((p) => p === '')) {
+      throw new Error(
+        `"${ref}" leaves one end of the range empty: name both, as in "HEAD~3..HEAD".`,
+      );
+    }
+    const endpoints = parts;
     for (const endpoint of endpoints) {
       if (endpoint.startsWith('-')) throw new Error(`Invalid ref "${endpoint}".`);
       if ((await this.revParseOrNull(git, `${endpoint}^{commit}`)) === null) {
@@ -2286,9 +2613,9 @@ export class GitService {
     auth: AuthConfig,
     branch: string,
   ): Promise<RebaseOutcome> {
-    await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+    await this.fetchOrigin(dir, gitUrl, auth);
     return this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-      this.withAuth(git, gitUrl, auth, () => git.raw(['pull', '--rebase', 'origin', branch])),
+      this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
     );
   }
 
@@ -2455,7 +2782,11 @@ export class GitService {
    * `core.quotePath` (on by default) C-quotes any non-ASCII path (`"r\303\251sum\303\251.tex"`)
    * rather than emitting UTF-8. `-c` must precede the subcommand for `git.raw`.
    */
-  private async logCommits(git: SimpleGit, range: string): Promise<RemoteCommit[]> {
+  /** `range` is one revision range, or several revision arguments (e.g. `x --not --remotes`). */
+  private async logCommits(
+    git: SimpleGit,
+    range: string | readonly string[],
+  ): Promise<RemoteCommit[]> {
     try {
       const out = await git.raw([
         '-c',
@@ -2464,7 +2795,7 @@ export class GitService {
         '--no-renames',
         '--format=%x00%H%x09%s',
         '--numstat',
-        range,
+        ...(typeof range === 'string' ? [range] : range),
       ]);
       return parseCommitLog(out);
     } catch {
@@ -2522,6 +2853,7 @@ export class GitService {
    * `nothing-to-push`.
    */
   private async pushWithRetry(
+    dir: string,
     git: SimpleGit,
     gitUrl: string,
     auth: AuthConfig,
@@ -2540,14 +2872,14 @@ export class GitService {
       }
       await this.hooks.beforePush?.(attempt);
       try {
-        await this.withAuth(git, gitUrl, auth, () => git.push(['origin', branch]));
+        await this.withAuth(dir, gitUrl, auth, ['push', 'origin', branch]);
         return { ok: true, rebasedOver: over, pushedCommits };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (!isNonFastForwardRejection(message)) throw err;
 
         if (attempt < rounds) {
-          await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+          await this.fetchOrigin(dir, gitUrl, auth);
           const justLanded = await this.logCommits(git, `HEAD..origin/${branch}`);
           over = mergeNewestFirst(justLanded, over);
           const outcome = await rebaseAgain();
@@ -2558,7 +2890,7 @@ export class GitService {
         // Final attempt: fetch once more and fold the commit that just won the race into
         // `over` too, so `rebasedOver` accounts for the exact remote tip named by `remoteHead`
         // — otherwise the landing that caused this very failure would be missing from it.
-        await this.withAuth(git, gitUrl, auth, () => git.fetch(['origin']));
+        await this.fetchOrigin(dir, gitUrl, auth);
         const justLanded = await this.logCommits(git, `HEAD..origin/${branch}`);
         over = mergeNewestFirst(justLanded, over);
         const remoteHead = (await this.revParseOrNull(git, `origin/${branch}`)) ?? '';
@@ -2619,15 +2951,99 @@ export class GitService {
     "Nothing left to push: after rebasing onto the remote, this session's commit was already " +
     'there (an identical change landed upstream) and was dropped.';
 
+  /** `branch`, when the caller already resolved it, saves the `currentBranch` spawn(s). */
   private async aheadBehindOf(
     git: SimpleGit,
+    branch?: string,
   ): Promise<{ branch: string; ahead: number; behind: number }> {
     try {
-      return await this.aheadBehindStrictOf(git);
+      return await this.aheadBehindStrictOf(git, branch);
     } catch {
       // No upstream tracking ref yet (e.g. before first fetch).
-      return { branch: await this.currentBranch(git), ahead: 0, behind: 0 };
+      return { branch: branch ?? (await this.currentBranch(git)), ahead: 0, behind: 0 };
     }
+  }
+
+  /**
+   * Whether `origin/<branch>` is absent (as of the last fetch, which prunes), and if so what that
+   * means — `null` when it resolves, which is the ordinary case and costs one `rev-parse`.
+   *
+   * Absent splits two ways, and `missing` is the split:
+   *
+   * - **missing** — the remote still has at least one branch, this clone's branch shares
+   *   history with the remote's branches (some of its commits are reachable from `origin/*`), AND
+   *   the branch tracks its namesake upstream (`branch.<name>.remote` is `origin` and
+   *   `branch.<name>.merge` is `refs/heads/<name>` — set by the clone, including a clone of an
+   *   empty remote). The branch came from there and is gone: renamed or deleted upstream.
+   * - **not missing** — the remote has no branches at all (an empty repository, freshly cloned),
+   *   or this clone's branch shares nothing with them (unborn, or an unrelated history pushed to
+   *   a differently named branch after an empty clone), or the branch was never tracking
+   *   `origin/<name>` — a local branch that was never pushed, such as the review branch
+   *   `prepareBranch` leaves the clone on (`checkout -B`), even when `branch.autoSetupMerge`
+   *   gave it a local upstream or `--set-upstream-to` pointed it at another origin branch.
+   *   Nothing here can be called gone; its commits are plainly unpushed.
+   *
+   * Either way `unpushed` counts the local commits reachable from no remote branch — never the
+   * lenient `0` {@link aheadBehindOf} returns when its range fails to resolve, which is what let a
+   * pruned branch report an unpushed commit as in sync.
+   */
+  private async remoteBranchAbsence(
+    git: SimpleGit,
+    branch: string,
+  ): Promise<{
+    branch: string;
+    missing: boolean;
+    remoteBranches: string[];
+    unpushed: number;
+  } | null> {
+    if ((await this.revParseOrNull(git, `refs/remotes/origin/${branch}`)) !== null) return null;
+    let remoteBranches: string[] = [];
+    try {
+      const out = await git.raw([
+        'for-each-ref',
+        '--format=%(refname:strip=3)',
+        'refs/remotes/origin/',
+      ]);
+      // `origin/HEAD` is a pointer, not a branch — and dangles once its target is pruned.
+      remoteBranches = out
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((name) => name !== '' && name !== 'HEAD');
+    } catch {
+      // Unreadable refs: claim nothing is missing rather than guess at what the remote holds.
+    }
+    const count = async (args: string[]): Promise<number> => {
+      try {
+        return Number((await git.raw(['rev-list', '--count', ...args])).trim()) || 0;
+      } catch {
+        return 0; // an unborn branch has no commits to count
+      }
+    };
+    const local = `refs/heads/${branch}`;
+    const total = await count([local]);
+    const unpushed = await count([local, '--not', '--remotes=origin']);
+    // Asked last, and only when the rest already says "missing": a branch that never tracked
+    // `origin/<branch>` cannot have lost it. That takes BOTH keys naming it — the mere presence of
+    // `branch.<b>.merge` is not enough: `branch.autoSetupMerge=always` makes `checkout -B` record
+    // `remote=.` + `merge=refs/heads/master` for a never-pushed review branch, and
+    // `--set-upstream-to=origin/<other>` names a branch that still exists. `config --get` exits 1
+    // when the key is unset, which reads as not tracking.
+    const configValue = async (key: string): Promise<string | null> => {
+      try {
+        return (await git.raw(['config', '--get', key])).trim();
+      } catch {
+        return null;
+      }
+    };
+    const tracksUpstream = async (): Promise<boolean> =>
+      (await configValue(`branch.${branch}.remote`)) === 'origin' &&
+      (await configValue(`branch.${branch}.merge`)) === `refs/heads/${branch}`;
+    return {
+      branch,
+      missing: remoteBranches.length > 0 && unpushed < total && (await tracksUpstream()),
+      remoteBranches,
+      unpushed,
+    };
   }
 
   /**
@@ -2645,8 +3061,9 @@ export class GitService {
    */
   private async aheadBehindStrictOf(
     git: SimpleGit,
+    knownBranch?: string,
   ): Promise<{ branch: string; ahead: number; behind: number }> {
-    const branch = await this.currentBranch(git);
+    const branch = knownBranch ?? (await this.currentBranch(git));
     const out = await git.raw([
       'rev-list',
       '--left-right',
@@ -2670,24 +3087,42 @@ export class GitService {
     return this.aheadBehindStrictOf(simpleGit(dir));
   }
 
-  /** Run `fn` with origin temporarily pointed at the authenticated URL, then restore. */
+  /**
+   * Run one fetch/pull/push against origin in `dir`, with this project's credential available
+   * to git (see {@link runRemoteGit}).
+   *
+   * This used to point origin at the token-bearing URL (`remote set-url`) for the length of the
+   * call and set it back afterwards, which wrote the token into `.git/config` and put it on the
+   * `set-url` command line: a process killed inside that window left it on disk in plain text.
+   * Nothing here writes a byte of config now.
+   */
   private async withAuth(
-    git: SimpleGit,
+    dir: string,
     gitUrl: string,
     auth: AuthConfig,
-    fn: () => Promise<unknown>,
+    args: string[],
   ): Promise<void> {
-    const authUrl = authenticateUrl(gitUrl, auth);
-    if (authUrl === gitUrl) {
-      await fn();
-      return;
-    }
-    await git.remote(['set-url', 'origin', authUrl]);
-    try {
-      await fn();
-    } finally {
-      await git.remote(['set-url', 'origin', gitUrl]);
-    }
+    await runRemoteGit(dir, gitUrl, auth, args);
+  }
+
+  /**
+   * Fetch origin WITH `--prune`, so `refs/remotes/origin/*` says what the remote has now — every
+   * fetch in this class goes through here. Without it (and `fetch.prune` is never set), a branch
+   * deleted or renamed upstream left its tracking ref behind at the old sha, and every caller that
+   * reads `origin/<branch>` as "the remote's current head" believed the ghost: `resolvePush`'s pin
+   * matched it, the rebase landed on it, and `push origin <branch>` RECREATED the branch the
+   * collaborator had just renamed away; `landBranch` would do the same to its base, and
+   * `resetToRemote` hard-reset onto a branch that no longer exists. Pruning touches only
+   * remote-tracking refs (never a local branch, tag, or the working tree). Two side effects follow.
+   * `origin/HEAD` can be left dangling when its target is pruned; `resolveDefaultBranch` reads that
+   * as "unknown" and falls back to `master`, which matches what the stale ref named only when the
+   * default WAS `master` — a pruned `main` makes `landBranch`'s default base `master`, and a caller
+   * on such a remote has to pass `base` explicitly. And `origin/<branch>` itself can vanish, so
+   * nothing may read "the ahead/behind range did not resolve" as "in sync": `syncPull` and `status`
+   * ask {@link remoteBranchAbsence} first and report a renamed-away branch as such.
+   */
+  private async fetchOrigin(dir: string, gitUrl: string, auth: AuthConfig): Promise<void> {
+    await this.withAuth(dir, gitUrl, auth, ['fetch', '--prune', 'origin']);
   }
 
   /**
@@ -2741,17 +3176,19 @@ export class GitService {
     }
     const touchedPaths = [...touched].sort();
 
-    const [dirtyPaths, linkPaths, stagedPaths] = await Promise.all([
-      this.dirtyAmong(git, touchedPaths),
-      this.linksAmong(dir, git, lineage, touchedPaths),
-      this.stagedAnywhere(git),
-    ]);
+    const [{ dirty: dirtyPaths, inTheWay: inTheWayPaths }, linkPaths, stagedPaths] =
+      await Promise.all([
+        this.dirtyAmong(dir, git, touchedPaths),
+        this.linksAmong(dir, git, lineage, touchedPaths),
+        this.stagedAnywhere(git),
+      ]);
     const only = lineage.length === 1 ? lineage[0] : undefined;
     const restoreRef = only && only.parents.length === 1 ? (only.parents[0] ?? null) : null;
     return {
       commits: shas,
       touchedPaths,
       dirtyPaths,
+      inTheWayPaths,
       linkPaths,
       stagedPaths,
       mergeCommits,
@@ -2950,8 +3387,12 @@ export class GitService {
    * of a rename pair come out of whichever chunk matched either side, so the pairing never
    * straddles a chunk boundary. A chunk that throws propagates — never read as "clean".
    */
-  private async dirtyAmong(git: SimpleGit, touchedPaths: string[]): Promise<string[]> {
-    if (touchedPaths.length === 0) return [];
+  private async dirtyAmong(
+    dir: string,
+    git: SimpleGit,
+    touchedPaths: string[],
+  ): Promise<{ dirty: string[]; inTheWay: string[] }> {
+    if (touchedPaths.length === 0) return { dirty: [], inTheWay: [] };
     const wanted = new Set(touchedPaths);
     const dirty = new Set<string>();
     for (const chunk of chunkPathspecs(touchedPaths)) {
@@ -2977,7 +3418,120 @@ export class GitService {
         for (const rel of named) if (wanted.has(rel)) dirty.add(rel);
       }
     }
-    return [...dirty].sort();
+
+    // What `status` cannot see: an IGNORED file in the way. `git revert` treats an ignored file
+    // as expendable — where it restores a path HEAD does not track, an ignored file sitting at
+    // that path (or at an ancestor, as a file where the revert needs a directory) is silently
+    // overwritten, while `status --porcelain` never lists it. A user's local note kept out of
+    // git via `.git/info/exclude` was replaced by the old committed bytes that way, behind a
+    // preflight that read the path as clean. So every touched path HEAD does not track is
+    // judged on disk instead, by `lstat` — ignored and untracked alike, and on a case-insensitive
+    // filesystem in any spelling, which is exactly what the revert's write would land on:
+    //   - the path itself exists and is not a directory: dirty;
+    //   - the path is a directory: dirty if anything under it is untracked, ignored files
+    //     included (`ls-files --others` without `--exclude-standard`) — git would have to remove
+    //     the directory to write the file, and a directory holding only HEAD's own files (the
+    //     revert deletes those too, and `status` above vouches for them) is not in the way;
+    //   - an ancestor exists and is not a directory: dirty unless HEAD tracks that ancestor
+    //     (then the revert itself replaces HEAD's file with the directory, and `status` vouches
+    //     for the file's content);
+    //   - anything `lstat` answers other than "absent" or the above fails CLOSED, as dirty.
+    // "Tracked at HEAD" folds case on an ignorecase clone (the whole tree is listed and folded
+    // through `canonicalNames`, as `trackedAtHead` does, since a pathspec cannot be literal and
+    // case-insensitive at once), so a revert of a case-only rename is not refused over HEAD's own
+    // file. Every listing here is {@link chunkPathspecs}-batched, literal and
+    // `core.quotePath=false` like the probes above; a chunk that throws propagates (the preflight
+    // then fails) rather than reading as "nothing in the way".
+    const caseInsensitive = await this.isCaseInsensitive(dir);
+    let headNames: ReturnType<typeof canonicalNames> | undefined;
+    const trackedAtHeadOf = async (rels: string[]): Promise<Set<string>> => {
+      if (caseInsensitive) {
+        headNames ??= canonicalNames(
+          (
+            await git.raw([
+              '-c',
+              'core.quotePath=false',
+              'ls-tree',
+              '-r',
+              '-z',
+              '--name-only',
+              'HEAD',
+            ])
+          )
+            .split('\0')
+            .filter(Boolean),
+        );
+        const names = headNames;
+        return new Set(rels.filter((rel) => names.has(rel)));
+      }
+      const listed = new Set<string>();
+      for (const chunk of chunkPathspecs(rels)) {
+        const out = await git.raw([
+          '-c',
+          'core.quotePath=false',
+          '--literal-pathspecs',
+          'ls-tree',
+          '-r',
+          '-z',
+          '--name-only',
+          'HEAD',
+          '--',
+          ...chunk,
+        ]);
+        for (const name of out.split('\0')) if (name) listed.add(toPosix(name));
+      }
+      return new Set(rels.filter((rel) => listed.has(rel)));
+    };
+    // Everything `status` reported, frozen before the on-disk probe below adds to `dirty`: the
+    // probe's additions are what `inTheWay` reports (see `RevertPreflight.inTheWayPaths`).
+    const statusDirty = new Set(dirty);
+    const atHead = await trackedAtHeadOf(touchedPaths);
+    const blockedBy = new Map<string, string>();
+    const occupiedDirs: string[] = [];
+    for (const rel of touchedPaths) {
+      if (dirty.has(rel) || atHead.has(rel)) continue;
+      const segments = rel.split('/').filter(Boolean);
+      for (let i = 1; i <= segments.length; i++) {
+        let st: Awaited<ReturnType<typeof lstat>>;
+        try {
+          st = await lstat(path.join(dir, ...segments.slice(0, i)));
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') dirty.add(rel);
+          break;
+        }
+        if (i === segments.length) {
+          if (st.isDirectory()) occupiedDirs.push(rel);
+          else dirty.add(rel);
+        } else if (!st.isDirectory()) {
+          blockedBy.set(rel, segments.slice(0, i).join('/'));
+          break;
+        }
+      }
+    }
+    if (blockedBy.size > 0) {
+      const trackedAncestors = await trackedAtHeadOf([...new Set(blockedBy.values())]);
+      for (const [rel, ancestor] of blockedBy) if (!trackedAncestors.has(ancestor)) dirty.add(rel);
+    }
+    for (const chunk of chunkPathspecs(occupiedDirs)) {
+      const others = (
+        await git.raw([
+          '-c',
+          'core.quotePath=false',
+          '--literal-pathspecs',
+          'ls-files',
+          '--others',
+          '-z',
+          '--',
+          ...chunk,
+        ])
+      )
+        .split('\0')
+        .filter(Boolean)
+        .map((name) => toPosix(name));
+      for (const rel of chunk) if (others.some((name) => coversPath(rel, name))) dirty.add(rel);
+    }
+    const all = [...dirty].sort();
+    return { dirty: all, inTheWay: all.filter((rel) => !statusDirty.has(rel)) };
   }
 
   /**
@@ -3187,6 +3741,132 @@ export function chunkPathspecs(
   }
   if (current.length > 0) chunks.push(current);
   return chunks;
+}
+
+/**
+ * Flags for every PARSED patch (`splitPatch` keys on line-initial `diff --git ` and `@@ -`, and
+ * reads paths off `a/`/`b/` headers): git's own unified diff whatever the user configured — no
+ * `diff.external` tool, no `color.ui=always` escapes, and the default prefixes over
+ * `diff.noprefix`/`diff.mnemonicPrefix`. Textconv is left on: its output is still a unified diff.
+ */
+const PLAIN_PATCH_FLAGS = ['--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/'];
+
+/** Environment variables the inline credential helper reads — see {@link gitCredentialConfig}. */
+const CREDENTIAL_USERNAME_ENV = 'WEB_LATEX_MCP_GIT_USERNAME';
+const CREDENTIAL_TOKEN_ENV = 'WEB_LATEX_MCP_GIT_TOKEN';
+
+/**
+ * A git credential helper (the `!`-prefixed shell form, which git runs through `sh` on every
+ * platform, Git for Windows included) that answers `get` from the two variables above and
+ * ignores `store`/`erase`. It holds only variable NAMES, so the command line carries no secret.
+ */
+const INLINE_CREDENTIAL_HELPER =
+  `!f() { test "$1" = get || return 0; ` +
+  `printf 'username=%s\\npassword=%s\\n' "$${CREDENTIAL_USERNAME_ENV}" "$${CREDENTIAL_TOKEN_ENV}"; }; f`;
+
+/**
+ * A remote host as it may appear inside a `-c credential.<scheme>://<host>.helper=…` KEY: a
+ * hostname or IPv4 address, or a bracketed IPv6 literal, each with an optional port. WHATWG URL
+ * keeps `=`, `;`, `$` and `"` in a host, and an `=` in a `-c` argument ends the key — so a host
+ * outside this shape is refused rather than handed to git to reinterpret. `_` is allowed: it is
+ * not a DNS hostname character, but WHATWG keeps it and resolvers accept it — a docker-compose
+ * service name (`https://git_server/…`) is the everyday case — and it means nothing inside a
+ * `-c` key.
+ */
+const CREDENTIAL_HOST_RE = /^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d+)?$/;
+
+/**
+ * The GLOBAL `-c` options and the extra environment that let one git process authenticate to
+ * `gitUrl` with `auth`, WITHOUT the credential touching `.git/config` or any command line;
+ * `null` when there is nothing to inject (no token, or not an http(s) remote). Consumed by
+ * {@link runRemoteGit}; exported as the unit seam for the host check and the config keys.
+ *
+ * - The token travels in the child's ENVIRONMENT only (`WEB_LATEX_MCP_GIT_TOKEN`), which other
+ *   users cannot read, unlike the process list the old `remote set-url https://user:TOKEN@…`
+ *   argv appeared in.
+ * - Git reads it through {@link INLINE_CREDENTIAL_HELPER}, configured with GLOBAL `-c` options
+ *   (before the subcommand): process-scoped, never persisted — not even by `clone`.
+ * - Both options are scoped to the remote's own scheme+host (`credential.<scheme>://<host>.helper`).
+ *   The first is EMPTY, which git reads as "reset the helper list" — for URLs that key matches
+ *   only — so for this host the project's resolved token is the one git uses (as it was when it
+ *   sat in the URL), and nothing stores it into the user's keychain on success; the second adds
+ *   the inline helper. Another host (a private submodule, an LFS store, a redirect) matches
+ *   neither key: it keeps the user's own helpers and is never handed the token.
+ */
+export function gitCredentialConfig(
+  gitUrl: string,
+  auth: AuthConfig,
+): { config: string[]; env: Record<string, string> } | null {
+  if (!auth.token) return null;
+  let url: URL;
+  try {
+    url = new URL(gitUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  // The credential protocol is line-based: a line break would let the value inject a key of its
+  // own. Git refuses such values itself; refuse before handing them over, naming neither.
+  if (/[\r\n\0]/.test(auth.token) || /[\r\n\0]/.test(auth.username)) {
+    throw new Error(
+      'The resolved git credential (username or token) contains a line break, which the git ' +
+        'credential protocol cannot carry. Fix the stored credential and retry.',
+    );
+  }
+  if (!CREDENTIAL_HOST_RE.test(url.host)) {
+    // The host is the caller's own configuration, not a secret — but JSON-quote it so a control
+    // character or quote in it cannot shape the message.
+    throw new Error(
+      `The git remote's host ${JSON.stringify(url.host)} contains characters a hostname cannot ` +
+        '(only letters, digits, ".", "-", "_", an optional ":port", or a bracketed IPv6 address), so ' +
+        'no credential can be scoped to it. Nothing was sent. Fix the project’s gitUrl.',
+    );
+  }
+  const key = `credential.${url.protocol}//${url.host}.helper`;
+  return {
+    config: [`${key}=`, `${key}=${INLINE_CREDENTIAL_HELPER}`],
+    env: { [CREDENTIAL_USERNAME_ENV]: auth.username, [CREDENTIAL_TOKEN_ENV]: auth.token },
+  };
+}
+
+/**
+ * Run one git command that talks to `gitUrl`'s remote (clone, fetch, pull, push) with the
+ * project's credential injected by {@link gitCredentialConfig}, and throw on a non-zero exit.
+ *
+ * Spawned directly (`execCapture`), not through simple-git: simple-git vets an explicitly-set
+ * child environment against a list of "unsafe" variables and config keys, and refuses the whole
+ * operation for any category not opted into — so injecting a token that way meant opting out of
+ * each category by hand, and a user environment carrying a config entry outside the list (or a
+ * simple-git minor adding a category) failed every authenticated operation before git ran. The
+ * environment here is this process's own — what simple-git passes when it is given none, and
+ * where `src/index.ts` puts `GIT_TERMINAL_PROMPT=0` — plus the two credential variables.
+ *
+ * The thrown message is stdout followed by stderr, the same text simple-git's `GitError` carried,
+ * because callers parse it: {@link isNonFastForwardRejection}, {@link untrackedOverwriteFromError}.
+ * No token is in it (it never reaches git's argv or config), and tool handlers scrub every
+ * resolved secret out of error text regardless (`errorResult`).
+ */
+async function runRemoteGit(
+  cwd: string | undefined,
+  gitUrl: string,
+  auth: AuthConfig,
+  args: string[],
+): Promise<void> {
+  const injected = gitCredentialConfig(gitUrl, auth);
+  const res = await execCapture(
+    'git',
+    [...(injected?.config.flatMap((c) => ['-c', c]) ?? []), ...args],
+    {
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(injected ? { env: { ...process.env, ...injected.env } } : {}),
+    },
+  );
+  if (res.code !== 0) {
+    const output = res.stdout + res.stderr;
+    throw new Error(
+      output.trim() ? output : `git ${args[0]} failed with exit code ${String(res.code)}.`,
+    );
+  }
 }
 
 /** Join at most `max` entries, appending `… N more` for whatever didn't fit. */

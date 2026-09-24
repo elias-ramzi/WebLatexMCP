@@ -7,6 +7,14 @@ import { uncoveredPaths, peerOwnership, coversPath } from '../lib/commitPaths.js
 import { collectPeerShadows } from '../lib/peerAttribution.js';
 import { foldCase } from '../lib/caseFold.js';
 import { settleTakenPaths, settleNothingToCommit } from '../lib/commitSettle.js';
+import { resolveCommitScope } from '../lib/commitScope.js';
+import {
+  planCommitLists,
+  renderCommittedFileLine,
+  renderLeftUncommittedLine,
+  renderFilesOmittedLine,
+  renderLeftUncommittedOmittedLine,
+} from '../lib/commitBudget.js';
 import { NothingToCommitError } from '../services/gitService.js';
 import type { ShadowChange } from '../services/shadowStore.js';
 
@@ -30,7 +38,10 @@ const inputSchema = {
     .describe(
       'Which changes to commit. "session" (the default when this session has tracked changes) ' +
         "commits only what this session edited, leaving other sessions' in-flight work " +
-        'uncommitted in the working tree. "all" commits every change in the clone, including ' +
+        'uncommitted in the working tree. When this session tracks nothing, the default is "all" ' +
+        'only if no other live session shares the clone — with one, the call refuses and ' +
+        'commits nothing, so pass scope "all" explicitly to take the whole working tree. ' +
+        '"all" commits every change in the clone, including ' +
         'other sessions\' and any made outside this server. "paths" commits exactly the files ' +
         'named in `paths` and nothing else — it refuses an empty list, and refuses a path a live ' +
         "session owns. Use it for work made outside this server (a script, the client's own " +
@@ -49,7 +60,16 @@ const outputSchema = {
         'never the sentinel itself).',
     ),
   filesChanged: z.number(),
-  files: z.array(z.object({ path: z.string(), added: z.number(), removed: z.number() })),
+  files: z
+    .array(z.object({ path: z.string(), added: z.number(), removed: z.number() }))
+    .describe(
+      'Files the commit took, with line counts. Budgeted with `leftUncommitted` against a ' +
+        'character budget across both channels: when cut, `filesOmitted` counts what is not ' +
+        'listed and `filesChanged` stays the full count.',
+    ),
+  filesOmitted: z
+    .number()
+    .describe('How many committed files `files` does not list because of the payload budget.'),
   scope: z.enum(['session', 'all', 'paths']).describe('The scope actually applied.'),
   session: z.string().describe('Id of the session the commit was attributed to.'),
   leftUncommitted: z
@@ -57,8 +77,12 @@ const outputSchema = {
     .describe(
       'Files changed in the working tree but not committed, because they belong to another ' +
         'session or were edited outside this server. Meaningful for scope "session" and ' +
-        '"paths"; always empty for scope "all".',
+        '"paths"; always empty for scope "all". Budgeted after `files`: when cut, ' +
+        '`leftUncommittedOmitted` counts what is not listed — `status` lists every change.',
     ),
+  leftUncommittedOmitted: z
+    .number()
+    .describe('How many left-uncommitted files `leftUncommitted` does not list (payload budget).'),
   conflicted: z
     .array(z.string())
     .describe(
@@ -111,10 +135,36 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
         return await ctx.projectManager.runExclusive(id, async () => {
           await ctx.sessions.touch(id);
+          // Whether this session tracked a change when the call BEGAN — read before the refresh
+          // below, which can settle entries (an edit reverted to its original text, or content a
+          // HEAD move absorbed). Judged afterwards, a session that arrived with a change could
+          // leave that refresh tracking nothing and, alone on the clone, widen the default to
+          // "all" — `git add -A` over hand edits nobody offered. The same principle
+          // `resolveCommitScope` states for a refusal: nothing this call does to the store may
+          // change which scope it gets. Only an omitted scope needs it.
+          // Read for scope "session" too (not only an omitted one), where it decides nothing but
+          // `commitSession`'s refusal wording: "already at HEAD" rather than "made no changes".
+          const trackedBeforeRefresh =
+            scope === 'all' || scope === 'paths' ? false : await ctx.shadows.hasChanges(id);
+          const trackedAtStart = scope ? true : trackedBeforeRefresh;
           // HEAD may have moved since this session last wrote (a peer committed, or a pull
           // landed), so carry its shadow forward before deciding what to commit.
           await ctx.shadows.refresh(id, dir);
-          const effective = scope ?? ((await ctx.shadows.hasChanges(id)) ? 'session' : 'all');
+          // Only an omitted scope needs the facts: a caller's `scope` always wins. With nothing
+          // tracked, the fallback to "all" is refused while any live peer shares the clone — see
+          // `resolveCommitScope` for why, and for why "any live peer" rather than "one that owns
+          // something". Decided before anything else runs, so a refusal here changes nothing. A
+          // session that tracked something at the start gets "session" even if the refresh just
+          // settled all of it; `commitSession` then refuses with "nothing to commit".
+          let effective = scope;
+          if (!effective) {
+            const livePeerIds = trackedAtStart
+              ? []
+              : (await ctx.sessions.livePeers(id)).map((p) => p.sessionId);
+            const decision = resolveCommitScope({ tracksChanges: trackedAtStart, livePeerIds });
+            if ('refusal' in decision) throw new Error(decision.refusal);
+            effective = decision.scope;
+          }
           // Resolved once per call and threaded into every by-name comparison this call makes:
           // both `ctx.shadows.settle` call sites, and all three scope functions
           // (`commitSession`/`commitEverything`/`commitPaths`), none of which resolve their own.
@@ -136,7 +186,13 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // scope "session".
           let settled: string[] = [];
           if (effective === 'session') {
-            res = await commitSession(ctx, id, dir, { message, paths, allowEmpty, fold });
+            res = await commitSession(ctx, id, dir, {
+              message,
+              paths,
+              allowEmpty,
+              fold,
+              trackedBeforeRefresh,
+            });
           } else {
             try {
               res =
@@ -224,15 +280,24 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
           // At the reporting boundary and nowhere earlier: everything above this line that hands
           // a path to git (`git add`'s pathspecs in `commitPaths`/`commitEverything`, the
           // `ignoredPaths` probes) or looks one up in the shadow store has already run.
-          const files = res.files.map((f) => ({ ...f, path: toPosix(f.path) }));
+          // Both working-tree path lists are budgeted before anything is rendered, and both
+          // channels are built from the cut lists (`src/lib/commitBudget.ts`) — a few thousand
+          // untracked files otherwise made the result undeliverable after the commit had landed.
+          const lists = planCommitLists({
+            files: res.files.map((f) => ({ ...f, path: toPosix(f.path) })),
+            leftUncommitted: res.leftUncommitted,
+          });
+          const files = lists.files;
           const ignored = res.ignored.map(toPosix);
           settled = settled.map(toPosix);
           const conflicted = remaining.filter((c) => c.conflicted).map((c) => toPosix(c.path));
           const unrecorded = remaining.filter((c) => c.unrecorded).map((c) => toPosix(c.path));
           const unrecordedSet = new Set(unrecorded);
           const collided = conflicted.filter((p) => !unrecordedSet.has(p));
-          const added = files.reduce((sum, f) => sum + f.added, 0);
-          const removed = files.reduce((sum, f) => sum + f.removed, 0);
+          // Summed over the FULL list, not the budgeted cut: the headline reports the commit, and
+          // `filesChanged` beside it is the full count too.
+          const added = res.files.reduce((sum, f) => sum + f.added, 0);
+          const removed = res.files.reduce((sum, f) => sum + f.removed, 0);
           // `headSha` reports a clone with no commits as the sentinel "unborn" — say so rather than
           // presenting the sentinel as if it were a commit id.
           const headAt = res.sha === 'unborn' ? 'no commits yet' : `HEAD ${res.sha.slice(0, 8)}`;
@@ -271,9 +336,11 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
                   `record of: ${settled.join(', ')} (${headAt})`;
           const text = [
             headline,
-            ...files.map((f) => `  ${f.path} +${f.added} -${f.removed}`),
-            res.leftUncommitted.length
-              ? `left uncommitted (not this session's): ${res.leftUncommitted.join(', ')}`
+            ...files.map(renderCommittedFileLine),
+            lists.filesOmitted > 0 ? renderFilesOmittedLine(lists.filesOmitted, res.sha) : '',
+            lists.leftUncommitted.length ? renderLeftUncommittedLine(lists.leftUncommitted) : '',
+            lists.leftUncommittedOmitted > 0
+              ? renderLeftUncommittedOmittedLine(lists.leftUncommittedOmitted)
               : '',
             unrecorded.length
               ? `⚠ excluded — this session's change to ${unrecorded.join(', ')} could not be ` +
@@ -302,9 +369,11 @@ export function registerCommit(server: McpServer, ctx: AppContext): void {
               // cannot disagree about a separator. `leftUncommitted` is converted at its source
               // (see `commitSession`/`commitPaths`), the one list that always was.
               files,
+              filesOmitted: lists.filesOmitted,
               scope: effective,
               session: ctx.shadows.sessionId,
-              leftUncommitted: res.leftUncommitted,
+              leftUncommitted: lists.leftUncommitted,
+              leftUncommittedOmitted: lists.leftUncommittedOmitted,
               conflicted,
               unrecorded,
               ignored,
@@ -379,14 +448,27 @@ async function commitSession(
     paths?: string[];
     allowEmpty?: boolean;
     fold?: (p: string) => string;
+    /**
+     * Whether this session tracked any change when the call began, before its opening refresh.
+     * Only the refusal wording reads it: tracked-then-settled is "already at HEAD", not "no
+     * changes", and must not be told to widen to scope "all".
+     */
+    trackedBeforeRefresh?: boolean;
   },
 ): Promise<CommitOutcome> {
   const all = await ctx.shadows.changes(id);
   const fold = opts.fold ?? ((p: string) => p);
   // Keyed by the folded name, valued by the caller's own spelling, so a refusal names what the
   // caller typed and never a folded form that may name no file.
+  // Normalised the way `commitPaths`/`withoutIgnored` normalise (`toPosix`, strip a leading
+  // `./`), so `./sections/a.tex` names the entry keyed `sections/a.tex` under every scope alike.
   const wanted = opts.paths?.length
-    ? new Map(opts.paths.map((p) => [fold(toPosix(p)), toPosix(p)] as const))
+    ? new Map(
+        opts.paths.map((raw) => {
+          const p = toPosix(raw);
+          return [fold(p.replace(/^(\.\/)+/, '')), p] as const;
+        }),
+      )
     : null;
   const selected = wanted ? all.filter((c) => wanted.has(fold(c.path))) : all;
 
@@ -448,10 +530,19 @@ async function commitSession(
       throw new Error(ignoredSentence);
     }
 
+    // `all` empty with no ignored entry means the session tracks nothing now; if it tracked
+    // something when the call began, the opening refresh settled all of it — the edits went back
+    // to their original text, or HEAD already holds them. That is not "made no changes", and the
+    // way out is not scope "all": that would commit other people's changes, never this session's.
+    const settledByRefresh = all.length === 0 && opts.trackedBeforeRefresh === true;
     const baseMessage =
       conflicted.length === 0
-        ? 'Nothing to commit (this session has made no changes). Use scope "all" to commit ' +
-          'changes made by other sessions or outside this server.'
+        ? settledByRefresh
+          ? "Nothing to commit: this session's changes are already at HEAD (reverted to their " +
+            "original text, or already committed) — nothing of this session's is left, and scope " +
+            '"all" would commit OTHER changes in the clone, not this session\'s.'
+          : 'Nothing to commit (this session has made no changes). Use scope "all" to commit ' +
+            'changes made by other sessions or outside this server.'
         : unrecorded.length > 0 && collided.length > 0
           ? `Nothing to commit: every change is excluded — ${unrecorded.join(', ')} could not be ` +
             'recorded (see the server log for why), and this session and someone else changed ' +

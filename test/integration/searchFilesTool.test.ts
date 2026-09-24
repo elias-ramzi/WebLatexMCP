@@ -317,6 +317,31 @@ describe('search_files: the guards', () => {
     expect(r.omittedBySize + r.omittedByCap).toBeGreaterThan(0);
   });
 
+  it('charges the budget for BOTH channels — the text renders every kept match again', async () => {
+    // The text channel is not a summary: it renders each kept match (path header, line, context)
+    // a second time. A budget charged on the JSON alone let the whole result reach ~2x the
+    // budget (39,675 characters observed for a 20000 budget), which is the #68 blowup halved.
+    const { client, userDir } = await setup();
+    const fat = Array.from(
+      { length: 400 },
+      (_, i) => `\\Cref{tab:sota} ${'x'.repeat(180)} ${i}`,
+    ).join('\n');
+    await writeFile(path.join(userDir, 'fat.tex'), `${fat}\n`);
+
+    const res = await client.callTool({
+      name: 'search_files',
+      arguments: { project: 'paper', pattern: 'Cref{tab:sota}', contextLines: 1 },
+    });
+    const r = out(res);
+    // Everything outside the matches in the text (the header line, the skipped-files line and the
+    // notes) is bounded prose, a few hundred characters each; 2500 covers it with room to spare.
+    const NON_MATCH_TEXT_ALLOWANCE = 2500;
+    expect(JSON.stringify(r.matches).length + textOf(res).length).toBeLessThanOrEqual(
+      SEARCH_CONTENT_BUDGET + NON_MATCH_TEXT_ALLOWANCE,
+    );
+    expect(r.omittedBySize).toBeGreaterThan(0);
+  });
+
   it('reports every path with forward slashes, from a nested directory', async () => {
     const { client } = await setup();
 

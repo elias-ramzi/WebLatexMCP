@@ -73,8 +73,18 @@ export async function appendWritingConvention(
   );
 }
 
+/** The line endings CommonMark recognises: LF, CR+LF, and a lone CR — and nothing else. */
+const COMMONMARK_LINE_ENDING = /\r\n?|\n/;
+
 /**
  * Format a rule as a markdown bullet; continuation lines of a multi-line rule stay indented.
+ *
+ * The rule is split on exactly the line endings CommonMark recognises — LF, CR+LF, and a CR on
+ * its own — and rejoined with LF. Splitting on LF alone left a lone CR inside one "line", so the
+ * text after it reached the file unindented and unescaped — a markdown
+ * reader starts a new line there, and `Use lidar.\r# Forged heading` landed a column-0 heading.
+ * Nothing else is treated as a break: U+2028/U+2029, U+0085, VT and FF are not CommonMark line
+ * endings, so no block can start after one and they stay inline text.
  *
  * Every line is escaped (`escapeLeadingBlockMarker`) before the bullet/indent prefix is added:
  * a rule's first line is already shielded from being parsed as a heading or blockquote by the
@@ -86,23 +96,45 @@ export async function appendWritingConvention(
  * restructures) that section, so a rule must never be able to do that on any of its lines.
  */
 function formatBullet(rule: string): string {
-  const lines = rule.split('\n').map(escapeLeadingBlockMarker);
+  const lines = rule.split(COMMONMARK_LINE_ENDING).map(escapeLeadingBlockMarker);
   const first = lines[0] ?? '';
   const rest = lines.slice(1).map((line) => `  ${line}`);
   return [`- ${first}`, ...rest].join('\n') + '\n';
 }
 
 /**
- * Neutralise a leading heading (`#`) or blockquote (`>`) marker on one line by escaping it with
- * a backslash — which CommonMark renders as the literal character — rather than rejecting the
- * rule outright. Escaping (not rejecting) is chosen so a rule that merely *starts* with one of
- * these characters (e.g. quoting a hashtag, or starting a sentence with "> " as an arrow) is
- * still recorded, byte-preserved apart from the one inserted backslash; only the character that
- * would open a new block is touched, up to 3 leading spaces of indent (CommonMark still parses a
- * heading/blockquote through that much indent) plus the marker itself.
+ * A line that is nothing but a run of `=` or of `-` (up to 3 spaces of indent, trailing
+ * whitespace allowed) is a setext heading underline: placed under a text line — which is exactly
+ * where a continuation line of a multi-line rule sits — it turns that line into an H1/H2, the
+ * same forged heading an ATX `#` would open. One backslash before the run's first character
+ * leaves the text visible and the line no longer an underline.
+ *
+ * Only the WHOLE-line run is matched, so a continuation line that is a real list item
+ * (`- nested item`) stays a nested list, as it always has, and a spaced thematic break (`- - -`)
+ * is left alone — neither can underline anything. A bare `-` or `- ` IS matched: an empty list
+ * item cannot interrupt a paragraph, so CommonMark reads that line as an underline too.
+ */
+const SETEXT_UNDERLINE = /^( {0,3})(=+|-+)(?=[ \t]*$)/;
+
+/**
+ * Neutralise a leading heading (`#`), blockquote (`>`) or code-fence (` ``` ` / `~~~`) marker on
+ * one line by escaping it with a backslash — which CommonMark renders as the literal character —
+ * rather than rejecting the rule outright. Escaping (not rejecting) is chosen so a rule that
+ * merely *starts* with one of these characters (e.g. quoting a hashtag, or starting a sentence
+ * with "> " as an arrow) is still recorded, byte-preserved apart from the one inserted backslash;
+ * only the character that would open a new block is touched, up to 3 leading spaces of indent
+ * (CommonMark still parses a heading/blockquote/fence through that much indent) plus the marker.
+ *
+ * A fence needs three unescaped markers in a row, so one backslash before the first disarms it.
+ * An appended rule must never open a fence: a fence has no end short of a matching closing line,
+ * so a rule quoting a bare ` ``` ` would swallow every rule after it — for a markdown reader, and
+ * for `countWritingConventions`, whose fence tracker would stop counting there.
+ *
+ * A setext underline (`---` / `===`, see `SETEXT_UNDERLINE`) is escaped the same way: it opens no
+ * block itself, but it turns the rule line above it into a heading.
  */
 function escapeLeadingBlockMarker(line: string): string {
-  return line.replace(/^( {0,3})([#>])/, '$1\\$2');
+  return line.replace(/^( {0,3})([#>]|```|~~~)/, '$1\\$2').replace(SETEXT_UNDERLINE, '$1\\$2');
 }
 
 /**
@@ -157,7 +189,9 @@ export function guideEditBlockedMessage(targetPath: string): string {
  * Lines inside a fenced code block (delimited by a line starting with ` ``` `, indented by at
  * most the three spaces CommonMark allows) are skipped even when they look like a bullet: a
  * hand-written region quoting `- a\n- b` inside a fence is example text, not a rule, and counting
- * it would over-report. A line of only markers and whitespace (a spaced thematic break such as
+ * it would over-report. The toggle is file-wide, which is why `formatBullet` must never write a
+ * line this test matches: `escapeLeadingBlockMarker` escapes a rule's leading ` ``` `, so an
+ * appended rule quoting an unclosed fence cannot hide every rule after it from this count. A line of only markers and whitespace (a spaced thematic break such as
  * `* * *` or `- - -`) is not counted either — it matches the bullet shape but carries no rule.
  *
  * Never throws: an unconfigured path, a missing file, or a permission error all resolve to
@@ -175,7 +209,7 @@ export async function countWritingConventions(
   } catch {
     return undefined;
   }
-  const lines = contents.split(/\r\n|\n/);
+  const lines = contents.split(COMMONMARK_LINE_ENDING);
   let count = 0;
   let inFence = false;
   for (const line of lines) {

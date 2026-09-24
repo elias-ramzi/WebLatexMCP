@@ -340,14 +340,12 @@ describe('bibtexEntrySpan: a believed closer is ALONE on its line and outside th
     expect(cut(body)).toBe(body);
   });
 
-  it('fails open on a single-line entry, whose closer is not alone on its line', () => {
-    // A deliberate, documented consequence: a one-line entry has no believable closer, so the
-    // span runs to the end of the text. Fail open is the right answer — rescuing it would take a
-    // positional guess, which is what this function must never make.
-    const oneLine = '@inproceedings{x, title={T}}';
-    expect(cut(oneLine)).toBe(oneLine);
-    const withJunk = oneLine + '\njunk';
-    expect(cut(withJunk)).toBe(withJunk);
+  it('still fails open when a stray closer balances a one-line entry mid-line', () => {
+    // NOT a regression pin (it passed before the single-line rule too): it guards that believing
+    // a one-line entry's close did not loosen "the close ENDS its line" — a depth-0 reached with
+    // more of the entry after it on the same line is a stray closer, never the entry's.
+    const oneLine = '@article{k, title={A } weird}, year={2020}}';
+    expect(cut(oneLine + '\njunk')).toBe(oneLine + '\njunk');
   });
 
   // The other half: `entryEnd` used to track ONE delimiter pair and ignore the other entirely, so
@@ -392,5 +390,53 @@ describe('bibtexEntrySpan: a believed closer is ALONE on its line and outside th
     expect(cut(brace)).toBe(brace);
     const paren = '@article(k,\n  a = (x{),\n  b = "z}\n)\n",\n)';
     expect(cut(paren)).toBe(paren);
+  });
+});
+
+describe('bibtexEntrySpan: a balanced ONE-LINE entry is cut at its close', () => {
+  function cut(text: string): string | null {
+    const span = bibtexEntrySpan(text);
+    return span === null ? null : text.slice(span.start, span.end);
+  }
+
+  // Crossref's `/transform` serves the whole entry on ONE line (` @article{Smith_2020, title={…},
+  // …, year={2020}}` — a leading space, and the close shares its line with the last field), so the
+  // closer is never alone on its line. The alone-on-its-line rule therefore believed no close at
+  // all, failed open to the end of the text, and a trailing `<script>` or a CDN footer rode along
+  // into the user's .bib — while the CHANGELOG promised neither does.
+  const CROSSREF =
+    '@article{Smith_2020, title={A {B} c}, DOI={10.1/x}, author={Smith, J.}, year={2020}}';
+
+  it('drops a trailing <script> after a one-line Crossref entry', () => {
+    expect(cut(' ' + CROSSREF + '\n<script>alert(1)</script>')).toBe(CROSSREF);
+  });
+
+  it('drops a trailing HTML footer after a one-line entry, and a CRLF body alike', () => {
+    expect(cut(CROSSREF + '\n<p>Served by edge-cache</p>')).toBe(CROSSREF);
+    expect(cut(CROSSREF + ' \r\n<p>Served by edge-cache</p>')).toBe(CROSSREF);
+  });
+
+  it('returns a one-line entry with nothing after it unchanged', () => {
+    expect(cut(CROSSREF)).toBe(CROSSREF);
+    expect(bibtexEntrySpan(CROSSREF)).toEqual({ start: 0, end: CROSSREF.length });
+  });
+
+  it('keeps a run of one-line entries and still cuts what follows the last', () => {
+    const two = CROSSREF + '\n@proceedings{p, title={P}}';
+    expect(cut(two + '\n<script>alert(1)</script>')).toBe(two);
+  });
+
+  it('fails OPEN on a one-line entry whose braces never balance', () => {
+    const broken = '@article{Smith_2020, title={A {B} c}, year={2020}\n<script>alert(1)</script>';
+    expect(cut(broken)).toBe(broken);
+  });
+
+  it('fails OPEN when the first line balances but the entry continues below it', () => {
+    // NOT a regression pin (it failed open before the fix too): it guards the direction this rule
+    // could break. `{A } b}` closes the header's line at depth 0, but the entry goes on, and its
+    // real close is the lone `}` further down — which the text after the candidate close gives
+    // away as an unmatched closer. Cutting at the first line would truncate the entry.
+    const body = '@article{k, title={A } b}\n  year = {2020}\n}\njunk';
+    expect(cut(body)).toBe(body);
   });
 });

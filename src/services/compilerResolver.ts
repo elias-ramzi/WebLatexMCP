@@ -1,4 +1,4 @@
-import { createCompiler } from './compiler.js';
+import { createCompiler, spawnFailureReason, UnrunnableCompilerError } from './compiler.js';
 import type { LatexCompiler } from './compiler.js';
 import type { CompilerKind } from '../types.js';
 
@@ -18,14 +18,37 @@ export interface CompilerSelection {
 /** Thrown when no backend the caller may have can be found on PATH. */
 export class MissingCompilerError extends Error {
   readonly missing: CompilerKind;
+  /** Other backends that are on PATH AND ran — the ones a retry could use. */
   readonly installed: readonly CompilerKind[];
+  /** Other backends that are on PATH but could not be run — never offered as a retry. */
+  readonly unrunnable: readonly CompilerKind[];
 
-  constructor(missing: CompilerKind, installed: readonly CompilerKind[], message: string) {
+  constructor(
+    missing: CompilerKind,
+    installed: readonly CompilerKind[],
+    message: string,
+    unrunnable: readonly CompilerKind[] = [],
+  ) {
     super(message);
     this.name = 'MissingCompilerError';
     this.missing = missing;
     this.installed = installed;
+    this.unrunnable = unrunnable;
   }
+}
+
+/** A backend other than the missing one that is on PATH but whose probe could not run it. */
+export interface UnrunnableBackend {
+  kind: CompilerKind;
+  /** The spawn failure, as `UnrunnableCompilerError` words it (`spawn tectonic EACCES`). */
+  reason: string;
+}
+
+/** "tectonic is installed but could not be run (spawn tectonic EACCES)", joined with "and". */
+function unrunnableClause(unrunnable: readonly UnrunnableBackend[]): string {
+  return unrunnable
+    .map((u) => `${u.kind} is installed but could not be run (${u.reason})`)
+    .join(' and ');
 }
 
 /**
@@ -81,6 +104,7 @@ export function missingMessage(
   missing: CompilerKind,
   installed: readonly CompilerKind[],
   reason: MissingReason,
+  unrunnable: readonly UnrunnableBackend[] = [],
 ): string {
   const opening =
     reason === 'requested'
@@ -88,6 +112,18 @@ export function missingMessage(
       : `${missing} is not on PATH`;
 
   const alt = installed[0];
+  if (alt === undefined && unrunnable.length > 0) {
+    // Something IS on PATH, so "neither is installed" would be false — but nothing on PATH runs,
+    // so there is nothing to retry with either. The missing backend still leads: when the user
+    // asserted it, that is the fact they need first, and the broken other one is why nothing was
+    // (or could be) offered in its place.
+    const broken = unrunnable.map((u) => u.kind).join(' or ');
+    return (
+      `${opening}, and ${unrunnableClause(unrunnable)} — no backend can build a document here. ` +
+      `Install ${missing}, or make sure ${broken} is executable and runs from a shell, and that ` +
+      'it is on PATH. Run the doctor tool for a full toolchain report.'
+    );
+  }
   if (alt === undefined) {
     const others = COMPILER_KINDS.filter((k) => k !== missing);
     return (
@@ -110,10 +146,12 @@ export function missingMessage(
           'substituted, so nothing was picked for you.'
         : `${missing} was only the default, and nothing was substituted for it automatically.`;
   const caveat = caveatFor(alt);
+  const broken = unrunnable.length > 0 ? `${unrunnableClause(unrunnable)}.` : '';
   return [
     `${opening}. ${joinIs(installed)} — retry this call with compiler: "${alt}", or set ` +
       `WEB_LATEX_MCP_COMPILER=${alt} to select it for every compile.`,
     caveat,
+    broken,
     tail,
   ]
     .filter(Boolean)
@@ -196,25 +234,45 @@ export class CompilerResolver {
       seen.set(kind, ok);
       return ok;
     };
-    const installedBesides = async (missing: CompilerKind): Promise<CompilerKind[]> => {
-      const found: CompilerKind[] = [];
+    // Surveys the OTHER backends for a message about a missing one. A backend on PATH whose probe
+    // could not run it (`UnrunnableCompilerError`) is recorded, not rethrown: rethrowing here
+    // replaced "the latexmk you asked for is missing" with "tectonic could not be run … no other
+    // backend was substituted", a message about a backend nobody asked for that never mentions
+    // the one they did. It is still never counted as installed, so it is never offered as a
+    // retry or substituted. Any other probe failure propagates as before.
+    const installedBesides = async (
+      missing: CompilerKind,
+    ): Promise<{ installed: CompilerKind[]; unrunnable: UnrunnableBackend[] }> => {
+      const installed: CompilerKind[] = [];
+      const unrunnable: UnrunnableBackend[] = [];
       for (const kind of COMPILER_KINDS) {
         if (kind === missing) continue;
-        if (await available(kind)) found.push(kind);
+        try {
+          if (await available(kind)) installed.push(kind);
+        } catch (err) {
+          if (!(err instanceof UnrunnableCompilerError)) throw err;
+          unrunnable.push({ kind, reason: spawnFailureReason(err.cause) });
+        }
       }
-      return found;
+      return { installed, unrunnable };
     };
+    const missingError = (
+      missing: CompilerKind,
+      survey: { installed: CompilerKind[]; unrunnable: UnrunnableBackend[] },
+      reason: MissingReason,
+    ): MissingCompilerError =>
+      new MissingCompilerError(
+        missing,
+        survey.installed,
+        missingMessage(missing, survey.installed, reason, survey.unrunnable),
+        survey.unrunnable.map((u) => u.kind),
+      );
 
     if (requested !== undefined) {
       if (await available(requested)) {
         return { kind: requested, compiler: this.compilerFor(requested) };
       }
-      const installed = await installedBesides(requested);
-      throw new MissingCompilerError(
-        requested,
-        installed,
-        missingMessage(requested, installed, 'requested'),
-      );
+      throw missingError(requested, await installedBesides(requested), 'requested');
     }
 
     if (await available(this.configured)) {
@@ -222,17 +280,12 @@ export class CompilerResolver {
     }
 
     if (this.explicit) {
-      const installed = await installedBesides(this.configured);
-      throw new MissingCompilerError(
-        this.configured,
-        installed,
-        missingMessage(this.configured, installed, 'explicit'),
-      );
+      throw missingError(this.configured, await installedBesides(this.configured), 'explicit');
     }
 
     // An unchosen default may be substituted: take the first other backend that is there.
-    const installed = await installedBesides(this.configured);
-    const alt = installed[0];
+    const survey = await installedBesides(this.configured);
+    const alt = survey.installed[0];
     if (alt !== undefined) {
       return {
         kind: alt,
@@ -241,16 +294,13 @@ export class CompilerResolver {
         note: fallbackNote(this.configured, alt),
       };
     }
-    // `installed` is provably `[]` here: `alt` is `installed[0]`, and the branch above returned
-    // whenever that was defined — so reaching this line means the fallback loop found nothing.
-    // That is why `missingMessage` takes its "nothing at all is installed" route and its
-    // 'default' tail is unreachable *today*. Both facts are load-bearing; if a future filter
+    // `survey.installed` is provably `[]` here: `alt` is `installed[0]`, and the branch above
+    // returned whenever that was defined — so reaching this line means the fallback loop found
+    // nothing runnable. That is why `missingMessage` takes its "nothing installed" route (or, when
+    // the other backend is on PATH but unrunnable, its "nothing runs" route) and its 'default'
+    // tail is unreachable *today*. Both facts are load-bearing; if a future filter
     // (a denylist, a per-project pin, a backend excluded from fallback) ever lets a non-empty
     // `installed` reach here, only the tail changes — it is already honest for that case.
-    throw new MissingCompilerError(
-      this.configured,
-      installed,
-      missingMessage(this.configured, installed, 'default'),
-    );
+    throw missingError(this.configured, survey, 'default');
   }
 }

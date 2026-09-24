@@ -16,6 +16,33 @@ describe('isBibFile', () => {
     expect(isBibFile('bibliography')).toBe(false);
     expect(isBibFile('notes.bib.txt')).toBe(false);
   });
+
+  // Windows normalises a trailing dot or space off the final component and reads `name:stream`
+  // as an alternate data stream of `name`, so each of these creates or writes `refs.bib` there.
+  // `extname` saw `.bib.`, `.bib ` and `.bib::$DATA`, and `write_file` skipped confirmBibEdit.
+  it('matches names Windows normalises onto a .bib (trailing dots/spaces, data streams)', () => {
+    expect(isBibFile('refs.bib.')).toBe(true);
+    expect(isBibFile('refs.bib ')).toBe(true);
+    expect(isBibFile('refs.bib. .')).toBe(true);
+    expect(isBibFile('refs.bib::$DATA')).toBe(true);
+    expect(isBibFile('refs.bib:stream')).toBe(true);
+    expect(isBibFile('refs.bib.:stream:$DATA')).toBe(true);
+    expect(isBibFile('sub/Refs.BIB. ')).toBe(true);
+    expect(isBibFile('sub\\refs.bib::$DATA')).toBe(true);
+  });
+
+  it('only ever widens: a POSIX file literally named "*.bib" still matches', () => {
+    // On POSIX `refs.tex:x.bib` is a real file with a .bib extension; cutting at ':' alone
+    // would have stopped guarding it.
+    expect(isBibFile('refs.tex:x.bib')).toBe(true);
+  });
+
+  it('does not cut a drive letter or a directory colon into the name', () => {
+    expect(isBibFile('C:/paper/refs.bib')).toBe(true);
+    expect(isBibFile('C:/paper/main.tex')).toBe(false);
+    expect(isBibFile('a:b/main.tex')).toBe(false);
+    expect(isBibFile('main.tex.')).toBe(false);
+  });
 });
 
 describe('extractEntryKeys', () => {

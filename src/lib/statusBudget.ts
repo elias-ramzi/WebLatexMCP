@@ -21,7 +21,10 @@
  * Four decisions carry this module.
  *
  *  1. **The commit lists are deliberately NOT in this budget's structured half.**
- *     `structuredContent.behindCommits`/`aheadCommits` stay complete, because
+ *     `structuredContent.behindCommits` stays complete, and so does `aheadCommits` while
+ *     `origin/<branch>` exists (when it is absent `ahead` can be the whole history, so
+ *     `GitService.status` caps that list at `CONFLICT_MAX_COMMITS` and counts the rest in
+ *     `aheadCommitsOmitted` — a cut made in git's layer, not by this budget), because
  *     `src/lib/conflictBudget.ts` caps its own `remoteCommits` at `CONFLICT_MAX_COMMITS` and points
  *     the caller at `status.behindCommits` as the complete list (`CONFLICT_COMMITS_MORE_HINT` in
  *     `conflictText.ts` says so in words). Which fields carry such a promise, and which code made
@@ -129,8 +132,11 @@ export const STATUS_PEER_TEXT_PATHS = 5;
  * than the 20000 content budget for one specific reason: unlike a path list, this block is a
  * *rendering of data that ships complete in the same result*. `renderCommitLines` already ends a
  * truncated block with "… N more commit(s) (see structuredContent)", and for `status` that pointer
- * is true — `behindCommits`/`aheadCommits` are uncapped. Nothing is lost by bounding the prose view
- * of a list the caller already has in full.
+ * is true — `behindCommits` is uncapped, and so is `aheadCommits` while `origin/<branch>` exists.
+ * When it is absent `aheadCommits` is capped at `CONFLICT_MAX_COMMITS` upstream of this module, and
+ * `status` adds its own line counting `aheadCommitsOmitted`, the commits listed nowhere; the
+ * pointer still holds for every commit `structuredContent` carries. Nothing is lost by bounding the
+ * prose view of a list the caller already has.
  *
  * The pool is split into two allocations of the same figure rather than shared, because the two
  * blocks answer different questions ("what landed upstream" vs "what a push would send") and a clone
@@ -362,7 +368,9 @@ export const STATUS_COMPLETENESS_PROMISES: readonly StatusCompletenessPromise[] 
     field: 'aheadCommits',
     affordable:
       "Bounded by how many commits this clone has made since its last push — the session's own " +
-      'work, not a document-controlled list.',
+      'work, not a document-controlled list. When origin/<branch> is absent (where `ahead` can be ' +
+      'the whole history) GitService.status caps the list at CONFLICT_MAX_COMMITS and counts the ' +
+      'rest in `aheadCommitsOmitted`.',
     dependents: [
       {
         module: 'src/lib/conflictText.ts',
@@ -787,8 +795,10 @@ export interface CommitTextPlan {
  * what {@link planCommitText} charges, so the plan and the render are the same call and cannot drift.
  *
  * `renderCommitLines`' own trailing "… N more commit(s) (see structuredContent)" line is the whole
- * reason a smaller `maxCommits` is safe here: `status`'s structured commit lists are complete, so
- * that default pointer is true for this caller (`DEFAULT_COMMITS_MORE_HINT`, `conflictText.ts`).
+ * reason a smaller `maxCommits` is safe here: `status`'s structured commit lists carry every commit
+ * the text leaves out (`aheadCommits` is capped only when `origin/<branch>` is absent, and then
+ * `aheadCommitsOmitted` counts what neither channel lists), so that default pointer is true for this
+ * caller (`DEFAULT_COMMITS_MORE_HINT`, `conflictText.ts`).
  */
 export function renderCommitBlock(plan: CommitTextPlan): string[] {
   return renderCommitLines(plan.commits, { maxCommits: plan.maxCommits });
@@ -804,8 +814,10 @@ export function renderCommitBlock(plan: CommitTextPlan): string[] {
  * the rendered block fits {@link STATUS_COMMIT_TEXT_BUDGET} — at least one commit always survives,
  * since a block that names nothing tells the caller nothing.
  *
- * Nothing here is a cut from the RESULT: `structuredContent.behindCommits`/`aheadCommits` stay
- * complete and untouched, which is the invariant `conflictBudget.ts` depends on. That is why this
+ * Nothing here is a cut from the RESULT: `structuredContent.behindCommits`/`aheadCommits` are left
+ * untouched — `behindCommits` complete, which is the invariant `conflictBudget.ts` depends on, and
+ * `aheadCommits` complete while `origin/<branch>` exists (capped at `CONFLICT_MAX_COMMITS` with
+ * `aheadCommitsOmitted` when it is absent, by `GitService.status`, not here). That is why this
  * returns no `…Omitted` counter — there is nothing omitted to count, only something not re-rendered.
  */
 export function planCommitText(

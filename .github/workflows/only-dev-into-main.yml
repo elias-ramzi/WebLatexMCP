@@ -1,6 +1,10 @@
-# Policy gate: a pull request into `main` may only come from `dev`.
+# Policy gate: a pull request into `main` may only come from this repository's `dev`.
 # GitHub branch protection cannot constrain a PR's head branch, so this required
-# check enforces it. It reads only github.head_ref (no checkout of PR code).
+# check enforces it. It reads only the PR's head ref and head repo (no checkout of PR code).
+#
+# The head repo is checked too: a fork's branch named `dev` is not our `dev`. And the head ref
+# reaches the shell only through `env:` — interpolating `${{ github.head_ref }}` into the script
+# body splices a contributor-chosen branch name into the command text (script injection).
 name: Branch policy
 
 on:
@@ -13,10 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify the PR source branch is dev
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         run: |
-          head='${{ github.head_ref }}'
-          if [ "$head" != "dev" ]; then
-            echo "::error::PRs into 'main' must come from 'dev' (this PR is from '$head')."
+          if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::error::PRs into '$BASE_REF' must come from this repository's 'dev' (this PR is from '$HEAD_REPO')."
             exit 1
           fi
-          echo "OK: source branch is 'dev'."
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::PRs into '$BASE_REF' must come from 'dev' (this PR is from '$HEAD_REF')."
+            exit 1
+          fi
+          echo "OK: source branch is '$THIS_REPO:dev'."

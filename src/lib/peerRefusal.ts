@@ -4,11 +4,15 @@ import type { ShadowStore } from '../services/shadowStore.js';
 import type { SessionRegistry } from '../services/sessionRegistry.js';
 import { toPosix } from './paths.js';
 import { foldCase } from './caseFold.js';
+import type { PeerShadowEntry } from '../services/shadowStore.js';
+import type { PeerSession } from '../services/sessionRegistry.js';
 import {
   attributePeers,
   collectPeerShadows,
   composeClosing,
   renderPeerRefusal,
+  PUSH_VOCABULARY,
+  REFUSAL_PATH_CAP,
   type ClosingVocabulary,
 } from './peerAttribution.js';
 
@@ -41,6 +45,88 @@ export function dedupeFolded(items: string[], fold: (p: string) => string): stri
     out.push(item);
   }
   return out;
+}
+
+/**
+ * Splits `paths` (dirty paths, or the paths a pull names) into the ones a refusal must dispute.
+ *
+ * A path is disputed when this session's own shadow does NOT list it (someone else's work, or
+ * nobody's) — or when it does, but a live peer's shadow lists it too, or a live peer's index is
+ * unreadable (`null` means unreadable, never "owns nothing", so it may list anything). The second
+ * half is the one that used to be missing: subtracting this session's paths first made a file both
+ * sessions edited "ours", and a `push` carrying a `message` commits via `git add -A`, which swept
+ * the peer's uncommitted lines in that file into our commit and pushed them. `commit scope:
+ * "paths"` has always refused any path a live peer lists, even one the caller owns too
+ * (`peerOwnership`, `src/lib/commitPaths.ts`); this is the same line, held for `push` and for the
+ * pull refusal's attribution.
+ *
+ * `shared` is the subset of `disputed` this session's shadow also lists — reported separately so
+ * the refusal can say those files carry this session's edits as well, and name the route that
+ * takes only those (`commit`, default scope "session"). `sharedUnconfirmed` is true when at least
+ * one of them is disputed only because a peer's index could not be read, so the wording does not
+ * claim a peer edited a file nobody has shown it did.
+ */
+function disputedPaths(
+  paths: string[],
+  mine: Set<string>,
+  peers: PeerSession[],
+  entries: Map<string, PeerShadowEntry[] | null>,
+  fold: (p: string) => string,
+): { disputed: string[]; shared: string[]; sharedUnconfirmed: boolean } {
+  let anyUnreadable = false;
+  const peerListed = new Set<string>();
+  for (const p of peers) {
+    const list = entries.get(p.sessionId) ?? null;
+    if (list === null) {
+      anyUnreadable = true;
+      continue;
+    }
+    for (const e of list) peerListed.add(fold(e.path));
+  }
+  const disputed: string[] = [];
+  const shared: string[] = [];
+  let sharedUnconfirmed = false;
+  for (const p of paths) {
+    const key = fold(p);
+    if (!mine.has(key)) {
+      disputed.push(p);
+    } else if (peerListed.has(key)) {
+      disputed.push(p);
+      shared.push(p);
+    } else if (anyUnreadable) {
+      disputed.push(p);
+      shared.push(p);
+      sharedUnconfirmed = true;
+    }
+  }
+  return { disputed, shared, sharedUnconfirmed };
+}
+
+/**
+ * The sentence a refusal adds when some disputed files also carry this session's own edits: they
+ * are not this session's alone, so the route that takes only this session's lines is `commit`'s
+ * default scope, never a `message` on `push` (which commits the whole tree, the peer's lines
+ * included). The push itself still waits on the other lines in those files — the rest of the
+ * closing says whose they are and how to wait for them.
+ */
+function sharedAdvice(shared: string[], unconfirmed: boolean, forPush: boolean): string {
+  const only = shared.length === 1;
+  const shown =
+    shared.length <= REFUSAL_PATH_CAP
+      ? shared.join(', ')
+      : `${shared.slice(0, REFUSAL_PATH_CAP).join(', ')}, … ${shared.length - REFUSAL_PATH_CAP} more`;
+  const head =
+    `${shown} also ${only ? 'carries' : 'carry'} this session's own edits, but a live session ` +
+    `has edited ${only ? 'it' : 'them'} too` +
+    (unconfirmed ? " (or may have: a live session's change index cannot be read)" : '') +
+    ', so ' +
+    `${only ? 'it is' : 'they are'} not this session's alone. Commit this session's own lines ` +
+    'with `commit` (default scope "session") — it stages only this session\'s changes, never a ' +
+    "peer's —";
+  return forPush
+    ? `${head} then, once the owner has committed, push without a \`message\`: a push carrying ` +
+        "a `message` commits the whole working tree (`git add -A`), the peer's lines included."
+    : `${head} and leave the rest of ${only ? 'that file' : 'those files'} to ${only ? 'its' : 'their'} owner.`;
 }
 
 /**
@@ -82,16 +168,16 @@ export async function guardPeerWork(deps: PeerRefusalDeps, id: string, dir: stri
   if (dirty.length === 0) return;
 
   const mine = new Set((await deps.shadows.changes(id)).map((c) => fold(c.path)));
-  const theirs = dirty.filter((p) => !mine.has(fold(p)));
-  if (theirs.length === 0) return;
+  const entries = await collectPeerShadows(deps.shadows, id, peers);
+  const { disputed, shared, sharedUnconfirmed } = disputedPaths(dirty, mine, peers, entries, fold);
+  if (disputed.length === 0) return;
 
-  const attribution = attributePeers(
-    theirs,
-    peers,
-    await collectPeerShadows(deps.shadows, id, peers),
-    fold,
-  );
-  throw new Error(renderPeerRefusal(theirs, attribution, Date.now()));
+  const attribution = attributePeers(disputed, peers, entries, fold);
+  const closing =
+    shared.length === 0
+      ? undefined
+      : `${sharedAdvice(shared, sharedUnconfirmed, true)} ${composeClosing(attribution, PUSH_VOCABULARY)}`;
+  throw new Error(renderPeerRefusal(disputed, attribution, Date.now(), closing));
 }
 
 /**
@@ -136,11 +222,13 @@ export const PULL_VOCABULARY: ClosingVocabulary = {
  * this function would be decorated with the wrong framing ("the pull would overwrite…" on a push).
  * It falls through to the plain-passthrough branch below, same as any other error type.
  *
- * Paths this session itself owns (per its own shadow) are subtracted first, exactly as
- * `guardPeerWork` subtracts `mine` before attributing `theirs` — otherwise this session's own
- * edits would be reported as "not this session's", which is false. When nothing foreign remains
- * (or no live peer exists at all) there is nothing to attribute, so the plain typed message passes
- * through unchanged.
+ * Paths only this session owns (per its own shadow, and listed by no live peer) are left out, by
+ * the same `disputedPaths` rule `guardPeerWork` applies — otherwise this session's own edits would
+ * be reported as "not this session's", which is false. A path this session owns that a live peer
+ * lists too (or while a live peer's index is unreadable) stays in, and the closing says it carries
+ * this session's edits as well: the typed message's `scope: "paths"` advice bounces off `commit`'s
+ * peer guard for exactly such a path. When nothing disputed remains (or no live peer exists at
+ * all) there is nothing to attribute, so the plain typed message passes through unchanged.
  *
  * `dir` is needed for exactly the reason it is in `guardPeerWork`: `typed.paths` arrives spelled
  * the way git's own stderr names it (the index's spelling), while a shadow key carries the
@@ -174,18 +262,24 @@ export async function enrichPullRefusal(
 
     const fold = (await deps.git.isCaseInsensitive(dir)) ? foldCase : (p: string) => p;
     const mine = new Set((await deps.shadows.changes(id)).map((c) => fold(c.path)));
-    const theirs = typed.paths.filter((p) => !mine.has(fold(p)));
-    if (theirs.length === 0) return fallback;
-
-    const attribution = attributePeers(
-      theirs,
+    const entries = await collectPeerShadows(deps.shadows, id, peers);
+    const { disputed, shared, sharedUnconfirmed } = disputedPaths(
+      typed.paths,
+      mine,
       peers,
-      await collectPeerShadows(deps.shadows, id, peers),
+      entries,
       fold,
     );
+    if (disputed.length === 0) return fallback;
+
+    const attribution = attributePeers(disputed, peers, entries, fold);
     const now = Date.now();
-    const closing = composeClosing(attribution, PULL_VOCABULARY);
-    return new Error(`${typed.message}\n\n${renderPeerRefusal(theirs, attribution, now, closing)}`);
+    const base = composeClosing(attribution, PULL_VOCABULARY);
+    const closing =
+      shared.length === 0 ? base : `${sharedAdvice(shared, sharedUnconfirmed, false)} ${base}`;
+    return new Error(
+      `${typed.message}\n\n${renderPeerRefusal(disputed, attribution, now, closing)}`,
+    );
   } catch {
     return fallback;
   }

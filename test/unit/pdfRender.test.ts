@@ -13,14 +13,18 @@ import {
   DEFAULT_MAX_EDGE_PX,
   HARD_MAX_EDGE_PX,
   isNativeCanvasMissing,
+  installDomMatrixStub,
+  nativeCanvasLoadable,
+  createCanvasProbe,
+  createPdfjsLoader,
   MAX_PAGES_PER_CALL,
   MAX_GEOMETRY_PAGES,
   MAX_TEXT_LINES_PER_PAGE,
   MAX_IMAGE_RECTS_PER_PAGE,
   MAX_TEXT_PAGES,
-  MAX_TEXT_CHARS_PER_PAGE,
 } from '../../src/services/pdfRender.js';
 import type { PdfjsLoader } from '../../src/services/pdfRender.js';
+import { planExtractedText } from '../../src/lib/extractTextBudget.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47];
@@ -314,20 +318,45 @@ describe('selectPages', () => {
 });
 
 describe('pngName', () => {
-  it('produces the unclipped form', () => {
+  it('keeps the plain name for a default render: no clip, no dpi, no maxEdgePx', () => {
     expect(pngName(3)).toBe('page-3.png');
   });
 
-  it('produces the clipped form with fractions x1000, zero-padded to 4 digits', () => {
-    expect(pngName(3, { x0: 0, y0: 0, x1: 0.5, y1: 0.3 })).toBe(
-      'page-3-clip-0000-0000-0500-0300.png',
-    );
+  it('names a clipped render page-N-<hash>.png — readable, and nothing illegal on Windows', () => {
+    expect(pngName(3, { x0: 0, y0: 0, x1: 0.5, y1: 0.3 })).toMatch(/^page-3-[0-9a-f]{12}\.png$/);
+  });
+
+  it('is deterministic: the same request names the same file', () => {
+    const clip = { x0: 0.1, y0: 0.2, x1: 0.5, y1: 0.9 };
+    expect(pngName(2, clip, { dpi: 150 })).toBe(pngName(2, { ...clip }, { dpi: 150 }));
   });
 
   it('gives two different clips of the same page different names', () => {
     const a = pngName(1, { x0: 0, y0: 0, x1: 0.5, y1: 1 });
     const b = pngName(1, { x0: 0.5, y0: 0, x1: 1, y1: 1 });
     expect(a).not.toBe(b);
+  });
+
+  // The build dir is shared across sessions, so a name two different renders share is an earlier
+  // result's pngPath silently naming a later image. Rounding the clip to three decimals did that
+  // for any two crops closer than 0.0005, and leaving the scale out did it for every dpi.
+  it('gives clips that differ by less than 0.0005 different names', () => {
+    const a = pngName(1, { x0: 0.2, y0: 0.2, x1: 0.2001, y1: 0.2001 });
+    const b = pngName(1, { x0: 0.2, y0: 0.2, x1: 0.2002, y1: 0.2002 });
+    expect(a).not.toBe(b);
+  });
+
+  it('gives two renders of one page at different dpi different names, clipped or not', () => {
+    expect(pngName(1, undefined, { dpi: 72 })).not.toBe(pngName(1, undefined, { dpi: 300 }));
+    expect(pngName(1, undefined, { dpi: 72 })).not.toBe(pngName(1));
+    const clip = { x0: 0, y0: 0, x1: 0.5, y1: 0.5 };
+    expect(pngName(1, clip, { dpi: 72 })).not.toBe(pngName(1, clip, { dpi: 300 }));
+  });
+
+  it('gives two renders of one page at different maxEdgePx different names', () => {
+    expect(pngName(1, undefined, { maxEdgePx: 800 })).not.toBe(
+      pngName(1, undefined, { maxEdgePx: 1200 }),
+    );
   });
 });
 
@@ -380,13 +409,24 @@ describe('isNativeCanvasMissing', () => {
 });
 
 describe('a machine without the native canvas backend', () => {
-  // The case that shipped unpinned the first time. pdf.js needs @napi-rs/canvas for the DOM
-  // geometry globals it uses in Node, so with the backend absent it cannot even OPEN a document —
-  // it dies on "DOMMatrix is not defined", which reads as a corrupt PDF. These drive the real
-  // methods through an injected loader, so deleting the classification in `openDocument`'s catch
-  // makes them fail; testing `isNativeCanvasMissing` alone does not.
-  const backendMissing = () => {
+  // What the backend is still needed for, and what it is not. Only RASTERIZING needs it: pdf.js
+  // used to need it just to be imported (a module-scope `new DOMMatrix()`), which the default
+  // loader now stubs — pinned for real, in a fresh process with the backend hidden, by
+  // test/integration/pdfWithoutCanvas.test.ts, since this process imported pdf.js long ago with the
+  // backend present. What this block pins is the classification: which failure is reported as
+  // what, driven through the real methods via the injectable loader and canvas probe.
+  const domGlobalMissing = () => {
     throw new Error('DOMMatrix is not defined');
+  };
+  // The Claude Desktop extension's failure, verbatim in shape: `.mcpbignore` once dropped pdf.js's
+  // legacy Node build, so the import itself found nothing.
+  const pdfjsModuleMissing = () => {
+    const err = new Error(
+      "Cannot find module '/bundle/node_modules/pdfjs-dist/legacy/build/pdf.mjs' imported from " +
+        '/bundle/dist/services/pdfRender.js',
+    ) as NodeJS.ErrnoException;
+    err.code = 'ERR_MODULE_NOT_FOUND';
+    throw err;
   };
 
   let dir: string;
@@ -402,18 +442,90 @@ describe('a machine without the native canvas backend', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('tells pageCount callers to install the backend, not that the PDF is broken', async () => {
-    const renderer = new PdfRenderer(backendMissing);
-    await expect(renderer.pageCount(pdfPath)).rejects.toThrow(/@napi-rs\/canvas/);
-    // The failure it must NOT be reported as: the document is perfectly valid.
-    await expect(renderer.pageCount(pdfPath)).rejects.not.toThrow(/Failed to open PDF/);
+  it('refuses render up front, naming the Desktop extension and not only `npm i`', async () => {
+    let loads = 0;
+    const renderer = new PdfRenderer(
+      async () => {
+        loads += 1;
+        return (await import('pdfjs-dist/legacy/build/pdf.mjs')) as never;
+      },
+      () => false,
+    );
+    const err = await renderer
+      .render({ pdfPath, outDir: path.join(dir, 'out'), pages: [1] })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PdfRenderError);
+    const message = (err as Error).message;
+    expect(message).toMatch(/@napi-rs\/canvas/);
+    expect(message).toMatch(/render_pages/);
+    // `npm i` means nothing inside a Desktop extension, whose bundle can never carry the binary.
+    expect(message).toMatch(/Desktop extension/);
+    // ...and the tools that DO work without it are not dragged down with it.
+    expect(message).not.toMatch(/extract_text and \/PageLabels reading need it/);
+    // Refused before any work — nothing opened, nothing written. pdf.js is LOADED once (to tell a
+    // missing canvas from a missing pdf.js, which the canvas probe cannot), but no document is.
+    expect(loads).toBe(1);
+    await expect(readdir(dir)).resolves.toEqual(['doc.pdf']);
   });
 
-  it('tells render callers the same thing', async () => {
-    const renderer = new PdfRenderer(backendMissing);
-    await expect(
-      renderer.render({ pdfPath, outDir: path.join(dir, 'out'), pages: [1] }),
-    ).rejects.toThrow(/@napi-rs\/canvas/);
+  it('tells a user whose backend IS installed to restart, since the refusal outlives the cause', async () => {
+    // The canvas probe keeps a definitive "no" for the life of the process, and pins "no" once the
+    // DOMMatrix stub went in after a transient load failure — pdf.js was imported over the stub
+    // and cannot use a backend that loads later. So a user who installs the package, or who hit
+    // an EMFILE, stays refused until a restart, and "install @napi-rs/canvas" alone sends them to
+    // install what is already there.
+    const renderer = new PdfRenderer(
+      async () => (await import('pdfjs-dist/legacy/build/pdf.mjs')) as never,
+      () => false,
+    );
+    const err = await renderer
+      .render({ pdfPath, outDir: path.join(dir, 'out'), pages: [1] })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PdfRenderError);
+    expect((err as Error).message).toMatch(/already installed[^.]*restart the server/);
+  });
+
+  it('names pdf.js, not the canvas, when render finds pdf.js itself unusable', async () => {
+    // The default canvas probe resolves @napi-rs/canvas from pdf.js's own location, so a missing
+    // pdfjs-dist reads as "no canvas" too. Refusing with the canvas message then sends the user to
+    // install a package that is already there — the same wrong-package failure
+    // `isNativeCanvasMissing` is keyed narrowly to avoid.
+    const renderer = new PdfRenderer(pdfjsModuleMissing, () => false);
+    const err = await renderer
+      .render({ pdfPath, outDir: path.join(dir, 'out'), pages: [1] })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PdfRenderError);
+    const message = (err as Error).message;
+    expect(message).toMatch(/pdfjs-dist/);
+    expect(message).toMatch(/not a problem with the document/);
+    expect(message).not.toMatch(/@napi-rs\/canvas/);
+    await expect(readdir(dir)).resolves.toEqual(['doc.pdf']);
+  });
+
+  it('reads page counts regardless of the canvas probe', async () => {
+    // The probe gates rasterizing only. Wired into pageCount by mistake, it would take compile's
+    // pageCount down on every Desktop install again.
+    const renderer = new PdfRenderer(undefined, () => false);
+    await expect(renderer.pageCount(pdfPath)).resolves.toBe(2);
+  });
+
+  it('reports a missing pdf.js module as a broken install, not a broken PDF or a missing canvas', async () => {
+    const renderer = new PdfRenderer(pdfjsModuleMissing);
+    const err = await renderer.pageCount(pdfPath).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PdfRenderError);
+    const message = (err as Error).message;
+    expect(message).not.toMatch(/Failed to open PDF/);
+    expect(message).toMatch(/pdfjs-dist/);
+    expect(message).toMatch(/not a problem with the document/);
+    // The canvas is a separate, optional package this failure says nothing about.
+    expect(message).not.toMatch(/@napi-rs\/canvas/);
+  });
+
+  it('still points a missing DOM global at the backend, and still not at the PDF', async () => {
+    const renderer = new PdfRenderer(domGlobalMissing);
+    const err = await renderer.pageCount(pdfPath).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/@napi-rs\/canvas/);
+    expect((err as Error).message).not.toMatch(/Failed to open PDF/);
   });
 
   it('still reports a genuinely broken PDF as a broken PDF', async () => {
@@ -422,11 +534,168 @@ describe('a machine without the native canvas backend', () => {
     const broken = path.join(dir, 'broken.pdf');
     await writeFile(broken, Buffer.from('%PDF-1.4\nnot a pdf\n', 'latin1'));
     const renderer = new PdfRenderer();
-    await expect(renderer.pageCount(broken)).rejects.not.toThrow(/@napi-rs\/canvas/);
+    const err = await renderer.pageCount(broken).catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/Failed to open PDF/);
+    expect((err as Error).message).not.toMatch(/@napi-rs\/canvas|pdfjs-dist/);
   });
 
   it('reports canRasterize false rather than throwing', async () => {
-    await expect(new PdfRenderer(backendMissing).canRasterize()).resolves.toBe(false);
+    await expect(new PdfRenderer(domGlobalMissing).canRasterize()).resolves.toBe(false);
+  });
+
+  describe('canReadPdf', () => {
+    it('answers ok on this machine', async () => {
+      await expect(new PdfRenderer().canReadPdf()).resolves.toEqual({ ok: true });
+    });
+
+    it('answers ok without the canvas — reading needs none', async () => {
+      await expect(new PdfRenderer(undefined, () => false).canReadPdf()).resolves.toEqual({
+        ok: true,
+      });
+    });
+
+    it('carries the loader failure rather than throwing', async () => {
+      const answer = await new PdfRenderer(pdfjsModuleMissing).canReadPdf();
+      expect(answer.ok).toBe(false);
+      expect(answer.ok === false && answer.error).toMatch(/pdfjs-dist/);
+    });
+  });
+});
+
+describe('installDomMatrixStub', () => {
+  it('installs a stub when the backend does not load and nothing defines the global', () => {
+    const globals: { DOMMatrix?: unknown } = {};
+    expect(installDomMatrixStub(() => false, globals)).toBe(true);
+    // pdf.js's module scope does exactly this; it must not throw.
+    const Ctor = globals.DOMMatrix as new () => unknown;
+    expect(() => new Ctor()).not.toThrow();
+  });
+
+  it('leaves the global to pdf.js when the backend loads', () => {
+    // With the backend present pdf.js installs the REAL DOMMatrix; a stub there would shadow it
+    // and break rasterizing.
+    const globals: { DOMMatrix?: unknown } = {};
+    expect(installDomMatrixStub(() => true, globals)).toBe(false);
+    expect(globals.DOMMatrix).toBeUndefined();
+  });
+
+  it('never replaces a DOMMatrix something else already defined', () => {
+    let probed = false;
+    const existing = class {};
+    const globals: { DOMMatrix?: unknown } = { DOMMatrix: existing };
+    expect(
+      installDomMatrixStub(() => {
+        probed = true;
+        return false;
+      }, globals),
+    ).toBe(false);
+    expect(globals.DOMMatrix).toBe(existing);
+    // Short-circuits before loading a native module it has no use for.
+    expect(probed).toBe(false);
+  });
+});
+
+describe('nativeCanvasLoadable', () => {
+  it('finds the backend on this machine, where it is installed', () => {
+    // Every CI platform installs the optional dependency; the render tests above depend on it.
+    expect(nativeCanvasLoadable()).toBe(true);
+  });
+});
+
+describe('createCanvasProbe', () => {
+  const errno = (message: string, code: string): Error =>
+    Object.assign(new Error(message), { code });
+
+  it('remembers a definitive "not installed" and does not load again', () => {
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+      throw errno("Cannot find module '@napi-rs/canvas'", 'MODULE_NOT_FOUND');
+    });
+    expect(probe.loadable()).toBe(false);
+    expect(probe.loadable()).toBe(false);
+    expect(loads).toBe(1);
+  });
+
+  it('remembers a missing per-platform binary as definitive too', () => {
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+      throw new Error('Cannot find native binding. npm has a bug related to optional dependencies');
+    });
+    expect(probe.loadable()).toBe(false);
+    expect(probe.loadable()).toBe(false);
+    expect(loads).toBe(1);
+  });
+
+  it('does not cache a transient failure, so a later call can still succeed', () => {
+    // EMFILE under fd pressure says nothing about whether the backend is installed; caching it
+    // disabled render_pages for the rest of the process.
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+      if (loads === 1) throw errno('EMFILE: too many open files', 'EMFILE');
+    });
+    expect(probe.loadable()).toBe(false);
+    expect(probe.loadable()).toBe(true);
+    expect(probe.loadable()).toBe(true);
+    expect(loads).toBe(2);
+  });
+
+  it('finds a transient errno anywhere in the cause chain (the napi-rs loader wraps it)', () => {
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+      if (loads === 1) {
+        throw new Error('Cannot find native binding.', {
+          cause: new Error('libcanvas.node: cannot open shared object file: Too many open files'),
+        });
+      }
+    });
+    expect(probe.loadable()).toBe(false);
+    expect(probe.loadable()).toBe(true);
+  });
+
+  it('stays unavailable once pinned, even if the backend would now load', () => {
+    // Pinned when the DOMMatrix stub was installed: pdf.js only polyfills DOMMatrix when the
+    // global is undefined, and built its module-scope matrix from the stub, so a real canvas loaded
+    // afterwards would rasterize against an inert matrix.
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+    });
+    probe.pinUnavailable();
+    expect(probe.loadable()).toBe(false);
+    expect(loads).toBe(0);
+  });
+});
+
+describe('createPdfjsLoader', () => {
+  it('pins the probe unavailable when it installs the DOMMatrix stub after a transient failure', async () => {
+    let loads = 0;
+    const probe = createCanvasProbe(() => {
+      loads += 1;
+      if (loads === 1) {
+        throw Object.assign(new Error('EMFILE: too many open files'), { code: 'EMFILE' });
+      }
+    });
+    const globals: { DOMMatrix?: unknown } = {};
+    const fake = { OPS: {} } as never;
+    const load = createPdfjsLoader(probe, async () => fake, globals);
+    await expect(load()).resolves.toBe(fake);
+    expect(globals.DOMMatrix).toBeDefined();
+    // The transient failure alone would have let the next call succeed; the stub forbids it.
+    expect(probe.loadable()).toBe(false);
+    expect(loads).toBe(1);
+  });
+
+  it('leaves the probe alone when the backend loads and no stub is installed', async () => {
+    const probe = createCanvasProbe(() => undefined);
+    const globals: { DOMMatrix?: unknown } = {};
+    const load = createPdfjsLoader(probe, async () => ({ OPS: {} }) as never, globals);
+    await load();
+    expect(globals.DOMMatrix).toBeUndefined();
+    expect(probe.loadable()).toBe(true);
   });
 });
 
@@ -2031,22 +2300,20 @@ describe('PdfRenderer.text', () => {
     );
   });
 
-  it('cuts a SUFFIX at the per-page character budget and counts exactly what it cut', async () => {
-    // Document-controlled and unbounded: a PDF can carry arbitrarily much text (an OCR layer, a
-    // \phantom block). The cut must be a contiguous prefix — a budget-PACKED selection of
-    // scattered lines reads as a page that says something it does not — and it must be counted,
-    // never silent.
+  it('returns every merged line whole and uncounted — the cutting is the tool budget’s job', async () => {
+    // PB3. This service used to cut each page to 20000 characters and truncate a single longer
+    // line to 20000 + "…" before `extract_text`'s call-wide budget (`extractTextBudget.ts`) saw
+    // it, so that budget reported the truncated length (20001) as the gap. The call-wide budget
+    // is smaller than that per-page cap and already cuts a suffix and counts it, so the per-page
+    // cut changed only what the counters said, and said it wrong. What is returned here must be
+    // the lines exactly as merged, so the one budget that cuts can count them at their length.
     //
-    // The line lengths are deliberately UNEQUAL, and that is what makes this test able to fail:
-    // with every line the same size a greedy filter and a suffix cut produce byte-identical
-    // output, so an equal-length version of this test passes against either and proves neither.
-    // Here the oversized line lands with 5000 characters of budget left, and the short lines
-    // behind it would each still fit — a filter keeps them and reports 1 line omitted, a suffix
-    // cut stops dead and reports 6.
+    // A 30000-character line (over the old cap) between shorter ones: pre-fix it came back as
+    // 20001 characters and ended the page, with 6 lines "omitted".
     const fifteen = Array.from({ length: 15 }, () => 'x'.repeat(1000));
     const lineTexts = [
       ...fifteen,
-      'y'.repeat(6000),
+      'y'.repeat(30_000),
       ...Array.from({ length: 5 }, () => 'z'.repeat(100)),
     ];
     const items = lineTexts.map((str, i) => ({
@@ -2062,13 +2329,17 @@ describe('PdfRenderer.text', () => {
     );
 
     const page = (await renderer.text({ pdfPath })).pages[0]!;
-    expect(page.lines).toEqual(fifteen);
-    // 15000 characters kept out of a 20000 budget — the cut is NOT "the budget ran out", it is
-    // "the next line did not fit", and nothing behind it may be promoted past it.
-    expect(page.lines.join('')).toHaveLength(15_000);
-    expect(MAX_TEXT_CHARS_PER_PAGE - 15_000).toBeGreaterThan(100);
-    expect(page.linesOmitted).toBe(6);
-    expect(page.charsOmitted).toBe(6000 + 5 * 100);
+    expect(page.lines).toEqual(lineTexts);
+    expect(page.linesOmitted).toBe(0);
+    expect(page.charsOmitted).toBe(0);
+
+    // And composed with the budget that does cut: the gap is counted at the line's true length.
+    const planned = planExtractedText([page]).pages[0]!;
+    const cut = lineTexts.slice(planned.lines.length);
+    expect(planned.lines).toEqual(lineTexts.slice(0, planned.lines.length));
+    expect(planned.linesOmitted).toBe(cut.length);
+    expect(planned.charsOmitted).toBe(cut.reduce((n, l) => n + l.length, 0));
+    expect(cut).toContain('y'.repeat(30_000));
   });
 
   it('does not apply pdf_geometry’s 160-character line label cap to the content', async () => {

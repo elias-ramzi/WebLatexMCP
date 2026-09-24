@@ -26,10 +26,11 @@
  *     `structuredContent.diff` — so a budget counting it once is wrong by 2x. {@link renderCost}
  *     charges a string at `s.length + JSON.stringify(s).length`, i.e. roughly twice its size plus the
  *     real escaping cost (LaTeX is backslash-dense; a raw-length charge under-counts the JSON
- *     side). This is a deliberate departure from `conflictBudget.ts`, which takes the MAX of its
- *     two channels: there the two channels are different *framings* of the same data (marker text
- *     vs. a JSON array), so each is bounded on its own; here they are byte-for-byte the same
- *     string, so they add.
+ *     side). `conflictBudget.ts` now charges the same way — the SUM of its two channels, text
+ *     rendering plus JSON encoding — even though there the two are different *framings* of the
+ *     same data (marker text vs. a JSON array): both ship in one result, so what a client receives
+ *     is their sum whatever their shape. (It once took the max of the two, which under-charged a
+ *     conflict by about half.)
  *  3. **Everything that renders is charged, including what replaces what was cut.** The per-file
  *     summary (`path +N -M` in the text, `files[]` in JSON), each kept file's mandatory header
  *     block, and each omission marker are all charged — the marker allowance up front, per

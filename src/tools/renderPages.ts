@@ -4,7 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
-import { locateProjectPdf } from '../lib/pdfLocate.js';
+import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import { buildDir } from '../services/compiler.js';
 import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL, PdfRenderError } from '../services/pdfRender.js';
@@ -12,7 +12,8 @@ import type { RenderResult } from '../services/pdfRender.js';
 import { planInlining } from '../lib/inlineBudget.js';
 import { readAuxFloats } from '../lib/auxFloats.js';
 import {
-  planLabelPages,
+  resolveLabelPages,
+  pdfLabelPageReader,
   labelRefusalMessage,
   labelResolutionNote,
   labelPageRangeMessage,
@@ -28,9 +29,11 @@ const inputSchema = {
     .string()
     .optional()
     .describe(
-      'Root .tex file, used to select the build-dir PDF to read when the surfaced workspace ' +
-        'copy is not being used (workspace-local mode prefers <workspace>/<id>.pdf and never ' +
-        'consults this). Auto-detected when omitted.',
+      'Root .tex file whose build this reads: its build-dir PDF (and, for `labels`, its ' +
+        '.aux), in every workspace mode — pass the same rootFile you compiled with to read a ' +
+        'non-default root. Auto-detected when omitted. Only when it is omitted and no .aux is ' +
+        'read does a missing build PDF fall back to the surfaced <workspace>/<id>.pdf ' +
+        '(workspace-local mode), which holds whichever root compiled last.',
     ),
   pages: z
     .array(z.number().int().positive())
@@ -61,10 +64,17 @@ const inputSchema = {
         'appendix scheme) resolves EXACTLY. A printed page that tree prints on no page is ' +
         'reported as a stale .aux, and one it prints on several pages (a restarted ' +
         '\\pagenumbering) is refused with both candidates named rather than resolved to the ' +
-        'first. A PDF with no /PageLabels — the usual `article` — falls back to using the ' +
-        'printed page as the index, which is correct exactly because nothing renumbered; there, ' +
-        'a label printing as "iv", and every label in a document any of whose labels print ' +
-        'roman, is REFUSED rather than mapped onto a page that would be wrong. Any label that ' +
+        'first. A PDF with no /PageLabels — the usual `article` without hyperref — falls back to ' +
+        "the printed page as the index, but only once that PDF page's own folio (the page " +
+        'number in its footer or running head) reads that printed page AND a neighbouring ' +
+        "page's folio reads the adjacent number (a section number or a table cell can pass for " +
+        'a folio on one page; a folio continues on the next): a title page or ' +
+        '\\setcounter{page} shifts every page without saying so, so a label whose page shows ' +
+        'another folio, no folio, a running head that reads two ways, or a folio no neighbour ' +
+        'corroborates, a label past the end ' +
+        'of the PDF or defined twice, a label printing as "iv", and every label in a document ' +
+        'any of whose labels print roman, is REFUSED rather than mapped onto a page that would ' +
+        'be wrong. Any label that ' +
         'cannot be resolved refuses the whole call — no page is ever guessed, and nothing ' +
         'partial is rendered. Cannot be combined with `pages`; two labels on one page render it ' +
         `once and both are echoed. At most ${MAX_LABELS_PER_CALL} per call.`,
@@ -171,7 +181,8 @@ const outputSchema = {
           .describe(
             "The 1-based PDF page index actually rendered for it: the page the PDF's own " +
               '/PageLabels tree prints `printedPage` on, or — for a PDF with no such tree — the ' +
-              'printed page read as a decimal integer. It differs from printedPage exactly when ' +
+              "printed page read as a decimal integer, once that page's text showed the label's " +
+              'number. It differs from printedPage exactly when ' +
               'the document renumbers and says so in /PageLabels; without that tree a document ' +
               'where they could differ is refused rather than reported here.',
           ),
@@ -217,9 +228,16 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
         "the label -> page mapping comes back in the result (through the PDF's own /PageLabels " +
         'tree when it has one, so a renumbered document resolves exactly). A label that cannot ' +
         'be resolved — absent from that .aux, printing on a page the PDF does not print, ' +
-        'printing on several pages at once, or printing a number that is not a PDF page index ' +
-        'in a document with no /PageLabels — refuses the call rather than rendering a guessed ' +
+        'printing on several pages at once, defined twice, or — in a document with no ' +
+        '/PageLabels — printing a number that is not a PDF page index or on a page whose own ' +
+        'folio does not read that number (or that no neighbouring folio corroborates), refuses ' +
+        'the call rather than rendering a guessed ' +
         'page. ' +
+        'Writes nothing into the project — its PNGs go under the temp build dir. It does take ' +
+        "the per-project lock, exactly as pdf_geometry and extract_text do (a peer session's " +
+        'compile can rewrite the build dir mid-read), so it creates ' +
+        '<workspace>/.sessions/<project>/ if that is not already there, and it can wait on — or ' +
+        'time out against — a peer holding that lock. ' +
         'Fails with a message to run compile first when nothing has been compiled yet.',
       inputSchema,
       outputSchema,
@@ -251,7 +269,13 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // detectRootFile itself records no baseline (see rootFile.ts) — recording one here would
           // wrongly claim the caller could now base a write on a file it only used to find a PDF.
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
-          const pdfPath = await locateProjectPdf(ctx.config, id, dir, root);
+          // The ROOT's build PDF, never the surfaced copy once a root is named or an .aux is
+          // read: the surfaced copy holds whichever root compiled last, and pairing it with this
+          // root's .aux would render another root's page for a label (see locateRootPdf).
+          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
+            rootNamed: rootFile !== undefined,
+            readsAux: labels !== undefined,
+          });
           if (!pdfPath) {
             throw new Error(
               `No compiled PDF found for project "${id}". Run compile first, then render_pages.`,
@@ -274,14 +298,20 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
             const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
-            // The PDF's own /PageLabels tree, which turns "printed page -> page index" from an
+            // The PDF's own /PageLabels tree turns "printed page -> page index" from an
             // inference into a lookup. `null` is the common answer (a plain `article` has no
-            // such tree) and planLabelPages falls back to the printed page as the index, with
-            // its two heuristic refusals live. This opens the document a second time — render
-            // opens it again below — which is one extra open on a labelled call only, and it
-            // happens under the same lock, so both reads see the same build.
-            const pageLabels = await ctx.pdfRenderer.pageLabels(pdfPath);
-            labelPlan = planLabelPages(labels, aux, pageLabels);
+            // such tree), and then the printed page is only a candidate: resolveLabelPages reads
+            // that page's text and accepts it only if the page's own folio reads it and a
+            // neighbouring page's folio reads the adjacent number. That opens
+            // the document a few more times — render opens it again below — on a labelled call
+            // only. Every read sees the same build because they are the same root's build-dir
+            // files (locateRootPdf) read under the same lock: the lock alone would not make
+            // that true.
+            labelPlan = await resolveLabelPages(
+              labels,
+              aux,
+              pdfLabelPageReader(ctx.pdfRenderer, pdfPath),
+            );
             // An assertion, never an inference: one unresolvable label refuses the whole call.
             // Rendering the labels that did resolve would hand back images the caller reads as
             // the answer to every label they asked about.

@@ -11,6 +11,20 @@ import type { ReferenceSourceId } from './lib/referenceKey.js';
  */
 export type ProjectConfig = GitProjectConfig | LocalProjectConfig;
 
+/**
+ * A configured project that was NOT loaded, and why — so a call naming it can say so. `kind` is
+ * `'id'` when the key itself is unusable as a project id (`src/lib/projectId.ts`), `'entry'` when
+ * the id is fine but its configuration does not parse.
+ */
+export interface SkippedProject {
+  id: string;
+  /** Where it was configured: `WEB_LATEX_MCP_PROJECTS`, or the registry file's path. */
+  source: string;
+  kind: 'id' | 'entry';
+  /** What is wrong, as a clause (`it contains a path separator …`, or the parse error). */
+  problem: string;
+}
+
 /** A project backed by a git remote (Overleaf, GitHub, or any host): cloned, synced, pushed. */
 export interface GitProjectConfig {
   /** Friendly id used in tool calls and as the clone directory name. */
@@ -108,6 +122,12 @@ export interface ServerConfig {
   sessionId: string;
   /** Registered projects. */
   projects: ProjectConfig[];
+  /**
+   * `WEB_LATEX_MCP_PROJECTS` entries `loadConfig` did not load because their id is unusable
+   * (`src/lib/projectId.ts`). Kept so a call naming one is told why, not merely "Unknown project" —
+   * the stderr note at startup is invisible to an MCP client. Optional; undefined means none.
+   */
+  skippedProjects?: SkippedProject[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
   /**

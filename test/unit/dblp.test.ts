@@ -376,8 +376,8 @@ describe('fetchBibtex returns the entry, not whatever else shares the body', () 
   });
 
   it('keeps BOTH entries of a crossref-format body, byte-identically', async () => {
-    // DBLP's `param=1` bib emits the @inproceedings plus the @proceedings its `crossref` field
-    // names. Cutting at the first closing delimiter would corrupt the entry that survives —
+    // A DBLP bib in its crossref style carries the @inproceedings plus the @proceedings its
+    // `crossref` field names. Cutting at the first closing delimiter would corrupt the entry that survives —
     // worse than the trailing junk the cut exists to remove.
     const TWO = ENTRY + '\n\n@proceedings{DBLP:conf/cvpr/2016,\n  title = {CVPR 2016}\n}';
     const svc = new DblpService(() => Promise.resolve(ok(TWO)));
@@ -637,5 +637,31 @@ describe('a 404 addressing a RECORD is DBLP answering, not DBLP being down', () 
     const svc = new DblpService(() => Promise.resolve(fail(404, 'Not Found')));
     await expect(svc.search('x')).rejects.toBeInstanceOf(BackendUnavailableError);
     await expect(svc.search('x')).rejects.toThrow(/404 Not Found/);
+  });
+});
+
+describe('a search hit whose key would not parse back is skipped, not emitted', () => {
+  // `formatRecordKey` composes blindly, so a hit key outside what `parseRecordKey` accepts produced
+  // a key the server printed and then refused one `add_citation` later — or, worse, one that
+  // parsed to a DIFFERENT record (`rec/conf/a/b` comes back as `conf/a/b`). The Crossref client
+  // already skips such a hit; this is the same round trip for DBLP.
+  it('keeps only the hits whose emitted key re-parses to the same DBLP record', async () => {
+    const info = (key: string) => ({ info: { key, title: `T ${key}.` } });
+    const body = JSON.stringify({
+      result: {
+        hits: {
+          hit: [
+            info('conf/cvpr/HeZRS16'),
+            info('conf/x/y z'), // whitespace: refused by the key shape
+            info('rec/conf/a/b'), // re-parses to `conf/a/b` — a different id
+            info('conf/x/y.bib'), // likewise, to `conf/x/y`
+            info('journals/x/../y'), // a dot segment
+          ],
+        },
+      },
+    });
+    const svc = new DblpService(() => Promise.resolve(ok(body)));
+    const hits = await svc.search('x');
+    expect(hits.map((h) => h.key)).toEqual(['dblp:conf/cvpr/HeZRS16']);
   });
 });

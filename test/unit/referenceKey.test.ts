@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   REFERENCE_SOURCES,
   formatRecordKey,
+  normalizeDblpKey,
   parseRecordKey,
   type ReferenceSourceId,
 } from '../../src/lib/referenceKey.js';
@@ -672,5 +673,51 @@ describe('a single-dot segment is a silent rewrite too, not just ..', () => {
     const sici = '10.1002/(SICI)1097-0142(19960101)77:1<50::AID-CNCR10>3.0.CO;2-#';
     expect(parseRecordKey(`crossref:${sici}`)).toEqual({ source: 'crossref', id: sici });
     expect(parseRecordKey(sici)).toEqual({ source: 'crossref', id: sici });
+  });
+});
+
+describe('a DBLP key is stripped ONCE, and what a second strip would change is refused', () => {
+  // `parseRecordKey` hands the resolver a normalised id, and `DblpService.fetchBibtex` normalises
+  // that id AGAIN. The strip removed one `rec/` and one suffix per pass, so a key carrying two
+  // parsed to one id and fetched another: `dblp:rec/rec/conf/x/y` parsed to `rec/conf/x/y` but
+  // requested `conf/x/y` — a different record than the one named, reported under the key the
+  // caller passed. Refusing is the only honest answer, the same as for a dot segment.
+  it.each([
+    'rec/rec/conf/x/y',
+    'conf/x/y.bib.bib',
+    'conf/x/y.html.bib',
+    'rec/conf/x/y.xml.html',
+    'https://dblp.org/rec/rec/conf/x/y.bib',
+  ])('refuses %s rather than rewriting it into another id', (input) => {
+    expect(() => normalizeDblpKey(input)).toThrow(/not a valid reference key/);
+    expect(() => parseRecordKey(`dblp:${input}`)).toThrow(/not a valid reference key/);
+  });
+
+  it('refuses or is idempotent — the second normalisation never changes an accepted id', () => {
+    // The property the resolver relies on, over accepted keys AND the double-stripped shapes: a
+    // key either fails here, or comes back as an id that normalises to itself. Before the fix the
+    // `rec/rec/` and double-suffix inputs were accepted and normalised to something else again.
+    for (const input of [
+      'conf/cvpr/HeZRS16',
+      'rec/conf/cvpr/HeZRS16',
+      'conf/cvpr/HeZRS16.bib',
+      'https://dblp.org/rec/conf/cvpr/HeZRS16.html',
+      'journals/corr/abs-1512-03385',
+      'rec/rec/conf/x/y',
+      'conf/x/y.bib.bib',
+    ]) {
+      let once: string;
+      try {
+        once = normalizeDblpKey(input);
+      } catch {
+        continue;
+      }
+      expect(normalizeDblpKey(once)).toBe(once);
+    }
+    // And the ordinary spellings are still accepted, so the loop above is not vacuous.
+    expect(normalizeDblpKey('rec/conf/cvpr/HeZRS16.bib')).toBe('conf/cvpr/HeZRS16');
+    expect(normalizeDblpKey('https://dblp.org/rec/conf/cvpr/HeZRS16.html')).toBe(
+      'conf/cvpr/HeZRS16',
+    );
   });
 });

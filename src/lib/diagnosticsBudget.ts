@@ -16,7 +16,7 @@
  * `compile` is the most-called tool in the server: this fires on the loop the agent is already in,
  * not on a tool someone reaches for deliberately.
  *
- * Four decisions carry this module.
+ * Five decisions carry this module.
  *
  *  1. **{@link ALLOCATION_ORDER}: errors are allocated first, so warnings are cut first.** The
  *     thing that breaks the build is cut last — `citationsBudget.ts`'s rule, and
@@ -47,14 +47,24 @@
  *     {@link DiagnosticsPlan.warningsOmittedByCap}, the `…ByCap` suffix being what tells the two
  *     claims apart.
  *
- * What this budget does **not** govern, deliberately: `logTail` (already bounded at 80 lines by
- * `filterLog`, and left exactly as it is — it is the fallback evidence for a `warnings[]` this
- * module cut, and moving it would perturb the byte-identical output `filterLog` promises a caller
- * that passes no `keepWarning`), `hint` (fixed server-authored templates plus package names) and
- * the headline. Those are bounded by construction; `errors`/`warnings` were bounded by nothing.
+ *  5. **`logTail` is charged too, and cut when it has to be.** It used to be left out as "bounded
+ *     by construction" at `filterLog`'s 80 lines, which it was not: each is a LOGICAL line —
+ *     `unwrapLines` rejoins TeX's 79-column wrap — so 80 warnings with 5000-character messages
+ *     made a ~400k-character `logTail` beside a perfectly budgeted `errors`/`warnings`. Now every
+ *     line is capped (`LOG_TAIL_LINE_CAP`, in `logParser`) and the rendered tail is fitted here as
+ *     a lane of its own ({@link ALLOCATION_ORDER}), through a `fitLogTail` callback so this module
+ *     stays pure and `filterLog` stays the one place that renders a tail. `filterLog`'s
+ *     byte-identity promise is untouched: it is a promise about `filterLog` with no `keepWarning`,
+ *     and the fit only ever drops whole earliest lines of that same output, which it announces in
+ *     the tail's own header line and in {@link DiagnosticsPlan.note}. `compile`'s `rawLog: true`
+ *     tail is not charged or cut — raw means raw — and so is not a lane here at all.
+ *
+ * What this budget does **not** govern, deliberately: `hint` (fixed server-authored templates plus
+ * package names) and the headline. Those are bounded by construction.
  */
 
 import { formatSnippet } from './sourceSnippet.js';
+import { elideAt, LOG_TAIL_LINE_CAP } from '../services/logParser.js';
 
 /**
  * Total character budget for `errors[]` and `warnings[]` together, across BOTH channels.
@@ -118,11 +128,18 @@ const TEXT_LINE_SEPARATOR_OVERHEAD = 1;
 /**
  * The order the character budget is ALLOCATED in — so, read back to front, the cut order.
  *
+ * `logTail` and `warnings` share the last rank rather than strictly following one another, and on
+ * purpose: they OVERLAP — one `Overfull \hbox` lands in both, as a structured entry and as a raw
+ * line — so strict priority either way would let one cause fill one lane and starve the other to
+ * nothing (CLAUDE.md's budget rule; `statusBudget.ts` is the same shape). Of what the errors left,
+ * each of the two is guaranteed half, and whatever one does not need flows to the other. `logTail`
+ * is listed first only because it is FITTED first — the warnings take what it actually used.
+ *
  *  1. `warnings` is cut first. A warning is advisory: the document compiled, and an
  *     `Overfull \hbox` is a typographic note about a line that is 3pt too wide. It is also the
  *     list that runs to the hundreds on an ordinary build, so it is both the cheapest to lose and
- *     the whole reason this budget exists. Losing it is not silence either — the box lines are
- *     still in `logTail`, and every one of them is in `logPath`.
+ *     the whole reason this budget exists. Losing it is not silence either — the latest box lines
+ *     are still in `logTail` (its guaranteed share, below), and every one is in `logPath`.
  *  2. `errors` is cut last. An error is why the PDF is not there. It is also the more expensive
  *     item (a `message`, and for up to ten locations a five-line `snippet` that ships in both
  *     channels), which is precisely why an order is needed rather than a shared pool walked in
@@ -130,18 +147,20 @@ const TEXT_LINE_SEPARATOR_OVERHEAD = 1;
  *     today, so a naive pool would look correct while being one refactor away from spending
  *     itself on box warnings and returning none of the three errors that broke the build.
  *
- * There is no third rank, and the two are never interleaved: once the errors have been fitted the
- * warnings take what is left, and if the errors were themselves cut by size the warnings get
- * nothing at all (`citationsBudget.ts`'s rule — letting a cheap advisory entry slip in behind a
+ * Errors and the rest are never interleaved: once the errors have been fitted the other two lanes
+ * share what is left, and if the errors were themselves cut by size the warnings get nothing at
+ * all and `logTail` only its last line (`citationsBudget.ts`'s rule — letting a cheap advisory entry slip in behind a
  * cut higher-priority list inverts the order for the sake of a few characters).
  */
-export const ALLOCATION_ORDER = ['errors', 'warnings'] as const;
+export const ALLOCATION_ORDER = ['errors', 'logTail', 'warnings'] as const;
 
 /** The fields {@link renderErrorLine} needs; anything else on the object is carried untouched. */
 export interface RenderableError {
   file?: string;
   line?: number;
   message: string;
+  /** Not rendered, but derived from `message` by `parseLog` and as unbounded — see {@link fitFirstError}. */
+  rule?: string;
   snippet?: string;
   snippetStartLine?: number;
 }
@@ -206,6 +225,13 @@ export interface DiagnosticsPlan<E, W> {
   errorLines: string;
   /** How many of the kept errors that block lists, so the tool can say what it left for JSON. */
   errorsInText: number;
+  /**
+   * The `logTail` to ship, fitted to its share — present exactly when a `fitLogTail` source was
+   * given (`compile` gives none under `rawLog: true`).
+   */
+  logTail?: string;
+  /** Earliest lines the budget dropped from `logTail`, apart from `filterLog`'s own line cap. */
+  logTailTrimmed: number;
   /** What was cut and how to get it. Present only when something actually was. */
   note?: string;
 }
@@ -214,6 +240,58 @@ export interface DiagnosticsBudgetOptions {
   budget?: number;
   maxErrors?: number;
   maxWarnings?: number;
+  /**
+   * The `logTail` lane: given a character allowance, the tail fitted to it (its JSON rendering no
+   * longer than `maxChars`, save that it always keeps its last line) and how many lines that cost.
+   * `compile` passes `logParser`'s `fitFilteredLog`; the planner charges the text it gets back.
+   */
+  fitLogTail?: (maxChars: number) => { text: string; trimmed: number };
+}
+
+/**
+ * The floor under a kept-regardless error's message: however little budget is left, it keeps
+ * this much. Reuses `LOG_TAIL_LINE_CAP` — the head of the same message is what that cap keeps of it
+ * in `logTail`, and it is enough to say which package and what went wrong. Only reachable when a
+ * snippet and a location alone nearly exhaust the budget, which a ~1KB snippet never does.
+ */
+const KEPT_ERROR_MESSAGE_FLOOR = LOG_TAIL_LINE_CAP;
+
+/**
+ * The first error, fitted to `remaining` by cutting its `message` — and its `rule`, which
+ * `parseLog` derives as the message's first clause and so is exactly as long when the message has
+ * no `.` or `:` in it — instead of shipping it whole.
+ *
+ * Keep-at-least-one exists so a failed compile never returns an empty `errors[]`; it was never a
+ * licence to ship an unbounded message. The message is document-controlled (a `\PackageError`, an
+ * `\errmessage`, a runaway line TeX echoes), and one of 60k characters went out in BOTH channels —
+ * JSON and the rendered text — which is the #68 shape this whole module exists to prevent, arriving
+ * through its own exception. So the cut is priced with the same cost function as every other error
+ * (binary search on the kept length, which is monotone in cost), the kept head is the part a reader
+ * acts on, and the marker says how much went and that `logPath` has it. `file`, `line` and the
+ * snippet are never touched: a location is either exact or withheld, never shortened.
+ */
+function fitFirstError<E extends RenderableError>(
+  e: E,
+  remaining: number,
+  cost: (x: E) => number,
+): { error: E; cut: boolean } {
+  if (cost(e) <= remaining) return { error: e, cut: false };
+  const rule =
+    e.rule !== undefined && e.rule.length > KEPT_ERROR_MESSAGE_FLOOR
+      ? { rule: elideAt(e.rule, KEPT_ERROR_MESSAGE_FLOOR) }
+      : {};
+  const withKeep = (keep: number): E => ({ ...e, ...rule, message: elideAt(e.message, keep) });
+  let lo = Math.min(KEPT_ERROR_MESSAGE_FLOOR, e.message.length);
+  let hi = e.message.length;
+  // Invariant: `lo` is kept whatever it costs (the floor), `hi` is the untouched message, which is
+  // known not to fit. Find the longest keep in [lo, hi) that fits.
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (cost(withKeep(mid)) <= remaining) lo = mid;
+    else hi = mid;
+  }
+  const error = withKeep(lo);
+  return { error, cut: error.message !== e.message || error.rule !== e.rule };
 }
 
 /**
@@ -249,7 +327,7 @@ function capErrors<E extends RenderableError>(errors: readonly E[], max: number)
  * alone exceeds the whole budget (`searchBudget.ts` and `citationsBudget.ts` make the same
  * exception for the same reason, and both confine it to the highest-priority list). Warnings get
  * no such exception, and not by omission: a warning's `message` is document-controlled free text,
- * and an empty `warnings[]` is not silence here, because the box lines are still in `logTail` and
+ * and an empty `warnings[]` is not silence here, because the latest box lines are still in `logTail` and
  * `warningsOmittedByCap` says how many went.
  */
 export function planDiagnosticsPayload<E extends RenderableError, W>(
@@ -274,6 +352,7 @@ export function planDiagnosticsPayload<E extends RenderableError, W>(
   const keptErrors: E[] = [];
   let listed = 0;
   let errorsCutBySize = 0;
+  let firstErrorCut = false;
   for (const e of cappedErrors) {
     if (errorsCutBySize > 0) {
       errorsCutBySize++;
@@ -283,15 +362,25 @@ export function planDiagnosticsPayload<E extends RenderableError, W>(
     // counter `textPrintedErrors` uses — so what is charged is what will be rendered, entry for
     // entry, and a cut error frees its text cost as well as its JSON cost.
     const printed = listed < MAX_TEXT_ERRORS || e.snippet !== undefined;
-    const cost =
-      JSON.stringify(e).length +
+    const costOf = (x: E): number =>
+      JSON.stringify(x).length +
       ELEMENT_SEPARATOR_OVERHEAD +
-      (printed ? renderErrorLine(e).length + TEXT_LINE_SEPARATOR_OVERHEAD : 0);
-    if (cost <= remaining || keptErrors.length === 0) {
-      // Keep-at-least-one absorbs the full cost, so `remaining` can go negative and everything
-      // after it is cut rather than small entries squeezing in behind an oversized first.
+      (printed ? renderErrorLine(x).length + TEXT_LINE_SEPARATOR_OVERHEAD : 0);
+    const cost = costOf(e);
+    if (cost <= remaining) {
       remaining -= cost;
       keptErrors.push(e);
+      if (listed < MAX_TEXT_ERRORS) listed++;
+      continue;
+    }
+    if (keptErrors.length === 0) {
+      // Keep-at-least-one keeps the ERROR, cut to fit — see `fitFirstError`. Only when even its
+      // floor does not fit can `remaining` go negative, and then everything after it is cut
+      // rather than small entries squeezing in behind an oversized first.
+      const fitted = fitFirstError(e, remaining, costOf);
+      firstErrorCut = fitted.cut;
+      remaining -= costOf(fitted.error);
+      keptErrors.push(fitted.error);
       if (listed < MAX_TEXT_ERRORS) listed++;
       continue;
     }
@@ -302,15 +391,37 @@ export function planDiagnosticsPayload<E extends RenderableError, W>(
   // nothing. Letting a short warning slip into what is left would invert the allocation order for
   // the sake of a few characters (`citationsBudget.ts`'s `spent()`).
   if (errorsCutBySize > 0) remaining = 0;
+  remaining = Math.max(0, remaining);
+
+  const warningCosts = cappedWarnings.map(
+    (w) => JSON.stringify(w).length + ELEMENT_SEPARATOR_OVERHEAD,
+  );
+
+  // The `logTail` lane, fitted before the warnings take what it leaves. The two overlap, so each is
+  // guaranteed half of what the errors left, and a lane that needs less than its half releases the
+  // rest to the other: the tail may have everything the warnings do not need, and the warnings
+  // everything the tail did not use (see ALLOCATION_ORDER).
+  let logTail: string | undefined;
+  let logTailTrimmed = 0;
+  if (opts.fitLogTail) {
+    const warningsNeed = warningCosts.reduce((a, b) => a + b, 0);
+    const allowance = Math.max(Math.floor(remaining / 2), remaining - warningsNeed);
+    const fitted = opts.fitLogTail(allowance);
+    logTail = fitted.text;
+    logTailTrimmed = fitted.trimmed;
+    // Charged on what ships: the JSON string value in `structuredContent`, quotes and escapes
+    // included. The result text does not render the tail, so it is charged once.
+    remaining -= JSON.stringify(fitted.text).length;
+  }
 
   const keptWarnings: W[] = [];
   let warningsCutBySize = 0;
-  for (const w of cappedWarnings) {
+  for (const [i, w] of cappedWarnings.entries()) {
     if (warningsCutBySize > 0) {
       warningsCutBySize++;
       continue;
     }
-    const cost = JSON.stringify(w).length + ELEMENT_SEPARATOR_OVERHEAD;
+    const cost = warningCosts[i] as number;
     if (cost <= remaining) {
       remaining -= cost;
       keptWarnings.push(w);
@@ -326,7 +437,9 @@ export function planDiagnosticsPayload<E extends RenderableError, W>(
     warningsOmittedByCap: warningsCutByCount + warningsCutBySize,
     errorLines: renderErrorLines(keptErrors),
     errorsInText: textPrintedErrors(keptErrors).length,
+    logTailTrimmed,
   };
+  if (logTail !== undefined) plan.logTail = logTail;
   const note = describeDiagnosticCuts(
     {
       errorsCutByCount,
@@ -335,6 +448,8 @@ export function planDiagnosticsPayload<E extends RenderableError, W>(
       warningsCutBySize,
       errorsShown: keptErrors.length,
       warningsShown: keptWarnings.length,
+      firstErrorCut,
+      logTailTrimmed,
     },
     { budget, maxErrors, maxWarnings },
   );
@@ -349,6 +464,8 @@ interface CutCounts {
   warningsCutBySize: number;
   errorsShown: number;
   warningsShown: number;
+  firstErrorCut: boolean;
+  logTailTrimmed: number;
 }
 
 /**
@@ -367,6 +484,9 @@ function describeDiagnosticCuts(
   const parts: string[] = [];
   const errorsOmitted = cuts.errorsCutByCount + cuts.errorsCutBySize;
   const warningsOmitted = cuts.warningsCutByCount + cuts.warningsCutBySize;
+  if (cuts.firstErrorCut) {
+    parts.push('the message of the first error was cut to fit (its head is kept)');
+  }
   if (errorsOmitted > 0) {
     const why: string[] = [];
     if (cuts.errorsCutByCount > 0) {
@@ -391,6 +511,12 @@ function describeDiagnosticCuts(
     parts.push(
       `warnings: showing ${cuts.warningsShown} of ${cuts.warningsShown + warningsOmitted} ` +
         `(${why.join(', ')})`,
+    );
+  }
+  if (cuts.logTailTrimmed > 0) {
+    parts.push(
+      `logTail: ${cuts.logTailTrimmed} earlier line(s) trimmed to fit (its first line counts ` +
+        'every line it omits)',
     );
   }
   if (parts.length === 0) return undefined;

@@ -616,7 +616,11 @@ describe('a conflicted-and-ignored session entry settles and reports as ignored 
       arguments: { project: 'demo', message: 'nothing left' },
     });
     expect(isError(second), textOf(second)).toBe(true);
-    expect(textOf(second)).toMatch(/Nothing to commit \(no staged changes\)/);
+    // With nothing left tracked and a live peer (beta) on the clone, the default no longer widens
+    // to scope "all" (`git add -A`) — it refuses and asks for "all" explicitly
+    // (`resolveCommitScope`, `commitDefaultScope.test.ts`). Before that fix this call ran
+    // `git add -A` and happened to find nothing to stage only because beta's edit was ignored.
+    expect(textOf(second)).toMatch(/no changes of its own to commit/);
     expect(textOf(second)).not.toMatch(/conflicted/);
     expect(textOf(second)).not.toMatch(/ignore/);
     expect(await alpha.ctx.shadows.hasChanges('demo')).toBe(false);

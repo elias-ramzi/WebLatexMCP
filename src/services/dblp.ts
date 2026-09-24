@@ -8,7 +8,7 @@
  * citations, so the entry text always originates from DBLP, never the model.
  */
 
-import { formatRecordKey, normalizeDblpKey } from '../lib/referenceKey.js';
+import { formatRecordKey, normalizeDblpKey, parseRecordKey } from '../lib/referenceKey.js';
 import {
   bibtexEntrySpan,
   BODY_EXCERPT,
@@ -67,6 +67,23 @@ function authorNames(authors: DblpInfo['authors']): string[] {
   return asArray(authors?.author)
     .map((a) => (typeof a === 'string' ? a : a?.text))
     .filter((name): name is string => Boolean(name));
+}
+
+/**
+ * True when the key DBLP returned for a hit, once `formatRecordKey` namespaces it, parses back to
+ * the SAME DBLP record. `formatRecordKey` composes blindly, so a key outside what `parseRecordKey`
+ * accepts was emitted and then refused one `add_citation` later — a result the user can see and
+ * cannot use — and one it accepts only after rewriting (`rec/conf/a/b` parses to `conf/a/b`) named
+ * a different record than the hit it came from. Skipping costs one result; emitting costs a dead
+ * end or a wrong citation. The Crossref client makes the same check for the same reason.
+ */
+function keyRoundTrips(key: string): boolean {
+  try {
+    const parsed = parseRecordKey(formatRecordKey('dblp', key));
+    return parsed.source === 'dblp' && parsed.id === key;
+  } catch {
+    return false;
+  }
 }
 
 function firstString(value: string | string[] | undefined): string | undefined {
@@ -186,6 +203,7 @@ export class DblpService implements ReferenceBackend {
       return hits
         .map((hit) => hit.info)
         .filter((info): info is DblpInfo => Boolean(info?.key))
+        .filter((info) => keyRoundTrips(info.key as string))
         .map((info) => {
           const year = info.year ? Number(info.year) : undefined;
           return {
@@ -215,9 +233,11 @@ export class DblpService implements ReferenceBackend {
   }
 
   /**
-   * Fetch the standalone BibTeX (`param=1`, crossrefs inlined) for a record key.
-   * Throws on a non-OK response or a body that isn't BibTeX, so callers never
-   * append a DBLP error page to a `.bib` file.
+   * Fetch the BibTeX DBLP serves at `rec/<key>.bib?param=1` for a record key. Whether that body
+   * is one self-contained entry or an entry plus the `@proceedings` its `crossref` field names,
+   * `bibtexEntrySpan` keeps the whole run, so nothing here depends on which. Throws on a non-OK
+   * response or a body that isn't BibTeX, so callers never append a DBLP error page to a `.bib`
+   * file.
    */
   async fetchBibtex(keyOrUrl: string): Promise<string> {
     const key = DblpService.normalizeKey(keyOrUrl);

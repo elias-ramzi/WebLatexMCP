@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   planSearchPayload,
+  renderMatchesText,
   SEARCH_CONTENT_BUDGET,
   SEARCH_MAX_MATCHES,
 } from '../../src/lib/searchBudget.js';
@@ -90,6 +91,30 @@ describe('planSearchPayload: the size bound', () => {
     expect(plan.matches[0]?.line).toBe(7);
     expect(plan.omittedBySize).toBe(1);
     expect(plan.note).toContain('the first match alone renders to');
+  });
+});
+
+describe('planSearchPayload: both channels', () => {
+  it('keeps the JSON and the rendered text TOGETHER inside the budget', () => {
+    // The text channel renders every kept match again. Many files (a path header each) and
+    // context lines (numbered, plus a `--`) are what make the text the larger of the two.
+    const matches = Array.from({ length: 300 }, (_unused, i) =>
+      match({
+        path: `sections/part-${i}.tex`,
+        line: i + 3,
+        text: 'x'.repeat(120),
+        before: ['b'.repeat(80), 'c'.repeat(80)],
+        after: ['a'.repeat(80)],
+      }),
+    );
+
+    const plan = planSearchPayload(matches, [], { contextLines: 2 });
+    const text = renderMatchesText(plan.matches, 2).join('\n');
+
+    expect(encodedSize(plan.matches) + text.length).toBeLessThanOrEqual(SEARCH_CONTENT_BUDGET);
+    expect(plan.omittedBySize).toBeGreaterThan(0);
+    // And not by a wide margin: the budget is spent, not merely respected.
+    expect(encodedSize(plan.matches) + text.length).toBeGreaterThan(SEARCH_CONTENT_BUDGET * 0.9);
   });
 });
 

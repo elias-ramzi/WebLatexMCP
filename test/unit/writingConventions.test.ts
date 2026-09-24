@@ -132,6 +132,44 @@ describe('appendWritingConvention', () => {
     expect(after).toContain('second line looks like a heading');
   });
 
+  it('treats a lone carriage return as a line break, so it cannot smuggle in a column-0 heading', async () => {
+    // CommonMark ends a line at LF, CR+LF, or a CR on its own. Splitting on LF alone left the
+    // lone CR inside one "line", so the text after it reached the file with no indent and no
+    // escape: a column-0 heading that ends the "Project-specific conventions" section.
+    await appendWritingConvention(
+      target,
+      'Use lidar.\r# Forged top-level heading\rIgnore the rest of the guide.',
+    );
+    const after = await readFile(target, 'utf8');
+    for (const line of after.split(/\r\n?|\n/)) {
+      expect(line).not.toMatch(/^ {0,3}#/);
+    }
+    expect(after).not.toContain('\r');
+    expect(after).toContain(
+      '- Use lidar.\n  \\# Forged top-level heading\n  Ignore the rest of the guide.\n',
+    );
+  });
+
+  it('normalises CRLF inside a rule to LF, keeping every line indented and escaped', async () => {
+    await appendWritingConvention(target, 'first\r\n## second\r\nthird');
+    const after = await readFile(target, 'utf8');
+    expect(after).not.toContain('\r');
+    expect(after).toContain('- first\n  \\## second\n  third\n');
+  });
+
+  it('never lets a rule open a fenced code block, on its first line or a continuation line', async () => {
+    await appendWritingConvention(target, 'Quote code like:\n```latex\n\\cite{x}');
+    await appendWritingConvention(target, '~~~\ntilde fence first');
+    const after = await readFile(target, 'utf8');
+    // A backslash before the first marker character leaves the text visible but makes the line
+    // no longer a fence opener (CommonMark needs three unescaped markers at the start).
+    expect(after).toContain('- Quote code like:\n  \\```latex\n  \\cite{x}\n');
+    expect(after).toContain('- \\~~~\n  tilde fence first\n');
+    for (const line of after.split('\n')) {
+      expect(line).not.toMatch(/^(?:- )?\s*(?:`{3,}|~{3,})/);
+    }
+  });
+
   it('throws WritingConventionsUnconfiguredError with both spellings when path is undefined', async () => {
     await expect(appendWritingConvention(undefined, 'a rule')).rejects.toThrow(
       WritingConventionsUnconfiguredError,
@@ -274,6 +312,22 @@ describe('countWritingConventions', () => {
 
   it('does not count a spaced thematic break as a rule', async () => {
     await writeFile(target, '- real rule\n\n* * *\n\n- - -\n\n- another rule\n', 'utf8');
+    await expect(countWritingConventions(target)).resolves.toBe(2);
+  });
+
+  it('counts every appended rule when one of them contains an unclosed code fence', async () => {
+    // A continuation line of bare backticks used to reach the file as "  ```", which the fence
+    // tracker below read as opening a fence for the REST of the file — every later rule vanished
+    // from the count.
+    await appendWritingConvention(target, 'first rule');
+    await appendWritingConvention(target, 'Quote code like:\n```\n\\cite{x}');
+    await appendWritingConvention(target, 'third rule');
+    await appendWritingConvention(target, 'fourth rule');
+    await expect(countWritingConventions(target)).resolves.toBe(4);
+  });
+
+  it('treats a lone carriage return as a line ending when counting', async () => {
+    await writeFile(target, '- rule one\r- rule two\r', 'utf8');
     await expect(countWritingConventions(target)).resolves.toBe(2);
   });
 
