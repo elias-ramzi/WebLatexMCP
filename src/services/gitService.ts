@@ -2414,7 +2414,14 @@ export class GitService {
    * longer pays for that log — which, with `origin/<branch>` absent, ran over the whole history.
    */
   async status(dir: string, opts: { withCommits?: boolean } = {}): Promise<StatusResult> {
-    const git = simpleGit(dir);
+    // The `status` tool takes no project lock, so it must not take git's index lock either: a
+    // plain `git status` refreshes stale stat data and writes the index back under
+    // `.git/index.lock`, and a peer's `discard` or `commit` landing in that window failed with
+    // "Unable to create index.lock". `--no-optional-locks` is git's switch for exactly this
+    // (read-only callers). It is a global option, so it rides in as the binary's prefix — not as
+    // GIT_OPTIONAL_LOCKS through simple-git's `env`, which replaces the whole environment and
+    // refuses one carrying GIT_EDITOR.
+    const git = simpleGit(dir, { binary: ['git', '--no-optional-locks'] });
     const s = await git.status();
     const branch = await this.currentBranch(git);
     // Same absence check as `syncPull`: with `origin/<branch>` pruned, the lenient count reports

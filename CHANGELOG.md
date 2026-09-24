@@ -383,6 +383,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   updates its own session's heartbeat in `session.json`). Shadow-index updates within one process
   are also serialised, concurrent atomic writes no longer share a temp file, and on Windows a rename
   refused because another write to the same file is in flight is retried rather than failed.
+  `status` no longer takes git's index lock either: `git status` writes refreshed stat data back
+  under `.git/index.lock`, and a peer's `discard` landing in that window failed part way through
+  with "Unable to create index.lock". It now runs git with `--no-optional-locks`.
 - **An edit this session undid by hand no longer wedges its default commit scope**, and neither does
   a file it created and then deleted through the tools: an entry whose shadow equals an unmoved HEAD
   is settled on the next refresh instead of failing every session-scoped commit with "nothing to

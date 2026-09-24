@@ -125,16 +125,22 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # TeX Live + latexmk via apt (no bibtex/biber is needed). texlive-pictures brings pgf —
-      # beamer cannot load without pgfmath, and the label smokes compile pgfpages layouts — and
-      # texlive-latex-extra brings lastpage and lipsum for the folio fixtures; without them those
-      # smokes fail to compile rather than skip, which is the point: they are the real-compile
-      # evidence for the label checks. Cached with cache-apt-pkgs-action so warm runs restore the
-      # .debs instead of re-downloading; bump `version` to bust the cache.
+      # cache-apt-pkgs-action resolves versions against the runner image's package lists without
+      # refreshing them, so on a cache miss it asks the mirror for versions it no longer carries
+      # (404 on ghostscript, a texlive-binaries dependency). Refresh the lists first.
+      - name: Refresh apt package lists
+        run: sudo apt-get update
+      # TeX Live + latexmk via apt (no bibtex/biber is needed). texlive-pictures brings pgf:
+      # beamer cannot load without pgfmath, and the label smokes compile pgfpages layouts. Without
+      # it those smokes fail to compile rather than skip, which is the point: they are the
+      # real-compile evidence for the label checks. (texlive-latex-extra is left out on purpose —
+      # it depends on Java; no smoke may need lastpage or lipsum.) Cached with
+      # cache-apt-pkgs-action so warm runs restore the .debs instead of re-downloading; bump
+      # `version` to bust the cache.
       - name: Set up TeX Live
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended texlive-pictures texlive-latex-extra
+          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended texlive-pictures
           version: 1.1
       # cache-apt-pkgs-action restores the .deb payloads but skips dpkg's post-install, so on a
       # warm cache the pieces that post-install generates are missing and latexmk fails
