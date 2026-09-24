@@ -95,6 +95,14 @@ async function buildTemplate(files: Record<string, string>, branch: string): Pro
   await mkdir(seedDir, { recursive: true });
 
   await simpleGit().raw(['init', '--bare', '-b', branch, bareDir]);
+  // Every later createFakeRemote copies this directory, so nothing may write into it once the
+  // seed push returns. receive-pack runs `maintenance run --auto` after a push, which can detach
+  // and repack in the background: ubuntu CI copied a `.tmp-<pid>-pack-*` file that the repack
+  // then renamed away (ENOENT in cp). Switch every automatic housekeeping route off here.
+  const bare = simpleGit(bareDir);
+  await bare.raw(['config', 'receive.autogc', 'false']);
+  await bare.raw(['config', 'gc.auto', '0']);
+  await bare.raw(['config', 'maintenance.auto', 'false']);
 
   const seed = simpleGit(seedDir, { config: identity('seed@example.com', 'Seed') });
   await seed.raw(['init', '-b', branch]);

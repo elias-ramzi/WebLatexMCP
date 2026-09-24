@@ -125,14 +125,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Minimal TeX Live + latexmk via apt (the sample is a bare `article` with a manual
-      # thebibliography, so no bibtex/biber is needed). Cached with cache-apt-pkgs-action so
-      # warm runs restore the .debs instead of re-downloading; bump `version` to bust the cache.
+      # TeX Live + latexmk via apt (no bibtex/biber is needed). texlive-pictures brings pgf —
+      # beamer cannot load without pgfmath, and the label smokes compile pgfpages layouts — and
+      # texlive-latex-extra brings lastpage and lipsum for the folio fixtures; without them those
+      # smokes fail to compile rather than skip, which is the point: they are the real-compile
+      # evidence for the label checks. Cached with cache-apt-pkgs-action so warm runs restore the
+      # .debs instead of re-downloading; bump `version` to bust the cache.
       - name: Set up TeX Live
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended
-          version: 1.0
+          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended texlive-pictures texlive-latex-extra
+          version: 1.1
       # cache-apt-pkgs-action restores the .deb payloads but skips dpkg's post-install, so on a
       # warm cache the pieces that post-install generates are missing and latexmk fails
       # intermittently (a cache miss installs cleanly and passes; a hit does not). Recreate them so

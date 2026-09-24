@@ -15,6 +15,7 @@ import {
 } from '../../src/lib/fileLock.js';
 import type { LockAttemptDeps, LockAcquisition } from '../../src/lib/fileLock.js';
 import { currentBootStamp } from '../../src/lib/bootIdentity.js';
+import { toPosix } from '../../src/lib/paths.js';
 
 describe('withFileLock', () => {
   let dir: string;
@@ -142,7 +143,7 @@ describe('withFileLock', () => {
 
   const remedy = (): string =>
     ` If no other web-latex-mcp session is running, the lock was left behind by a crash: ` +
-    `delete ${lock} and retry.`;
+    `delete ${toPosix(lock)} and retry.`;
 
   it('keeps the existing message wording for a real holder, plus the manual remedy', () => {
     const err = new LockTimeoutError(lock, {
@@ -664,10 +665,10 @@ describe('withFileLock never wedges on a holder that can no longer release', () 
       owner: 'method-section',
       acquiredAt: '2024-01-01T00:00:00.000Z',
     });
-    expect(withHolder.message).toContain(lock);
+    expect(withHolder.message).toContain(toPosix(lock));
     expect(withHolder.message).toMatch(/no other web-latex-mcp session is running/);
     expect(withHolder.message).toMatch(/delete/);
-    expect(new LockTimeoutError(lock, null).message).toContain(lock);
+    expect(new LockTimeoutError(lock, null).message).toContain(toPosix(lock));
   });
 
   it("reclaims this process's own record once no call in it holds that token (restore window)", async () => {
