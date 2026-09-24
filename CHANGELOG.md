@@ -9,499 +9,7 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
-### Changed
-
-- **`commit` with no `scope` no longer falls back to the whole working tree while a live peer shares
-  the clone.** When this session tracks no change of its own, the default used to become
-  `scope: "all"` (`git add -A`) unconditionally, which swept a peer's in-flight lines into this
-  session's commit with nobody having asked for that — and the ignored-only refusal left the session
-  tracking nothing, so an identical retry widened to `"all"`. With any live peer the call now
-  refuses, naming the peers and both explicit routes (`scope: "all"`, `scope: "paths"`). Alone on
-  the clone the fallback to `"all"` is unchanged. The default is decided from what the session
-  tracked when the call began, so the call's own refresh settling its last entry (an edit undone by
-  hand, or content a HEAD move absorbed) reports that this session's changes are already at HEAD
-  instead of widening to `"all"` over edits nobody offered.
-- **Project ids are validated.** An id becomes a directory name twice (the clone and
-  `.sessions/<id>/`), and `path.join` resolves `..`, so `../../somewhere` cloned outside the
-  workspace. An id is now refused only where it is unsafe as one directory entry: a path separator
-  or a character no Windows file name may hold (`: < > " | ? *`), a backtick, a control,
-  bidirectional-override or unpaired-surrogate character, an invisible character (a format or
-  default-ignorable code point such as a zero-width space, word joiner, soft hyphen or variation
-  selector — a ZWNJ/ZWJ between two letters of a script that spells with it, such as Persian or
-  Devanagari, is kept), text that is not NFC-normalised (the NFC form is named, never substituted),
-  a leading `.` or `-`, leading or trailing whitespace, a trailing `.`, a Windows device name
-  (`con`, `nul`, `com1`, … with or without an extension), `registry.json` or a name beginning
-  `registry.json.`, a `*.pdf` name — these last three compared under a full case fold, so
-  `regiſtry.json` is refused too — a `~` followed by a digit (a Windows 8.3 short name such as
-  `PAPER-~1`), `__proto__`/`constructor`/`prototype`, or more than 64 characters (or 246 UTF-8
-  bytes, so the `<id>-<hash>` build directory still fits a file name). A space other than U+0020 (NBSP, U+3000,
-  U+2000–200A), a line or paragraph separator, or a leading combining mark is refused too, so two
-  ids can never look the same. Unicode letters, spaces and
-  ordinary punctuation are fine (`thèse`, `My Thesis`, `論文`). `register_project` and
-  `project_sync` refuse an invalid id, and a new id that differs from a known one only in letter
-  case; **an existing invalid one in `WEB_LATEX_MCP_PROJECTS` or the workspace registry is skipped
-  at startup** with a note on stderr, and a call naming it is told why instead of "Unknown
-  project" — including a call that omits `project` while `WEB_LATEX_MCP_DEFAULT_PROJECT` names it,
-  which no longer stops the server from starting. Messages quote every id and write control,
-  bidirectional and invisible characters as `\u{…}`. To keep using such a
-  project, rename its key and move both of its directories under the workspace to the new name:
-  `<workspace>/<old id>` (the clone, for a git project) and `<workspace>/.sessions/<old id>/`. The
-  registry is now judged entry by entry (one bad entry no longer hides the rest), an entry this
-  version cannot use is carried through verbatim when the file is rewritten, an empty
-  `registry.json` reads as an empty registry, and an unparseable one is refused rather than
-  overwritten. A second id for a directory another project already uses is
-  refused, and where two ids do share a local directory, symlinks are followed only if every one of
-  them sets `followSymlinks: true`.
-- **`search_files` refuses more regular expressions — the ones whose estimated backtracking on one
-  line passes a fixed budget.** A counted repeat of a group that can match in more than one way
-  (`(fig|tab){2}`, `(?:a|aa){0,40}`, `(a)\1{2}`) is refused like an unbounded one. So are a counted
-  run re-matched at every stop of a repeat (`[\s\S]*a{999}b`, `[\s\S]*\u{999}b`), a chain of repeats that
-  can trade input (`(?:a*)a*b`, `.*a\w+\s`, `.*(fig|figure|eq):`), and a repeat re-run from every
-  occurrence of the text before it (`.*\\cite\{[^}]*\}` — write `\\cite\{[^}]*\}` instead). The old
-  analyzer accepted `(?:\w|\w\w){0,100}\}`, which hung the server on one line. The cost model is
-  calibrated against V8: written-out text is charged for what the engine actually spends on it, a
-  pattern anchored with `^` or starting with written-out text is costly only where it can start,
-  and a repeat right after text it cannot match is charged for the stretch of line it covers, not
-  once per stop. Ordinary searches such as
-  `.*\\includegraphics\[width`, `^.*TODO.*$` and `\\begin\{(figure|table)\}.*\\label\{[^}]*\}` are
-  accepted. A refusal from the cost rules names the constructs — with their positions when two are written
-  alike — and suggests a rewrite, and `regex: false`
-  is still the way out. A lookbehind is judged in the order V8 runs it, right to left, so `(?<=b.*a.*)` (2 s on one
-  line) and `(?<=a{999}.*)` are refused like the `.*a.*b` and `.*a{999}` they run as. Octal escapes
-  (`\01`, `\47`), `\c` escapes inside a class and — with `caseInsensitive` — characters that match
-  only through a case fold are judged by what they actually match. A `\b` inside written-out text,
-  and a `\s*` between two pieces of text, no longer cost a pattern its credit:
-  `\\cite\{[^}]*\bsmith\b[^}]*\}` and `\\label\{.*\}\s*\\cite\{[^}]*\}` are accepted. An
-  optional piece the next character decides is no choice at all
-  (`\\cite(\[[^\]]*\])?\{[^}]*\}.*\\cite\{[^}]*\}` is accepted), and a repeat whose runs the text
-  before it keeps apart keeps what follows it apart too (`.*\\label\{[a-z:_]+\}\s*$`). `.*TODO.*$`
-  is refused where `.*TODO.*` and `^.*TODO.*$` are not, because a line can hold U+2028, which `.`
-  does not match. Pieces that can match nothing are charged each time the engine reaches them
-  (`x{0,75}x*a*b*c*d*\}` was accepted and took about 2 s, and twenty-three such pieces after
-  `x{0,75}x*` took 8–10 s); runs that all end at one place are counted once each
-  (`x{0,30}x*a+a{11}b`, where `a+a{11}` runs in full after each of the 31 places `x{0,30}` stops,
-  was accepted and took 1–3 s, and two such stages 4–6 s) — written out or inside groups
-  (`(x{0,30}x*\{)(y{0,30}y*\{)a+a{4}b` took 3 s, `x{0,40}(?:x*\{)a+a{9}b` 1.2 s) — though a group that closes a bounded repeat
-  before it counts that repeat once, as the written-out pattern does (`\s?(\s*\\cite)(.*\\cite)` is
-  accepted like `\s?\s*\\cite.*\\cite`), and only where a piece ends those runs, so `[A-Z]{2,5}.*\\cite` and `\$\d{1,3}.*\$` stay accepted; and a
-  greedy repeat inside an optional
-  capture group a full step per character (`x{0,78}(\wx*)?\}`). The analyzer is an estimate; what bounds a regex search is the worker
-  thread terminated at the deadline.
-- **`render_pages` names a clipped or re-scaled PNG `page-<n>-<hash>.png`**, where the hash covers
-  the exact clip fractions and the requested `dpi`/`maxEdgePx`. The old name rounded the clip to
-  three decimals and left the scale out, so two different requests of one page overwrote each other
-  in the shared build dir and an earlier result's `pngPath` named the later image. A default render
-  is still `page-<n>.png`.
-- **A `labels` lookup in a PDF without `/PageLabels` is checked against the page before it is
-  believed** (`render_pages`, `extract_text`). The printed page from the `.aux` was used as the page
-  index on the argument that nothing renumbered — but a `report` title page or a `\setcounter{page}`
-  shifts every page while leaving each printed number plausible, and the wrong page came back with a
-  note calling it correct. The printed page is now only a candidate, accepted when that PDF page's
-  own folio — the page number in its footer, or at the edge of its running head — reads exactly the
-  printed page. A page whose folio reads another number, that shows none (a title page,
-  `\pagestyle{empty}`), whose running head can be read as two different numbers, or that lies past
-  the end of the PDF is refused (`unverifiedPage`), and the refusal says which. The folio must also
-  be corroborated by a neighbouring page reading the adjacent number: a fancyhdr `Page \thepage`
-  foot, an eso-pic foreground mark or a `[b]` table ending in a bare number made a section number
-  or a table cell read as the folio (`uncorroboratedFolio`). A one-page PDF is the exception — it
-  has no neighbour, and its only page is the only one a label can be on — so its own folio is
-  enough. A foot in one of the common forms (`Page N`, `N of M`, `Page N of M`, `N/M`, `– N –`) is
-  read as the folio and wins over the running head, so a head showing the section number no
-  longer passes for the page number beside such a foot. A document whose arabic numbering restarts
-  — a printed page that goes down in `.aux` order, such as a supplement after
-  `\setcounter{page}{1}` — has every label refused on this route (`restarted`), since its folios
-  confirm the main paper's pages as readily as its own. A label's own
-  number is not consulted: in an `article` its single digits turn up on nearly every page (`[1, 2]`),
-  so it proved nothing. A label **defined twice** is
-  refused on either route (`multiplyDefined`) instead of resolving to its first record, which is not
-  even the one LaTeX prints. Load `hyperref` (it writes `/PageLabels`) or pass `pages:`.
-- **A beamer deck's `/PageLabels` tree is never used for a `labels` lookup** (`render_pages`,
-  `extract_text`). beamer labels each PDF page with its frame number, which every overlay slide of a
-  `\pause` frame repeats, while `\label` records the slide — so a label after such a frame rendered
-  a later slide, with no refusal. Overlays and `pgfpages` layouts make the tree prove nothing even
-  when it numbers the pages "1".."N": `2 on 1` handouts put two slides on each sheet, and
-  `resize to` (one slide per sheet, a common print layout) defers every shipout by a page, so each
-  label records the next slide's number while the tree and the slide count match the PDF exactly. A
-  deck, recognised by the navigation records beamer writes into its `.aux`, takes the folio route
-  above: a footline printing the slide number (`\insertpagenumber`) confirms the page, and a deck
-  with no slide number in its footline, or one printing frame numbers, is refused. The refusal says
-  the tree was not used, and why. Before the folio is read, a deck's label is refused
-  (`slideMismatch`) when its printed page disagrees with beamer's own record of the slide its
-  `\label` ran on (`\beamer@slide`, in the same `.aux`): a `resize to` deck whose footline prints
-  `\insertpagenumber` shows each slide's true number beside a label recording the next one, so the
-  folio used to confirm the next slide for every label (a build whose `.fls` or `.log` shows
-  `pgfpages` is now refused before this, as `pgfpagesLayout` — see below). A label in an
-  `allowframebreaks` frame disagrees with that record too, and is refused although its page was
-  right; the refusal then points at `allowframebreaks` rather than at a layout the deck does not
-  use. A label whose key holds a brace group (`\label{fig:{a}}`) is checked against that record
-  like any other.
-- **A build that loaded `pgfpages` has every `labels:` lookup refused, in every document class**
-  (`render_pages`, `extract_text`; `pgfpagesLayout`). A `\pgfpagesuselayout` (`resize to`,
-  `2 on 1`) holds each page back until the next one is built, so every `\newlabel` records a later
-  page than its own, and the printed folios and hyperref's `/PageLabels` move with the pages: an
-  `article` under `resize to`, with or without `hyperref`, rendered the next figure for every
-  label. The evidence is the build's recorder file (`.fls`) or `.log` naming `pgfpages.sty` (or
-  `pgfmorepages.sty`, which holds pages back the same way without loading it); a
-  forged log line can only add a refusal. Loading the package without a layout is refused too, and
-  a build that left neither file readable is not checked. The refusal names the label's number, so
-  the page can be found with `extract_text` and passed as `pages:`.
-  `pdf_geometry kinds: ["floats"]` still returns the index for such a build, but flags it
-  (`floatsPagesShifted: true`, and a note in both channels), since its pages are shifted the same
-  way. Remaining gaps are tracked in #194.
-- **A document whose arabic numbering restarts without its printed pages going down is refused
-  too** (`labels:` without `/PageLabels`): a label is also refused when the PDF's last page reads as
-  a decimal page number other than the page count, or cannot be read — what a supplement starting at
-  or above the main paper's last labelled page, an equal restart, or arabic front matter followed by
-  `\pagenumbering{arabic}` leaves behind. Such documents resolved supplement labels to the main
-  paper's pages. Every label of a restarted document is refused, main paper included. The rule
-  costs ordinary documents too: a last page that prints no folio but opens with a section heading
-  (its number is read from the head), or an appended `\includepdf` page with its own folio, refuses
-  every label although nothing restarted — so the refusal says the last page reads as another
-  number and names both readings rather than asserting a restart. A last page with no decimal
-  reading at all (no folio, or a roman one) passes. A restart whose last page shows no number, and a
-  table cell or a line such as `3/9` or `– 3 –` standing where the folio is looked for above an
-  empty foot, can still pass; load `hyperref` for an exact lookup.
-- **`unshelve` three-way merges a shelved text file onto a HEAD that moved under it.** It used to
-  refuse `head-moved` for every such file, and nothing offered a way out. When the tree is clean
-  there, the shelved change is now merged onto HEAD's new content with the merge the session shadows
-  use; the new `merged` output lists those paths. It still refuses — shelf intact — when the two
-  changes touch the same lines, the file is not text, or one side added or deleted it, and the
-  refusal payload now charges `theirs` (the shelved content, the one side no other tool can read)
-  first and cuts it last.
-- **`edit_file`: an empty `newString` on a line range deletes the lines outright, terminator
-  included**, instead of leaving a blank line where they were (which in LaTeX is a `\par`). A range
-  now owns the terminator after its `endLine`, so a string edit in the same call that touches it is
-  refused as an overlap. Whether a range edit is a no-op is judged against the file as it was before
-  the call, so several deletions in one call succeed in any order (deleting an unterminated last
-  line and the line before it was refused as "identical" in one of the two orders). Under rewrite
-  preservation a range's preserved block comments out every line the range named, a blank one
-  included, and a string edit is judged in the file as the call found it — its separator, whether
-  it starts and ends a line, whether a trailing `\r` is half of a CRLF, and whether a terminator
-  `oldString` consumed is put back after the replacement — so an earlier edit in the same call
-  cannot change what a later one writes, and a CR-only file never gains an LF. Whether it ends a
-  line must hold in the current content too: an earlier edit that took its terminator left live
-  text right after it, which a preserved deletion would comment out. A stray bare CR stays bare
-  however `oldString` is spelled. In a file mixing bare-CR and LF endings, a deletion that would
-  leave a bare `\r` right before a blank LF line — one the file had, or one preservation put back —
-  turns that `\r` into `\n`, so the two never fuse into one CRLF and swallow the blank line.
-- **`edit_file` under rewrite preservation never pulls live text onto a preserved comment line.**
-  A later edit in the same call that took the line break ending a block an earlier edit had
-  preserved put its text on the `%` line (`P` preserved, then `\nQ` → ` tail` gave `% P tail`), where
-  LaTeX silently drops it; a deletion could likewise merge a blank line into a preserved block's
-  bare-CR terminator. Such a call is now refused and the file left untouched.
-- **`edit_file` and `add_citation` refuse a file that is not valid UTF-8.** Both rewrite the whole
-  file, and a lossy decode of a Latin-1 file turned every non-ASCII byte in it — not just the edited
-  text — into U+FFFD. Nothing is written; convert the file to UTF-8 first (or replace it
-  deliberately with `write_file`). `add_citation` still reads a `.bib` of any size.
-- **`push`'s `expectedRemoteHead` must be a commit SHA** (4 to 40 hex characters, the `remoteHead` a
-  conflict reported). A ref name such as `origin/master` was resolved at check time, which pins
-  nothing. The pin is checked against the one fetch the rebase then targets: resolving used to fetch
-  twice, so a commit landing between the two was rebased onto after the pin had passed, and the
-  verbatim resolution overwrote it. A pinned `push` whose `origin/<branch>` no longer exists after
-  the fetch (the branch was deleted or renamed upstream) is refused in words instead of with git's
-  raw "invalid upstream" — every explicit fetch now runs with `--prune`, so a stale `origin/<branch>` no
-  longer lets such a push recreate the branch a collaborator renamed. For the same reason
-  `project_sync` and `status` no longer call a clone up to date or in sync after the upstream
-  branch is renamed or deleted: they report `remote-branch-missing` (`status`: `remoteBranchMissing`
-  and `remoteBranchNote`; `project_sync`: `note`) and count local commits on no remote branch as
-  unpushed. Only a branch that tracked `origin/<its own name>` (`branch.<b>.remote` is `origin` and
-  `branch.<b>.merge` is `refs/heads/<b>`) can be missing: a never-pushed local branch (the review
-  branch `push` in branch mode leaves the clone on, even when `branch.autoSetupMerge=always` or
-  `--set-upstream-to` gave it another upstream) reports `syncState: "ahead"`. When
-  `origin/<branch>` is absent, `status`'s `aheadCommits` is capped at 20 with `aheadCommitsOmitted`
-  counting the rest, and the missing-branch note clips and escapes the remote branch names it lists.
-- **`WEB_LATEX_MCP_SESSION` refuses `shelves`, `project.lock` and `rewrite-mode.json`**, in any
-  case: each names project-wide state beside the session directories, and a session called `shelves`
-  wrote its records into the shelf store. The server does not start with one.
-- **`WEB_LATEX_MCP_CONTACT_EMAIL` must be printable ASCII**, without `(`, `)`, `;` or `\`. A
-  non-ASCII address made every Crossref and OpenAlex request fail before any I/O (a header value
-  cannot carry it) while `server_info` reported it configured; it is now ignored with a note on
-  stderr and reported as `contactEmailInvalid`, like any other malformed value.
-- **The bundled skills' descriptions no longer point at `/hunt-typo`, `/review-writing` or
-  `/format-latex`**, commands the plugin does not ship.
-
-### Fixed
-
-- **The Claude Desktop extension could not read a PDF at all.** `.mcpbignore` dropped pdf.js's Node
-  build, which the server imports, so `render_pages`, `extract_text`, `pdf_geometry` and `compile`'s
-  `pageCount` all failed with `Cannot find module`, and `doctor` blamed the canvas backend. The
-  build now ships, a stub `DOMMatrix` is installed when the native canvas backend is absent (pdf.js
-  needs that global merely to be imported), and everything but rasterizing works without the
-  backend. **`render_pages` is unavailable in the extension** — the bundle is built once for every
-  platform, and `@napi-rs/canvas` is a per-platform binary — and it refuses with a message that says
-  so, points at the npm install, and says to restart the server once the backend is installed.
-  Before blaming the backend it checks that pdf.js itself loads,
-  so a broken pdf.js install is reported as that rather than as a missing canvas. A momentary
-  failure to load the backend (too many open files, out of memory) is no longer remembered as
-  "unavailable" for the life of the process; once the stub has been installed, though, the process
-  keeps reporting the backend unavailable, since its pdf.js was built over the stub. `doctor`'s
-  `pdf-render` check now asks two questions apart: whether pdf.js loads at all, and whether pages
-  can be rasterized. The release workflow smoke-tests the PDF path in the packed bundle.
-- **`render_pages`, `extract_text` and `pdf_geometry` read the root's own build PDF.** In
-  workspace-local mode they preferred `<workspace>/<id>.pdf`, which holds whichever root compiled
-  last, while `labels`/`floats` came from the requested root's `.aux` — so a label could render the
-  other root's page. They now read `rootFile`'s build-dir PDF in every mode; the surfaced copy is a
-  fallback only when no `rootFile` was named and no `.aux` is read.
-- **The `viewer` shows the detected root's own build PDF, and maps a comment through that same
-  build.** It showed `<workspace>/<id>.pdf`, which holds whichever root compiled last, while a
-  comment's source location came from the detected root's SyncTeX — so after compiling a second
-  root, each comment was filed against the other document's file and line, silently. The surfaced
-  copy is now shown only when that build PDF is gone (a wiped temp dir), and a comment made on it
-  is kept without a source location. **The viewer hot-reloads when the detected root is
-  recompiled**; compiling a different root no longer changes what it shows. `compile`'s hint says
-  which: it used to tell you the running viewer "just refreshed with this build" after every
-  compile, and now says whether the viewer shows this build, shows it only as the surfaced copy
-  (the root it follows has no build of its own, so a comment made there carries no source
-  location), or shows another root — naming `render_pages`/`extract_text` with this `rootFile` to
-  look at the build just made. The comparison ignores letter case on macOS and Windows, where
-  `rootFile: "Main.tex"` compiles the very `main.tex` the viewer shows. With no viewer running, the
-  tip says which root the viewer would follow.
-- **Labels in `\include`d chapters are found** (`render_pages`/`extract_text` `labels`,
-  `pdf_geometry`'s `floats`). `\include` writes each chapter's labels into its own `.aux`, which the
-  reader never opened, so a chapter's label was reported as absent. `\@input` lines are followed —
-  only to `.aux` files the build dir actually holds, never as a path, bounded in count, depth and
-  bytes — and an input that could not be read is named in `note`. One whose name differs from a
-  build-directory entry only in letter case is not read, and the note says so with the fix (spell
-  the `\include` the way the directory or file is spelled, or compile with `clean: true`) instead
-  of calling it a chapter not compiled yet.
-- **`pdf_geometry`'s page boxes are budgeted.** They were bounded by count alone (4 pages x 300 text
-  lines), and every box carries a document-controlled label, so a default call on an ordinary
-  six-page paper returned ~76k characters — past what a client rejected undelivered in #68. The
-  boxes are now charged against a 20000-character budget on their JSON encoding, every page and kind
-  guaranteed an equal share and the surplus shared out; each page's cut is a suffix, counted in
-  `textOmittedBySize`/`imagesOmittedBySize` and named in `note`. **A dense page now comes back
-  partial**: on a two-column paper a default call keeps roughly a quarter of each page's lines — ask
-  for fewer pages, or `kinds: ["text"]` alone, to get more of each.
-- **`extract_text` is bounded per call.** The only bound was 20000 characters held per page, over
-  four pages, and every kept line shipped twice (text channel and `structuredContent`) — ~160k
-  characters with every counter at 0. There is now one 20000-character budget for the whole call,
-  charged on the text as rendered in both channels (about 10000 characters of page text); every page
-  gets an equal share and passes what it does not need on, each page's cut is a suffix counted in
-  `linesOmitted`/`charsOmitted`, and the text channel is rendered from the cut payload.
-- **`extract_text` counts an over-long line at its true length.** The per-page cap truncated a
-  single long line to 20000 characters plus `…`, so `charsOmitted` reported the cap plus one rather
-  than the gap. There is no per-page cap now; the call-wide budget above is the bound, and it counts
-  what it cuts as it is.
-- **`compile`'s `logTail` is bounded in characters.** It was capped at 80 lines, but each is an
-  un-wrapped logical line, so a long `\PackageWarning` could put hundreds of kilobytes into a
-  result. A tail line is now cut at 500 characters with a marker, and the whole tail is charged
-  against the 20000-character diagnostics budget — errors first, then the tail and `warnings[]` each
-  guaranteed half of what is left — dropping its earliest lines first. The tail's last line is
-  always kept, and when even that does not fit (a control character costs six characters in JSON)
-  it is cut further, to no fewer than 80 characters. The one error always kept has its message cut
-  to fit too. `rawLog: true` is still neither cut nor charged. **A warning-heavy
-  build now lists fewer warnings** in `warnings[]`, since the tail takes its share of the same
-  budget; what was cut is still counted in `warningsOmittedByCap`.
-- **`warningsFilter` trims a warning whose message contains `Error:`.** `logTail` pinned any line
-  containing `Error:`, so `Package foo Warning: Error: …` left `warnings[]` under
-  `excludeRule: ["foo"]` but stayed in the tail. Only an error-shaped line at the start of a line is
-  pinned now.
-- **A compile backend that is on `PATH` but cannot run is reported as such.** `compile` threw the
-  bare errno (`spawn latexmk EACCES`); it now names the backend, says that no substitute was tried
-  and why, and gives both ways to choose another. When the backend a compile needs is missing and
-  the other one is on `PATH` but cannot run, the error leads with the missing one and names the
-  unrunnable one after it, instead of reporting only the backend nobody asked for. `doctor` graded
-  the same case as "not on PATH" and
-  promised a fallback `compile` never makes; it now reports it as a failure and names the installed
-  alternative. Under tectonic, `doctor` no longer warns about the system TeX's age or suggests
-  `tlmgr`, neither of which a tectonic compile touches.
-- **`search_files` cannot stall the server, and says when the deadline cut a file.** The deadline
-  was checked between files only, and a regex `exec` cannot be interrupted, so one slow line held
-  the server's only thread. A regex search now runs on a worker thread terminated at the deadline (a
-  small fixed start-up cost per regex call), and a literal one checks the deadline before every
-  line. A file cut off part-way is counted in the new `filesPartiallySearched` and named in `note`
-  with the line reached. The payload budget is charged on both channels, not only the JSON (a result
-  reached twice the budget), and `excludeComments` on a file with no `%` comment syntax is now
-  reported in `note` instead of passing silently.
-- **`list_files` and `search_files` no longer follow a symlinked `subdir` out of the project.** The
-  walk guarded the entries under `subdir` but not `subdir` itself, so a link to the home directory
-  passed as `subdir` listed it. It is judged like every other path now (followed only on a local
-  project with `followSymlinks: true`).
-- **A git URL carrying credentials is never stored.** `register_project` and `project_sync` kept
-  `https://user:token@host/…` as given, so the token reached the registry, the result text and the
-  clone's origin. A secret in an http(s) `gitUrl` is now removed before anything is persisted,
-  echoed or cloned: `user:token@` keeps `user@` — a login name is not a secret, and Azure DevOps' and
-  Bitbucket's own clone URLs carry one that your credential helper looks the credential up by —
-  while a userinfo that is itself an access token (`ghp_…@`, `glpat-…@`, a base64 token carrying
-  `+`, `=` or `/`, or a long opaque token) is removed whole; a login name the URL already carries
-  in its host or path (Azure DevOps `<org>@dev.azure.com/<org>/…`) and an AWS CodeCommit
-  `<user>-at-<account>` name are kept. The test errs toward removal: a login name of 20 or more
-  characters that holds a digit or mixes letter case, and that the URL does not carry elsewhere
-  (`ContosoEngineeringTeam@…`), reads as a token and is removed whole. The URL is trimmed first, and a token after `https:/`,
-  `https:\` or `https:` with no slashes (all of which URL parsers accept) is removed too. `register_project` and `project_sync` say what was removed and how to supply
-  the token instead. `list_projects`, `push`'s `remote` and `set_credential`'s "no host" error show
-  an env-configured or legacy URL with the secret replaced by `***`, and an error message no longer
-  leaks the part of a password after a raw `@` in it.
-- **`add_asset` reads the source through one handle.** It resolved `sourcePath`, checked it, and
-  then read it by name, so a swap in between could substitute another file. The resolved file is now
-  opened once (`O_NOFOLLOW`, where the platform has it), checked with `fstat` and read through that
-  handle up to the size cap. A Windows network (UNC) or device path is refused before any syscall,
-  since merely resolving one connects this machine to that server.
-- **`add_citation` no longer holds the project lock across the network fetch.** An `openalex:` key
-  costs a DOI lookup plus a Crossref fetch, as long as a peer's own lock wait, so a peer's write
-  could time out behind a citation. The entry is fetched first; the `.bib` is resolved again, and
-  written, under the lock.
-- **`add_citation` refuses a `.bib`-named link to a file that is not one.** A committed
-  `refs.bib -> main.tex` passed the name check, and the entry landed in `main.tex`. The
-  link-resolved name is judged too, as `write_file` and `edit_file` judge it.
-- **`list_references` claims the out-of-band-edit baseline only for a file whose bytes it returned
-  whole.** It recorded one whenever every entry of a file shipped uncut, but a `thebibliography`, a
-  prose list or a `.bib` with `@string`/`@comment` blocks or `%` comments holds text no entry
-  carries, so a later `write_file` could overwrite a hand edit there without `ExternalChangeError`.
-  It now records only a bibliography whose entries are all `bibtex` and whose `raw`s cover the file
-  apart from whitespace.
-- **A Crossref entry's trailing junk is cut.** Crossref sends a whole entry on one line, which never
-  has a closing brace alone on its line, so the cut never found an end and anything after the entry
-  (a `<script>`) was appended to the `.bib`. A one-line entry's close is now believed when it ends
-  the header's line and no unmatched closer follows; junk that itself carries an unmatched closer
-  still fails open, whole.
-- **A DBLP key is never rewritten into a different record.** `dblp:rec/rec/conf/x/y` parsed to one
-  id and fetched another; a key with a doubled `rec/` prefix or a `.bib`/`.html`/`.xml` suffix is
-  now refused, and `search_references` drops a DBLP hit whose key would not round-trip.
-- **`check_citations`' `documents` and `bibliographySources` are capped** at 20 paths and 2000
-  characters each, with `documentsOmitted`/`bibliographySourcesOmitted`; a local project of 1500
-  markdown notes returned ~84 KB of paths. `maxResults` does not raise them. The
-  keyless-bibliography refusal caps its file list the same way.
-- **`commit`'s `files` and `leftUncommitted` are budgeted** (20000 characters across both channels,
-  `filesOmitted`/`leftUncommittedOmitted`). A few thousand untracked files made the result
-  undeliverable after the commit had landed. The headline's `+added -removed` still totals every
-  file committed, listed or not. A `./`-prefixed path now names the same session entry under every
-  scope.
-- **`push` no longer takes a peer's lines in a file both sessions edited.** Its peer guard
-  subtracted this session's own paths first, so a file both had edited counted as this session's,
-  and a push carrying a `message` (`git add -A`) committed and pushed the peer's lines in it. Such a
-  file — or any of this session's files while a live peer's index is unreadable — now refuses,
-  saying it also carries this session's edits and to land those with a session-scoped `commit`. This
-  also refuses a `message` push over an untracked file both sessions list.
-- **A same-line collision stays flagged.** `refresh` could clear the `conflicted` flag of an entry
-  whose shadow was missing a write this session made (a collision found while recording, or a write
-  made while already conflicted), after which a peer's `commit scope: "paths"` took the file. Such
-  an entry is now marked incomplete and no refresh clears it.
-- **`status` no longer writes the session's shadow index.** It refreshed the session's shadow
-  without the lock, which could overwrite a concurrent write's record or resurrect entries a peer's
-  `discard` had just settled; it now computes the refreshed view without persisting it (it still
-  updates its own session's heartbeat in `session.json`). Shadow-index updates within one process
-  are also serialised, concurrent atomic writes no longer share a temp file, and on Windows a rename
-  refused because another write to the same file is in flight is retried rather than failed.
-  `status` no longer takes git's index lock either: `git status` writes refreshed stat data back
-  under `.git/index.lock`, and a peer's `discard` landing in that window failed part way through
-  with "Unable to create index.lock". It now runs git with `--no-optional-locks`.
-- **An edit this session undid by hand no longer wedges its default commit scope**, and neither does
-  a file it created and then deleted through the tools: an entry whose shadow equals an unmoved HEAD
-  is settled on the next refresh instead of failing every session-scoped commit with "nothing to
-  commit". Naming such a created-then-deleted path in `commit scope: "paths"` is now refused
-  ("Nothing to commit at: …") where it used to return `committed: false` with the path under
-  `settled` — the refresh has already settled it.
-- **A project file named after an `Object.prototype` member is tracked like any other file**
-  (`constructor`, `__proto__`, `toString`, …). The session's edit was recorded into nothing, so the
-  default `commit` left it out, and a file named `__proto__` wrote the shadow bookkeeping onto
-  `Object.prototype` itself, which could wedge the server. The same fix covers a BibTeX entry of type
-  `@constructor`, which crashed `list_references` and `check_citations`, and a git remote whose host
-  is `constructor` or `__proto__`, which could be handed the value of an environment variable
-  literally named `undefined` as its token.
-- **A malformed peer `session.json` no longer breaks `status` for every session.** A record naming
-  a different session than its directory (`../x`, or another session's id) made `status`, `commit`
-  and `push` throw for everyone. The directory is now the authority for the session's name, a
-  missing `startedAt` falls back to the heartbeat, and only a record with no usable `pid` or
-  `heartbeatAt` is read as unreadable — dropping more would make a live peer invisible, and its
-  lines unprotected.
-- **The cross-process lock no longer admits two holders among servers on one host, in one pid
-  namespace.** Reclaiming a stale lock deleted
-  whatever was at the path by then, a faster waiter's fresh lock included — two holders in about
-  half of trials with a crashed holder and three waiters. Every lock record now carries a token and
-  is removed only by whoever holds its removal marker, after re-reading it; and a release removes
-  only its own record. A holder whose pid is alive on the boot that recorded it is no longer
-  reclaimed on one look at its age (a laptop waking from sleep no longer steals a live lock): only
-  once the same record, unchanged, has been seen stale twice at least 10 seconds apart — long
-  enough for a woken holder's overdue heartbeat to land — so a crashed holder whose pid another
-  process has reused cannot wedge the lock either. A lock timeout names the lock file and when
-  deleting it by hand is safe. A crash mid-removal can leave a `project.lock.rm-*` or
-  `project.lock.gone-*` file beside the lock; it is harmless, and is not cleaned up. **Every server
-  sharing a workspace must run this version for the guarantee to hold**: a server from before this change
-  (0.6.x or earlier) still deletes a lock it judges stale unconditionally. Each server also stamps its records with a random
-  per-process nonce, so two containers sharing a workspace volume that both run the server as pid 1
-  no longer take each other's live lock. The lock is still not sound across hosts, or across pid
-  namespaces where pids differ, since whether a holder is alive is judged from the local process
-  table: run every server sharing a workspace on one host, in one pid namespace.
-  A server restarted under the same pid as its crashed predecessor (a container's pid 1) judges
-  that predecessor's lock by its heartbeat alone: it is reclaimed once it has gone 15 seconds
-  without one and is seen unchanged 10 seconds later — about 25 seconds after the crash, inside
-  the default 30-second wait — while a live server in another container sharing that pid refreshes
-  its lock every 5 seconds and is never taken.
-- **`unshelve` never deletes a file because a shelf could not be read.** Any read error on a shelved
-  side was taken for "the shelf recorded a deletion", so a corrupt or unreadable shelf removed the
-  file and then the shelf. Only a missing file means absent now; a shelf that contradicts its own
-  manifest is refused. A failed restore rolls back per path.
-- **`shelve` names the shelf when clearing the tree fails**, and how to restore from it, instead of
-  implying the work was lost.
-- **`revert` and `unshelve` keep a Latin-1 file's bytes.** Both decoded any NUL-free file as UTF-8
-  on its way into the session shadow, so the next session commit staged U+FFFD where the file had
-  `é`. Content is text only when it survives a UTF-8 round trip; otherwise it is kept byte for byte
-  (and, like any binary entry, not three-way merged).
-- **`revert` refuses when an untracked or ignored file is in the way.** `git revert` overwrites an
-  ignored file at a path it restores (a note kept out of git through `.git/info/exclude` was
-  replaced by old committed bytes), and `status` never lists one, so the preflight read the path as
-  clean. A touched path HEAD does not track is now judged on disk, ancestors included, and the
-  refusal says to move the file by hand (`discard` never removes an ignored file). Each of
-  `revert`'s refusals now names at most 20 paths, then counts the rest.
-- **`discard` restores from HEAD, staged changes included.** It restored from the index, so a staged
-  change survived while the result said `discarded: true`. It now uses
-  `git checkout --no-overlay HEAD` (git 2.22 or newer; the server as a whole now needs git 2.25,
-  see `commit` below).
-- **A git access token never touches `.git/config` or a command line.** Fetch, pull, push and clone
-  wrote the token-bearing URL into the clone's `.git/config` for the length of the call (clone
-  saved it as `origin` before fetching), so a process killed mid-operation left it on disk. These
-  now run git directly, and the token reaches it only through the child's environment, read by an
-  inline credential helper configured for the remote's own scheme and host
-  (`credential.https://<host>.helper`, process-scoped, never persisted); `origin` always holds the
-  tokenless URL, from the clone on. **When a token resolves for a project, your own credential
-  helpers are not asked for, nor told about, that host's credential during the git call** (a
-  token the resolver itself read from a helper via `git credential fill` was of course read from it
-  first) — the resolved token is the one git uses, as when it sat in the URL, and nothing stores it into your keychain — while any other host (a
-  submodule, an LFS store) keeps your helpers and never sees the token. With no token resolved, git
-  falls through to your helpers as before. A remote whose host holds characters no hostname can
-  (`=`, `;`, `$`, `"`) is refused before anything is sent; `_` is allowed (docker-compose
-  service names such as `git_server`).
-- **`commit` `scope: "all"` with `paths` commits only what those paths cover.** Anything already
-  staged elsewhere rode along; it now stays staged and out of the commit. This uses
-  `git commit --only --pathspec-from-file`, so **the server now needs git 2.25 or newer**. `doctor`
-  checks it: a git older than 2.25 is a `fail`, and a version it cannot read is a `warn`.
-- **A session commit refused over a symbolic link leaves nothing staged.** The link check ran after
-  earlier files had already been written to the index.
-- **`shelve` and `unshelve` of several hundred files fit Windows' command line.** Two git probes
-  passed every path in one invocation; they are now batched like `commit` and `discard`.
-- **`diff` is not broken by a user's git configuration.** `color.ui=always`, `diff.external` and
-  `diff.noprefix` changed the patch the tool parses; it now asks for a plain patch explicitly.
-- **`diff`'s `ref` refuses a three-dot or multi-`..` range** in words, instead of a raw git error
-  (`HEAD~1..HEAD..HEAD`) or a silently different comparison (`A...B`).
-- **A conflict payload is charged on both channels together.** `conflictBudget` charged the larger
-  of the text and JSON renderings instead of their sum, and left the per-file scaffolding uncharged,
-  so a conflict inlines about half as much content before eliding it now — and stays deliverable.
-- **`add_writing_convention` cannot forge Markdown structure.** A lone CR (a line ending in
-  CommonMark) passed as one line, so `rule\r# Heading` added a heading; a leading
-  ` ``` `/`~~~` fence or a setext `---`/`===` underline was not escaped either. Every
-  CommonMark line ending is split on now, and those markers are escaped; the reported rule count is
-  right for such a file.
-- **Rewrite preservation handles CR and CRLF files.** A preserved block in a CR-only file was one
-  `%` line followed by live text; each line is commented now, whatever its terminator, and every
-  terminator is kept as it was — a CR-only file stays CR-only, and a stray CR in an LF file is not
-  turned into CRLF.
-- **The `.bib` guard sees Windows spellings of a `.bib` name.** `refs.bib.`, `refs.bib` with a
-  trailing space, and `refs.bib::$DATA` all open `refs.bib` on Windows, and passed as non-`.bib`
-  names.
-- **A subprocess's stderr is decoded whole**, so a multi-byte character split across two chunks no
-  longer turns into two replacement characters in an error message.
-- **Rejected environment values and paths are escaped in messages.** An invalid
-  `WEB_LATEX_MCP_COMPILER`, `_VIEWER_TARGET`, `_VIEWER_PORT`, `_WRITING_GUIDE_EXTRA`,
-  `_REFERENCE_SOURCE`, `_REWRITE_MODE` or `_CONTACT_EMAIL` (also where `server_info` and the
-  `search_references` refusal echo an invalid reference source), and a file path in a
-  session-recorder warning, are quoted with control and bidirectional characters escaped, so a
-  newline in one can no longer forge a log line. A long value is cut, with its length noted
-  outside the quotes.
-- **`server_info` returns an error result instead of throwing**, and an invalid
-  `WEB_LATEX_MCP_REWRITE_MODE` is echoed to stderr trimmed and elided rather than in full.
-
-## [0.7.0] - 2026-09-23
+## [0.7.0] - 2026-09-24
 
 ### Added
 
@@ -1701,6 +1209,19 @@ rerun` pattern never matches — is kept too, since on a biblatex paper it is th
 
 ### Changed
 
+- **`commit` with no `scope` no longer widens to the whole working tree** while a live peer shares
+  the clone.
+- **`search_files` refuses regular expressions whose estimated backtracking is too high**, names the
+  construct and suggests a rewrite; `regex: false` always works.
+- **`labels` lookups are checked against the page and refused rather than guessed** when the page
+  cannot be confirmed: no `/PageLabels` and no confirming folio, restarted numbering, a beamer deck
+  without a slide number in its footline, or any build that loaded `pgfpages`/`pgfmorepages`
+  (remaining gaps: #194).
+- **Inputs are validated**: project ids, `WEB_LATEX_MCP_SESSION`, `WEB_LATEX_MCP_CONTACT_EMAIL` and
+  `push`'s `expectedRemoteHead`; `edit_file` and `add_citation` refuse a file that is not valid
+  UTF-8.
+- **git 2.25 or later is required** (`doctor` checks it).
+
 - **README cut to a landing page, for the release** (248 → 124 lines). It had grown into a second,
   staler copy of `docs/` — the failure mode of which is not length but divergence, since the copy is
   the one nobody updates. Every detail below moved rather than went away.
@@ -1988,6 +1509,32 @@ omitted` marker in place. **The budget is charged on the rendered size of BOTH c
   implementation.
 
 ### Fixed
+
+- **The Claude Desktop extension can read PDFs**: pdf.js ships in the bundle; only `render_pages`
+  needs the native canvas, and says so.
+- **`search_files` cannot stall the server**: regex searches run on a worker thread that is
+  terminated at the deadline.
+- **Parallel sessions**: a commit or push no longer takes a live peer's lines, conflicted entries
+  stay flagged, `status` writes no shadow state and takes no git index lock, and the cross-process
+  lock no longer admits two holders.
+- **Git**: the access token never reaches `.git/config` or a command line, and a git URL carrying
+  credentials is never stored; `discard` restores from HEAD; `revert` refuses when an untracked or
+  ignored file is in the way; a missing remote branch is reported instead of "in sync"; a user's git
+  configuration no longer breaks `diff`.
+- **Files and edits**: `list_files`/`search_files` no longer follow a symlinked `subdir` out of the
+  project; line-range deletions remove the lines; rewrite preservation never hides live text;
+  `add_asset` reads through one handle; files named after `Object.prototype` members are tracked;
+  shelving never loses work; non-UTF-8 bytes survive `revert` and `unshelve`.
+- **PDF tools**: `render_pages`, `extract_text`, `pdf_geometry` and the `viewer` read the root's own
+  build PDF; labels in `\include`d chapters are found; clipped renders no longer overwrite each
+  other.
+- **Bounded payloads**: `pdf_geometry` boxes, `extract_text`, `compile`'s `logTail`, `commit`'s file
+  lists and `check_citations`' lists are budgeted.
+- **References**: `add_citation` fetches outside the project lock; trailing junk after a Crossref
+  entry is cut; DBLP keys are never rewritten; `list_references` claims the edit baseline only for a
+  file it returned whole.
+- **Messages**: values from the environment, a document or the caller are quoted and escaped;
+  `server_info` returns an error result instead of throwing.
 
 - **`push`'s review payload is budgeted too, not just its conflict payload** (#160, #153, #68). Branch
   mode returned `diff` (the whole review branch vs its base) and `diffFiles` uncapped, while the
