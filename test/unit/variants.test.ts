@@ -515,6 +515,54 @@ describe('applyOverlay', () => {
   });
 });
 
+describe('overlay: a latexmk rc file', () => {
+  // latexmk reads `latexmkrc`/`.latexmkrc` from the directory it runs in — the farm — and runs it
+  // as Perl, with no shell-escape flag involved: an overlaid one could write the source through
+  // the farm's links. The project's own rc file still runs, as in a normal compile.
+  const edit = { oldString: 'x', newString: 'y' };
+  /** A reader that fails the test if the overlay reads anything at all. */
+  const noReads = {
+    readTextExact: () => Promise.reject(new Error('read a file before refusing')),
+    linkTarget: () => Promise.reject(new Error('resolved a link before refusing')),
+  };
+
+  it('refuses latexmkrc and .latexmkrc wherever they sit, before reading anything', async () => {
+    const src = await tempDir('ovl-rc-');
+    await put(src, 'main.tex', 'x\n');
+    await put(src, 'latexmkrc', 'x\n');
+    await put(src, 'paper/.latexmkrc', 'x\n');
+    const before = await snapshot(src);
+    for (const file of ['latexmkrc', './latexmkrc', 'paper/.latexmkrc']) {
+      await expect(
+        applyOverlay(
+          noReads,
+          src,
+          [
+            { file: 'main.tex', edits: [edit] },
+            { file, edits: [edit] },
+          ],
+          { platform: 'linux' },
+        ),
+      ).rejects.toThrow(/Overlay entry 2 \(".*latexmkrc"\) is a latexmk configuration file/);
+    }
+    await expectSame(before, await snapshot(src));
+  });
+
+  it('folds case only where the platform does', async () => {
+    const src = await tempDir('ovl-rc-');
+    for (const platform of ['darwin', 'win32'] as const) {
+      await expect(
+        applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform }),
+      ).rejects.toThrow(/is a latexmk configuration file/);
+    }
+    // On a case-sensitive filesystem `LatexMkRc` is not a file latexmk reads, so it is an
+    // ordinary overlay (here: one that reaches the reader, which is the point).
+    await expect(
+      applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform: 'linux' }),
+    ).rejects.toThrow('read a file before refusing');
+  });
+});
+
 describe('overlaySnippetReader', () => {
   it('serves an overlaid path from memory and delegates everything else', async () => {
     const src = await tempDir('ovl-snip-');

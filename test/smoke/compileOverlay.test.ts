@@ -244,4 +244,90 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
       expect(after.get(rel)?.equals(bytes), rel).toBe(true);
     }
   }, 900_000);
+
+  it('runs no shell command from an overlay the caller did not opt into, so none writes through the farm', async () => {
+    // TeX Live's default `shell_escape = p` lets a document run makeindex with no flag at all.
+    // In the farm, sections/a.tex is a link to the SOURCE file, so `makeindex -o sections/a.tex`
+    // run from the farm truncated the source. An overlay compile disables shell escape unless the
+    // caller asked for it.
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-ws-'));
+    const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-src-'));
+    cleanups.push(
+      () => rm(workspace, { recursive: true, force: true }),
+      () => rm(userDir, { recursive: true, force: true }),
+      () => rm(buildDir(userDir), { recursive: true, force: true }),
+    );
+    const files: Record<string, string> = {
+      'main.tex': [
+        '\\documentclass{article}',
+        '\\begin{document}',
+        '\\input{sections/a}',
+        '\\end{document}',
+        '',
+      ].join('\n'),
+      'sections/a.tex': 'Section A text.\n',
+      'sections/b.tex': 'Section B text.\n',
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(userDir, rel)), { recursive: true });
+      await writeFile(path.join(userDir, rel), content);
+    }
+    const before = await snapshot(userDir);
+
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      workspaceIsLocal: true,
+      sessionId: 'test',
+      projects: [{ id: 'esc', mode: 'local', path: userDir, rootFile: 'main.tex' }],
+      defaultProject: 'esc',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), {
+      name: 'Test',
+      email: 'test@example.com',
+    });
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+
+    const res = await client.callTool(
+      {
+        name: 'compile',
+        arguments: {
+          project: 'esc',
+          overlay: [
+            {
+              file: 'main.tex',
+              edits: [
+                {
+                  oldString: '\\begin{document}\n',
+                  // makeindex is on TeX Live's restricted allow-list, and its input is an ordinary
+                  // project file, so the command is portable wherever TeX Live is.
+                  newString:
+                    '\\begin{document}\n' +
+                    '\\immediate\\write18{makeindex -q -o sections/a.tex sections/b.tex}\n',
+                },
+              ],
+            },
+          ],
+        },
+      },
+      undefined,
+      { timeout: 240_000 },
+    );
+    expect(res.isError, JSON.stringify(res.content)).toBeFalsy();
+    const out = res.structuredContent as { hint?: string; logPath?: string; variant?: string };
+    expect(out.variant).toMatch(/^v[0-9a-f]{12}$/);
+    // The source first: it is the promise. Then why it held — the engine refused the command —
+    // and that the caller is told the variant ran without shell escape.
+    const after = await snapshot(userDir);
+    expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+    for (const [rel, bytes] of before) {
+      expect(after.get(rel)?.toString('utf8'), rel).toBe(bytes.toString('utf8'));
+    }
+    const log = await readFile(out.logPath ?? '', 'utf8');
+    expect(log).toMatch(/runsystem\(makeindex[^)]*\)\.\.\.disabled/);
+    expect(out.hint ?? '').toContain('disables shell escape');
+  }, 300_000);
 });

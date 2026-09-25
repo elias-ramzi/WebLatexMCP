@@ -69,6 +69,12 @@ export const MAX_OVERLAY_EDITS = 100;
 
 const HANDLE_RE = /^v[0-9a-f]{12}$/;
 
+/**
+ * The rc files latexmk reads from its working directory, lowercase: an overlay may not name one
+ * (compared under the platform's case fold, like every other overlay name).
+ */
+const LATEXMK_RC_NAMES = new Set(['latexmkrc', '.latexmkrc']);
+
 /** A caller-supplied handle, validated BEFORE it is ever joined into a path. */
 export function isVariantHandle(s: string): boolean {
   return HANDLE_RE.test(s);
@@ -526,7 +532,8 @@ export interface OverlayReader {
  * content per project-relative POSIX path, in the order given.
  *
  * Refused, before anything is read: more than {@link MAX_OVERLAY_EDITS} edits in total, a path
- * that is empty or leaves the project, and a file named twice — after normalisation, and under the
+ * that is empty or leaves the project, a latexmk rc file (`latexmkrc`, `.latexmkrc` — Perl latexmk
+ * runs from the farm), and a file named twice — after normalisation, and under the
  * platform's case fold (win32, darwin). Refused per file, naming it: a file that does not exist,
  * one that is the same directory entry or hard-linked file as an earlier entry (`Main.tex` beside
  * `main.tex` on a case-insensitive filesystem, wherever it runs: both would be applied to the
@@ -560,6 +567,17 @@ export async function applyOverlay(
     const rel = toPosix(path.relative(path.resolve(projectDir), abs));
     if (rel === '') {
       throw new Error(`Overlay entry ${i + 1}: ${quoteValue(entry.file)} does not name a file.`);
+    }
+    // latexmk reads `latexmkrc`/`.latexmkrc` from the directory it runs in — the farm — and runs
+    // it as Perl, whatever the shell-escape flags say, so an overlaid one could write the source
+    // through the farm's links. The project's own rc file still runs, as in a normal compile.
+    if (LATEXMK_RC_NAMES.has(foldName(path.posix.basename(rel), platform))) {
+      throw new Error(
+        `Overlay entry ${i + 1} (${quoteId(rel)}) is a latexmk configuration file, which latexmk ` +
+          'runs as Perl code, so an overlay may not replace it: the variant builds among links to ' +
+          "the project's own files, and that code could write through them. Edit the file itself " +
+          '(edit_file) and compile without overlay, or overlay the .tex files instead.',
+      );
     }
     const earlier = seen.get(foldName(rel, platform));
     if (earlier !== undefined) throw sameFile(i, rel, earlier, normalized[earlier]!);

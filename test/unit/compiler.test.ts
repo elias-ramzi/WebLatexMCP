@@ -49,6 +49,24 @@ describe('latexmkArgs (shell escape)', () => {
     expect(args).not.toContain('-shell-escape');
   });
 
+  it('passes -no-shell-escape only for a request that asks for it (an overlay compile)', () => {
+    const plain = latexmkArgs(base, BUILD);
+    const disabled = latexmkArgs({ ...base, noShellEscape: true }, BUILD);
+    expect(plain).not.toContain('-no-shell-escape');
+    expect(disabled).toContain('-no-shell-escape');
+    // Nothing else moves: a normal compile's argv is exactly what it was.
+    expect(disabled.filter((a) => a !== '-no-shell-escape')).toEqual(plain);
+    expect(plain).toEqual([
+      '-pdf',
+      '-interaction=nonstopmode',
+      '-file-line-error',
+      '-cd',
+      '-synctex=1',
+      `-outdir=${BUILD}`,
+      'main.tex',
+    ]);
+  });
+
   it('prefers full -shell-escape over restricted when both are set', () => {
     const args = latexmkArgs({ ...base, shellEscape: true, restrictedShellEscape: true }, BUILD);
     expect(args).toContain('-shell-escape');

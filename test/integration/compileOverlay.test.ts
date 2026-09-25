@@ -35,7 +35,7 @@ const MAIN_TEX =
 const B_TEX = 'Section B original.\n';
 
 /** An engine that "typesets" sections/b.tex, read through `workDir`, into a one-page PDF. */
-function stubCompiler(requests: CompileRequest[]) {
+function stubCompiler(requests: CompileRequest[], extraLog = '') {
   return {
     isAvailable: async () => true,
     compile: async (req: CompileRequest): Promise<CompileOutcome> => {
@@ -52,7 +52,7 @@ function stubCompiler(requests: CompileRequest[]) {
         `PWD ${path.join(workDir, logBaseDir(req.rootFile))}\nINPUT main.tex\nINPUT ./sections/b.tex\n`,
       );
       // One error located in the overlaid file, so the snippet has to come from the variant.
-      const log = './sections/b.tex:1: Undefined control sequence.\n';
+      const log = './sections/b.tex:1: Undefined control sequence.\n' + extraLog;
       return {
         success: true,
         pdfPath,
@@ -72,7 +72,7 @@ async function tmp(prefix: string): Promise<string> {
   return dir;
 }
 
-async function setup() {
+async function setup(opts: { extraLog?: string } = {}) {
   const remote = await createFakeRemote({
     'main.tex': MAIN_TEX,
     'sections/b.tex': B_TEX,
@@ -94,7 +94,9 @@ async function setup() {
     new ProjectRegistry(workspace),
   );
   const requests: CompileRequest[] = [];
-  ctx.compiler = new CompilerResolver('latexmk', false, () => stubCompiler(requests));
+  ctx.compiler = new CompilerResolver('latexmk', false, () =>
+    stubCompiler(requests, opts.extraLog),
+  );
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test', version: '0.0.0' });
@@ -195,7 +197,9 @@ describe('compile with an overlay', () => {
   it('qualifies "untouched" when shell escape was on', async () => {
     const { client } = await setup();
     const plain = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
-    expect(textOf(plain)).toContain('and the viewer are untouched.');
+    expect(textOf(plain)).toContain(
+      'and the viewer are untouched (shell escape was disabled for this build).',
+    );
     const escaped = await client.callTool({
       name: 'compile',
       arguments: { overlay: OVERLAY, restrictedShellEscape: true },
@@ -204,6 +208,65 @@ describe('compile with an overlay', () => {
       "untouched by the server — but shell escape was on, and the document's shell commands " +
         'can write anywhere',
     );
+  });
+
+  it('disables shell escape for a variant the caller did not opt in for, and only then', async () => {
+    // TeX Live's default `shell_escape = p` runs allow-listed commands with no flag; in the farm a
+    // `makeindex -o sections/b.tex` writes the source through its link. So a variant asks the
+    // backend for -no-shell-escape — and a normal compile's request is exactly what it was.
+    const { client, requests } = await setup();
+    await client.callTool({ name: 'compile', arguments: {} });
+    await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    await client.callTool({
+      name: 'compile',
+      arguments: { overlay: OVERLAY, restrictedShellEscape: true },
+    });
+    await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY, shellEscape: true } });
+    expect(requests).toHaveLength(4);
+    expect(requests.map((r) => r.noShellEscape)).toEqual([undefined, true, undefined, undefined]);
+    expect(requests[0]).not.toHaveProperty('noShellEscape');
+  });
+
+  it('says when a variant refused a shell command, and never for a normal compile', async () => {
+    const { client } = await setup({
+      extraLog: 'runsystem(makeindex -q -o sections/b.tex main.tex)...disabled.\n',
+    });
+    const hintOf = (res: unknown) =>
+      (res as { structuredContent?: { hint?: string } }).structuredContent?.hint ?? '';
+    const variant = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(hintOf(variant)).toContain('an overlay compile disables shell escape');
+    expect(hintOf(variant)).toContain('restrictedShellEscape: true');
+    expect(textOf(variant)).toContain('lifts that guarantee');
+    // A normal compile never passed -no-shell-escape, so the line is not the server's doing.
+    const plain = await client.callTool({ name: 'compile', arguments: {} });
+    expect(hintOf(plain)).not.toContain('disables shell escape');
+    // Opted in: the caller already knows, and the flag was theirs.
+    const optedIn = await client.callTool({
+      name: 'compile',
+      arguments: { overlay: OVERLAY, restrictedShellEscape: true },
+    });
+    expect(hintOf(optedIn)).not.toContain('disables shell escape');
+  });
+
+  it('refuses to overlay a latexmk rc file, before compiling or staging anything', async () => {
+    const { client, clone, requests } = await setup();
+    await writeFile(path.join(clone, '.latexmkrc'), '$pdf_mode = 1;\n');
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: {
+        overlay: [
+          {
+            file: '.latexmkrc',
+            edits: [{ oldString: '$pdf_mode = 1;', newString: 'system("touch pwned");' }],
+          },
+        ],
+      },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain('".latexmkrc") is a latexmk configuration file');
+    expect(requests).toHaveLength(0);
+    expect(await readFile(path.join(clone, '.latexmkrc'), 'utf8')).toBe('$pdf_mode = 1;\n');
+    await expect(stat(path.join(buildDir(clone), 'variants'))).rejects.toThrow();
   });
 
   it('says when the build never read an overlaid file, and only then', async () => {

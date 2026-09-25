@@ -64,7 +64,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve exactly as in the
   project (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the path for an
   explicitly relative name). The source, the main build, the surfaced PDF, the viewer and the
-  session's records are all left alone, and nothing records a revision baseline. The result
+  session's records are all left alone, and nothing records a revision baseline. To keep the
+  source out of reach of the build itself, an overlay compile runs no shell command unless you
+  pass `shellEscape` or `restrictedShellEscape` — not even TeX Live's default restricted
+  allow-list, whose `makeindex -o` could otherwise write a project file through the farm's links —
+  and says so in `hint` when the document tried to run one; opting in lifts that guarantee. A
+  `latexmkrc` or `.latexmkrc` cannot be overlaid, since latexmk runs it as Perl (the project's own
+  one still runs, as in a normal compile). Under `lualatex`, Lua code in the document can still
+  write a project file, since `io.open` needs no shell escape. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant

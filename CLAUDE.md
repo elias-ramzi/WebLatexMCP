@@ -936,10 +936,25 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   the compile, so an overlaid file the build never opened is named in `hint` rather
   than producing a variant silently identical to the main build. Nothing goes through FileService's
   write path (no shadow record, no baseline, no rewrite mode), and the surfaced PDF and the viewer
-  are left alone. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape
-  flags and the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle
-  is checked by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay
-  compile, under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed
+  are left alone. **The farm's links are also a write path for the BUILD**, and two doors through
+  them are shut: a variant compile with neither `shellEscape` nor `restrictedShellEscape` passes
+  `-no-shell-escape` (`CompileRequest.noShellEscape`, set only by `compile` for a variant — a
+  normal compile's argv stays byte-identical, pinned by a test), because TeX Live's default
+  `shell_escape = p` runs allow-listed commands with no flag at all, and a `makeindex -o` into
+  `sections/a.tex` from the farm truncated the source file behind that link; a refused command
+  (`shellCommandRefused`, pdfTeX's `runsystem(...)...disabled`) or a TikZ-externalization failure
+  gets a `hint` saying the variant ran without shell escape and that opting in lifts the
+  guarantee. Tectonic needs no flag: it runs nothing without `-Z shell-escape`. And an overlay
+  entry named `latexmkrc`/`.latexmkrc` (basename, under the platform's case fold) is refused
+  before anything is read, since latexmk runs it as Perl from its working directory. **Accepted,
+  not overlooked:** the project's OWN rc file still runs in a variant (as in a normal compile —
+  it is the project's code, not the caller's), and under `lualatex` the document's Lua `io.open`
+  writes relative to the farm whatever the shell-escape flag says, so a variant's own Lua can still
+  reach the source; the tool description says both, and a lualatex variant's result text repeats the
+  second. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape flags and
+  the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle is checked
+  by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay compile,
+  under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed
   (`rm -rf`, which unlinks a farm's links without following them), never the one just compiled. The
   PDF tools take `variant` and read that build only — its PDF, `.aux`/`.log` (`readAuxFloats`'
   `buildDir`) and its own `render/` — never falling back to the main build.

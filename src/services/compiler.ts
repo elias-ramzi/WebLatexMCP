@@ -29,6 +29,15 @@ export interface CompileRequest {
    */
   restrictedShellEscape?: boolean;
   /**
+   * Pass `-no-shell-escape` when neither flag above is set, so the engine runs no shell command at
+   * all — not even TeX Live's default restricted allow-list (`shell_escape = p`), which a plain
+   * compile leaves on. Set only by an overlay compile: it runs in a link farm whose files are links
+   * to the source, so an allow-listed `makeindex -o sections/a.tex` would write the source through
+   * them. Ignored when `shellEscape` or `restrictedShellEscape` is set — the caller's opt-in wins.
+   * Tectonic needs nothing here: it runs no shell command unless `shellEscape` is set.
+   */
+  noShellEscape?: boolean;
+  /**
    * Directory the backend runs in (its cwd), which `rootFile` is relative to. Default
    * `projectDir`. An overlay compile (`compile`'s `overlay`) points it at the variant's link farm,
    * which mirrors the project tree, so `rootFile` keeps its project-relative spelling.
@@ -337,11 +346,14 @@ export async function mirrorSubdirsForRoot(
 /**
  * The engine shell-escape flag for a request, or `undefined` for none. Full `-shell-escape`
  * (arbitrary commands) takes precedence over the safer `-shell-restricted` (allow-list only)
- * when both are set; neither is ever enabled unless the caller explicitly opted in.
+ * when both are set; neither is ever enabled unless the caller explicitly opted in. With neither,
+ * `noShellEscape` passes `-no-shell-escape`; otherwise no flag, leaving the TeX installation's
+ * own default (TeX Live: restricted) — which a normal compile's argv must keep byte-identical.
  */
 function shellEscapeFlag(req: CompileRequest): string | undefined {
   if (req.shellEscape) return '-shell-escape';
   if (req.restrictedShellEscape) return '-shell-restricted';
+  if (req.noShellEscape) return '-no-shell-escape';
   return undefined;
 }
 
@@ -568,7 +580,8 @@ export class TectonicCompiler implements LatexCompiler {
 
     const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
     // Tectonic has no restricted mode, so `restrictedShellEscape` alone does not widen to full
-    // shell escape here; only an explicit `shellEscape` enables system calls.
+    // shell escape here; only an explicit `shellEscape` enables system calls. Without it tectonic
+    // runs none at all, so `noShellEscape` needs no flag here.
     if (req.shellEscape) args.push('-Z', 'shell-escape');
 
     const before = await statOrNull(buildPdfPathIn(buildDir, req.rootFile));

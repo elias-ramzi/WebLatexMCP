@@ -23,6 +23,7 @@ import {
   fitFilteredLog,
   logTail,
   needsShellEscape,
+  shellCommandRefused,
   findMissingPackages,
   LOG_TAIL_LINE_CAP,
 } from '../services/logParser.js';
@@ -155,14 +156,21 @@ const inputSchema = {
         'in memory, everything else as it is — to measure a change (page count, where a float ' +
         'lands, whether a table still fits) without touching the source. The source, the main ' +
         'build, the surfaced PDF and the viewer are all left as they were, and nothing is ' +
-        'recorded as a change of this session. The result carries a `variant` handle; pass it ' +
+        'recorded as a change of this session — unless you opt into shell escape (below). To ' +
+        'hold that, an overlay compile runs NO shell command unless shellEscape or ' +
+        'restrictedShellEscape is set — not even the restricted allow-list a normal compile may ' +
+        'run by default — so a document that needs one (makeindex, epstopdf, TikZ ' +
+        'externalization) can build differently here, and `hint` says so; and a latexmkrc / ' +
+        ".latexmkrc may not be overlaid (latexmk runs it as Perl; the project's own one still " +
+        "runs, as in a normal compile). Under lualatex the document's own Lua code can still " +
+        'write a project file (io.open needs no shell escape). The result carries a `variant` handle; pass it ' +
         'to render_pages / extract_text / pdf_geometry to inspect that build. Name each file ' +
         `once (all its edits in one entry); at most ${MAX_OVERLAY_FILES} files and ` +
         `${MAX_OVERLAY_EDITS} edits in total. A .bib may be overlaid without confirmBibEdit — ` +
         'the real file is never written. Line numbers in the diagnostics (and snippets) for an ' +
-        "overlaid file refer to the variant's text, not the file on disk. shellEscape in an " +
-        'overlay compile can still write anywhere a normal compile can — including into the ' +
-        "source, through the variant's links to it. The " +
+        "overlaid file refer to the variant's text, not the file on disk. shellEscape or " +
+        'restrictedShellEscape in an overlay compile lets the document write wherever a normal ' +
+        "compile can — including into the source, through the variant's links to it. The " +
         `${MAX_VARIANTS} most recently compiled variants per project are kept; older ones are ` +
         'removed. Recompiling the same overlay reuses its variant (incrementally).',
     ),
@@ -485,7 +493,8 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended). ' +
         'Pass `overlay` to compile a what-if variant instead — some files with edit_file-style ' +
         'edits applied in memory — and measure it (pageCount, render_pages / extract_text / ' +
-        'pdf_geometry with the returned `variant`) without touching the source or the main build.',
+        'pdf_geometry with the returned `variant`) without touching the source or the main build ' +
+        '(shell escape is off for an overlay unless you opt in, which lifts that guarantee).',
       inputSchema,
       outputSchema,
     },
@@ -537,6 +546,11 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             });
             variant = { handle, contents, outDir: paths.out, workDir: paths.src };
           }
+          // Shell escape is on unless the caller turned it off? Not for a variant: TeX Live's
+          // default (`shell_escape = p`) runs allow-listed commands with no flag at all, and in
+          // the farm `makeindex -o sections/a.tex` writes the SOURCE file through its link. So a
+          // variant runs none unless the caller opted in; a normal compile's argv is unchanged.
+          const shellEscapeOn = shellEscape || restrictedShellEscape;
           const outcome = await backend.compiler.compile({
             projectDir: dir,
             rootFile: root,
@@ -545,7 +559,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             timeoutSec,
             shellEscape,
             restrictedShellEscape,
-            ...(variant ? { workDir: variant.workDir, outDir: variant.outDir } : {}),
+            ...(variant
+              ? {
+                  workDir: variant.workDir,
+                  outDir: variant.outDir,
+                  ...(shellEscapeOn ? {} : { noShellEscape: true }),
+                }
+              : {}),
           });
           // Retention runs after the compile, under the same lock, and never removes this one.
           if (variant) await evictVariants(dir, MAX_VARIANTS, variant.handle);
@@ -589,7 +609,6 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
-          const shellEscapeOn = shellEscape || restrictedShellEscape;
           const hints: string[] = [];
           // First: it reframes everything below it. A substituted backend means the caller is not
           // reading the diagnostics they expected — under tectonic, notably, none of them carry a
@@ -619,6 +638,22 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               'This document uses TikZ externalization, which needs system calls. Retry compile ' +
                 'with restrictedShellEscape: true (preferred) or shellEscape: true. Only enable ' +
                 'this for a project you trust — shell escape lets the .tex run arbitrary commands.',
+            );
+          }
+          // A variant ran with shell escape disabled (above), so a command a normal compile would
+          // run under the installation's default was refused — say so, and what opting in costs.
+          if (
+            variant &&
+            !shellEscapeOn &&
+            (shellCommandRefused(outcome.log) || needsShellEscape(outcome.log))
+          ) {
+            hints.push(
+              'This overlay compile refused a shell command the document ran (\\write18): an ' +
+                'overlay compile disables shell escape — even the restricted allow-list a normal ' +
+                "compile may run — to keep the source untouched, since the variant's files are " +
+                'links to it. So this variant can differ from a normal build. Retrying with ' +
+                'restrictedShellEscape: true (or shellEscape: true) runs it, but lifts that ' +
+                'guarantee: the command can then write the source through those links.',
             );
           }
           if (missingPackages.length > 0)
@@ -787,7 +822,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               (shellEscapeOn
                 ? " by the server — but shell escape was on, and the document's shell commands " +
                   "can write anywhere, the source included through the variant's links to it."
-                : '.')
+                : ' (shell escape was disabled for this build)' +
+                  // LuaTeX's `io.open` writes relative to the working directory whatever the
+                  // shell-escape flag says, and tectonic never runs LuaTeX.
+                  (backend.kind === 'latexmk' && engine === 'lualatex'
+                    ? " — except by the document's own Lua code: under lualatex, io.open can " +
+                      "still write a project file through the variant's links."
+                    : '.'))
             : '';
           const text = [
             headline,

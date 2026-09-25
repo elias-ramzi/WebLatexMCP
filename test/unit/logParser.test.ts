@@ -5,6 +5,7 @@ import {
   logTail,
   unwrapLines,
   needsShellEscape,
+  shellCommandRefused,
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
@@ -519,6 +520,26 @@ describe('needsShellEscape', () => {
 
   it('is false for an ordinary error with no system-call failure', () => {
     expect(needsShellEscape('./main.tex:3: Undefined control sequence.')).toBe(false);
+  });
+});
+
+describe('shellCommandRefused', () => {
+  it('detects a \\write18 the engine refused, wrapped or not', () => {
+    // What pdfTeX logs under -no-shell-escape, hard-wrapped mid-"...disabled" as a long one is.
+    const wrapped = hardWrap(
+      `runsystem(makeindex -q -o sections/a.tex ${'x'.repeat(31)}.tex)...disabled.`,
+    );
+    expect(wrapped.split('\n')[1]).toBe('.disabled.');
+    expect(shellCommandRefused(wrapped)).toBe(true);
+    expect(shellCommandRefused('runsystem(epstopdf x.eps)...disabled (restricted).')).toBe(true);
+  });
+
+  it('is false for a command that ran, and for a log with no system call', () => {
+    expect(shellCommandRefused('runsystem(makeindex -q x)...executed safely (allowed).')).toBe(
+      false,
+    );
+    expect(shellCommandRefused('runsystem(echo hi)...executed.')).toBe(false);
+    expect(shellCommandRefused(' restricted \\write18 enabled.\n\\write18 disabled.')).toBe(false);
   });
 });
 
