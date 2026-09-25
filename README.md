@@ -51,6 +51,7 @@ every change, and nothing reaches Overleaf until you say so.
 - 🧪 **Local compiles** — two backends run on your machine: `latexmk`, which is what Overleaf runs, or `tectonic`.
 - 👀 **Live PDF viewer + review comments** — a viewer that hot-reloads on every compile, in a browser or a **VS Code** tab. Select text in the PDF to leave a note, and Claude applies it at the right source line.
 - 📚 **Citations checked, not trusted** — API (CrossRef, OpenAlex) calls to verify, or add citations.
+- 🧑‍⚖️ **Pre-submission peer review** — a multi-model reviewer panel, merged into one verified review ([how it works](https://claude.ai/artifact/Kg5Zuk3wvu9XfprmPgv2rR)).
 - 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 
@@ -91,6 +92,7 @@ unless you ask:
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
+- **`/peer-review`** — pre-submission review of an ML paper: summary, strengths, weaknesses, minor weaknesses, questions, typos — from a clone, `/review-paper` runs it as a Sonnet/Opus/Fable panel merged by a Fable triage.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 
 Every bundled skill is scanned on each pull request by NVIDIA's
