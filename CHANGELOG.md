@@ -16,6 +16,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   credential and redaction tests need were reported as hardcoded secrets; `src/` is still scanned
   in full. The score goes from 69 to 88, past the catalog's threshold of 80.
 
+### Changed
+
+- **CI moves to `actions/setup-node@v7`.** v5 wrote an `always-auth` line into the `.npmrc` it
+  generates, which npm 11 flags as an unknown config that "will stop working in the next major
+  version" — a warning on every npm step of the publish job, and a likely publish failure once the
+  runner's npm is 12. v7 drops the input, and stops exporting a placeholder `NODE_AUTH_TOKEN`, which
+  suits trusted publishing. Every workflow moves, not just `publish.yml`, so the pull request's own CI
+  exercises v7 before a tag depends on it.
+
 ## [0.7.1] - 2026-09-25
 
 ### Changed
