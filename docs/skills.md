@@ -233,9 +233,13 @@ dropping false positives, adjudicating every devil's-advocate critical — and w
 Agreement between reviewers raises confidence, never severity. Anywhere else (an MCP prompt, one agent)
 the skill runs the same roles in sequence in one session, with less independent coverage.
 
-It **never edits the paper**. The reports go to `paper-review.local/<timestamp>/` at the clone root,
-git-excluded before the first write so `commit` cannot pick them up; on a local project it asks before
-writing anything into your directory. Ask Claude to "review my paper before submission" or "what would
+It **never edits the paper**. Every run is recorded on the local copy it reviews, under
+`paper-review.local/<timestamp>/` — the final review, the triage log and each panel report — at the
+clone root, git-excluded before the first write so `commit` cannot pick it up and nothing reaches
+your remote; in a local project's own directory (excluded from its repo's git too); or, for a bare
+PDF with no project (`/review-paper paper.pdf`), under the server's workspace. The final review
+then reaches you three ways: as a **file to download** in the Claude desktop app, as a clickable
+link, and in full in the reply. Ask Claude to "review my paper before submission" or "what would
 reviewers say".
 
 ## `session-feedback` — report back on the server itself

@@ -1,6 +1,6 @@
 ---
 description: Pre-submission peer review of an ML paper by an independent multi-model panel — full reviews on sonnet, opus and fable, an opus devil's advocate, a novelty scout, per-file typo hunters — merged by a fable triage into one final review (summary, strengths, weaknesses, minor weaknesses, questions, typos). Reviews, never edits.
-argument-hint: <project id> [venue] [--deadline YYYY-MM-DD] [--focus "..."] [--no-web]
+argument-hint: <project id | paper.pdf> [venue] [--deadline YYYY-MM-DD] [--focus "..."] [--no-web]
 ---
 
 Review the paper below before submission with an independent panel of agents on different
@@ -11,7 +11,7 @@ Target: $ARGUMENTS
 
 **This command reviews and never edits.** Nothing in the paper is written, committed, or pushed —
 not the `.tex`, not the `.bib`. The only files it writes are the review reports, git-excluded, as
-step 2 says. Applying a suggestion afterwards is a separate, explicit request.
+step 2 says, on the local copy of the project. Applying a suggestion afterwards is a separate, explicit request.
 
 **Load the method before you touch anything:** `list_skills({ skill: "peer-review" })`. That
 skill is the single source of truth for how to review, what each role returns, and how triage
@@ -31,10 +31,16 @@ stop and tell me.
    and undefined-citation warning into a `CMP-n` item, and add `check_citations`' keys without an
    entry. If the compile fails, stop and show me the first error — a review of a paper that does
    not build is a review of the wrong thing. Then set up the run directory
-   `paper-review.local/<YYYYMMDD-HHMM>/` exactly as the skill's "Where the reports go" says —
-   git-excluded before the first write on a git project, and only after asking me on a local one
-   (if I decline, keep the reports in a temporary directory outside the project). Save the review
-   context there as `context.md`, and the `CMP` items as `reports/compile.md`.
+   `paper-review.local/<YYYYMMDD-HHMM>/` on the local copy, exactly as the skill's "Where the
+   reports go" says — git-excluded before the first write. Save the review context there as
+   `context.md`, and the `CMP` items as `reports/compile.md`.
+
+   **A bare PDF instead of a project id** (a co-author's draft, a paper with no sources) needs no
+   project: skip `compile` and `check_citations`, put the run directory under the server's
+   workspace as the skill says, copy the PDF there as `paper.pdf`, and extract its text layer with
+   `pdftotext -layout` into `paper.txt` — a review-mode PDF keeps its margin line numbers there.
+   Every agent then gets those two paths instead of a project id and anchors findings to
+   `p.<page>, L<line>`; the typo pass is one `corrector` per ~8 pages of `paper.txt`, by line range.
 
 3. **Dispatch the panel — in parallel, and independent.** Launch these in the background, at most
    8 tool uses per message. Each agent starts empty and loads the skill itself, so each prompt
@@ -70,11 +76,13 @@ stop and tell me.
    Strengths, Weaknesses, Minor weaknesses, Questions, Typos — and send it back to the triage
    agent once if not.
 
-6. **Report.** Show `final-review.md` in full — it is the deliverable. Then, from the triage log:
-   the predicted outcome, the top of the author action plan, and every item marked UNVERIFIABLE
-   that I must check myself. Close with the panel that actually ran (models, any failed agent), the
-   venue assumed, and links to `final-review.md`, `triage-log.md` and `reports/`. Never upload,
-   publish or share the paper or the reviews anywhere.
+6. **Report.** Surface `final-review.md` as the skill's "Surfacing the final review" says — in
+   the Claude desktop app, send it as a file I can download (`SendUserFile`, `display: "attach"`);
+   everywhere, show it in full and link it. Then, from the triage log: the predicted outcome, the
+   top of the author action plan, and every item marked UNVERIFIABLE that I must check myself.
+   Close with the panel that actually ran (models, any failed agent), the venue assumed, and links
+   to `final-review.md`, `triage-log.md` and `reports/`. Never upload, publish or share the paper
+   or the reviews anywhere.
 
 To review a revision, run the command again: a new run directory, a fresh panel that never sees
 the previous reports. Give only the triage agent the previous `triage-log.md` path, and ask it to

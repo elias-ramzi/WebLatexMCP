@@ -25,7 +25,9 @@ Do not improvise the rules from memory.
 ## Your scope
 
 - Read your file with `read_file` (project id + path). Do not read any other file unless
-  the prompt names it.
+  the prompt names it. When the prompt gives no project but a local text layer of a PDF
+  (`paper.txt`) and a line range, read that range with `Read` instead, report each finding
+  as `p.<page>, L<line>` using the line prefixes, and never apply anything.
 - If your assigned path is a `.bib`, return immediately with `out of scope: .bib`.
 - Report findings only, unless the prompt **explicitly** authorizes applying them. When it
   does: `edit_file` per finding, one at a time, re-reading on any failure rather than

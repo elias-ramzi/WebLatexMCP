@@ -504,8 +504,13 @@ one model playing every role gives less independent coverage than the `/review-p
 
 ### Where the reports go
 
-- **Git project** — under `paper-review.local/<YYYYMMDD-HHMM>/` at the clone root, made
-  git-excluded **before** anything is written, so `commit` can never pick it up:
+Every run is recorded on the **local copy** it reviews, never only in the chat and never in a
+temporary directory, so the author and the next session find it beside the paper. A run directory
+`paper-review.local/<YYYYMMDD-HHMM>/` holds `final-review.md`, `triage-log.md`, `context.md` and
+`reports/`.
+
+- **Git project** — at the clone root, made git-excluded **before** anything is written, so
+  `commit` can never pick it up and nothing reaches the remote:
 
   ```bash
   DIR="<clone path from list_projects>"
@@ -518,10 +523,32 @@ one model playing every role gives less independent coverage than the `/review-p
   `reports/<id>.md`); the returned diff is empty because the path is excluded — expected. Without a
   shell, say that the directory is not yet excluded and give the user the exclude line to add.
 
-- **Local project** — the directory is the user's own: **ask** before writing anything into it,
-  and offer to give the review inline only.
+- **Local project** — in the project directory itself, with `write_file`. When that directory is
+  inside a git repo of the user's, exclude `paper-review.local/` there first — the same commands,
+  with the exclude file at `$(git -C "$DIR" rev-parse --git-dir)/info/exclude`, which is local to
+  their checkout and never committed. Say in the final message that the folder was added and that
+  deleting it is safe.
+- **A bare PDF, not a project** — under the server's workspace, at
+  `<workspace>/paper-review.local/<paper-slug>/<YYYYMMDD-HHMM>/`, with `<workspace>` from
+  `server_info`. A workspace-local workspace is already excluded from the host repo's git. Write
+  with the client's file tool or the shell, since `write_file` needs a project.
 - **Never** put the paper or the reviews anywhere else — no upload, no sharing, no issue, no
   gist. The paper is unpublished.
 
-Finish by showing the final review in full, then the predicted outcome and the top of the author
-action plan, with links to the files.
+### Surfacing the final review
+
+The author should get the review without hunting for it, in every client:
+
+1. **As a file to download.** When the client can hand the user a file — the Claude desktop app's
+   `SendUserFile`, or an equivalent — send `final-review.md` once it is written, as an attachment
+   (`display: "attach"`), with a one-line caption naming the paper and the predicted outcome. Send
+   only the final review; offer the triage log rather than sending it too.
+2. **As a link.** A clickable workspace-relative link when the run directory is inside the IDE
+   working directory — e.g.
+   `[final-review.md](.web_latex_mcp/<id>/paper-review.local/<run>/final-review.md)` — and the
+   absolute path otherwise.
+3. **Inline.** Show the final review in full in the reply. In a client that can neither send a
+   file nor open a link (an MCP prompt in Claude Desktop), this is how the user gets it, so it is
+   never skipped.
+
+Then give the predicted outcome and the top of the author action plan.
