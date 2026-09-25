@@ -177,7 +177,12 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       arguments: { project: 'doc', ...(engine ? { engine } : {}) },
     });
     const structured = res.structuredContent as Record<string, unknown>;
-    expect(structured.success, JSON.stringify(res.content)).toBe(true);
+    // On failure, say which build and show its log excerpt: the result text alone names no
+    // error when latexmk exits non-zero without a TeX error, and CI's TeX is not this machine's.
+    expect(
+      structured.success,
+      `${engine ?? 'pdflatex'}: ${JSON.stringify(res.content)}\n${String(structured.logTail)}\n${String(structured.hint ?? '')}`,
+    ).toBe(true);
     // Every real build here is ordinary TeX output, so its .log's shipout marks must number
     // exactly the PDF's pages: a shorter or longer parse would silently skip the shipout check
     // (and a wrong sequence of the right length would refuse labels it should not).
