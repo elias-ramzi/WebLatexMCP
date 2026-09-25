@@ -8,6 +8,8 @@
 
 [![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
+[![NVIDIA SkillSpector: 0 findings](https://img.shields.io/badge/SkillSpector-0%20findings-76B900?logo=nvidia&logoColor=white)](#skills)
+&nbsp;
 ![Node ≥ 20](https://img.shields.io/badge/node-%E2%89%A5%2020-3C873A?logo=node.js&logoColor=white)
 &nbsp;
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-444)
@@ -90,6 +92,10 @@ unless you ask:
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
+
+Every bundled skill is scanned on each pull request by NVIDIA's
+[SkillSpector](https://github.com/NVIDIA/skillspector) (static rules, `--no-llm`), and any finding
+fails CI. Today every skill scores 0/100 with no findings.
 
 **How you get them depends on the client:**
 

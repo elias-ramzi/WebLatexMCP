@@ -104,7 +104,8 @@ session to look at.
      unasked. Default path: `web-latex-mcp-feedback-<YYYY-MM-DD>.md` in the directory the client was
      launched from.
    - **`gh` missing, unauthenticated, or offline** — there is no filing route, so the report would exist
-     only in the transcript and be lost when the session closes. **Write it without asking** to
+     only in the transcript and be lost when the session closes. **Always write it**, and name the path
+     in your reply, to
      `.claude/session_feedbacks/web-latex-mcp-feedback-<YYYY-MM-DD>.md`, relative to the directory the
      client was launched from, creating the directory if it is not there. It holds the chat summary and
      every issue block verbatim, so the user (or a later session with a logged-in `gh`) can file it
@@ -163,18 +164,27 @@ finding needs a fix in the user's paper, that is a separate request they make se
 
 Measure these once, reuse in every block. Where a command is given, run it — do not answer from memory.
 
-| Fact                 | How to get it                                                                                                                                                           |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server version       | `server_info` → `version`. Running from a clone, add the commit: `git -C <repo> rev-parse --short HEAD`.                                                                |
-| Is it the latest?    | `npm view web-latex-mcp version` (best-effort, network). "0.4.0, latest is 0.5.0" pre-empts the first reply every stale report gets.                                    |
-| OS, arch, WSL        | `uname -sr -m` on Unix, `cmd /c ver` on Windows. WSL shows as `microsoft` in `uname -r` — say so, its path and locking behavior differ: `Ubuntu 24.04 (WSL2) · x86_64`. |
-| Node version         | `node --version`. The client spawns the server, possibly with a different Node than your shell's — if they could differ, say which one you measured.                    |
-| MCP client + version | Claude Code CLI (`claude --version`), Claude Code VS Code extension, Claude Desktop, Cursor, Gemini CLI, GitHub Copilot, or another MCP client. **Ask** — see below.    |
-| Model                | Which AI drove the session (`Claude Opus 5`, `Mistral Large`, …). Name what you are sure of; an exact build number you do not know is `unknown`, not a guess.           |
-| Install method       | `npx web-latex-mcp`, global npm, the `.mcpb` bundle, the Claude Code plugin, or from a clone. It decides which dependencies shipped, so it decides which bugs exist.    |
-| Compiler + TeX       | `doctor` → configured compiler, engines, TeX distribution and year. Only when the session compiled; omit otherwise rather than padding.                                 |
-| Workspace + project  | `server_info` → `workspaceLocal`; `list_projects` → git or local in-place, and the **host** (Overleaf / GitHub / GitLab / other). The host, never the URL.              |
-| Parallel sessions    | Was `WEB_LATEX_MCP_SESSION` set, or another client working the same clone? Concurrency bugs are unreadable without it.                                                  |
+- **Server version** — `server_info` → `version`. Running from a clone, add the commit:
+  `git -C <repo> rev-parse --short HEAD`.
+- **Is it the latest?** — `npm view web-latex-mcp version` (best-effort, network). "0.4.0, latest is
+  0.5.0" pre-empts the first reply every stale report gets.
+- **OS, arch, WSL** — `uname -sr -m` on Unix, `cmd /c ver` on Windows. WSL shows as `microsoft` in
+  `uname -r` — say so, its path and locking behavior differ: `Ubuntu 24.04 (WSL2) · x86_64`.
+- **Node version** — `node --version`. The client spawns the server, possibly with a different Node
+  than your shell's — if they could differ, say which one you measured.
+- **MCP client + version** — Claude Code CLI (`claude --version`), Claude Code VS Code extension,
+  Claude Desktop, Cursor, Gemini CLI, GitHub Copilot, or another MCP client. **Ask** — see below.
+- **Model** — which AI drove the session (`Claude Opus 5`, `Mistral Large`, …). Name what you are
+  sure of; an exact build number you do not know is `unknown`, not a guess.
+- **Install method** — npx (the package run straight from npm), global npm, the `.mcpb` bundle, the
+  Claude Code plugin, or from a clone. It decides which dependencies shipped, so it decides which bugs
+  exist.
+- **Compiler + TeX** — `doctor` → configured compiler, engines, TeX distribution and year. Only when
+  the session compiled; omit otherwise rather than padding.
+- **Workspace + project** — `server_info` → `workspaceLocal`; `list_projects` → git or local in-place,
+  and the **host** (Overleaf / GitHub / GitLab / other). The host, never the URL.
+- **Parallel sessions** — was `WEB_LATEX_MCP_SESSION` set, or another client working the same clone?
+  Concurrency bugs are unreadable without it.
 
 **What you cannot measure, ask for — once, in one message, before printing.** The client, the model, and
 the install method cannot be read from inside the session; the user answers all three in a line. If they
@@ -256,7 +266,7 @@ v22.14.0
 
 ### How was it installed?
 
-npx web-latex-mcp
+npx (the npm package, run on demand)
 
 ### MCP client
 

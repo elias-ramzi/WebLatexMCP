@@ -59,10 +59,13 @@ Run in order. Stop and report if any step fails.
    - `--commands_only_to_delete` — command wrapper goes, wrapped text stays (e.g. `\revised{keep this}`).
    - `--environments_to_delete` — whole environments go (e.g. a `note`/`comment` env).
 6. **Choose the mode.** Ask **separate copy** vs **in place** (defaults per operations below).
-7. **Run the cleaner** on a scratchpad _copy_ of the clone (never point it at the live clone's `.git`):
+7. **Run the cleaner** on a scratchpad _copy_ of the clone (never point it at the live clone's `.git`).
+   The copy is made **without** `.git` rather than copied whole and pruned, so nothing is deleted.
+   The plain `mkdir` fails if the directory already exists, so the cleaner always gets a fresh tree:
 
    ```bash
-   cp -r "<clone>" "<scratch>/<id>" && rm -rf "<scratch>/<id>/.git"
+   mkdir "<scratch>/<id>"
+   tar -C "<clone>" --exclude=./.git -cf - . | tar -C "<scratch>/<id>" -xf -
    arxiv_latex_cleaner "<scratch>/<id>" --keep_bib \
      --commands_to_delete todo note fixme \
      --environments_to_delete note comment
@@ -74,11 +77,13 @@ Run in order. Stop and report if any step fails.
 
 8. **Deliver by mode:**
    - **Separate copy (always zip):** place the cleaned tree **and a zip** beside the clone, in
-     `<workspaceRoot>` — clearing any stale prior run first. The zip holds the cleaned files at its root
-     (arXiv-ready — no wrapping folder). **No MCP mutation.**
+     `<workspaceRoot>`. The zip holds the cleaned files at its root (arXiv-ready — no wrapping folder).
+     **No MCP mutation.** If `<workspaceRoot>/<id>_arXiv` or `<workspaceRoot>/<id>_arXiv.zip` is
+     already there from an earlier run, **ask before replacing it**, and on a yes move it into the
+     scratchpad rather than deleting it (`mkdir -p "<scratch>/previous"`, then `mv` whichever of the
+     two exists into it) — the user may have edited that copy by hand.
 
      ```bash
-     rm -rf "<workspaceRoot>/<id>_arXiv" "<workspaceRoot>/<id>_arXiv.zip"
      cp -r "<scratch>/<id>_arXiv" "<workspaceRoot>/<id>_arXiv"
      ( cd "<workspaceRoot>/<id>_arXiv" && zip -r "../<id>_arXiv.zip" . )
      ```
