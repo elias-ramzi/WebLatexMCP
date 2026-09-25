@@ -56,12 +56,11 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 The [`publish` workflow](.github/workflows/publish.yml) then runs the full gate, verifies the tag
-matches `package.json`'s version, and runs `npm publish --provenance --access public`. It needs an
-`NPM_TOKEN` repository secret (an npm automation/publish token) — set it once under
-**Settings → Secrets and variables → Actions**. The `bin`/`files`/`prepublishOnly` fields in
-`package.json` are already publish-ready, and the `web-latex-mcp` name is available on npm. Until the
-first publish lands, the `npx -y web-latex-mcp` install path (README's npm section and the Claude Code
-plugin) will not resolve — publishing is what makes them work.
+matches `package.json`'s version, and runs `npm publish --access public`. It authenticates through
+npm **trusted publishing** (OIDC), so there is no token to store or rotate: the package's
+**Settings → Trusted Publisher** on npmjs.com names GitHub Actions, `elias-ramzi/WebLatexMCP` and the
+workflow file `publish.yml`. Renaming that file breaks publishing until the npm setting is updated to
+match. Trusted publishing attaches the provenance attestation on its own.
 
 ## Feedback from a session
 

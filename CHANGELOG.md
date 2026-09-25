@@ -9,6 +9,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-25
+
+### Changed
+
+- **npm releases publish through trusted publishing (OIDC), with no stored token.** The v0.7.0
+  publish was refused with `E404`, most likely an expired `NPM_TOKEN`; `publish.yml` now
+  authenticates as this repository's workflow, runs on Node 24 (npm >= 11.5.1 is required), and
+  no longer reads `NPM_TOKEN`.
+
 ## [0.7.0] - 2026-09-24
 
 ### Added
