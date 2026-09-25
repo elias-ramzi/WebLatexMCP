@@ -479,6 +479,51 @@ describe('variant lifecycle', () => {
     );
   });
 
+  it.skipIf(isWin || (typeof process.getuid === 'function' && process.getuid() === 0))(
+    'tries every old variant, and reports every one it could not remove',
+    async () => {
+      const src = await tempDir('ovl-evict-fail-');
+      const current = 'v0000000000cc';
+      // Removal order is newest first: 4, 3, 2, 1. The first and the third cannot be removed.
+      const old = ['v000000000001', 'v000000000002', 'v000000000003', 'v000000000004'];
+      const stamp = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString();
+      for (const [i, h] of [...old, current].entries()) {
+        const p = variantPaths(src, h);
+        await mkdir(p.out, { recursive: true });
+        await writeManifest(p.manifest, {
+          rootFile: 'main.tex',
+          createdAt: stamp(i),
+          usedAt: stamp(i),
+          files: [],
+          compiler: 'latexmk',
+          engine: 'pdflatex',
+        });
+      }
+      const locked = ['v000000000004', 'v000000000002'];
+      for (const h of locked) {
+        const out = variantPaths(src, h).out;
+        await writeFile(path.join(out, 'main.pdf'), 'held');
+        await chmod(out, 0o555);
+        cleanups.unshift(() => chmod(out, 0o755).catch(() => undefined));
+      }
+
+      const err = await evictVariants(src, 1, current).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      // Every handle was tried: the removable ones are gone although an earlier one failed.
+      expect((await readdir(path.join(buildDir(src), 'variants'))).sort()).toEqual(
+        [current, ...locked].sort(),
+      );
+      // And every failure is reported, together, in removal order.
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      expect(message).toMatch(/^v000000000004: EACCES.*; v000000000002: EACCES/s);
+      expect(message).not.toContain('v000000000003');
+    },
+  );
+
   it('resolveVariantBuild refuses an invalid, unknown or mismatched variant', async () => {
     const src = await tempDir('ovl-resolve-');
     await expect(resolveVariantBuild(src, 'p', '../x', undefined)).rejects.toThrow(

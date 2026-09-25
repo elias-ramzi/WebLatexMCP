@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -561,22 +561,44 @@ describe('compile with an overlay: refusals and retention', () => {
           engine: 'pdflatex',
         });
       }
-      // The oldest is the one eviction removes; make its out/ unremovable (EACCES on unlink).
+      // The oldest is the one eviction removes; make its out/ unremovable (EACCES on unlink). The
+      // file it cannot unlink has a right-to-left override and a newline in its name, and the
+      // failure's message quotes that path: it must reach neither the hint nor stderr raw.
       const locked = variantPaths(clone, old[0]!).out;
-      await writeFile(path.join(locked, 'main.pdf'), 'held');
+      const rlo = String.fromCodePoint(0x202e);
+      await writeFile(path.join(locked, `held${rlo}\nforged.pdf`), 'held');
       await chmod(locked, 0o555);
       // Restore before the build dir is removed (cleanups run in order).
       cleanups.unshift(() => chmod(locked, 0o755).catch(() => undefined));
 
+      const stderr: string[] = [];
+      const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+        stderr.push(args.map(String).join(' '));
+      });
+      cleanups.unshift(async () => spy.mockRestore());
       const res = await client.callTool({
         name: 'compile',
         arguments: { rootFile: 'main.tex', overlay: OVERLAY },
       });
+      spy.mockRestore();
       expect(res.isError ?? false, textOf(res)).toBe(false);
       const out = res.structuredContent as { success: boolean; variant?: string; hint?: string };
       expect(out.success).toBe(true);
       expect(out.variant).toMatch(/^v[0-9a-f]{12}$/);
-      expect(out.hint ?? '').toMatch(
+      // stderr names the project as every message does, and escapes the failure: a newline in a
+      // path must not forge a log line.
+      const logged = stderr.filter((l) => l.includes('could not remove an old variant'));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('of "demo": ');
+      expect(logged[0]).toContain('held\\u{202E}\\u{A}forged.pdf');
+      expect(logged[0]).not.toContain(rlo);
+      expect(logged[0]).not.toContain('\n');
+      // The hint is escaped as every supplied value is: the override and the newline written out.
+      const hint = out.hint ?? '';
+      expect(hint).toContain('held\\u{202E}\\u{A}forged.pdf');
+      expect(hint).not.toContain(rlo);
+      expect(hint.split('\n').some((line) => line.startsWith('forged.pdf'))).toBe(false);
+      expect(hint).toMatch(
         /An older variant of this project could not be removed \(.*EACCES.*\); this compile is unaffected/,
       );
       expect(textOf(res)).toContain('could not be removed');

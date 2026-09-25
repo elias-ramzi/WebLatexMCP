@@ -31,6 +31,8 @@ import {
 import { makeWarningJudge } from '../lib/warningFilter.js';
 import {
   applyOverlay,
+  describeEvictionFailure,
+  evictionFailureHint,
   evictVariants,
   overlayFilesNeverRead,
   overlaySnippetReader,
@@ -181,7 +183,11 @@ const inputSchema = {
         "compile can — including into the source, through the variant's links to it. The " +
         `${MAX_VARIANTS} most recently compiled variants per project are kept; older ones are ` +
         'removed. Recompiling the same overlay reuses its variant (incrementally). rootFile ' +
-        'must be project-relative, with no ".." segment and no linked directory on its way.',
+        'must be relative to the project root — not absolute or drive-qualified (C:), with no ' +
+        '".." segment, and not reached through a linked directory — or the overlay compile is ' +
+        'refused before anything is read. The variant mirrors the project and not its parent: ' +
+        './ and ../ inputs resolve as in the project while they stay inside it, but a ../ input ' +
+        'that leaves the project fails here, where a normal compile reads it.',
     ),
 };
 
@@ -609,9 +615,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             try {
               await evictVariants(dir, MAX_VARIANTS, variant.handle);
             } catch (err) {
-              evictionFailure = err instanceof Error ? err.message : String(err);
+              evictionFailure = evictionFailureHint(err);
               console.error(
-                `[compile] could not remove an old variant of ${id}: ${evictionFailure}`,
+                `[compile] could not remove an old variant of ${quoteId(id)}: ` +
+                  describeEvictionFailure(err),
               );
             }
           }
@@ -717,12 +724,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           if (missingPackages.length > 0)
             hints.push(missingPackageHint(missingPackages, backend.kind));
           // Last: housekeeping, not this compile — an older variant that could not be removed.
-          if (evictionFailure !== undefined) {
-            hints.push(
-              `An older variant of this project could not be removed (${evictionFailure}); this ` +
-                'compile is unaffected, and removal is tried again after the next overlay compile.',
-            );
-          }
+          if (evictionFailure !== undefined) hints.push(evictionFailure);
           const hint = hints.length > 0 ? hints.join('\n') : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.

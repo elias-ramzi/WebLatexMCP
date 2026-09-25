@@ -47,7 +47,7 @@ import type { Engine } from '../services/compiler.js';
 import { applyEditsToContent } from '../services/fileService.js';
 import type { AnyEditOp } from '../services/fileService.js';
 import type { CompilerKind } from '../types.js';
-import { childPathInside, quoteId } from './projectId.js';
+import { childPathInside, escapeInvisibleChars, quoteId } from './projectId.js';
 import { resolveInside, toPosix } from './paths.js';
 import { matchIsCommented, supportsLineComments } from './rewriteMode.js';
 import type { SnippetReader } from './sourceSnippet.js';
@@ -556,11 +556,46 @@ export async function writeManifest(file: string, manifest: VariantManifest): Pr
 }
 
 /**
+ * The variants {@link evictVariants} could not remove, each with why — thrown only after every
+ * other handle was tried. The message lists them as `<handle>: <reason>`, in removal order; the
+ * reasons carry filesystem paths, so render it through {@link describeEvictionFailure}.
+ */
+export class VariantEvictionError extends Error {
+  readonly failures: ReadonlyArray<{ handle: string; reason: string }>;
+  constructor(failures: Array<{ handle: string; reason: string }>) {
+    super(failures.map((f) => `${f.handle}: ${f.reason}`).join('; '));
+    this.name = 'VariantEvictionError';
+    this.failures = failures;
+  }
+}
+
+/**
+ * An eviction failure as a message shows it: escaped as every supplied value is
+ * (`escapeInvisibleChars`), since the reasons quote filesystem paths and a newline or a bidi
+ * override in one would otherwise forge a log line or reorder the text around it.
+ */
+export function describeEvictionFailure(err: unknown): string {
+  return escapeInvisibleChars(err instanceof Error ? err.message : String(err));
+}
+
+/** The `hint` line for an eviction that failed: what, escaped, and that the compile stands. */
+export function evictionFailureHint(err: unknown): string {
+  const n = err instanceof VariantEvictionError ? err.failures.length : 1;
+  return (
+    `${n === 1 ? 'An older variant' : `${n} older variants`} of this project could not be ` +
+    `removed (${describeEvictionFailure(err)}); this compile is unaffected, and removal is tried ` +
+    'again after the next overlay compile.'
+  );
+}
+
+/**
  * Keep `keep` variants of the project — `current` always among them, then the most recently
  * compiled by manifest `usedAt` (an unreadable manifest counts as oldest) — and remove the rest. Only
  * directories named like a handle are considered. Removal is `rm -rf`, which unlinks a farm's
- * links without following them, so the source behind them is never touched. Returns the removed
- * handles.
+ * links without following them, so the source behind them is never touched. Every handle is
+ * tried: one that cannot be removed (a viewer holding its PDF open on Windows) does not keep the
+ * rest, and the failures are thrown together afterwards as a {@link VariantEvictionError}.
+ * Returns the removed handles.
  */
 export async function evictVariants(
   projectDir: string,
@@ -580,10 +615,17 @@ export async function evictVariants(
     others.push({ handle: name, usedAt: manifest?.usedAt ?? '' });
   }
   others.sort((a, b) => (a.usedAt < b.usedAt ? 1 : a.usedAt > b.usedAt ? -1 : 0));
-  const removed = others.slice(Math.max(0, keep - 1)).map((o) => o.handle);
-  for (const handle of removed) {
-    await rm(variantPaths(projectDir, handle).root, { recursive: true, force: true });
+  const removed: string[] = [];
+  const failures: Array<{ handle: string; reason: string }> = [];
+  for (const { handle } of others.slice(Math.max(0, keep - 1))) {
+    try {
+      await rm(variantPaths(projectDir, handle).root, { recursive: true, force: true });
+      removed.push(handle);
+    } catch (err) {
+      failures.push({ handle, reason: err instanceof Error ? err.message : String(err) });
+    }
   }
+  if (failures.length > 0) throw new VariantEvictionError(failures);
   return removed;
 }
 
