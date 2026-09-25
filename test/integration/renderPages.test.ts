@@ -89,11 +89,23 @@ function captionOn(page: number, caption: string): (n: number) => string {
   return (n) => (n === page ? `body\n${caption}\n${n}` : `body\n${n}`);
 }
 
-/** Stage the `.aux` the last compile would have left, without running latexmk. */
-async function stageAux(userDir: string, content: string): Promise<void> {
+/** The head of an ordinary compile's `.log`: names no pgfpages, so a label may resolve. */
+const PLAIN_LOG = 'This is pdfTeX, Version 3.141592653\n';
+
+/**
+ * Stage the `.aux` the last compile would have left, without running latexmk — and the `.log`
+ * beside it, since every compile leaves one and a build with neither `.log` nor `.fls` has every
+ * label refused (`'pgfpagesUnknown'`). `log: null` stages that unreadable-records state.
+ */
+async function stageAux(
+  userDir: string,
+  content: string,
+  log: string | null = PLAIN_LOG,
+): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
   await writeFile(auxPath, content);
+  if (log !== null) await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, log);
 }
 
 interface ContentBlock {
@@ -343,6 +355,92 @@ describe('render_pages', () => {
     // the mapping, so a looser assertion passes with the scannable summary line deleted.
     expect(textOf(res)).toMatch(/labels \(from the last compile's \.aux\): tab:results -> page 4/);
     expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(1);
+  });
+
+  it('labels: refuses every label when neither the .fls nor the .log could be read', async () => {
+    // The .aux alone cannot show a \pgfpagesuselayout, which records every label a page late
+    // and moves the folios and /PageLabels with it; only the build's .fls/.log can. With neither
+    // readable, the page that would render is unverifiable, so the call refuses — even though
+    // this very setup resolves once a .log sits beside the .aux (the next test).
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
+    await stageAux(userDir, '\\newlabel{tab:results}{{2}{4}}\n', null);
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('tab:results');
+    expect(text).toMatch(/neither the build's recorder file \(\.fls\) nor its \.log could be read/);
+    expect(text).toContain('pages:');
+    // Not the pgfpagesLayout refusal: nothing shows the package was loaded.
+    expect(text).not.toMatch(/name pgfpages\.sty/);
+    expect(text).not.toMatch(/compile without pgfpages/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it("labels: refuses a page the log's shipout record shipped under another page counter", async () => {
+    // Every page's folio reads as its own index and a neighbour agrees, so the folio route
+    // accepts PDF page 4 for printed page 4 — but the .log shipped PDF page 4 with counter 3
+    // (a title page reset it) and counter 4 on PDF page 5.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{2}{4}}\n',
+      `${PLAIN_LOG} [1] [1] [2] [3] [4] (./main.aux) )\n`,
+    );
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain(
+      "but the log's shipout record says PDF page 4 was shipped out with page counter 3, and " +
+        'page counter 4 was shipped out on PDF page 5',
+    );
+    expect(text).toContain('pages:');
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it("labels: resolves as before when the log's shipout record agrees", async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{2}{4}}\n',
+      `${PLAIN_LOG} [1] [2] [3] [4] [5] (./main.aux) )\n`,
+    );
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(structuredOf(res).resolvedLabels).toEqual([
+      { label: 'tab:results', printedPage: '4', page: 4 },
+    ]);
+  });
+
+  it('labels: an EMPTY .log is a record that was read, and the label resolves', async () => {
+    // The value just outside the refusal above: a readable .log naming no pgfpages is `false`
+    // evidence, not missing evidence.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
+    await stageAux(userDir, '\\newlabel{tab:results}{{2}{4}}\n', '');
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    expect(structuredOf(res).resolvedLabels).toEqual([
+      { label: 'tab:results', printedPage: '4', page: 4 },
+    ]);
   });
 
   it('labels: two labels on one page render it once, and both are echoed', async () => {

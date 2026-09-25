@@ -26,6 +26,19 @@ import type { ServerConfig } from '../../src/types.js';
 const MAIN_TEX = '\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n';
 const MAIN_AUX = '\\relax\n\\newlabel{fig:x}{{1}{3}{A caption}{figure.1}{}}\n';
 
+/**
+ * Stage main.tex's `.aux` — and the `.log` a compile always leaves beside it: a build with
+ * neither `.log` nor `.fls` has every label refused (`'pgfpagesUnknown'`).
+ */
+async function stageMainAux(userDir: string): Promise<void> {
+  const auxPath = buildAuxPath(userDir, 'main.tex');
+  await writeFile(auxPath, MAIN_AUX);
+  await writeFile(
+    `${auxPath.slice(0, -'.aux'.length)}.log`,
+    'This is pdfTeX, Version 3.141592653\n',
+  );
+}
+
 const cleanups: Array<() => Promise<unknown>> = [];
 
 afterEach(async () => {
@@ -60,7 +73,7 @@ async function setup(opts: { stageMain: boolean }): Promise<Harness> {
       mainPdf,
       minimalPdf(3, 300, 200, { text: (n) => `MAIN page ${n}, Figure 1 caption\n${n}` }),
     );
-    await writeFile(buildAuxPath(userDir, 'main.tex'), MAIN_AUX);
+    await stageMainAux(userDir);
   }
   // The surfaced copy, left by a later compile of a DIFFERENT root (a 5-page supplement).
   const surfaced = path.join(workspace, 'poster.pdf');
@@ -170,7 +183,7 @@ describe('PDF tools read the requested root’s build, not the last-surfaced cop
   it('refuses rather than pairing the .aux with the surfaced copy when the root has no build', async () => {
     const { client, userDir } = await setup({ stageMain: false });
     // A compile that died after writing main.aux but before producing main.pdf.
-    await writeFile(buildAuxPath(userDir, 'main.tex'), MAIN_AUX);
+    await stageMainAux(userDir);
     const res = await client.callTool({
       name: 'render_pages',
       arguments: { project: 'poster', labels: ['fig:x'], inline: false },

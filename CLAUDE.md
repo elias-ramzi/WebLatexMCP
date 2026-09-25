@@ -913,6 +913,36 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
+- **An overlay compile builds a what-if variant in a link farm, and never writes the project.**
+  `compile`'s `overlay` (`src/lib/variants.ts`) applies `edit_file`'s edits in memory
+  (`applyEditsToContent`, the pure half of `FileService.applyEdits`, so both refuse the same edits)
+  to files read through `readTextExact` — the project's link policy, **no baseline** — and compiles
+  in `buildDir(dir)/variants/<handle>/src/`: a mirror of the project tree whose every file is a
+  link to its absolute source path (a symlinked directory is ONE link, never walked; `.git`, the
+  workspace and the build root are skipped; win32 uses junctions, hard links and copies), except
+  the overlaid files, which are real files — an overlaid path under a linked directory
+  materialises that directory first, so nothing is written through a link. The backend runs there
+  (`CompileRequest.workDir`) into the variant's own `out/` (`outDir`). Not `TEXINPUTS`: kpathsea
+  never searches the path for `./` or `../` names, so those inputs read the source. **The server
+  never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
+  surface; the only project files read are the overlaid ones — **except on win32**, where the
+  farm's copy fallback does read files through the server: a file symlink is copied (a symlink
+  needs a privilege there), and so is a file a hard link cannot reach (another drive than the temp
+  dir) or a read-only one (a hard link shares its attributes, and deleting the farm would clear
+  the source's read-only bit), all charged against `MAX_FARM_COPY_BYTES` (512 MiB). Two entries
+  naming one file (a case variant, a hard link: judged by `lstat` dev+ino, after the platform's
+  case fold) are refused, since only the second would reach the farm; and the variant's `.fls` (what the engine
+  opened) and `.fdb_latexmk` (what latexmk's other rules read — biber's `.bib`) are checked after
+  the compile, so an overlaid file the build never opened is named in `hint` rather
+  than producing a variant silently identical to the main build. Nothing goes through FileService's
+  write path (no shadow record, no baseline, no rewrite mode), and the surfaced PDF and the viewer
+  are left alone. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape
+  flags and the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle
+  is checked by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay
+  compile, under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed
+  (`rm -rf`, which unlinks a farm's links without following them), never the one just compiled. The
+  PDF tools take `variant` and read that build only — its PDF, `.aux`/`.log` (`readAuxFloats`'
+  `buildDir`) and its own `render/` — never falling back to the main build.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location
@@ -1049,18 +1079,60 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   without `hyperref`. The evidence (`readPgfpagesEvidence`, `AuxFloatsResult.pgfpages`) is the
   build's `.fls` or `.log` naming `pgfpages.sty` or `pgfmorepages.sty` (a drop-in that holds pages
   back the same way without loading `pgfpages.sty`), read from the start only, `O_NOFOLLOW`,
-  regular files only. It is tri-state and the three values must stay apart: `true` refuses;
-  `false` means a record was read and names neither package; `undefined` means neither was
-  readable, and nothing is checked (a documented gap, #194). The `.log` is read even when a `.fls`
-  exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
+  regular files only. It is tri-state and the three values must stay apart: `true` refuses; `false`
+  means a record was read and names neither package; `undefined` means neither was readable, and
+  **every label is refused too** (`pgfpagesUnknown`) — whether a layout shifted the build cannot be
+  told, and a compile always leaves a `.log`, so this only fires when something removed or replaced
+  the build's records; resolving there was the last silent-wrong-page path (#194). The tri-state
+  stays in the reader; only the consumer treats `undefined` as a refusal. The `.log` is read even
+  when a `.fls` exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
   document-controlled, which is acceptable only because `true` can only ADD a refusal — never let
   this evidence resolve a page. "Loaded" is wider than "layout in use" (the `.fls` even records a
-  file merely opened by `\IfFileExists`); that over-refusal is accepted, since a layout-specific
-  log line can be hidden by redefining `\wlog`, which errs the unsafe way. `slideMismatch` is
-  therefore the fallback for a deck whose records were unreadable, and its advice turns on
-  `pgfpages === false`. `pdf_geometry kinds: ["floats"]` does not refuse — the index is data the
-  caller asked for, and its keys and numbers are true — but flags `floatsPagesShifted: true` with a
-  note in both channels.
+  file merely opened by `\IfFileExists`); that over-refusal is accepted, since a layout-specific log
+  line can be hidden by redefining `\wlog`, which errs the unsafe way; the refusal says the records
+  name the file (never that a layout is in use) and that it is spurious for a load without
+  `\pgfpagesuselayout` or a mere `\IfFileExists`. No label is exempted by name either — `lastpage`'s
+  `LastPage` happens to be written unshifted, but a hand `\label{LastPage}` is not, and telling the
+  two apart would need the same forgeable evidence used to accept; the refusal points at `pages:`
+  with the page count instead. `slideMismatch` therefore runs only on `pgfpages === false`, and its
+  advice is the `allowframebreaks` one. `pdf_geometry kinds: ["floats"]` does not refuse — the index
+  is data the caller asked for, and its keys and numbers are true — but flags
+  `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, no
+  record beside it) carries a note that the pages could not be checked, without the flag.
+  **Behind both routes, the `.log`'s shipout marks** (`[<\count0>…]`, one per page shipped;
+  `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup asks) refuse a
+  resolved page (`unverifiedPage`/`shipoutMismatch`) unless that PDF page was shipped with the
+  label's decimal printed page p as its counter and — on the folio route only, since roman front
+  matter under hyperref repeats counters the tree tells apart — no other page shipped with p
+  COMPETES: a counter is not a printed page, and an appendix under `\pagenumbering{alph}`/`{Roman}`
+  or a supplement under `S\arabic{page}` ships 1, 2, … again while printing `a`, `I`, `S1`. So
+  another page with mark p is let through only when its own text, read where `readFolios` looks,
+  gives exactly one reading and that reading is a roman numeral, a letter run or a prefixed
+  number (`printsOtherStylePage`); no reading, two readings, a missing text (`pagesToVerify` reads
+  at most `MAX_AMBIGUOUS_CANDIDATES` such pages per label, only when the check will run) and **any
+  decimal reading** keep it a competitor — a decimal is what a section number or table cell
+  forges, so it never vouches. That rule only decides whether the marks ADD a refusal; it can
+  never accept a page the route refused. The engine writes the marks and a document cannot remove
+  one, but it can add one (`\message{[7]}`), so they are consulted only when their count equals
+  the PDF's page count — any other length skips the check silently, and then the folio route's
+  residual shapes pass as they did without it — and never resolve, move or accept a page. The
+  parser skips the places TeX copies document text into the log: a whole box display (warning
+  line through the next empty line; an output-routine warning, whose display shares its line, is
+  a block of one line), a TeX error from its `file:line:` or `!` line through the next empty
+  line, and, outside an error, only the FIRST line of a context pair (`l.<n> …`, `<argument> …`)
+  — the line under it is read, because pdfTeX's duplicate-destination warning prints the next
+  page's mark there. Real logs put every genuine mark after the skipped blocks. Known parse gaps,
+  both of which only change the count and so switch the check off: a LaTeX/package-format error
+  (`\GenericError` puts an empty line right after its first line, so the rest of its context and
+  help is read), and a mark glued at column 0 onto a line wrapped at exactly 79 columns
+  (`\batchmode` runs of `] [n]`, a truncated `...` context line), which `(?<!\S)\[` misses.
+  Accepted residuals: an extra and a missed mark can line up to the right count and shift the
+  list, which can refuse a correct label or fail to add a refusal it should (either way never
+  worse than the route's own answer),
+  and a section number opening a competing page (`A`, `S1` above an empty foot) can read as its
+  page number and let a repeat through (back to the route's own answer). The log is opened after
+  an `lstat` refuses a link, plus `O_NOFOLLOW` where it exists; on Windows a link planted between
+  the two is followed, which is harmless only because the marks can do nothing but refuse.
   **Labels in `\include`d chapters** are found by following
   line-anchored `\@input` lines (`findBuildDirAux`): each name is looked up component by component
   in a `readdir` listing of the build dir, **never used as a path** (no symlinks, no `..`; re-checked at

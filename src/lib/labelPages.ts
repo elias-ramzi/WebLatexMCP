@@ -68,15 +68,18 @@
  *     the true slide while the `\newlabel` is one late — and there a footline printing the true
  *     slide numbers would confirm the late page.
  *
- *     The pgfpages shift is not a beamer matter, though, and ahead of both routes a build that
- *     loaded `pgfpages` at all has every label refused (`'pgfpagesLayout'`,
+ *     The pgfpages shift is not a beamer matter, though, and ahead of both routes a build whose
+ *     records name `pgfpages` at all has every label refused (`'pgfpagesLayout'`,
  *     `AuxFloatsResult.pgfpages`, read off the build's `.fls` and `.log`). An `article` under
  *     `resize to` records every label one page late too, with or without hyperref, and there is
  *     no slide record to contradict it: each page prints its own true folio, so the late page
  *     reads exactly as the printed page the `.aux` names and a neighbour agrees, and hyperref's
  *     tree moves with the pages. Nothing in the PDF or the `.aux` shows the shift; only the
- *     build's record of what it loaded does. When neither record can be read, nothing is known and
- *     the routes run as described — a deck then still has its slide record, an article nothing.
+ *     build's record of what it read does. When neither record can be read, nothing is known —
+ *     and since the shift is invisible everywhere else, every label of such a build is refused
+ *     too (`'pgfpagesUnknown'`). Every compile leaves a `.log` beside the `.aux`, so in normal use
+ *     that never happens and failing closed costs nothing; the routes below run only for a build
+ *     whose records were read and name neither package.
  *
  *  3. **Without `/PageLabels` the conversion is inferred, then CHECKED, and refused unless the
  *     check passes.** `getPageLabels()` returning `null` is the COMMON case, not an error: a
@@ -196,6 +199,39 @@
  *     would be a guess. (A redefinition that fell past the lookup cap is not seen; the cap is
  *     far above any real document, and the reader reports `omitted` when it fires.)
  *
+ *     Behind both routes stands one more check, which can only take an accepted page away
+ *     (`'unverifiedPage'`/`'shipoutMismatch'`, {@link shipoutVerdict}): the build's `.log`
+ *     records the page counter at every shipout (`[1] [2] [3]`, `AuxFloatsResult.shipouts`), so
+ *     its k-th mark is the counter PDF page k was shipped with, whatever the page prints. A page a
+ *     route chose for a decimal printed page p is refused unless its mark reads p — and, on the
+ *     printed-page route, unless every OTHER page whose mark reads p visibly prints a page number
+ *     in another style: a roman numeral, a letter or a prefixed number, read where the folio is
+ *     looked for. A counter is not a printed page — an appendix under `\pagenumbering{alph}`
+ *     or `{Roman}`, or a supplement under `S\arabic{page}`, resets it and ships 1, 2, … again
+ *     while printing "a", "I", "S1" — so such a page is no second copy of p; one whose text shows
+ *     no number, reads two ways, or reads ANY decimal number is (a decimal reading is what a
+ *     section number or table cell forges, so it cannot vouch that the page prints something
+ *     else). The check runs only when the marks number exactly the PDF's pages — anything else
+ *     means the parse cannot be trusted, and it is skipped entirely: when the log cannot be read,
+ *     when the document writes text that looks like a mark (`\message{[3]}`, a string TeX echoes
+ *     outside the box displays and error contexts the parser skips), or when a mark is cut in a
+ *     way the parser will not guess at. Where it runs it closes the residual shapes above: a
+ *     shifted document whose empty foot a table cell or a "3/9" line forged (a title page shipped
+ *     with counter 1 and the counter reset, so the body's page 2 carries mark 1), a
+ *     section-numbered head beside a foot form outside the list, and an arabic restart with no
+ *     label before it (its counters repeat, and the restarted pages print the same numbers).
+ *     Where it is skipped, those shapes can still pass as described above. The marks are written
+ *     by the engine and a document cannot remove one, but it can ADD text that looks like one, so
+ *     they never choose, move or accept a page, and another page's text only ever decides
+ *     whether they refuse. The residuals, stated: an extra mark and a missed one in the same log
+ *     can line up to the right count and shift the list, which can refuse a correct label or
+ *     fail to add a refusal it should (either way never worse than the route's own answer); and a repeated counter is let through when the other page's head reads as a
+ *     letter or prefixed number that is really a section number ("A", "S1" opening a page with an
+ *     empty foot) — then the check adds nothing, and the route's own answer stands as it did
+ *     without the log. On the `/PageLabels` route a counter repeated elsewhere is no evidence at
+ *     all: roman front matter under hyperref ships counters 1..n and the body 1..m again, while
+ *     the tree tells them apart exactly.
+ *
  *  4. **An assertion, never an inference.** If a label cannot be resolved, the whole call refuses
  *     ({@link labelRefusalMessage}) — it never renders the labels it did resolve and quietly drops
  *     the rest, and it never falls back to page 1. A partially-honoured request would be read as
@@ -263,14 +299,19 @@ export interface ResolvedLabel {
  * load `hyperref`, or pass `pages:` yourself". `'slideMismatch'` is the beamer form of that:
  * the deck's `\newlabel` page and beamer's own record of the slide disagree
  * ({@link slideMismatch}), so neither is trusted. `'pgfpagesLayout'` means "no label of this
- * build is usable": the build loaded `pgfpages` (`AuxFloatsResult.pgfpages`), whose layouts shift
- * every label a page late, so the caller must pass `pages:` or compile without the layout.
+ * build is usable": the build's records name `pgfpages` (`AuxFloatsResult.pgfpages` is `true`),
+ * whose layouts shift every label a page late, so the caller must pass `pages:` or compile
+ * without the package. `'pgfpagesUnknown'` means the same for a build whose records could not be
+ * read at all (`AuxFloatsResult.pgfpages` absent): whether pgfpages shifted this build cannot be
+ * told, so no label is usable — the caller must compile again (which writes the `.log`) or pass
+ * `pages:`.
  *
  * Which reasons are even reachable depends on how the plan was resolved: `'notAPageNumber'`,
  * `'renumbered'`, `'restarted'`, `'slideMismatch'` and `'unverifiedPage'` belong to the inferred
  * fallback (which a beamer deck always takes),
  * `'printedPageAbsent'` and `'ambiguousPrintedPage'` to the `/PageLabels` lookup. `'notFound'`,
- * `'multiplyDefined'` and `'pgfpagesLayout'` belong to both.
+ * `'multiplyDefined'`, `'pgfpagesLayout'` and `'pgfpagesUnknown'` belong to both — and so does
+ * `'unverifiedPage'` with `'shipoutMismatch'`, the one unverified reason the lookup can reach.
  *
  * None of this reaches a tool's `structuredContent`: a failure refuses the call, and only the
  * refusal TEXT ({@link labelRefusalMessage}) goes back.
@@ -283,6 +324,7 @@ export type LabelFailureReason =
   | 'restarted'
   | 'slideMismatch'
   | 'pgfpagesLayout'
+  | 'pgfpagesUnknown'
   | 'printedPageAbsent'
   | 'ambiguousPrintedPage'
   | 'unverifiedPage';
@@ -306,7 +348,11 @@ export type LabelFailureReason =
  *    which). That is what an arabic restart leaves behind when the `.aux` shows no decrease
  *    ({@link lastPageVerdict}) — and also what an ordinary last page shows when its head or its
  *    content puts another number where the folio is looked for, which nothing here tells apart;
- *  - `'noEvidence'` — no text was supplied for the page at all.
+ *  - `'noEvidence'` — no text was supplied for the page at all;
+ *  - `'shipoutMismatch'` — on EITHER route, the page the route chose was shipped out under a
+ *    different page counter, by the build's `.log` (`shipout`), or — on the printed-page route —
+ *    the printed page's counter was also shipped out on another PDF page that does not visibly
+ *    print a page number in another style (`shipoutPages`) ({@link shipoutVerdict}).
  */
 export type UnverifiedReason =
   | 'folioMismatch'
@@ -315,7 +361,8 @@ export type UnverifiedReason =
   | 'uncorroboratedFolio'
   | 'pastEndOfPdf'
   | 'lastPageMismatch'
-  | 'noEvidence';
+  | 'noEvidence'
+  | 'shipoutMismatch';
 
 /**
  * What one neighbouring PDF page read as, for an `'uncorroboratedFolio'` refusal: its
@@ -345,8 +392,8 @@ export interface LabelFailure {
   printedPages?: string[];
   /** `'multiplyDefined'` only: how many further records the cap left out of the list. */
   printedPagesOmitted?: number;
-  /** `'unverifiedPage'`, `'slideMismatch'` and `'pgfpagesLayout'` only: the label's number as the
-   *  `.aux` records it
+  /** `'unverifiedPage'`, `'slideMismatch'`, `'pgfpagesLayout'` and `'pgfpagesUnknown'` only: the
+   *  label's number as the `.aux` records it
    *  (the first field of `\newlabel`). Not checked against anything — it is echoed so the
    *  refusal can tell the caller what to search `extract_text`'s output for. */
   number?: string;
@@ -367,6 +414,20 @@ export interface LabelFailure {
   /** `'unverifiedPage'` with `'lastPageMismatch'` only: the last PDF page and what it read as
    *  (`null`: its text could not be read). */
   lastPage?: NeighbourFolio;
+  /** `'shipoutMismatch'` only: the 1-based PDF page the route chose for the label, and would have
+   *  rendered. */
+  resolvedPage?: number;
+  /** `'shipoutMismatch'` only: the page counter the build's `.log` records `resolvedPage` was
+   *  shipped out with (absent only when the record has no entry for that page). */
+  shipout?: number;
+  /** `'shipoutMismatch'` only, in page order, at most {@link MAX_AMBIGUOUS_CANDIDATES} of them:
+   *  when `resolvedPage` was shipped with another counter, every PDF page the `.log` records as
+   *  shipped out with the printed page's counter; when it was shipped with the right one,
+   *  `resolvedPage` and the other pages shipped with that counter that compete with it (those
+   *  not visibly printing a page number in another style). */
+  shipoutPages?: number[];
+  /** `'shipoutMismatch'` only: how many further pages the cap left out of `shipoutPages`. */
+  shipoutPagesOmitted?: number;
 }
 
 /**
@@ -424,6 +485,14 @@ export interface LabelPagePlan {
    * takes the printed-page route, and the refusal and note must not claim the PDF has no tree.
    */
   pageLabelsIgnored?: 'beamer';
+  /** The PDF's page count, when the plan was given it (`evidence.pageCount`) — on either route,
+   *  since {@link resolveLabelPages} always reads it. The shipout check needs it, and a refusal
+   *  that points at the last page can name it. */
+  pageCount?: number;
+  /** `true` when the build's shipout record was consulted — `aux.shipouts` present and numbering
+   *  exactly `pageCount` pages ({@link shipoutVerdict}) — so {@link labelResolutionNote} can say
+   *  what was checked. Absent when it was not. */
+  shipoutsChecked?: true;
 }
 
 /**
@@ -491,8 +560,9 @@ export function buildPageLabelIndex(
  * An identity tree whose length matches that slide count is no evidence either — the second
  * layout passes that test — so a deck always takes the printed-page route (`'beamer'`), where a
  * footline printing the slide number is what resolves it. Both layouts are refused before that
- * wherever the build's records show `pgfpages` loaded (`'pgfpagesLayout'`); where they cannot be
- * read, the second layout, whose footline prints the TRUE slide numbers, is still refused by
+ * wherever the build's records name `pgfpages` (`'pgfpagesLayout'`), and so is every label of a
+ * build whose records cannot be read (`'pgfpagesUnknown'`); where the records were read and are
+ * wrong, the second layout, whose footline prints the TRUE slide numbers, is still refused by
  * beamer's own slide record ({@link slideMismatch}).
  */
 function usablePageLabelIndex(
@@ -551,10 +621,11 @@ export function findNumberingRestart(floats: readonly AuxLabel[]): NumberingRest
  * for a `\label` in an `allowframebreaks` frame, where beamer's record names the
  * slide before the frame was broken and the `\newlabel` page was the right one. That second case
  * is refused too — a right page given up, the safe direction, since the `.aux` cannot tell the
- * two apart. A build whose `.fls` or `.log` shows `pgfpages` never reaches this check — every
- * label is refused as `'pgfpagesLayout'` first — so here the pgfpages case is the fallback for a
- * build whose records could not be read, and the refusal's advice says which cause fits
- * (`AuxFloatsResult.pgfpages`).
+ * two apart. Only a build whose records were read and name no `pgfpages`
+ * (`AuxFloatsResult.pgfpages === false`) reaches this check — one whose `.fls` or `.log` names it
+ * is refused as `'pgfpagesLayout'` first, and one whose records could not be read as
+ * `'pgfpagesUnknown'` — so what it catches is what the records cannot show: an
+ * `allowframebreaks` label, and a pgfpages shift only if the records were wrong.
  *
  * A label with NO record (a `\newlabel` some package writes itself, e.g. `lastpage`'s
  * `LastPage`, or a key holding a brace group, which the line pattern does not read) keeps the
@@ -616,16 +687,20 @@ const FOOT_FORMS: ReadonlyArray<{ re: RegExp; folio: number; total?: number }> =
   { re: /^(-{1,2}|[\u2013\u2014])\s*(\S+?)\s*\1$/, folio: 2 },
 ];
 
-/** The folio a whole foot line holds in one of the {@link FOOT_FORMS}, or `undefined`. */
-function footFormFolio(line: string): string | undefined {
+/** The folio a whole foot line holds in one of the {@link FOOT_FORMS}, or `undefined`. `isToken`
+ *  is what counts as a page number there ({@link isFolioToken} unless a caller says otherwise). */
+function footFormFolio(
+  line: string,
+  isToken: (token: string) => boolean = isFolioToken,
+): string | undefined {
   for (const form of FOOT_FORMS) {
     const m = form.re.exec(line);
     if (!m) continue;
     const folio = m[form.folio] ?? '';
-    if (!isFolioToken(folio)) continue;
+    if (!isToken(folio)) continue;
     if (form.total !== undefined) {
       const total = m[form.total] ?? '';
-      if (!isFolioToken(total)) continue;
+      if (!isToken(total)) continue;
       if (DECIMAL_PAGE.test(folio) && DECIMAL_PAGE.test(total) && Number(folio) > Number(total)) {
         continue;
       }
@@ -670,23 +745,72 @@ const HEAD_LINES = 5;
  * section number ("1.1."). An empty result means the page shows no folio at all.
  */
 export function readFolios(lines: readonly string[]): string[] {
+  return readFoliosAs(lines, isFolioToken);
+}
+
+/** {@link readFolios}' position logic over any notion of a page-number token: the last line as a
+ *  bare token or a foot form, else the running head. One body, so the two readers cannot disagree
+ *  about WHERE a page number is looked for. */
+function readFoliosAs(lines: readonly string[], isToken: (token: string) => boolean): string[] {
   if (lines.length === 0) return [];
   const foot = lines[lines.length - 1]!.trim();
-  if (isFolioToken(foot)) return [foot];
-  const form = footFormFolio(foot);
+  if (isToken(foot)) return [foot];
+  const form = footFormFolio(foot, isToken);
   if (form !== undefined) return [form];
   const readings: string[] = [];
   const first = lines[0]!.trim();
-  if (isFolioToken(first)) readings.push(first);
+  if (isToken(first)) readings.push(first);
   const scan = Math.min(lines.length, HEAD_LINES);
   for (let i = 1; i < scan; i++) {
     const token = lines[i]!.trim();
-    if (isFolioToken(token) && !isFolioToken(lines[i - 1]!.trim())) {
+    if (isToken(token) && !isToken(lines[i - 1]!.trim())) {
       if (!readings.includes(token)) readings.push(token);
       break;
     }
   }
   return readings;
+}
+
+/** A letter run as `\alph`/`\Alph` (and `alphalph`'s doubled letters) print it: one or two
+ *  letters, all of one case. */
+const LETTER_PAGE = /^(?:[a-z]{1,2}|[A-Z]{1,2})$/;
+
+/** A number behind a short letter prefix, as a supplement or an appendix numbers its pages
+ *  (`S1`, `A-3`, `S-12`, `A.3`). */
+const PREFIXED_PAGE = /^[A-Za-z]{1,3}[-.]?[0-9]{1,7}$/;
+
+/**
+ * Whether a token is a page number in a style OTHER than decimal: a roman numeral, a letter
+ * run, or a prefixed number — the shapes `\thepage` takes when a document numbers a part of
+ * itself apart (`\pagenumbering{alph}`, `{Roman}`, `\renewcommand{\thepage}{S\arabic{page}}`).
+ * Roman numerals and letter runs must be all one case: `Mix` is a word, not a page number.
+ */
+function isOtherStylePageToken(token: string): boolean {
+  if (isRomanPage(token)) return token === token.toLowerCase() || token === token.toUpperCase();
+  return LETTER_PAGE.test(token) || PREFIXED_PAGE.test(token);
+}
+
+/** A page number of any style this file can read — decimal or {@link isOtherStylePageToken}. */
+function isAnyStylePageToken(token: string): boolean {
+  return DECIMAL_PAGE.test(token) || isOtherStylePageToken(token);
+}
+
+/**
+ * Whether PDF page `page`'s own text shows it printing a page number in another style than
+ * decimal — exactly one reading, where {@link readFolios} looks for one, and that reading a
+ * roman numeral, a letter run or a prefixed number. `false` when the page's text was not read,
+ * shows no page number, reads two ways, or reads a decimal number.
+ *
+ * A decimal reading never counts, even one different from the counter it was shipped with: the
+ * question is whether this page could be a second copy of a decimal printed page, and a decimal
+ * reading is exactly what a section number or a table cell standing where the folio is looked for
+ * forges (this file's header), so it cannot vouch that the page prints something else.
+ */
+function printsOtherStylePage(page: number, evidence: LabelPageEvidence | undefined): boolean {
+  const lines = evidence?.text.get(page);
+  if (!lines) return false;
+  const readings = readFoliosAs(lines, isAnyStylePageToken);
+  return readings.length === 1 && isOtherStylePageToken(readings[0]!);
 }
 
 /**
@@ -711,7 +835,9 @@ export function readFolios(lines: readonly string[]): string[] {
  * `evidence` is what the inferred route checks each candidate page against (fact 3). Without it,
  * that route refuses every label it would otherwise have resolved (`'noEvidence'`) — the check is
  * not optional, so a caller that skips gathering the evidence gets a refusal, never an unchecked
- * page. {@link resolveLabelPages} gathers exactly the evidence this needs.
+ * page. {@link resolveLabelPages} gathers exactly the evidence this needs. On the `/PageLabels`
+ * route only its `pageCount` is used — for the shipout check ({@link shipoutVerdict}), which runs
+ * on both routes whenever `aux.shipouts` is present and numbers exactly that many pages.
  */
 export function planLabelPages(
   labels: string[],
@@ -745,8 +871,12 @@ export function planLabelPages(
   // Document-wide like the two above, but consulted only for a label whose own page checked out,
   // so every other refusal keeps its more specific reason.
   const lastPage = byPrintedPage || !evidence ? undefined : lastPageVerdict(evidence);
+  const pageCount = evidence?.pageCount;
+  const shipoutsChecked = usableShipouts(aux, pageCount) !== undefined;
   const verdicts = {
     labelSource,
+    ...(pageCount === undefined ? {} : { pageCount }),
+    ...(shipoutsChecked ? { shipoutsChecked: true as const } : {}),
     renumberedBy,
     ...(restartedAt ? { restartedAt } : {}),
     ...(pageLabelsIgnored ? { pageLabelsIgnored } : {}),
@@ -790,6 +920,19 @@ export function planLabelPages(
       failed.push({
         label,
         reason: 'pgfpagesLayout',
+        printedPage: entry.page,
+        number: entry.number,
+      });
+      continue;
+    }
+    if (aux.pgfpages === undefined) {
+      // Neither the .fls nor the .log could be read, so a layout that shifted every label cannot
+      // be ruled out — and it is invisible to both routes (above). Refused rather than resolved:
+      // this evidence may only ever add a refusal. Every compile leaves a .log beside the .aux,
+      // so in normal use this never happens, and failing closed costs nothing.
+      failed.push({
+        label,
+        reason: 'pgfpagesUnknown',
         printedPage: entry.page,
         number: entry.number,
       });
@@ -886,6 +1029,22 @@ export function planLabelPages(
       }
     }
 
+    // After either route has settled on a page, and only ever against it: the shipout record may
+    // take the page away, never change it or accept one a route refused.
+    const shipout = shipoutVerdict(aux, evidence, page, entry.page, labelSource);
+    if (shipout) {
+      failed.push({
+        label,
+        reason: 'unverifiedPage',
+        printedPage: entry.page,
+        number: entry.number,
+        unverified: 'shipoutMismatch',
+        resolvedPage: page,
+        ...shipout,
+      });
+      continue;
+    }
+
     resolved.push({ label, printedPage: entry.page, page });
     if (!seenPage.has(page)) {
       seenPage.add(page);
@@ -897,6 +1056,87 @@ export function planLabelPages(
     return { resolved: [], failed, pages: [], ...verdicts };
   }
   return { resolved, failed, pages, ...verdicts };
+}
+
+/**
+ * `undefined` when the build's shipout record does not contradict PDF page `page` for decimal
+ * printed page `printedPage` — or is not usable — otherwise the evidence against it.
+ *
+ * `shipouts[k-1]` is the page counter (`\count0`, which is LaTeX's `\c@page`) TeX wrote into the
+ * `.log` as it shipped PDF page k ({@link AuxFloatsResult.shipouts}). For a label printed on
+ * decimal page p, the page a route chose must have been shipped with counter p.
+ *
+ * On the printed-page route p must also not be shipped on another page that could print it too:
+ * two pages shipped with counter p under arabic numbering (a restart, a title page that reset the
+ * counter) make "printed page p" two pages, and the folio check can confirm the wrong one. But a
+ * counter is not a printed page — an appendix under `\pagenumbering{alph}` or a supplement under
+ * `S\arabic{page}` resets it and ships 1, 2, … again while printing "a", "S1", … — so another page
+ * shipped with p is a competitor UNLESS its own text shows it printing a page number in another
+ * style ({@link printsOtherStylePage}). A page whose text was not read, shows no number, reads two
+ * ways or reads any decimal number stays a competitor: that only ever keeps a refusal.
+ * {@link pagesToVerify} asks for those pages' text, at most {@link MAX_AMBIGUOUS_CANDIDATES} per
+ * label; the rest are competitors unread.
+ *
+ * On the `/PageLabels` route a repeated counter proves nothing — roman front matter shipped with
+ * 1..n and then arabic 1..m, which the tree tells apart — so only the chosen page's own mark is
+ * checked there.
+ *
+ * The record is used only when it numbers exactly the PDF's pages ({@link usableShipouts}): a
+ * document can add a mark-shaped line (`\message{[7]}`), and any other length means the parse
+ * cannot be trusted, so nothing is checked — never a refusal from a record that does not line up.
+ * A printed page that is not a decimal integer (`iv`, `S3`) is not checked either: nothing says
+ * what counter it was shipped with. And nothing here ever picks a page — the marks only refuse
+ * one, and the text of another page only decides whether they refuse.
+ */
+function shipoutVerdict(
+  aux: AuxFloatsResult,
+  evidence: LabelPageEvidence | undefined,
+  page: number,
+  printedPage: string,
+  route: LabelSource,
+): Pick<LabelFailure, 'shipout' | 'shipoutPages' | 'shipoutPagesOmitted'> | undefined {
+  const shipouts = usableShipouts(aux, evidence?.pageCount);
+  if (!shipouts) return undefined;
+  const printed = parsePrintedPage(printedPage);
+  if (printed === undefined) return undefined;
+  const shipout = shipouts[page - 1];
+  const matching = pagesShippedWith(shipouts, printed);
+  let named: number[];
+  if (shipout !== printed) {
+    named = matching;
+  } else {
+    if (route !== 'printedPage') return undefined;
+    const competitors = matching.filter((p) => p !== page && !printsOtherStylePage(p, evidence));
+    if (competitors.length === 0) return undefined;
+    named = [page, ...competitors].sort((a, b) => a - b);
+  }
+  return {
+    ...(shipout === undefined ? {} : { shipout }),
+    shipoutPages: named.slice(0, MAX_AMBIGUOUS_CANDIDATES),
+    shipoutPagesOmitted: Math.max(0, named.length - MAX_AMBIGUOUS_CANDIDATES),
+  };
+}
+
+/** `aux.shipouts` when it numbers exactly `pageCount` pages — the only case the record is
+ *  consulted in — otherwise `undefined`. One helper, so {@link shipoutVerdict} and
+ *  {@link pagesToVerify} cannot disagree about when the check runs. */
+function usableShipouts(
+  aux: AuxFloatsResult,
+  pageCount: number | undefined,
+): readonly number[] | undefined {
+  const shipouts = aux.shipouts;
+  return shipouts && pageCount !== undefined && shipouts.length === pageCount
+    ? shipouts
+    : undefined;
+}
+
+/** Every 1-based PDF page the record shows shipped out with page counter `counter`, in order. */
+function pagesShippedWith(shipouts: readonly number[], counter: number): number[] {
+  const pages: number[] = [];
+  shipouts.forEach((c, i) => {
+    if (c === counter) pages.push(i + 1);
+  });
+  return pages;
 }
 
 /** The PDF pages whose folios can corroborate candidate page `page`: its predecessor and its
@@ -985,17 +1225,21 @@ function lastPageVerdict(evidence: LabelPageEvidence): NeighbourFolio | undefine
 /**
  * The pages whose text {@link planLabelPages} will check on the printed-page route: the candidate
  * page of every requested label that reaches the check, followed by its in-range neighbours (the
- * pages that can corroborate its folio) — at most three pages per label, each page once across
- * the whole call, in request order — then the LAST page of the PDF, once, for
- * {@link lastPageVerdict}. Only pages inside the PDF (a candidate past the end is refused without
- * reading anything, and the renderer would throw for it). Empty when the build loaded `pgfpages`,
- * the document shows roman renumbering or an arabic restart, or no label reaches the check, since
- * nothing is checked then.
+ * pages that can corroborate its folio), then — only when the shipout check will run and the
+ * candidate was shipped with its own printed page — up to {@link MAX_AMBIGUOUS_CANDIDATES} other
+ * pages shipped with the same counter, whose text decides whether they compete with it
+ * ({@link shipoutVerdict}); each page once across the whole call, in request order — then the
+ * LAST page of the PDF, once, for {@link lastPageVerdict}. Only pages inside the PDF (a candidate past the end is refused without
+ * reading anything, and the renderer would throw for it). Empty unless the build's records were
+ * read and name no `pgfpages` (`aux.pgfpages === false`: every label is refused as
+ * `'pgfpagesLayout'` or `'pgfpagesUnknown'` otherwise), and empty when the document shows roman
+ * renumbering or an arabic restart, or no label reaches the check, since nothing is checked then.
  */
 export function pagesToVerify(labels: string[], aux: AuxFloatsResult, pageCount: number): number[] {
-  if (aux.pgfpages === true) return [];
+  if (aux.pgfpages !== false) return [];
   if (aux.floats.some((entry) => isRomanPage(entry.page))) return [];
   if (findNumberingRestart(aux.floats)) return [];
+  const shipouts = usableShipouts(aux, pageCount);
   const wanted = new Set(labels);
   const counts = new Map<string, number>();
   for (const entry of aux.floats) {
@@ -1007,7 +1251,16 @@ export function pagesToVerify(labels: string[], aux: AuxFloatsResult, pageCount:
     if (slideMismatch(aux, entry)) continue;
     const page = parsePrintedPage(entry.page);
     if (page === undefined || page > pageCount) continue;
-    for (const p of [page, ...neighbourPages(page, pageCount)]) {
+    // The other pages shipped with this counter, whose text decides whether they compete with
+    // the candidate ({@link shipoutVerdict}) — only when that check will run and can pass: the
+    // record is usable and the candidate itself was shipped with its printed page.
+    const sameCounter =
+      shipouts && shipouts[page - 1] === page
+        ? pagesShippedWith(shipouts, page)
+            .filter((p) => p !== page)
+            .slice(0, MAX_AMBIGUOUS_CANDIDATES)
+        : [];
+    for (const p of [page, ...neighbourPages(page, pageCount), ...sameCounter]) {
       if (!pages.includes(p)) pages.push(p);
     }
   }
@@ -1027,10 +1280,12 @@ export interface LabelPageReader {
 /**
  * Resolve labels to pages against the PDF itself: `/PageLabels` when it has a usable tree (no
  * page text is read at all — and a beamer deck's tree never, see {@link usablePageLabelIndex}),
- * otherwise the printed page, checked against the text of the candidate pages and their
- * neighbours (at most three pages per label, each read once per call), plus the last page. This
- * is what the tools call — it gathers exactly the evidence {@link planLabelPages} checks, and no
- * more.
+ * otherwise the printed page, checked against the text of the candidate pages, their neighbours
+ * and any other pages shipped with the same counter (each read once per call,
+ * {@link pagesToVerify}), plus the last page. The
+ * page count is read on both routes, for the shipout check ({@link shipoutVerdict}) and the
+ * plan's `pageCount`. This is what the tools call — it gathers exactly the evidence
+ * {@link planLabelPages} checks, and no more.
  */
 export async function resolveLabelPages(
   labels: string[],
@@ -1038,10 +1293,10 @@ export async function resolveLabelPages(
   reader: LabelPageReader,
 ): Promise<LabelPagePlan> {
   const pageLabels = await reader.pageLabels();
-  if (usablePageLabelIndex(aux, pageLabels).index) {
-    return planLabelPages(labels, aux, pageLabels);
-  }
   const pageCount = await reader.pageCount();
+  if (usablePageLabelIndex(aux, pageLabels).index) {
+    return planLabelPages(labels, aux, pageLabels, { pageCount, text: new Map() });
+  }
   const wanted = pagesToVerify(labels, aux, pageCount);
   const text = wanted.length > 0 ? await reader.pageText(wanted) : new Map<number, string[]>();
   return planLabelPages(labels, aux, pageLabels, { pageCount, text });
@@ -1139,7 +1394,7 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       continue;
     }
     if (failure.reason === 'unverifiedPage') {
-      lines.push(`  - ${quoteLabel(failure.label)}: ${unverifiedText(failure)}`);
+      lines.push(`  - ${quoteLabel(failure.label)}: ${unverifiedText(failure, plan.labelSource)}`);
       continue;
     }
     if (failure.reason === 'pgfpagesLayout') {
@@ -1149,12 +1404,27 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
           : '';
       lines.push(
         `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
-          `${quoteLabel(failure.printedPage ?? '')}, but this build loaded pgfpages (its recorder ` +
-          'file or log names pgfpages.sty or pgfmorepages.sty), and a pgfpages layout ' +
+          `${quoteLabel(failure.printedPage ?? '')}, but this build's records (its recorder file ` +
+          'or log) name pgfpages.sty or pgfmorepages.sty, and a pgfpages layout ' +
           '(\\pgfpagesuselayout{resize to}, {2 on 1}) holds each page back until the next one ' +
           'is built, so every label records a later page than its own — and the /PageLabels ' +
           'tree and the printed page numbers move with it, so nothing in the PDF can show the ' +
           'shift. No page was assumed.' +
+          number,
+      );
+      continue;
+    }
+    if (failure.reason === 'pgfpagesUnknown') {
+      const number =
+        failure.number && failure.number !== ''
+          ? ` Its number is ${quoteLabel(failure.number)}, if you search for the page yourself.`
+          : '';
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
+          `${quoteLabel(failure.printedPage ?? '')}, but neither the build's recorder file ` +
+          '(.fls) nor its .log could be read beside the .aux, so whether a pgfpages layout ' +
+          '(\\pgfpagesuselayout{resize to}, {2 on 1}) shifted every label a page late cannot ' +
+          'be told — and nothing in the PDF would show that shift. No page was assumed.' +
           number,
       );
       continue;
@@ -1169,9 +1439,7 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
         `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
           `${quoteLabel(failure.printedPage ?? '')}, but beamer's own record of the slide its ` +
           `\\label ran on (\\beamer@slide) says slide ${slides}. The two disagree when the page ` +
-          'moved after the \\label ran — a pgfpages layout (\\pgfpagesuselayout{resize to}, ' +
-          '{2 on 1}) holds each page back until the next is built, so every label records the ' +
-          'page after its own, and a label in an allowframebreaks frame can land on a later ' +
+          'moved after the \\label ran — a label in an allowframebreaks frame can land on a later ' +
           "part — and which of the two is this label's PDF page cannot be told from the .aux, " +
           'so neither was assumed.' +
           number,
@@ -1247,31 +1515,53 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
   }
   if (plan.failed.some((f) => f.reason === 'pgfpagesLayout')) {
     lines.push(
-      '  pgfpages shifts the page of every label in the document, so no label of this build is ' +
-        'resolved, whatever the document class and whether or not hyperref is loaded. The ' +
-        "build's records show the package, not the layout, so loading pgfpages without " +
-        '\\pgfpagesuselayout is refused too. To look pages up by label, compile without pgfpages ' +
-        '(it changes only how pages are laid out on paper); or find the page yourself: search ' +
+      '  A pgfpages layout shifts the page of every label in the document, so no label of this ' +
+        'build is resolved, whatever the document class and whether or not hyperref is loaded. ' +
+        "The build's records show only that the file was opened, not that a layout is in use, " +
+        'so this refusal is spurious — and still made — when the document loads pgfpages ' +
+        'without \\pgfpagesuselayout or only tests for the file ' +
+        '(\\IfFileExists{pgfpages.sty}); removing that load or test lets the lookup run. To look ' +
+        'pages up by label, compile without pgfpages (it changes only how pages are laid out on ' +
+        "paper); or find the page yourself: search extract_text's output (or pdf_geometry " +
+        'kinds: ["text"]) for the label\'s number and pass pages:. To show the last page ' +
+        "(lastpage's LastPage, say), pass pages: " +
+        (plan.pageCount === undefined
+          ? "with the PDF's page count."
+          : `[${plan.pageCount}] (the PDF's page count).`),
+    );
+  }
+  if (plan.failed.some((f) => f.reason === 'pgfpagesUnknown')) {
+    lines.push(
+      '  A compile leaves a .log beside the .aux, so compile again and retry; or find the page ' +
+        'yourself: search extract_text\'s output (or pdf_geometry kinds: ["text"]) for the ' +
+        "label's number and pass pages:.",
+    );
+  }
+  if (plan.failed.some((f) => f.reason === 'slideMismatch')) {
+    // Only a build whose records were read and name no pgfpages reaches 'slideMismatch' (the
+    // others refuse as 'pgfpagesLayout' or 'pgfpagesUnknown' first), so one message fits.
+    lines.push(
+      "  This build's records name neither pgfpages nor pgfmorepages, so the disagreement is not a " +
+        'pgfpages shift: the usual cause is a \\label in an allowframebreaks frame, which ' +
+        'beamer records under the slide the frame began on, and such a label cannot be ' +
+        "looked up by label. Find the page yourself: search extract_text's output (or " +
+        'pdf_geometry kinds: ["text"]) for the label\'s number and pass pages:.',
+    );
+  }
+  if (plan.failed.some((f) => f.unverified === 'shipoutMismatch')) {
+    lines.push(
+      "  The log's shipout record is what TeX writes into the build's .log (as [n]) each time it " +
+        'ships a page out: it records the page counter as each page is shipped out, whatever ' +
+        'the page prints. It is consulted only when it numbers exactly the ' +
+        "PDF's pages, and it can only refuse a page, never choose one: a document can write " +
+        'text that looks like it. No page was assumed. Find the page yourself: search ' +
         'extract_text\'s output (or pdf_geometry kinds: ["text"]) for the label\'s number and ' +
         'pass pages:.',
     );
   }
-  if (plan.failed.some((f) => f.reason === 'slideMismatch')) {
-    lines.push(
-      aux.pgfpages === false
-        ? '  This build did not load pgfpages (or pgfmorepages), so the disagreement is not a ' +
-            'pgfpages shift: the usual cause is a \\label in an allowframebreaks frame, which ' +
-            'beamer records under the slide the frame began on, and such a label cannot be ' +
-            "looked up by label. Find the page yourself: search extract_text's output (or " +
-            'pdf_geometry kinds: ["text"]) for the label\'s number and pass pages:.'
-        : '  If the deck uses a pgfpages layout, compiling without it (it changes only how slides ' +
-            'are laid out on paper) removes that shift; a label in an allowframebreaks frame ' +
-            'stays unresolvable by label either way. Or find the page yourself: search ' +
-            'extract_text\'s output (or pdf_geometry kinds: ["text"]) for the label\'s number ' +
-            'and pass pages:.',
-    );
-  }
-  if (plan.failed.some((f) => f.reason === 'unverifiedPage')) {
+  if (
+    plan.failed.some((f) => f.reason === 'unverifiedPage' && f.unverified !== 'shipoutMismatch')
+  ) {
     if (plan.pageLabelsIgnored === 'beamer') {
       lines.push(
         "  This PDF's /PageLabels tree was not used: the .aux shows a beamer deck, whose page " +
@@ -1305,7 +1595,7 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
   return lines.join('\n');
 }
 
-function unverifiedText(failure: LabelFailure): string {
+function unverifiedText(failure: LabelFailure, route: LabelSource): string {
   const printed = quoteLabel(failure.printedPage ?? '');
   const page = failure.printedPage ?? '';
   const folios = (failure.folios ?? []).map(quoteLabel);
@@ -1314,6 +1604,8 @@ function unverifiedText(failure: LabelFailure): string {
       ? ` Its number is ${quoteLabel(failure.number)}, if you search for the page yourself.`
       : '';
   switch (failure.unverified) {
+    case 'shipoutMismatch':
+      return shipoutText(failure, route) + number;
     case 'pastEndOfPdf':
       return (
         `the .aux records printed page ${printed}, but this PDF has ${failure.pageCount ?? '?'} ` +
@@ -1392,6 +1684,51 @@ function unverifiedText(failure: LabelFailure): string {
   }
 }
 
+/** The `'shipoutMismatch'` line: what the route chose, and what the log's shipout record says. */
+function shipoutText(failure: LabelFailure, route: LabelSource): string {
+  const printed = quoteLabel(failure.printedPage ?? '');
+  // The counter the printed page stands for, as a number: "02" is counter 2, and the record's
+  // counters are numbers, so comparing or naming the printed string would call them different.
+  const counterValue = parsePrintedPage(failure.printedPage ?? '');
+  const counter = counterValue === undefined ? (failure.printedPage ?? '') : String(counterValue);
+  const page = failure.resolvedPage ?? '?';
+  const chose =
+    route === 'pageLabels'
+      ? `the .aux records printed page ${printed}, and the PDF's /PageLabels tree puts printed ` +
+        `page ${printed} on PDF page ${page}`
+      : `the .aux records printed page ${printed}, and PDF page ${page} reads as ${printed} ` +
+        'with a neighbour agreeing';
+  const others = (failure.shipoutPages ?? []).filter((p) => p !== failure.resolvedPage);
+  const omitted = failure.shipoutPagesOmitted ?? 0;
+  const list = (pages: number[]): string =>
+    `PDF page${pages.length + omitted > 1 ? 's' : ''} ${pages.join(', ')}` +
+    (omitted > 0 ? `, and ${omitted} more` : '');
+  let record: string;
+  if (failure.shipout === undefined) {
+    record = `has no entry for PDF page ${page}`;
+  } else if (failure.shipout === counterValue) {
+    // Only the printed-page route refuses on a repeat, and only for the pages that could print
+    // the same number: none of them reads as a page number in another style.
+    const competing =
+      others.length + omitted > 1
+        ? 'none of which reads as a page number in another style'
+        : 'which does not read as a page number in another style';
+    record =
+      `shows page counter ${counter} on PDF page ${page} and also on ${list(others)}, ` +
+      `${competing} (a roman numeral, a letter, or a prefixed number such as "S${counter}")`;
+  } else {
+    record =
+      `says PDF page ${page} was shipped out with page counter ${failure.shipout}, and ` +
+      (others.length + omitted === 0
+        ? `no PDF page was shipped out with page counter ${counter}`
+        : `page counter ${counter} was shipped out on ${list(others)}`);
+  }
+  return (
+    `${chose}, but the log's shipout record ${record} — so PDF page ${page} is not confirmed ` +
+    `to be printed page ${printed}, and no page was assumed.`
+  );
+}
+
 /** `label -> page` pairs, for a one-line summary in a result's text channel and note. */
 export function describeResolvedLabels(resolved: ResolvedLabel[]): string {
   return resolved.map((r) => `${r.label} -> page ${r.page}`).join(', ');
@@ -1403,25 +1740,46 @@ export function describeResolvedLabels(resolved: ResolvedLabel[]): string {
  * moved since, so the result must say so rather than presenting a live page.
  */
 export function labelResolutionNote(plan: LabelPagePlan): string {
-  const conversion =
-    plan.labelSource === 'pageLabels'
-      ? "which records each label's PRINTED page; that printed page was then looked up in the " +
-        "PDF's own /PageLabels tree to get the page index, so a renumbered document (roman " +
-        'front matter, an appendix scheme) resolves exactly rather than being refused'
-      : "which records each label's PRINTED page. " +
-        (plan.pageLabelsIgnored === 'beamer'
-          ? "This PDF's /PageLabels tree was not used — the .aux shows a beamer deck, whose " +
-            'page labels number frames while each label records its slide — so the '
-          : 'This PDF carries no /PageLabels tree, so the ') +
-        "printed page was taken as the page index only after that PDF page's own folio (the " +
-        'page number in its footer or running head, read from its text layer) was found to ' +
-        'read the same, a neighbouring page read as the adjacent number, and the last page read ' +
-        'as no decimal page number other than the page count (a restarted numbering usually ' +
-        'ends on a smaller one) — evidence, not proof: a restart ' +
-        'whose last page shows no page number goes unseen, and a number standing where the ' +
-        'folio is looked for (a table cell, or a line such as "3/9" or "– 3 –", above an empty ' +
-        'foot) can read like one, so check the result' +
-        (plan.pageLabelsIgnored === 'beamer' ? '' : ', and load hyperref for an exact lookup');
+  const checked = plan.shipoutsChecked === true;
+  let conversion: string;
+  if (plan.labelSource === 'pageLabels') {
+    conversion =
+      "which records each label's PRINTED page; that printed page was then looked up in the " +
+      "PDF's own /PageLabels tree to get the page index, so a renumbered document (roman " +
+      'front matter, an appendix scheme) resolves exactly rather than being refused' +
+      (checked
+        ? " — and, for a decimal printed page, the build's .log recorded that PDF page as " +
+          'shipped out with that page counter'
+        : '');
+  } else {
+    const tree =
+      plan.pageLabelsIgnored === 'beamer'
+        ? "This PDF's /PageLabels tree was not used — the .aux shows a beamer deck, whose " +
+          'page labels number frames while each label records its slide — so the '
+        : 'This PDF carries no /PageLabels tree, so the ';
+    const checks =
+      "printed page was taken as the page index only after that PDF page's own folio (the " +
+      'page number in its footer or running head, read from its text layer) was found to ' +
+      'read the same, a neighbouring page read as the adjacent number, ' +
+      (checked
+        ? 'the last page read as no decimal page number other than the page count, and the ' +
+          "build's .log recorded that PDF page as shipped out with that page counter, with " +
+          'every other page shipped under it printing a page number in another style (a roman ' +
+          'numeral, a letter, a prefixed number) — evidence, not proof: the folios are read ' +
+          'from text, and a section number opening such a page can read as its page number, ' +
+          'so check the result'
+        : 'and the last page read as no decimal page number other than the page count (a ' +
+          "restarted numbering usually ends on a smaller one); the build's .log shipout record " +
+          "was not used, since it could not be read or did not number exactly the PDF's pages " +
+          '— evidence, not proof: a restart whose last page shows no page number goes unseen, ' +
+          'and a number standing where the folio is looked for (a table cell, or a line such ' +
+          'as "3/9" or "– 3 –", above an empty foot) can read like one, so check the result');
+    conversion =
+      "which records each label's PRINTED page. " +
+      tree +
+      checks +
+      (plan.pageLabelsIgnored === 'beamer' ? '' : ', and load hyperref for an exact lookup');
+  }
   return (
     `Pages resolved from labels through the build-directory .aux of the LAST COMPILE ` +
     `(${describeResolvedLabels(plan.resolved)}), ${conversion}. Edits since that compile, and ` +

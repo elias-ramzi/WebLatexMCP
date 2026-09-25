@@ -10,6 +10,7 @@ import {
   labelResolutionNote,
   resolveLabelPages,
   pdfLabelPageReader,
+  pagesToVerify,
   readFolios,
   MAX_AMBIGUOUS_CANDIDATES,
 } from '../../src/lib/labelPages.js';
@@ -19,10 +20,23 @@ import type { AuxFloatsResult, AuxLabel } from '../../src/lib/auxFloats.js';
 import { buildAuxPath, buildDir } from '../../src/services/compiler.js';
 import type { TextRequest, TextResult } from '../../src/services/pdfRender.js';
 
-/** `[label, number, page]` — the three fields a `\newlabel{label}{{number}{page}}` carries. */
+/**
+ * `[label, number, page]` — the three fields a `\newlabel{label}{{number}{page}}` carries. The
+ * index is the ordinary case, `pgfpages: false`: a build whose `.log` was read and names no
+ * pgfpages, so the label routes run (an index without the field is refused as
+ * `'pgfpagesUnknown'`, see {@link withoutRecords}).
+ */
 function aux(entries: Array<[label: string, number: string, page: string]>): AuxFloatsResult {
   const floats: AuxLabel[] = entries.map(([label, number, page]) => ({ label, number, page }));
-  return { floats, omitted: 0, total: floats.length, dropped: 0 };
+  return { floats, omitted: 0, total: floats.length, dropped: 0, pgfpages: false };
+}
+
+/** `index` as the reader hands it over when neither the build's `.fls` nor its `.log` could be
+ *  read: `pgfpages` absent, nothing known about the layout. */
+function withoutRecords(index: AuxFloatsResult): AuxFloatsResult {
+  const copy = { ...index };
+  delete copy.pgfpages;
+  return copy;
 }
 
 function evidence(pageCount: number, text: Record<number, string[]>): LabelPageEvidence {
@@ -72,10 +86,11 @@ function linesOf(doc: string, page: number): string[] {
   return FOLIO[doc]![String(page)]!;
 }
 
-describe('planLabelPages verifies the printed-page route against the page FOLIO (LP1)', () => {
+describe('planLabelPages verifies the printed-page route against the page FOLIO', () => {
   it('refuses a [titlepage] article whose body is full of small numbers (real pdflatex text)', () => {
-    // The round-1 check accepted both: "[1, 2]" and "3 runs" put the label numbers "1" and "2"
-    // on every page, so PDF pages 2 and 3 "showed" them — one page before the real figures.
+    // An earlier check ("the page shows the label's number") accepted both: "[1, 2]" and
+    // "3 runs" put the label numbers "1" and "2" on every page, so PDF pages 2 and 3 "showed"
+    // them — one page before the real figures.
     const index = aux([
       ['fig:a', '1', '2'],
       ['fig:b', '2', '3'],
@@ -294,15 +309,17 @@ function truthPage(doc: string, label: string): number | undefined {
   return hit ? Number(hit[0]) : undefined;
 }
 
-describe('planLabelPages believes a folio only when a neighbouring page corroborates it (R3)', () => {
-  // Each of these is a real pdflatex build (sources beside pages.json) that round 2 resolved to
-  // the WRONG page: the folio it read was not the folio.
+describe('planLabelPages believes a folio only when a neighbouring page corroborates it', () => {
+  // Each of these is a real pdflatex build (sources beside pages.json) that an earlier version,
+  // one that believed a single page's folio, resolved to the WRONG page: the folio it read was
+  // not the folio.
   it('refuses a fancyhdr "Page N" foot whose head carries the section number (titlepage)', () => {
-    // `\cfoot{Page \thepage}` is not a bare number, so round 2 read the head instead — and the
-    // head is `\rightmark`, the SECTION number: PDF page 4 heads "4" "SEC4" (section 4 started on
-    // printed page 3) while fig:s4 (printed page 4) is really on PDF page 5. Round 3 refused it
-    // only because no neighbour corroborated the forged "4"; since round 4 the "Page N" foot is
-    // read as what it is, the folio, and PDF page 4 reads as the page number it prints: 3.
+    // `\cfoot{Page \thepage}` is not a bare number, so an earlier version read the head instead
+    // — and the head is `\rightmark`, the SECTION number: PDF page 4 heads "4" "SEC4" (section 4
+    // started on printed page 3) while fig:s4 (printed page 4) is really on PDF page 5. The
+    // neighbour check alone would refuse it, since no neighbour corroborates the forged "4"; but
+    // the "Page N" foot is now read as what it is, the folio, so PDF page 4 reads as the page
+    // number it prints: 3.
     const fig4 = aux([['fig:s4', '4', '4']]);
     const plan = planLabelPages(['fig:s4'], fig4, null, pagesOf('fancyPageFoot'));
     expect(truthPage('fancyPageFoot', 'fig:s4')).toBe(5);
@@ -471,7 +488,7 @@ describe('readFolios', () => {
   });
 });
 
-describe('planLabelPages refuses a multiply-defined label (LP2)', () => {
+describe('planLabelPages refuses a multiply-defined label', () => {
   it('names every printed page rather than resolving to the first record', () => {
     // LaTeX's \@newl@bel \global-defines each time, so \pageref prints the LAST record; the
     // first is not what a reader of the document sees.
@@ -684,7 +701,7 @@ function fixtureReader(doc: string, pageLabels: string[] | null): LabelPageReade
   };
 }
 
-describe('the .aux, read through the real reader (R4)', () => {
+describe('the .aux, read through the real reader (readAuxFloats over a build dir)', () => {
   let dir: string | undefined;
   afterEach(async () => {
     if (dir) {
@@ -694,11 +711,15 @@ describe('the .aux, read through the real reader (R4)', () => {
     }
   });
 
-  /** `readAuxFloats` over a build dir holding `files` (the root is `main.aux`). */
+  /**
+   * `readAuxFloats` over a build dir holding `files` (the root is `main.aux`), plus the `.log`
+   * every compile writes beside it — one that names no pgfpages, unless `files` brings its own —
+   * so the routes run rather than every label refusing as `'pgfpagesUnknown'`.
+   */
   async function readBuild(files: Record<string, string>): Promise<AuxFloatsResult> {
-    dir = await mkdtemp(path.join(os.tmpdir(), 'labelr4-'));
+    dir = await mkdtemp(path.join(os.tmpdir(), 'labelaux-'));
     await mkdir(buildDir(dir), { recursive: true });
-    for (const [name, content] of Object.entries(files)) {
+    for (const [name, content] of Object.entries({ 'main.log': 'This is pdfTeX\n', ...files })) {
       await writeFile(path.join(buildDir(dir), name), content);
     }
     expect(path.join(buildDir(dir), 'main.aux')).toBe(buildAuxPath(dir, 'main.tex'));
@@ -899,7 +920,7 @@ describe('the .aux, read through the real reader (R4)', () => {
   });
 });
 
-describe('readFolios reads the common non-bare foot forms on the last line (R4)', () => {
+describe('readFolios reads the common non-bare foot forms on the last line', () => {
   it('takes "Page N", "N/M", "– N –" over a head that carries section numbers (real pdflatex)', () => {
     // Each head reads "3" "3" "P3": \rightmark's section number, which advanced one per page in
     // step with the PDF and forged the old head reading. The foot is the folio.
@@ -933,7 +954,7 @@ describe('readFolios reads the common non-bare foot forms on the last line (R4)'
   });
 
   it('never resolves a section-per-page document to a page its float is not on', () => {
-    // The reviewer's adversarial builds: `[titlepage]` shifts every page by one, and the head
+    // Adversarial builds: `[titlepage]` shifts every page by one, and the head
     // shows the section number, which advances one per page — so page p read "p" and its
     // neighbour "p±1", a perfect forgery. Printed page s-1 is fig:s<s>'s, on PDF page s.
     for (const doc of ['secpagePageN', 'secpageSlashOf', 'secpageDash']) {
@@ -963,7 +984,7 @@ describe('readFolios reads the common non-bare foot forms on the last line (R4)'
   });
 });
 
-describe('the printed-page route checks the numbering reaches the LAST page (R5)', () => {
+describe('the printed-page route checks that the numbering reaches the LAST page', () => {
   /** A fixture `.aux` as the reader would hand it over (its beamer flag included). */
   function auxOf(name: string): AuxFloatsResult {
     const text = fixtureAux(name);
@@ -974,6 +995,8 @@ describe('the printed-page route checks the numbering reaches the LAST page (R5)
       total: floats.length,
       dropped: 0,
       beamerNav: isBeamerAux(text),
+      // The ordinary case: the build's .log was read and names no pgfpages.
+      pgfpages: false,
     };
   }
 
@@ -1195,6 +1218,95 @@ describe("a beamer label is checked against beamer's own slide record (\\beamer@
   });
 });
 
+describe('a build whose records cannot say whether it loaded pgfpages refuses every label, on both routes', () => {
+  // `pgfpages` absent: neither the build's .fls nor its .log could be read beside the .aux, so a
+  // layout that shifted every label a page late cannot be ruled out. Evidence the document
+  // controls may only ADD a refusal, so the unknown case refuses rather than resolving.
+  const ENTRIES: Array<[string, string, string]> = [
+    ['dup', '3', '1'],
+    ['dup', '4', '1'],
+    ['fig:a', '1', '2'],
+    ['fig:b', '2', '3'],
+  ];
+  const TREE = ['1', '2', '3', '4'];
+
+  it('refuses each found label as pgfpagesUnknown; notFound and multiplyDefined still win for theirs', () => {
+    const index = withoutRecords(aux(ENTRIES));
+    for (const [tree, ev] of [
+      [null, pagesOf('unshifted')],
+      [TREE, undefined],
+    ] as const) {
+      const plan = planLabelPages(['fig:a', 'nope', 'dup', 'fig:b'], index, tree, ev);
+      expect(plan.labelSource).toBe(tree ? 'pageLabels' : 'printedPage');
+      expect(plan.resolved).toEqual([]);
+      expect(plan.pages).toEqual([]);
+      expect(plan.failed).toEqual([
+        { label: 'fig:a', reason: 'pgfpagesUnknown', printedPage: '2', number: '1' },
+        { label: 'nope', reason: 'notFound' },
+        {
+          label: 'dup',
+          reason: 'multiplyDefined',
+          printedPages: ['1', '1'],
+          printedPagesOmitted: 0,
+        },
+        { label: 'fig:b', reason: 'pgfpagesUnknown', printedPage: '3', number: '2' },
+      ]);
+    }
+  });
+
+  it('resolves the same labels once a record was read and names no pgfpages (the value just outside)', () => {
+    const index = aux(ENTRIES);
+    expect(planLabelPages(['fig:a', 'fig:b'], index, null, pagesOf('unshifted'))).toMatchObject({
+      failed: [],
+      pages: [2, 3],
+    });
+    expect(planLabelPages(['fig:a', 'fig:b'], index, TREE)).toMatchObject({
+      failed: [],
+      pages: [2, 3],
+    });
+  });
+
+  it('asks the reader for no page text unless the records were read and name no pgfpages', async () => {
+    const known = aux(ENTRIES);
+    expect(pagesToVerify(['fig:a'], known, 4)).toEqual([2, 1, 3, 4]);
+    expect(pagesToVerify(['fig:a'], withoutRecords(known), 4)).toEqual([]);
+    expect(pagesToVerify(['fig:a'], { ...known, pgfpages: true }, 4)).toEqual([]);
+
+    const read: number[][] = [];
+    const base = fixtureReader('unshifted', null);
+    const reader: LabelPageReader = {
+      ...base,
+      pageText: (p) => {
+        read.push(p);
+        return base.pageText(p);
+      },
+    };
+    const plan = await resolveLabelPages(['fig:a', 'fig:b'], withoutRecords(known), reader);
+    expect(plan.failed.map((f) => f.reason)).toEqual(['pgfpagesUnknown', 'pgfpagesUnknown']);
+    expect(read).toEqual([]);
+  });
+
+  it('says the records could not be read, that a compile writes them, and how to pass pages:', () => {
+    const index = withoutRecords(aux(ENTRIES));
+    const msg = labelRefusalMessage(planLabelPages(['fig:a'], index, null), index);
+    expect(msg).toContain('"fig:a"');
+    expect(msg).toContain('printed page "2"');
+    expect(msg).toContain('.fls');
+    expect(msg).toContain('.log');
+    expect(msg).toMatch(/neither the build's recorder file \(\.fls\) nor its \.log could be read/);
+    expect(msg).toMatch(/\\pgfpagesuselayout\{resize to\}/);
+    expect(msg).toMatch(/No page was assumed/);
+    expect(msg).toMatch(/Its number is "1"/);
+    expect(msg).toMatch(/compile again/i);
+    expect(msg).toMatch(/pages:/);
+    // Nothing is known about pgfpages, so nothing may be claimed about it.
+    expect(msg).not.toMatch(/loaded pgfpages|names? pgfpages\.sty/);
+    // The advice is given once, however many labels refuse.
+    const two = labelRefusalMessage(planLabelPages(['fig:a', 'fig:b'], index, null), index);
+    expect(two.match(/compile again/gi)).toHaveLength(1);
+  });
+});
+
 describe('a build that loaded pgfpages refuses every label, on both routes', () => {
   let dir: string | undefined;
   afterEach(async () => {
@@ -1268,6 +1380,28 @@ describe('a build that loaded pgfpages refuses every label, on both routes', () 
     expect(msg).toMatch(/pgfpages/);
     expect(msg).toMatch(/pages:/);
     expect(msg).toMatch(/Its number is "1"/);
+    // The records name the file; they do not show it was loaded, let alone the layout used —
+    // the .fls records a file merely opened by \IfFileExists.
+    expect(msg).not.toMatch(/loaded pgfpages/);
+    expect(msg).toMatch(/names? pgfpages\.sty or pgfmorepages\.sty/);
+    expect(msg).toMatch(/only that the file was opened, not that a layout is in use/);
+    expect(msg).toMatch(/spurious — and still made/);
+    expect(msg).toContain('\\IfFileExists{pgfpages.sty}');
+    expect(msg).toMatch(/without \\pgfpagesuselayout/);
+    expect(msg).toMatch(/removing that load or test lets the lookup run/);
+    // The last page is simply the last PDF page: the pointer, not an exemption.
+    expect(msg).toContain('LastPage');
+    // With the number in hand: the PDF's own page count, which resolveLabelPages read.
+    expect(plan.pageCount).toBe(4);
+    expect(msg).toMatch(/pass pages: \[4\] \(the PDF's page count\)/);
+    // A plan made without the page count falls back to naming what to pass.
+    const bare = planLabelPages(LABELS, index, null);
+    expect(bare.pageCount).toBeUndefined();
+    expect(labelRefusalMessage(bare, index)).toMatch(/pass pages: with the PDF's page count/);
+    // Still points at the way round it.
+    expect(msg).toMatch(/extract_text/);
+    expect(msg).toContain('pdf_geometry kinds: ["text"]');
+    expect(msg).not.toMatch(/could be read beside the \.aux/);
   });
 
   it('reads the evidence off the .log when the build left no .fls (a recorder turned off)', async () => {
@@ -1292,6 +1426,41 @@ describe('a build that loaded pgfpages refuses every label, on both routes', () 
   it('knows nothing when neither record is there, and says so as undefined, not false', async () => {
     const index = await readBuild({ 'main.aux': fixtureAux('articleResizeTo') });
     expect(index.pgfpages).toBeUndefined();
+  });
+
+  it('refuses every label of that "resize to" article when neither record is there, on both routes (real pdflatex)', async () => {
+    // Nothing says whether a layout shifted the labels, and without the records the folio route
+    // resolved every label to the NEXT figure (fig:a, on PDF page 1, records "2", and PDF page 2
+    // reads "2"). Every compile leaves a .log beside the .aux, so failing closed costs nothing in
+    // normal use.
+    const index = await readBuild({ 'main.aux': fixtureAux('articleResizeTo') });
+    expect(index.pgfpages).toBeUndefined();
+    const expected = LABELS.map((label, i) => ({
+      label,
+      reason: 'pgfpagesUnknown',
+      printedPage: String(i + 2),
+      number: String(i + 1),
+    }));
+    for (const tree of [null, ['1', '2', '3', '4']]) {
+      const plan = await resolveLabelPages(LABELS, index, fixtureReader('articleResizeTo', tree));
+      expect(plan.resolved, JSON.stringify(tree)).toEqual([]);
+      expect(plan.pages, JSON.stringify(tree)).toEqual([]);
+      expect(plan.failed, JSON.stringify(tree)).toEqual(expected);
+    }
+  });
+
+  it('runs the routes once an EMPTY .log was read: a record that names nothing is not "unknown"', async () => {
+    // The value just outside the guard: the same .aux, and a .log that was read and names
+    // nothing, so pgfpages is false and whatever the routes decide, it is not a pgfpages refusal.
+    const index = await readBuild({ 'main.aux': fixtureAux('articleResizeTo'), 'main.log': '' });
+    expect(index.pgfpages).toBe(false);
+    for (const tree of [null, ['1', '2', '3', '4']]) {
+      const plan = await resolveLabelPages(LABELS, index, fixtureReader('articleResizeTo', tree));
+      const reasons = plan.failed.map((f) => f.reason);
+      expect(reasons, JSON.stringify(tree)).not.toContain('pgfpagesUnknown');
+      expect(reasons, JSON.stringify(tree)).not.toContain('pgfpagesLayout');
+      expect(plan.resolved.length + plan.failed.length, JSON.stringify(tree)).toBe(LABELS.length);
+    }
   });
 
   it('says false only when a record was read and names no pgfpages.sty', async () => {
@@ -1394,12 +1563,15 @@ describe('a beamer slide record whose label key holds a brace group', () => {
   it('is read under the key the \\newlabel parser stores, so the slide check applies (real pdflatex)', async () => {
     // A "resize to" deck whose footline prints the slide number, with \label{fig:{a}} and
     // \label{fig:{c}}: the .aux records "2" and "4" while beamer's own record keeps slides 1 and
-    // 3. Only the build dir's .aux is written, so this is the slide record's refusal alone.
+    // 3. Beside the .aux sits a .log that names no pgfpages — records that are wrong about this
+    // deck, the one case the slide check is still there to catch — so this is the slide record's
+    // refusal alone.
     dir = await mkdtemp(path.join(os.tmpdir(), 'labelbrace-'));
     await mkdir(buildDir(dir), { recursive: true });
     await writeFile(path.join(buildDir(dir), 'main.aux'), fixtureAux('beamerResizeToBraces'));
+    await writeFile(path.join(buildDir(dir), 'main.log'), 'This is pdfTeX\n');
     const index = await readAuxFloats(dir, 'main.tex', { max: 20_000 });
-    expect(index.pgfpages).toBeUndefined();
+    expect(index.pgfpages).toBe(false);
     expect(index.beamerSlides?.get('fig:{a}')).toEqual(['1']);
     expect(index.beamerSlides?.get('fig:{c}')).toEqual(['3']);
     const tree = ['1', '2', '3', '4'];
@@ -1441,14 +1613,25 @@ describe('the slideMismatch refusal gives the advice that fits the build', () =>
     expect(plan.failed[0]?.reason).toBe('slideMismatch');
     const msg = labelRefusalMessage(plan, index);
     expect(msg).not.toMatch(/compile without|compiling without/);
-    expect(msg).toMatch(/did not load pgfpages/);
+    expect(msg).toMatch(/records name neither pgfpages nor pgfmorepages/);
     expect(msg).toMatch(/allowframebreaks/);
+    // Nor offer a pgfpages layout as a cause per label, which the closing advice then denies.
+    expect(msg).not.toMatch(/pgfpages layout/);
   });
 
-  it('names both causes when nothing says whether the build loaded pgfpages', () => {
-    const index = deckAux(undefined);
-    const msg = labelRefusalMessage(planLabelPages(['brk'], index, null, evidence(4, {})), index);
-    expect(msg).toMatch(/If the deck uses a pgfpages layout/);
-    expect(msg).toMatch(/allowframebreaks frame stays unresolvable/);
+  it('is never reached by a deck whose records could not be read, nor one whose records name pgfpages', () => {
+    // Both refuse every label first, so the slide record is not consulted and its advice (which
+    // only fits a build known to have no pgfpages) is never given.
+    for (const [pgfpages, reason] of [
+      [undefined, 'pgfpagesUnknown'],
+      [true, 'pgfpagesLayout'],
+    ] as const) {
+      const index = deckAux(pgfpages);
+      const plan = planLabelPages(['brk'], index, null, evidence(4, {}));
+      expect(plan.failed, reason).toEqual([{ label: 'brk', reason, printedPage: '3', number: '' }]);
+      const msg = labelRefusalMessage(plan, index);
+      expect(msg, reason).not.toMatch(/allowframebreaks/);
+      expect(msg, reason).not.toMatch(/beamer@slide/);
+    }
   });
 });

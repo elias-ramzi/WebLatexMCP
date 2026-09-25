@@ -13,12 +13,14 @@ import {
 import type { LabelPageEvidence } from '../../src/lib/labelPages.js';
 import type { AuxFloatsResult, AuxLabel } from '../../src/lib/auxFloats.js';
 
+/** An index as the reader hands it over for an ordinary build: `pgfpages: false`, its `.log`
+ *  read and naming no pgfpages (an index without the field refuses every label). */
 function aux(
   entries: Array<[label: string, page: string]>,
   extra?: Partial<Omit<AuxFloatsResult, 'floats'>>,
 ): AuxFloatsResult {
   const floats: AuxLabel[] = entries.map(([label, page]) => ({ label, number: '1', page }));
-  return { floats, omitted: 0, total: floats.length, dropped: 0, ...extra };
+  return { floats, omitted: 0, total: floats.length, dropped: 0, pgfpages: false, ...extra };
 }
 
 /**

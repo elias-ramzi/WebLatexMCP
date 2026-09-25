@@ -10,7 +10,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
-import { LatexmkCompiler, buildDir } from '../../src/services/compiler.js';
+import { LatexmkCompiler, buildDir, buildPdfPath } from '../../src/services/compiler.js';
+import { readAuxFloats } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -146,7 +147,7 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     for (const c of cleanups.splice(0)) await c();
   });
 
-  async function compiled(tex: string): Promise<Client> {
+  async function compiled(tex: string, engine?: 'xelatex' | 'lualatex'): Promise<Client> {
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-ws-'));
     const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-src-'));
     cleanups.push(
@@ -171,9 +172,24 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     cleanups.push(() => client.close());
 
-    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc', ...(engine ? { engine } : {}) },
+    });
     const structured = res.structuredContent as Record<string, unknown>;
-    expect(structured.success, JSON.stringify(res.content)).toBe(true);
+    // On failure, say which build and show its log excerpt: the result text alone names no
+    // error when latexmk exits non-zero without a TeX error, and CI's TeX is not this machine's.
+    expect(
+      structured.success,
+      `${engine ?? 'pdflatex'}: ${JSON.stringify(res.content)}\n${String(structured.logTail)}\n${String(structured.hint ?? '')}`,
+    ).toBe(true);
+    // Every real build here is ordinary TeX output, so its .log's shipout marks must number
+    // exactly the PDF's pages: a shorter or longer parse would silently skip the shipout check
+    // (and a wrong sequence of the right length would refuse labels it should not).
+    const aux = await readAuxFloats(userDir, 'main.tex', { max: 20_000, shipouts: true });
+    const pageCount = await ctx.pdfRenderer.pageCount(buildPdfPath(userDir, 'main.tex'));
+    expect(aux.shipouts, 'shipout marks read').toBeDefined();
+    expect(aux.shipouts, 'one shipout mark per PDF page').toHaveLength(pageCount);
     return client;
   }
 
@@ -420,7 +436,9 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       for (const label of ['fig:a', 'fig:b', 'fig:c']) {
         const got = await landed(client, label);
         expect(got.page, label).toBeUndefined();
-        expect(got.text, label).toMatch(/this build loaded pgfpages/);
+        expect(got.text, label).toMatch(
+          /this build's records \(its recorder file or log\) name pgfpages\.sty/,
+        );
       }
     }
   }, 240_000);
@@ -438,6 +456,77 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     },
     240_000,
   );
+
+  it("refuses the shifted table-bottom residual through the log's shipout record", async () => {
+    // `[titlepage]`, `\pagestyle{empty}`, and a tabular ending in a bare cell at each page foot
+    // that reads as the PDF page index. The folio route accepted figb, figc and figd one page early
+    // (each candidate's last line reads its printed page, and the next page's reads the next
+    // number); the .log shipped the pages as [1] [1] [2] [3] [4], which refuses them.
+    const client = await compiled(fixtureTex('tableBottomShifted'));
+    for (const label of ['figa', 'figb', 'figc', 'figd']) {
+      const got = await landed(client, label);
+      expect(got.page, label).toBeUndefined();
+    }
+    for (const label of ['figb', 'figc', 'figd']) {
+      const got = await landed(client, label);
+      expect(got.text, label).toMatch(/the log's shipout record says PDF page \d was shipped out/);
+    }
+  }, 240_000);
+
+  it('resolves the body of a document whose appendix resets the counter under alph, S or Roman', async () => {
+    // No hyperref. The body prints 1-4; the appendix resets the page counter under
+    // \pagenumbering{alph}, `S\arabic{page}` or \pagenumbering{Roman}, so the log ships
+    // [1] [2] [3] [4] [1] [2]. The appendix pages print "a", "S1", "I" — no second "1" — so
+    // every body label resolves to its own page, as it did before the log was read.
+    // The Roman variant drops the appendix label: a label printing "I" refuses every label of the
+    // document as renumbered, with or without the log.
+    const roman = fixtureTex('appendixAlph')
+      .replace('\\pagenumbering{alph}', '\\pagenumbering{Roman}')
+      .replace('\\fig{appa}', '');
+    const docs: Array<[string, string, 'xelatex' | 'lualatex' | undefined]> = [
+      ['appendixAlph', fixtureTex('appendixAlph'), undefined],
+      ['appendixAlph (lualatex)', fixtureTex('appendixAlph'), 'lualatex'],
+      ['suppPrefixed', fixtureTex('suppPrefixed'), undefined],
+      ['suppPrefixed (xelatex)', fixtureTex('suppPrefixed'), 'xelatex'],
+      ['appendixRoman', roman, undefined],
+    ];
+    for (const [name, tex, engine] of docs) {
+      const client = await compiled(tex, engine);
+      const res = await client.callTool({
+        name: 'extract_text',
+        arguments: { project: 'doc', labels: ['figa', 'figb', 'figc', 'figd'] },
+      });
+      expect(res.isError ?? false, `${name}: ${textOf(res)}`).toBe(false);
+      const out = res.structuredContent as unknown as Out;
+      expect(
+        out.resolvedLabels?.map((r) => r.page),
+        name,
+      ).toEqual([1, 2, 3, 4]);
+      for (const r of out.resolvedLabels ?? []) {
+        const mark = 'MK' + r.label;
+        const shown = out.pages.find((p) => p.page === r.page);
+        expect(
+          shown?.lines?.some((l) => l.includes(mark)),
+          `${name}: ${r.label} -> ${r.page}`,
+        ).toBe(true);
+      }
+    }
+  }, 480_000);
+
+  it('still refuses an arabic restart with no label before it, by its shipout record', async () => {
+    // Main paper 1-4, then \setcounter{page}{1} (arabic) and a supplement whose label suppb is
+    // on its printed page 2 (PDF page 6); the last page prints no number. The .aux reads 1, 2 and
+    // the last page is silent, so the folio route alone resolves suppb to the main paper's page
+    // 2; the log ships [1] [2] [3] [4] [1] [2] [3] and PDF page 6 prints "2" too.
+    for (const engine of [undefined, 'lualatex'] as const) {
+      const client = await compiled(fixtureTex('restartUnlabelled'), engine);
+      for (const label of ['suppb', 'figa']) {
+        const got = await landed(client, label);
+        expect(got.page, `${engine ?? 'pdflatex'} ${label}`).toBeUndefined();
+        expect(got.text).toMatch(/the log's shipout record shows page counter \d on PDF page \d/);
+      }
+    }
+  }, 480_000);
 
   it('never resolves a section-per-page "Page N" / "N/M" / "– N –" document wrongly', async () => {
     for (const doc of ['secpagePageN', 'secpageSlashOf', 'secpageDash']) {

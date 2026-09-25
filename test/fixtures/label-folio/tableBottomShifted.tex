@@ -1,0 +1,13 @@
+\documentclass[titlepage]{article}
+\pagestyle{empty}
+\title{T}\author{A}
+\newcommand\para{Filler text that stands in for a paragraph of an ordinary paper, long enough to wrap over several lines and fill the page in a handful of repetitions. Prior work [1, 2] reports 3 runs, and 4 of 5 settings agree.\par}
+\newcommand\fig[1]{\begin{figure}[h]\centering MK#1 BODY\caption{Cap MK#1}\label{#1}\end{figure}}
+\newcommand\foot[1]{\vfill\noindent\begin{tabular}{lr}alpha & 10\\ beta & #1\end{tabular}\newpage}
+\begin{document}
+\maketitle
+\para\para\fig{figa}\para\foot{2}
+\para\para\fig{figb}\para\foot{3}
+\para\para\fig{figc}\para\foot{4}
+\para\para\fig{figd}\para
+\end{document}

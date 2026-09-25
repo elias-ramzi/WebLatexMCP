@@ -14,9 +14,11 @@ import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
 import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
 import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
 import { planGeometryPayload, GEOMETRY_CONTENT_BUDGET } from '../lib/geometryBudget.js';
+import { findVariantPdf, resolveVariantBuild, VARIANT_INPUT_DESCRIPTION } from '../lib/variants.js';
 
 const inputSchema = {
   project: z.string().optional(),
+  variant: z.string().optional().describe(VARIANT_INPUT_DESCRIPTION),
   rootFile: z
     .string()
     .optional()
@@ -221,6 +223,10 @@ const floatShape = z.object({
 });
 
 const outputSchema = {
+  variant: z
+    .string()
+    .optional()
+    .describe('The variant handle this read, echoed back; absent when the main build was read.'),
   pdfPath: z
     .string()
     .optional()
@@ -331,20 +337,23 @@ const outputSchema = {
     .boolean()
     .optional()
     .describe(
-      'Present (true) only when "floats" was requested and the build loaded `pgfpages` (its .fls ' +
-        'or .log names pgfpages.sty or pgfmorepages.sty): a \\pgfpagesuselayout (`resize to`, ' +
+      'Present (true) only when "floats" was requested and the build\'s records (its .fls or ' +
+        '.log) name pgfpages.sty or pgfmorepages.sty: a \\pgfpagesuselayout (`resize to`, ' +
         '`2 on 1`) holds each page back until the next is built, so every `page` in `floats` is ' +
         "likely LATER than the page the label is on — don't pass it to render_pages as `pages:`; " +
         'find the page with extract_text instead. Label keys and numbers are unaffected. Loading ' +
         'the package without a layout shifts nothing, but is flagged too. Absent when the build ' +
-        'shows no pgfpages, or when neither file could be read.',
+        'shows no pgfpages. Also absent when neither file could be read — `note` then says the ' +
+        'pages are unverified instead, since nothing shows the package was loaded.',
     ),
   note: z
     .string()
     .optional()
     .describe(
-      'Explains an unusual situation, several joined when more than one applies: the build ' +
-        'loaded pgfpages, so the floats pages are likely shifted (see floatsPagesShifted); the page ' +
+      "Explains an unusual situation, several joined when more than one applies: the build's " +
+        'records name pgfpages, so the floats pages are likely shifted (see floatsPagesShifted), or ' +
+        'neither its .fls nor its .log could be read, so whether they are shifted could not be ' +
+        'checked; the page ' +
         'geometry hit its size budget (see textOmittedBySize); "floats" requested but no .aux ' +
         'was found in the build directory (nothing has been compiled with that root file yet, ' +
         'or the backend in use does not write one), or the .aux reader could not read an ' +
@@ -417,7 +426,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, kinds }) => {
+    async ({ project, rootFile, pages, kinds, variant }) => {
       try {
         // Invariant: requireProjectDir, NEVER requireGitProject — this tool must work for a
         // mode:'local' project exactly like compile and render_pages. Git-gating it would be wrong.
@@ -432,15 +441,22 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // and the .aux read (readAuxFloats) goes through node:fs directly, never FileService —
           // recording a baseline would wrongly claim the caller could now base a write on a file
           // it only used to locate a PDF/aux.
-          const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // A variant is read from its own out/ and nowhere else — as render_pages reads one.
+          const v =
+            variant !== undefined
+              ? await resolveVariantBuild(dir, id, variant, rootFile)
+              : undefined;
+          const root = v ? v.rootFile : (rootFile ?? (await detectRootFile(ctx.files, dir)));
           const requestedKinds = kinds ?? ['text', 'images'];
           // The ROOT's build PDF, never the surfaced copy once a root is named or "floats" reads
           // the .aux: the surfaced copy holds whichever root compiled last, and measuring it
           // beside this root's float index would join two different documents (locateRootPdf).
-          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
-            rootNamed: rootFile !== undefined,
-            readsAux: requestedKinds.includes('floats'),
-          });
+          const pdfPath = v
+            ? await findVariantPdf(v)
+            : await locateRootPdf(ctx.config, id, dir, root, {
+                rootNamed: rootFile !== undefined,
+                readsAux: requestedKinds.includes('floats'),
+              });
 
           const pageKinds = requestedKinds.filter((k): k is GeometryKind => k !== 'floats');
 
@@ -464,7 +480,10 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           if (pageKinds.length > 0) {
             if (!pdfPath) {
               throw new Error(
-                `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
+                v
+                  ? `Variant ${variant} has no PDF: its compile did not produce one. Fix the ` +
+                      'overlay and compile it again.'
+                  : `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
               );
             }
             result = await ctx.pdfRenderer.geometry({ pdfPath, pages, kinds: pageKinds });
@@ -486,7 +505,11 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           let floatsNote: string | undefined;
           let floatsPagesShifted: true | undefined;
           if (requestedKinds.includes('floats')) {
-            const auxResult = await readAuxFloats(dir, root);
+            const auxResult = await readAuxFloats(
+              dir,
+              root,
+              v ? { buildDir: v.paths.out } : undefined,
+            );
             // The size budget is applied AFTER the reader's count cap, over whatever survived it,
             // because the two bound different things and the count cap is the cheaper one: there
             // is no point charging rendered characters against entries that were never going to
@@ -525,13 +548,28 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // it is data the caller asked for — but its pages are not, so it says so, first.
             floatsPagesShifted = auxResult.pgfpages === true ? true : undefined;
             const shiftedNote = floatsPagesShifted
-              ? 'This build loaded pgfpages: a \\pgfpagesuselayout holds each page back until the ' +
+              ? "This build's records name pgfpages.sty: a \\pgfpagesuselayout holds each page back until the " +
                 'next is built, so every floats page is likely one later than the page the label ' +
                 'is on (see floatsPagesShifted). Find the page with extract_text rather than ' +
                 'passing these to render_pages.'
               : undefined;
+            // The same state in which labels: refuses every label ('pgfpagesUnknown'): an .aux
+            // with entries, but neither the .fls nor the .log beside it could be read, so a
+            // layout cannot be ruled out. Said in the note only — floatsPagesShifted says the
+            // build's records name pgfpages, which nothing here shows. Gated on `total` because the
+            // no-.aux result also carries no pgfpages evidence, and it has no pages to call
+            // unverified (nor does an .aux with no entries).
+            const unverifiedNote =
+              auxResult.pgfpages === undefined && auxResult.total > 0
+                ? 'Whether this build used a pgfpages layout could not be checked (neither its ' +
+                  '.fls nor its .log could be read beside the .aux), so these pages are ' +
+                  'unverified: a \\pgfpagesuselayout would make every one a page later than ' +
+                  "the label's own. render_pages labels: refuses such a build; compile again to " +
+                  'restore the records.'
+                : undefined;
             floatsNote =
-              [shiftedNote, auxResult.note, plan.note].filter(Boolean).join(' ') || undefined;
+              [shiftedNote, unverifiedNote, auxResult.note, plan.note].filter(Boolean).join(' ') ||
+              undefined;
           }
           const note = [geometryPlan.note, floatsNote].filter(Boolean).join(' ') || undefined;
 
@@ -540,6 +578,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // inside it is what narrows the type. From here the path is a display value only.
           const { pdfPath: outPdfPath } = toPosixOut({ pdfPath });
           const structuredContent = {
+            ...(variant !== undefined ? { variant } : {}),
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
             pages: geometryPlan.pages,
@@ -559,8 +598,12 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
               ? `${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}`
               : outPdfPath !== undefined
                 ? `${outPdfPath} (no page opened — kinds: floats only)`
-                : 'no PDF (kinds: floats only, and none was ever compiled)';
-          const header = `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})`;
+                : v
+                  ? `no PDF (kinds: floats only; variant ${variant} produced none)`
+                  : 'no PDF (kinds: floats only, and none was ever compiled)';
+          const header =
+            `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})` +
+            (variant !== undefined ? ` (variant ${variant})` : '');
           const pageLines = geometryPlan.pages.map((p) => {
             const parts = [
               `page ${p.page}: ${p.pageWidthPt.toFixed(1)}x${p.pageHeightPt.toFixed(1)} pt`,

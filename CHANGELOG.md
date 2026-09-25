@@ -18,6 +18,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **A SkillSpector job in CI.** NVIDIA's SkillSpector scans every bundled skill with its static
   rules (`--no-llm`, so no model and no key) on each pull request, and any finding fails the build.
   The README carries a badge for it.
+- **`compile` can build a what-if variant without touching the source** (#205). Pass `overlay` —
+  up to 20 files, each with `edit_file`'s edits (100 in total) — and the edits are applied in
+  memory and compiled in a private link farm: a mirror of the project's tree whose files link to
+  the originals, except the overlaid ones, which hold the edited text. `./` and `../` inputs,
+  `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve exactly as in the
+  project (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the path for an
+  explicitly relative name). The source, the main build, the surfaced PDF, the viewer and the
+  session's records are all left alone, and nothing records a revision baseline. The result
+  carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
+  read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
+  compiled variants of a project are kept; recompiling the same overlay reuses its variant
+  incrementally. `clean: true` on an overlay compile cleans that variant only. An overlaid file
+  the build never opened is named in `hint`.
 
 ### Changed
 
@@ -71,6 +84,44 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   draft-07 `Client` still accepts them. A test round-trips `listTools()` and compiles every
   advertised schema with strict 2020-12 and draft-07 validators, so a future zod construct that is
   specific to one draft fails in CI instead of in a client.
+- **`compile` of a root in a subdirectory no longer fails on `\include`.** latexmk's `-cd` runs
+  the engine in the root file's directory, so `paper/main.tex` doing `\include{chap/c1}` writes
+  `<build>/chap/c1.aux`, but only the project-root tree (`<build>/paper/chap`) was mirrored into
+  the build directory, and the compile died with "I can't write on file `chap/c1.aux'". The root
+  file's own directory tree is now mirrored at the build directory's root too (latexmk only;
+  tectonic runs in the project root).
+- **`labels:` lookups refuse a build whose records cannot be read, instead of resolving it
+  blind** (#194). `render_pages`/`extract_text` decide whether a `pgfpages` layout shifted every
+  label from the build's `.fls` and `.log`; when neither could be read the check was skipped, and
+  an `article` under `\pgfpagesuselayout{resize to}` resolved every label a page late. Every label
+  is now refused (`pgfpagesUnknown`) with advice to compile again or pass `pages:`, and
+  `pdf_geometry kinds: ["floats"]` notes that its pages could not be checked. A server compile
+  always leaves a `.log`, so ordinary builds are unaffected.
+- **The `pgfpages` refusal says what it saw.** It said the build "loaded pgfpages"; the records
+  only show the file was opened, so the message now says so, names the cases where the refusal is
+  spurious (`pgfpages` loaded without `\pgfpagesuselayout`, or only tested with `\IfFileExists`),
+  and points at `pages:` with the page count for the last page (`lastpage`'s `LastPage`). The
+  refusal itself is unchanged: no document-controlled signal can safely tell a layout in use from
+  a load, and none may resolve a page. When the page count is known the refusal now gives it
+  (`pass pages: [N]`).
+- **`labels:` lookups check the resolved page against the log's shipout record** (#194). TeX
+  writes the page counter into the `.log` as it ships each page out (`[1] [1] [2] …`), so a label
+  whose chosen PDF page was shipped under another counter — a title page that reset the counter
+  under an empty foot a table cell forged, for one — is now refused (`unverifiedPage`) on both
+  routes instead of rendered a page early; so is a folio-route label whose printed page's counter
+  was also shipped on another page that could print the same number (an arabic restart with no
+  label before it). A page that resets the counter under another numbering style — an appendix
+  under `\pagenumbering{alph}` or `{Roman}`, a supplement under `S\arabic{page}` — is recognised
+  by the page number it prints and does not count, so the body's labels resolve as before. The
+  record only ever refuses a page, never chooses one, and is used only when its marks number
+  exactly the PDF's pages: a log that cannot be read, a document that writes mark-shaped text
+  (`\message{[3]}`), or a mark cut in a way the parser will not guess at skips it, and the shapes
+  it closes can then still pass. An extra and a missed mark that line up to the right count can
+  refuse a correct label, or miss a refusal (leaving the route's own answer). One change in
+  behaviour: when the counter restarts for back matter or an appendix that prints **no** page
+  number (`\pagestyle{empty}`, `\pagenumbering{gobble}`), the body labels sharing those counters
+  are now refused on the folio route, where 0.7.1 resolved them — a page that prints nothing
+  cannot be told apart from the label's own. Loading `hyperref` resolves them exactly.
 
 ## [0.7.1] - 2026-09-25
 

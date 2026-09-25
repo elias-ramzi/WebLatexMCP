@@ -28,6 +28,17 @@ export interface CompileRequest {
    * `shellEscape` and sufficient for most externalization setups. Ignored if `shellEscape` is set.
    */
   restrictedShellEscape?: boolean;
+  /**
+   * Directory the backend runs in (its cwd), which `rootFile` is relative to. Default
+   * `projectDir`. An overlay compile (`compile`'s `overlay`) points it at the variant's link farm,
+   * which mirrors the project tree, so `rootFile` keeps its project-relative spelling.
+   */
+  workDir?: string;
+  /**
+   * The build (`-outdir`) directory. Default `buildDir(projectDir)`. An overlay compile points it
+   * at the variant's own `out/`, so the main build is never touched.
+   */
+  outDir?: string;
 }
 
 export interface CompileOutcome {
@@ -165,13 +176,27 @@ async function exists(p: string): Promise<boolean> {
 export function buildDir(projectDir: string): string {
   const resolved = path.resolve(projectDir);
   const key = createHash('sha1').update(resolved).digest('hex').slice(0, 8);
-  return path.join(os.tmpdir(), 'web-latex-mcp-build', `${path.basename(resolved)}-${key}`);
+  return path.join(buildRoot(), `${path.basename(resolved)}-${key}`);
 }
 
-async function buildDirFor(projectDir: string): Promise<string> {
-  const dir = buildDir(projectDir);
+/**
+ * The directory every project's {@link buildDir} sits in. Exported so an overlay compile's link
+ * farm can refuse to mirror it, should a project directory ever contain the OS temp dir.
+ */
+export function buildRoot(): string {
+  return path.join(os.tmpdir(), 'web-latex-mcp-build');
+}
+
+/** The build dir a request writes to — its `outDir`, else the project's — created if missing. */
+async function outDirFor(req: CompileRequest): Promise<string> {
+  const dir = req.outDir ?? buildDir(req.projectDir);
   await mkdir(dir, { recursive: true });
   return dir;
+}
+
+/** The directory a request's backend runs in: its `workDir`, else the project itself. */
+function workDirFor(req: CompileRequest): string {
+  return req.workDir ?? req.projectDir;
 }
 
 /**
@@ -190,6 +215,42 @@ export async function mirrorSubdirs(srcDir: string, buildDir: string): Promise<v
     await mkdir(dest, { recursive: true });
     await mirrorSubdirs(path.join(srcDir, entry.name), dest);
   }
+}
+
+/**
+ * {@link mirrorSubdirs} for latexmk, whose `-cd` puts the engine in the root file's own directory.
+ * Relative write paths then resolve against the build dir from THAT directory, not the project
+ * root: `paper/main.tex` doing `\include{chap/c1}` writes `<outdir>/chap/c1.aux`, while mirroring
+ * the project root alone created only `<outdir>/paper/chap`, and the compile failed with "I can't
+ * write on file `chap/c1.aux'". So the root file's directory subtree is mirrored at the build dir's
+ * root too. The project-root mirror stays, since a document may also write through `../`.
+ *
+ * `rootFile` is caller-supplied, so the root's directory is mirrored only when it resolves INSIDE
+ * the project and is an existing directory. Anything else — an absolute root, a directory that
+ * does not exist, a `../` root — is skipped silently and left to latexmk to fail on in its own
+ * words: mirroring `path.join(projectDir, '/abs/paper')` threw a raw ENOENT where a plain compile
+ * had worked, and `../x.tex` copied the tree of a directory outside the project.
+ */
+export async function mirrorSubdirsForRoot(
+  projectDir: string,
+  buildDir: string,
+  rootFile: string,
+): Promise<void> {
+  await mirrorSubdirs(projectDir, buildDir);
+  const base = logBaseDir(rootFile);
+  if (base === '') return;
+  const root = path.resolve(projectDir);
+  const abs = path.resolve(root, base);
+  const rel = path.relative(root, abs);
+  if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return;
+  }
+  try {
+    if (!(await stat(abs)).isDirectory()) return;
+  } catch {
+    return;
+  }
+  await mirrorSubdirs(abs, buildDir);
 }
 
 /**
@@ -247,8 +308,16 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
  * copy; a workspace-local compile also surfaces the same PDF beside the clone (`pdfSurface`).
  */
 export function buildPdfPath(projectDir: string, rootFile: string): string {
+  return buildPdfPathIn(buildDir(projectDir), rootFile);
+}
+
+/**
+ * {@link buildPdfPath} inside a given build dir — the one an overlay compile writes to
+ * (`CompileRequest.outDir`) rather than the project's own.
+ */
+export function buildPdfPathIn(outDir: string, rootFile: string): string {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
-  return path.join(buildDir(projectDir), `${rootBase}.pdf`);
+  return path.join(outDir, `${rootBase}.pdf`);
 }
 
 /**
@@ -257,8 +326,13 @@ export function buildPdfPath(projectDir: string, rootFile: string): string {
  * `buildPdfPath` exactly.
  */
 export function buildAuxPath(projectDir: string, rootFile: string): string {
+  return buildAuxPathIn(buildDir(projectDir), rootFile);
+}
+
+/** {@link buildAuxPath} inside a given build dir, as {@link buildPdfPathIn}. */
+export function buildAuxPathIn(outDir: string, rootFile: string): string {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
-  return path.join(buildDir(projectDir), `${rootBase}.aux`);
+  return path.join(outDir, `${rootBase}.aux`);
 }
 
 /**
@@ -345,14 +419,14 @@ export class LatexmkCompiler implements LatexCompiler {
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
-    const buildDir = await buildDirFor(req.projectDir);
-    await mirrorSubdirs(req.projectDir, buildDir);
+    const buildDir = await outDirFor(req);
+    await mirrorSubdirsForRoot(req.projectDir, buildDir, req.rootFile);
     const args = latexmkArgs(req, buildDir);
 
-    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
+    const before = await statOrNull(buildPdfPathIn(buildDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('latexmk', args, {
-      cwd: req.projectDir,
+      cwd: workDirFor(req),
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
     // `-cd` chdirs into the root file's directory: that is what the log's paths are relative to.
@@ -384,7 +458,9 @@ export class TectonicCompiler implements LatexCompiler {
   }
 
   async compile(req: CompileRequest): Promise<CompileOutcome> {
-    const buildDir = await buildDirFor(req.projectDir);
+    const buildDir = await outDirFor(req);
+    // No root-directory mirror here (see `mirrorSubdirsForRoot`): tectonic takes no `-cd`, so its
+    // relative paths already resolve against the project root, which this mirrors.
     await mirrorSubdirs(req.projectDir, buildDir);
 
     const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
@@ -392,10 +468,10 @@ export class TectonicCompiler implements LatexCompiler {
     // shell escape here; only an explicit `shellEscape` enables system calls.
     if (req.shellEscape) args.push('-Z', 'shell-escape');
 
-    const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
+    const before = await statOrNull(buildPdfPathIn(buildDir, req.rootFile));
     const start = Date.now();
     const res = await execCapture('tectonic', args, {
-      cwd: req.projectDir,
+      cwd: workDirFor(req),
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
     // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are.
