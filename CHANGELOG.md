@@ -36,6 +36,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   runner's npm is 12. v7 drops the input, and stops exporting a placeholder `NODE_AUTH_TOKEN`, which
   suits trusted publishing. Every workflow moves, not just `publish.yml`, so the pull request's own CI
   exercises v7 before a tag depends on it.
+- **Every GitHub Action is pinned to a commit SHA**, with the release it names kept as a trailing
+  comment (`@<sha> # v5.1.0`). A tag can be moved to other code after the fact, and `publish.yml`
+  runs with the npm publishing credentials. A new `.github/dependabot.yml` keeps the pins current:
+  one grouped weekly PR into `dev` (main accepts `dev` only), labelled `no-changelog`. Together these
+  clear the plugin scanner's remaining findings (#198), taking the score from 88 to 100.
 - **Skills that write a `.git/info/exclude` line now say so.** `arxiv-clean-project` asks before
   adding its export to the exclude file of a repository that is not the project, `verify-citations`
   names the exclude line when it asks to write into a local project, and `session-feedback`'s

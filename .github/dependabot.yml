@@ -1,0 +1,20 @@
+# Keeps the SHA-pinned actions in .github/workflows current. Each `uses:` carries the release it
+# pins as a trailing comment (`@<sha> # v5.1.0`); Dependabot reads that comment and rewrites the
+# SHA and the comment together, so a pin never goes stale silently.
+#
+#   - target-branch: dev, because main accepts pull requests from dev only (only-dev-into-main.yml).
+#     Left at the default, every update PR would open against main and fail the branch policy.
+#   - The `no-changelog` label skips the CHANGELOG gate (changelog.yml): an action bump changes
+#     nothing a user of the server sees, and an entry written to satisfy a bot is a junk entry.
+#   - One grouped PR per week, not one per action.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    labels: [no-changelog]
+    groups:
+      actions:
+        patterns: ['*']
