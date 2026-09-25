@@ -53,6 +53,28 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+  # NVIDIA SkillSpector over the skills the plugin ships (plugin.json `skills`), each scanned as its
+  # own skill. Any finding fails the job; the README's SkillSpector badge claims exactly this.
+  # --no-llm keeps it to the static rules (YARA + patterns): no model, no API key, no secret in CI,
+  # ~20s. Two flags are deliberately absent: --fail-on-incomplete, because a static-only scan always
+  # reports its coverage as "partial" and would fail every run; and a scan of the repo root, which
+  # inventories node_modules for ~8 minutes and inspects nothing, since it looks for SKILL.md files.
+  # A finding is fixed in the skill, not suppressed — there is no baseline file on purpose.
+  skillspector:
+    name: SkillSpector scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+      - run: >-
+          skillspector scan .claude/skills --recursive --no-llm --fail-on-findings
+          --format markdown --output skillspector-report.md
+      - name: Publish the report to the log and the job summary
+        if: always()
+        run: tee -a "$GITHUB_STEP_SUMMARY" < skillspector-report.md || true
+
   test:
     name: Test (${{ matrix.os }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:

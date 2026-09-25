@@ -15,6 +15,21 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   runs before listing the server (#198). It excludes `test/`, where the token-shaped strings the
   credential and redaction tests need were reported as hardcoded secrets; `src/` is still scanned
   in full. The score goes from 69 to 88, past the catalog's threshold of 80.
+- **A SkillSpector job in CI.** NVIDIA's SkillSpector scans every bundled skill with its static
+  rules (`--no-llm`, so no model and no key) on each pull request, and any finding fails the build.
+  The README carries a badge for it.
+
+### Changed
+
+- **`arxiv-clean-project` no longer runs `rm -rf`.** The scratch copy of the clone is made without
+  `.git` (a `tar --exclude`) instead of copied whole and pruned. A submission folder or zip left by
+  an earlier run is replaced only after the user agrees, and is moved into the scratchpad, not
+  deleted, since it may carry hand edits.
+- **`session-feedback`'s environment facts are a list, not a wide table**, and the offline fallback
+  report is described as always written, with its path named in the reply. The bug-report form's
+  install option `npx web-latex-mcp` now reads `npx (the npm package, run on demand)`, and the
+  skill's example report matches it. Together these clear the seven SkillSpector findings the two
+  skills had (three high).
 
 ### Changed
 
