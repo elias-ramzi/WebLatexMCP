@@ -18,6 +18,22 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **A SkillSpector job in CI.** NVIDIA's SkillSpector scans every bundled skill with its static
   rules (`--no-llm`, so no model and no key) on each pull request, and any finding fails the build.
   The README carries a badge for it.
+- **A `peer-review` skill, and a `/review-paper` command that runs it as a multi-model panel.** A
+  pre-submission review of an ML paper: a three-pass reading protocol, a claim–evidence map, an ML
+  checklist, and a severity × fixability × confidence label on every weakness, ending in one review
+  with six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. The command
+  (repo clone only, like `/hunt-typo`) dispatches three full `paper-reviewer`s on Sonnet, Opus and
+  Fable, a `paper-devils-advocate`, a `novelty-scout` and the existing `corrector`s, none of which sees
+  another's report, and a Fable `review-triage` verifies every finding against the paper before it
+  keeps it. The panel is independent because agreement between reviewers is only a signal if they
+  could not copy each other; for the same reason triage lets consensus raise a finding's confidence
+  but never its severity. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
+  or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
+  copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
+  git-excluded `paper-review.local/<timestamp>/` (under the server workspace for a bare PDF, which
+  the command also accepts), rather than in the chat or a temporary directory, because a review
+  that has to be hunted for is not read; and in the Claude desktop app the final review is sent as
+  a file to download.
 
 ### Changed
 

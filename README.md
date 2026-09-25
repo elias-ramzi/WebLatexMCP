@@ -91,6 +91,7 @@ unless you ask:
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
+- **`/peer-review`** — pre-submission review of an ML paper: summary, strengths, weaknesses, minor weaknesses, questions, typos — from a clone, `/review-paper` runs it as a Sonnet/Opus/Fable panel merged by a Fable triage.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 
 Every bundled skill is scanned on each pull request by NVIDIA's
