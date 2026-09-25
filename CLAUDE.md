@@ -913,7 +913,7 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
-- **An overlay compile builds a what-if variant in a link farm, and never writes the project.**
+- **An overlay compile builds a what-if variant in a link farm; the server never writes the project, and what the build writes is reported.**
   `compile`'s `overlay` (`src/lib/variants.ts`) applies `edit_file`'s edits in memory
   (`applyEditsToContent`, the pure half of `FileService.applyEdits`, so both refuse the same edits)
   to files read through `readTextExact` — the project's link policy, **no baseline** — and compiles
@@ -935,7 +935,13 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   a silently different document. Every directory component of the root is `lstat`ed (a junction
   reads as a link on win32), whatever the backend; the refusal names the link and the real-path
   `rootFile` to pass instead (a normal compile of which is the same document). A root at the project
-  root has no components to judge; a normal compile is unchanged.
+  root has no components to judge; a normal compile is unchanged. **The check judges the normalised
+  spelling while the backend gets the raw one**, so every spelling for which the two can resolve
+  differently is refused first: a `..` segment (`paper/../p1/main.tex` normalises to a `p1/` that
+  does not exist, ending the check, while `-cd` resolves it physically through the farm's link into
+  the source) and an absolute root (`-cd` goes straight to the source, farm or no farm — refused
+  with the project-relative spelling when it lies inside; on win32 a drive-qualified name counts).
+  What remains (`./`, doubled separators) normalises to what the OS resolves.
   Not `TEXINPUTS`: kpathsea
   never searches the path for `./` or `../` names, so those inputs read the source. **The server
   never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
@@ -958,14 +964,25 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `sections/a.tex` from the farm truncated the source file behind that link; a refused command
   (`shellCommandRefused`, pdfTeX's `runsystem(...)...disabled`) or a TikZ-externalization failure
   gets a `hint` saying the variant ran without shell escape and that opting in lifts the
-  guarantee. Tectonic needs no flag: it runs nothing without `-Z shell-escape`. And an overlay
-  entry named `latexmkrc`/`.latexmkrc` (basename, under the platform's case fold) is refused
-  before anything is read, since latexmk runs it as Perl from its working directory. **Accepted,
-  not overlooked:** the project's OWN rc file still runs in a variant (as in a normal compile —
-  it is the project's code, not the caller's), and under `lualatex` the document's Lua `io.open`
-  writes relative to the farm whatever the shell-escape flag says, so a variant's own Lua can still
-  reach the source; the tool description says both, and a lualatex variant's result text repeats the
-  second. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape flags and
+  guarantee. Tectonic takes no flag for this (it runs no command without `-Z shell-escape`) — which
+  settles its shell escape and nothing else. And an overlay entry named `latexmkrc`/`.latexmkrc`
+  (basename, under the platform's case fold) is refused before anything is read, since latexmk
+  runs it as Perl from its working directory. **Three doors stay open, and are reported rather
+  than closed:** the project's OWN rc file still runs (it is the project's code, not the
+  caller's), and `-no-shell-escape` reaches the engine only through `%O` — an rc of
+  `'pdflatex %O -shell-escape %S'`, or one with no `%O`, turns shell escape back on; under
+  `lualatex` the document's Lua `io.open` writes whatever the flag says; and tectonic has no
+  `openout_any`, so its `\openout` writes any absolute path, the source included. So `compile`
+  never asserts the source is untouched: `watchSource` (`snapshotSource`/`sourceChanges`) records
+  every project entry by `lstat` — kind, size, mode, inode, mtime and **ctime**, which a restored
+  mtime cannot hide; no content read; walked as the farm is, `.git` and `skip` left out, a linked
+  directory ONE entry — after staging (win32 staging hard-links and unlinks source files, moving
+  their ctime) and again right after the build, before eviction does the same. A changed path is
+  named in `hint` (`sourceChangedHint`, 20 named and the rest counted) and the text says CHANGED;
+  a walk that failed or hit `MAX_FARM_ENTRIES` is "could not be checked", never "unchanged". The
+  text's shell-escape clause is likewise read off the engine's banner (`shellEscapeWasEnabled`),
+  not off the flag the server passed. The check observes; it never undoes a write, and it cannot
+  tell the build's write from a hand edit made meanwhile — the hint says both. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape flags and
   the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle is checked
   by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay compile,
   under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed

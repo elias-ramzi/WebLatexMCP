@@ -328,6 +328,107 @@ export async function buildLinkFarm(
 }
 
 /**
+ * The project's tree as `lstat` sees it, for telling afterwards whether a variant build wrote it:
+ * project-relative POSIX path -> a signature of kind, size, mode, inode, mtime and ctime (in ns).
+ * The change time is there because it cannot be set back — a rewrite of the same length whose
+ * mtime is restored still moves it.
+ */
+export interface SourceSnapshot {
+  entries: Map<string, string>;
+}
+
+/**
+ * Snapshot the project's tree the way {@link buildLinkFarm} walks it — `.git` and the `skip`
+ * directories left out, a linked directory recorded as ONE entry and never walked — reading no
+ * file's content. Undefined when the tree has more than `maxEntries` entries, since a walk that
+ * stopped part-way cannot vouch for the rest.
+ *
+ * Why it exists: the farm's links make the variant's build able to write the source, and some of
+ * the routes are not the server's to close — the project's own latexmkrc can put `-shell-escape`
+ * back after the server's `-no-shell-escape`, lualatex's `io.open` needs no shell escape, and
+ * tectonic's `\openout` writes any absolute path (it has no `openout_any`). So `compile` compares a
+ * snapshot from before the build with one from after and names what changed, rather than asserting
+ * the source is untouched. It observes and reports; it never undoes a write.
+ */
+export async function snapshotSource(
+  projectDir: string,
+  opts: { skip: string[]; maxEntries?: number },
+): Promise<SourceSnapshot | undefined> {
+  const skip = new Set(opts.skip.map((p) => path.resolve(p)));
+  const max = opts.maxEntries ?? MAX_FARM_ENTRIES;
+  const entries = new Map<string, string>();
+  const base = path.resolve(projectDir);
+  const walk = async (dir: string, relDir: string): Promise<boolean> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const abs = path.join(dir, entry.name);
+      const kind = kindOf(entry);
+      if (kind === undefined) continue;
+      if (kind === 'dir' && skip.has(path.resolve(abs))) continue;
+      if (entries.size >= max) return false;
+      const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
+      if (kind === 'dir') {
+        entries.set(rel, 'dir');
+        if (!(await walk(abs, rel))) return false;
+        continue;
+      }
+      const st = await lstat(abs, { bigint: true });
+      entries.set(rel, `${kind}:${st.size}:${st.mode}:${st.ino}:${st.mtimeNs}:${st.ctimeNs}`);
+    }
+    return true;
+  };
+  return (await walk(base, '')) ? { entries } : undefined;
+}
+
+/** The project-relative paths added, removed or changed between two snapshots, sorted. Pure. */
+export function sourceChanges(before: SourceSnapshot, after: SourceSnapshot): string[] {
+  const changed = new Set<string>();
+  for (const [rel, sig] of before.entries) if (after.entries.get(rel) !== sig) changed.add(rel);
+  for (const rel of after.entries.keys()) if (!before.entries.has(rel)) changed.add(rel);
+  return [...changed].sort();
+}
+
+/**
+ * Snapshot the project now and return how to ask, later, what changed since: the sorted changed
+ * paths, or undefined when either walk failed or hit the entry cap — "could not check", which a
+ * caller must never report as "nothing changed". Never throws: a check that cannot run must not
+ * fail the compile it reports on.
+ */
+export async function watchSource(
+  projectDir: string,
+  opts: { skip: string[]; maxEntries?: number },
+): Promise<() => Promise<string[] | undefined>> {
+  const snap = () => snapshotSource(projectDir, opts).catch(() => undefined);
+  const before = await snap();
+  return async () => {
+    if (before === undefined) return undefined;
+    const after = await snap();
+    return after === undefined ? undefined : sourceChanges(before, after);
+  };
+}
+
+/** How many changed paths the hint names; the rest are counted. The house figure for a list. */
+const SOURCE_CHANGES_NAMED = 20;
+
+/**
+ * The `hint` for a variant build that changed project files: which ones (the first
+ * {@link SOURCE_CHANGES_NAMED}, the rest counted), what can have written them, and what to do.
+ */
+export function sourceChangedHint(paths: string[]): string {
+  const named = paths.slice(0, SOURCE_CHANGES_NAMED).map(quoteId).join(', ');
+  const more = paths.length - SOURCE_CHANGES_NAMED;
+  return (
+    `This overlay compile changed ${paths.length} project file(s) while it ran: ${named}` +
+    (more > 0 ? `, and ${more} more` : '') +
+    '. An overlay compile writes nothing to the project itself, but the build can, through the ' +
+    "variant's links to the source: shell escape (if you opted in, or the project's own " +
+    'latexmkrc turned it back on), Lua code under lualatex (io.open), or \\openout under ' +
+    'tectonic, which restricts no path — or the files were edited by hand meanwhile. Review them ' +
+    '(status, diff) and restore what you did not mean to change (discard).'
+  );
+}
+
+/**
  * Put `content` at `relPosix` in the farm as a real file. When an ancestor of that path is a link
  * in the farm (a symlinked directory in the source), it is materialised first: replaced by a real
  * directory whose children are links to `<projectDir>/<prefix>/<child>`, repeating down the path,
@@ -672,12 +773,55 @@ export async function applyOverlay(
  * Judged whatever the backend (tectonic has no `-cd`, but the `../` half applies to any engine
  * that resolves relative to the root): simple and conservative. A root at the project root has no
  * directory components and is never refused; a component that does not exist ends the check (the
- * compile reports the missing root); a `rootFile` that leaves the project is not this check's to
- * judge. Throws; returns nothing.
+ * compile reports the missing root). Throws; returns nothing.
+ *
+ * The check judges the normalised spelling, and the backend is handed the caller's raw one — so
+ * first it refuses every spelling for which the two can resolve differently. A `..` segment:
+ * normalising `paper/../p1/main.tex` drops `paper` lexically, while latexmk's `-cd` resolves it
+ * physically, through the farm's link, into the source (and a root that leaves the project has no
+ * farm to build in at all). An ABSOLUTE root: `-cd` goes straight to the source directory, farm or
+ * no farm — refused with the project-relative spelling to pass when it lies inside. On win32 a
+ * drive-qualified name (`C:main.tex`, drive-relative) counts as absolute too. What is left (`./`,
+ * doubled or trailing separators, backslashes) normalises to what the OS resolves.
  */
-export async function refuseLinkedRootDir(projectDir: string, rootFile: string): Promise<void> {
+export async function refuseLinkedRootDir(
+  projectDir: string,
+  rootFile: string,
+  opts: { platform?: NodeJS.Platform } = {},
+): Promise<void> {
+  const platform = opts.platform ?? process.platform;
+  const raw = toPosix(rootFile).replace(/\\/g, '/');
+  const absolute =
+    path.posix.isAbsolute(raw) ||
+    (platform === 'win32' && (path.win32.isAbsolute(rootFile) || /^[A-Za-z]:/.test(raw)));
+  if (absolute) {
+    const inside = path.relative(path.resolve(projectDir), path.resolve(rootFile));
+    const relSpelling =
+      platform === process.platform &&
+      inside !== '' &&
+      !inside.startsWith('..') &&
+      !path.isAbsolute(inside)
+        ? toPosix(inside)
+        : undefined;
+    throw new Error(
+      `The root file ${quoteId(rootFile)} is an absolute path, and an overlay compile builds in ` +
+        'a private mirror of the project, which an absolute root would bypass: the engine would ' +
+        'run in the source directory itself. ' +
+        (relSpelling !== undefined
+          ? `Name it relative to the project root — rootFile: ${quoteId(relSpelling)}.`
+          : 'Name it relative to the project root.'),
+    );
+  }
+  if (raw.split('/').includes('..')) {
+    throw new Error(
+      `The root file ${quoteId(rootFile)} is spelled with a ".." segment, and an overlay compile ` +
+        'refuses one: the engine resolves ".." physically — through a symbolic link, into the ' +
+        "link's target — while the variant is staged from the name as written, so the two can " +
+        'name different directories, one of them the source itself. Name the root by its path ' +
+        'from the project root, without "..".',
+    );
+  }
   const rel = normalizeRelPosix(rootFile);
-  if (rel === '..' || rel.startsWith('../') || path.posix.isAbsolute(rel)) return;
   const dirs = path.posix
     .dirname(rel)
     .split('/')
@@ -740,7 +884,7 @@ export async function stageVariant(opts: {
   platform?: NodeJS.Platform;
   now?: Date;
 }): Promise<VariantPaths> {
-  await refuseLinkedRootDir(opts.projectDir, opts.rootFile);
+  await refuseLinkedRootDir(opts.projectDir, opts.rootFile, { platform: opts.platform });
   const paths = variantPaths(opts.projectDir, opts.handle);
   await mkdir(paths.root, { recursive: true });
   await rm(paths.src, { recursive: true, force: true });

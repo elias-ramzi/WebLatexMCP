@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   chmod,
+  utimes,
   link,
   lstat,
   mkdir,
@@ -28,6 +29,9 @@ import {
   readVariant,
   refuseLinkedRootDir,
   resolveVariantBuild,
+  snapshotSource,
+  sourceChangedHint,
+  sourceChanges,
   stageVariant,
   touchVariant,
   variantHandle,
@@ -503,6 +507,106 @@ describe('refuseLinkedRootDir', () => {
     await expect(refuseLinkedRootDir(src, 'paper/main.tex')).rejects.toThrow(
       /not a directory inside the project/,
     );
+  });
+});
+
+describe('refuseLinkedRootDir: a root spelled so the engine resolves it differently', () => {
+  it('refuses a `..` segment, which the OS resolves through a link and normalisation does not', async () => {
+    // paper -> drafts/p1, and no top-level p1: `paper/../p1/main.tex` normalises to a path that
+    // does not exist, while latexmk's -cd resolves it physically, through the farm's ONE link to
+    // the source directory — the engine would run inside the SOURCE.
+    const src = await tempDir('ovl-rootdots-');
+    await put(src, 'drafts/p1/main.tex', 'x\n');
+    await put(src, 'top.tex', 'x\n');
+    await linkDir(path.join(src, 'drafts', 'p1'), path.join(src, 'paper'));
+    await expect(refuseLinkedRootDir(src, 'paper/../p1/main.tex')).rejects.toThrow(
+      /"paper\/\.\.\/p1\/main\.tex".*"\.\."/s,
+    );
+    // Any `..`, link or not: the spelling is judged, never what it happens to resolve to.
+    await expect(refuseLinkedRootDir(src, 'drafts/../top.tex')).rejects.toThrow(/"\.\."/);
+    await expect(refuseLinkedRootDir(src, '../elsewhere/main.tex')).rejects.toThrow(/"\.\."/);
+    // Backslashes are separators too.
+    await expect(refuseLinkedRootDir(src, 'paper\\..\\p1\\main.tex')).rejects.toThrow(/"\.\."/);
+  });
+
+  it('refuses an absolute root, naming the project-relative spelling when it is inside', async () => {
+    const src = await tempDir('ovl-rootabs-');
+    await put(src, 'drafts/p1/main.tex', 'x\n');
+    await expect(
+      refuseLinkedRootDir(src, path.join(src, 'drafts', 'p1', 'main.tex')),
+    ).rejects.toThrow(/absolute.*rootFile: "drafts\/p1\/main\.tex"/s);
+    const outside = await tempDir('ovl-rootabs-out-');
+    await expect(refuseLinkedRootDir(src, path.join(outside, 'main.tex'))).rejects.toThrow(
+      /absolute/,
+    );
+    // A drive-qualified spelling is absolute (or drive-relative) on win32, whatever it looks like.
+    await expect(refuseLinkedRootDir(src, 'C:main.tex', { platform: 'win32' })).rejects.toThrow(
+      /absolute/,
+    );
+    await expect(
+      refuseLinkedRootDir(src, 'C:\\p\\main.tex', { platform: 'win32' }),
+    ).rejects.toThrow(/absolute/);
+  });
+});
+
+describe('snapshotSource / sourceChanges', () => {
+  it('names what a build added, removed or rewrote, and nothing it did not touch', async () => {
+    const src = await tempDir('ovl-snap-');
+    await put(src, 'main.tex', 'main\n');
+    await put(src, 'sections/a.tex', 'Section A.\n');
+    await put(src, 'sections/gone.tex', 'gone\n');
+    await put(src, 'same.tex', 'same size\n');
+    const before = await snapshotSource(src, { skip: [] });
+    expect(before).toBeDefined();
+    await writeFile(path.join(src, 'sections/a.tex'), 'PWNED\n');
+    await rm(path.join(src, 'sections/gone.tex'));
+    await put(src, 'sections/new.tex', 'new\n');
+    // Same length, and the mtime put back: only the change time still says it was written.
+    const st = await stat(path.join(src, 'same.tex'));
+    await writeFile(path.join(src, 'same.tex'), 'SAME SIZE\n');
+    await utimes(path.join(src, 'same.tex'), st.atime, st.mtime);
+    const after = await snapshotSource(src, { skip: [] });
+    expect(sourceChanges(before!, after!)).toEqual([
+      'same.tex',
+      'sections/a.tex',
+      'sections/gone.tex',
+      'sections/new.tex',
+    ]);
+    // Nothing changed: nothing named.
+    expect(sourceChanges(after!, (await snapshotSource(src, { skip: [] }))!)).toEqual([]);
+  });
+
+  it('skips .git and the skipped directories, and never walks a linked directory', async () => {
+    const src = await tempDir('ovl-snap-skip-');
+    const outside = await tempDir('ovl-snap-out-');
+    await put(src, 'main.tex', 'main\n');
+    await put(src, '.git/HEAD', 'ref\n');
+    await put(src, 'ws/state.json', '{}\n');
+    await put(outside, 'shared.tex', 'shared\n');
+    await linkDir(outside, path.join(src, 'linked'));
+    const skip = [path.join(src, 'ws')];
+    const before = await snapshotSource(src, { skip });
+    expect([...before!.entries.keys()].sort()).toEqual(['linked', 'main.tex']);
+    await writeFile(path.join(src, '.git/HEAD'), 'moved\n');
+    await writeFile(path.join(src, 'ws/state.json'), '{"x":1}\n');
+    await writeFile(path.join(outside, 'shared.tex'), 'changed\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([]);
+  });
+
+  it('cannot vouch for a tree past the entry cap', async () => {
+    const src = await tempDir('ovl-snap-cap-');
+    await put(src, 'a.tex', 'a\n');
+    await put(src, 'b.tex', 'b\n');
+    expect(await snapshotSource(src, { skip: [], maxEntries: 1 })).toBeUndefined();
+  });
+
+  it('caps the hint at 20 names and counts the rest', () => {
+    const paths = Array.from({ length: 23 }, (_, i) => `f${i}.tex`);
+    const hint = sourceChangedHint(paths);
+    expect(hint).toContain('23 project file(s)');
+    expect(hint).toContain('"f19.tex"');
+    expect(hint).not.toContain('"f20.tex"');
+    expect(hint).toContain('and 3 more');
   });
 });
 

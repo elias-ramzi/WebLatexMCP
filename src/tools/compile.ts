@@ -24,6 +24,7 @@ import {
   logTail,
   needsShellEscape,
   shellCommandRefused,
+  shellEscapeWasEnabled,
   findMissingPackages,
   LOG_TAIL_LINE_CAP,
 } from '../services/logParser.js';
@@ -33,9 +34,11 @@ import {
   evictVariants,
   overlayFilesNeverRead,
   overlaySnippetReader,
+  sourceChangedHint,
   stageVariant,
   variantHandle,
   variantPaths,
+  watchSource,
   MAX_OVERLAY_EDITS,
   MAX_OVERLAY_FILES,
   MAX_VARIANTS,
@@ -154,17 +157,21 @@ const inputSchema = {
     .describe(
       'Compile a what-if VARIANT instead of the project: these files with these edits applied ' +
         'in memory, everything else as it is — to measure a change (page count, where a float ' +
-        'lands, whether a table still fits) without touching the source. The source, the main ' +
-        'build, the surfaced PDF and the viewer are all left as they were, and nothing is ' +
-        'recorded as a change of this session — unless you opt into shell escape (below). To ' +
-        'hold that, an overlay compile runs NO shell command unless shellEscape or ' +
-        'restrictedShellEscape is set — not even the restricted allow-list a normal compile may ' +
-        'run by default — so a document that needs one (makeindex, epstopdf, TikZ ' +
+        'lands, whether a table still fits) without the server writing the source. The server ' +
+        'leaves the source, the main build, the surfaced PDF and the viewer as they were, and ' +
+        'records nothing as a change of this session. To keep the build itself from writing ' +
+        'the source through the variant, an overlay compile runs NO shell command unless ' +
+        'shellEscape or restrictedShellEscape is set — not even the restricted allow-list a ' +
+        'normal compile may run by default — so a document that needs one (makeindex, epstopdf, TikZ ' +
         'externalization) can build differently here, and `hint` says so; and a latexmkrc / ' +
-        ".latexmkrc may not be overlaid (latexmk runs it as Perl; the project's own one still " +
-        "runs, as in a normal compile). Under lualatex the document's own Lua code can still " +
-        'write a project file (io.open needs no shell escape). The result carries a `variant` handle; pass it ' +
-        'to render_pages / extract_text / pdf_geometry to inspect that build. Name each file ' +
+        '.latexmkrc may not be overlaid (latexmk runs it as Perl). Some routes stay open: the ' +
+        "project's own latexmkrc still runs and can turn shell escape back on, lualatex's Lua " +
+        "io.open needs no shell escape, and tectonic's \\openout writes any absolute path. So " +
+        "the project's files are compared (lstat only) before and after the build: any that " +
+        'changed are named in `hint` — check them and discard what you did not mean — and a ' +
+        'log showing shell escape enabled against the request is reported. The result ' +
+        'carries a `variant` handle; pass it to render_pages / extract_text / pdf_geometry to ' +
+        'inspect that build. Name each file ' +
         `once (all its edits in one entry); at most ${MAX_OVERLAY_FILES} files and ` +
         `${MAX_OVERLAY_EDITS} edits in total. A .bib may be overlaid without confirmBibEdit — ` +
         'the real file is never written. Line numbers in the diagnostics (and snippets) for an ' +
@@ -172,7 +179,8 @@ const inputSchema = {
         'restrictedShellEscape in an overlay compile lets the document write wherever a normal ' +
         "compile can — including into the source, through the variant's links to it. The " +
         `${MAX_VARIANTS} most recently compiled variants per project are kept; older ones are ` +
-        'removed. Recompiling the same overlay reuses its variant (incrementally).',
+        'removed. Recompiling the same overlay reuses its variant (incrementally). rootFile ' +
+        'must be project-relative, with no ".." segment and no linked directory on its way.',
     ),
 };
 
@@ -493,8 +501,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended). ' +
         'Pass `overlay` to compile a what-if variant instead — some files with edit_file-style ' +
         'edits applied in memory — and measure it (pageCount, render_pages / extract_text / ' +
-        'pdf_geometry with the returned `variant`) without touching the source or the main build ' +
-        '(shell escape is off for an overlay unless you opt in, which lifts that guarantee).',
+        'pdf_geometry with the returned `variant`) without the server writing the source or the ' +
+        'main build ' +
+        '(shell escape is off for an overlay unless you opt in; any project file the build ' +
+        'still changed is named in `hint`).',
       inputSchema,
       outputSchema,
     },
@@ -523,7 +533,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // through FileService under the project's link policy, never written back, no baseline)
           // and compiled in a link farm with its own build dir — see src/lib/variants.ts.
           let variant:
-            | { handle: string; contents: Map<string, string>; outDir: string; workDir: string }
+            | {
+                handle: string;
+                contents: Map<string, string>;
+                outDir: string;
+                workDir: string;
+                sourceChanges: () => Promise<string[] | undefined>;
+              }
             | undefined;
           if (overlay) {
             const contents = await applyOverlay(ctx.files, dir, overlay);
@@ -535,6 +551,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               restrictedShellEscape,
               overlay,
             });
+            const skip = [ctx.config.workspaceRoot, buildRoot()];
             const paths = await stageVariant({
               projectDir: dir,
               handle,
@@ -542,9 +559,15 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               engine: engine ?? 'pdflatex',
               compiler: backend.kind,
               contents,
-              skip: [ctx.config.workspaceRoot, buildRoot()],
+              skip,
             });
-            variant = { handle, contents, outDir: paths.out, workDir: paths.src };
+            // Snapshot the source AFTER staging (on win32 staging hard-links and unlinks source
+            // files, which moves their change time) and compare right after the build, before
+            // eviction does the same. Some routes from the farm back into the source are not the
+            // server's to close (see `snapshotSource`), so the result reports what the build
+            // actually did to the project rather than asserting "untouched".
+            const sourceChanges = await watchSource(dir, { skip });
+            variant = { handle, contents, outDir: paths.out, workDir: paths.src, sourceChanges };
           }
           // Shell escape is on unless the caller turned it off? Not for a variant: TeX Live's
           // default (`shell_escape = p`) runs allow-listed commands with no flag at all, and in
@@ -567,6 +590,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 }
               : {}),
           });
+          const changedSource = variant ? await variant.sourceChanges() : undefined;
           // Retention runs after the compile, under the same lock, and never removes this one.
           if (variant) await evictVariants(dir, MAX_VARIANTS, variant.handle);
           // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
@@ -614,7 +638,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // reading the diagnostics they expected — under tectonic, notably, none of them carry a
           // snippet — so say which engine spoke before explaining what it said.
           if (backend.note) hints.push(backend.note);
-          // Next: an engine latexmk could not run explains a failure that otherwise reads as
+          // Next: a variant build that wrote the project is the one thing here the caller may
+          // have to undo.
+          if (changedSource !== undefined && changedSource.length > 0) {
+            hints.push(sourceChangedHint(changedSource));
+          }
+          // Then: an engine latexmk could not run explains a failure that otherwise reads as
           // "FAILED — 0 error(s)" and nothing else. The gate (failed, nothing parsed) and the
           // wording are the service's; this only places it.
           const engineHint = engineNotFoundHint(outcome, parsedErrors.length);
@@ -815,20 +844,29 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                     : undefined,
                 )
               : '';
+          // Every claim here is one the build's own record backs: the source's state from the
+          // before/after comparison, shell escape's from the engine's banner — the latexmk flag
+          // alone reaches the engine only through %O, which a project latexmkrc can override.
+          const escapeReenabled = !shellEscapeOn && shellEscapeWasEnabled(outcome.log);
           const variantLine = variant
             ? `variant ${variant.handle}: pass variant to render_pages / extract_text / ` +
-              'pdf_geometry to inspect it. The source, the main build, the surfaced PDF and the ' +
-              'viewer are untouched' +
+              'pdf_geometry to inspect it. ' +
+              (changedSource === undefined
+                ? 'The main build, the surfaced PDF and the viewer are untouched; whether the ' +
+                  'build wrote a project file could not be checked this time.'
+                : changedSource.length > 0
+                  ? `The build CHANGED ${changedSource.length} project file(s) (named in hint); ` +
+                    'the main build, the surfaced PDF and the viewer are untouched.'
+                  : 'The source (checked: no project file changed while it built), the main ' +
+                    'build, the surfaced PDF and the viewer are untouched.') +
               (shellEscapeOn
-                ? " by the server — but shell escape was on, and the document's shell commands " +
-                  "can write anywhere, the source included through the variant's links to it."
-                : ' (shell escape was disabled for this build)' +
-                  // LuaTeX's `io.open` writes relative to the working directory whatever the
-                  // shell-escape flag says, and tectonic never runs LuaTeX.
-                  (backend.kind === 'latexmk' && engine === 'lualatex'
-                    ? " — except by the document's own Lua code: under lualatex, io.open can " +
-                      "still write a project file through the variant's links."
-                    : '.'))
+                ? " Shell escape was on, so the document's shell commands could write anywhere — " +
+                  "the source included, through the variant's links to it."
+                : escapeReenabled
+                  ? ' Shell escape was requested off, but the log shows it enabled: a ' +
+                    "latexmkrc (the project's own, or a user or system one) overrode the flag, " +
+                    "so the document's shell commands could run."
+                  : ' Shell escape was off for this build.')
             : '';
           const text = [
             headline,

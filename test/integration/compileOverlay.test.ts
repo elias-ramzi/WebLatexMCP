@@ -35,12 +35,19 @@ const MAIN_TEX =
 const B_TEX = 'Section B original.\n';
 
 /** An engine that "typesets" sections/b.tex, read through `workDir`, into a one-page PDF. */
-function stubCompiler(requests: CompileRequest[], extraLog = '') {
+function stubCompiler(
+  requests: CompileRequest[],
+  extraLog = '',
+  duringBuild?: (workDir: string) => Promise<void>,
+) {
   return {
     isAvailable: async () => true,
     compile: async (req: CompileRequest): Promise<CompileOutcome> => {
       requests.push(req);
       const workDir = req.workDir ?? req.projectDir;
+      // What a document can do from inside the farm that the server cannot stop: a project rc
+      // re-enabling shell escape, lualatex's io.open, tectonic's unrestricted \openout.
+      if (duringBuild) await duringBuild(workDir);
       const outDir = req.outDir ?? buildDir(req.projectDir);
       await mkdir(outDir, { recursive: true });
       const body = (await readFile(path.join(workDir, 'sections/b.tex'), 'utf8')).trim();
@@ -72,7 +79,9 @@ async function tmp(prefix: string): Promise<string> {
   return dir;
 }
 
-async function setup(opts: { extraLog?: string } = {}) {
+async function setup(
+  opts: { extraLog?: string; duringBuild?: (workDir: string) => Promise<void> } = {},
+) {
   const remote = await createFakeRemote({
     'main.tex': MAIN_TEX,
     'sections/b.tex': B_TEX,
@@ -95,7 +104,7 @@ async function setup(opts: { extraLog?: string } = {}) {
   );
   const requests: CompileRequest[] = [];
   ctx.compiler = new CompilerResolver('latexmk', false, () =>
-    stubCompiler(requests, opts.extraLog),
+    stubCompiler(requests, opts.extraLog, opts.duringBuild),
   );
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -198,15 +207,15 @@ describe('compile with an overlay', () => {
     const { client } = await setup();
     const plain = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
     expect(textOf(plain)).toContain(
-      'and the viewer are untouched (shell escape was disabled for this build).',
+      'The source (checked: no project file changed while it built), the main build, the ' +
+        'surfaced PDF and the viewer are untouched. Shell escape was off for this build.',
     );
     const escaped = await client.callTool({
       name: 'compile',
       arguments: { overlay: OVERLAY, restrictedShellEscape: true },
     });
     expect(textOf(escaped)).toContain(
-      "untouched by the server — but shell escape was on, and the document's shell commands " +
-        'can write anywhere',
+      "Shell escape was on, so the document's shell commands could write anywhere",
     );
   });
 
@@ -303,6 +312,61 @@ describe('compile with an overlay', () => {
     expect(out.variant).toMatch(/^v[0-9a-f]{12}$/);
     expect(requests).toHaveLength(1);
     expect(toPosix(requests[0]!.rootFile)).toBe('drafts/p1/main.tex');
+  });
+
+  it('names a project file the build changed, and never then calls the source untouched', async () => {
+    // A write from inside the farm through a file's link lands in the SOURCE (on win32 the farm's
+    // file is a hard link to it, which a write reaches just the same). The server cannot stop
+    // every such write, so it checks the project's files before and after, and says what changed.
+    const { client, clone } = await setup({
+      duringBuild: (workDir) => writeFile(path.join(workDir, 'notes.tex'), 'PWNED\n'),
+    });
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    // The stub really did reach the source: this is the case being reported, not a hypothetical.
+    expect(await readFile(path.join(clone, 'notes.tex'), 'utf8')).toBe('PWNED\n');
+    const hint = (res.structuredContent as { hint?: string }).hint ?? '';
+    expect(hint).toContain('changed 1 project file(s) while it ran: "notes.tex"');
+    expect(textOf(res)).not.toMatch(/source[^.]*untouched/i);
+    expect(textOf(res)).toContain('CHANGED');
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+
+  it('does not claim shell escape was disabled when the log shows the project re-enabled it', async () => {
+    // latexmk's -no-shell-escape reaches the engine only through %O: a project latexmkrc of
+    // `$pdflatex = 'pdflatex %O -shell-escape %S'` (or one with no %O) turns it back on, and the
+    // engine's banner is what says so.
+    const { client } = await setup({ extraLog: ' \\write18 enabled.\n' });
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(textOf(res)).not.toMatch(/shell escape was disabled/i);
+    expect(textOf(res)).toContain("a latexmkrc (the project's own, or a user or system one)");
+  });
+
+  it('refuses a root spelled with `..` or as an absolute path, before staging anything', async () => {
+    // lstat judged the normalised spelling while latexmk got the raw one: `paper/../p1/main.tex`
+    // normalises to a p1/ that does not exist, and -cd resolved it physically — through the
+    // farm's link to drafts/p1, so the engine ran inside the SOURCE directory. And an absolute
+    // root sent -cd straight into the source.
+    const { client, clone, requests } = await setup();
+    const real = path.join(clone, 'drafts', 'p1');
+    await mkdir(real, { recursive: true });
+    await writeFile(path.join(real, 'main.tex'), MAIN_TEX);
+    await symlink(real, path.join(clone, 'paper'), 'junction');
+    const dotted = await client.callTool({
+      name: 'compile',
+      arguments: { rootFile: 'paper/../p1/main.tex', overlay: OVERLAY },
+    });
+    expect(dotted.isError, textOf(dotted)).toBe(true);
+    expect(textOf(dotted)).toContain('".."');
+    const absolute = await client.callTool({
+      name: 'compile',
+      arguments: { rootFile: path.join(clone, 'drafts', 'p1', 'main.tex'), overlay: OVERLAY },
+    });
+    expect(absolute.isError, textOf(absolute)).toBe(true);
+    expect(textOf(absolute)).toContain('rootFile: "drafts/p1/main.tex"');
+    expect(requests).toHaveLength(0);
+    await expect(stat(path.join(buildDir(clone), 'variants'))).rejects.toThrow();
   });
 
   it('says when the build never read an overlaid file, and only then', async () => {

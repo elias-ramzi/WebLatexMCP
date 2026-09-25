@@ -7,7 +7,13 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
-import { LatexmkCompiler, buildDir, probeOnPath } from '../../src/services/compiler.js';
+import {
+  LatexmkCompiler,
+  TectonicCompiler,
+  buildDir,
+  probeOnPath,
+} from '../../src/services/compiler.js';
+import { toPosix } from '../../src/lib/paths.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /*
@@ -20,6 +26,7 @@ import type { ServerConfig } from '../../src/types.js';
 
 const compiler = new LatexmkCompiler();
 const available = await compiler.isAvailable();
+const hasTectonic = await new TectonicCompiler().isAvailable();
 const hasBiber = available && (await probeOnPath('biber', '--version').catch(() => false));
 
 // A 1x1 PNG: enough for \includegraphics, and nothing to generate at test time.
@@ -423,4 +430,147 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
       expect(await readFile(path.join(userDir, rel), 'utf8'), rel).toBe(content);
     }
   }, 900_000);
+});
+
+/*
+ * What the server cannot stop, it reports. Two routes from a variant's farm back into the source
+ * that no flag closes: a project latexmkrc that puts -shell-escape back after the server's
+ * -no-shell-escape, and tectonic, whose \openout writes any absolute path (no openout_any). Both
+ * are the project's own code or the engine's own behaviour, so the promise is not "cannot happen"
+ * but "never reported as untouched when it did".
+ */
+async function serveLocal(files: Record<string, string>, cleanups: Array<() => Promise<unknown>>) {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-ws-'));
+  const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-src-'));
+  cleanups.push(
+    () => rm(workspace, { recursive: true, force: true }),
+    () => rm(userDir, { recursive: true, force: true }),
+    () => rm(buildDir(userDir), { recursive: true, force: true }),
+  );
+  for (const [rel, content] of Object.entries(files)) {
+    await mkdir(path.dirname(path.join(userDir, rel)), { recursive: true });
+    await writeFile(path.join(userDir, rel), content);
+  }
+  const config: ServerConfig = {
+    workspaceRoot: workspace,
+    workspaceIsLocal: true,
+    sessionId: 'test',
+    projects: [{ id: 'wb', mode: 'local', path: userDir, rootFile: 'main.tex' }],
+    defaultProject: 'wb',
+  };
+  const ctx = createContext(config, new CredentialResolver({}), {
+    name: 'Test',
+    email: 'test@example.com',
+  });
+  const server = createServer(ctx);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test', version: '0.0.0' });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  cleanups.push(() => client.close());
+  return { client, userDir };
+}
+
+const WRITE_BACK_MAIN = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  '\\input{sections/a}',
+  '\\end{document}',
+  '',
+].join('\n');
+
+describe('an overlay build that writes the source anyway (real TeX)', () => {
+  const cleanups: Array<() => Promise<unknown>> = [];
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) await c();
+  });
+
+  it.skipIf(!available)(
+    "reports the write when the project's latexmkrc re-enables shell escape",
+    async () => {
+      const { client, userDir } = await serveLocal(
+        {
+          'main.tex': WRITE_BACK_MAIN,
+          'sections/a.tex': 'Section A text.\n',
+          // -no-shell-escape comes in through %O; the rc's -shell-escape lands after it and wins.
+          latexmkrc: "$pdflatex = 'pdflatex %O -shell-escape %S';\n",
+        },
+        cleanups,
+      );
+      const res = await client.callTool(
+        {
+          name: 'compile',
+          arguments: {
+            project: 'wb',
+            overlay: [
+              {
+                file: 'main.tex',
+                edits: [
+                  {
+                    oldString: '\\begin{document}\n',
+                    newString:
+                      '\\begin{document}\n\\immediate\\write18{echo PWNED > sections/a.tex}\n',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        undefined,
+        { timeout: 240_000 },
+      );
+      const text = JSON.stringify(res.content);
+      expect(res.isError, text).toBeFalsy();
+      // The route is real — the source was written — and that is exactly what gets reported.
+      expect(await readFile(path.join(userDir, 'sections/a.tex'), 'utf8')).toMatch(/PWNED/);
+      const hint = (res.structuredContent as { hint?: string }).hint ?? '';
+      expect(hint).toContain('"sections/a.tex"');
+      expect(text).toContain("a latexmkrc (the project's own, or a user or system one)");
+      expect(text).not.toMatch(/shell escape was disabled/i);
+      expect(text).not.toMatch(/source[^.]*untouched/i);
+    },
+    300_000,
+  );
+
+  it.skipIf(!hasTectonic)(
+    "reports tectonic's \\openout to an absolute project path",
+    async () => {
+      const { client, userDir } = await serveLocal(
+        { 'main.tex': WRITE_BACK_MAIN, 'sections/a.tex': 'Section A text.\n' },
+        cleanups,
+      );
+      const target = `${toPosix(userDir)}/sections/a.tex`;
+      const res = await client.callTool(
+        {
+          name: 'compile',
+          arguments: {
+            project: 'wb',
+            compiler: 'tectonic',
+            overlay: [
+              {
+                file: 'main.tex',
+                edits: [
+                  {
+                    oldString: '\\begin{document}\n',
+                    newString:
+                      '\\begin{document}\n\\newwrite\\ww\\immediate\\openout\\ww=' +
+                      target +
+                      '\\immediate\\write\\ww{PWNED}\\immediate\\closeout\\ww\n',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        undefined,
+        { timeout: 240_000 },
+      );
+      const text = JSON.stringify(res.content);
+      expect(res.isError, text).toBeFalsy();
+      expect(await readFile(path.join(userDir, 'sections/a.tex'), 'utf8')).toMatch(/PWNED/);
+      const hint = (res.structuredContent as { hint?: string }).hint ?? '';
+      expect(hint).toContain('"sections/a.tex"');
+      expect(text).not.toMatch(/source[^.]*untouched/i);
+    },
+    300_000,
+  );
 });

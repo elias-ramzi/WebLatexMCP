@@ -63,15 +63,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the originals, except the overlaid ones, which hold the edited text. `./` and `../` inputs,
   `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve exactly as in the
   project (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the path for an
-  explicitly relative name). The source, the main build, the surfaced PDF, the viewer and the
-  session's records are all left alone, and nothing records a revision baseline. To keep the
-  source out of reach of the build itself, an overlay compile runs no shell command unless you
+  explicitly relative name). The server writes none of the source, the main build, the surfaced
+  PDF, the viewer or the session's records, and records no revision baseline. To narrow what the
+  build itself can write through the farm, an overlay compile runs no shell command unless you
   pass `shellEscape` or `restrictedShellEscape` — not even TeX Live's default restricted
   allow-list, whose `makeindex -o` could otherwise write a project file through the farm's links —
   and says so in `hint` when the document tried to run one; opting in lifts that guarantee. A
-  `latexmkrc` or `.latexmkrc` cannot be overlaid, since latexmk runs it as Perl (the project's own
-  one still runs, as in a normal compile). Under `lualatex`, Lua code in the document can still
-  write a project file, since `io.open` needs no shell escape. The result
+  `latexmkrc` or `.latexmkrc` cannot be overlaid, since latexmk runs it as Perl. Some routes back
+  into the source stay open — the project's own latexmkrc still runs and can turn shell escape
+  back on, Lua code under `lualatex` can write with `io.open`, and tectonic's `\openout` writes any
+  absolute path — so an overlay compile compares the project's files before and after the build
+  (by size, mode, inode and times; nothing is read) and names any that changed in `hint`, instead
+  of calling the source untouched; it also says when the log shows shell escape enabled although
+  the compile asked for it off. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant
@@ -81,7 +85,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the variant would build in the link's target — the source itself — or resolve `../` inputs
   against the wrong directory; the refusal names the real path to pass instead
   (`rootFile: "drafts/p1/main.tex"`, the same document), and the overlay files are named by their
-  real paths too.
+  real paths too. So is a root spelled with a `..` segment (`paper/../p1/main.tex`, which latexmk
+  resolves through the link) or as an absolute path; name it from the project root instead.
 
 ### Changed
 
