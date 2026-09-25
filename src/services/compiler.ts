@@ -1,7 +1,7 @@
 import os from 'node:os';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
 import type { CompilerKind } from '../types.js';
@@ -320,6 +320,13 @@ export async function mirrorSubdirs(srcDir: string, buildDir: string): Promise<v
  * does not exist, a `../` root — is skipped silently and left to latexmk to fail on in its own
  * words: mirroring `path.join(projectDir, '/abs/paper')` threw a raw ENOENT where a plain compile
  * had worked, and `../x.tex` copied the tree of a directory outside the project.
+ *
+ * "Inside" is judged on REAL paths (both sides `realpath`ed), never on the path string: the walk
+ * below follows the root directory itself, so a committed `paper -> /` passed a string check and
+ * made every compile mirror the outside tree into the build dir. A link to a directory that stays
+ * in the project is still mirrored, so its `\include` keeps working. The walk cannot loop: it
+ * starts at a real directory inside the project and {@link mirrorSubdirs} never descends into a
+ * linked directory (a `Dirent` of a link is not `isDirectory()`).
  */
 export async function mirrorSubdirsForRoot(
   projectDir: string,
@@ -331,16 +338,21 @@ export async function mirrorSubdirsForRoot(
   if (base === '') return;
   const root = path.resolve(projectDir);
   const abs = path.resolve(root, base);
-  const rel = path.relative(root, abs);
-  if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-    return;
-  }
+  // `to` lies strictly below `from`: not `from` itself, and not outside it.
+  const strictlyInside = (from: string, to: string): boolean => {
+    const rel = path.relative(from, to);
+    return !(rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
+  };
+  if (!strictlyInside(root, abs)) return;
+  let real: string;
   try {
-    if (!(await stat(abs)).isDirectory()) return;
+    real = await realpath(abs);
+    if (!strictlyInside(await realpath(root), real)) return;
+    if (!(await stat(real)).isDirectory()) return;
   } catch {
     return;
   }
-  await mirrorSubdirs(abs, buildDir);
+  await mirrorSubdirs(real, buildDir);
 }
 
 /**

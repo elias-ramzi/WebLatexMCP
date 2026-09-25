@@ -922,7 +922,12 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   workspace and the build root are skipped; win32 uses junctions, hard links and copies), except
   the overlaid files, which are real files — an overlaid path under a linked directory
   materialises that directory first, so nothing is written through a link. The backend runs there
-  (`CompileRequest.workDir`) into the variant's own `out/` (`outDir`). Not `TEXINPUTS`: kpathsea
+  (`CompileRequest.workDir`) into the variant's own `out/` (`outDir`), whose directory scaffold is
+  mirrored from the SOURCE as for every compile (`mirrorSubdirsForRoot`): the root file's own
+  directory is mirrored at `out/`'s root for latexmk's `-cd` only when its **realpath** stays inside
+  the project's — judged on the string, a committed `paper -> /` made every compile walk `/` — and
+  `mirrorSubdirs` never descends into a linked directory (`Dirent` types), so the walk cannot loop.
+  Not `TEXINPUTS`: kpathsea
   never searches the path for `./` or `../` names, so those inputs read the source. **The server
   never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
   surface; the only project files read are the overlaid ones — **except on win32**, where the

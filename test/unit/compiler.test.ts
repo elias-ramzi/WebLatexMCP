@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readdir, writeFile, rm, stat, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, writeFile, rm, stat, symlink, utimes } from 'node:fs/promises';
 import {
   latexmkArgs,
   mirrorSubdirs,
@@ -175,6 +175,49 @@ describe('mirrorSubdirsForRoot', () => {
       expect((await readdir(dest)).sort()).toEqual(['inside']);
     } finally {
       await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('does not follow a root directory that is a link out of the project', async () => {
+    // Containment was judged on the path STRING, then `stat` and `mirrorSubdirs` followed the
+    // link: a committed `paper -> /` made every compile walk the outside tree into the build dir.
+    const base = await mkdtemp(path.join(os.tmpdir(), 'mirror-base-'));
+    const src = path.join(base, 'proj');
+    const dest = path.join(base, 'dest');
+    const outside = path.join(base, 'outside');
+    try {
+      await mkdir(path.join(src, 'inside'), { recursive: true });
+      await mkdir(path.join(outside, 'secret', 'deeper'), { recursive: true });
+      await mkdir(path.join(outside, 'nested', 'more'), { recursive: true });
+      await mkdir(dest, { recursive: true });
+      // 'junction' is ignored on POSIX and is what win32 can create without a privilege.
+      await symlink(outside, path.join(src, 'paper'), 'junction');
+
+      await mirrorSubdirsForRoot(src, dest, 'paper/main.tex');
+      // A root BENEATH the link leaves the project the same way.
+      await mirrorSubdirsForRoot(src, dest, 'paper/nested/main.tex');
+
+      // Only the project-root mirror ran, and it does not descend into the link either.
+      expect((await readdir(dest)).sort()).toEqual(['inside']);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('still mirrors a root directory that is a link to a directory inside the project', async () => {
+    const src = await mkdtemp(path.join(os.tmpdir(), 'mirror-src-'));
+    const dest = await mkdtemp(path.join(os.tmpdir(), 'mirror-dst-'));
+    try {
+      await mkdir(path.join(src, 'real', 'chap', 'deep'), { recursive: true });
+      await symlink(path.join(src, 'real'), path.join(src, 'paper'), 'junction');
+
+      await mirrorSubdirsForRoot(src, dest, 'paper/main.tex');
+
+      // `\include{chap/c1}` from paper/main.tex writes <outdir>/chap/c1.aux: it must exist.
+      expect(await isDir(path.join(dest, 'chap', 'deep'))).toBe(true);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+      await rm(dest, { recursive: true, force: true });
     }
   });
 

@@ -140,7 +140,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `<build>/chap/c1.aux`, but only the project-root tree (`<build>/paper/chap`) was mirrored into
   the build directory, and the compile died with "I can't write on file `chap/c1.aux'". The root
   file's own directory tree is now mirrored at the build directory's root too (latexmk only;
-  tectonic runs in the project root).
+  tectonic runs in the project root). That directory is mirrored only when its real path stays
+  inside the project, so a committed symlink from the root's directory to one outside the project
+  (even to the filesystem root) is skipped rather than walked into the build directory; a link to
+  another directory of the project is still mirrored.
 - **`labels:` lookups refuse a build whose records cannot be read, instead of resolving it
   blind** (#194). `render_pages`/`extract_text` decide whether a `pgfpages` layout shifted every
   label from the build's `.fls` and `.log`; when neither could be read the check was skipped, and
