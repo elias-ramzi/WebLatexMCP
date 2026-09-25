@@ -15,9 +15,11 @@ import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats
 import { shippedNothing } from '../lib/labelPages.js';
 import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
 import { planGeometryPayload, GEOMETRY_CONTENT_BUDGET } from '../lib/geometryBudget.js';
+import { findVariantPdf, resolveVariantBuild, VARIANT_INPUT_DESCRIPTION } from '../lib/variants.js';
 
 const inputSchema = {
   project: z.string().optional(),
+  variant: z.string().optional().describe(VARIANT_INPUT_DESCRIPTION),
   rootFile: z
     .string()
     .optional()
@@ -222,6 +224,10 @@ const floatShape = z.object({
 });
 
 const outputSchema = {
+  variant: z
+    .string()
+    .optional()
+    .describe('The variant handle this read, echoed back; absent when the main build was read.'),
   pdfPath: z
     .string()
     .optional()
@@ -425,7 +431,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, kinds }) => {
+    async ({ project, rootFile, pages, kinds, variant }) => {
       try {
         // Invariant: requireProjectDir, NEVER requireGitProject — this tool must work for a
         // mode:'local' project exactly like compile and render_pages. Git-gating it would be wrong.
@@ -440,15 +446,22 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // and the .aux read (readAuxFloats) goes through node:fs directly, never FileService —
           // recording a baseline would wrongly claim the caller could now base a write on a file
           // it only used to locate a PDF/aux.
-          const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // A variant is read from its own out/ and nowhere else — as render_pages reads one.
+          const v =
+            variant !== undefined
+              ? await resolveVariantBuild(dir, id, variant, rootFile)
+              : undefined;
+          const root = v ? v.rootFile : (rootFile ?? (await detectRootFile(ctx.files, dir)));
           const requestedKinds = kinds ?? ['text', 'images'];
           // The ROOT's build PDF, never the surfaced copy once a root is named or "floats" reads
           // the .aux: the surfaced copy holds whichever root compiled last, and measuring it
           // beside this root's float index would join two different documents (locateRootPdf).
-          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
-            rootNamed: rootFile !== undefined,
-            readsAux: requestedKinds.includes('floats'),
-          });
+          const pdfPath = v
+            ? await findVariantPdf(v)
+            : await locateRootPdf(ctx.config, id, dir, root, {
+                rootNamed: rootFile !== undefined,
+                readsAux: requestedKinds.includes('floats'),
+              });
 
           const pageKinds = requestedKinds.filter((k): k is GeometryKind => k !== 'floats');
 
@@ -472,7 +485,10 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           if (pageKinds.length > 0) {
             if (!pdfPath) {
               throw new Error(
-                `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
+                v
+                  ? `Variant ${variant} has no PDF: its compile did not produce one. Fix the ` +
+                      'overlay and compile it again.'
+                  : `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
               );
             }
             result = await ctx.pdfRenderer.geometry({ pdfPath, pages, kinds: pageKinds });
@@ -496,7 +512,10 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           if (requestedKinds.includes('floats')) {
             // `shipouts: true` for one question only: whether the .log records a compile that
             // shipped no page (the nothing-shipped note below). The marks check nothing else here.
-            const auxResult = await readAuxFloats(dir, root, { shipouts: true });
+            const auxResult = await readAuxFloats(dir, root, {
+              shipouts: true,
+              ...(v ? { buildDir: v.paths.out } : {}),
+            });
             // The size budget is applied AFTER the reader's count cap, over whatever survived it,
             // because the two bound different things and the count cap is the cheaper one: there
             // is no point charging rendered characters against entries that were never going to
@@ -591,6 +610,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           // inside it is what narrows the type. From here the path is a display value only.
           const { pdfPath: outPdfPath } = toPosixOut({ pdfPath });
           const structuredContent = {
+            ...(variant !== undefined ? { variant } : {}),
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
             pages: geometryPlan.pages,
@@ -610,8 +630,12 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
               ? `${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}`
               : outPdfPath !== undefined
                 ? `${outPdfPath} (no page opened — kinds: floats only)`
-                : 'no PDF (kinds: floats only, and none was ever compiled)';
-          const header = `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})`;
+                : v
+                  ? `no PDF (kinds: floats only; variant ${variant} produced none)`
+                  : 'no PDF (kinds: floats only, and none was ever compiled)';
+          const header =
+            `geometry for ${pageCountText} (kinds: ${requestedKinds.join(', ')})` +
+            (variant !== undefined ? ` (variant ${variant})` : '');
           const pageLines = geometryPlan.pages.map((p) => {
             const parts = [
               `page ${p.page}: ${p.pageWidthPt.toFixed(1)}x${p.pageHeightPt.toFixed(1)} pt`,

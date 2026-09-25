@@ -404,6 +404,687 @@ async function translateMissingParentError(
   throw err;
 }
 
+/**
+ * The pure half of {@link FileService.applyEdits}: turn `original` plus `edits` into the edited
+ * content, with no I/O at all — no read, no write, no baseline, no mutation record. `applyEdits`
+ * wraps it with exactly those; `compile`'s `overlay` calls it directly, because an overlay applies
+ * `edit_file`'s edits to text that is never written back to the project. `relPath` is used only
+ * to name the file in error messages. Every guard of `applyEdits` (not found, non-unique, overlap,
+ * preserved-block refusals) lives here, so both callers refuse exactly the same edits.
+ */
+export function applyEditsToContent(
+  original: string,
+  relPath: string,
+  edits: AnyEditOp[],
+  opts: {
+    /** As `applyEdits`' option of the same name. */
+    excludeMatch?: (content: string, start: number, end: number) => boolean;
+    /** As `applyEdits`' option of the same name. */
+    preserve?: EditTransform;
+  } = {},
+): { content: string; commentMatches: CommentMatchReport[] } {
+  if (edits.length === 0) {
+    throw new Error('No edits provided.');
+  }
+  let content = original;
+  // The file as the call found it: what every line range, and every judgment about one, refers to.
+  const initial: string = original;
+  // [start, end) ranges, in `content`'s *current* coordinate space, of every preserved comment
+  // block spliced in so far by this call. Owned here — not by `opts.preserve` — because this is
+  // the only place that knows every splice offset a call produces, including each individual
+  // occurrence a `replaceAll` edit touches; a hook that owned this ledger itself could only ever
+  // shift it for the non-`replaceAll` edits it was actually called for, leaving it stale the
+  // moment a `replaceAll` edit spliced text without going through the hook at all.
+  //
+  // Each block also carries what the end-of-call check (`assertBlocksStillComments`) needs: the
+  // edit that preserved it (`edit`), the last edit whose splice reached the byte just past it
+  // (`lastTouch`), and where the `'\n'` sits that a block ending in its own bare `'\r'` was
+  // DESIGNED to pair with (`pairedNl`: a CRLF the match split, or a separator the hook wrote),
+  // or `null` — kept in step by every splice, and dropped when a splice removes it.
+  const preserved: PreservedBlock[] = [];
+  /**
+   * Every splice this call has made, in order, as `[start, removed, inserted]` in the
+   * coordinates of the content at that moment — enough for `toInitial` to carry an offset in the
+   * current content back into `initial`, where a string edit's preservation separator is judged
+   * (see `MatchOrigin`).
+   */
+  const spliceLog: [number, number, number][] = [];
+  /**
+   * Where offset `p` of the current content sat in `initial`, or `null` when it lies strictly
+   * inside text a splice inserted. An offset AT a splice's start stays where it is: for a pure
+   * removal that is the side before the removed text — so the end of a match whose terminator a
+   * later-listed deletion already took still lands on that terminator in `initial`.
+   *
+   * With `byte`, `p` names the character at `p` rather than the boundary before it, and one a
+   * splice inserted (the first included) is `null`: the answer to "did the file have this byte
+   * before the call".
+   */
+  const toInitial = (p: number, byte = false): number | null => {
+    let at = p;
+    for (let k = spliceLog.length - 1; k >= 0; k--) {
+      const [start, removed, inserted] = spliceLog[k] as [number, number, number];
+      if (byte ? at < start : at <= start) continue;
+      if (at < start + inserted) return null;
+      at += removed - inserted;
+    }
+    return at;
+  };
+  /**
+   * Where each range deletion in this call cut the text, in current coordinates, kept in step
+   * by `splice` (a later splice that removes text on both sides of one drops it). Checked by
+   * `unfuse` once every edit has applied — see there for why not at the cut itself.
+   */
+  const cutPoints: number[] = [];
+  /**
+   * [start, end) ranges, in current coordinates, of the line terminators a preservation hook
+   * put back after a replacement (`lastRestoredTerminator`), kept in step by `splice` (one a
+   * later splice overwrites is dropped). They stand in for the terminator the match consumed —
+   * an original byte — so `unfuse` may rewrite them too; without that, a deletion leaving a
+   * put-back bare `\r` before a blank line's `\n` merged the blank line away, where spelling
+   * the same edit without its `\r` (which then stays in the file, original) kept it.
+   */
+  const restored: { start: number; end: number }[] = [];
+  /**
+   * Adjust every recorded range for a splice of `[spliceStart, spliceEnd)` (pre-splice
+   * coordinates) that changed the content's length by `delta`. A `replaceAll` occurrence can
+   * land anywhere relative to a preserved range — including, intentionally, *inside* one
+   * (rewriting a preserved comment is documented behaviour) — or *straddling* one of its
+   * boundaries, which a range can never survive as a single shifted interval: whichever side
+   * the splice consumed is gone, replaced by caller-authored text that was never part of the
+   * comment this ledger is protecting. So this rebuilds the list rather than mutating each
+   * range in place, run unconditionally (a zero-`delta` splice still overwrites bytes and can
+   * still straddle a boundary, even though nothing after it needs to move). Cases:
+   *
+   *  - Entirely after the range (`spliceStart >= range.end`): untouched — nothing before it
+   *    moved.
+   *  - Entirely before the range (`spliceEnd <= range.start`): the whole range slides by
+   *    `delta`, same as any other coordinate after the splice point.
+   *  - The splice fully contains the range (`spliceStart <= range.start && spliceEnd >=
+   *    range.end`): every byte of the range was overwritten by caller text — drop it, it is no
+   *    longer preserved at all.
+   *  - The range fully contains the splice (`spliceStart >= range.start && spliceEnd <=
+   *    range.end`): a `replaceAll` rewriting part of a preserved comment, kept as one
+   *    contiguous span — its `start` is unaffected (the splice began at or after it) and its
+   *    `end` grows/shrinks by `delta`.
+   *  - The splice straddles the range's *start* (`spliceStart < range.start`, so it must end
+   *    at or before `range.end`): it consumed the range's leading bytes (and possibly text
+   *    before them too), so no prefix of the original survives — only the suffix after the
+   *    splice remains preserved, as `[spliceEnd + delta, range.end + delta)`.
+   *  - The splice straddles the range's *end* (the remaining case: it starts inside the range
+   *    but ends past it): only the prefix before the splice point is still preserved, as
+   *    `[range.start, spliceStart)` — it needs no shift, since it sits entirely before the
+   *    splice.
+   *
+   * `editIndex` is recorded on every range this splice starts exactly at the end of
+   * (`lastTouch`), so the end-of-call check can name the edit that took a block's line break.
+   */
+  const shiftPreserved = (
+    spliceStart: number,
+    spliceEnd: number,
+    delta: number,
+    editIndex: number,
+  ) => {
+    const next: PreservedBlock[] = [];
+    for (const range of preserved) {
+      // The paired '\n' is a single byte: gone if the splice removed it, moved if it sat after.
+      const pairedNl =
+        range.pairedNl === null || range.pairedNl < spliceStart
+          ? range.pairedNl
+          : range.pairedNl < spliceEnd
+            ? null
+            : range.pairedNl + delta;
+      // A splice starting exactly at the block's end reached the byte just past it: the line
+      // break that ends it, unless the block carries its own. One starting inside the block and
+      // running to or past its end rewrote the block's own last bytes — only a `replaceAll` can,
+      // the documented rewrite-inside-a-comment case — and `rewrittenTo` then marks where that
+      // replacement text ends, so the end-of-call check can tell a line break the caller wrote
+      // into it from a comment line that now runs on into text after it. Kept in step like any
+      // offset: a later splice across it leaves it at the end of that splice's own text.
+      const rewrites = spliceStart < range.end && spliceEnd >= range.end;
+      const movedTo =
+        range.rewrittenTo === null || spliceStart >= range.rewrittenTo
+          ? range.rewrittenTo
+          : spliceEnd <= range.rewrittenTo
+            ? range.rewrittenTo + delta
+            : spliceEnd + delta;
+      const kept = {
+        ...range,
+        pairedNl,
+        lastTouch: spliceStart === range.end || rewrites ? editIndex : range.lastTouch,
+        rewrittenTo: rewrites ? spliceEnd + delta : movedTo,
+      };
+      if (spliceStart >= range.end) {
+        next.push(kept);
+      } else if (spliceEnd <= range.start) {
+        next.push({ ...kept, start: range.start + delta, end: range.end + delta });
+      } else if (spliceStart <= range.start && spliceEnd >= range.end) {
+        // Fully overwritten — drop it.
+      } else if (spliceStart >= range.start && spliceEnd <= range.end) {
+        next.push({ ...kept, end: range.end + delta });
+      } else if (spliceStart < range.start) {
+        next.push({ ...kept, start: spliceEnd + delta, end: range.end + delta });
+      } else {
+        next.push({ ...kept, end: spliceStart });
+      }
+    }
+    preserved.length = 0;
+    preserved.push(...next);
+  };
+  /**
+   * Every line range in this call, resolved **up front against the content as the call found
+   * it** — the bytes `read_file` handed the caller — and thereafter kept in `content`'s current
+   * coordinate space by `splice` below, exactly like the preserved-block ledger.
+   *
+   * Resolving up front is what makes a range mean the same thing wherever it sits in the
+   * `edits` array: the caller's line numbers came from a read of the file before this call, so
+   * an earlier edit that adds or removes lines must not silently slide a later range onto
+   * different text. Keeping the resolved spans shifted (rather than re-deriving line numbers
+   * against the mutated content) means a range still covers exactly the original bytes it
+   * named, and an earlier edit that *touches* those bytes is refused outright — see `splice`.
+   *
+   * `term` is the length of the line terminator that ends `endLine` (0 for an unterminated last
+   * line). The range **owns** it for the overlap check even though it is not part of the span
+   * replaced: a deletion (`newString: ''`, see below) takes it, so an earlier edit that rewrote
+   * it would leave the deletion eating someone else's text — and without it a blank line's
+   * empty span `[r, r)` owned nothing at all, so a splice starting at `r` slipped past the check
+   * and landed the range edit in front of whatever that splice inserted.
+   *
+   * `origStart` is `start` before any shift: where the range sat in `initial`, handed to the
+   * preservation hook (`RangeMatch`) so it judges the range in the file the caller read.
+   *
+   * `prev` is the length of the terminator that ends `startLine - 1` in `initial` (0 for line
+   * 1) — what a deletion of an unterminated last line takes — or `null` once a splice has
+   * touched those bytes, after which it is measured in the current content instead. Measuring
+   * it there unconditionally was wrong in a file mixing bare `\r` and `\n`: an earlier deletion
+   * can leave one line's bare `\r` right before the next line's `\n`, where the two read as a
+   * single `\r\n`, and taking "the terminator before" then ate the `\r` of a line nobody
+   * deleted — in one order of the edits and not the other.
+   *
+   * The no-op guard runs here too, against `initial`, never at apply time: whether a deletion
+   * is a no-op must not depend on which edit ran first. Deleting an unterminated last line
+   * takes the terminator before it — possibly a blank line's own — and a blank-line deletion
+   * that ran afterwards found nothing left to take and was refused as "identical", while the
+   * same two edits in the other order succeeded. A blank line with an empty `newString` is a
+   * deletion of that line and its terminator, so it is identical only when the file is empty
+   * (a blank line in any other file is always terminated: `splitLines` counts no phantom last
+   * line).
+   */
+  const pendingRanges = new Map<
+    number,
+    Span & { term: number; origStart: number; prev: number | null }
+  >();
+  edits.forEach((edit, i) => {
+    if (!isRangeEdit(edit)) return;
+    if (edit.endLine < edit.startLine) {
+      throw new Error(
+        `Edit ${i + 1}: startLine ${edit.startLine} is after endLine ${edit.endLine}; the range is 1-based and endLine is inclusive.`,
+      );
+    }
+    const span = lineSpan(content, edit.startLine, edit.endLine);
+    if (span === null) {
+      throw new Error(
+        `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} are outside ${relPath}, which has ${splitLines(content).length} line(s). Line numbers are 1-based and endLine is inclusive.`,
+      );
+    }
+    const oldText = initial.slice(span.start, span.end);
+    if (oldText === edit.newString && !(oldText === '' && initial !== '')) {
+      throw new Error(
+        `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} and newString are identical.`,
+      );
+    }
+    pendingRanges.set(i, {
+      ...span,
+      term: terminatorLengthAt(initial, span.end),
+      origStart: span.start,
+      prev: terminatorLengthBefore(initial, span.start),
+    });
+  });
+  /**
+   * The one place content is ever spliced, so both ledgers move on **every** splice — the
+   * preserved-comment ranges and the not-yet-applied line ranges alike. A `replaceAll` edit
+   * runs no preservation hook but still changes the file's length at every occurrence, and a
+   * ledger that only moved for the edits that went through the hook was exactly the bug that
+   * made preserved ranges go stale; routing every splice through one function is what keeps
+   * that structural rather than remembered.
+   *
+   * It also enforces the no-silent-overlap rule: if this splice would touch bytes some *other*
+   * edit's line range covers, the whole call fails. The alternative — applying it and letting
+   * the range shift — would rewrite lines the caller never named, which is precisely the
+   * silent corruption a range edit invites. A range covers its span **plus the terminator after
+   * it** here (see `term` above), and the test handles empty intervals explicitly — see
+   * `touches`.
+   *
+   * `checkFrom` narrows only the overlap check, never the splice: a deletion of an unterminated
+   * last line takes the terminator *before* it, which is the previous line's — possibly owned by
+   * a pending range for that line. Taking it is exactly right (deleting the last line leaves the
+   * new last line unterminated, as the file's last line was), and that pending range's span is
+   * untouched, so the check starts at the deleted line itself; the owner simply loses its `term`.
+   *
+   * `prevAtStart` is what a range DELETION knows about the bytes just before `start`: the
+   * length of the terminator ending there, in `initial` (its own `prev`). Once the deleted
+   * lines are gone, those bytes are what precedes the range the deletion ended against, so that
+   * range's `prev` is carried over instead of being lost to the fallback measurement.
+   */
+  const splice = (
+    editIndex: number,
+    start: number,
+    end: number,
+    replacement: string,
+    checkFrom: number = start,
+    prevAtStart: number | null = null,
+  ) => {
+    for (const [j, range] of pendingRanges) {
+      if (j === editIndex) continue;
+      if (touches(checkFrom, end, range.start, range.end + range.term)) {
+        throw new Error(
+          `Edit ${editIndex + 1} changes text that edit ${j + 1}'s line range covers. Line numbers refer to ${relPath} as it was before this call, so two edits in one call may not touch the same text; split them into separate calls (and re-read the file in between, since the line numbers move).`,
+        );
+      }
+    }
+    content = content.slice(0, start) + replacement + content.slice(end);
+    spliceLog.push([start, end - start, replacement.length]);
+    const delta = replacement.length - (end - start);
+    shiftPreserved(start, end, delta, editIndex);
+    for (let j = cutPoints.length - 1; j >= 0; j--) {
+      const point = cutPoints[j] as number;
+      if (point <= start) continue;
+      if (point >= end) cutPoints[j] = point + delta;
+      else cutPoints.splice(j, 1);
+    }
+    for (let j = restored.length - 1; j >= 0; j--) {
+      const range = restored[j] as { start: number; end: number };
+      if (start >= range.end) continue;
+      if (end <= range.start) restored[j] = { start: range.start + delta, end: range.end + delta };
+      else restored.splice(j, 1);
+    }
+    for (const [j, range] of pendingRanges) {
+      if (j === editIndex) continue;
+      if (end <= range.start) {
+        // Only a range entirely *after* the splice moves; one entirely before is unaffected,
+        // and an overlapping one already threw above. A splice reaching into the terminator
+        // just before the range (the previous line's) makes `prev` unknowable from `initial`.
+        const prev =
+          replacement === '' && end === range.start
+            ? prevAtStart
+            : range.prev !== null && end > range.start - range.prev
+              ? null
+              : range.prev;
+        if (delta !== 0 || prev !== range.prev) {
+          pendingRanges.set(j, {
+            ...range,
+            start: range.start + delta,
+            end: range.end + delta,
+            prev,
+          });
+        }
+      } else if (start < checkFrom && start === range.end) {
+        // The one exemption `checkFrom` grants: this splice took the terminator that ended
+        // range j's last line. Its span stands; it just no longer has a terminator to own.
+        pendingRanges.set(j, { ...range, term: 0 });
+      }
+    }
+  };
+  /**
+   * Run once every edit has applied, at each point a range deletion cut the text. When a cut
+   * leaves a bare `\r` (the end of the line before) right in front of a `\n` (a blank line
+   * after), the two read as ONE CRLF: the blank line merges into the line before, so a line
+   * nobody deleted disappears with the deleted ones. The `\r` becomes a `\n` instead — the
+   * terminator the blank line after it already uses, so never a type the file lacks — and so
+   * does every bare `\r` just before it that would in turn fuse with the `\n` it now meets (a
+   * run of CR-terminated blank lines). The line count then drops by exactly the lines deleted.
+   *
+   * Deferred to the end, not run at the cut, because whether the two stay adjacent is up to
+   * the edits still pending — a later deletion of the blank line, or of an unterminated last
+   * line that takes its `\n`, leaves nothing to fuse with — and deciding early made the bytes
+   * depend on the order of the edits. At the end every deletion of a run has happened, so the
+   * answer is the same whichever of them completed it. Cut points are visited from the last
+   * to the first, since a walk only ever moves left.
+   *
+   * Only a byte the file had before the call is ever rewritten (`toInitial(k, true)`), or a
+   * terminator a preservation hook put back in place of one the match consumed (`restored`):
+   * never a preserved block, which must stay the bytes that were there, nor text a caller
+   * supplied. An in-place, same-length change, made after the last splice, so no ledger is
+   * involved.
+   */
+  const unfuse = (at: number) => {
+    if (content[at - 1] !== '\r' || content[at] !== '\n') return;
+    for (let k = at - 1; k >= 0 && content[k] === '\r'; k--) {
+      const putBack = restored.some((range) => k >= range.start && k < range.end);
+      if (toInitial(k, true) === null && !putBack) return;
+      content = content.slice(0, k) + '\n' + content.slice(k + 1);
+    }
+  };
+  /** Record where the hook's latest `transform()` put a terminator back, once its replacement
+   * has been spliced in at `at`. Call only right after an edit that ran the hook. */
+  const recordRestored = (at: number) => {
+    const put = opts.preserve?.lastRestoredTerminator?.();
+    if (put !== undefined && put.length > 0) {
+      restored.push({ start: at + put.offset, end: at + put.offset + put.length });
+    }
+  };
+  /**
+   * Enter a block edit `editIndex` just spliced in at `[start, end)`. `pairedByDesign` says
+   * whether a `'\n'` right after it now is one it was meant to meet: inside the replacement the
+   * hook returned (a separator), or the byte that followed the match in the file as found — a
+   * CRLF whose `'\r'` the match took. Only then is a block ending in its own bare `'\r'`
+   * allowed to be followed by a `'\n'` (see `assertBlocksStillComments`).
+   */
+  const pushPreserved = (
+    editIndex: number,
+    start: number,
+    end: number,
+    pairedByDesign: boolean,
+  ) => {
+    const paired = content[end - 1] === '\r' && content[end] === '\n' && pairedByDesign;
+    preserved.push({
+      start,
+      end,
+      edit: editIndex,
+      lastTouch: undefined,
+      rewrittenTo: null,
+      pairedNl: paired ? end : null,
+    });
+  };
+  /**
+   * Run once every edit has applied (and `unfuse` has run): refuse the call when a block an edit
+   * preserved is no longer a comment of exactly the lines it was. The `%` makes a comment only
+   * up to the end of its line, so the line break that ends a block is part of what makes it one
+   * — and two later edits could take that away without matching a byte of the block itself,
+   * which is all the match-time ledger check can see:
+   *
+   *  - A block that does not end in its own terminator is ended by the byte after it (the
+   *    line's terminator, or a separator the hook wrote). A later edit that removes that byte and
+   *    leaves text in its place — `'\nQ'` → `' tail'` after `'P'` was preserved as `% P` — puts
+   *    that live text on the comment's line, where LaTeX silently drops it.
+   *  - A block that ends in its own bare `'\r'` (the match took its line's terminator) and now
+   *    meets a `'\n'` it was not designed to pair with — a deletion of the blank line after it
+   *    brought the next blank line's `'\n'` up — reads as one CRLF with it: that blank line (a
+   *    `\par`) disappears into the comment. For an original `'\r'` `unfuse` rewrites it to
+   *    `'\n'`; a preserved block's bytes are the bytes that were there and are not rewritten.
+   *
+   * Refused rather than repaired: putting a line break back would be text nobody asked for, and
+   * undoing the preservation would silently drop what the caller's mode promised. The refusal
+   * is loud, the file is untouched (nothing is written until every edit succeeds), and the way
+   * out is one step — the edits in separate calls, where the second sees the comment and the
+   * block's bytes are the file's own. Judged on the final content, not per splice, so an edit
+   * later in the call that puts a line break back is not refused for the moment in between,
+   * and whether the fusion stands does not depend on which of the deletions ran last — the same
+   * reason `unfuse` is deferred.
+   *
+   * A block whose own last bytes a `replaceAll` rewrote (`rewrittenTo`) — rewriting inside a
+   * preserved comment is what a `replaceAll` is documented to do — is judged on where its
+   * comment line now ends: fine when the caller's replacement text itself carries the line
+   * break, or puts nothing on the line at all; refused when the line runs through the end of that
+   * text, since whatever the replacement put there (it took live text with it) or whatever
+   * follows it is then on the comment line. Only the first rule applies to such a block: its
+   * trailing `'\r'`, if any, is the caller's now, not a byte this call must keep.
+   */
+  const assertBlocksStillComments = () => {
+    for (const block of preserved) {
+      if (block.end <= block.start) continue;
+      const last = content[block.end - 1];
+      const next = content[block.end];
+      const endsLine = (ch: string | undefined) => ch === '\n' || ch === '\r';
+      // Where the comment line the block ends on now ends: the first line break (or EOF) at or
+      // after the block's end.
+      let lineEnd = block.end;
+      while (lineEnd < content.length && !endsLine(content[lineEnd])) lineEnd++;
+      const runsOn =
+        !endsLine(last) &&
+        lineEnd > block.end &&
+        (block.rewrittenTo === null || lineEnd >= block.rewrittenTo);
+      if (runsOn) {
+        const who = block.lastTouch === undefined ? 'An edit' : `Edit ${block.lastTouch + 1}`;
+        throw new Error(
+          `${who} removes the line break that ends the text edit ${block.edit + 1} preserved (commented out) in this same call, so the text after it would continue on that comment line, where LaTeX ignores it. Make the edits in separate calls (re-read the file in between, so the second one sees the comment), or turn preservation off for this call (preserveOriginal: false).`,
+        );
+      }
+      if (
+        block.rewrittenTo === null &&
+        last === '\r' &&
+        next === '\n' &&
+        block.pairedNl !== block.end
+      ) {
+        throw new Error(
+          `Another edit in this same call leaves a line break right after the text edit ${block.edit + 1} preserved (commented out), which ends in a bare carriage return: the two would read as one CRLF, and the blank line after the block (a paragraph break in LaTeX) would disappear into it. Make the edits in separate calls (re-read the file in between), or turn preservation off for this call (preserveOriginal: false).`,
+        );
+      }
+    }
+  };
+  const commentMatches: CommentMatchReport[] = [];
+  edits.forEach((edit, i) => {
+    if (isRangeEdit(edit)) {
+      // Resolved above and shifted by every splice since, so it still covers exactly the lines
+      // the caller named in the file they read. Drop it from the ledger first: it is about to
+      // be consumed, and `splice` must not refuse this edit for overlapping its own range.
+      const span = pendingRanges.get(i);
+      /* c8 ignore next 3 -- unreachable: every range edit got an entry in the pass above. */
+      if (span === undefined) {
+        throw new Error(`Edit ${i + 1}: internal error — line range was never resolved.`);
+      }
+      pendingRanges.delete(i);
+      const oldString = content.slice(span.start, span.end);
+      /**
+       * What a deletion removes: the lines AND a terminator, so they disappear rather than
+       * collapsing into one blank line (a `\par` in LaTeX). The terminator after `endLine` when
+       * there is one — owned by this range, so no earlier edit can have rewritten it — else,
+       * for an unterminated last line, the one before `startLine`, so the new last line is left
+       * unterminated as the old one was. That one is taken only when it is not part of a block
+       * an earlier edit preserved: eating a preserved block's newline would make it no longer
+       * the bytes that were there, so the lines' text goes and that newline stays.
+       */
+      const deletion = (): { start: number; end: number } => {
+        if (span.term > 0) return { start: span.start, end: span.end + span.term };
+        const before = span.prev ?? terminatorLengthBefore(content, span.start);
+        const from = span.start - before;
+        if (before > 0 && !preserved.some((r) => from < r.end && span.start > r.start)) {
+          return { start: from, end: span.end };
+        }
+        return { start: span.start, end: span.end };
+      };
+      // A blank line named with an empty newString is a deletion of that line, not a no-op
+      // (the one no-op shape, an empty file, was refused when the range was resolved).
+      const blankDeletion = oldString === '' && edit.newString === '';
+      // A range edit is line-aligned by construction, is never a `replaceAll`, and has exactly
+      // one position — so it is preserved through the *same* hook as a unique string edit,
+      // with the `oldString` the file actually holds there. Nothing about preservation is
+      // re-decided here; `createPreserveTransform` still owns the whole judgment, and this
+      // synthesized edit reaches it only after the identical-text guard (run when the range
+      // was resolved), so the hook still never sees a no-op — which is also why a blank-line
+      // deletion skips it: there is no text on that line to preserve. The `RangeMatch` tells
+      // the hook this `oldString` is whole lines — see there for why it cannot tell alone.
+      const synthesized: EditOp = { oldString, newString: edit.newString };
+      const replacement =
+        opts.preserve && !blankDeletion
+          ? opts.preserve.transform(synthesized, span.start, content, {
+              original: initial,
+              start: span.origStart,
+            })
+          : edit.newString;
+      const commentedLength =
+        opts.preserve && !blankDeletion ? opts.preserve.lastInsertion() : undefined;
+      if (replacement === '') {
+        // Only when the replacement is STILL empty after the hook: under preservation the old
+        // lines come back %-commented and nothing is deleted, so the terminators stay put.
+        // An empty cut is not an error: it is a blank first line whose terminator an earlier
+        // deletion in this call already took (deleting the unterminated last line after it), so
+        // the line is already gone and there is nothing left to splice. Whether the edit is a
+        // no-op was decided against `initial`, where it was not one.
+        const cut = deletion();
+        if (cut.end > cut.start) {
+          splice(i, cut.start, cut.end, '', span.start, span.prev);
+          cutPoints.push(cut.start);
+        }
+        return;
+      }
+      splice(i, span.start, span.end, replacement);
+      // Never read for a blank-line deletion: the hook was not called, so it would report the
+      // previous edit's terminator.
+      if (!blankDeletion) recordRestored(span.start);
+      if (commentedLength !== undefined) {
+        // No intersection check is needed against `preserved` here: an earlier splice that
+        // touched this range — its span, or the terminator after it, which it owns — would
+        // have thrown (a blank line's empty span included, since it owns its terminator), and
+        // one entirely before it inserted its whole replacement (preserved block included)
+        // before this range's shifted start.
+        pushPreserved(i, span.start, span.start + commentedLength, true);
+      }
+      return;
+    }
+    if (edit.oldString === edit.newString) {
+      throw new Error(`Edit ${i + 1}: oldString and newString are identical.`);
+    }
+    // A filter is only consulted for an edit that asked for it. Asking for it with no filter
+    // wired in is refused rather than quietly downgraded to "replace everything" — the flag
+    // exists to protect text, so ignoring it is the one failure mode that must never be silent.
+    let excludeMatch: ((content: string, start: number, end: number) => boolean) | undefined;
+    if (edit.excludeComments) {
+      if (!opts.excludeMatch) {
+        throw new Error(
+          `Edit ${i + 1}: excludeComments was requested but this call supplied no comment filter.`,
+        );
+      }
+      excludeMatch = opts.excludeMatch;
+    }
+    const count = countOccurrences(content, edit.oldString);
+    if (count === 0) {
+      throw new Error(`Edit ${i + 1}: oldString not found in ${relPath}.`);
+    }
+    if (count > 1 && !edit.replaceAll && !excludeMatch) {
+      // "set replaceAll" is fine advice for plain ambiguity, but if one of the K occurrences
+      // sits inside a block an earlier edit in this same call already preserved (commented
+      // out), it is the one piece of advice that would silently rewrite that byte-exact block.
+      // Find occurrences the same way `countOccurrences` does (non-overlapping, left to right)
+      // and check each against the ledger before choosing which message to give.
+      let occursInPreserved = false;
+      if (preserved.length > 0) {
+        let idx = content.indexOf(edit.oldString);
+        while (idx !== -1 && !occursInPreserved) {
+          const end = idx + edit.oldString.length;
+          occursInPreserved = preserved.some((range) => idx < range.end && end > range.start);
+          idx = content.indexOf(edit.oldString, idx + edit.oldString.length);
+        }
+      }
+      throw new Error(
+        occursInPreserved
+          ? `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, at least once inside text preserved (commented out) by an earlier edit in this same call; add more surrounding context so it matches only the live text, if any live occurrence remains.`
+          : `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
+      );
+    }
+    if (edit.replaceAll) {
+      // Splice one occurrence at a time (never String.prototype.replace / split-join with a
+      // pattern-interpreting replacement — see the non-replaceAll branch below for why) so
+      // each individual splice's offset is known and the preserved-range ledger can be shifted
+      // per occurrence, left to right. A replaceAll edit is never routed through opts.preserve
+      // (there is no single match position to comment above, and rewriting inside an earlier
+      // preserved comment is documented, intended behaviour), but it still changes the file's
+      // length at every occurrence, so the ledger must move regardless.
+      let replaced = 0;
+      let skippedInComments = 0;
+      let from = 0;
+      for (;;) {
+        const idx = content.indexOf(edit.oldString, from);
+        if (idx === -1) break;
+        const spliceEnd = idx + edit.oldString.length;
+        // Asked per occurrence against the *current* content, not from a mask computed once:
+        // an earlier replacement on the same line can introduce (or remove) a comment, and a
+        // stale mask would then decide this occurrence on bytes that are no longer there.
+        if (excludeMatch?.(content, idx, spliceEnd)) {
+          skippedInComments++;
+          from = spliceEnd;
+          continue;
+        }
+        splice(i, idx, spliceEnd, edit.newString);
+        replaced++;
+        from = idx + edit.newString.length;
+      }
+      if (excludeMatch) {
+        if (replaced === 0) {
+          throw new Error(
+            `Edit ${i + 1}: all ${skippedInComments} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
+          );
+        }
+        commentMatches.push({ edit: i + 1, replaced, skippedInComments });
+      }
+      return;
+    }
+    let matchIndex: number;
+    if (excludeMatch) {
+      // Uniqueness is judged over the *live* occurrences only — the whole point of the flag is
+      // that the commented ones are not candidates. Enumerated the same way `countOccurrences`
+      // counts: non-overlapping, left to right.
+      const live: number[] = [];
+      let idx = content.indexOf(edit.oldString);
+      while (idx !== -1) {
+        const end = idx + edit.oldString.length;
+        if (!excludeMatch(content, idx, end)) live.push(idx);
+        idx = content.indexOf(edit.oldString, end);
+      }
+      const inComments = count - live.length;
+      if (live.length === 0) {
+        throw new Error(
+          `Edit ${i + 1}: all ${count} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
+        );
+      }
+      if (live.length > 1) {
+        throw new Error(
+          `Edit ${i + 1}: oldString matches ${live.length} times outside comments in ${relPath} (${inComments} further match(es) are inside comments and were not counted); add more surrounding context for a unique match, or set replaceAll.`,
+        );
+      }
+      matchIndex = live[0] as number;
+      commentMatches.push({ edit: i + 1, replaced: 1, skippedInComments: inComments });
+    } else {
+      matchIndex = content.indexOf(edit.oldString);
+    }
+    const matchEnd = matchIndex + edit.oldString.length;
+    if (opts.preserve) {
+      const intersectsPreserved = preserved.some(
+        (range) => matchIndex < range.end && matchEnd > range.start,
+      );
+      if (intersectsPreserved) {
+        throw new Error(
+          `Edit ${i + 1}: oldString only matches text preserved (commented out) by an earlier edit in this same call, not the live document; the live occurrence was already replaced by that edit.`,
+        );
+      }
+    }
+    const origin: MatchOrigin = {
+      original: initial,
+      start: toInitial(matchIndex, true),
+      end: toInitial(matchEnd),
+    };
+    const newString = opts.preserve
+      ? opts.preserve.transform(edit, matchIndex, content, undefined, origin)
+      : edit.newString;
+    const commentedLength = opts.preserve ? opts.preserve.lastInsertion() : undefined;
+    // Not `content.replace(edit.oldString, newString)`: String.prototype.replace treats a
+    // string *replacement* argument specially — $$, $&, $`, $', $1 etc. are substitution
+    // patterns, not literal text — and LaTeX is full of literal `$`. That corrupts both a
+    // caller-supplied newString containing e.g. `$$100$$` and, since preservation generates
+    // the replacement text server-side, text the user never typed at all. Splice at the
+    // already-computed matchIndex instead so newString lands byte-exact, unconditionally.
+    splice(i, matchIndex, matchEnd, newString);
+    if (opts.preserve) recordRestored(matchIndex);
+    if (commentedLength !== undefined) {
+      // Whether a '\n' now after the match was the one after it in the file as found — the
+      // CRLF a trailing '\r' split, which the hook judges there — or one an earlier edit of
+      // this call moved up against it. Judged where the hook judged it (`judgedAt`'s rule).
+      const placed =
+        origin.start !== null &&
+        origin.end !== null &&
+        initial.slice(origin.start, origin.end) === edit.oldString;
+      pushPreserved(
+        i,
+        matchIndex,
+        matchIndex + commentedLength,
+        commentedLength < newString.length || !placed || initial[origin.end as number] === '\n',
+      );
+    }
+  });
+  for (const point of [...cutPoints].sort((a, b) => b - a)) unfuse(point);
+  assertBlocksStillComments();
+  return { content, commentMatches };
+}
+
 /** Sandboxed file access within a project's clone directory. */
 export class FileService {
   /** Tracks the last-seen content of each file so mutations can detect out-of-band edits. */
@@ -1084,663 +1765,10 @@ export class FileService {
           'first, or replace it deliberately with write_file and its full content.',
       );
     }
-    let content = original;
-    // The file as the call found it: what every line range, and every judgment about one, refers to.
-    const initial: string = original;
-    // [start, end) ranges, in `content`'s *current* coordinate space, of every preserved comment
-    // block spliced in so far by this call. Owned here — not by `opts.preserve` — because this is
-    // the only place that knows every splice offset a call produces, including each individual
-    // occurrence a `replaceAll` edit touches; a hook that owned this ledger itself could only ever
-    // shift it for the non-`replaceAll` edits it was actually called for, leaving it stale the
-    // moment a `replaceAll` edit spliced text without going through the hook at all.
-    //
-    // Each block also carries what the end-of-call check (`assertBlocksStillComments`) needs: the
-    // edit that preserved it (`edit`), the last edit whose splice reached the byte just past it
-    // (`lastTouch`), and where the `'\n'` sits that a block ending in its own bare `'\r'` was
-    // DESIGNED to pair with (`pairedNl`: a CRLF the match split, or a separator the hook wrote),
-    // or `null` — kept in step by every splice, and dropped when a splice removes it.
-    const preserved: PreservedBlock[] = [];
-    /**
-     * Every splice this call has made, in order, as `[start, removed, inserted]` in the
-     * coordinates of the content at that moment — enough for `toInitial` to carry an offset in the
-     * current content back into `initial`, where a string edit's preservation separator is judged
-     * (see `MatchOrigin`).
-     */
-    const spliceLog: [number, number, number][] = [];
-    /**
-     * Where offset `p` of the current content sat in `initial`, or `null` when it lies strictly
-     * inside text a splice inserted. An offset AT a splice's start stays where it is: for a pure
-     * removal that is the side before the removed text — so the end of a match whose terminator a
-     * later-listed deletion already took still lands on that terminator in `initial`.
-     *
-     * With `byte`, `p` names the character at `p` rather than the boundary before it, and one a
-     * splice inserted (the first included) is `null`: the answer to "did the file have this byte
-     * before the call".
-     */
-    const toInitial = (p: number, byte = false): number | null => {
-      let at = p;
-      for (let k = spliceLog.length - 1; k >= 0; k--) {
-        const [start, removed, inserted] = spliceLog[k] as [number, number, number];
-        if (byte ? at < start : at <= start) continue;
-        if (at < start + inserted) return null;
-        at += removed - inserted;
-      }
-      return at;
-    };
-    /**
-     * Where each range deletion in this call cut the text, in current coordinates, kept in step
-     * by `splice` (a later splice that removes text on both sides of one drops it). Checked by
-     * `unfuse` once every edit has applied — see there for why not at the cut itself.
-     */
-    const cutPoints: number[] = [];
-    /**
-     * [start, end) ranges, in current coordinates, of the line terminators a preservation hook
-     * put back after a replacement (`lastRestoredTerminator`), kept in step by `splice` (one a
-     * later splice overwrites is dropped). They stand in for the terminator the match consumed —
-     * an original byte — so `unfuse` may rewrite them too; without that, a deletion leaving a
-     * put-back bare `\r` before a blank line's `\n` merged the blank line away, where spelling
-     * the same edit without its `\r` (which then stays in the file, original) kept it.
-     */
-    const restored: { start: number; end: number }[] = [];
-    /**
-     * Adjust every recorded range for a splice of `[spliceStart, spliceEnd)` (pre-splice
-     * coordinates) that changed the content's length by `delta`. A `replaceAll` occurrence can
-     * land anywhere relative to a preserved range — including, intentionally, *inside* one
-     * (rewriting a preserved comment is documented behaviour) — or *straddling* one of its
-     * boundaries, which a range can never survive as a single shifted interval: whichever side
-     * the splice consumed is gone, replaced by caller-authored text that was never part of the
-     * comment this ledger is protecting. So this rebuilds the list rather than mutating each
-     * range in place, run unconditionally (a zero-`delta` splice still overwrites bytes and can
-     * still straddle a boundary, even though nothing after it needs to move). Cases:
-     *
-     *  - Entirely after the range (`spliceStart >= range.end`): untouched — nothing before it
-     *    moved.
-     *  - Entirely before the range (`spliceEnd <= range.start`): the whole range slides by
-     *    `delta`, same as any other coordinate after the splice point.
-     *  - The splice fully contains the range (`spliceStart <= range.start && spliceEnd >=
-     *    range.end`): every byte of the range was overwritten by caller text — drop it, it is no
-     *    longer preserved at all.
-     *  - The range fully contains the splice (`spliceStart >= range.start && spliceEnd <=
-     *    range.end`): a `replaceAll` rewriting part of a preserved comment, kept as one
-     *    contiguous span — its `start` is unaffected (the splice began at or after it) and its
-     *    `end` grows/shrinks by `delta`.
-     *  - The splice straddles the range's *start* (`spliceStart < range.start`, so it must end
-     *    at or before `range.end`): it consumed the range's leading bytes (and possibly text
-     *    before them too), so no prefix of the original survives — only the suffix after the
-     *    splice remains preserved, as `[spliceEnd + delta, range.end + delta)`.
-     *  - The splice straddles the range's *end* (the remaining case: it starts inside the range
-     *    but ends past it): only the prefix before the splice point is still preserved, as
-     *    `[range.start, spliceStart)` — it needs no shift, since it sits entirely before the
-     *    splice.
-     *
-     * `editIndex` is recorded on every range this splice starts exactly at the end of
-     * (`lastTouch`), so the end-of-call check can name the edit that took a block's line break.
-     */
-    const shiftPreserved = (
-      spliceStart: number,
-      spliceEnd: number,
-      delta: number,
-      editIndex: number,
-    ) => {
-      const next: PreservedBlock[] = [];
-      for (const range of preserved) {
-        // The paired '\n' is a single byte: gone if the splice removed it, moved if it sat after.
-        const pairedNl =
-          range.pairedNl === null || range.pairedNl < spliceStart
-            ? range.pairedNl
-            : range.pairedNl < spliceEnd
-              ? null
-              : range.pairedNl + delta;
-        // A splice starting exactly at the block's end reached the byte just past it: the line
-        // break that ends it, unless the block carries its own. One starting inside the block and
-        // running to or past its end rewrote the block's own last bytes — only a `replaceAll` can,
-        // the documented rewrite-inside-a-comment case — and `rewrittenTo` then marks where that
-        // replacement text ends, so the end-of-call check can tell a line break the caller wrote
-        // into it from a comment line that now runs on into text after it. Kept in step like any
-        // offset: a later splice across it leaves it at the end of that splice's own text.
-        const rewrites = spliceStart < range.end && spliceEnd >= range.end;
-        const movedTo =
-          range.rewrittenTo === null || spliceStart >= range.rewrittenTo
-            ? range.rewrittenTo
-            : spliceEnd <= range.rewrittenTo
-              ? range.rewrittenTo + delta
-              : spliceEnd + delta;
-        const kept = {
-          ...range,
-          pairedNl,
-          lastTouch: spliceStart === range.end || rewrites ? editIndex : range.lastTouch,
-          rewrittenTo: rewrites ? spliceEnd + delta : movedTo,
-        };
-        if (spliceStart >= range.end) {
-          next.push(kept);
-        } else if (spliceEnd <= range.start) {
-          next.push({ ...kept, start: range.start + delta, end: range.end + delta });
-        } else if (spliceStart <= range.start && spliceEnd >= range.end) {
-          // Fully overwritten — drop it.
-        } else if (spliceStart >= range.start && spliceEnd <= range.end) {
-          next.push({ ...kept, end: range.end + delta });
-        } else if (spliceStart < range.start) {
-          next.push({ ...kept, start: spliceEnd + delta, end: range.end + delta });
-        } else {
-          next.push({ ...kept, end: spliceStart });
-        }
-      }
-      preserved.length = 0;
-      preserved.push(...next);
-    };
-    /**
-     * Every line range in this call, resolved **up front against the content as the call found
-     * it** — the bytes `read_file` handed the caller — and thereafter kept in `content`'s current
-     * coordinate space by `splice` below, exactly like the preserved-block ledger.
-     *
-     * Resolving up front is what makes a range mean the same thing wherever it sits in the
-     * `edits` array: the caller's line numbers came from a read of the file before this call, so
-     * an earlier edit that adds or removes lines must not silently slide a later range onto
-     * different text. Keeping the resolved spans shifted (rather than re-deriving line numbers
-     * against the mutated content) means a range still covers exactly the original bytes it
-     * named, and an earlier edit that *touches* those bytes is refused outright — see `splice`.
-     *
-     * `term` is the length of the line terminator that ends `endLine` (0 for an unterminated last
-     * line). The range **owns** it for the overlap check even though it is not part of the span
-     * replaced: a deletion (`newString: ''`, see below) takes it, so an earlier edit that rewrote
-     * it would leave the deletion eating someone else's text — and without it a blank line's
-     * empty span `[r, r)` owned nothing at all, so a splice starting at `r` slipped past the check
-     * and landed the range edit in front of whatever that splice inserted.
-     *
-     * `origStart` is `start` before any shift: where the range sat in `initial`, handed to the
-     * preservation hook (`RangeMatch`) so it judges the range in the file the caller read.
-     *
-     * `prev` is the length of the terminator that ends `startLine - 1` in `initial` (0 for line
-     * 1) — what a deletion of an unterminated last line takes — or `null` once a splice has
-     * touched those bytes, after which it is measured in the current content instead. Measuring
-     * it there unconditionally was wrong in a file mixing bare `\r` and `\n`: an earlier deletion
-     * can leave one line's bare `\r` right before the next line's `\n`, where the two read as a
-     * single `\r\n`, and taking "the terminator before" then ate the `\r` of a line nobody
-     * deleted — in one order of the edits and not the other.
-     *
-     * The no-op guard runs here too, against `initial`, never at apply time: whether a deletion
-     * is a no-op must not depend on which edit ran first. Deleting an unterminated last line
-     * takes the terminator before it — possibly a blank line's own — and a blank-line deletion
-     * that ran afterwards found nothing left to take and was refused as "identical", while the
-     * same two edits in the other order succeeded. A blank line with an empty `newString` is a
-     * deletion of that line and its terminator, so it is identical only when the file is empty
-     * (a blank line in any other file is always terminated: `splitLines` counts no phantom last
-     * line).
-     */
-    const pendingRanges = new Map<
-      number,
-      Span & { term: number; origStart: number; prev: number | null }
-    >();
-    edits.forEach((edit, i) => {
-      if (!isRangeEdit(edit)) return;
-      if (edit.endLine < edit.startLine) {
-        throw new Error(
-          `Edit ${i + 1}: startLine ${edit.startLine} is after endLine ${edit.endLine}; the range is 1-based and endLine is inclusive.`,
-        );
-      }
-      const span = lineSpan(content, edit.startLine, edit.endLine);
-      if (span === null) {
-        throw new Error(
-          `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} are outside ${relPath}, which has ${splitLines(content).length} line(s). Line numbers are 1-based and endLine is inclusive.`,
-        );
-      }
-      const oldText = initial.slice(span.start, span.end);
-      if (oldText === edit.newString && !(oldText === '' && initial !== '')) {
-        throw new Error(
-          `Edit ${i + 1}: lines ${edit.startLine}-${edit.endLine} and newString are identical.`,
-        );
-      }
-      pendingRanges.set(i, {
-        ...span,
-        term: terminatorLengthAt(initial, span.end),
-        origStart: span.start,
-        prev: terminatorLengthBefore(initial, span.start),
-      });
+    const { content, commentMatches } = applyEditsToContent(original, relPath, edits, {
+      excludeMatch: opts.excludeMatch,
+      preserve: opts.preserve,
     });
-    /**
-     * The one place content is ever spliced, so both ledgers move on **every** splice — the
-     * preserved-comment ranges and the not-yet-applied line ranges alike. A `replaceAll` edit
-     * runs no preservation hook but still changes the file's length at every occurrence, and a
-     * ledger that only moved for the edits that went through the hook was exactly the bug that
-     * made preserved ranges go stale; routing every splice through one function is what keeps
-     * that structural rather than remembered.
-     *
-     * It also enforces the no-silent-overlap rule: if this splice would touch bytes some *other*
-     * edit's line range covers, the whole call fails. The alternative — applying it and letting
-     * the range shift — would rewrite lines the caller never named, which is precisely the
-     * silent corruption a range edit invites. A range covers its span **plus the terminator after
-     * it** here (see `term` above), and the test handles empty intervals explicitly — see
-     * `touches`.
-     *
-     * `checkFrom` narrows only the overlap check, never the splice: a deletion of an unterminated
-     * last line takes the terminator *before* it, which is the previous line's — possibly owned by
-     * a pending range for that line. Taking it is exactly right (deleting the last line leaves the
-     * new last line unterminated, as the file's last line was), and that pending range's span is
-     * untouched, so the check starts at the deleted line itself; the owner simply loses its `term`.
-     *
-     * `prevAtStart` is what a range DELETION knows about the bytes just before `start`: the
-     * length of the terminator ending there, in `initial` (its own `prev`). Once the deleted
-     * lines are gone, those bytes are what precedes the range the deletion ended against, so that
-     * range's `prev` is carried over instead of being lost to the fallback measurement.
-     */
-    const splice = (
-      editIndex: number,
-      start: number,
-      end: number,
-      replacement: string,
-      checkFrom: number = start,
-      prevAtStart: number | null = null,
-    ) => {
-      for (const [j, range] of pendingRanges) {
-        if (j === editIndex) continue;
-        if (touches(checkFrom, end, range.start, range.end + range.term)) {
-          throw new Error(
-            `Edit ${editIndex + 1} changes text that edit ${j + 1}'s line range covers. Line numbers refer to ${relPath} as it was before this call, so two edits in one call may not touch the same text; split them into separate calls (and re-read the file in between, since the line numbers move).`,
-          );
-        }
-      }
-      content = content.slice(0, start) + replacement + content.slice(end);
-      spliceLog.push([start, end - start, replacement.length]);
-      const delta = replacement.length - (end - start);
-      shiftPreserved(start, end, delta, editIndex);
-      for (let j = cutPoints.length - 1; j >= 0; j--) {
-        const point = cutPoints[j] as number;
-        if (point <= start) continue;
-        if (point >= end) cutPoints[j] = point + delta;
-        else cutPoints.splice(j, 1);
-      }
-      for (let j = restored.length - 1; j >= 0; j--) {
-        const range = restored[j] as { start: number; end: number };
-        if (start >= range.end) continue;
-        if (end <= range.start)
-          restored[j] = { start: range.start + delta, end: range.end + delta };
-        else restored.splice(j, 1);
-      }
-      for (const [j, range] of pendingRanges) {
-        if (j === editIndex) continue;
-        if (end <= range.start) {
-          // Only a range entirely *after* the splice moves; one entirely before is unaffected,
-          // and an overlapping one already threw above. A splice reaching into the terminator
-          // just before the range (the previous line's) makes `prev` unknowable from `initial`.
-          const prev =
-            replacement === '' && end === range.start
-              ? prevAtStart
-              : range.prev !== null && end > range.start - range.prev
-                ? null
-                : range.prev;
-          if (delta !== 0 || prev !== range.prev) {
-            pendingRanges.set(j, {
-              ...range,
-              start: range.start + delta,
-              end: range.end + delta,
-              prev,
-            });
-          }
-        } else if (start < checkFrom && start === range.end) {
-          // The one exemption `checkFrom` grants: this splice took the terminator that ended
-          // range j's last line. Its span stands; it just no longer has a terminator to own.
-          pendingRanges.set(j, { ...range, term: 0 });
-        }
-      }
-    };
-    /**
-     * Run once every edit has applied, at each point a range deletion cut the text. When a cut
-     * leaves a bare `\r` (the end of the line before) right in front of a `\n` (a blank line
-     * after), the two read as ONE CRLF: the blank line merges into the line before, so a line
-     * nobody deleted disappears with the deleted ones. The `\r` becomes a `\n` instead — the
-     * terminator the blank line after it already uses, so never a type the file lacks — and so
-     * does every bare `\r` just before it that would in turn fuse with the `\n` it now meets (a
-     * run of CR-terminated blank lines). The line count then drops by exactly the lines deleted.
-     *
-     * Deferred to the end, not run at the cut, because whether the two stay adjacent is up to
-     * the edits still pending — a later deletion of the blank line, or of an unterminated last
-     * line that takes its `\n`, leaves nothing to fuse with — and deciding early made the bytes
-     * depend on the order of the edits. At the end every deletion of a run has happened, so the
-     * answer is the same whichever of them completed it. Cut points are visited from the last
-     * to the first, since a walk only ever moves left.
-     *
-     * Only a byte the file had before the call is ever rewritten (`toInitial(k, true)`), or a
-     * terminator a preservation hook put back in place of one the match consumed (`restored`):
-     * never a preserved block, which must stay the bytes that were there, nor text a caller
-     * supplied. An in-place, same-length change, made after the last splice, so no ledger is
-     * involved.
-     */
-    const unfuse = (at: number) => {
-      if (content[at - 1] !== '\r' || content[at] !== '\n') return;
-      for (let k = at - 1; k >= 0 && content[k] === '\r'; k--) {
-        const putBack = restored.some((range) => k >= range.start && k < range.end);
-        if (toInitial(k, true) === null && !putBack) return;
-        content = content.slice(0, k) + '\n' + content.slice(k + 1);
-      }
-    };
-    /** Record where the hook's latest `transform()` put a terminator back, once its replacement
-     * has been spliced in at `at`. Call only right after an edit that ran the hook. */
-    const recordRestored = (at: number) => {
-      const put = opts.preserve?.lastRestoredTerminator?.();
-      if (put !== undefined && put.length > 0) {
-        restored.push({ start: at + put.offset, end: at + put.offset + put.length });
-      }
-    };
-    /**
-     * Enter a block edit `editIndex` just spliced in at `[start, end)`. `pairedByDesign` says
-     * whether a `'\n'` right after it now is one it was meant to meet: inside the replacement the
-     * hook returned (a separator), or the byte that followed the match in the file as found — a
-     * CRLF whose `'\r'` the match took. Only then is a block ending in its own bare `'\r'`
-     * allowed to be followed by a `'\n'` (see `assertBlocksStillComments`).
-     */
-    const pushPreserved = (
-      editIndex: number,
-      start: number,
-      end: number,
-      pairedByDesign: boolean,
-    ) => {
-      const paired = content[end - 1] === '\r' && content[end] === '\n' && pairedByDesign;
-      preserved.push({
-        start,
-        end,
-        edit: editIndex,
-        lastTouch: undefined,
-        rewrittenTo: null,
-        pairedNl: paired ? end : null,
-      });
-    };
-    /**
-     * Run once every edit has applied (and `unfuse` has run): refuse the call when a block an edit
-     * preserved is no longer a comment of exactly the lines it was. The `%` makes a comment only
-     * up to the end of its line, so the line break that ends a block is part of what makes it one
-     * — and two later edits could take that away without matching a byte of the block itself,
-     * which is all the match-time ledger check can see:
-     *
-     *  - A block that does not end in its own terminator is ended by the byte after it (the
-     *    line's terminator, or a separator the hook wrote). A later edit that removes that byte and
-     *    leaves text in its place — `'\nQ'` → `' tail'` after `'P'` was preserved as `% P` — puts
-     *    that live text on the comment's line, where LaTeX silently drops it.
-     *  - A block that ends in its own bare `'\r'` (the match took its line's terminator) and now
-     *    meets a `'\n'` it was not designed to pair with — a deletion of the blank line after it
-     *    brought the next blank line's `'\n'` up — reads as one CRLF with it: that blank line (a
-     *    `\par`) disappears into the comment. For an original `'\r'` `unfuse` rewrites it to
-     *    `'\n'`; a preserved block's bytes are the bytes that were there and are not rewritten.
-     *
-     * Refused rather than repaired: putting a line break back would be text nobody asked for, and
-     * undoing the preservation would silently drop what the caller's mode promised. The refusal
-     * is loud, the file is untouched (nothing is written until every edit succeeds), and the way
-     * out is one step — the edits in separate calls, where the second sees the comment and the
-     * block's bytes are the file's own. Judged on the final content, not per splice, so an edit
-     * later in the call that puts a line break back is not refused for the moment in between,
-     * and whether the fusion stands does not depend on which of the deletions ran last — the same
-     * reason `unfuse` is deferred.
-     *
-     * A block whose own last bytes a `replaceAll` rewrote (`rewrittenTo`) — rewriting inside a
-     * preserved comment is what a `replaceAll` is documented to do — is judged on where its
-     * comment line now ends: fine when the caller's replacement text itself carries the line
-     * break, or puts nothing on the line at all; refused when the line runs through the end of that
-     * text, since whatever the replacement put there (it took live text with it) or whatever
-     * follows it is then on the comment line. Only the first rule applies to such a block: its
-     * trailing `'\r'`, if any, is the caller's now, not a byte this call must keep.
-     */
-    const assertBlocksStillComments = () => {
-      for (const block of preserved) {
-        if (block.end <= block.start) continue;
-        const last = content[block.end - 1];
-        const next = content[block.end];
-        const endsLine = (ch: string | undefined) => ch === '\n' || ch === '\r';
-        // Where the comment line the block ends on now ends: the first line break (or EOF) at or
-        // after the block's end.
-        let lineEnd = block.end;
-        while (lineEnd < content.length && !endsLine(content[lineEnd])) lineEnd++;
-        const runsOn =
-          !endsLine(last) &&
-          lineEnd > block.end &&
-          (block.rewrittenTo === null || lineEnd >= block.rewrittenTo);
-        if (runsOn) {
-          const who = block.lastTouch === undefined ? 'An edit' : `Edit ${block.lastTouch + 1}`;
-          throw new Error(
-            `${who} removes the line break that ends the text edit ${block.edit + 1} preserved (commented out) in this same call, so the text after it would continue on that comment line, where LaTeX ignores it. Make the edits in separate calls (re-read the file in between, so the second one sees the comment), or turn preservation off for this call (preserveOriginal: false).`,
-          );
-        }
-        if (
-          block.rewrittenTo === null &&
-          last === '\r' &&
-          next === '\n' &&
-          block.pairedNl !== block.end
-        ) {
-          throw new Error(
-            `Another edit in this same call leaves a line break right after the text edit ${block.edit + 1} preserved (commented out), which ends in a bare carriage return: the two would read as one CRLF, and the blank line after the block (a paragraph break in LaTeX) would disappear into it. Make the edits in separate calls (re-read the file in between), or turn preservation off for this call (preserveOriginal: false).`,
-          );
-        }
-      }
-    };
-    const commentMatches: CommentMatchReport[] = [];
-    edits.forEach((edit, i) => {
-      if (isRangeEdit(edit)) {
-        // Resolved above and shifted by every splice since, so it still covers exactly the lines
-        // the caller named in the file they read. Drop it from the ledger first: it is about to
-        // be consumed, and `splice` must not refuse this edit for overlapping its own range.
-        const span = pendingRanges.get(i);
-        /* c8 ignore next 3 -- unreachable: every range edit got an entry in the pass above. */
-        if (span === undefined) {
-          throw new Error(`Edit ${i + 1}: internal error — line range was never resolved.`);
-        }
-        pendingRanges.delete(i);
-        const oldString = content.slice(span.start, span.end);
-        /**
-         * What a deletion removes: the lines AND a terminator, so they disappear rather than
-         * collapsing into one blank line (a `\par` in LaTeX). The terminator after `endLine` when
-         * there is one — owned by this range, so no earlier edit can have rewritten it — else,
-         * for an unterminated last line, the one before `startLine`, so the new last line is left
-         * unterminated as the old one was. That one is taken only when it is not part of a block
-         * an earlier edit preserved: eating a preserved block's newline would make it no longer
-         * the bytes that were there, so the lines' text goes and that newline stays.
-         */
-        const deletion = (): { start: number; end: number } => {
-          if (span.term > 0) return { start: span.start, end: span.end + span.term };
-          const before = span.prev ?? terminatorLengthBefore(content, span.start);
-          const from = span.start - before;
-          if (before > 0 && !preserved.some((r) => from < r.end && span.start > r.start)) {
-            return { start: from, end: span.end };
-          }
-          return { start: span.start, end: span.end };
-        };
-        // A blank line named with an empty newString is a deletion of that line, not a no-op
-        // (the one no-op shape, an empty file, was refused when the range was resolved).
-        const blankDeletion = oldString === '' && edit.newString === '';
-        // A range edit is line-aligned by construction, is never a `replaceAll`, and has exactly
-        // one position — so it is preserved through the *same* hook as a unique string edit,
-        // with the `oldString` the file actually holds there. Nothing about preservation is
-        // re-decided here; `createPreserveTransform` still owns the whole judgment, and this
-        // synthesized edit reaches it only after the identical-text guard (run when the range
-        // was resolved), so the hook still never sees a no-op — which is also why a blank-line
-        // deletion skips it: there is no text on that line to preserve. The `RangeMatch` tells
-        // the hook this `oldString` is whole lines — see there for why it cannot tell alone.
-        const synthesized: EditOp = { oldString, newString: edit.newString };
-        const replacement =
-          opts.preserve && !blankDeletion
-            ? opts.preserve.transform(synthesized, span.start, content, {
-                original: initial,
-                start: span.origStart,
-              })
-            : edit.newString;
-        const commentedLength =
-          opts.preserve && !blankDeletion ? opts.preserve.lastInsertion() : undefined;
-        if (replacement === '') {
-          // Only when the replacement is STILL empty after the hook: under preservation the old
-          // lines come back %-commented and nothing is deleted, so the terminators stay put.
-          // An empty cut is not an error: it is a blank first line whose terminator an earlier
-          // deletion in this call already took (deleting the unterminated last line after it), so
-          // the line is already gone and there is nothing left to splice. Whether the edit is a
-          // no-op was decided against `initial`, where it was not one.
-          const cut = deletion();
-          if (cut.end > cut.start) {
-            splice(i, cut.start, cut.end, '', span.start, span.prev);
-            cutPoints.push(cut.start);
-          }
-          return;
-        }
-        splice(i, span.start, span.end, replacement);
-        // Never read for a blank-line deletion: the hook was not called, so it would report the
-        // previous edit's terminator.
-        if (!blankDeletion) recordRestored(span.start);
-        if (commentedLength !== undefined) {
-          // No intersection check is needed against `preserved` here: an earlier splice that
-          // touched this range — its span, or the terminator after it, which it owns — would
-          // have thrown (a blank line's empty span included, since it owns its terminator), and
-          // one entirely before it inserted its whole replacement (preserved block included)
-          // before this range's shifted start.
-          pushPreserved(i, span.start, span.start + commentedLength, true);
-        }
-        return;
-      }
-      if (edit.oldString === edit.newString) {
-        throw new Error(`Edit ${i + 1}: oldString and newString are identical.`);
-      }
-      // A filter is only consulted for an edit that asked for it. Asking for it with no filter
-      // wired in is refused rather than quietly downgraded to "replace everything" — the flag
-      // exists to protect text, so ignoring it is the one failure mode that must never be silent.
-      let excludeMatch: ((content: string, start: number, end: number) => boolean) | undefined;
-      if (edit.excludeComments) {
-        if (!opts.excludeMatch) {
-          throw new Error(
-            `Edit ${i + 1}: excludeComments was requested but this call supplied no comment filter.`,
-          );
-        }
-        excludeMatch = opts.excludeMatch;
-      }
-      const count = countOccurrences(content, edit.oldString);
-      if (count === 0) {
-        throw new Error(`Edit ${i + 1}: oldString not found in ${relPath}.`);
-      }
-      if (count > 1 && !edit.replaceAll && !excludeMatch) {
-        // "set replaceAll" is fine advice for plain ambiguity, but if one of the K occurrences
-        // sits inside a block an earlier edit in this same call already preserved (commented
-        // out), it is the one piece of advice that would silently rewrite that byte-exact block.
-        // Find occurrences the same way `countOccurrences` does (non-overlapping, left to right)
-        // and check each against the ledger before choosing which message to give.
-        let occursInPreserved = false;
-        if (preserved.length > 0) {
-          let idx = content.indexOf(edit.oldString);
-          while (idx !== -1 && !occursInPreserved) {
-            const end = idx + edit.oldString.length;
-            occursInPreserved = preserved.some((range) => idx < range.end && end > range.start);
-            idx = content.indexOf(edit.oldString, idx + edit.oldString.length);
-          }
-        }
-        throw new Error(
-          occursInPreserved
-            ? `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, at least once inside text preserved (commented out) by an earlier edit in this same call; add more surrounding context so it matches only the live text, if any live occurrence remains.`
-            : `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
-        );
-      }
-      if (edit.replaceAll) {
-        // Splice one occurrence at a time (never String.prototype.replace / split-join with a
-        // pattern-interpreting replacement — see the non-replaceAll branch below for why) so
-        // each individual splice's offset is known and the preserved-range ledger can be shifted
-        // per occurrence, left to right. A replaceAll edit is never routed through opts.preserve
-        // (there is no single match position to comment above, and rewriting inside an earlier
-        // preserved comment is documented, intended behaviour), but it still changes the file's
-        // length at every occurrence, so the ledger must move regardless.
-        let replaced = 0;
-        let skippedInComments = 0;
-        let from = 0;
-        for (;;) {
-          const idx = content.indexOf(edit.oldString, from);
-          if (idx === -1) break;
-          const spliceEnd = idx + edit.oldString.length;
-          // Asked per occurrence against the *current* content, not from a mask computed once:
-          // an earlier replacement on the same line can introduce (or remove) a comment, and a
-          // stale mask would then decide this occurrence on bytes that are no longer there.
-          if (excludeMatch?.(content, idx, spliceEnd)) {
-            skippedInComments++;
-            from = spliceEnd;
-            continue;
-          }
-          splice(i, idx, spliceEnd, edit.newString);
-          replaced++;
-          from = idx + edit.newString.length;
-        }
-        if (excludeMatch) {
-          if (replaced === 0) {
-            throw new Error(
-              `Edit ${i + 1}: all ${skippedInComments} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
-            );
-          }
-          commentMatches.push({ edit: i + 1, replaced, skippedInComments });
-        }
-        return;
-      }
-      let matchIndex: number;
-      if (excludeMatch) {
-        // Uniqueness is judged over the *live* occurrences only — the whole point of the flag is
-        // that the commented ones are not candidates. Enumerated the same way `countOccurrences`
-        // counts: non-overlapping, left to right.
-        const live: number[] = [];
-        let idx = content.indexOf(edit.oldString);
-        while (idx !== -1) {
-          const end = idx + edit.oldString.length;
-          if (!excludeMatch(content, idx, end)) live.push(idx);
-          idx = content.indexOf(edit.oldString, end);
-        }
-        const inComments = count - live.length;
-        if (live.length === 0) {
-          throw new Error(
-            `Edit ${i + 1}: all ${count} occurrence(s) of oldString in ${relPath} are inside comments, and excludeComments is set, so there is nothing to replace.`,
-          );
-        }
-        if (live.length > 1) {
-          throw new Error(
-            `Edit ${i + 1}: oldString matches ${live.length} times outside comments in ${relPath} (${inComments} further match(es) are inside comments and were not counted); add more surrounding context for a unique match, or set replaceAll.`,
-          );
-        }
-        matchIndex = live[0] as number;
-        commentMatches.push({ edit: i + 1, replaced: 1, skippedInComments: inComments });
-      } else {
-        matchIndex = content.indexOf(edit.oldString);
-      }
-      const matchEnd = matchIndex + edit.oldString.length;
-      if (opts.preserve) {
-        const intersectsPreserved = preserved.some(
-          (range) => matchIndex < range.end && matchEnd > range.start,
-        );
-        if (intersectsPreserved) {
-          throw new Error(
-            `Edit ${i + 1}: oldString only matches text preserved (commented out) by an earlier edit in this same call, not the live document; the live occurrence was already replaced by that edit.`,
-          );
-        }
-      }
-      const origin: MatchOrigin = {
-        original: initial,
-        start: toInitial(matchIndex, true),
-        end: toInitial(matchEnd),
-      };
-      const newString = opts.preserve
-        ? opts.preserve.transform(edit, matchIndex, content, undefined, origin)
-        : edit.newString;
-      const commentedLength = opts.preserve ? opts.preserve.lastInsertion() : undefined;
-      // Not `content.replace(edit.oldString, newString)`: String.prototype.replace treats a
-      // string *replacement* argument specially — $$, $&, $`, $', $1 etc. are substitution
-      // patterns, not literal text — and LaTeX is full of literal `$`. That corrupts both a
-      // caller-supplied newString containing e.g. `$$100$$` and, since preservation generates
-      // the replacement text server-side, text the user never typed at all. Splice at the
-      // already-computed matchIndex instead so newString lands byte-exact, unconditionally.
-      splice(i, matchIndex, matchEnd, newString);
-      if (opts.preserve) recordRestored(matchIndex);
-      if (commentedLength !== undefined) {
-        // Whether a '\n' now after the match was the one after it in the file as found — the
-        // CRLF a trailing '\r' split, which the hook judges there — or one an earlier edit of
-        // this call moved up against it. Judged where the hook judged it (`judgedAt`'s rule).
-        const placed =
-          origin.start !== null &&
-          origin.end !== null &&
-          initial.slice(origin.start, origin.end) === edit.oldString;
-        pushPreserved(
-          i,
-          matchIndex,
-          matchIndex + commentedLength,
-          commentedLength < newString.length || !placed || initial[origin.end as number] === '\n',
-        );
-      }
-    });
-    for (const point of [...cutPoints].sort((a, b) => b - a)) unfuse(point);
-    assertBlocksStillComments();
     await writeFile(abs, content, 'utf8');
     this.revisions.record(abs, content);
     await this.notify(
