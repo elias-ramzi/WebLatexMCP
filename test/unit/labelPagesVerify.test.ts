@@ -1391,7 +1391,13 @@ describe('a build that loaded pgfpages refuses every label, on both routes', () 
     expect(msg).toMatch(/removing that load or test lets the lookup run/);
     // The last page is simply the last PDF page: the pointer, not an exemption.
     expect(msg).toContain('LastPage');
-    expect(msg).toMatch(/pass pages: with the PDF's page count/);
+    // With the number in hand: the PDF's own page count, which resolveLabelPages read.
+    expect(plan.pageCount).toBe(4);
+    expect(msg).toMatch(/pass pages: \[4\] \(the PDF's page count\)/);
+    // A plan made without the page count falls back to naming what to pass.
+    const bare = planLabelPages(LABELS, index, null);
+    expect(bare.pageCount).toBeUndefined();
+    expect(labelRefusalMessage(bare, index)).toMatch(/pass pages: with the PDF's page count/);
     // Still points at the way round it.
     expect(msg).toMatch(/extract_text/);
     expect(msg).toContain('pdf_geometry kinds: ["text"]');

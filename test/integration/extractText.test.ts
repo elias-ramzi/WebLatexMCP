@@ -186,6 +186,54 @@ describe('extract_text', () => {
     expect(out.note).toContain('LAST COMPILE');
   });
 
+  it("refuses a /PageLabels lookup whose page the log's shipout record contradicts", async () => {
+    // The tree puts printed page "2" on PDF page 4, but the log shipped PDF page 4 with counter 3.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, {
+      pageLabels: ['i', 'ii', '1', '2', '3'],
+      text: (n) => `text of pdf page ${n}`,
+    });
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{1}{2}}\n',
+      'This is pdfTeX, Version 3.141592653\n [1] [2] [1] [3] [4]\n',
+    );
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain(
+      'the PDF\'s /PageLabels tree puts printed page "2" on PDF page 4, but the log\'s shipout ' +
+        'record says PDF page 4 was shipped out with page counter 3',
+    );
+    expect(text).not.toContain('text of pdf page');
+  });
+
+  it("resolves that lookup when the log's shipout record agrees", async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, {
+      pageLabels: ['i', 'ii', '1', '2', '3'],
+      text: (n) => `text of pdf page ${n}`,
+    });
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{1}{2}}\n',
+      'This is pdfTeX, Version 3.141592653\n [1] [2] [1] [2] [3]\n',
+    );
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(structuredOf(res).resolvedLabels).toEqual([
+      { label: 'tab:results', printedPage: '2', page: 4 },
+    ]);
+  });
+
   it('refuses a label when neither the .fls nor the .log could be read beside the .aux', async () => {
     // Same resolution as render_pages, so the same refusal: with no record of what the build
     // read, a pgfpages layout that shifted every label a page late cannot be ruled out.

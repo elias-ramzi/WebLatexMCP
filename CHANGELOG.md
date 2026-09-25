@@ -83,7 +83,26 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   spurious (`pgfpages` loaded without `\pgfpagesuselayout`, or only tested with `\IfFileExists`),
   and points at `pages:` with the page count for the last page (`lastpage`'s `LastPage`). The
   refusal itself is unchanged: no document-controlled signal can safely tell a layout in use from
-  a load, and none may resolve a page.
+  a load, and none may resolve a page. When the page count is known the refusal now gives it
+  (`pass pages: [N]`).
+- **`labels:` lookups check the resolved page against the log's shipout record** (#194). TeX
+  writes the page counter into the `.log` as it ships each page out (`[1] [1] [2] …`), so a label
+  whose chosen PDF page was shipped under another counter — a title page that reset the counter
+  under an empty foot a table cell forged, for one — is now refused (`unverifiedPage`) on both
+  routes instead of rendered a page early; so is a folio-route label whose printed page's counter
+  was also shipped on another page that could print the same number (an arabic restart with no
+  label before it). A page that resets the counter under another numbering style — an appendix
+  under `\pagenumbering{alph}` or `{Roman}`, a supplement under `S\arabic{page}` — is recognised
+  by the page number it prints and does not count, so the body's labels resolve as before. The
+  record only ever refuses a page, never chooses one, and is used only when its marks number
+  exactly the PDF's pages: a log that cannot be read, a document that writes mark-shaped text
+  (`\message{[3]}`), or a mark cut in a way the parser will not guess at skips it, and the shapes
+  it closes can then still pass. An extra and a missed mark that line up to the right count can
+  refuse a correct label, or miss a refusal (leaving the route's own answer). One change in
+  behaviour: when the counter restarts for back matter or an appendix that prints **no** page
+  number (`\pagestyle{empty}`, `\pagenumbering{gobble}`), the body labels sharing those counters
+  are now refused on the folio route, where 0.7.1 resolved them — a page that prints nothing
+  cannot be told apart from the label's own. Loading `hyperref` resolves them exactly.
 
 ## [0.7.1] - 2026-09-25
 
