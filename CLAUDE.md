@@ -927,23 +927,32 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   directory is mirrored at `out/`'s root for latexmk's `-cd` only when its **realpath** stays inside
   the project's — judged on the string, a committed `paper -> /` made every compile walk `/` — and
   `mirrorSubdirs` never descends into a linked directory (`Dirent` types), so the walk cannot loop.
-  **A root file under a linked directory is refused** (`refuseLinkedRootDir`, first thing in
-  `stageVariant`, so nothing is staged): in the farm that directory is ONE link to the source's
-  absolute path, so latexmk's `-cd` would run the engine physically inside the SOURCE — reading none
-  of the overlays, writing relative names into the source — and an overlay that materialised the
-  directory would resolve `\input{../common/x}` against the link's parent instead of its target's,
-  a silently different document. Every directory component of the root is `lstat`ed (a junction
-  reads as a link on win32), whatever the backend; the refusal names the link and the real-path
-  `rootFile` to pass instead (a normal compile of which is the same document). A root at the project
-  root has no components to judge; a normal compile is unchanged. **The check judges the normalised
-  spelling while the backend gets the raw one**, so every spelling for which the two can resolve
-  differently is refused first: a `..` segment (`paper/../p1/main.tex` normalises to a `p1/` that
-  does not exist, ending the check, while `-cd` resolves it physically through the farm's link into
-  the source) and an absolute root (`-cd` goes straight to the source, farm or no farm — refused
-  with the project-relative spelling when it lies inside; on win32 a drive-qualified name counts).
-  What remains (`./`, doubled separators) normalises to what the OS resolves.
-  Not `TEXINPUTS`: kpathsea
-  never searches the path for `./` or `../` names, so those inputs read the source. **The server
+  **`rootFile` is judged by one function, on the raw spelling the caller gave, before anything is
+  read or staged** (`refuseLinkedRootDir`: `compile` calls it ahead of `applyOverlay`, and
+  `stageVariant` calls it again first thing, so no caller of `stageVariant` can stage around it).
+  **A root file under a linked directory is refused**: in the farm that directory is ONE link to
+  the source's absolute path, so latexmk's `-cd` would run the engine physically inside the SOURCE
+  — reading none of the overlays, writing relative names into the source — and an overlay that
+  materialised the directory would resolve `\input{../common/x}` against the link's parent instead
+  of its target's, a silently different document. Every directory component of the root is
+  `lstat`ed (a junction reads as a link on win32), whatever the backend; the refusal names the link
+  and the real-path `rootFile` to pass instead (a normal compile of which is the same document). A
+  root at the project root has no components to judge; a normal compile is unchanged. **The link
+  check judges the normalised spelling while the backend gets the raw one**, so every spelling for
+  which the two can resolve differently is refused first: any `..` segment (`paper/../p1/main.tex`
+  normalises to a `p1/` that does not exist, ending the check, while `-cd` resolves it physically
+  through the farm's link into the source; `../demo/main.tex` names a file inside the project but,
+  in the farm, a sibling of the farm, which is not there) and an absolute root (`-cd` goes straight
+  to the source, farm or no farm — refused with the project-relative spelling when it lies inside).
+  A drive-qualified name (`C:main.tex`, `C:\p\main.tex`) counts as absolute on **every** platform,
+  not only win32, so the refusal does not depend on where the server runs. What remains (`./`,
+  doubled separators) normalises to what the OS resolves. Not `TEXINPUTS`: kpathsea never searches
+  the path for `./` or `../` names, so those inputs read the source. The farm mirrors the project
+  and not its parent, so a `../` input that LEAVES the project resolves inside the variant dir and
+  fails where a normal compile reads it — a stated limit, not a guarantee. The entry cap and the
+  win32 copy cap are **per stage**: `stageVariant` threads one `FarmBudget` through `buildLinkFarm`
+  and every `placeOverlayFile`, whose materialisation of a linked directory links each of its
+  children. **The server
   never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
   surface; the only project files read are the overlaid ones — **except on win32**, where the
   farm's copy fallback does read files through the server: a file symlink is copied (a symlink
@@ -982,11 +991,20 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   a walk that failed or hit `MAX_FARM_ENTRIES` is "could not be checked", never "unchanged". The
   text's shell-escape clause is likewise read off the engine's banner (`shellEscapeWasEnabled`),
   not off the flag the server passed. The check observes; it never undoes a write, and it cannot
-  tell the build's write from a hand edit made meanwhile — the hint says both. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape flags and
-  the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle is checked
-  by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay compile,
-  under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed
-  (`rm -rf`, which unlinks a farm's links without following them), never the one just compiled. The
+  tell the build's write from a hand edit made meanwhile — the hint says both. The handle is `v` +
+  12 hex of SHA-256 over root, engine, backend, shell-escape flags and the normalised overlay, so
+  the same overlay reuses its `out/`; a caller-supplied handle is checked by `isVariantHandle`
+  **before** any path join (`childPathInside`). After each overlay compile, under the lock, all but
+  the `MAX_VARIANTS` (4) most recently compiled variants are removed (`rm -rf`, which unlinks a
+  farm's links without following them), never the one just compiled — best-effort: every handle is
+  tried, the failures are collected and thrown together (`VariantEvictionError`), and `compile`
+  logs them to stderr and reports them in `hint` (escaped like any supplied value, since the
+  message carries filesystem paths), never letting them throw away the finished compile. "Most
+  recently compiled" is the manifest's `usedAt`, which only `stageVariant` stamps. A
+  `.fdb_latexmk` that exists but is unusable (over the size cap, unreadable) makes the never-read
+  check claim nothing, like an unusable `.fls`; only a MISSING one lets the `.fls` stand alone. On
+  a failed build the never-read hint says the build stopped before reading the file, never that the
+  caller should overlay another path. The
   PDF tools take `variant` and read that build only — its PDF, `.aux`/`.log` (`readAuxFloats`'
   `buildDir`) and its own `render/` — never falling back to the main build.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around

@@ -7,8 +7,11 @@
  * the edited text. The backend runs with the farm as its working directory (latexmk keeps `-cd`
  * and the same project-relative `rootFile`) and a private `-outdir`, so `\input{./x}`,
  * `\input{../shared/defs}`, `\include`, `\graphicspath`, a local `.sty` and a `.bib` all resolve
- * exactly as they do in the project. A `TEXINPUTS` overlay was tried first and fails on exactly
- * those `./` and `../` names: kpathsea never searches the path for an explicitly relative name.
+ * as they do in the project — as long as they stay inside it. The limit: a `../` input that LEAVES
+ * the project resolves inside the variant's own directory instead (the farm mirrors the project,
+ * not its parent), finds nothing there and fails, where a normal compile reads it. A `TEXINPUTS`
+ * overlay was tried first and fails on every `./` and `../` name: kpathsea never searches the path
+ * for an explicitly relative name.
  *
  * The server itself never reads THROUGH the farm: TeX reads what a normal compile of the project
  * would read, so the farm adds no read surface. The only project files this module reads are the
@@ -188,18 +191,48 @@ export function variantPaths(projectDir: string, handle: string): VariantPaths {
 /** How one entry is linked into a farm. */
 type EntryKind = 'dir' | 'file' | 'symlink';
 
-/** How much one farm build may still copy, shared by every entry of that build. */
-interface CopyBudget {
+/**
+ * What one variant's farm may still create and copy. ONE budget is shared by everything a stage
+ * does — {@link buildLinkFarm} and every {@link placeOverlayFile} after it — so
+ * {@link MAX_FARM_ENTRIES} and {@link MAX_FARM_COPY_BYTES} are limits per compile, not per call: a
+ * placement under a linked directory materialises that directory, linking every child of it.
+ */
+export interface FarmBudget {
+  entries: number;
+  maxEntries: number;
   copied: number;
-  max: number;
+  maxCopyBytes: number;
+}
+
+/** A fresh budget for one variant's stage. */
+export function newFarmBudget(
+  opts: { maxEntries?: number; maxCopyBytes?: number } = {},
+): FarmBudget {
+  return {
+    entries: 0,
+    maxEntries: opts.maxEntries ?? MAX_FARM_ENTRIES,
+    copied: 0,
+    maxCopyBytes: opts.maxCopyBytes ?? MAX_FARM_COPY_BYTES,
+  };
+}
+
+/** Count one entry the farm is about to create, refusing in words once the cap is passed. */
+function chargeEntry(budget: FarmBudget): void {
+  if (++budget.entries > budget.maxEntries) {
+    throw new Error(
+      `This project has more than ${budget.maxEntries} files and directories; an overlay compile ` +
+        'links every one of them into a private copy of the tree, so it is refused here. Compile ' +
+        'without overlay, or move what the document does not need out of the project.',
+    );
+  }
 }
 
 /** Copy `src` to `dest`, charging the budget first and refusing in words once it is spent. */
-async function copyCharged(src: string, dest: string, budget: CopyBudget): Promise<void> {
+async function copyCharged(src: string, dest: string, budget: FarmBudget): Promise<void> {
   const size = (await stat(src)).size;
-  if (budget.copied + size > budget.max) {
+  if (budget.copied + size > budget.maxCopyBytes) {
     throw new Error(
-      `An overlay compile would have to copy more than ${Math.round(budget.max / 1024 / 1024)} ` +
+      `An overlay compile would have to copy more than ${Math.round(budget.maxCopyBytes / 1024 / 1024)} ` +
         "MiB of this project into its private build tree, so it is refused. On Windows a farm's " +
         'files are hard links, and they are copied instead when hard-linking fails — most often ' +
         'because the project is on a different drive than the temp directory — or when a file ' +
@@ -228,7 +261,7 @@ async function linkEntry(
   dest: string,
   kind: EntryKind,
   platform: NodeJS.Platform,
-  budget: CopyBudget,
+  budget: FarmBudget,
 ): Promise<void> {
   if (platform !== 'win32') {
     await symlink(src, dest);
@@ -260,10 +293,6 @@ async function linkEntry(
   }
 }
 
-function newCopyBudget(max: number = MAX_FARM_COPY_BYTES): CopyBudget {
-  return { copied: 0, max };
-}
-
 function kindOf(entry: {
   isDirectory(): boolean;
   isFile(): boolean;
@@ -281,7 +310,9 @@ function kindOf(entry: {
  * is never walked — its link resolves exactly as the project's does). Entries named `.git` are
  * skipped, and so is any directory in `skip` — the workspace root and the build root, since a
  * local project registered at the launch directory contains the workspace. Returns how many
- * entries it created; more than `maxEntries` is refused, since every one of them is a syscall.
+ * entries it created; more than the budget's `maxEntries` is refused, since every one of them is a
+ * syscall. Pass `budget` to share it with the {@link placeOverlayFile} calls that follow (a stage
+ * does); otherwise a fresh one is made from `maxEntries`/`maxCopyBytes`.
  */
 export async function buildLinkFarm(
   projectDir: string,
@@ -291,12 +322,13 @@ export async function buildLinkFarm(
     platform?: NodeJS.Platform;
     maxEntries?: number;
     maxCopyBytes?: number;
+    budget?: FarmBudget;
   },
 ): Promise<number> {
   const skip = new Set(opts.skip.map((p) => path.resolve(p)));
   const platform = opts.platform ?? process.platform;
-  const max = opts.maxEntries ?? MAX_FARM_ENTRIES;
-  const budget = newCopyBudget(opts.maxCopyBytes);
+  const budget =
+    opts.budget ?? newFarmBudget({ maxEntries: opts.maxEntries, maxCopyBytes: opts.maxCopyBytes });
   let count = 0;
   const walk = async (srcDir: string, destDir: string): Promise<void> => {
     const entries = await readdir(srcDir, { withFileTypes: true });
@@ -306,13 +338,8 @@ export async function buildLinkFarm(
       const kind = kindOf(entry);
       if (kind === undefined) continue;
       if (kind === 'dir' && skip.has(path.resolve(src))) continue;
-      if (++count > max) {
-        throw new Error(
-          `This project has more than ${max} files and directories; an overlay compile links ` +
-            'every one of them into a private copy of the tree, so it is refused here. Compile ' +
-            'without overlay, or move what the document does not need out of the project.',
-        );
-      }
+      chargeEntry(budget);
+      count++;
       const dest = path.join(destDir, entry.name);
       if (kind === 'dir') {
         await mkdir(dest);
@@ -433,17 +460,19 @@ export function sourceChangedHint(paths: string[]): string {
  * in the farm (a symlinked directory in the source), it is materialised first: replaced by a real
  * directory whose children are links to `<projectDir>/<prefix>/<child>`, repeating down the path,
  * so writing the file can never write through a link into the source. The file's own link is
- * removed, never written through, and the new file is created exclusively (`wx`).
+ * removed, never written through, and the new file is created exclusively (`wx`). Every entry it
+ * creates, and every byte it copies, is charged to `budget` — the stage's one budget, shared with
+ * {@link buildLinkFarm}.
  */
 export async function placeOverlayFile(
   farmDir: string,
   projectDir: string,
   relPosix: string,
   content: string,
-  opts: { platform?: NodeJS.Platform } = {},
+  opts: { platform?: NodeJS.Platform; budget?: FarmBudget } = {},
 ): Promise<void> {
   const platform = opts.platform ?? process.platform;
-  const budget = newCopyBudget();
+  const budget = opts.budget ?? newFarmBudget();
   const parts = relPosix.split('/');
   const name = parts.pop();
   if (name === undefined || name === '')
@@ -459,6 +488,7 @@ export async function placeOverlayFile(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       // Not mirrored (under a skipped directory): the overlaid file stands alone there.
+      chargeEntry(budget);
       await mkdir(farmCur);
       continue;
     }
@@ -469,6 +499,7 @@ export async function placeOverlayFile(
       if (entry.name === '.git') continue;
       const kind = kindOf(entry);
       if (kind === undefined) continue;
+      chargeEntry(budget);
       await linkEntry(
         path.join(srcCur, entry.name),
         path.join(farmCur, entry.name),
@@ -522,21 +553,6 @@ export async function readManifest(file: string): Promise<VariantManifest | unde
 
 export async function writeManifest(file: string, manifest: VariantManifest): Promise<void> {
   await writeFile(file, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-}
-
-/**
- * Stamp a variant's `usedAt` as now — what a compile of it does — so retention counts it as the
- * most recently compiled. A variant with no valid manifest is left.
- */
-export async function touchVariant(
-  projectDir: string,
-  handle: string,
-  now: Date = new Date(),
-): Promise<void> {
-  const paths = variantPaths(projectDir, handle);
-  const manifest = await readManifest(paths.manifest);
-  if (!manifest) return;
-  await writeManifest(paths.manifest, { ...manifest, usedAt: now.toISOString() });
 }
 
 /**
@@ -780,9 +796,14 @@ export async function applyOverlay(
  * normalising `paper/../p1/main.tex` drops `paper` lexically, while latexmk's `-cd` resolves it
  * physically, through the farm's link, into the source (and a root that leaves the project has no
  * farm to build in at all). An ABSOLUTE root: `-cd` goes straight to the source directory, farm or
- * no farm — refused with the project-relative spelling to pass when it lies inside. On win32 a
- * drive-qualified name (`C:main.tex`, drive-relative) counts as absolute too. What is left (`./`,
- * doubled or trailing separators, backslashes) normalises to what the OS resolves.
+ * no farm — refused with the project-relative spelling to pass when it lies inside. A
+ * drive-qualified name (`C:\p\main.tex`, or drive-relative `C:main.tex`) is refused with them on
+ * EVERY platform, not only win32: whether a root is accepted must not depend on where the server
+ * runs. What is left (`./`, doubled or trailing separators, backslashes) normalises to what the OS
+ * resolves.
+ *
+ * This is the one check of an overlay's root: `compile` calls it on the caller's raw spelling
+ * before the overlay is read, and {@link stageVariant} again before anything is staged.
  */
 export async function refuseLinkedRootDir(
   projectDir: string,
@@ -791,22 +812,29 @@ export async function refuseLinkedRootDir(
 ): Promise<void> {
   const platform = opts.platform ?? process.platform;
   const raw = toPosix(rootFile).replace(/\\/g, '/');
-  const absolute =
-    path.posix.isAbsolute(raw) ||
-    (platform === 'win32' && (path.win32.isAbsolute(rootFile) || /^[A-Za-z]:/.test(raw)));
-  if (absolute) {
-    const inside = path.relative(path.resolve(projectDir), path.resolve(rootFile));
+  const posixAbsolute = path.posix.isAbsolute(raw);
+  // A drive prefix, on every platform: absolute (`C:/p`) or drive-relative (`C:main.tex`) on win32.
+  const driveQualified = /^[A-Za-z]:/.test(raw);
+  if (posixAbsolute || driveQualified || path.win32.isAbsolute(rootFile)) {
+    // Suggest a relative spelling only for a path absolute on the platform that resolves it here;
+    // a drive-relative name resolves against that drive's current directory, which says nothing.
+    const inside =
+      platform === process.platform && path.isAbsolute(rootFile)
+        ? path.relative(path.resolve(projectDir), path.resolve(rootFile))
+        : '';
     const relSpelling =
-      platform === process.platform &&
-      inside !== '' &&
-      !inside.startsWith('..') &&
-      !path.isAbsolute(inside)
+      inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)
         ? toPosix(inside)
         : undefined;
+    const what =
+      driveQualified && !path.win32.isAbsolute(rootFile)
+        ? 'is spelled with a drive prefix, which Windows reads as an absolute or drive-relative ' +
+          'path (so it is refused on every platform)'
+        : 'is an absolute path';
     throw new Error(
-      `The root file ${quoteId(rootFile)} is an absolute path, and an overlay compile builds in ` +
-        'a private mirror of the project, which an absolute root would bypass: the engine would ' +
-        'run in the source directory itself. ' +
+      `The root file ${quoteId(rootFile)} ${what}, and an overlay compile builds in a private ` +
+        'mirror of the project, which such a root would bypass: the engine would run outside ' +
+        'the mirror — in the source directory itself when the root is in the project. ' +
         (relSpelling !== undefined
           ? `Name it relative to the project root — rootFile: ${quoteId(relSpelling)}.`
           : 'Name it relative to the project root.'),
@@ -870,8 +898,12 @@ export async function refuseLinkedRootDir(
 /**
  * Stage a variant for compiling: rebuild its link farm from scratch, place the overlaid files,
  * create its `out/`, and write its manifest (keeping `createdAt` across rebuilds of one handle).
- * Refused, before anything is staged, when the root file sits under a linked directory
- * ({@link refuseLinkedRootDir}).
+ * Refused, before anything is staged, when the root file's spelling or its directory path cannot
+ * be built as a variant ({@link refuseLinkedRootDir}; `compile` has already called it before
+ * reading the overlay, and it is called again here so no caller stages around it).
+ * The farm and every placement share ONE {@link FarmBudget}, so the entry and copy caps bound the
+ * whole stage. Writing the manifest stamps `usedAt`: this is what makes a variant the most
+ * recently compiled for {@link evictVariants}.
  */
 export async function stageVariant(opts: {
   projectDir: string;
@@ -883,14 +915,27 @@ export async function stageVariant(opts: {
   skip: string[];
   platform?: NodeJS.Platform;
   now?: Date;
+  maxFarmEntries?: number;
+  maxFarmCopyBytes?: number;
 }): Promise<VariantPaths> {
   await refuseLinkedRootDir(opts.projectDir, opts.rootFile, { platform: opts.platform });
   const paths = variantPaths(opts.projectDir, opts.handle);
   await mkdir(paths.root, { recursive: true });
   await rm(paths.src, { recursive: true, force: true });
-  await buildLinkFarm(opts.projectDir, paths.src, { skip: opts.skip, platform: opts.platform });
+  const budget = newFarmBudget({
+    maxEntries: opts.maxFarmEntries,
+    maxCopyBytes: opts.maxFarmCopyBytes,
+  });
+  await buildLinkFarm(opts.projectDir, paths.src, {
+    skip: opts.skip,
+    platform: opts.platform,
+    budget,
+  });
   for (const [rel, content] of opts.contents) {
-    await placeOverlayFile(paths.src, opts.projectDir, rel, content, { platform: opts.platform });
+    await placeOverlayFile(paths.src, opts.projectDir, rel, content, {
+      platform: opts.platform,
+      budget,
+    });
   }
   await mkdir(paths.out, { recursive: true });
   const previous = await readManifest(paths.manifest);
@@ -1002,13 +1047,17 @@ export function parseFdbSources(text: string): string[] {
   return out;
 }
 
-/** A build-dir file read whole, or undefined when it is not a regular file or is over `max`. */
-async function readWholeBuildFile(file: string, max: number): Promise<string | undefined> {
+/**
+ * A build-dir file read whole; `null` when it does not exist, and `undefined` when it exists but
+ * cannot be used — not a regular file, unreadable, or over `max`. The two are kept apart because
+ * an absent `.fdb_latexmk` is an answer (latexmk ran no other rule) while an unusable one is not.
+ */
+async function readWholeBuildFile(file: string, max: number): Promise<string | null | undefined> {
   let handle;
   try {
     handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-  } catch {
-    return undefined;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : undefined;
   }
   try {
     const st = await handle.stat();
@@ -1031,7 +1080,10 @@ async function readWholeBuildFile(file: string, max: number): Promise<string | u
  * through another name (an in-project symlink such as `notes.tex -> sections/real.tex`, or a file
  * the document never inputs) changes nothing, and the variant would otherwise read as identical to
  * the main build without a word. `undefined` when there is no usable `.fls` (tectonic writes none;
- * a missing `PWD`, or one past {@link MAX_FLS_BYTES}), in which case nothing is claimed.
+ * a missing `PWD`, or one past {@link MAX_FLS_BYTES}), or when a `.fdb_latexmk` exists but cannot
+ * be used (past that size, or unreadable) — without it every `.bib` overlay would be reported
+ * unread — in which case nothing is claimed. A MISSING `.fdb_latexmk` is not that case: the
+ * `.fls` alone is then the whole record.
  */
 export async function overlayFilesNeverRead(
   paths: VariantPaths,
@@ -1045,14 +1097,15 @@ export async function overlayFilesNeverRead(
     path.join(paths.out, `${stem}.fls`),
     opts.maxBytes ?? MAX_FLS_BYTES,
   );
-  if (text === undefined) return undefined;
+  if (text === undefined || text === null) return undefined;
   const { pwd, inputs } = parseFls(text);
   if (pwd === undefined) return undefined;
   const fdb = await readWholeBuildFile(
     path.join(paths.out, `${stem}.fdb_latexmk`),
     opts.maxBytes ?? MAX_FLS_BYTES,
   );
-  const sources = fdb === undefined ? [] : parseFdbSources(fdb);
+  if (fdb === undefined) return undefined;
+  const sources = fdb === null ? [] : parseFdbSources(fdb);
   const read = new Set(
     [...inputs, ...sources].map((input) => foldName(path.resolve(pwd, input), platform)),
   );

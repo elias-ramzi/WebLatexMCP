@@ -1,7 +1,17 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -34,12 +44,18 @@ const MAIN_TEX =
   '\\documentclass{article}\n\\begin{document}\n\\input{sections/b}\n\\end{document}\n';
 const B_TEX = 'Section B original.\n';
 
+/** How the stub engine behaves on its next run; tests flip it between calls. */
+interface StubBehaviour {
+  /** Abort on main.tex, before ever opening sections/b.tex: no PDF, and a .fls without it. */
+  failEarly?: boolean;
+  /** Appended to a successful run's log. */
+  extraLog?: string;
+  /** Run inside the build, with the directory the engine was handed. */
+  duringBuild?: (workDir: string) => Promise<void>;
+}
+
 /** An engine that "typesets" sections/b.tex, read through `workDir`, into a one-page PDF. */
-function stubCompiler(
-  requests: CompileRequest[],
-  extraLog = '',
-  duringBuild?: (workDir: string) => Promise<void>,
-) {
+function stubCompiler(requests: CompileRequest[], behaviour: StubBehaviour = {}) {
   return {
     isAvailable: async () => true,
     compile: async (req: CompileRequest): Promise<CompileOutcome> => {
@@ -47,9 +63,23 @@ function stubCompiler(
       const workDir = req.workDir ?? req.projectDir;
       // What a document can do from inside the farm that the server cannot stop: a project rc
       // re-enabling shell escape, lualatex's io.open, tectonic's unrestricted \openout.
-      if (duringBuild) await duringBuild(workDir);
+      if (behaviour.duringBuild) await behaviour.duringBuild(workDir);
       const outDir = req.outDir ?? buildDir(req.projectDir);
       await mkdir(outDir, { recursive: true });
+      if (behaviour.failEarly) {
+        await writeFile(
+          path.join(outDir, `${path.basename(req.rootFile, '.tex')}.fls`),
+          `PWD ${path.join(workDir, logBaseDir(req.rootFile))}\nINPUT main.tex\n`,
+        );
+        return {
+          success: false,
+          durationSec: 0.1,
+          log: './main.tex:3: Undefined control sequence.\n',
+          timedOut: false,
+          logBaseDir: logBaseDir(req.rootFile),
+          rebuilt: false,
+        };
+      }
       const body = (await readFile(path.join(workDir, 'sections/b.tex'), 'utf8')).trim();
       const pdfPath = buildPdfPathIn(outDir, req.rootFile);
       await writeFile(pdfPath, minimalPdf(1, 300, 200, { text: () => body }));
@@ -59,7 +89,7 @@ function stubCompiler(
         `PWD ${path.join(workDir, logBaseDir(req.rootFile))}\nINPUT main.tex\nINPUT ./sections/b.tex\n`,
       );
       // One error located in the overlaid file, so the snippet has to come from the variant.
-      const log = './sections/b.tex:1: Undefined control sequence.\n' + extraLog;
+      const log = './sections/b.tex:1: Undefined control sequence.\n' + (behaviour.extraLog ?? '');
       return {
         success: true,
         pdfPath,
@@ -103,9 +133,8 @@ async function setup(
     new ProjectRegistry(workspace),
   );
   const requests: CompileRequest[] = [];
-  ctx.compiler = new CompilerResolver('latexmk', false, () =>
-    stubCompiler(requests, opts.extraLog, opts.duringBuild),
-  );
+  const behaviour: StubBehaviour = { extraLog: opts.extraLog, duringBuild: opts.duringBuild };
+  ctx.compiler = new CompilerResolver('latexmk', false, () => stubCompiler(requests, behaviour));
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test', version: '0.0.0' });
@@ -118,7 +147,7 @@ async function setup(
   expect(sync.isError ?? false, textOf(sync)).toBe(false);
   const clone = path.join(workspace, 'demo');
   cleanups.push(() => rm(buildDir(clone), { recursive: true, force: true }));
-  return { client, clone, workspace, requests };
+  return { client, clone, workspace, requests, behaviour };
 }
 
 function textOf(res: unknown): string {
@@ -343,28 +372,48 @@ describe('compile with an overlay', () => {
     expect(textOf(res)).toContain("a latexmkrc (the project's own, or a user or system one)");
   });
 
-  it('refuses a root spelled with `..` or as an absolute path, before staging anything', async () => {
-    // lstat judged the normalised spelling while latexmk got the raw one: `paper/../p1/main.tex`
-    // normalises to a p1/ that does not exist, and -cd resolved it physically — through the
-    // farm's link to drafts/p1, so the engine ran inside the SOURCE directory. And an absolute
-    // root sent -cd straight into the source.
+  it('refuses a root spelled with `..`, absolute or drive-qualified, before reading or staging anything', async () => {
+    // One check (refuseLinkedRootDir) on the RAW spelling. lstat judged the normalised spelling
+    // while latexmk got the raw one: `paper/../p1/main.tex` normalises to a p1/ that does not
+    // exist, and -cd resolved it physically — through the farm's link to drafts/p1, so the engine
+    // ran inside the SOURCE directory. `../demo/main.tex` names a file INSIDE the project (the
+    // clone is `<workspace>/demo`), but in the variant's mirror a sibling of the mirror: refused by
+    // spelling, not resolution. An absolute root sends -cd straight into the source, and a drive
+    // prefix is refused on every platform, not only where Windows would read it.
     const { client, clone, requests } = await setup();
     const real = path.join(clone, 'drafts', 'p1');
     await mkdir(real, { recursive: true });
     await writeFile(path.join(real, 'main.tex'), MAIN_TEX);
     await symlink(real, path.join(clone, 'paper'), 'junction');
-    const dotted = await client.callTool({
+    const cases: Array<[string, string]> = [
+      ['paper/../p1/main.tex', '".."'],
+      ['paper/../main.tex', '".."'],
+      ['../demo/main.tex', '".."'],
+      ['sections/../../elsewhere/main.tex', '".."'],
+      [path.join(clone, 'drafts', 'p1', 'main.tex'), 'rootFile: "drafts/p1/main.tex"'],
+      [path.join(clone, 'main.tex'), 'rootFile: "main.tex"'],
+      ['C:main.tex', 'drive prefix'],
+    ];
+    for (const [rootFile, message] of cases) {
+      const res = await client.callTool({
+        name: 'compile',
+        arguments: { rootFile, overlay: OVERLAY },
+      });
+      expect(res.isError, `${rootFile}: ${textOf(res)}`).toBe(true);
+      expect(textOf(res), rootFile).toContain(message);
+    }
+    // Judged before the overlay is read: an overlay entry that would fail on its own (a missing
+    // file) does not get to answer first.
+    const masked = await client.callTool({
       name: 'compile',
-      arguments: { rootFile: 'paper/../p1/main.tex', overlay: OVERLAY },
+      arguments: {
+        rootFile: 'paper/main.tex',
+        overlay: [{ file: 'sections/nope.tex', edits: [{ oldString: 'x', newString: 'y' }] }],
+      },
     });
-    expect(dotted.isError, textOf(dotted)).toBe(true);
-    expect(textOf(dotted)).toContain('".."');
-    const absolute = await client.callTool({
-      name: 'compile',
-      arguments: { rootFile: path.join(clone, 'drafts', 'p1', 'main.tex'), overlay: OVERLAY },
-    });
-    expect(absolute.isError, textOf(absolute)).toBe(true);
-    expect(textOf(absolute)).toContain('rootFile: "drafts/p1/main.tex"');
+    expect(masked.isError, textOf(masked)).toBe(true);
+    expect(textOf(masked)).toContain('through "paper", which is a symbolic link');
+    expect(textOf(masked)).not.toContain('no such file');
     expect(requests).toHaveLength(0);
     await expect(stat(path.join(buildDir(clone), 'variants'))).rejects.toThrow();
   });
@@ -412,6 +461,169 @@ describe('compile with an overlay', () => {
       expect(textOf(res)).toMatch(message);
     }
     expect(requests).toHaveLength(0);
+  });
+});
+
+describe('compile with an overlay: refusals and retention', () => {
+  const isWin = process.platform === 'win32';
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+  it('says the build stopped before reading an overlaid file when it failed first', async () => {
+    const { client, behaviour } = await setup();
+    behaviour.failEarly = true;
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: { rootFile: 'main.tex', overlay: OVERLAY },
+    });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    const out = res.structuredContent as { success: boolean; hint?: string };
+    expect(out.success).toBe(false);
+    const hint = out.hint ?? '';
+    expect(hint).toContain(
+      'The build stopped before reading the overlaid file "sections/b.tex" (neither its .fls ' +
+        'nor its .fdb_latexmk lists it)',
+    );
+    // Not the advice for a SUCCESSFUL build that skipped the file: nothing says the path is wrong.
+    expect(hint).not.toContain('never read');
+    expect(hint).not.toContain('overlay the path TeX actually opens');
+  });
+
+  it('names both records the never-read check consults on a successful build', async () => {
+    const { client } = await setup();
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: {
+        rootFile: 'main.tex',
+        overlay: [{ file: 'notes.tex', edits: [{ oldString: 'Notes', newString: 'Changed' }] }],
+      },
+    });
+    expect((res.structuredContent as { hint?: string }).hint ?? '').toContain(
+      'The build never read the overlaid file "notes.tex" (neither its .fls nor its ' +
+        '.fdb_latexmk lists it)',
+    );
+  });
+
+  it('keeps the four most recently compiled variants and refuses the evicted one by name', async () => {
+    const { client } = await setup();
+    const handles: string[] = [];
+    for (let i = 1; i <= 5; i++) {
+      const res = await client.callTool({
+        name: 'compile',
+        arguments: {
+          rootFile: 'main.tex',
+          overlay: [
+            {
+              file: 'sections/b.tex',
+              edits: [{ oldString: 'Section B original.', newString: `Section B take ${i}.` }],
+            },
+          ],
+        },
+      });
+      expect(res.isError ?? false, textOf(res)).toBe(false);
+      handles.push((res.structuredContent as { variant: string }).variant);
+      // usedAt is a millisecond timestamp: keep the order strict.
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(new Set(handles).size).toBe(5);
+    const [first, ...kept] = handles;
+    for (const name of ['extract_text', 'render_pages']) {
+      const gone = await client.callTool({
+        name,
+        arguments: { variant: first, ...(name === 'render_pages' ? { inline: false } : {}) },
+      });
+      expect(gone.isError, `${name}: ${textOf(gone)}`).toBe(true);
+      expect(textOf(gone)).toMatch(
+        new RegExp(`No variant "${first}" for project "demo": it was evicted`),
+      );
+    }
+    for (const [i, handle] of kept.entries()) {
+      const res = await client.callTool({ name: 'extract_text', arguments: { variant: handle } });
+      expect(res.isError ?? false, textOf(res)).toBe(false);
+      expect(textOf(res)).toContain(`Section B take ${i + 2}.`);
+    }
+  });
+
+  it.skipIf(isWin || isRoot)(
+    'keeps a finished compile when an old variant cannot be removed, and says so',
+    async () => {
+      const { client, clone } = await setup();
+      const stamp = (n: number) => new Date(Date.UTC(2020, 0, 1, 0, n)).toISOString();
+      const old = ['v00000000000a', 'v00000000000b', 'v00000000000c', 'v00000000000d'];
+      for (const [i, h] of old.entries()) {
+        const p = variantPaths(clone, h);
+        await mkdir(p.out, { recursive: true });
+        await writeManifest(p.manifest, {
+          rootFile: 'main.tex',
+          createdAt: stamp(i),
+          usedAt: stamp(i),
+          files: [],
+          compiler: 'latexmk',
+          engine: 'pdflatex',
+        });
+      }
+      // The oldest is the one eviction removes; make its out/ unremovable (EACCES on unlink).
+      const locked = variantPaths(clone, old[0]!).out;
+      await writeFile(path.join(locked, 'main.pdf'), 'held');
+      await chmod(locked, 0o555);
+      // Restore before the build dir is removed (cleanups run in order).
+      cleanups.unshift(() => chmod(locked, 0o755).catch(() => undefined));
+
+      const res = await client.callTool({
+        name: 'compile',
+        arguments: { rootFile: 'main.tex', overlay: OVERLAY },
+      });
+      expect(res.isError ?? false, textOf(res)).toBe(false);
+      const out = res.structuredContent as { success: boolean; variant?: string; hint?: string };
+      expect(out.success).toBe(true);
+      expect(out.variant).toMatch(/^v[0-9a-f]{12}$/);
+      expect(out.hint ?? '').toMatch(
+        /An older variant of this project could not be removed \(.*EACCES.*\); this compile is unaffected/,
+      );
+      expect(textOf(res)).toContain('could not be removed');
+      await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+    },
+  );
+
+  it('refuses an overlay path that leaves the project, and touches nothing', async () => {
+    const { client, clone, requests } = await setup();
+    const outside = await tmp('ovl-outside-');
+    await writeFile(path.join(outside, 'secret.tex'), 'outside original\n');
+    // A directory link out of the project: a junction on Windows, which needs no privilege.
+    await symlink(outside, path.join(clone, 'outdir'), 'junction');
+    const cases: string[] = [
+      '../secret.tex',
+      path.join(outside, 'secret.tex'),
+      'sections/../../secret.tex',
+      'outdir/secret.tex',
+    ];
+    // File symlinks need a privilege on Windows that CI runners do not grant.
+    if (!isWin) {
+      await symlink(path.join(outside, 'secret.tex'), path.join(clone, 'escape.tex'));
+      await symlink(path.join(outside, 'missing.tex'), path.join(clone, 'dangling.tex'));
+      cases.push('escape.tex', 'dangling.tex');
+    }
+    for (const file of cases) {
+      const res = await client.callTool({
+        name: 'compile',
+        arguments: {
+          rootFile: 'main.tex',
+          overlay: [{ file, edits: [{ oldString: 'outside', newString: 'EDITED' }] }],
+        },
+      });
+      expect(res.isError, `${file}: ${textOf(res)}`).toBe(true);
+      expect(textOf(res), file).toMatch(
+        /escapes the project root|must be relative to the project root/,
+      );
+    }
+    expect(requests).toHaveLength(0);
+    expect(await readFile(path.join(outside, 'secret.tex'), 'utf8')).toBe('outside original\n');
+    await expect(stat(path.join(outside, 'missing.tex'))).rejects.toThrow();
+    expect((await lstat(path.join(clone, 'outdir'))).isSymbolicLink()).toBe(true);
+    if (!isWin) {
+      expect((await lstat(path.join(clone, 'escape.tex'))).isSymbolicLink()).toBe(true);
+      expect((await lstat(path.join(clone, 'dangling.tex'))).isSymbolicLink()).toBe(true);
+    }
+    expect(await readFile(path.join(clone, 'sections/b.tex'), 'utf8')).toBe(B_TEX);
   });
 });
 

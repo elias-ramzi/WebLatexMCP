@@ -279,7 +279,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
             `text of ${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}` +
             (variant !== undefined ? ` (variant ${variant})` : '');
           const labelLine = labelPlan
-            ? `  labels (from the last compile's .aux): ${describeResolvedLabels(labelPlan.resolved)}`
+            ? `  labels (from the .aux of the build read${variant !== undefined ? ` — variant ${variant}` : ''}): ${describeResolvedLabels(labelPlan.resolved)}`
             : '';
           // Rendered from the already-cut plan, never from `result`: the text channel is the
           // other half of what the budget charged.

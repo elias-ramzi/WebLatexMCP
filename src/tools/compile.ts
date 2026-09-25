@@ -34,6 +34,7 @@ import {
   evictVariants,
   overlayFilesNeverRead,
   overlaySnippetReader,
+  refuseLinkedRootDir,
   sourceChangedHint,
   stageVariant,
   variantHandle,
@@ -246,7 +247,8 @@ const outputSchema = {
     .describe(
       'Path to the compiled PDF. For workspace-local clones this is <workspace>/.web_latex_mcp/' +
         '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path. ' +
-        'POSIX (`/`-separated) on every OS.',
+        "For an overlay compile it is always the variant's own PDF, in its temp build dir " +
+        '(variants/<handle>/out/) — a variant is never surfaced. POSIX (`/`-separated) on every OS.',
     ),
   pdfUrl: z
     .string()
@@ -433,7 +435,12 @@ const outputSchema = {
         'failure: the LaTeX engine latexmk tried to run (pdflatex/xelatex/lualatex) is not ' +
         'installed — said only when the log names no error of its own — or the document uses ' +
         'TikZ externalization and needs a shell-escape retry, or a package is missing from the ' +
-        'local TeX installation. Absent when there is nothing to say.',
+        'local TeX installation. For an overlay compile, also: first, the project files the ' +
+        'build changed while it ran (the one thing here you may have to undo); after the engine ' +
+        "note, an overlaid file the build never opened (by the variant's .fls and " +
+        '.fdb_latexmk — so never under tectonic, which writes no .fls), or, on a failed build, ' +
+        'one it stopped before reading; and last, an older variant that could not be removed. ' +
+        'Absent when there is nothing to say.',
     ),
 };
 
@@ -542,6 +549,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               }
             | undefined;
           if (overlay) {
+            // The root's spelling and directory path are judged before the overlay is read: a
+            // refusal here must not wait on (or be masked by) an overlay entry's own error.
+            await refuseLinkedRootDir(dir, root);
             const contents = await applyOverlay(ctx.files, dir, overlay);
             const handle = variantHandle({
               rootFile: root,
@@ -591,8 +601,20 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               : {}),
           });
           const changedSource = variant ? await variant.sourceChanges() : undefined;
-          // Retention runs after the compile, under the same lock, and never removes this one.
-          if (variant) await evictVariants(dir, MAX_VARIANTS, variant.handle);
+          // Retention runs after the compile, under the same lock, and never removes this one. It
+          // is best-effort: an old variant that cannot be removed (a viewer holding its PDF open on
+          // Windows) must not throw away the compile that just finished.
+          let evictionFailure: string | undefined;
+          if (variant) {
+            try {
+              await evictVariants(dir, MAX_VARIANTS, variant.handle);
+            } catch (err) {
+              evictionFailure = err instanceof Error ? err.message : String(err);
+              console.error(
+                `[compile] could not remove an old variant of ${id}: ${evictionFailure}`,
+              );
+            }
+          }
           // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
           // to the project root — rebase them there so a `file` is one the caller can open.
           const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
@@ -650,15 +672,22 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           if (engineHint) hints.push(engineHint);
           // An overlaid file the build never opened changed nothing, and the variant would read as
           // the main build without a word — say so, naming it. No .fls (tectonic): nothing claimed.
+          // A FAILED build may simply have stopped before reaching it, so it is not told to
+          // overlay another path.
           if (variant) {
             const unread = await overlayFilesNeverRead(variantPaths(dir, variant.handle), root, [
               ...variant.contents.keys(),
             ]);
             for (const rel of unread ?? []) {
               hints.push(
-                `The build never read the overlaid file ${quoteId(rel)} (its .fls lists no such ` +
-                  'input), so the overlay had no effect on it — overlay the path TeX actually ' +
-                  'opens instead (the target of a symbolic link, or the name the document inputs).',
+                outcome.success
+                  ? `The build never read the overlaid file ${quoteId(rel)} (neither its .fls nor ` +
+                      'its .fdb_latexmk lists it), so the overlay had no effect on it — overlay ' +
+                      'the path TeX actually opens instead (the target of a symbolic link, or the ' +
+                      'name the document inputs).'
+                  : `The build stopped before reading the overlaid file ${quoteId(rel)} (neither ` +
+                      'its .fls nor its .fdb_latexmk lists it), so whether the document reads it ' +
+                      'is not known yet — fix the errors and compile again.',
               );
             }
           }
@@ -687,6 +716,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           }
           if (missingPackages.length > 0)
             hints.push(missingPackageHint(missingPackages, backend.kind));
+          // Last: housekeeping, not this compile — an older variant that could not be removed.
+          if (evictionFailure !== undefined) {
+            hints.push(
+              `An older variant of this project could not be removed (${evictionFailure}); this ` +
+                'compile is unaffected, and removal is tried again after the next overlay compile.',
+            );
+          }
           const hint = hints.length > 0 ? hints.join('\n') : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.

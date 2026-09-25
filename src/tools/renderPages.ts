@@ -448,7 +448,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // that only reads the text would otherwise see "page 3" with no way to know which label
           // asked for it, which is the whole point of resolving one.
           const labelLine = labelPlan
-            ? `  labels (from the last compile's .aux): ${describeResolvedLabels(labelPlan.resolved)}`
+            ? `  labels (from the .aux of the build read${variant !== undefined ? ` — variant ${variant}` : ''}): ${describeResolvedLabels(labelPlan.resolved)}`
             : '';
           const noteLine = note ? `  … ${note}` : '';
           const text = [header, labelLine, ...pageLines, skippedLine, noteLine]

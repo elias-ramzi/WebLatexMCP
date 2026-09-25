@@ -57,36 +57,44 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the command also accepts), rather than in the chat or a temporary directory, because a review
   that has to be hunted for is not read; and in the Claude desktop app the final review is sent as
   a file to download.
-- **`compile` can build a what-if variant without touching the source** (#205). Pass `overlay` —
+- **`compile` can build a what-if variant without the server writing the source** (#205). Pass `overlay` —
   up to 20 files, each with `edit_file`'s edits (100 in total) — and the edits are applied in
   memory and compiled in a private link farm: a mirror of the project's tree whose files link to
   the originals, except the overlaid ones, which hold the edited text. `./` and `../` inputs,
-  `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve exactly as in the
-  project (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the path for an
-  explicitly relative name). The server writes none of the source, the main build, the surfaced
-  PDF, the viewer or the session's records, and records no revision baseline. To narrow what the
-  build itself can write through the farm, an overlay compile runs no shell command unless you
-  pass `shellEscape` or `restrictedShellEscape` — not even TeX Live's default restricted
-  allow-list, whose `makeindex -o` could otherwise write a project file through the farm's links —
-  and says so in `hint` when the document tried to run one; opting in lifts that guarantee. A
-  `latexmkrc` or `.latexmkrc` cannot be overlaid, since latexmk runs it as Perl. Some routes back
-  into the source stay open — the project's own latexmkrc still runs and can turn shell escape
-  back on, Lua code under `lualatex` can write with `io.open`, and tectonic's `\openout` writes any
-  absolute path — so an overlay compile compares the project's files before and after the build
-  (by size, mode, inode and times; nothing is read) and names any that changed in `hint`, instead
-  of calling the source untouched; it also says when the log shows shell escape enabled although
-  the compile asked for it off. The result
+  `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve as in the project
+  while they stay inside it (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the
+  path for an explicitly relative name); a `../` input that leaves the project resolves inside the
+  variant's directory instead and fails, where a normal compile reads it. The server writes none
+  of the source, the main build, the surfaced PDF, the viewer or the session's records, and
+  records no revision baseline. To narrow what the build itself can write through the farm, an
+  overlay compile runs no shell command unless you pass `shellEscape` or `restrictedShellEscape`
+  — not even TeX Live's default restricted allow-list, whose `makeindex -o` could otherwise write
+  a project file through the farm's links — and says so in `hint` when the document tried to run
+  one; opting in lifts that guarantee. A `latexmkrc` or `.latexmkrc` cannot be overlaid, since
+  latexmk runs it as Perl. Some routes back into the source stay open — the project's own
+  latexmkrc still runs and can turn shell escape back on, Lua code under `lualatex` can write with
+  `io.open`, and tectonic's `\openout` writes any absolute path — so an overlay compile compares
+  the project's files before and after the build (by size, mode, inode and times; nothing is
+  read) and names any that changed in `hint`, instead of calling the source untouched; it also
+  says when the log shows shell escape enabled although the compile asked for it off. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant
-  incrementally. `clean: true` on an overlay compile cleans that variant only. An overlaid file
-  the build never opened is named in `hint`. An overlay compile whose root file is reached
-  through a linked directory (`paper -> drafts/p1`, `rootFile: "paper/main.tex"`) is refused, since
-  the variant would build in the link's target — the source itself — or resolve `../` inputs
-  against the wrong directory; the refusal names the real path to pass instead
-  (`rootFile: "drafts/p1/main.tex"`, the same document), and the overlay files are named by their
-  real paths too. So is a root spelled with a `..` segment (`paper/../p1/main.tex`, which latexmk
-  resolves through the link) or as an absolute path; name it from the project root instead.
+  incrementally. An older variant that cannot be removed (a Windows viewer holding its PDF) is
+  reported in `hint`, never failing the compile. `clean: true` on an overlay compile cleans that
+  variant only. An overlaid file the build never opened (by its `.fls` and `.fdb_latexmk`;
+  tectonic writes no `.fls`, so never there) is named in `hint` — on a failed build, as one it
+  stopped before reading. An overlay compile's `rootFile` must be relative to the project, and is
+  refused before anything is read or staged otherwise. An absolute (or drive-qualified, such as
+  `C:main.tex`) root is refused because latexmk's `-cd` would run the engine in the real project
+  directory and compile the unedited source; so is a root reached through a linked directory
+  (`paper -> drafts/p1`, `rootFile: "paper/main.tex"`), where the variant would build in the
+  link's target — the source itself — or resolve `../` inputs against the wrong directory. Both
+  refusals name the spelling to pass instead when there is one (`rootFile: "drafts/p1/main.tex"`,
+  the same document; name the overlay files by their real paths too). A root spelled with a `..`
+  segment is refused for a different reason: the variant is staged from the name as written while
+  the engine resolves `..` physically, so `paper/../p1/main.tex` goes through the link into the
+  source, and `../demo/main.tex` names a file the variant's mirror does not hold.
 
 ### Changed
 

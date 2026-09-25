@@ -33,7 +33,6 @@ import {
   sourceChangedHint,
   sourceChanges,
   stageVariant,
-  touchVariant,
   variantHandle,
   variantPaths,
   writeManifest,
@@ -352,6 +351,32 @@ describe('placeOverlayFile', () => {
   });
 });
 
+describe('stageVariant: one budget for the whole stage', () => {
+  it('counts the entries a placement under a linked directory creates against the farm cap', async () => {
+    const src = await tempDir('ovl-budget-src-');
+    const shared = await tempDir('ovl-budget-shared-');
+    for (const f of ['a', 'b', 'c', 'd', 'e']) await put(shared, `${f}.tex`, f);
+    await put(src, 'main.tex', 'main');
+    await linkDir(shared, path.join(src, 'lib'));
+    const opts = {
+      projectDir: src,
+      rootFile: 'main.tex',
+      engine: 'pdflatex' as const,
+      compiler: 'latexmk' as const,
+      // Materialising lib/ links its five children: the farm itself is only main.tex and lib.
+      contents: new Map([['lib/a.tex', 'edited']]),
+      skip: [],
+    };
+    // The farm alone (2 entries) fits a cap of 4; the placement's 5 links do not.
+    await expect(
+      stageVariant({ ...opts, handle: 'v0000000000a1', maxFarmEntries: 4 }),
+    ).rejects.toThrow(/more than 4 files and directories; an overlay compile links every one/);
+    // 2 + 5 = 7 fits exactly.
+    const paths = await stageVariant({ ...opts, handle: 'v0000000000a2', maxFarmEntries: 7 });
+    expect(await readFile(path.join(paths.src, 'lib/a.tex'), 'utf8')).toBe('edited');
+  });
+});
+
 describe('variant lifecycle', () => {
   it('rebuilding and removing a variant leaves every source file intact', async () => {
     const src = await tempDir('ovl-life-src-');
@@ -436,8 +461,18 @@ describe('variant lifecycle', () => {
       ['v000000000001', 'v000000000002', 'v000000000003', 'v0000000000bb'].sort(),
     );
 
-    // Touching an old one makes it the most recent: the next eviction keeps it.
-    await touchVariant(src, 'v000000000004', new Date(Date.UTC(2027, 0, 1)));
+    // Compiling an old one again (staging it stamps usedAt) makes it the most recent: the next
+    // eviction keeps it.
+    await stageVariant({
+      projectDir: src,
+      handle: 'v000000000004',
+      rootFile: 'main.tex',
+      engine: 'pdflatex',
+      compiler: 'latexmk',
+      contents: new Map(),
+      skip: [buildDir(src)],
+      now: new Date(Date.UTC(2027, 0, 1)),
+    });
     await evictVariants(src, 2, current);
     expect((await readdir(path.join(buildDir(src), 'variants'))).sort()).toEqual(
       ['not-a-handle', current, 'v000000000004'].sort(),
@@ -539,13 +574,29 @@ describe('refuseLinkedRootDir: a root spelled so the engine resolves it differen
     await expect(refuseLinkedRootDir(src, path.join(outside, 'main.tex'))).rejects.toThrow(
       /absolute/,
     );
-    // A drive-qualified spelling is absolute (or drive-relative) on win32, whatever it looks like.
-    await expect(refuseLinkedRootDir(src, 'C:main.tex', { platform: 'win32' })).rejects.toThrow(
-      /absolute/,
-    );
-    await expect(
-      refuseLinkedRootDir(src, 'C:\\p\\main.tex', { platform: 'win32' }),
-    ).rejects.toThrow(/absolute/);
+  });
+
+  it('refuses every Windows spelling on every platform, before touching the disk', async () => {
+    // The project directory does not exist: each refusal is decided on the spelling alone, so it
+    // is the same wherever the server runs — a drive prefix included, which only Windows reads.
+    const nowhere = path.join(os.tmpdir(), 'ovl-no-such-project', 'p');
+    const spellings: Array<[string, RegExp]> = [
+      ['C:main.tex', /is spelled with a drive prefix/],
+      ['c:sub\\main.tex', /is spelled with a drive prefix/],
+      ['C:\\p\\main.tex', /is an absolute path/],
+      ['C:/p/main.tex', /is an absolute path/],
+      ['\\\\server\\share\\main.tex', /is an absolute path/],
+      ['\\main.tex', /is an absolute path/],
+      ['sub\\..\\main.tex', /"\.\."/],
+    ];
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      for (const [spelling, message] of spellings) {
+        await expect(
+          refuseLinkedRootDir(nowhere, spelling, { platform }),
+          `${platform}: ${spelling}`,
+        ).rejects.toThrow(message);
+      }
+    }
   });
 });
 
@@ -838,5 +889,29 @@ describe('overlayFilesNeverRead', () => {
     expect(
       await overlayFilesNeverRead(paths, 'paper/main.tex', files, { maxBytes: 10 }),
     ).toBeUndefined();
+  });
+
+  it('claims nothing when the .fdb_latexmk is over the cap, rather than calling a .bib unread', async () => {
+    const src = await tempDir('ovl-fdb-');
+    const paths = variantPaths(src, 'v0123456789ab');
+    await mkdir(paths.out, { recursive: true });
+    const fls = `PWD ${paths.src}\nINPUT ./main.tex\n`;
+    await writeFile(path.join(paths.out, 'main.fls'), fls);
+    // The bibliography rule's record, padded past a cap the .fls itself stays under.
+    const fdb =
+      '# Fdb version 4\n["biber main"] 1 "main.bcf" "main.bbl" "main" 1 0\n' +
+      '  "refs.bib" 1 71 c03e012c95b02e83136ecda800da647a ""\n' +
+      `${'  "pad.sty" 1 1 0 ""\n'.repeat(50)}`;
+    await writeFile(path.join(paths.out, 'main.fdb_latexmk'), fdb);
+    const maxBytes = Buffer.byteLength(fls) + 10;
+    expect(Buffer.byteLength(fdb)).toBeGreaterThan(maxBytes);
+    expect(
+      await overlayFilesNeverRead(paths, 'main.tex', ['refs.bib'], { maxBytes }),
+    ).toBeUndefined();
+    // Within the cap it is read, and the .bib counts as read.
+    expect(await overlayFilesNeverRead(paths, 'main.tex', ['refs.bib'])).toEqual([]);
+    // And a MISSING .fdb_latexmk leaves the .fls alone as the record.
+    await rm(path.join(paths.out, 'main.fdb_latexmk'));
+    expect(await overlayFilesNeverRead(paths, 'main.tex', ['refs.bib'])).toEqual(['refs.bib']);
   });
 });

@@ -8,8 +8,10 @@ import { matchIsCommented } from '../../src/lib/rewriteMode.js';
 
 /*
  * The pure half of `applyEdits`, which `compile`'s overlay calls without any I/O. It is a move,
- * not a rewrite: the parity block runs the same edits through `FileService.applyEdits` on a temp
- * file and requires the same bytes, so the two can never drift apart.
+ * not a rewrite: `FileService.applyEdits` now calls `applyEditsToContent` itself. The parity block
+ * runs the same edits through both on a temp file and requires the same bytes — it pins that the
+ * I/O wrapper adds nothing to the content (no re-encoding, no newline or BOM handling of its own)
+ * for these cases, not that the two could never differ on any input.
  */
 
 const cleanups: Array<() => Promise<unknown>> = [];

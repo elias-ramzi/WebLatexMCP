@@ -58,8 +58,9 @@ export const editItemSchema = z.union([
         .string()
         .describe(
           'Text those lines become. Empty deletes them outright, line terminator included, ' +
-            'so no blank line is left behind (or, under a rewrite-preservation mode, leaves ' +
-            'them %-commented in place). In a file mixing bare-CR and LF endings, a deletion ' +
+            'so no blank line is left behind (in edit_file only, a rewrite-preservation mode ' +
+            "leaves them %-commented in place instead; compile's overlay never preserves). In a " +
+            'file mixing bare-CR and LF endings, a deletion ' +
             'that would leave a bare \\r right before a blank LF line turns that \\r (and ' +
             'any bare \\r run just before it) into \\n, so the blank line is not swallowed ' +
             'into one CRLF.',
