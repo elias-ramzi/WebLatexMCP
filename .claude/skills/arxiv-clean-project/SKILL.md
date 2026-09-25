@@ -8,6 +8,8 @@ allowed-tools:
   - Bash(pip install arxiv-latex-cleaner:*)
   - Bash(pip install --user arxiv-latex-cleaner:*)
   - Bash(zip:*)
+  - Bash(mkdir:*)
+  - Bash(grep:*)
 ---
 
 # Clean a LaTeX project for arXiv
@@ -33,6 +35,11 @@ Two output modes; **ask the user which they want each run** (after the baseline 
 ## Workflow
 
 Run in order. Stop and report if any step fails.
+
+Shell commands this skill runs: `arxiv_latex_cleaner` and its install, `zip`, `mkdir` and `grep`
+(pre-approved in `allowed-tools`), plus `tar`, `cp`, `mv` and `git -C … check-ignore` for the scratch
+copy, delivery and git-exclude steps. Those four are left out of `allowed-tools` on purpose — each can
+overwrite or move files anywhere — so the client asks for each call; expect those prompts.
 
 1. **Pick the project.** If the user didn't name one, call `list_projects` and ask which.
 2. **Sync & baseline.** `project_sync` the project, then `compile`. Record success + page count. **If it
@@ -97,7 +104,9 @@ Run in order. Stop and report if any step fails.
      go to step 9.
 
 9. **Recompile (in-place only).** `compile` again — it must still succeed. Fewer pages / removed content
-   is expected; broken build is not. If it breaks, fix it, or `discard` and report.
+   is expected; broken build is not. If it breaks, fix it; if you can't, ask the user, then `discard`
+   with `paths` set to the files this run changed — never a bare `discard`, which also throws away
+   edits the user had before the skill ran — and report.
 10. **Review (in-place only).** Show the `diff`. Do **not** `commit`/`push` unless the user asks — per
     CLAUDE.md, mutating the remote happens only on explicit request.
 
@@ -113,9 +122,12 @@ Give the user a usable pointer to `<workspaceRoot>/<id>_arXiv.zip`:
   durable across sessions and already untracked, so it never shows in this repo's `git status`.
 - Otherwise (home-dir default, or an explicit path outside the workspace) give the **absolute path** and
   note it lives outside the IDE workspace, so it can't be a clickable relative link.
-- If `<workspaceRoot>` happens to sit inside some _other_ git repo that does not already exclude it, add
-  `<id>_arXiv/` and `<id>_arXiv.zip` to that repo's `.git/info/exclude` so the export is never
-  accidentally tracked (the same local-exclude trick `summarize-paper` uses).
+- If `<workspaceRoot>` happens to sit inside some _other_ git repo that does not already exclude it
+  (`git -C "<workspaceRoot>" check-ignore "<id>_arXiv.zip"` prints nothing), **ask before touching
+  it**: that repo is not the project. On a yes, add `<id>_arXiv/` and `<id>_arXiv.zip` to its
+  `.git/info/exclude` so the export is never accidentally tracked (the same local-exclude trick
+  `summarize-paper` uses; the file is local to that checkout and never committed). On a no, say the
+  export will show up as untracked there.
 
 Report the zip's size and the page count before/after alongside the link.
 

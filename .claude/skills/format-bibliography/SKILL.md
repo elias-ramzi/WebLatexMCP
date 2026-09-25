@@ -67,7 +67,8 @@ Run in order. Stop and report if a step fails.
    a bibliography service. Do all edits within the one project so the per-project mutex serializes them.
 8. **Recompile and verify.** `compile` again. It must succeed with **zero `Citation … undefined`**
    warnings and the same count of distinct papers cited as the baseline. If anything broke, fix it; if you
-   can't, `discard` and report.
+   can't, ask the user, then `discard` with `paths` set to the files this run changed — never a bare
+   `discard`, which also throws away edits the user had before the skill ran — and report.
 9. **Mark.** Add a `% formatted-by-claude:` comment to each entry you reformatted (see the marker section).
 10. **Review.** Show the `diff` (both `.bib` and `.tex`). Do **not** `commit`/`push` unless asked.
 
