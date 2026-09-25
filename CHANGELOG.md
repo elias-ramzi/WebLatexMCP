@@ -32,7 +32,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   read-only by its tool list, which a test pins; the typo pass uses its own `paper-typo-hunter`
   rather than `corrector`, which `/hunt-typo` can authorize to edit. The command stops when the
   server is not connected rather than improvising around it, and on a bare PDF it checks for
-  poppler and names the install line instead of installing it. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
+  poppler and names the install line instead of installing it. The agents hold no `Grep`/`Glob`,
+  which reach past the project, so a review stays on the commit that was compiled; and nothing is
+  written into the run directory until the whole panel has returned, since the reviewers search
+  the project it sits in. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
   or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
   copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
   git-excluded `paper-review.local/<timestamp>/` (under the server workspace for a bare PDF, which

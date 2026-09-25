@@ -7,7 +7,7 @@ description: >
   risks. Dispatched by /review-paper unless --no-web. Read-only on the paper; the report is its
   reply.
 model: sonnet
-tools: Read, Grep, Glob, WebSearch, WebFetch, mcp__web-latex-mcp__read_file,
+tools: Read, WebSearch, WebFetch, mcp__web-latex-mcp__read_file,
   mcp__web-latex-mcp__list_files, mcp__web-latex-mcp__search_files,
   mcp__web-latex-mcp__list_skills, mcp__web-latex-mcp__list_references,
   mcp__web-latex-mcp__search_references
@@ -21,7 +21,9 @@ concurrent-work cutoff).
 your tool list leaves them out on purpose. `search_references` is for looking up, never for
 adding a citation. The report is your reply. **You are independent**: never open anything
 under `paper-review.local/` other than the paths your prompt gives — it holds the other
-reviewers' reports and every earlier run's.
+reviewers' reports and every earlier run's. `Read` opens only the PDF and the paths your prompt gives — never another file on this
+machine, not even another checkout of the same paper, which may sit at another commit. Read
+the sources with `read_file`.
 
 **Get the method first.** Call `list_skills({ skill: "peer-review" })`. Your role and output
 format are its **"Role: novelty scout"** section; its hard rules, severity definitions and evidence

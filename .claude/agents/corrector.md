@@ -7,7 +7,7 @@ description: >
   the exact old text, and the exact replacement. Never rewrites prose for style, never
   touches a .bib, never edits without being told to.
 model: sonnet
-tools: Read, Grep, Glob, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
+tools: Read, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
   mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills,
   mcp__web-latex-mcp__edit_file
 ---

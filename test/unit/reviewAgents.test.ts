@@ -26,11 +26,15 @@ const REVIEW_AGENTS = [
   'paper-typo-hunter',
 ];
 
-/** Every tool a review agent may hold: reads, searches, lookups — nothing that writes. */
+/**
+ * Every tool a review agent may hold: reads, searches, lookups — nothing that writes. `Grep` and
+ * `Glob` are left out on purpose: they are not confined to the project, and a reviewer once
+ * grepped another checkout of the same paper at a different commit. `search_files` and
+ * `list_files` cover them inside the sandbox; `Read` stays, for the PDF, which the server does not
+ * serve as pages.
+ */
 const READ_ONLY_TOOLS = new Set([
   'Read',
-  'Grep',
-  'Glob',
   'WebSearch',
   'WebFetch',
   `${MCP}read_file`,

@@ -50,6 +50,10 @@ desk-reject for it.
   panel — it rewrites the build directory under the other reviewers; the orchestrator compiles once.
 - **References**: `list_references` reads the bibliography in any format; `check_citations`
   finds cite keys without an entry.
+- **Stay on the commit that was compiled.** Read the sources only through the server
+  (`read_file`, `search_files`, `list_files`), which keeps you inside the project. A file tool of
+  your own (`Read`) is for the PDF and the paths your prompt gives, nothing else — never another
+  checkout of the same paper elsewhere on the machine, which may sit at another commit.
 - **Earlier review runs are not the paper.** Skip everything under `paper-review.local/` — this
   run's reports and every earlier run's — except the paths your prompt gives you (the triage's reports, a bare PDF's `paper.pdf` and
   `paper.txt`).
@@ -70,8 +74,8 @@ desk-reject for it.
   done > "$RUN/paper.txt"
   ```
 
-  Read `paper.pdf` for figures, tables and layout (at most 20 pages per call) and `paper.txt` to
-  search and quote. The page of a line is the nearest `=== p.<n> ===` marker above it.
+  Read `paper.pdf` for figures, tables and layout (at most 20 pages per call) and `paper.txt`, in
+  line ranges, to quote. The page of a line is the nearest `=== p.<n> ===` marker above it.
 
 ## Reading protocol — three passes
 
@@ -462,7 +466,10 @@ wrong, and one raised by a single reviewer can be the most important.
    important, and flag it for the authors to check). Verify every CRITICAL and MAJOR yourself;
    check every absence claim against the appendix; drop any typo you cannot find. The
    orchestrator's own `CMP` items are a source like any other: check each one's location in the
-   paper, and log every correction you make to it rather than fixing it silently.
+   paper, and log every correction you make to it rather than fixing it silently. **Re-check
+   every anchor that reaches the final review**: re-read the cited line range with `read_file`
+   (or the cited page), and correct the line number when the text sits elsewhere — reviewers'
+   line numbers drift by one or two, and the author's first look is at the anchor.
 5. **Final labels** with the severity rubric. **Consensus raises confidence, never severity.**
    Every devil's-advocate CRITICAL gets a visible verdict — upheld at a stated severity, or
    rejected with the evidence. Real disagreements between reviewers are adjudicated on the paper

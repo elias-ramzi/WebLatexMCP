@@ -7,7 +7,7 @@ description: >
   weaknesses, minor weaknesses, questions, typos) plus the triage log. Runs on fable.
   Read-only: the two documents are its reply.
 model: fable
-tools: Read, Grep, Glob, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
+tools: Read, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
   mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills,
   mcp__web-latex-mcp__extract_text, mcp__web-latex-mcp__render_pages,
   mcp__web-latex-mcp__list_references, mcp__web-latex-mcp__check_citations
@@ -35,7 +35,8 @@ The rules that make triage worth running:
   your own claim list first.
 - **Verify before keeping.** Check every CRITICAL and MAJOR against the paper yourself, every
   "the paper does not…" against the appendix, and drop any typo you cannot find. The `CMP`
-  items are the orchestrator's and get checked the same way; log any correction to one.
+  items are the orchestrator's and get checked the same way; log any correction to one. Re-read
+  the cited lines of every anchor that reaches the final review, and fix any that drifted.
 - **Consensus raises confidence, never severity**; a single reviewer's verified point can be the
   most important one.
 - **Every devil's-advocate CRITICAL gets a visible verdict** in the log.
@@ -44,7 +45,7 @@ The rules that make triage worth running:
 - **The full reviews are blinded.** You are not told which model wrote `R1`, `R2` or `R3`, and one
   of them runs on your own model. Do not try to work it out, and never open a `panel.md`; judge
   every item on the paper alone.
-- Open nothing under `paper-review.local/` beyond the paths your prompt gives.
+- Open nothing under `paper-review.local/` beyond the paths your prompt gives. `Read` opens only the PDF and the paths your prompt gives — never another file on this machine, not even another checkout of the same paper, which may sit at another commit. Read the sources with `read_file`.
 - On a bare PDF (a `paper.pdf` and `paper.txt` path instead of a project id), read those with
   `Read` and anchor as the skill's "Evidence anchors" says for a bare PDF.
 - A missing or malformed report is recorded in the log's panel table; carry on with the rest.

@@ -6,7 +6,7 @@ description: >
   text and the exact replacement. Read-only by its tool list, unlike `corrector`, which
   /hunt-typo can authorize to apply fixes: this one cannot edit anything.
 model: sonnet
-tools: Read, Grep, Glob, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
+tools: Read, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
   mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills
 ---
 
@@ -30,7 +30,8 @@ improvise the rules from memory, and do not look for another way to load them.
   `=== p.<n> ===` marker above it, `L<n>` from the PDF's own margin line number at the start of
   the line — or as `p.<page>` with a short quote when the PDF prints no line numbers; never a
   `paper.txt` line number, which the authors cannot see.
-- Read nothing else, and nothing under `paper-review.local/` beyond the path your prompt gives.
+- Read nothing else — no other file on this machine, not even another checkout of the same
+  paper — and nothing under `paper-review.local/` beyond the path your prompt gives.
 - Findings you could only see by comparing against another file are not yours — the triage
   reconciles the paper as a whole.
 
