@@ -10,8 +10,9 @@ and the clerk; the agents do the reviewing, and the triage does the judging.
 Target: $ARGUMENTS
 
 **This command reviews and never edits.** Nothing in the paper is written, committed, or pushed —
-not the `.tex`, not the `.bib`. The only files it writes are the review reports, git-excluded, as
-step 2 says, on the local copy of the project. Applying a suggestion afterwards is a separate, explicit request.
+not the `.tex`, not the `.bib`. It writes only the review reports, on the local copy of the
+project, and the one `.git/info/exclude` line that keeps them out of git, as step 2 says. Applying a
+suggestion afterwards is a separate, explicit request.
 
 **Load the method before you touch anything:** `list_skills({ skill: "peer-review" })`. That
 skill is the single source of truth for how to review, what each role returns, and how triage
@@ -62,7 +63,8 @@ stop and tell me.
    (`.tex`/`.md`, no `.bib`, no build directories; split a file over ~2000 lines across two
    agents), **report-only** — never pass apply authorization. If there are more than ~25 files,
    tell me the count and ask whether to run all or a subset. Say in one line that the panel is
-   running, then wait for the completion notifications; do not poll.
+   running — naming, unless `--no-web`, that the novelty scout is sending search queries out —
+   then wait for the completion notifications; do not poll.
 
 4. **Collect.** Save each reply to its file with `write_file`, and merge the correctors' findings
    into one `reports/typos.md` table in file order. A reply that starts with `failed:`, is empty,
@@ -81,8 +83,9 @@ stop and tell me.
    everywhere, show it in full and link it. Then, from the triage log: the predicted outcome, the
    top of the author action plan, and every item marked UNVERIFIABLE that I must check myself.
    Close with the panel that actually ran (models, any failed agent), the venue assumed, and links
-   to `final-review.md`, `triage-log.md` and `reports/`. Never upload, publish or share the paper
-   or the reviews anywhere.
+   to `final-review.md`, `triage-log.md` and `reports/`, and name the exclude file that gained the
+   `paper-review.local/` line, if one did. Never upload, publish or share the paper or the reviews
+   anywhere.
 
 To review a revision, run the command again: a new run directory, a fresh panel that never sees
 the previous reports. Give only the triage agent the previous `triage-log.md` path, and ask it to
