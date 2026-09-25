@@ -20,7 +20,7 @@ import type { Dirent } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, readdir, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { buildAuxPath } from '../services/compiler.js';
+import { buildAuxPath, buildAuxPathIn } from '../services/compiler.js';
 import { MAX_READ_BYTES } from '../services/fileService.js';
 import { unwrapLines } from '../services/logParser.js';
 import { toPosix } from './paths.js';
@@ -1445,10 +1445,16 @@ export async function readShipoutMarks(auxPath: string): Promise<number[] | unde
 export async function readAuxFloats(
   projectDir: string,
   rootFile: string,
-  opts?: { max?: number; shipouts?: boolean },
+  opts?: { max?: number; shipouts?: boolean; buildDir?: string },
 ): Promise<AuxFloatsResult> {
   const max = opts?.max ?? DEFAULT_MAX_FLOATS;
-  const auxPath = buildAuxPath(projectDir, rootFile);
+  // `buildDir` reads another build of the same root — an overlay compile's variant `out/` —
+  // instead of the project's own. Everything below (the \@input walk, the pgfpages evidence, the
+  // shipout marks) is derived from this one path, so it all reads that build.
+  const auxPath =
+    opts?.buildDir !== undefined
+      ? buildAuxPathIn(opts.buildDir, rootFile)
+      : buildAuxPath(projectDir, rootFile);
 
   let auxContent: string;
   try {

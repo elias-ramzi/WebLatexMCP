@@ -22,9 +22,15 @@ import {
   MAX_LABELS_PER_CALL,
 } from '../lib/labelPages.js';
 import type { LabelPagePlan } from '../lib/labelPages.js';
+import {
+  locateVariantPdf,
+  resolveVariantBuild,
+  VARIANT_INPUT_DESCRIPTION,
+} from '../lib/variants.js';
 
 const inputSchema = {
   project: z.string().optional(),
+  variant: z.string().optional().describe(VARIANT_INPUT_DESCRIPTION),
   rootFile: z
     .string()
     .optional()
@@ -153,6 +159,10 @@ const pageShape = z.object({
 });
 
 const outputSchema = {
+  variant: z
+    .string()
+    .optional()
+    .describe('The variant handle this read, echoed back; absent when the main build was read.'),
   pdfPath: z
     .string()
     .describe('The compiled PDF that was rasterized. POSIX (`/`-separated) on every OS.'),
@@ -245,7 +255,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, labels, dpi, maxEdgePx, clip, inline }) => {
+    async ({ project, rootFile, pages, labels, dpi, maxEdgePx, clip, inline, variant }) => {
       try {
         // Rejected, never silently resolved — the house rule `diff` already applies to
         // `ref` + `staged`. Either one could be made to win, and whichever were chosen would
@@ -271,14 +281,23 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // No recordBaseline: nothing here reads a caller-named file through FileService, and
           // detectRootFile itself records no baseline (see rootFile.ts) — recording one here would
           // wrongly claim the caller could now base a write on a file it only used to find a PDF.
-          const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // A variant (an overlay compile's what-if build) is read from its own out/ and
+          // nowhere else: its root, its PDF, its .aux, and its own render/ for the PNGs.
+          const v =
+            variant !== undefined
+              ? await resolveVariantBuild(dir, id, variant, rootFile)
+              : undefined;
+          const root = v ? v.rootFile : (rootFile ?? (await detectRootFile(ctx.files, dir)));
           // The ROOT's build PDF, never the surfaced copy once a root is named or an .aux is
           // read: the surfaced copy holds whichever root compiled last, and pairing it with this
           // root's .aux would render another root's page for a label (see locateRootPdf).
-          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
-            rootNamed: rootFile !== undefined,
-            readsAux: labels !== undefined,
-          });
+          const pdfPath =
+            v && variant !== undefined
+              ? await locateVariantPdf(variant, v)
+              : await locateRootPdf(ctx.config, id, dir, root, {
+                  rootNamed: rootFile !== undefined,
+                  readsAux: labels !== undefined,
+                });
           if (!pdfPath) {
             throw new Error(
               `No compiled PDF found for project "${id}". Run compile first, then render_pages.`,
@@ -287,7 +306,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // Invariant: nothing is ever written inside the project directory. PNGs go under the
           // temp build dir's own "render" subdirectory — for a local (in-place) project this is
           // the difference between reading/editing in place and littering it with PNGs.
-          const outDir = path.join(buildDir(dir), 'render');
+          const outDir = v ? v.paths.render : path.join(buildDir(dir), 'render');
 
           // Label resolution reads the build-dir .aux, which is the very file a peer session's
           // compile rewrites in place — so it belongs INSIDE this runExclusive closure, alongside
@@ -300,7 +319,11 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // base a write on. Same reasoning as pdf_geometry's "floats" kind.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
-            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX, shipouts: true });
+            const aux = await readAuxFloats(dir, root, {
+              max: LABEL_LOOKUP_MAX,
+              shipouts: true,
+              ...(v ? { buildDir: v.paths.out } : {}),
+            });
             // The PDF's own /PageLabels tree turns "printed page -> page index" from an
             // inference into a lookup. `null` is the common answer (a plain `article` has no
             // such tree), and then the printed page is only a candidate: resolveLabelPages reads
@@ -388,6 +411,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // structuredContent must never carry base64 (it would double the payload) — the image
           // bytes only ever reach `content`, below.
           const structuredContent = {
+            ...(variant !== undefined ? { variant } : {}),
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
             outDir: outOutDir,
@@ -397,7 +421,9 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             note,
           };
 
-          const header = `rendered ${rendered.length} of ${result.pageCount} page(s) from ${outPdfPath}`;
+          const header =
+            `rendered ${rendered.length} of ${result.pageCount} page(s) from ${outPdfPath}` +
+            (variant !== undefined ? ` (variant ${variant})` : '');
           // Mapped over pagesOut, not `rendered`: the line must name the same pngPath
           // structuredContent reports, and pagesOut is where the converted one lives. The base64
           // loop below stays on `rendered`, which is the only side carrying the image bytes.

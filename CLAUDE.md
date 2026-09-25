@@ -913,6 +913,36 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
+- **An overlay compile builds a what-if variant in a link farm, and never writes the project.**
+  `compile`'s `overlay` (`src/lib/variants.ts`) applies `edit_file`'s edits in memory
+  (`applyEditsToContent`, the pure half of `FileService.applyEdits`, so both refuse the same edits)
+  to files read through `readTextExact` — the project's link policy, **no baseline** — and compiles
+  in `buildDir(dir)/variants/<handle>/src/`: a mirror of the project tree whose every file is a
+  link to its absolute source path (a symlinked directory is ONE link, never walked; `.git`, the
+  workspace and the build root are skipped; win32 uses junctions, hard links and copies), except
+  the overlaid files, which are real files — an overlaid path under a linked directory
+  materialises that directory first, so nothing is written through a link. The backend runs there
+  (`CompileRequest.workDir`) into the variant's own `out/` (`outDir`). Not `TEXINPUTS`: kpathsea
+  never searches the path for `./` or `../` names, so those inputs read the source. **The server
+  never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
+  surface; the only project files read are the overlaid ones — **except on win32**, where the
+  farm's copy fallback does read files through the server: a file symlink is copied (a symlink
+  needs a privilege there), and so is a file a hard link cannot reach (another drive than the temp
+  dir) or a read-only one (a hard link shares its attributes, and deleting the farm would clear
+  the source's read-only bit), all charged against `MAX_FARM_COPY_BYTES` (512 MiB). Two entries
+  naming one file (a case variant, a hard link: judged by `lstat` dev+ino, after the platform's
+  case fold) are refused, since only the second would reach the farm; and the variant's `.fls` (what the engine
+  opened) and `.fdb_latexmk` (what latexmk's other rules read — biber's `.bib`) are checked after
+  the compile, so an overlaid file the build never opened is named in `hint` rather
+  than producing a variant silently identical to the main build. Nothing goes through FileService's
+  write path (no shadow record, no baseline, no rewrite mode), and the surfaced PDF and the viewer
+  are left alone. The handle is `v` + 12 hex of SHA-256 over root, engine, backend, shell-escape
+  flags and the normalised overlay, so the same overlay reuses its `out/`; a caller-supplied handle
+  is checked by `isVariantHandle` **before** any path join (`childPathInside`). After each overlay
+  compile, under the lock, all but the `MAX_VARIANTS` (4) most recently compiled variants are removed
+  (`rm -rf`, which unlinks a farm's links without following them), never the one just compiled. The
+  PDF tools take `variant` and read that build only — its PDF, `.aux`/`.log` (`readAuxFloats`'
+  `buildDir`) and its own `render/` — never falling back to the main build.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location
