@@ -18,7 +18,9 @@ import type { LabelPageEvidence, LabelPageReader } from '../../src/lib/labelPage
 import { isBeamerAux, parseAuxLabels, readAuxFloats } from '../../src/lib/auxFloats.js';
 import type { AuxFloatsResult, AuxLabel } from '../../src/lib/auxFloats.js';
 import { buildAuxPath, buildDir } from '../../src/services/compiler.js';
-import type { TextRequest, TextResult } from '../../src/services/pdfRender.js';
+import { PdfRenderer, PDFJS_SPECIFIER } from '../../src/services/pdfRender.js';
+import type { PdfjsLoader, TextRequest, TextResult } from '../../src/services/pdfRender.js';
+import { minimalPdf } from '../helpers/minimalPdf.js';
 
 /**
  * `[label, number, page]` — the three fields a `\newlabel{label}{{number}{page}}` carries. The
@@ -598,11 +600,46 @@ describe('resolveLabelPages', () => {
 });
 
 describe('pdfLabelPageReader', () => {
+  let pdfDir: string | undefined;
+  afterEach(async () => {
+    if (pdfDir) await rm(pdfDir, { recursive: true, force: true });
+    pdfDir = undefined;
+  });
+
+  it('opens the PDF once for its page labels and its page count', async () => {
+    // Both answers come off one document load: a second open read the whole file again, and was
+    // a second way for a lookup the tree route settles to fail. Counted at pdf.js's getDocument,
+    // under the real renderer and the real pdf.js.
+    pdfDir = await mkdtemp(path.join(os.tmpdir(), 'label-reader-'));
+    const pdfPath = path.join(pdfDir, 'main.pdf');
+    await writeFile(pdfPath, minimalPdf(3, 200, 100, { pageLabels: ['i', '1', '2'] }));
+    let loads = 0;
+    const loader: PdfjsLoader = async () => {
+      const real = (await import(PDFJS_SPECIFIER)) as unknown as Awaited<ReturnType<PdfjsLoader>>;
+      return {
+        OPS: real.OPS,
+        getDocument: (src) => {
+          loads++;
+          return real.getDocument(src);
+        },
+      };
+    };
+    const index = { ...aux([['fig:a', '1', '2']]), shipouts: [1, 1, 2] };
+    const plan = await resolveLabelPages(
+      ['fig:a'],
+      index,
+      pdfLabelPageReader(new PdfRenderer(loader), pdfPath),
+    );
+    expect(plan.labelSource).toBe('pageLabels');
+    expect(plan.pageCount).toBe(3);
+    expect(plan.resolved).toEqual([{ label: 'fig:a', printedPage: '2', page: 3 }]);
+    expect(loads).toBe(1);
+  });
+
   it('keeps asking until every page came back, past the renderer’s per-call page cap', async () => {
     const calls: number[][] = [];
     const renderer = {
-      pageLabels: () => Promise.resolve(null),
-      pageCount: () => Promise.resolve(10),
+      pageLabelsAndCount: () => Promise.resolve({ pageLabels: null, pageCount: 10 }),
       text: (req: TextRequest): Promise<TextResult> => {
         const pages = req.pages ?? [];
         calls.push(pages);
@@ -1299,11 +1336,26 @@ describe('a build whose records cannot say whether it loaded pgfpages refuses ev
     expect(msg).toMatch(/Its number is "1"/);
     expect(msg).toMatch(/compile again/i);
     expect(msg).toMatch(/pages:/);
+    // An empty record counts as unread, and the refusal says so.
+    expect(msg).toMatch(
+      /could be read beside the \.aux \(a missing or empty file counts as unread\)/,
+    );
     // Nothing is known about pgfpages, so nothing may be claimed about it.
     expect(msg).not.toMatch(/loaded pgfpages|names? pgfpages\.sty/);
     // The advice is given once, however many labels refuse.
     const two = labelRefusalMessage(planLabelPages(['fig:a', 'fig:b'], index, null), index);
     expect(two.match(/compile again/gi)).toHaveLength(1);
+  });
+
+  it('points at the last page by the PDF page count, as the pgfpagesLayout advice does', () => {
+    const index = withoutRecords(aux(ENTRIES));
+    const counted = planLabelPages(['fig:a'], index, null, pagesOf('unshifted'));
+    expect(labelRefusalMessage(counted, index)).toContain(
+      "To show the last page (lastpage's LastPage, say), pass pages: [4] (the PDF's page count).",
+    );
+    expect(labelRefusalMessage(planLabelPages(['fig:a'], index, null), index)).toContain(
+      "pass pages: with the PDF's page count.",
+    );
   });
 });
 
@@ -1449,17 +1501,23 @@ describe('a build that loaded pgfpages refuses every label, on both routes', () 
     }
   });
 
-  it('runs the routes once an EMPTY .log was read: a record that names nothing is not "unknown"', async () => {
-    // The value just outside the guard: the same .aux, and a .log that was read and names
-    // nothing, so pgfpages is false and whatever the routes decide, it is not a pgfpages refusal.
+  it('refuses every label when the only .log is EMPTY: a zero-byte file is no record, on both routes', async () => {
+    // A zero-byte .log is what an interrupted run leaves, not a record that names nothing. Read
+    // as `false`, it let the routes run on this very article, and every label resolved a page
+    // LATE; so it counts as unread, and with no .fls either nothing is known.
     const index = await readBuild({ 'main.aux': fixtureAux('articleResizeTo'), 'main.log': '' });
-    expect(index.pgfpages).toBe(false);
+    expect(index.pgfpages).toBeUndefined();
+    const expected = LABELS.map((label, i) => ({
+      label,
+      reason: 'pgfpagesUnknown',
+      printedPage: String(i + 2),
+      number: String(i + 1),
+    }));
     for (const tree of [null, ['1', '2', '3', '4']]) {
       const plan = await resolveLabelPages(LABELS, index, fixtureReader('articleResizeTo', tree));
-      const reasons = plan.failed.map((f) => f.reason);
-      expect(reasons, JSON.stringify(tree)).not.toContain('pgfpagesUnknown');
-      expect(reasons, JSON.stringify(tree)).not.toContain('pgfpagesLayout');
-      expect(plan.resolved.length + plan.failed.length, JSON.stringify(tree)).toBe(LABELS.length);
+      expect(plan.resolved, JSON.stringify(tree)).toEqual([]);
+      expect(plan.pages, JSON.stringify(tree)).toEqual([]);
+      expect(plan.failed, JSON.stringify(tree)).toEqual(expected);
     }
   });
 
@@ -1615,6 +1673,13 @@ describe('the slideMismatch refusal gives the advice that fits the build', () =>
     expect(msg).not.toMatch(/compile without|compiling without/);
     expect(msg).toMatch(/records name neither pgfpages nor pgfmorepages/);
     expect(msg).toMatch(/allowframebreaks/);
+    // A `false` reading can itself be wrong (a record another run left), so the advice names the
+    // usual cause rather than ruling a pgfpages shift out.
+    expect(msg).not.toMatch(/is not a pgfpages shift/);
+    expect(msg).toContain(
+      "This build's records name neither pgfpages nor pgfmorepages, so the usual cause is a " +
+        '\\label in an allowframebreaks frame',
+    );
     // Nor offer a pgfpages layout as a cause per label, which the closing advice then denies.
     expect(msg).not.toMatch(/pgfpages layout/);
   });

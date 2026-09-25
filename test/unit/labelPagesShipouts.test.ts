@@ -195,7 +195,9 @@ describe('the printed-page route refuses a page the log shipped under another co
   });
 
   it('does not check when the marks do not number exactly the PDF pages', () => {
-    for (const shipouts of [[], range(1, 3), range(1, 5), [7, 1, 8, 2, 3, 4]]) {
+    // Not `[]`: a log that shipped NO page while the PDF has some is another run's record, and
+    // refuses every label (see 'a .log that shipped no page' below).
+    for (const shipouts of [range(1, 3), range(1, 5), [7, 1, 8, 2, 3, 4]]) {
       const plan = planLabelPages(
         ['fig:a', 'fig:b'],
         aux(UNSHIFTED, shipouts),
@@ -576,6 +578,27 @@ describe('pagesToVerify reads the pages shipped with the same counter', () => {
   });
 });
 
+describe('the shipout refusal names pages as evidence, not as a page to render', () => {
+  it('says the pages it names come from the log and are not a pages: value', () => {
+    // Tree route, "3" on PDF page 3, shipped with counter 4; counter 3 was shipped on PDF page 4.
+    const index = aux([['fig:a', '1', '3']], [1, 2, 4, 3]);
+    const plan = planLabelPages(['fig:a'], index, ['1', '2', '3', '4'], count(4));
+    const msg = labelRefusalMessage(plan, index);
+    expect(msg).toContain('page counter 3 was shipped out on PDF page 4');
+    expect(msg).toContain(
+      'The PDF pages the record names come from a log the document can write into: they are ' +
+        'evidence for this refusal, not a page to pass as pages:.',
+    );
+    // A record naming no other page says nothing of the kind.
+    const none = aux([['fig:a', '1', '3']], [1, 2, 4, 5]);
+    const bare = labelRefusalMessage(
+      planLabelPages(['fig:a'], none, ['1', '2', '3', '4'], count(4)),
+      none,
+    );
+    expect(bare).not.toMatch(/evidence for this refusal/);
+  });
+});
+
 describe('the shipout refusal compares the counter as a number', () => {
   it('names a repeated counter as repeated when the printed page has a leading zero', () => {
     // Printed page "02" is counter 2. PDF page 2 reads "02" (its neighbour "1" agrees) and was
@@ -609,6 +632,12 @@ describe('the resolution note says whether the shipout record was checked', () =
     expect(checked.shipoutsChecked).toBe(true);
     const note = labelResolutionNote(checked);
     expect(note).toMatch(/\.log recorded that PDF page as shipped out with that page counter/);
+    // The residuals the module header states for the checked case: marks that line up wrongly,
+    // and whatever reads as a page number in another style where the folio is looked for.
+    expect(note).toMatch(
+      /an extra mark and a missed one in the \.log can line up to the right count and agree with a wrong page/,
+    );
+    expect(note).toMatch(/a figure's axis label "x", a two-letter word, or a word such as "mix"/);
     expect(note).not.toMatch(/a restart whose last page shows no page number goes unseen/);
     for (const shipouts of [undefined, range(1, 3)]) {
       const unchecked = planLabelPages(
@@ -627,5 +656,179 @@ describe('the resolution note says whether the shipout record was checked', () =
       text: new Map(),
     });
     expect(labelResolutionNote(tree)).toMatch(/for a decimal printed page, the build's \.log/);
+  });
+});
+
+describe('a .log that shipped no page describes another run than the PDF: every label refused', () => {
+  // TeX writes a mark for every page it ships and a document cannot suppress one, so a log that
+  // was read, parsed, and holds NO mark, beside a PDF that has pages, is not that PDF's run. The
+  // case seen: an error in the preamble stops pdflatex before its first page; it rewrites the
+  // .log and .fls (neither names pgfpages yet) but leaves the earlier run's .aux and PDF, so the
+  // pgfpages evidence reads `false` about a build it never saw.
+  const TREE = ['1', '2', '3', '4'];
+
+  it('refuses every found label on both routes; notFound and multiplyDefined still win for theirs', () => {
+    const index = aux([...UNSHIFTED, ['dup', '3', '1'], ['dup', '4', '1']], []);
+    for (const [tree, ev] of [
+      [null, pagesOf('unshifted')],
+      [TREE, count(4)],
+    ] as const) {
+      const plan = planLabelPages(['fig:a', 'nope', 'dup', 'fig:b'], index, tree, ev);
+      expect(plan.labelSource).toBe(tree ? 'pageLabels' : 'printedPage');
+      expect(plan.resolved).toEqual([]);
+      expect(plan.pages).toEqual([]);
+      expect(plan.failed).toEqual([
+        { label: 'fig:a', reason: 'nothingShipped', printedPage: '2', number: '1' },
+        { label: 'nope', reason: 'notFound' },
+        {
+          label: 'dup',
+          reason: 'multiplyDefined',
+          printedPages: ['1', '1'],
+          printedPagesOmitted: 0,
+        },
+        { label: 'fig:b', reason: 'nothingShipped', printedPage: '3', number: '2' },
+      ]);
+    }
+  });
+
+  it('refuses nothing new when the log was not read or its parse gave up (`undefined`)', () => {
+    const index = aux(UNSHIFTED);
+    expect(index.shipouts).toBeUndefined();
+    expect(planLabelPages(['fig:a', 'fig:b'], index, null, pagesOf('unshifted'))).toMatchObject({
+      failed: [],
+      pages: [2, 3],
+    });
+    expect(planLabelPages(['fig:a', 'fig:b'], index, TREE, count(4))).toMatchObject({
+      failed: [],
+      pages: [2, 3],
+    });
+  });
+
+  it('resolves as before when the marks number the PDF pages (a real record)', () => {
+    const index = aux(UNSHIFTED, range(1, 4));
+    for (const [tree, ev] of [
+      [null, pagesOf('unshifted')],
+      [TREE, count(4)],
+    ] as const) {
+      expect(planLabelPages(['fig:a', 'fig:b'], index, tree, ev)).toMatchObject({
+        failed: [],
+        pages: [2, 3],
+      });
+    }
+  });
+
+  it('comes after the pgfpages refusals: a record naming pgfpages, or none read, keeps its reason', () => {
+    for (const [pgfpages, reason] of [
+      [true, 'pgfpagesLayout'],
+      [undefined, 'pgfpagesUnknown'],
+    ] as const) {
+      const index: AuxFloatsResult = { ...aux(UNSHIFTED, []) };
+      if (pgfpages === undefined) delete index.pgfpages;
+      else index.pgfpages = pgfpages;
+      for (const [tree, ev] of [
+        [null, pagesOf('unshifted')],
+        [TREE, count(4)],
+      ] as const) {
+        const plan = planLabelPages(['fig:a'], index, tree, ev);
+        expect(plan.failed, reason).toEqual([
+          { label: 'fig:a', reason, printedPage: '2', number: '1' },
+        ]);
+      }
+    }
+  });
+
+  it('asks the reader for no page text, since no label can resolve', async () => {
+    const index = aux(UNSHIFTED, []);
+    expect(pagesToVerify(['fig:a'], index, 4)).toEqual([]);
+    const read: number[][] = [];
+    const base = readerOver('unshifted');
+    const plan = await resolveLabelPages(['fig:a', 'fig:b'], index, {
+      ...base,
+      pageText: (p) => {
+        read.push(p);
+        return base.pageText(p);
+      },
+    });
+    expect(plan.failed.map((f) => f.reason)).toEqual(['nothingShipped', 'nothingShipped']);
+    expect(read).toEqual([]);
+  });
+
+  it('says the last compile shipped no page, how to recover, and names the page count once', () => {
+    const index = aux(UNSHIFTED, []);
+    const plan = planLabelPages(['fig:a', 'fig:b'], index, null, pagesOf('unshifted'));
+    const msg = labelRefusalMessage(plan, index);
+    expect(msg).toContain(
+      '"fig:a": the .aux records it on printed page "2", but the build\'s .log holds no [n] ' +
+        'shipout mark (it records a compile that shipped no page, or is empty) while the PDF ' +
+        'beside it has 4 page(s)',
+    );
+    expect(msg).toMatch(/Its number is "1"/);
+    expect(msg).toContain(
+      "  The build's .log is not a record of the run that made this PDF: the last compile " +
+        'stopped before shipping a page — typically on an error in the preamble, which leaves ' +
+        "the earlier run's .aux and PDF in place — or left the .log empty. Fix what stopped it " +
+        "and compile again, then retry; or find the page yourself: search extract_text's " +
+        'output (or pdf_geometry kinds: ["text"]) for the label\'s number and pass pages:. To ' +
+        "show the last page (lastpage's LastPage, say), pass pages: [4] (the PDF's page count).",
+    );
+    // The advice is given once, however many labels refuse, and claims nothing about pgfpages.
+    expect(msg.match(/the last compile stopped/g)).toHaveLength(1);
+    expect(msg).not.toMatch(/names? pgfpages\.sty|compile without pgfpages/);
+  });
+});
+
+describe('the D1 scenario: a preamble error after a `resize to` build (real pdflatex files)', () => {
+  // A good build under `\pgfpagesuselayout{resize to}` recorded tab:x on printed page 3 while the
+  // table is on PDF page 2. Then `\usepackage{doesnotexist}` above `\usepackage{pgfpages}`:
+  // pdflatex stops in the preamble, rewriting main.log and main.fls (neither names pgfpages yet)
+  // and leaving the old main.aux and the 3-page main.pdf. The folio route resolved tab:x to
+  // PDF page 3 — the wrong page, with no refusal.
+  const AUX = '\\relax \n\\newlabel{tab:x}{{1}{3}}\n';
+  const FLS =
+    'PWD /build/proj\nINPUT main.tex\nOUTPUT /build/out/main.log\n' +
+    'INPUT /usr/share/texlive/texmf-dist/tex/latex/base/article.cls\n' +
+    'INPUT /usr/share/texlive/texmf-dist/tex/latex/base/size10.clo\n';
+  /** The 3-page PDF's real text layer (captured through `PdfRenderer.text`). */
+  const PAGES = new Map<number, string[]>([
+    [1, ['Page one text.', '1']],
+    [2, ['Second page.', 'Table 1: T', '2']],
+    [3, ['Third page.', '3']],
+  ]);
+  const reader: LabelPageReader = {
+    pageLabels: () => Promise.resolve(null),
+    pageCount: () => Promise.resolve(3),
+    pageText: (pages) => Promise.resolve(new Map(pages.map((p) => [p, PAGES.get(p) ?? []]))),
+  };
+  let proj: string | undefined;
+  afterEach(async () => {
+    if (proj) {
+      await rm(buildDir(proj), { recursive: true, force: true });
+      await rm(proj, { recursive: true, force: true });
+      proj = undefined;
+    }
+  });
+
+  it.each([
+    ['with the aborted run’s .fls', true],
+    ['with no .fls', false],
+  ])('refuses tab:x %s', async (_name, withFls) => {
+    proj = await mkdtemp(path.join(os.tmpdir(), 'shipouts-stale-'));
+    await mkdir(buildDir(proj), { recursive: true });
+    await writeFile(buildAuxPath(proj, 'main.tex'), AUX);
+    await writeFile(
+      path.join(buildDir(proj), 'main.log'),
+      readFileSync(path.join(FIXTURES, 'shipouts/preambleAbort-pdflatex.log.txt')),
+    );
+    if (withFls) await writeFile(path.join(buildDir(proj), 'main.fls'), FLS);
+    const index = await readAuxFloats(proj, 'main.tex', { max: 20_000, shipouts: true });
+    // The state the lookup used to run on: a readable record naming no pgfpages, and no marks.
+    expect(index.pgfpages).toBe(false);
+    expect(index.shipouts).toEqual([]);
+    const plan = await resolveLabelPages(['tab:x'], index, reader);
+    expect(plan.resolved).toEqual([]);
+    expect(plan.pages).toEqual([]);
+    expect(plan.failed).toEqual([
+      { label: 'tab:x', reason: 'nothingShipped', printedPage: '3', number: '1' },
+    ]);
   });
 });

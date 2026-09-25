@@ -833,7 +833,8 @@ export interface AuxFloatsResult {
   /** Whether the build that wrote this `.aux` loaded `pgfpages` ({@link readPgfpagesEvidence}):
    *  `true` when its recorder file (`.fls`) or its `.log` names `pgfpages.sty`, `false` when at
    *  least one of the two was read and neither does, and absent when neither could be read (no
-   *  `.aux` at all, or a backend that wrote neither). `labelPages.ts` refuses every label of a
+   *  `.aux` at all, or a backend that wrote neither). A zero-byte file counts as unread: it is
+   *  what an interrupted run leaves, not a record. `labelPages.ts` refuses every label of a
    *  `true` build (`'pgfpagesLayout'`): a pgfpages layout shifts every `\newlabel` a page late.
    *  It refuses every label when this is absent too (`'pgfpagesUnknown'`), since the shift is
    *  invisible everywhere else, and `pdf_geometry` then notes that its floats pages are
@@ -843,9 +844,11 @@ export interface AuxFloatsResult {
   /** The page counter (`\count0`) each PDF page was shipped out with, in page order, read off the
    *  shipout marks of the build's `.log` ({@link readShipoutMarks}). Present only when the
    *  caller asked for it (`readAuxFloats(…, { shipouts: true })`) and the log was read and parsed
-   *  whole; absent otherwise — never a partial list. `labelPages.ts` uses it only to REFUSE a
-   *  label whose resolved page was shipped under another counter, and only when its length is
-   *  the PDF's page count. Never spread into a tool's `structuredContent`. */
+   *  whole; absent otherwise — never a partial list. `labelPages.ts` uses it only to REFUSE: a
+   *  label whose resolved page was shipped under another counter, when its length is the PDF's
+   *  page count; and every label (`'nothingShipped'`) when it is EMPTY beside a PDF with pages,
+   *  since the log is then a run that shipped nothing, not the PDF's. Never spread into a tool's
+   *  `structuredContent`. */
   shipouts?: readonly number[];
   /** Present when no `.aux` was found in the build directory, or when the root `.aux` inputs
    *  (`\@input`, which `\include` writes) a file that could not be read — so the index may be
@@ -1197,16 +1200,29 @@ const LOG_PGFPAGES =
   /(?:^|[\s(/\\])pgf(?:more)?pages\.sty(?=[\s)]|$)|^Package: pgf(?:more)?pages\s|^\\pgfpages@shipoutbox=\\box/m;
 
 /**
+ * The flags both build-file readers open with. `O_NOFOLLOW` refuses a symbolic link at the final
+ * component where the platform has it. `O_NONBLOCK`, as in `assetImport.ts`, keeps a FIFO at the
+ * name from blocking the `open` until a writer appears — forever, with the project lock held; the
+ * FIFO is then refused by the regular-file check on the handle. On a regular file it changes
+ * nothing, and on Windows, where neither constant is defined, both fall back to 0.
+ */
+const BUILD_FILE_OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+
+/**
  * Up to `MAX_READ_BYTES` from the start of a build-dir file, as text, or `undefined` when there is
  * no such regular file. Opened without following a symbolic link (where the platform can say so)
- * and checked to be a regular file on the open handle. Only the start is read: `pgfpages` is a
- * preamble package, so both of its marks sit near the top of either file, and a build large
- * enough to reach the cap is not read in full for a question the preamble answers.
+ * and without blocking on a FIFO ({@link BUILD_FILE_OPEN_FLAGS}), and checked to be a regular file
+ * on the open handle. Only the start is read: `pgfpages` is a preamble package, so both of its
+ * marks sit near the top of either file, and a build large enough to reach the cap is not read in
+ * full for a question the preamble answers. Any other failure to open, stat or read propagates;
+ * a failure to CLOSE does not, since it says nothing about the bytes already read and would
+ * otherwise replace the error a failed read is propagating.
  */
 async function readBuildFileHead(file: string): Promise<string | undefined> {
   let handle;
   try {
-    handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    handle = await open(file, BUILD_FILE_OPEN_FLAGS);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ELOOP' || code === 'ENOTDIR' || code === 'EISDIR') {
@@ -1222,7 +1238,7 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
     const { bytesRead } = await handle.read(buf, 0, length, 0);
     return buf.subarray(0, bytesRead).toString('utf8');
   } finally {
-    await handle.close();
+    await handle.close().catch(() => {});
   }
 }
 
@@ -1243,7 +1259,12 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
  *
  * Either one naming `pgfpages.sty` (or `pgfmorepages.sty`) is `true`: the answer only ever
  * refuses, so the union is the safe reading. `false` needs at least one of the two read and
- * neither naming it. `undefined` — neither readable — means nothing is known, and that is not a
+ * neither naming it. A ZERO-BYTE file counts as unread, not as a record naming nothing: it is
+ * what an interrupted run leaves, and reading one as `false` let the label routes run on a real
+ * `resize to` build and resolve every label a page late. Only zero bytes: a file holding anything
+ * at all is judged on what it holds, as before — the narrowest rule that closes the case seen,
+ * rather than a guess at which non-empty contents are "really" empty. `undefined` — neither read
+ * — means nothing is known, and that is not a
  * pass: `labelPages.ts` refuses every label of such a build (`'pgfpagesUnknown'`) and
  * `pdf_geometry` notes that its floats pages are unverified. Every compile leaves a `.log`, so
  * this state means the records were removed or unreadable, and failing closed costs a recompile.
@@ -1254,9 +1275,10 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
  */
 export async function readPgfpagesEvidence(auxPath: string): Promise<boolean | undefined> {
   const stem = auxPath.slice(0, -path.extname(auxPath).length);
-  const fls = await readBuildFileHead(`${stem}.fls`);
+  // `|| undefined`: a zero-byte file is no record (above).
+  const fls = (await readBuildFileHead(`${stem}.fls`)) || undefined;
   if (fls !== undefined && FLS_PGFPAGES.test(fls)) return true;
-  const log = await readBuildFileHead(`${stem}.log`);
+  const log = (await readBuildFileHead(`${stem}.log`)) || undefined;
   if (log !== undefined && LOG_PGFPAGES.test(log)) return true;
   return fls === undefined && log === undefined ? undefined : false;
 }
@@ -1284,9 +1306,12 @@ const SHIPOUT_MARK = /(?<!\S)\[(-?\d{1,10})(?:\.-?\d{1,10}){0,9}(?=[\]{<\s]|$)/g
  *  document. `Tight`/`Loose` are what TeX writes when `\hbadness`/`\vbadness` is set low. */
 const BOX_WARNING = /^(?:Overfull|Underfull|Tight|Loose) \\[hv]box \(/;
 
-/** A box warning raised while the output routine was active: its display (` []`) is on the
- *  warning's own line, so the block is that one line. */
-const OUTPUT_ACTIVE_BOX_WARNING = /has occurred while \\output is active/;
+/** A `\vbox` warning raised while the output routine was active: TeX's `vpack` puts its display
+ *  (` []`) on the warning's own line, so the block is that one line. Only the `\vbox` form:
+ *  `hpack` ends the warning's line before the display, so an `\hbox` one (`Overfull \hbox …
+ *  has occurred while \output is active`, then the display — a header's text, say — then ` []`
+ *  and an empty line) is a block through the next empty line like any other. */
+const OUTPUT_ACTIVE_VBOX_WARNING = /^\S+ \\vbox \(.*has occurred while \\output is active/;
 
 /**
  * The first line of a TeX error: `<file>:<line>: ` under `-file-line-error` (which the server
@@ -1312,8 +1337,11 @@ const ERROR_CONTEXT = /^(?:l\.\d+ |<(?:\*|read \*|read \d+|[a-z][a-z ]{0,20})> )
  * when the log cannot be read that way.
  *
  * TeX's `ship_out` writes `[<\count0>…` into the log as it ships each page, and `]` when done, and
- * a document has no way to stop it, so the k-th mark is the counter PDF page k was shipped with
- * (verified over real pdflatex, xelatex and lualatex builds: see `test/unit/shipoutMarks.test.ts`).
+ * a document has no way to stop it (short of LuaTeX's `start_page_number`/`stop_page_number`
+ * callbacks, which no LaTeX package in TeX Live 2026 registers, and whose suppression only leaves
+ * the list short or empty — a refusal in `labelPages.ts`, or its check off), so the k-th mark is
+ * the counter PDF page k was shipped with (verified over real pdflatex, xelatex and lualatex
+ * builds: see `test/unit/shipoutMarks.test.ts`).
  * A document CAN add text that looks like a mark (`\message{[7]}`, a box display quoting
  * "see [1]"), so the result is evidence that may only refuse a page, and its length is checked
  * against the PDF's page count before it is used at all (`labelPages.ts`).
@@ -1328,10 +1356,12 @@ const ERROR_CONTEXT = /^(?:l\.\d+ |<(?:\*|read \*|read \d+|[a-z][a-z ]{0,20})> )
  *    before anything else is written (`end_diagnostic`), and over real pdflatex, xelatex and
  *    lualatex builds that shipped a page right after a box warning the page's mark always came
  *    after that line, never inside the block. The one exception to "through the next empty
- *    line" is a warning raised inside the output routine (`… has occurred while \output is
- *    active []`), whose display is on its own line and whose ONE following empty line the
- *    79-column rejoin swallows when that line is exactly 79 columns — so it is a block of one
- *    line, and the page's mark after it is kept;
+ *    line" is a `\vbox` warning raised inside the output routine (`Overfull \vbox … has
+ *    occurred while \output is active []`), whose display is on its own line and whose ONE
+ *    following empty line the 79-column rejoin swallows when that line is exactly 79 columns —
+ *    so it is a block of one line, and the page's mark after it is kept. The `\hbox` form of
+ *    that warning is no exception: its display (a `fancyhdr` header quoting `see [3]`, say)
+ *    follows on the next lines, then ` []` and the empty line, as for any other box;
  *  - an error ({@link ERROR_START}): from its `./main.tex:3: …` line through the next empty
  *    line — its context quotes the source (`l.3 Text \foo` / `see [12] here`) and its help can be
  *    the document's own `\errhelp`. A primitive TeX error writes nothing else before that empty
@@ -1366,7 +1396,7 @@ export function parseShipoutMarks(log: string): number[] | undefined {
       continue;
     }
     if (BOX_WARNING.test(line)) {
-      inBlock = !OUTPUT_ACTIVE_BOX_WARNING.test(line);
+      inBlock = !OUTPUT_ACTIVE_VBOX_WARNING.test(line);
       continue;
     }
     if (ERROR_START.test(line)) {
@@ -1396,7 +1426,8 @@ export function parseShipoutMarks(log: string): number[] | undefined {
  * undefined). Where it does not, a link planted between the `lstat` and the `open` would be
  * followed — a window this function does not close, and does not need to: the marks can only
  * ever REFUSE a label (and a list that does not number the PDF's pages is not used at all), so a
- * swapped-in file can at worst refuse a label that would have resolved, never resolve one.
+ * swapped-in file can at worst refuse a label that would have resolved, never resolve one. A
+ * FIFO swapped in there is refused without blocking the `open` ({@link BUILD_FILE_OPEN_FLAGS}).
  *
  * Every failure is "no marks" rather than an error, because the marks can only add a refusal: a
  * lookup without them runs exactly as it did before they were read. Kept apart from
@@ -1408,7 +1439,7 @@ export async function readShipoutMarks(auxPath: string): Promise<number[] | unde
   let handle;
   try {
     if (!(await lstat(logPath)).isFile()) return undefined;
-    handle = await open(logPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    handle = await open(logPath, BUILD_FILE_OPEN_FLAGS);
   } catch {
     return undefined;
   }
@@ -1428,7 +1459,8 @@ export async function readShipoutMarks(auxPath: string): Promise<number[] | unde
   } catch {
     return undefined;
   } finally {
-    await handle.close();
+    // A failed close must not escape either: every failure here is "no marks".
+    await handle.close().catch(() => {});
   }
 }
 

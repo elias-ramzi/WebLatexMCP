@@ -1049,11 +1049,13 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   without `hyperref`. The evidence (`readPgfpagesEvidence`, `AuxFloatsResult.pgfpages`) is the
   build's `.fls` or `.log` naming `pgfpages.sty` or `pgfmorepages.sty` (a drop-in that holds pages
   back the same way without loading `pgfpages.sty`), read from the start only, `O_NOFOLLOW`,
-  regular files only. It is tri-state and the three values must stay apart: `true` refuses; `false`
+  regular files only, opened `O_NONBLOCK` so a FIFO there is refused rather than hung on under
+  the project lock. A zero-byte file counts as unread — it is what an interrupted run leaves, not a
+  record. It is tri-state and the three values must stay apart: `true` refuses; `false`
   means a record was read and names neither package; `undefined` means neither was readable, and
   **every label is refused too** (`pgfpagesUnknown`) — whether a layout shifted the build cannot be
   told, and a compile always leaves a `.log`, so this only fires when something removed or replaced
-  the build's records; resolving there was the last silent-wrong-page path (#194). The tri-state
+  the build's records (#194). The tri-state
   stays in the reader; only the consumer treats `undefined` as a refusal. The `.log` is read even
   when a `.fls` exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
   document-controlled, which is acceptable only because `true` can only ADD a refusal — never let
@@ -1064,11 +1066,26 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `\pgfpagesuselayout` or a mere `\IfFileExists`. No label is exempted by name either — `lastpage`'s
   `LastPage` happens to be written unshifted, but a hand `\label{LastPage}` is not, and telling the
   two apart would need the same forgeable evidence used to accept; the refusal points at `pages:`
-  with the page count instead. `slideMismatch` therefore runs only on `pgfpages === false`, and its
-  advice is the `allowframebreaks` one. `pdf_geometry kinds: ["floats"]` does not refuse — the index
+  with the page count instead. **A `.log` that shipped nothing is not this build's record**
+  (`nothingShipped`, after the two pgfpages refusals): a compile that aborts in the preamble
+  rewrites the `.log` and `.fls` — naming no pgfpages yet — while the earlier run's `.aux` and PDF
+  stay, so `false` there described the wrong run and a `resize to` build resolved a page late.
+  The signal is the shipout record read and parsed to an EMPTY list (or an empty `.log`) while the
+  PDF has pages; TeX writes a mark for every page it ships, so it only ever adds a refusal.
+  `undefined` marks (not read, or the parse gave up) never trigger it. A mark the parser skips on
+  the only page of a one-page PDF (a `\message{\string\foo}` just before it, which starts the line
+  with `\`) refuses spuriously — accepted, since it only refuses. It is not closed against the
+  document, though: mark-shaped text written before the abort point (`\message{[1]}` in the
+  preamble) makes the list non-empty, the length check then switches the cross-check off, and the
+  lookup answers as it did before this refusal existed. No log rule can close that, since the
+  document can write anything a rule would look for. `false` evidence can still
+  be wrong in ways no record shows, so no message says a shift is ruled out: `slideMismatch` runs
+  only on `pgfpages === false`, and its advice gives `allowframebreaks` as the usual cause, not the
+  only one. `pdf_geometry kinds: ["floats"]` does not refuse — the index
   is data the caller asked for, and its keys and numbers are true — but flags
   `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, no
-  record beside it) carries a note that the pages could not be checked, without the flag.
+  record beside it, or each empty) and for a `.log` that shipped nothing carries a note that the
+  pages could not be checked, without the flag.
   **Behind both routes, the `.log`'s shipout marks** (`[<\count0>…]`, one per page shipped;
   `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup asks) refuse a
   resolved page (`unverifiedPage`/`shipoutMismatch`) unless that PDF page was shipped with the
@@ -1082,13 +1099,15 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   at most `MAX_AMBIGUOUS_CANDIDATES` such pages per label, only when the check will run) and **any
   decimal reading** keep it a competitor — a decimal is what a section number or table cell
   forges, so it never vouches. That rule only decides whether the marks ADD a refusal; it can
-  never accept a page the route refused. The engine writes the marks and a document cannot remove
-  one, but it can add one (`\message{[7]}`), so they are consulted only when their count equals
+  never accept a page the route refused. The engine writes the marks and a LaTeX document cannot
+  remove one (LuaTeX's `start_page_number`/`stop_page_number` callbacks can, and no LaTeX package
+  in TeX Live registers them; a short list only refuses), but it can add one (`\message{[7]}`), so they are consulted only when their count equals
   the PDF's page count — any other length skips the check silently, and then the folio route's
   residual shapes pass as they did without it — and never resolve, move or accept a page. The
   parser skips the places TeX copies document text into the log: a whole box display (warning
-  line through the next empty line; an output-routine warning, whose display shares its line, is
-  a block of one line), a TeX error from its `file:line:` or `!` line through the next empty
+  line through the next empty line; an output-routine `\vbox` warning, whose display shares its
+  line, is a block of one line — an `\hbox` one puts its display on the lines below and runs to the
+  empty line like any other), a TeX error from its `file:line:` or `!` line through the next empty
   line, and, outside an error, only the FIRST line of a context pair (`l.<n> …`, `<argument> …`)
   — the line under it is read, because pdfTeX's duplicate-destination warning prints the next
   page's mark there. Real logs put every genuine mark after the skipped blocks. Known parse gaps,
@@ -1099,8 +1118,11 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   Accepted residuals: an extra and a missed mark can line up to the right count and shift the
   list, which can refuse a correct label or fail to add a refusal it should (either way never
   worse than the route's own answer),
-  and a section number opening a competing page (`A`, `S1` above an empty foot) can read as its
-  page number and let a repeat through (back to the route's own answer). The log is opened after
+  and whatever stands where a folio is looked for on a competing page and reads as a page number
+  in another style — a section number opening it (`A`, `S1` above an empty foot), or a whole last
+  line such as an axis label `x`, a two-letter word, or `mix`/`di` parsing as roman — can let a
+  repeat through (back to the route's own answer). A refusal naming other pages says they are
+  evidence from a document-writable log, not a `pages:` value. The log is opened after
   an `lstat` refuses a link, plus `O_NOFOLLOW` where it exists; on Windows a link planted between
   the two is followed, which is harmless only because the marks can do nothing but refuse.
   **Labels in `\include`d chapters** are found by following

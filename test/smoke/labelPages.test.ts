@@ -101,6 +101,19 @@ function hasBeamer(): boolean {
 }
 const beamerAvailable = available && hasBeamer();
 
+/** Whether an engine binary answers on PATH. latexmk being installed says nothing about which
+ *  engines are, and a missing one fails the compile rather than skipping the test. */
+function hasEngine(engine: 'xelatex' | 'lualatex'): boolean {
+  try {
+    execFileSync(engine, ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const xelatexAvailable = available && hasEngine('xelatex');
+const lualatexAvailable = available && hasEngine('lualatex');
+
 /**
  * A plain `\documentclass{beamer}` deck (hyperref by default) whose first frame has three
  * `\pause` slides: beamer's /PageLabels number FRAMES ("1","1","1","2",...) while the .aux
@@ -468,23 +481,10 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     }
   }, 240_000);
 
-  it('resolves the body of a document whose appendix resets the counter under alph, S or Roman', async () => {
-    // No hyperref. The body prints 1-4; the appendix resets the page counter under
-    // \pagenumbering{alph}, `S\arabic{page}` or \pagenumbering{Roman}, so the log ships
-    // [1] [2] [3] [4] [1] [2]. The appendix pages print "a", "S1", "I" — no second "1" — so
-    // every body label resolves to its own page, as it did before the log was read.
-    // The Roman variant drops the appendix label: a label printing "I" refuses every label of the
-    // document as renumbered, with or without the log.
-    const roman = fixtureTex('appendixAlph')
-      .replace('\\pagenumbering{alph}', '\\pagenumbering{Roman}')
-      .replace('\\fig{appa}', '');
-    const docs: Array<[string, string, 'xelatex' | 'lualatex' | undefined]> = [
-      ['appendixAlph', fixtureTex('appendixAlph'), undefined],
-      ['appendixAlph (lualatex)', fixtureTex('appendixAlph'), 'lualatex'],
-      ['suppPrefixed', fixtureTex('suppPrefixed'), undefined],
-      ['suppPrefixed (xelatex)', fixtureTex('suppPrefixed'), 'xelatex'],
-      ['appendixRoman', roman, undefined],
-    ];
+  /** Compile each doc and check every body label resolves to its own page, by its marker. */
+  async function expectBodyResolves(
+    docs: Array<[string, string, 'xelatex' | 'lualatex' | undefined]>,
+  ): Promise<void> {
     for (const [name, tex, engine] of docs) {
       const client = await compiled(tex, engine);
       const res = await client.callTool({
@@ -506,22 +506,67 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
         ).toBe(true);
       }
     }
+  }
+
+  it('resolves the body of a document whose appendix resets the counter under alph, S or Roman', async () => {
+    // No hyperref. The body prints 1-4; the appendix resets the page counter under
+    // \pagenumbering{alph}, `S\arabic{page}` or \pagenumbering{Roman}, so the log ships
+    // [1] [2] [3] [4] [1] [2]. The appendix pages print "a", "S1", "I" — no second "1" — so
+    // every body label resolves to its own page, as it did before the log was read.
+    // The Roman variant drops the appendix label: a label printing "I" refuses every label of the
+    // document as renumbered, with or without the log.
+    const roman = fixtureTex('appendixAlph')
+      .replace('\\pagenumbering{alph}', '\\pagenumbering{Roman}')
+      .replace('\\fig{appa}', '');
+    await expectBodyResolves([
+      ['appendixAlph', fixtureTex('appendixAlph'), undefined],
+      ['suppPrefixed', fixtureTex('suppPrefixed'), undefined],
+      ['appendixRoman', roman, undefined],
+    ]);
   }, 480_000);
+
+  it.skipIf(!lualatexAvailable)(
+    'resolves the body of a document whose appendix resets the counter, under lualatex',
+    async () => {
+      await expectBodyResolves([
+        ['appendixAlph (lualatex)', fixtureTex('appendixAlph'), 'lualatex'],
+      ]);
+    },
+    240_000,
+  );
+
+  it.skipIf(!xelatexAvailable)(
+    'resolves the body of a document whose supplement prints S-prefixed pages, under xelatex',
+    async () => {
+      await expectBodyResolves([['suppPrefixed (xelatex)', fixtureTex('suppPrefixed'), 'xelatex']]);
+    },
+    240_000,
+  );
+
+  async function expectRestartRefused(engine?: 'lualatex'): Promise<void> {
+    const client = await compiled(fixtureTex('restartUnlabelled'), engine);
+    for (const label of ['suppb', 'figa']) {
+      const got = await landed(client, label);
+      expect(got.page, `${engine ?? 'pdflatex'} ${label}`).toBeUndefined();
+      expect(got.text).toMatch(/the log's shipout record shows page counter \d on PDF page \d/);
+    }
+  }
 
   it('still refuses an arabic restart with no label before it, by its shipout record', async () => {
     // Main paper 1-4, then \setcounter{page}{1} (arabic) and a supplement whose label suppb is
     // on its printed page 2 (PDF page 6); the last page prints no number. The .aux reads 1, 2 and
     // the last page is silent, so the folio route alone resolves suppb to the main paper's page
     // 2; the log ships [1] [2] [3] [4] [1] [2] [3] and PDF page 6 prints "2" too.
-    for (const engine of [undefined, 'lualatex'] as const) {
-      const client = await compiled(fixtureTex('restartUnlabelled'), engine);
-      for (const label of ['suppb', 'figa']) {
-        const got = await landed(client, label);
-        expect(got.page, `${engine ?? 'pdflatex'} ${label}`).toBeUndefined();
-        expect(got.text).toMatch(/the log's shipout record shows page counter \d on PDF page \d/);
-      }
-    }
-  }, 480_000);
+    await expectRestartRefused();
+  }, 240_000);
+
+  it.skipIf(!lualatexAvailable)(
+    'still refuses an arabic restart with no label before it, under lualatex',
+    async () => {
+      await expectRestartRefused('lualatex');
+    },
+    240_000,
+  );
 
   it('never resolves a section-per-page "Page N" / "N/M" / "– N –" document wrongly', async () => {
     for (const doc of ['secpagePageN', 'secpageSlashOf', 'secpageDash']) {

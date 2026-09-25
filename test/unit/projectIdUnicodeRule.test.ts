@@ -54,7 +54,7 @@ let root: string;
 let workspaceRoot: string;
 
 beforeEach(async () => {
-  root = await mkdtemp(path.join(os.tmpdir(), 'ovl-idr3-'));
+  root = await mkdtemp(path.join(os.tmpdir(), 'ovl-idunicode-'));
   workspaceRoot = path.join(root, 'ws');
   await mkdir(workspaceRoot);
   vi.spyOn(console, 'error').mockImplementation(() => undefined);

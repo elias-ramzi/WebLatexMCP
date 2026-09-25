@@ -11,6 +11,7 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { toPosix } from '../../src/lib/paths.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /*
@@ -27,16 +28,14 @@ const MAIN_TEX = '\\documentclass{article}\n\\begin{document}\nHi\n\\end{documen
 const MAIN_AUX = '\\relax\n\\newlabel{fig:x}{{1}{3}{A caption}{figure.1}{}}\n';
 
 /**
- * Stage main.tex's `.aux` — and the `.log` a compile always leaves beside it: a build with
- * neither `.log` nor `.fls` has every label refused (`'pgfpagesUnknown'`).
+ * Stage main.tex's `.aux` — and a `.log` beside it, as a compile always leaves one: a build with
+ * neither `.log` nor `.fls` has every label refused (`'pgfpagesUnknown'`). A stand-in whose
+ * shipout marks are not used ({@link ROUTES_ONLY_LOG}), so the lookup runs the routes alone.
  */
 async function stageMainAux(userDir: string): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await writeFile(auxPath, MAIN_AUX);
-  await writeFile(
-    `${auxPath.slice(0, -'.aux'.length)}.log`,
-    'This is pdfTeX, Version 3.141592653\n',
-  );
+  await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, ROUTES_ONLY_LOG);
 }
 
 const cleanups: Array<() => Promise<unknown>> = [];

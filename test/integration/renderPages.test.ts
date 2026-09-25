@@ -10,6 +10,7 @@ import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { PREAMBLE_ABORT_LOG, ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import { toPosix } from '../../src/lib/paths.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -89,18 +90,21 @@ function captionOn(page: number, caption: string): (n: number) => string {
   return (n) => (n === page ? `body\n${caption}\n${n}` : `body\n${n}`);
 }
 
-/** The head of an ordinary compile's `.log`: names no pgfpages, so a label may resolve. */
+/** The head of an ordinary compile's `.log`: names no pgfpages. The tests that stage shipout
+ *  marks append them to it; on its own it holds none (see {@link ROUTES_ONLY_LOG}). */
 const PLAIN_LOG = 'This is pdfTeX, Version 3.141592653\n';
 
 /**
- * Stage the `.aux` the last compile would have left, without running latexmk — and the `.log`
+ * Stage the `.aux` the last compile would have left, without running latexmk — and a `.log`
  * beside it, since every compile leaves one and a build with neither `.log` nor `.fls` has every
- * label refused (`'pgfpagesUnknown'`). `log: null` stages that unreadable-records state.
+ * label refused (`'pgfpagesUnknown'`). The default is a stand-in whose shipout marks are not used
+ * ({@link ROUTES_ONLY_LOG}), so a test exercises the label routes alone. `log: null` stages the
+ * unreadable-records state.
  */
 async function stageAux(
   userDir: string,
   content: string,
-  log: string | null = PLAIN_LOG,
+  log: string | null = ROUTES_ONLY_LOG,
 ): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
@@ -361,7 +365,8 @@ describe('render_pages', () => {
     // The .aux alone cannot show a \pgfpagesuselayout, which records every label a page late
     // and moves the folios and /PageLabels with it; only the build's .fls/.log can. With neither
     // readable, the page that would render is unverifiable, so the call refuses — even though
-    // this very setup resolves once a .log sits beside the .aux (the next test).
+    // this very setup resolves once a real .log sits beside the .aux ("resolves as before when
+    // the log's shipout record agrees", below).
     const { client, userDir } = await setup();
     await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
     await stageAux(userDir, '\\newlabel{tab:results}{{2}{4}}\n', null);
@@ -426,9 +431,41 @@ describe('render_pages', () => {
     ]);
   });
 
-  it('labels: an EMPTY .log is a record that was read, and the label resolves', async () => {
-    // The value just outside the refusal above: a readable .log naming no pgfpages is `false`
-    // evidence, not missing evidence.
+  it('labels: refuses every label when the last compile stopped before shipping a page', async () => {
+    // The real sequence: a `resize to` build recorded tab:x on printed page 3 while the table is
+    // on PDF page 2; then an error in the preamble stopped pdflatex before its first page. It
+    // rewrote main.log (a real one, below) and main.fls — neither names pgfpages yet — and left
+    // the old .aux and the 3-page PDF, whose folios agree with the .aux's late page 3. The .log
+    // holds no shipout mark beside a PDF that has pages, so it is not that PDF's run.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3, undefined, captionOn(2, 'Table 1: T'));
+    await stageAux(userDir, '\\relax \n\\newlabel{tab:x}{{1}{3}}\n', PREAMBLE_ABORT_LOG);
+    const stem = buildAuxPath(userDir, 'main.tex').slice(0, -'.aux'.length);
+    await writeFile(
+      `${stem}.fls`,
+      'PWD /build\nINPUT main.tex\nINPUT /texmf/tex/latex/base/article.cls\n',
+    );
+
+    const res = await client.callTool({
+      name: 'render_pages',
+      arguments: { project: 'poster', labels: ['tab:x'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain(
+      '"tab:x": the .aux records it on printed page "3", but the build\'s .log holds no [n] ' +
+        'shipout mark (it records a compile that shipped no page, or is empty) while the PDF ' +
+        'beside it has 3 page(s)',
+    );
+    expect(text).toMatch(/the last compile stopped before shipping a page/);
+    expect(text).toContain("pass pages: [3] (the PDF's page count)");
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
+  });
+
+  it('labels: an EMPTY .log is no record, so the label is refused as unknown', async () => {
+    // A zero-byte .log is what an interrupted run leaves, not a record that names nothing: it
+    // counts as unread, so with no .fls beside it nothing is known about pgfpages and the call
+    // refuses exactly as it does with no .log at all (above).
     const { client, userDir } = await setup();
     await stagePdf(userDir, 5, undefined, captionOn(4, 'Table 2: Results'));
     await stageAux(userDir, '\\newlabel{tab:results}{{2}{4}}\n', '');
@@ -437,10 +474,12 @@ describe('render_pages', () => {
       name: 'render_pages',
       arguments: { project: 'poster', labels: ['tab:results'] },
     });
-    expect(res.isError ?? false).toBe(false);
-    expect(structuredOf(res).resolvedLabels).toEqual([
-      { label: 'tab:results', printedPage: '4', page: 4 },
-    ]);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('tab:results');
+    expect(text).toMatch(/neither the build's recorder file \(\.fls\) nor its \.log could be read/);
+    expect(text).not.toMatch(/name pgfpages\.sty/);
+    expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(0);
   });
 
   it('labels: two labels on one page render it once, and both are echoed', async () => {

@@ -12,6 +12,7 @@ import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compile
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import { toPosix } from '../../src/lib/paths.js';
 import { expectDeclaredField, expectNoUndeclaredKeys } from '../helpers/outputSchema.js';
+import { PREAMBLE_ABORT_LOG, ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import { GROUP_SKIP_SCAN } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 import type { AppContext } from '../../src/context.js';
@@ -90,14 +91,16 @@ async function stagePdf(userDir: string, pages: number): Promise<void> {
 }
 
 /**
- * Stage the `.aux` the last compile would have left — and the `.log` beside it, since every
+ * Stage the `.aux` the last compile would have left — and a `.log` beside it, since every
  * compile leaves one, and a build with neither `.log` nor `.fls` cannot say whether pgfpages
- * shifted its pages. `log: null` stages that unreadable-records state.
+ * shifted its pages. The default is a stand-in whose shipout marks are not used
+ * ({@link ROUTES_ONLY_LOG}): a banner-only log would be a compile that shipped no page, and every
+ * floats page would be noted as unverified. `log: null` stages the unreadable-records state.
  */
 async function stageAux(
   userDir: string,
   content: string,
-  log: string | null = 'This is pdfTeX, Version 3.141592653\n',
+  log: string | null = ROUTES_ONLY_LOG,
 ): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
@@ -291,14 +294,16 @@ describe('pdf_geometry', () => {
     expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
     expect(out.floatsPagesShifted).toBeUndefined();
     expect(out.note).toMatch(/could not be checked/);
-    expect(out.note).toMatch(/neither its \.fls nor its \.log could be read/);
+    expect(out.note).toMatch(
+      /neither its \.fls nor its \.log could be read beside the \.aux; a missing or empty file counts as unread/,
+    );
     expect(textOf(res)).toMatch(/these pages are unverified/);
     await expectNoUndeclaredKeys(client, 'pdf_geometry', out);
 
-    // The value just outside: a plain .log beside the same .aux is a record that was read and
-    // names no pgfpages, so there is nothing to warn about.
+    // The value just outside: a .log beside the same .aux is a record that was read, names no
+    // pgfpages, and shipped the PDF's one page, so there is nothing to warn about.
     const stem = buildAuxPath(userDir, 'main.tex').slice(0, -'.aux'.length);
-    await writeFile(`${stem}.log`, 'This is pdfTeX, Version 3.141592653\n');
+    await writeFile(`${stem}.log`, 'This is pdfTeX, Version 3.141592653\n [1] (./main.aux) )\n');
     const clean = structuredOf(
       await client.callTool({
         name: 'pdf_geometry',
@@ -306,6 +311,47 @@ describe('pdf_geometry', () => {
       }),
     );
     expect(clean.floatsPagesShifted).toBeUndefined();
+    expect(clean.note).toBeUndefined();
+  });
+
+  it('says the floats pages are unverified when the .log shipped no page, in both channels', async () => {
+    // A compile that stopped in the preamble rewrites the .log (a real one, below: no shipout
+    // mark, no pgfpages) and leaves the earlier run's .aux and PDF — the state in which labels:
+    // lookups refuse every label (labelPages.ts, 'nothingShipped'). The .log's `false` says
+    // nothing about the build that wrote this .aux, so its pages are unverified exactly as when
+    // no record could be read; and floatsPagesShifted stays true-only.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 2);
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{2}}\n', PREAMBLE_ABORT_LOG);
+
+    for (const kinds of [['floats'], ['text', 'floats']]) {
+      const res = await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'poster', kinds },
+      });
+      expect(res.isError ?? false, textOf(res)).toBe(false);
+      const out = structuredOf(res);
+      expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '2' }]);
+      expect(out.floatsPagesShifted).toBeUndefined();
+      expect(out.note, kinds.join()).toMatch(
+        /The build's \.log holds no \[n\] shipout mark \(it records a compile that shipped no page, or is empty\)/,
+      );
+      expect(textOf(res), kinds.join()).toMatch(/these pages are unverified/);
+      await expectNoUndeclaredKeys(client, 'pdf_geometry', out);
+    }
+
+    // The value just outside: the same .aux beside a .log that shipped the PDF's two pages.
+    const stem = buildAuxPath(userDir, 'main.tex').slice(0, -'.aux'.length);
+    await writeFile(
+      `${stem}.log`,
+      'This is pdfTeX, Version 3.141592653\n [1] [2] (./main.aux) )\n',
+    );
+    const clean = structuredOf(
+      await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'poster', kinds: ['floats'] },
+      }),
+    );
     expect(clean.note).toBeUndefined();
   });
 

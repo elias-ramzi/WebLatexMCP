@@ -60,6 +60,16 @@ export interface CompileOutcome {
   rebuilt: boolean;
   /** ISO 8601 mtime of the build-dir PDF, read before any surfacing copy is made. Absent with no PDF. */
   pdfMtime?: string;
+  /**
+   * The engine latexmk could not run because the shell reported it not found — set only on a
+   * failed latexmk run whose own stdout/stderr carried one of {@link engineNotFound}'s shapes,
+   * and never by tectonic, which drives its bundled engine and runs no engine binary. Read off
+   * the captured output, never off `log`: the build dir is stable per project, so a run whose
+   * engine never started leaves the previous run's `.log` in place and `log` is that stale file.
+   * The captured output is document-controlled too (`\typeout` reaches the terminal), which is
+   * why this is only ever a name from the fixed engine allowlist and never a captured line.
+   */
+  missingEngine?: Engine;
 }
 
 export interface LatexCompiler {
@@ -74,6 +84,77 @@ const ENGINE_FLAG: Record<Engine, string> = {
   xelatex: '-pdfxe',
   lualatex: '-pdflua',
 };
+
+/** The engine binaries latexmk runs for {@link ENGINE_FLAG}'s flags — the matcher's allowlist. */
+const ENGINES = Object.keys(ENGINE_FLAG) as Engine[];
+const ENGINE_ALT = ENGINES.join('|');
+
+/**
+ * The shell's "no such command" lines, anchored to a whole line and to an engine name exactly:
+ * - POSIX `sh`/`bash` (latexmk hands a quoted command line to `system`, so a shell runs it):
+ *   `sh: 1: xelatex: not found` (dash), `sh: xelatex: not found` (busybox),
+ *   `sh: xelatex: command not found` (bash as sh, macOS), `bash: line 1: xelatex: command not
+ *   found`, `xelatex: command not found`;
+ * - Windows `cmd.exe`: `'xelatex' is not recognized as an internal or external command,` (English
+ *   only — a localized Windows words it differently and simply gets no hint).
+ */
+const ENGINE_NOT_FOUND_POSIX = new RegExp(
+  `^(?:\\S+: (?:line )?\\d+: |\\S+: )?(${ENGINE_ALT}): (?:command )?not found$`,
+);
+const ENGINE_NOT_FOUND_WINDOWS = new RegExp(
+  `^'(${ENGINE_ALT})' is not recognized as an internal or external command`,
+);
+
+/**
+ * The engine a latexmk run's captured output says the shell could not find, or `undefined`.
+ * Pure, and deliberately narrow: only the shapes above, only for an engine latexmk runs, only a
+ * whole line — `biber: not found` or `xdvipdfmx: not found` is not an engine, and a mention inside
+ * some other line is not the shell speaking. A document CAN print a forged line of this shape
+ * (`\typeout`), which is why the answer is a name from the allowlist rather than any captured
+ * text, and why {@link engineNotFoundHint} fires only on a failure no parsed error explains.
+ */
+export function engineNotFound(output: string): Engine | undefined {
+  for (const raw of output.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    const m = ENGINE_NOT_FOUND_POSIX.exec(line) ?? ENGINE_NOT_FOUND_WINDOWS.exec(line);
+    if (m) return m[1] as Engine;
+  }
+  return undefined;
+}
+
+/** Where each engine comes from, for the install half of the hint. */
+const ENGINE_PACKAGES: Record<Engine, { debian: string; tlmgr: string }> = {
+  pdflatex: { debian: 'texlive-latex-base', tlmgr: 'collection-latex' },
+  xelatex: { debian: 'texlive-xetex', tlmgr: 'collection-xetex' },
+  lualatex: { debian: 'texlive-luatex', tlmgr: 'collection-luatex' },
+};
+
+/**
+ * The compile hint for an engine latexmk could not run, or `undefined` when there is nothing to
+ * say. Gated on a failed compile with **zero parsed errors**: a forged not-found line can then
+ * only add a misleading hint to a compile that already failed with nothing else to show for it,
+ * and can never mask a real error. Fixed server text; the only variable is the allowlisted name.
+ */
+export function engineNotFoundHint(
+  outcome: Pick<CompileOutcome, 'success' | 'missingEngine'>,
+  parsedErrorCount: number,
+): string | undefined {
+  const engine = outcome.missingEngine;
+  if (outcome.success || parsedErrorCount > 0 || engine === undefined) return undefined;
+  const pkg = ENGINE_PACKAGES[engine];
+  const others = ENGINES.filter((e) => e !== engine)
+    .map((e) => `"${e}"`)
+    .join(' or ');
+  return (
+    `The ${engine} engine is not installed (latexmk could not run it), so this run compiled ` +
+    'nothing — a pdfPath or logPath in this result is left from an earlier run. Install it with ' +
+    'your TeX ' +
+    `distribution (Debian/Ubuntu: \`apt install ${pkg.debian}\`; TeX Live: ` +
+    `\`tlmgr install ${pkg.tlmgr}\`), or compile with another engine: pass engine: ${others} ` +
+    '(doctor lists the engines this machine has). If you already passed a different engine, a ' +
+    `latexmkrc in the project is choosing ${engine}.`
+  );
+}
 
 /**
  * Whether a spawn rejection means "the binary is not there" — `ENOENT`, which is also what a
@@ -305,6 +386,10 @@ export async function collectOutcome(
   durationSec: number,
   logBase: string,
   before: PdfStat | null,
+  opts: {
+    /** Scan the captured output for {@link engineNotFound} on failure — latexmk only. */
+    detectMissingEngine?: boolean;
+  } = {},
 ): Promise<CompileOutcome> {
   const rootBase = path.basename(rootFile).replace(/\.tex$/, '');
   const logPath = path.join(buildDir, `${rootBase}.log`);
@@ -323,8 +408,14 @@ export async function collectOutcome(
   const rebuilt =
     after !== null &&
     (before === null || after.mtimeMs !== before.mtimeMs || after.size !== before.size);
+  const success = res.code === 0 && after !== null && !res.timedOut;
+  // From what the backend printed, never from `log`, which may be a previous run's file.
+  const missingEngine =
+    !success && opts.detectMissingEngine
+      ? engineNotFound(`${res.stdout}\n${res.stderr}`)
+      : undefined;
   return {
-    success: res.code === 0 && after !== null && !res.timedOut,
+    success,
     pdfPath: after !== null ? pdfPath : undefined,
     durationSec,
     log,
@@ -335,11 +426,18 @@ export async function collectOutcome(
     // `mtimeMs` is a float derived from nanoseconds; `new Date(x)` truncates it, so an mtime set
     // to an exact millisecond can read back one ms early (seen on CI). Round to the nearest ms.
     pdfMtime: after !== null ? new Date(Math.round(after.mtimeMs)).toISOString() : undefined,
+    ...(missingEngine ? { missingEngine } : {}),
   };
 }
 
-/** Compiles a project locally with latexmk. Build artifacts go to a temp dir, keeping the clone clean. */
+/**
+ * Compiles a project locally with latexmk. Build artifacts go to a temp dir, keeping the clone clean.
+ * `run` is injectable (as for {@link probeOnPath}) so what a run's output does to the outcome is
+ * testable without TeX.
+ */
 export class LatexmkCompiler implements LatexCompiler {
+  constructor(private readonly run: typeof execCapture = execCapture) {}
+
   isAvailable(): Promise<boolean> {
     return probeOnPath('latexmk', '-v');
   }
@@ -351,11 +449,12 @@ export class LatexmkCompiler implements LatexCompiler {
 
     const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
-    const res = await execCapture('latexmk', args, {
+    const res = await this.run('latexmk', args, {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
     // `-cd` chdirs into the root file's directory: that is what the log's paths are relative to.
+    // latexmk shells out to the engine, so a missing one shows up as the shell's not-found line.
     return collectOutcome(
       buildDir,
       req.rootFile,
@@ -363,6 +462,7 @@ export class LatexmkCompiler implements LatexCompiler {
       (Date.now() - start) / 1000,
       logBaseDir(req.rootFile),
       before,
+      { detectMissingEngine: true },
     );
   }
 }
@@ -379,6 +479,9 @@ export class LatexmkCompiler implements LatexCompiler {
  * (`--keep-logs`), which the parser needs.
  */
 export class TectonicCompiler implements LatexCompiler {
+  /** Injectable like {@link LatexmkCompiler}'s. */
+  constructor(private readonly run: typeof execCapture = execCapture) {}
+
   isAvailable(): Promise<boolean> {
     return probeOnPath('tectonic', '--version');
   }
@@ -394,11 +497,13 @@ export class TectonicCompiler implements LatexCompiler {
 
     const before = await statOrNull(buildPdfPath(req.projectDir, req.rootFile));
     const start = Date.now();
-    const res = await execCapture('tectonic', args, {
+    const res = await this.run('tectonic', args, {
       cwd: req.projectDir,
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
     });
-    // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are.
+    // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are. No
+    // `detectMissingEngine`: it drives its bundled engine and never runs an engine binary, so a
+    // not-found line in its output could only have come from the document.
     return collectOutcome(buildDir, req.rootFile, res, (Date.now() - start) / 1000, '', before);
   }
 }

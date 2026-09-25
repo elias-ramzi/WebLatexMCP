@@ -12,6 +12,7 @@ import {
 } from '../services/pdfRender.js';
 import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
 import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
+import { shippedNothing } from '../lib/labelPages.js';
 import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
 import { planGeometryPayload, GEOMETRY_CONTENT_BUDGET } from '../lib/geometryBudget.js';
 
@@ -337,8 +338,10 @@ const outputSchema = {
         "likely LATER than the page the label is on — don't pass it to render_pages as `pages:`; " +
         'find the page with extract_text instead. Label keys and numbers are unaffected. Loading ' +
         'the package without a layout shifts nothing, but is flagged too. Absent when the build ' +
-        'shows no pgfpages. Also absent when neither file could be read — `note` then says the ' +
-        'pages are unverified instead, since nothing shows the package was loaded.',
+        'shows no pgfpages. Also absent when neither file could be read (a missing or empty file ' +
+        'counts as unread), or when the .log holds no [n] shipout mark beside a PDF that has ' +
+        "pages (another run's record, or an empty file) — `note` then says the pages are " +
+        'unverified instead, since nothing shows the package was loaded.',
     ),
   note: z
     .string()
@@ -346,8 +349,10 @@ const outputSchema = {
     .describe(
       "Explains an unusual situation, several joined when more than one applies: the build's " +
         'records name pgfpages, so the floats pages are likely shifted (see floatsPagesShifted), or ' +
-        'neither its .fls nor its .log could be read, so whether they are shifted could not be ' +
-        'checked; the page ' +
+        'neither its .fls nor its .log could be read (a missing or empty file counts as ' +
+        'unread), or its .log holds no [n] shipout mark beside a PDF that has pages (it ' +
+        "records a compile that shipped no page, or is empty, so it is not that PDF's run), so " +
+        'whether they are shifted could not be checked; the page ' +
         'geometry hit its size budget (see textOmittedBySize); "floats" requested but no .aux ' +
         'was found in the build directory (nothing has been compiled with that root file yet, ' +
         'or the backend in use does not write one), or the .aux reader could not read an ' +
@@ -489,7 +494,9 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           let floatsNote: string | undefined;
           let floatsPagesShifted: true | undefined;
           if (requestedKinds.includes('floats')) {
-            const auxResult = await readAuxFloats(dir, root);
+            // `shipouts: true` for one question only: whether the .log records a compile that
+            // shipped no page (the nothing-shipped note below). The marks check nothing else here.
+            const auxResult = await readAuxFloats(dir, root, { shipouts: true });
             // The size budget is applied AFTER the reader's count cap, over whatever survived it,
             // because the two bound different things and the count cap is the cheaper one: there
             // is no point charging rendered characters against entries that were never going to
@@ -534,22 +541,48 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                 'passing these to render_pages.'
               : undefined;
             // The same state in which labels: refuses every label ('pgfpagesUnknown'): an .aux
-            // with entries, but neither the .fls nor the .log beside it could be read, so a
-            // layout cannot be ruled out. Said in the note only — floatsPagesShifted says the
-            // build's records name pgfpages, which nothing here shows. Gated on `total` because the
-            // no-.aux result also carries no pgfpages evidence, and it has no pages to call
-            // unverified (nor does an .aux with no entries).
+            // with entries, but neither the .fls nor the .log beside it could be read (a missing
+            // or empty file counts as unread), so a layout cannot be ruled out. Said in the note
+            // only — floatsPagesShifted says the build's records name pgfpages, which nothing here
+            // shows. Gated on `total` because the no-.aux result also carries no pgfpages
+            // evidence, and it has no pages to call unverified (nor does an .aux with no entries).
             const unverifiedNote =
               auxResult.pgfpages === undefined && auxResult.total > 0
                 ? 'Whether this build used a pgfpages layout could not be checked (neither its ' +
-                  '.fls nor its .log could be read beside the .aux), so these pages are ' +
-                  'unverified: a \\pgfpagesuselayout would make every one a page later than ' +
-                  "the label's own. render_pages labels: refuses such a build; compile again to " +
-                  'restore the records.'
+                  '.fls nor its .log could be read beside the .aux; a missing or empty file ' +
+                  'counts as unread), so these pages are unverified: a \\pgfpagesuselayout ' +
+                  "would make every one a page later than the label's own. render_pages " +
+                  'labels: refuses such a build; compile again to restore the records.'
+                : undefined;
+            // The same state in which labels: refuses every label ('nothingShipped'): the records
+            // were read and name no pgfpages, but the .log holds no shipout mark (a compile that
+            // shipped no page, or an empty log) beside a PDF that has pages, so it (and any .fls)
+            // is another run's — a compile that stopped in the preamble leaves the earlier .aux
+            // and PDF — and its `false` says nothing about this build. Said in the note only, like
+            // the unverified note above, and only where neither note above applies (pgfpages is
+            // `false`). Whether the PDF has pages: its page count when geometry opened it; for
+            // kinds: ["floats"] alone the PDF is never opened, and a build PDF that exists stands
+            // in, since pdfTeX, XeTeX and LuaTeX write no PDF for a run that shipped nothing ("No
+            // pages of output.").
+            const pdfHasPages =
+              result.pageCount !== undefined ? result.pageCount >= 1 : pdfPath !== undefined;
+            const nothingShippedNote =
+              auxResult.pgfpages === false &&
+              auxResult.total > 0 &&
+              shippedNothing(auxResult, pdfHasPages)
+                ? "The build's .log holds no [n] shipout mark (it records a compile that " +
+                  'shipped no page, or is empty) while the PDF beside it has pages, so it — like ' +
+                  'any .fls beside it — is not a record of the run that wrote this .aux: ' +
+                  'typically the last compile stopped on an error in the preamble, leaving the ' +
+                  "earlier run's .aux and PDF. Whether that run used a pgfpages layout cannot " +
+                  'be told, so these pages are unverified: a \\pgfpagesuselayout would make ' +
+                  "every one a page later than the label's own. render_pages labels: refuses " +
+                  'such a build; fix what stopped the last compile and compile again.'
                 : undefined;
             floatsNote =
-              [shiftedNote, unverifiedNote, auxResult.note, plan.note].filter(Boolean).join(' ') ||
-              undefined;
+              [shiftedNote, unverifiedNote, nothingShippedNote, auxResult.note, plan.note]
+                .filter(Boolean)
+                .join(' ') || undefined;
           }
           const note = [geometryPlan.note, floatsNote].filter(Boolean).join(' ') || undefined;
 

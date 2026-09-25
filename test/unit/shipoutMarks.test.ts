@@ -1,13 +1,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmod, mkdtemp, mkdir, open, rm, symlink, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import {
   MAX_SHIPOUT_LOG_BYTES,
   parseShipoutMarks,
   readAuxFloats,
+  readPgfpagesEvidence,
   readShipoutMarks,
 } from '../../src/lib/auxFloats.js';
 import { buildAuxPath, buildDir } from '../../src/services/compiler.js';
@@ -50,6 +52,11 @@ import { buildAuxPath, buildDir } from '../../src/services/compiler.js';
  *  - `boxshipout` — pages shipped right after box warnings, including `Overfull \vbox … has
  *    occurred while \output is active []`: every genuine mark lands AFTER the display's blank
  *    line, never inside it.
+ *  - `outputhbox` — `fancyhdr` with a header and a footer `\hbox to` too narrow for its text
+ *    (`see [3] and [4]`, `pg [9]`), so every page raises `Overfull \hbox … has occurred while
+ *    \output is active`, whose display, unlike the `\vbox` form's, runs over the lines after it
+ *    to an empty line. The one fixture from TeX Live 2019 (pdfTeX 1.40.20, run in place rather
+ *    than under latexmk); its one personal path segment became `/home/tex001/`, same length.
  *  - `errcontext` — undefined control sequences and missing `$`/`{` whose error context
  *    (`l.3 Text \foo` / `see [12] here and [13]`, `<inserted text>`) quotes mark-shaped text.
  *  - `hyperrefdest` — `report` + hyperref + `\maketitle`: pdfTeX's duplicate-destination warning
@@ -104,6 +111,7 @@ const REAL: Array<[name: string, pageCount: number, marks: number[]]> = [
   ['errcontext-pdflatex', 3, [1, 2, 3]],
   ['errcontext-lualatex', 3, [1, 2, 3]],
   ['hyperrefdest-pdflatex', 2, [1, 1]],
+  ['outputhbox-pdflatex', 3, [1, 2, 3]],
 ];
 
 describe('parseShipoutMarks over real logs', () => {
@@ -173,6 +181,24 @@ describe('parseShipoutMarks over real logs', () => {
     expect(parseShipoutMarks(`[1]\n${head}\n\n [2]\n[3]\n`)).toEqual([1, 2, 3]);
     const short = 'Overfull \\vbox (32.0pt too high) has occurred while \\output is active []';
     expect(parseShipoutMarks(`[1]\n${short}\n\n [2]\n`)).toEqual([1, 2]);
+  });
+
+  it('ignores the display lines of an output-routine \\hbox warning, unlike the \\vbox one', () => {
+    // For an \hbox, TeX writes the display on the lines AFTER `… has occurred while \output is
+    // active`, then ` []`, then an empty line (real pdflatex + fancyhdr, fixture `outputhbox`).
+    const log = [
+      'Overfull \\hbox (93.84138pt too wide) has occurred while \\output is active',
+      ' \\OT1/cmr/m/n/10 see [3] and [4] too long header text here',
+      ' []',
+      '',
+      '[1]',
+      'Underfull \\hbox (badness 10000) has occurred while \\output is active',
+      ' \\OT1/cmr/m/n/10 pg [9] 2',
+      ' []',
+      '',
+      '[2]',
+    ].join('\n');
+    expect(parseShipoutMarks(log)).toEqual([1, 2]);
   });
 
   it("ignores an error's context lines, which quote the document", () => {
@@ -354,3 +380,107 @@ describe('readAuxFloats reads the shipout marks only when asked', () => {
     expect((await readAuxFloats(proj, 'main.tex', { shipouts: true })).pgfpages).toBe(false);
   });
 });
+
+describe('readPgfpagesEvidence: a zero-byte .fls or .log is no record', () => {
+  let dir: string | undefined;
+  afterEach(async () => {
+    if (dir) {
+      await rm(dir, { recursive: true, force: true });
+      dir = undefined;
+    }
+  });
+
+  /** The evidence for `main.aux` in a temp dir holding `files`. */
+  async function evidenceOf(files: Record<string, string>): Promise<boolean | undefined> {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'pgfevidence-'));
+    for (const [name, content] of Object.entries(files)) {
+      await writeFile(path.join(dir, name), content);
+    }
+    return readPgfpagesEvidence(path.join(dir, 'main.aux'));
+  }
+
+  const NAMING_FLS = 'PWD /build\nINPUT /texmf/tex/latex/pgf/utilities/pgfpages.sty\n';
+  const PLAIN = 'This is pdfTeX, Version 3.141592653\n';
+
+  it('an empty .log and no .fls: undefined', async () => {
+    expect(await evidenceOf({ 'main.log': '' })).toBeUndefined();
+  });
+
+  it('an empty .fls and no .log: undefined', async () => {
+    expect(await evidenceOf({ 'main.fls': '' })).toBeUndefined();
+  });
+
+  it('both empty: undefined', async () => {
+    expect(await evidenceOf({ 'main.fls': '', 'main.log': '' })).toBeUndefined();
+  });
+
+  it('an empty .fls beside a .log that names nothing: false', async () => {
+    expect(await evidenceOf({ 'main.fls': '', 'main.log': PLAIN })).toBe(false);
+  });
+
+  it('an empty .log beside a .fls that names pgfpages.sty: true', async () => {
+    expect(await evidenceOf({ 'main.fls': NAMING_FLS, 'main.log': '' })).toBe(true);
+  });
+
+  it('a whitespace-only .log is still a record that names nothing: false', async () => {
+    // Only zero bytes counts as unread; anything the engine wrote is a record.
+    expect(await evidenceOf({ 'main.log': '\n' })).toBe(false);
+  });
+});
+
+/**
+ * A FIFO at a build file blocks a plain `open` until a writer appears — forever, while the project
+ * lock is held. Both readers open with `O_NONBLOCK` and refuse the non-regular file on the handle.
+ * POSIX only: Windows has no `mkfifo`. The timeout turns a regression into a failure rather than a
+ * hung suite, and `afterEach` opens the FIFO for writing so a reader stuck in `open` is released.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'a FIFO at the .log is refused, not waited on',
+  () => {
+    let dir: string | undefined;
+    afterEach(async () => {
+      if (!dir) return;
+      for (const name of ['main.log', 'main.fls']) {
+        try {
+          const h = await open(path.join(dir, name), constants.O_WRONLY | constants.O_NONBLOCK);
+          await h.close();
+        } catch {
+          // No FIFO there, or no reader waiting on it: nothing to release.
+        }
+      }
+      await rm(dir, { recursive: true, force: true });
+      dir = undefined;
+    });
+
+    async function fifoAtLog(t: { skip: () => void }): Promise<string | undefined> {
+      dir = await mkdtemp(path.join(os.tmpdir(), 'shipouts-fifo-'));
+      try {
+        execFileSync('mkfifo', [path.join(dir, 'main.log')], { stdio: 'ignore' });
+      } catch {
+        t.skip(); // no mkfifo on this machine
+        return undefined;
+      }
+      return path.join(dir, 'main.aux');
+    }
+
+    it(
+      'readShipoutMarks: a FIFO already at the path is refused by the lstat check',
+      { timeout: 3000 },
+      async (t) => {
+        // Refused by lstat before any open; O_NONBLOCK is covered by the lstat-swap test in
+        // shipoutMarksNoFollow.test.ts ('a FIFO swapped in after the lstat is refused').
+        const aux = await fifoAtLog(t);
+        if (aux) expect(await readShipoutMarks(aux)).toBeUndefined();
+      },
+    );
+
+    it(
+      'readPgfpagesEvidence: with no .fls either, nothing is known',
+      { timeout: 3000 },
+      async (t) => {
+        const aux = await fifoAtLog(t);
+        if (aux) expect(await readPgfpagesEvidence(aux)).toBeUndefined();
+      },
+    );
+  },
+);
