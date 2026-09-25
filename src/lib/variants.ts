@@ -658,8 +658,76 @@ export async function applyOverlay(
 }
 
 /**
+ * Refuse an overlay compile whose root file sits under a symbolic link (a junction on win32 —
+ * `lstat` reports one as a link) somewhere in its DIRECTORY path within the project.
+ *
+ * In the farm a linked directory is ONE link to the source's absolute path, and latexmk's `-cd`
+ * chdir()s into the root's directory — so the engine would run physically inside the SOURCE
+ * directory: it reads none of the overlays placed elsewhere in the farm, and anything it writes by
+ * a relative name lands in the source. Materialising the directory (which an overlay under it
+ * does) is no cure either: `\input{../common/x}` then resolves against the link's parent, not its
+ * target's, and a silently different document compiles. So the root must be named through its
+ * real path, which a normal compile treats as the same document.
+ *
+ * Judged whatever the backend (tectonic has no `-cd`, but the `../` half applies to any engine
+ * that resolves relative to the root): simple and conservative. A root at the project root has no
+ * directory components and is never refused; a component that does not exist ends the check (the
+ * compile reports the missing root); a `rootFile` that leaves the project is not this check's to
+ * judge. Throws; returns nothing.
+ */
+export async function refuseLinkedRootDir(projectDir: string, rootFile: string): Promise<void> {
+  const rel = normalizeRelPosix(rootFile);
+  if (rel === '..' || rel.startsWith('../') || path.posix.isAbsolute(rel)) return;
+  const dirs = path.posix
+    .dirname(rel)
+    .split('/')
+    .filter((c) => c !== '' && c !== '.');
+  const base = path.resolve(projectDir);
+  for (let i = 0; i < dirs.length; i++) {
+    const linkRel = dirs.slice(0, i + 1).join('/');
+    const abs = path.join(base, ...dirs.slice(0, i + 1));
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(abs)).isSymbolicLink();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw new Error(
+        `Cannot check whether the root file's directory ${quoteId(linkRel)} is a symbolic link, ` +
+          'so the overlay compile is refused.',
+        { cause: err },
+      );
+    }
+    if (!isLink) continue;
+    let realRoot: string | undefined;
+    try {
+      const target = await realpath(path.join(base, ...dirs));
+      const inside = path.relative(await realpath(base), target);
+      if (inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)) {
+        realRoot = path.posix.join(toPosix(inside), path.posix.basename(rel));
+      }
+    } catch {
+      realRoot = undefined;
+    }
+    throw new Error(
+      `The root file ${quoteId(rel)} is reached through ${quoteId(linkRel)}, which is a symbolic ` +
+        'link to a directory, and an overlay compile cannot build through one: the variant would ' +
+        "compile in the link's target (the source itself) or resolve ../ inputs against the " +
+        'wrong directory. ' +
+        (realRoot !== undefined
+          ? `Pass the root through its real path — rootFile: ${quoteId(realRoot)}, which a ` +
+            'normal compile treats as the same document — and name the overlay files by their ' +
+            'real paths too.'
+          : 'Its target is not a directory inside the project, so it cannot be an overlay root; ' +
+            'compile without overlay, or move the document into the project.'),
+    );
+  }
+}
+
+/**
  * Stage a variant for compiling: rebuild its link farm from scratch, place the overlaid files,
  * create its `out/`, and write its manifest (keeping `createdAt` across rebuilds of one handle).
+ * Refused, before anything is staged, when the root file sits under a linked directory
+ * ({@link refuseLinkedRootDir}).
  */
 export async function stageVariant(opts: {
   projectDir: string;
@@ -672,6 +740,7 @@ export async function stageVariant(opts: {
   platform?: NodeJS.Platform;
   now?: Date;
 }): Promise<VariantPaths> {
+  await refuseLinkedRootDir(opts.projectDir, opts.rootFile);
   const paths = variantPaths(opts.projectDir, opts.handle);
   await mkdir(paths.root, { recursive: true });
   await rm(paths.src, { recursive: true, force: true });

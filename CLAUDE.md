@@ -927,6 +927,15 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   directory is mirrored at `out/`'s root for latexmk's `-cd` only when its **realpath** stays inside
   the project's — judged on the string, a committed `paper -> /` made every compile walk `/` — and
   `mirrorSubdirs` never descends into a linked directory (`Dirent` types), so the walk cannot loop.
+  **A root file under a linked directory is refused** (`refuseLinkedRootDir`, first thing in
+  `stageVariant`, so nothing is staged): in the farm that directory is ONE link to the source's
+  absolute path, so latexmk's `-cd` would run the engine physically inside the SOURCE — reading none
+  of the overlays, writing relative names into the source — and an overlay that materialised the
+  directory would resolve `\input{../common/x}` against the link's parent instead of its target's,
+  a silently different document. Every directory component of the root is `lstat`ed (a junction
+  reads as a link on win32), whatever the backend; the refusal names the link and the real-path
+  `rootFile` to pass instead (a normal compile of which is the same document). A root at the project
+  root has no components to judge; a normal compile is unchanged.
   Not `TEXINPUTS`: kpathsea
   never searches the path for `./` or `../` names, so those inputs read the source. **The server
   never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read

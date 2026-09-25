@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -330,4 +330,97 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
     expect(log).toMatch(/runsystem\(makeindex[^)]*\)\.\.\.disabled/);
     expect(out.hint ?? '').toContain('disables shell escape');
   }, 300_000);
+
+  it('refuses a root reached through a linked directory, and builds it through its real path', async () => {
+    // latexmk's -cd would chdir() through the farm's ONE link to the source directory, and a
+    // materialised directory would resolve ../common against the link's parent: the top-level
+    // common/ — a different document, silently. Through the real path, ../common is drafts/common.
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-ws-'));
+    const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-smoke-src-'));
+    cleanups.push(
+      () => rm(workspace, { recursive: true, force: true }),
+      () => rm(userDir, { recursive: true, force: true }),
+      () => rm(buildDir(userDir), { recursive: true, force: true }),
+    );
+    const files: Record<string, string> = {
+      'drafts/p1/main.tex': [
+        '\\documentclass{article}',
+        '\\begin{document}',
+        '\\input{../common/x}',
+        '\\input{sec}',
+        '\\end{document}',
+        '',
+      ].join('\n'),
+      'drafts/p1/sec.tex': 'Section original.\n',
+      'drafts/common/x.tex': 'Drafts common.\n',
+      'common/x.tex': 'Top-level common.\n',
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(userDir, rel)), { recursive: true });
+      await writeFile(path.join(userDir, rel), content);
+    }
+    // 'junction' is ignored on POSIX and is what win32 can create without a privilege.
+    await symlink(path.join(userDir, 'drafts', 'p1'), path.join(userDir, 'paper'), 'junction');
+
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      workspaceIsLocal: true,
+      sessionId: 'test',
+      projects: [{ id: 'lnk', mode: 'local', path: userDir }],
+      defaultProject: 'lnk',
+    };
+    const ctx = createContext(config, new CredentialResolver({}), {
+      name: 'Test',
+      email: 'test@example.com',
+    });
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+
+    const overlayFor = (dir: string) => [
+      {
+        file: `${dir}/sec.tex`,
+        edits: [{ oldString: 'Section original.', newString: 'Section VARIANT.' }],
+      },
+    ];
+    const refused = await client.callTool({
+      name: 'compile',
+      arguments: { project: 'lnk', rootFile: 'paper/main.tex', overlay: overlayFor('paper') },
+    });
+    expect(refused.isError, JSON.stringify(refused.content)).toBe(true);
+    expect(JSON.stringify(refused.content)).toContain('drafts/p1/main.tex');
+
+    const res = await client.callTool(
+      {
+        name: 'compile',
+        arguments: {
+          project: 'lnk',
+          rootFile: 'drafts/p1/main.tex',
+          overlay: overlayFor('drafts/p1'),
+        },
+      },
+      undefined,
+      { timeout: 240_000 },
+    );
+    const out = res.structuredContent as { success?: boolean; variant?: string } | undefined;
+    expect(out?.success, JSON.stringify(res.content).slice(0, 4000)).toBe(true);
+    const extracted = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'lnk', variant: out?.variant },
+    });
+    expect(extracted.isError, JSON.stringify(extracted.content)).toBeFalsy();
+    const text = ((extracted.content as Array<{ text?: string }>)[0]?.text ?? '').replace(
+      /\s+/g,
+      ' ',
+    );
+    expect(text).toContain('Section VARIANT.');
+    expect(text).toContain('Drafts common.');
+    expect(text).not.toContain('Top-level common.');
+    // The source is untouched.
+    for (const [rel, content] of Object.entries(files)) {
+      expect(await readFile(path.join(userDir, rel), 'utf8'), rel).toBe(content);
+    }
+  }, 900_000);
 });

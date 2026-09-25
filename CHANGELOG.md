@@ -76,7 +76,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant
   incrementally. `clean: true` on an overlay compile cleans that variant only. An overlaid file
-  the build never opened is named in `hint`.
+  the build never opened is named in `hint`. An overlay compile whose root file is reached
+  through a linked directory (`paper -> drafts/p1`, `rootFile: "paper/main.tex"`) is refused, since
+  the variant would build in the link's target — the source itself — or resolve `../` inputs
+  against the wrong directory; the refusal names the real path to pass instead
+  (`rootFile: "drafts/p1/main.tex"`, the same document), and the overlay files are named by their
+  real paths too.
 
 ### Changed
 

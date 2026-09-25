@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -267,6 +267,42 @@ describe('compile with an overlay', () => {
     expect(requests).toHaveLength(0);
     expect(await readFile(path.join(clone, '.latexmkrc'), 'utf8')).toBe('$pdf_mode = 1;\n');
     await expect(stat(path.join(buildDir(clone), 'variants'))).rejects.toThrow();
+  });
+
+  it('refuses an overlay whose root file is reached through a linked directory', async () => {
+    // latexmk's -cd chdir()s into the root's directory; in the farm a linked directory is ONE link
+    // to the source's absolute path, so the engine would run inside the SOURCE directory, read none
+    // of the farm's overlays and write relative names into the source — or, once an overlay
+    // materialised the directory, resolve `../` against the link's parent instead of its target.
+    const { client, clone, requests } = await setup();
+    const real = path.join(clone, 'drafts', 'p1');
+    await mkdir(real, { recursive: true });
+    await writeFile(path.join(real, 'main.tex'), MAIN_TEX);
+    // 'junction' is ignored on POSIX and is what win32 can create without a privilege.
+    await symlink(real, path.join(clone, 'paper'), 'junction');
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: { rootFile: 'paper/main.tex', overlay: OVERLAY },
+    });
+    expect(res.isError, textOf(res)).toBe(true);
+    expect(textOf(res)).toContain('through "paper", which is a symbolic link');
+    expect(textOf(res)).toContain('rootFile: "drafts/p1/main.tex"');
+    expect(requests).toHaveLength(0);
+    expect(await readFile(path.join(real, 'main.tex'), 'utf8')).toBe(MAIN_TEX);
+    expect(await readFile(path.join(clone, 'sections/b.tex'), 'utf8')).toBe(B_TEX);
+    await expect(stat(path.join(buildDir(clone), 'variants'))).rejects.toThrow();
+
+    // The same document named through its real path is an ordinary overlay compile.
+    const ok = await client.callTool({
+      name: 'compile',
+      arguments: { rootFile: 'drafts/p1/main.tex', overlay: OVERLAY },
+    });
+    expect(ok.isError ?? false, textOf(ok)).toBe(false);
+    const out = ok.structuredContent as unknown as CompileOut;
+    expect(out.success).toBe(true);
+    expect(out.variant).toMatch(/^v[0-9a-f]{12}$/);
+    expect(requests).toHaveLength(1);
+    expect(toPosix(requests[0]!.rootFile)).toBe('drafts/p1/main.tex');
   });
 
   it('says when the build never read an overlaid file, and only then', async () => {

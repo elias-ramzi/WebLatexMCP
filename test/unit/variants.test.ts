@@ -26,6 +26,7 @@ import {
   parseFls,
   placeOverlayFile,
   readVariant,
+  refuseLinkedRootDir,
   resolveVariantBuild,
   stageVariant,
   touchVariant,
@@ -463,6 +464,45 @@ describe('variant lifecycle', () => {
     await expect(
       resolveVariantBuild(src, 'p', 'v0123456789ab', './paper/main.tex'),
     ).resolves.toMatchObject({ rootFile: 'paper/main.tex' });
+  });
+});
+
+describe('refuseLinkedRootDir', () => {
+  it('refuses a root under a linked directory at any depth, naming the link and the real path', async () => {
+    const src = await tempDir('ovl-rootlink-');
+    await put(src, 'a/drafts/p1/main.tex', 'x\n');
+    await put(src, 'top.tex', 'x\n');
+    await linkDir(path.join(src, 'a', 'drafts', 'p1'), path.join(src, 'a', 'paper'));
+    await expect(refuseLinkedRootDir(src, './a/paper/main.tex')).rejects.toThrow(
+      /reached through "a\/paper", which is a symbolic link.*rootFile: "a\/drafts\/p1\/main\.tex"/s,
+    );
+    // Nothing is staged when stageVariant refuses.
+    await expect(
+      stageVariant({
+        projectDir: src,
+        handle: variantHandle(KEY),
+        rootFile: 'a/paper/main.tex',
+        engine: 'pdflatex',
+        compiler: 'latexmk',
+        contents: new Map(),
+        skip: [],
+      }),
+    ).rejects.toThrow(/symbolic link/);
+    await expect(stat(path.join(buildDir(src), 'variants'))).rejects.toThrow();
+    // The real path, a root at the project root and a missing directory are not refused.
+    await refuseLinkedRootDir(src, 'a/drafts/p1/main.tex');
+    await refuseLinkedRootDir(src, 'top.tex');
+    await refuseLinkedRootDir(src, 'nope/main.tex');
+  });
+
+  it('says a link out of the project cannot be an overlay root', async () => {
+    const src = await tempDir('ovl-rootlink-');
+    const outside = await tempDir('ovl-rootlink-out-');
+    await put(outside, 'main.tex', 'x\n');
+    await linkDir(outside, path.join(src, 'paper'));
+    await expect(refuseLinkedRootDir(src, 'paper/main.tex')).rejects.toThrow(
+      /not a directory inside the project/,
+    );
   });
 });
 
