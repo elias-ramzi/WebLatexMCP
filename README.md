@@ -51,6 +51,7 @@ every change, and nothing reaches Overleaf until you say so.
 - 🧪 **Local compiles** — two backends run on your machine: `latexmk`, which is what Overleaf runs, or `tectonic`.
 - 👀 **Live PDF viewer + review comments** — a viewer that hot-reloads on every compile, in a browser or a **VS Code** tab. Select text in the PDF to leave a note, and Claude applies it at the right source line.
 - 📚 **Citations checked, not trusted** — API (CrossRef, OpenAlex) calls to verify, or add citations.
+- 🧑‍⚖️ **Pre-submission peer review** — an independent panel on Sonnet, Opus and Fable, a devil's advocate and a novelty check, merged by a Fable triage that verifies every point against the paper into one review: summary, strengths, weaknesses, minor weaknesses, questions, typos.
 - 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 
