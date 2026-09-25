@@ -9,6 +9,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-25
+
 ### Changed
 
 - **npm releases publish through trusted publishing (OIDC), with no stored token.** The v0.7.0
