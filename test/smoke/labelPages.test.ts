@@ -420,7 +420,9 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       for (const label of ['fig:a', 'fig:b', 'fig:c']) {
         const got = await landed(client, label);
         expect(got.page, label).toBeUndefined();
-        expect(got.text, label).toMatch(/this build loaded pgfpages/);
+        expect(got.text, label).toMatch(
+          /this build's records \(its recorder file or log\) name pgfpages\.sty/,
+        );
       }
     }
   }, 240_000);

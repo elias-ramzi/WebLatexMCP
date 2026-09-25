@@ -17,7 +17,7 @@ import type { Skill } from '../../src/lib/skills.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
- * Review round 3 on project ids (the permissive Unicode rule of round 2):
+ * Project ids under the permissive Unicode rule:
  *
  * 1. `__proto__` must never reach a plain object as a key — `map["__proto__"] = entry` sets the
  *    prototype instead of adding an entry, so a registration "succeeded" and persisted nothing

@@ -68,15 +68,18 @@
  *     the true slide while the `\newlabel` is one late — and there a footline printing the true
  *     slide numbers would confirm the late page.
  *
- *     The pgfpages shift is not a beamer matter, though, and ahead of both routes a build that
- *     loaded `pgfpages` at all has every label refused (`'pgfpagesLayout'`,
+ *     The pgfpages shift is not a beamer matter, though, and ahead of both routes a build whose
+ *     records name `pgfpages` at all has every label refused (`'pgfpagesLayout'`,
  *     `AuxFloatsResult.pgfpages`, read off the build's `.fls` and `.log`). An `article` under
  *     `resize to` records every label one page late too, with or without hyperref, and there is
  *     no slide record to contradict it: each page prints its own true folio, so the late page
  *     reads exactly as the printed page the `.aux` names and a neighbour agrees, and hyperref's
  *     tree moves with the pages. Nothing in the PDF or the `.aux` shows the shift; only the
- *     build's record of what it loaded does. When neither record can be read, nothing is known and
- *     the routes run as described — a deck then still has its slide record, an article nothing.
+ *     build's record of what it read does. When neither record can be read, nothing is known —
+ *     and since the shift is invisible everywhere else, every label of such a build is refused
+ *     too (`'pgfpagesUnknown'`). Every compile leaves a `.log` beside the `.aux`, so in normal use
+ *     that never happens and failing closed costs nothing; the routes below run only for a build
+ *     whose records were read and name neither package.
  *
  *  3. **Without `/PageLabels` the conversion is inferred, then CHECKED, and refused unless the
  *     check passes.** `getPageLabels()` returning `null` is the COMMON case, not an error: a
@@ -263,14 +266,18 @@ export interface ResolvedLabel {
  * load `hyperref`, or pass `pages:` yourself". `'slideMismatch'` is the beamer form of that:
  * the deck's `\newlabel` page and beamer's own record of the slide disagree
  * ({@link slideMismatch}), so neither is trusted. `'pgfpagesLayout'` means "no label of this
- * build is usable": the build loaded `pgfpages` (`AuxFloatsResult.pgfpages`), whose layouts shift
- * every label a page late, so the caller must pass `pages:` or compile without the layout.
+ * build is usable": the build's records name `pgfpages` (`AuxFloatsResult.pgfpages` is `true`),
+ * whose layouts shift every label a page late, so the caller must pass `pages:` or compile
+ * without the package. `'pgfpagesUnknown'` means the same for a build whose records could not be
+ * read at all (`AuxFloatsResult.pgfpages` absent): whether pgfpages shifted this build cannot be
+ * told, so no label is usable — the caller must compile again (which writes the `.log`) or pass
+ * `pages:`.
  *
  * Which reasons are even reachable depends on how the plan was resolved: `'notAPageNumber'`,
  * `'renumbered'`, `'restarted'`, `'slideMismatch'` and `'unverifiedPage'` belong to the inferred
  * fallback (which a beamer deck always takes),
  * `'printedPageAbsent'` and `'ambiguousPrintedPage'` to the `/PageLabels` lookup. `'notFound'`,
- * `'multiplyDefined'` and `'pgfpagesLayout'` belong to both.
+ * `'multiplyDefined'`, `'pgfpagesLayout'` and `'pgfpagesUnknown'` belong to both.
  *
  * None of this reaches a tool's `structuredContent`: a failure refuses the call, and only the
  * refusal TEXT ({@link labelRefusalMessage}) goes back.
@@ -283,6 +290,7 @@ export type LabelFailureReason =
   | 'restarted'
   | 'slideMismatch'
   | 'pgfpagesLayout'
+  | 'pgfpagesUnknown'
   | 'printedPageAbsent'
   | 'ambiguousPrintedPage'
   | 'unverifiedPage';
@@ -345,8 +353,8 @@ export interface LabelFailure {
   printedPages?: string[];
   /** `'multiplyDefined'` only: how many further records the cap left out of the list. */
   printedPagesOmitted?: number;
-  /** `'unverifiedPage'`, `'slideMismatch'` and `'pgfpagesLayout'` only: the label's number as the
-   *  `.aux` records it
+  /** `'unverifiedPage'`, `'slideMismatch'`, `'pgfpagesLayout'` and `'pgfpagesUnknown'` only: the
+   *  label's number as the `.aux` records it
    *  (the first field of `\newlabel`). Not checked against anything — it is echoed so the
    *  refusal can tell the caller what to search `extract_text`'s output for. */
   number?: string;
@@ -491,8 +499,9 @@ export function buildPageLabelIndex(
  * An identity tree whose length matches that slide count is no evidence either — the second
  * layout passes that test — so a deck always takes the printed-page route (`'beamer'`), where a
  * footline printing the slide number is what resolves it. Both layouts are refused before that
- * wherever the build's records show `pgfpages` loaded (`'pgfpagesLayout'`); where they cannot be
- * read, the second layout, whose footline prints the TRUE slide numbers, is still refused by
+ * wherever the build's records name `pgfpages` (`'pgfpagesLayout'`), and so is every label of a
+ * build whose records cannot be read (`'pgfpagesUnknown'`); where the records were read and are
+ * wrong, the second layout, whose footline prints the TRUE slide numbers, is still refused by
  * beamer's own slide record ({@link slideMismatch}).
  */
 function usablePageLabelIndex(
@@ -551,10 +560,11 @@ export function findNumberingRestart(floats: readonly AuxLabel[]): NumberingRest
  * for a `\label` in an `allowframebreaks` frame, where beamer's record names the
  * slide before the frame was broken and the `\newlabel` page was the right one. That second case
  * is refused too — a right page given up, the safe direction, since the `.aux` cannot tell the
- * two apart. A build whose `.fls` or `.log` shows `pgfpages` never reaches this check — every
- * label is refused as `'pgfpagesLayout'` first — so here the pgfpages case is the fallback for a
- * build whose records could not be read, and the refusal's advice says which cause fits
- * (`AuxFloatsResult.pgfpages`).
+ * two apart. Only a build whose records were read and name no `pgfpages`
+ * (`AuxFloatsResult.pgfpages === false`) reaches this check — one whose `.fls` or `.log` names it
+ * is refused as `'pgfpagesLayout'` first, and one whose records could not be read as
+ * `'pgfpagesUnknown'` — so what it catches is what the records cannot show: an
+ * `allowframebreaks` label, and a pgfpages shift only if the records were wrong.
  *
  * A label with NO record (a `\newlabel` some package writes itself, e.g. `lastpage`'s
  * `LastPage`, or a key holding a brace group, which the line pattern does not read) keeps the
@@ -795,6 +805,19 @@ export function planLabelPages(
       });
       continue;
     }
+    if (aux.pgfpages === undefined) {
+      // Neither the .fls nor the .log could be read, so a layout that shifted every label cannot
+      // be ruled out — and it is invisible to both routes (above). Refused rather than resolved:
+      // this evidence may only ever add a refusal. Every compile leaves a .log beside the .aux,
+      // so in normal use this never happens, and failing closed costs nothing.
+      failed.push({
+        label,
+        reason: 'pgfpagesUnknown',
+        printedPage: entry.page,
+        number: entry.number,
+      });
+      continue;
+    }
 
     let page: number | undefined;
     if (byPrintedPage) {
@@ -988,12 +1011,13 @@ function lastPageVerdict(evidence: LabelPageEvidence): NeighbourFolio | undefine
  * pages that can corroborate its folio) — at most three pages per label, each page once across
  * the whole call, in request order — then the LAST page of the PDF, once, for
  * {@link lastPageVerdict}. Only pages inside the PDF (a candidate past the end is refused without
- * reading anything, and the renderer would throw for it). Empty when the build loaded `pgfpages`,
- * the document shows roman renumbering or an arabic restart, or no label reaches the check, since
- * nothing is checked then.
+ * reading anything, and the renderer would throw for it). Empty unless the build's records were
+ * read and name no `pgfpages` (`aux.pgfpages === false`: every label is refused as
+ * `'pgfpagesLayout'` or `'pgfpagesUnknown'` otherwise), and empty when the document shows roman
+ * renumbering or an arabic restart, or no label reaches the check, since nothing is checked then.
  */
 export function pagesToVerify(labels: string[], aux: AuxFloatsResult, pageCount: number): number[] {
-  if (aux.pgfpages === true) return [];
+  if (aux.pgfpages !== false) return [];
   if (aux.floats.some((entry) => isRomanPage(entry.page))) return [];
   if (findNumberingRestart(aux.floats)) return [];
   const wanted = new Set(labels);
@@ -1149,12 +1173,27 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
           : '';
       lines.push(
         `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
-          `${quoteLabel(failure.printedPage ?? '')}, but this build loaded pgfpages (its recorder ` +
-          'file or log names pgfpages.sty or pgfmorepages.sty), and a pgfpages layout ' +
+          `${quoteLabel(failure.printedPage ?? '')}, but this build's records (its recorder file ` +
+          'or log) name pgfpages.sty or pgfmorepages.sty, and a pgfpages layout ' +
           '(\\pgfpagesuselayout{resize to}, {2 on 1}) holds each page back until the next one ' +
           'is built, so every label records a later page than its own — and the /PageLabels ' +
           'tree and the printed page numbers move with it, so nothing in the PDF can show the ' +
           'shift. No page was assumed.' +
+          number,
+      );
+      continue;
+    }
+    if (failure.reason === 'pgfpagesUnknown') {
+      const number =
+        failure.number && failure.number !== ''
+          ? ` Its number is ${quoteLabel(failure.number)}, if you search for the page yourself.`
+          : '';
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
+          `${quoteLabel(failure.printedPage ?? '')}, but neither the build's recorder file ` +
+          '(.fls) nor its .log could be read beside the .aux, so whether a pgfpages layout ' +
+          '(\\pgfpagesuselayout{resize to}, {2 on 1}) shifted every label a page late cannot ' +
+          'be told — and nothing in the PDF would show that shift. No page was assumed.' +
           number,
       );
       continue;
@@ -1169,9 +1208,7 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
         `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
           `${quoteLabel(failure.printedPage ?? '')}, but beamer's own record of the slide its ` +
           `\\label ran on (\\beamer@slide) says slide ${slides}. The two disagree when the page ` +
-          'moved after the \\label ran — a pgfpages layout (\\pgfpagesuselayout{resize to}, ' +
-          '{2 on 1}) holds each page back until the next is built, so every label records the ' +
-          'page after its own, and a label in an allowframebreaks frame can land on a later ' +
+          'moved after the \\label ran — a label in an allowframebreaks frame can land on a later ' +
           "part — and which of the two is this label's PDF page cannot be told from the .aux, " +
           'so neither was assumed.' +
           number,
@@ -1247,28 +1284,34 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
   }
   if (plan.failed.some((f) => f.reason === 'pgfpagesLayout')) {
     lines.push(
-      '  pgfpages shifts the page of every label in the document, so no label of this build is ' +
-        'resolved, whatever the document class and whether or not hyperref is loaded. The ' +
-        "build's records show the package, not the layout, so loading pgfpages without " +
-        '\\pgfpagesuselayout is refused too. To look pages up by label, compile without pgfpages ' +
-        '(it changes only how pages are laid out on paper); or find the page yourself: search ' +
-        'extract_text\'s output (or pdf_geometry kinds: ["text"]) for the label\'s number and ' +
-        'pass pages:.',
+      '  A pgfpages layout shifts the page of every label in the document, so no label of this ' +
+        'build is resolved, whatever the document class and whether or not hyperref is loaded. ' +
+        "The build's records show only that the file was opened, not that a layout is in use, " +
+        'so this refusal is spurious — and still made — when the document loads pgfpages ' +
+        'without \\pgfpagesuselayout or only tests for the file ' +
+        '(\\IfFileExists{pgfpages.sty}); removing that load or test lets the lookup run. To look ' +
+        'pages up by label, compile without pgfpages (it changes only how pages are laid out on ' +
+        "paper); or find the page yourself: search extract_text's output (or pdf_geometry " +
+        'kinds: ["text"]) for the label\'s number and pass pages:. To show the last page ' +
+        "(lastpage's LastPage, say), pass pages: with the PDF's page count.",
+    );
+  }
+  if (plan.failed.some((f) => f.reason === 'pgfpagesUnknown')) {
+    lines.push(
+      '  A compile leaves a .log beside the .aux, so compile again and retry; or find the page ' +
+        'yourself: search extract_text\'s output (or pdf_geometry kinds: ["text"]) for the ' +
+        "label's number and pass pages:.",
     );
   }
   if (plan.failed.some((f) => f.reason === 'slideMismatch')) {
+    // Only a build whose records were read and name no pgfpages reaches 'slideMismatch' (the
+    // others refuse as 'pgfpagesLayout' or 'pgfpagesUnknown' first), so one message fits.
     lines.push(
-      aux.pgfpages === false
-        ? '  This build did not load pgfpages (or pgfmorepages), so the disagreement is not a ' +
-            'pgfpages shift: the usual cause is a \\label in an allowframebreaks frame, which ' +
-            'beamer records under the slide the frame began on, and such a label cannot be ' +
-            "looked up by label. Find the page yourself: search extract_text's output (or " +
-            'pdf_geometry kinds: ["text"]) for the label\'s number and pass pages:.'
-        : '  If the deck uses a pgfpages layout, compiling without it (it changes only how slides ' +
-            'are laid out on paper) removes that shift; a label in an allowframebreaks frame ' +
-            'stays unresolvable by label either way. Or find the page yourself: search ' +
-            'extract_text\'s output (or pdf_geometry kinds: ["text"]) for the label\'s number ' +
-            'and pass pages:.',
+      "  This build's records name neither pgfpages nor pgfmorepages, so the disagreement is not a " +
+        'pgfpages shift: the usual cause is a \\label in an allowframebreaks frame, which ' +
+        'beamer records under the slide the frame began on, and such a label cannot be ' +
+        "looked up by label. Find the page yourself: search extract_text's output (or " +
+        'pdf_geometry kinds: ["text"]) for the label\'s number and pass pages:.',
     );
   }
   if (plan.failed.some((f) => f.reason === 'unverifiedPage')) {

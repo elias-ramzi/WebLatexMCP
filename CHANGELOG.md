@@ -76,6 +76,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   draft-07 `Client` still accepts them. A test round-trips `listTools()` and compiles every
   advertised schema with strict 2020-12 and draft-07 validators, so a future zod construct that is
   specific to one draft fails in CI instead of in a client.
+- **`labels:` lookups refuse a build whose records cannot be read, instead of resolving it
+  blind** (#194). `render_pages`/`extract_text` decide whether a `pgfpages` layout shifted every
+  label from the build's `.fls` and `.log`; when neither could be read the check was skipped, and
+  an `article` under `\pgfpagesuselayout{resize to}` resolved every label a page late. Every label
+  is now refused (`pgfpagesUnknown`) with advice to compile again or pass `pages:`, and
+  `pdf_geometry kinds: ["floats"]` notes that its pages could not be checked. A server compile
+  always leaves a `.log`, so ordinary builds are unaffected.
+- **The `pgfpages` refusal says what it saw.** It said the build "loaded pgfpages"; the records
+  only show the file was opened, so the message now says so, names the cases where the refusal is
+  spurious (`pgfpages` loaded without `\pgfpagesuselayout`, or only tested with `\IfFileExists`),
+  and points at `pages:` with the page count for the last page (`lastpage`'s `LastPage`). The
+  refusal itself is unchanged: no document-controlled signal can safely tell a layout in use from
+  a load, and none may resolve a page.
 
 ## [0.7.1] - 2026-09-25
 

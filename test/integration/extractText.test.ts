@@ -73,11 +73,20 @@ async function stagePdf(userDir: string, pages: number, opts?: MinimalPdfOptions
   await writeFile(pdfPath, minimalPdf(pages, 300, 200, opts));
 }
 
-/** Stage the `.aux` the last compile would have left, without running latexmk. */
-async function stageAux(userDir: string, content: string): Promise<void> {
+/**
+ * Stage the `.aux` the last compile would have left, without running latexmk — and the `.log`
+ * beside it, since every compile leaves one and a build with neither `.log` nor `.fls` has every
+ * label refused (`'pgfpagesUnknown'`). `log: null` stages that unreadable-records state.
+ */
+async function stageAux(
+  userDir: string,
+  content: string,
+  log: string | null = 'This is pdfTeX, Version 3.141592653\n',
+): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
   await writeFile(auxPath, content);
+  if (log !== null) await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, log);
 }
 
 function textOf(res: unknown): string {
@@ -175,6 +184,26 @@ describe('extract_text', () => {
     expect(out.pages[0]?.lines).toEqual(['Table 1 caption on page 3', '3']);
     expect(out.resolvedLabels).toEqual([{ label: 'tab:results', printedPage: '3', page: 3 }]);
     expect(out.note).toContain('LAST COMPILE');
+  });
+
+  it('refuses a label when neither the .fls nor the .log could be read beside the .aux', async () => {
+    // Same resolution as render_pages, so the same refusal: with no record of what the build
+    // read, a pgfpages layout that shifted every label a page late cannot be ruled out.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3, { text: (n) => `Table 1 caption on page ${n}\n${n}` });
+    await stageAux(userDir, '\\newlabel{tab:results}{{1}{3}}\n', null);
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('tab:results');
+    expect(text).toMatch(/neither the build's recorder file \(\.fls\) nor its \.log could be read/);
+    expect(text).toContain('pages:');
+    expect(text).not.toMatch(/name pgfpages\.sty/);
+    expect(text).not.toContain('Table 1 caption');
   });
 
   it('resolves a renumbered document’s label through /PageLabels here too', async () => {

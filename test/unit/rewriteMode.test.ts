@@ -590,7 +590,7 @@ describe('createPreserveTransform', () => {
   });
 
   describe('oldString whose own bytes include the trailing newline (Finding 4)', () => {
-    // Round 1's fix rewrote the EOF case above so oldString === content exactly — the match's
+    // An earlier fix rewrote the EOF case above so oldString === content exactly — the match's
     // "end" is content.length either way, so atLineEnd was trivially true regardless of whether
     // it checked oldString's own trailing newline. That sidesteps the actual bug: atLineStart
     // and end-of-file are not the only ways to be line-aligned — a match can also END with its

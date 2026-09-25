@@ -1049,18 +1049,26 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   without `hyperref`. The evidence (`readPgfpagesEvidence`, `AuxFloatsResult.pgfpages`) is the
   build's `.fls` or `.log` naming `pgfpages.sty` or `pgfmorepages.sty` (a drop-in that holds pages
   back the same way without loading `pgfpages.sty`), read from the start only, `O_NOFOLLOW`,
-  regular files only. It is tri-state and the three values must stay apart: `true` refuses;
-  `false` means a record was read and names neither package; `undefined` means neither was
-  readable, and nothing is checked (a documented gap, #194). The `.log` is read even when a `.fls`
-  exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
+  regular files only. It is tri-state and the three values must stay apart: `true` refuses; `false`
+  means a record was read and names neither package; `undefined` means neither was readable, and
+  **every label is refused too** (`pgfpagesUnknown`) — whether a layout shifted the build cannot be
+  told, and a compile always leaves a `.log`, so this only fires when something removed or replaced
+  the build's records; resolving there was the last silent-wrong-page path (#194). The tri-state
+  stays in the reader; only the consumer treats `undefined` as a refusal. The `.log` is read even
+  when a `.fls` exists, since a `.fls` left by an earlier recorder-on compile is stale. The log is
   document-controlled, which is acceptable only because `true` can only ADD a refusal — never let
   this evidence resolve a page. "Loaded" is wider than "layout in use" (the `.fls` even records a
-  file merely opened by `\IfFileExists`); that over-refusal is accepted, since a layout-specific
-  log line can be hidden by redefining `\wlog`, which errs the unsafe way. `slideMismatch` is
-  therefore the fallback for a deck whose records were unreadable, and its advice turns on
-  `pgfpages === false`. `pdf_geometry kinds: ["floats"]` does not refuse — the index is data the
-  caller asked for, and its keys and numbers are true — but flags `floatsPagesShifted: true` with a
-  note in both channels.
+  file merely opened by `\IfFileExists`); that over-refusal is accepted, since a layout-specific log
+  line can be hidden by redefining `\wlog`, which errs the unsafe way; the refusal says the records
+  name the file (never that a layout is in use) and that it is spurious for a load without
+  `\pgfpagesuselayout` or a mere `\IfFileExists`. No label is exempted by name either — `lastpage`'s
+  `LastPage` happens to be written unshifted, but a hand `\label{LastPage}` is not, and telling the
+  two apart would need the same forgeable evidence used to accept; the refusal points at `pages:`
+  with the page count instead. `slideMismatch` therefore runs only on `pgfpages === false`, and its
+  advice is the `allowframebreaks` one. `pdf_geometry kinds: ["floats"]` does not refuse — the index
+  is data the caller asked for, and its keys and numbers are true — but flags
+  `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, no
+  record beside it) carries a note that the pages could not be checked, without the flag.
   **Labels in `\include`d chapters** are found by following
   line-anchored `\@input` lines (`findBuildDirAux`): each name is looked up component by component
   in a `readdir` listing of the build dir, **never used as a path** (no symlinks, no `..`; re-checked at
