@@ -1,0 +1,10 @@
+# Config for the HOL AI Plugin Scanner (`plugin-scanner scan .`), which the awesome-ai-plugins
+# catalog runs against this repository before listing it.
+#
+# test/ is excluded because every finding there is a deliberate fixture, not a leak: the
+# credential, redaction and URL-stripping tests need token-shaped strings (ghp_…, glpat-…) to prove
+# that a secret never reaches .git/config, a command line or an error message, and the viewer test
+# evaluates the page's inline script with `new Function`. None of it ships (package.json `files`,
+# .mcpbignore), and src/ is still scanned in full.
+[scanner]
+ignore_paths = ["test/*"]

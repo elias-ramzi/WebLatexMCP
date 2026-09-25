@@ -9,6 +9,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **A `.plugin-scanner.toml` for the HOL AI Plugin Scanner**, which the awesome-ai-plugins catalog
+  runs before listing the server (#198). It excludes `test/`, where the token-shaped strings the
+  credential and redaction tests need were reported as hardcoded secrets; `src/` is still scanned
+  in full. The score goes from 69 to 88, past the catalog's threshold of 80.
+
 ## [0.7.1] - 2026-09-25
 
 ### Changed

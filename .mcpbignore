@@ -21,6 +21,7 @@ vitest.config.ts
 eslint.config.*
 .prettier*
 .editorconfig
+/.plugin-scanner.toml
 .gitignore
 .npmrc
 *.tsbuildinfo
