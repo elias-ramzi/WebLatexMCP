@@ -1,6 +1,6 @@
 ---
 name: peer-review
-description: Pre-submission peer review of a deep learning / ML paper for a major conference (NeurIPS, ICML, ICLR, CVPR, ICCV, ECCV, ACL, EMNLP, AAAI…) — the review the toughest competent reviewer would write, so the authors can fix it before the deadline. Covers the reading protocol, the claim–evidence map, an ML checklist (baselines, leakage, seeds, ablations, compute, LLM pitfalls, theory, anonymity), severity/fixability/confidence calibration, evidence anchors, the devil's-advocate and novelty passes, and the triage that merges several reviews into one final review (summary, strengths, weaknesses, minor weaknesses, questions, typos). Use when the user asks to "review my paper", "act as a reviewer for my paper", "what would reviewers say about this paper", "stress-test the paper before submission", or for a referee report — not for code, design or pull-request review. Read-only on the paper — its only writes are its own reports, in a `paper-review.local/` folder, and one line adding that folder to the repository's local `.git/info/exclude` (compiling writes build output, which the server keeps outside the project). The novelty pass sends search queries — built from technical ingredients, never the title or the text — to bibliography services and the web, and only with the user's go-ahead.
+description: Pre-submission peer review of an ML paper for a major conference (NeurIPS, ICML, ICLR, CVPR…) — the toughest competent reviewer's review, while the authors can still fix it. Covers the reading protocol, the claim–evidence map, an ML checklist (baselines, leakage, seeds, ablations, compute, anonymity…), severity/fixability/confidence, evidence anchors, the devil's-advocate and novelty passes, and the triage that merges reviews into one final review in six sections. Use when the user asks to "review my paper", "what would reviewers say about this paper", "stress-test it before submission", or for a referee report — not for code or pull-request review. Read-only on the paper: it writes only its reports, in a `paper-review.local/` folder, and one line adding that folder to the repository's local `.git/info/exclude` (compile output stays outside the project). The novelty pass sends search queries — technical terms, never the title or text — to bibliography services and the web, only with the user's go-ahead.
 project: optional
 ---
 
@@ -50,6 +50,26 @@ desk-reject for it.
   panel — it rewrites the build directory under the other reviewers; the orchestrator compiles once.
 - **References**: `list_references` reads the bibliography in any format; `check_citations`
   finds cite keys without an entry.
+- **Earlier review runs are not the paper.** Skip everything under `paper-review.local/` — this
+  run's reports and every earlier run's — except the paths your prompt gives you (the triage's reports, a bare PDF's `paper.pdf` and
+  `paper.txt`).
+  `list_files` and `search_files` list that folder like any other; a reviewer who reads a previous
+  review is no longer independent.
+- **A bare PDF, no sources** (a co-author's draft): the orchestrator copies it into the run
+  directory as `paper.pdf` and builds `paper.txt` from it with one marker line per page, so every
+  line of text is on a known page:
+
+  ```bash
+  RUN="<run directory>"
+  N=$(pdfinfo "$RUN/paper.pdf" | awk '/^Pages:/ { print $2 }')
+  for p in $(seq 1 "$N"); do
+    printf '=== p.%d ===\n' "$p"
+    pdftotext -layout -f "$p" -l "$p" "$RUN/paper.pdf" - | tr -d '\f'
+  done > "$RUN/paper.txt"
+  ```
+
+  Read `paper.pdf` for figures, tables and layout (at most 20 pages per call) and `paper.txt` to
+  search and quote. The page of a line is the nearest `=== p.<n> ===` marker above it.
 
 ## Reading protocol — three passes
 
@@ -218,6 +238,12 @@ seconds: the **source location** (`sections/method.tex:L88`) plus what a reader 
 (§3.2, Tab. 2, Fig. 4 right, Eq. (7), Alg. 1 line 5, App. C), and for a text claim a verbatim quote
 of at most 25 words.
 
+On a **bare PDF** there is no source file, so the anchor is `p.<page>` plus the PDF location:
+`p.<page>, L<n>` when the PDF prints margin line numbers (a review-mode build does, and
+`pdftotext` keeps them at the start of each line of `paper.txt`); otherwise `p.<page>` with §, Fig.,
+Tab. or Eq. and a verbatim quote of at most 25 words. Never use a `paper.txt` line number — the
+authors cannot see it.
+
 An **absence** anchor reads `absence: expected <X>; checked <where>` — for example
 `absence: expected std over seeds; checked Tab. 1–3, §5, App. B–D`. It is valid only if you
 actually checked those places, appendix included. "The paper does not report X" when X is in
@@ -283,12 +309,13 @@ out of scope here (the `proofread-document` and `review-writing-guide` skills ow
 
 ## Role: reviewer report
 
-A full reviewer returns exactly these eight sections:
+A full reviewer returns exactly these eight sections. Never name the model you run on: under
+`/review-paper` the three full reviews are blinded from the triage.
 
 ```markdown
 # Reviewer report — <reviewer id>
 
-- Paper: <title> · Venue: <venue> · Model: <model> · Reviewer confidence: <1–5>, <expertise basis>
+- Paper: <title> · Venue: <venue> · Reviewer confidence: <1–5>, <expertise basis>
 
 ## 1. Summary
 
@@ -296,7 +323,7 @@ A full reviewer returns exactly these eight sections:
 
 ## 2. Claim–evidence map
 
-<the table above, one row per claim>
+<one entry per claim, in the format of the example above>
 
 ## 3. Strengths
 
@@ -413,7 +440,10 @@ wrong, and one raised by a single reviewer can be the most important.
 1. **Read the paper yourself first** — at least pass 1 and the experiments — and write your own
    claim list before opening any report, so the reports do not anchor you.
 2. **Ledger.** Extract every strength, weakness, question and typo from every report with a source
-   ID (`SON-W3`, `OPU-W1`, `FAB-Q2`, `DA-C1`, `NOV-W1`, `TYP-12`, `CMP-3` for compile warnings).
+   ID (`R1-W3`, `R2-W1`, `R3-Q2`, `DA-C1`, `NOV-W1`, `TYP-12`, `CMP-3` for compile warnings).
+   Under `/review-paper` the three full reviews are blinded: you are not told which model wrote
+   `R1`, `R2` or `R3`, and one of them runs on your own model. Do not try to work it out; judge
+   every item on the paper alone.
 3. **Cluster** items describing the same underlying problem; split items bundling two.
 4. **Verify each cluster in the paper** — `CONFIRMED`, `PARTIAL` (real but overstated: adjust scope
    or severity), `REJECTED` (a false positive: say where the paper addresses it), or
@@ -475,7 +505,7 @@ _Target venue: <venue> · <YYYY-MM-DD>_
 ```markdown
 # Triage log — <paper title>
 
-## Panel — id, agent, model, status (ok / missing / malformed)
+## Panel — id, agent, status (ok / missing / malformed)
 
 ## Recommendations by reviewer — recommendation, confidence, their most important issue
 

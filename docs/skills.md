@@ -217,7 +217,7 @@ that control for parameters and compute, efficiency and scaling claims, LLM-spec
 reproducibility, and the desk-reject risks (anonymity, page limit, hidden prompts) — and labels every
 weakness with a **severity** (critical / major / minor), its **fixability before the deadline** (quick /
 moderate / hard), and a **confidence**. Every point is anchored to a `file.tex:line` and to the figure,
-table or section a reader sees; an "the paper does not report X" is only allowed after the appendix was
+table or section a reader sees; a "the paper does not report X" is only allowed after the appendix was
 checked.
 
 The result is one review in six sections — **summary** (the idea, the claims, the results and how well
@@ -230,6 +230,9 @@ rejection, a novelty scout that looks for the closest prior and concurrent work 
 queries never contain the paper's title), and one `corrector` per file for typos. None of them sees
 another's report. A Fable triage agent then re-reads the paper, verifies each finding against it —
 dropping false positives, adjudicating every devil's-advocate critical — and writes the final review.
+The three full reviews reach it blinded (`R1`–`R3`, shuffled each run), since one of them runs on its
+own model. Before dispatching, the command says how many agents will run and how many read the whole
+paper, and asks first for a paper over ~40 pages.
 Agreement between reviewers raises confidence, never severity. Anywhere else (an MCP prompt, one agent)
 the skill runs the same roles in sequence in one session, with less independent coverage.
 

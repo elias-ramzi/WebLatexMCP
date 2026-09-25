@@ -27,7 +27,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   another's report, and a Fable `review-triage` verifies every finding against the paper before it
   keeps it. The panel is independent because agreement between reviewers is only a signal if they
   could not copy each other; for the same reason triage lets consensus raise a finding's confidence
-  but never its severity. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
+  but never its severity. The three full reviews reach the triage blinded, as `R1`–`R3` in a fresh
+  random order each run, because the triage runs on the same model as one of them. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
   or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
   copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
   git-excluded `paper-review.local/<timestamp>/` (under the server workspace for a bare PDF, which
