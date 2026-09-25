@@ -331,20 +331,23 @@ const outputSchema = {
     .boolean()
     .optional()
     .describe(
-      'Present (true) only when "floats" was requested and the build loaded `pgfpages` (its .fls ' +
-        'or .log names pgfpages.sty or pgfmorepages.sty): a \\pgfpagesuselayout (`resize to`, ' +
+      'Present (true) only when "floats" was requested and the build\'s records (its .fls or ' +
+        '.log) name pgfpages.sty or pgfmorepages.sty: a \\pgfpagesuselayout (`resize to`, ' +
         '`2 on 1`) holds each page back until the next is built, so every `page` in `floats` is ' +
         "likely LATER than the page the label is on — don't pass it to render_pages as `pages:`; " +
         'find the page with extract_text instead. Label keys and numbers are unaffected. Loading ' +
         'the package without a layout shifts nothing, but is flagged too. Absent when the build ' +
-        'shows no pgfpages, or when neither file could be read.',
+        'shows no pgfpages. Also absent when neither file could be read — `note` then says the ' +
+        'pages are unverified instead, since nothing shows the package was loaded.',
     ),
   note: z
     .string()
     .optional()
     .describe(
-      'Explains an unusual situation, several joined when more than one applies: the build ' +
-        'loaded pgfpages, so the floats pages are likely shifted (see floatsPagesShifted); the page ' +
+      "Explains an unusual situation, several joined when more than one applies: the build's " +
+        'records name pgfpages, so the floats pages are likely shifted (see floatsPagesShifted), or ' +
+        'neither its .fls nor its .log could be read, so whether they are shifted could not be ' +
+        'checked; the page ' +
         'geometry hit its size budget (see textOmittedBySize); "floats" requested but no .aux ' +
         'was found in the build directory (nothing has been compiled with that root file yet, ' +
         'or the backend in use does not write one), or the .aux reader could not read an ' +
@@ -525,13 +528,28 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // it is data the caller asked for — but its pages are not, so it says so, first.
             floatsPagesShifted = auxResult.pgfpages === true ? true : undefined;
             const shiftedNote = floatsPagesShifted
-              ? 'This build loaded pgfpages: a \\pgfpagesuselayout holds each page back until the ' +
+              ? "This build's records name pgfpages.sty: a \\pgfpagesuselayout holds each page back until the " +
                 'next is built, so every floats page is likely one later than the page the label ' +
                 'is on (see floatsPagesShifted). Find the page with extract_text rather than ' +
                 'passing these to render_pages.'
               : undefined;
+            // The same state in which labels: refuses every label ('pgfpagesUnknown'): an .aux
+            // with entries, but neither the .fls nor the .log beside it could be read, so a
+            // layout cannot be ruled out. Said in the note only — floatsPagesShifted says the
+            // build's records name pgfpages, which nothing here shows. Gated on `total` because the
+            // no-.aux result also carries no pgfpages evidence, and it has no pages to call
+            // unverified (nor does an .aux with no entries).
+            const unverifiedNote =
+              auxResult.pgfpages === undefined && auxResult.total > 0
+                ? 'Whether this build used a pgfpages layout could not be checked (neither its ' +
+                  '.fls nor its .log could be read beside the .aux), so these pages are ' +
+                  'unverified: a \\pgfpagesuselayout would make every one a page later than ' +
+                  "the label's own. render_pages labels: refuses such a build; compile again to " +
+                  'restore the records.'
+                : undefined;
             floatsNote =
-              [shiftedNote, auxResult.note, plan.note].filter(Boolean).join(' ') || undefined;
+              [shiftedNote, unverifiedNote, auxResult.note, plan.note].filter(Boolean).join(' ') ||
+              undefined;
           }
           const note = [geometryPlan.note, floatsNote].filter(Boolean).join(' ') || undefined;
 

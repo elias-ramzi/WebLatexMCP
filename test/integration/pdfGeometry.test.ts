@@ -11,7 +11,7 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import { toPosix } from '../../src/lib/paths.js';
-import { expectDeclaredField } from '../helpers/outputSchema.js';
+import { expectDeclaredField, expectNoUndeclaredKeys } from '../helpers/outputSchema.js';
 import { GROUP_SKIP_SCAN } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 import type { AppContext } from '../../src/context.js';
@@ -89,10 +89,20 @@ async function stagePdf(userDir: string, pages: number): Promise<void> {
   await writeFile(pdfPath, minimalPdf(pages));
 }
 
-async function stageAux(userDir: string, content: string): Promise<void> {
+/**
+ * Stage the `.aux` the last compile would have left — and the `.log` beside it, since every
+ * compile leaves one, and a build with neither `.log` nor `.fls` cannot say whether pgfpages
+ * shifted its pages. `log: null` stages that unreadable-records state.
+ */
+async function stageAux(
+  userDir: string,
+  content: string,
+  log: string | null = 'This is pdfTeX, Version 3.141592653\n',
+): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
   await writeFile(auxPath, content);
+  if (log !== null) await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, log);
 }
 
 interface ContentBlock {
@@ -253,6 +263,42 @@ describe('pdf_geometry', () => {
 
     // A build whose recorder names no pgfpages carries neither the flag nor the note.
     await writeFile(`${stem}.fls`, 'PWD /build\nINPUT /texmf/tex/latex/base/article.cls\n');
+    const clean = structuredOf(
+      await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'poster', kinds: ['floats'] },
+      }),
+    );
+    expect(clean.floatsPagesShifted).toBeUndefined();
+    expect(clean.note).toBeUndefined();
+  });
+
+  it('says the floats pages are unverified when neither the .fls nor the .log could be read', async () => {
+    // With no record of what the build read, a pgfpages layout cannot be ruled out — the same
+    // state in which labels: lookups refuse every label (labelPages.ts, 'pgfpagesUnknown'). The
+    // index is still data the caller asked for, but its pages must not read as checked. The
+    // flag stays true-only: it says the build's records name pgfpages, which nothing here shows.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 1);
+    await stageAux(userDir, '\\newlabel{fig:one}{{1}{3}}\n', null);
+
+    const res = await client.callTool({
+      name: 'pdf_geometry',
+      arguments: { project: 'poster', kinds: ['floats'] },
+    });
+    expect(res.isError ?? false).toBe(false);
+    const out = structuredOf(res);
+    expect(out.floats).toEqual([{ label: 'fig:one', number: '1', page: '3' }]);
+    expect(out.floatsPagesShifted).toBeUndefined();
+    expect(out.note).toMatch(/could not be checked/);
+    expect(out.note).toMatch(/neither its \.fls nor its \.log could be read/);
+    expect(textOf(res)).toMatch(/these pages are unverified/);
+    await expectNoUndeclaredKeys(client, 'pdf_geometry', out);
+
+    // The value just outside: a plain .log beside the same .aux is a record that was read and
+    // names no pgfpages, so there is nothing to warn about.
+    const stem = buildAuxPath(userDir, 'main.tex').slice(0, -'.aux'.length);
+    await writeFile(`${stem}.log`, 'This is pdfTeX, Version 3.141592653\n');
     const clean = structuredOf(
       await client.callTool({
         name: 'pdf_geometry',

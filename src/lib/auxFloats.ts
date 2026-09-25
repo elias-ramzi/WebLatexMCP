@@ -832,9 +832,12 @@ export interface AuxFloatsResult {
   /** Whether the build that wrote this `.aux` loaded `pgfpages` ({@link readPgfpagesEvidence}):
    *  `true` when its recorder file (`.fls`) or its `.log` names `pgfpages.sty`, `false` when at
    *  least one of the two was read and neither does, and absent when neither could be read (no
-   *  `.aux` at all, or a backend that wrote neither), which leaves label resolution as it was.
-   *  `labelPages.ts` refuses every label of a `true` build: a pgfpages layout shifts every
-   *  `\newlabel` a page late. Never spread into a tool's `structuredContent`. */
+   *  `.aux` at all, or a backend that wrote neither). `labelPages.ts` refuses every label of a
+   *  `true` build (`'pgfpagesLayout'`): a pgfpages layout shifts every `\newlabel` a page late.
+   *  It refuses every label when this is absent too (`'pgfpagesUnknown'`), since the shift is
+   *  invisible everywhere else, and `pdf_geometry` then notes that its floats pages are
+   *  unverified; only `false` lets a label resolve. Never spread into a tool's
+   *  `structuredContent`. */
   pgfpages?: boolean;
   /** Present when no `.aux` was found in the build directory, or when the root `.aux` inputs
    *  (`\@input`, which `\include` writes) a file that could not be read — so the index may be
@@ -1231,11 +1234,15 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
  *    (`--keep-logs`) and no `.fls`; it keeps no `.aux` either, so no label resolves there anyway.
  *
  * Either one naming `pgfpages.sty` (or `pgfmorepages.sty`) is `true`: the answer only ever
- * refuses, so the union is the safe reading. `false` needs at least one of the two read and neither naming it. `undefined` —
- * neither readable — means nothing is known, and label resolution goes on as it did before this
- * check existed; that is a known gap, not a verdict. Loading the package without calling
- * `\pgfpagesuselayout` does not shift anything, and is still `true`: the build's records show the
- * package, not the layout, and over-refusing is the direction to err in.
+ * refuses, so the union is the safe reading. `false` needs at least one of the two read and
+ * neither naming it. `undefined` — neither readable — means nothing is known, and that is not a
+ * pass: `labelPages.ts` refuses every label of such a build (`'pgfpagesUnknown'`) and
+ * `pdf_geometry` notes that its floats pages are unverified. Every compile leaves a `.log`, so
+ * this state means the records were removed or unreadable, and failing closed costs a recompile.
+ * Loading the package without calling `\pgfpagesuselayout` does not shift anything, and is still
+ * `true`: the build's records show the package, not the layout, and over-refusing is the
+ * direction to err in. The same holds for a file merely opened — the `.fls` records one that
+ * `\IfFileExists{pgfpages.sty}` only tested for — which is likewise `true`.
  */
 export async function readPgfpagesEvidence(auxPath: string): Promise<boolean | undefined> {
   const stem = auxPath.slice(0, -path.extname(auxPath).length);

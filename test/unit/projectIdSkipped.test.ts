@@ -16,7 +16,7 @@ import { errorResult } from '../../src/lib/errors.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
- * Review round 2 on project ids and git URLs:
+ * Project ids and git URLs:
  *
  * - the id rule refuses only what is unsafe as a directory name, so `thèse`, `My Thesis`,
  *   `paper+notes` — which worked before 0.7 — still do;

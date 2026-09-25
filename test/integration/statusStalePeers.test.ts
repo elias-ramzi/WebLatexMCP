@@ -290,10 +290,10 @@ describe('status collapses stale, change-free peer sessions', () => {
     expect(firstText).not.toMatch(/exited with nothing recorded/);
     // And POSITIVELY: the preserved peer must be rendered as holding nothing *recorded*, not as
     // holding no changes. A negative assertion alone passes while the text channel says the very
-    // thing the schema and the docs were narrowed to stop asserting — which is exactly how this
-    // gap survived the first round: `peerDetail` spelled the same claim differently, so the
-    // `not.toMatch` above was satisfied by a line reading `just-quiet (gone; no changes)`. Keeping
-    // the two channels pinned together is the whole point.
+    // thing the schema and the docs were narrowed to stop asserting: `peerDetail` could spell the
+    // same claim differently, and the `not.toMatch` above is satisfied by a line reading
+    // `just-quiet (gone; no changes)`. Keeping the two channels pinned together is the whole
+    // point.
     expect(firstText).toMatch(/just-quiet \(gone; nothing recorded\)/);
     expect(firstText).not.toMatch(/no changes/);
 
