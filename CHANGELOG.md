@@ -30,15 +30,33 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   install option `npx web-latex-mcp` now reads `npx (the npm package, run on demand)`, and the
   skill's example report matches it. Together these clear the seven SkillSpector findings the two
   skills had (three high).
-
-### Changed
-
 - **CI moves to `actions/setup-node@v7`.** v5 wrote an `always-auth` line into the `.npmrc` it
   generates, which npm 11 flags as an unknown config that "will stop working in the next major
   version" — a warning on every npm step of the publish job, and a likely publish failure once the
   runner's npm is 12. v7 drops the input, and stops exporting a placeholder `NODE_AUTH_TOKEN`, which
   suits trusted publishing. Every workflow moves, not just `publish.yml`, so the pull request's own CI
   exercises v7 before a tag depends on it.
+- **Skills that write a `.git/info/exclude` line now say so.** `arxiv-clean-project` asks before
+  adding its export to the exclude file of a repository that is not the project, `verify-citations`
+  names the exclude line when it asks to write into a local project, and `session-feedback`'s
+  description and closing rule no longer claim it writes nothing. `arxiv-clean-project` also lists
+  every shell command it runs, and adds only `mkdir` and `grep` to its pre-approved `allowed-tools`:
+  `tar`, `cp`, `mv` and `git` can overwrite or move files anywhere, so the client still asks for
+  each. These are the findings of a SkillSpector scan with its LLM pass (the CI job runs without it).
+- **`format-latex-project`, `format-bibliography` and `arxiv-clean-project` no longer fall back to a
+  bare `discard`** when a compile they broke cannot be repaired. That reset the whole tree, including
+  edits the user had made before the skill ran, which none of them checks for. They now ask, then
+  `discard` only the paths the run changed.
+
+### Fixed
+
+- **`verify-citations` could write a git-exclude line into the wrong repository.** For a local
+  project, its snippet ran `printf … >> "$(git -C "$DIR" rev-parse --git-dir)/info/exclude"` even
+  when the check before it had found no repository, which appended to `/info/exclude`; and at a
+  repository's top level `--git-dir` prints a bare `.git`, which resolved against the shell's own
+  directory, some other repository. It now asks git for the absolute path
+  (`--path-format=absolute --git-path info/exclude`, which also works in a worktree) and writes
+  nothing outside a repository.
 
 ## [0.7.1] - 2026-09-25
 

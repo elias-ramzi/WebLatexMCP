@@ -34,7 +34,9 @@ Run these in order. Stop and report if any step fails.
    works on smaller files and the diffs stay legible.
 5. **Recompile.** `compile` again. It must still succeed. Compare the log to the baseline —
    page count / overfull-box warnings should be essentially unchanged. If compilation
-   breaks, fix it; if you can't, `discard` and report.
+   breaks, fix it; if you can't, ask the user, then `discard` with `paths` set to the
+   files this run changed — never a bare `discard`, which also throws away edits the user
+   had before the skill ran — and report.
 6. **Review.** Show the user the `diff`. Do **not** `commit`/`push` unless they ask — per
    CLAUDE.md, mutating the remote happens only on explicit request.
 
