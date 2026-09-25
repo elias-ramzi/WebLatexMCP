@@ -72,8 +72,10 @@ async function main(): Promise<void> {
 
   // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
   const transport = new StdioServerTransport();
-  // Shape outgoing tool schemas for clients that can't handle `outputSchema` (e.g. Claude Desktop);
-  // see src/lib/outputSchemaCompat.ts. The default `auto` mode only affects known-incompatible clients.
+  // Shape outgoing tool schemas: always drop the SDK's draft-07 `$schema` marker (a 2020-12-only
+  // client refuses it), and omit `outputSchema` for clients that can't handle it (e.g. Claude
+  // Desktop); see src/lib/outputSchemaCompat.ts. The default `auto` mode omits it only for
+  // known-incompatible clients. Every mode installs the hook.
   const schemaMode = outputSchemaMode();
   installOutputSchemaCompat(server, transport, schemaMode);
   const prevOnInitialized = server.server.oninitialized;

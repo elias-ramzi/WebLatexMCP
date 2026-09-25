@@ -58,6 +58,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   (`--path-format=absolute --git-path info/exclude`, which also works in a worktree) and writes
   nothing outside a repository.
 
+### Fixed
+
+- **Tools are callable from clients that validate schemas as JSON Schema 2020-12.** The MCP SDK
+  converts every tool's zod schema with no target, which falls back to draft-07 and stamps
+  `"$schema": "http://json-schema.org/draft-07/schema#"` on each advertised `inputSchema` and
+  `outputSchema`. The Claude desktop app's Code tab validates with a 2020-12-only Ajv, so it refused
+  every tool (`… has an invalid outputSchema: JSON Schema declares an unsupported dialect`) before any
+  call reached the server. The server now drops that root `$schema` from every tool it lists, for
+  every client and in every `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA` mode. MCP reads a schema without
+  `$schema` as 2020-12. The schema bodies mean the same thing in both dialects, so the SDK's own
+  draft-07 `Client` still accepts them. A test round-trips `listTools()` and compiles every
+  advertised schema with strict 2020-12 and draft-07 validators, so a future zod construct that is
+  specific to one draft fails in CI instead of in a client.
+
 ## [0.7.1] - 2026-09-25
 
 ### Changed
