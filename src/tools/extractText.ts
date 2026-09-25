@@ -201,7 +201,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           // them the same ROOT's build.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
-            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
+            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX, shipouts: true });
             labelPlan = await resolveLabelPages(
               labels,
               aux,

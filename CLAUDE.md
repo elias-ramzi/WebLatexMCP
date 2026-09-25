@@ -1069,6 +1069,40 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   is data the caller asked for, and its keys and numbers are true — but flags
   `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, no
   record beside it) carries a note that the pages could not be checked, without the flag.
+  **Behind both routes, the `.log`'s shipout marks** (`[<\count0>…]`, one per page shipped;
+  `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup asks) refuse a
+  resolved page (`unverifiedPage`/`shipoutMismatch`) unless that PDF page was shipped with the
+  label's decimal printed page p as its counter and — on the folio route only, since roman front
+  matter under hyperref repeats counters the tree tells apart — no other page shipped with p
+  COMPETES: a counter is not a printed page, and an appendix under `\pagenumbering{alph}`/`{Roman}`
+  or a supplement under `S\arabic{page}` ships 1, 2, … again while printing `a`, `I`, `S1`. So
+  another page with mark p is let through only when its own text, read where `readFolios` looks,
+  gives exactly one reading and that reading is a roman numeral, a letter run or a prefixed
+  number (`printsOtherStylePage`); no reading, two readings, a missing text (`pagesToVerify` reads
+  at most `MAX_AMBIGUOUS_CANDIDATES` such pages per label, only when the check will run) and **any
+  decimal reading** keep it a competitor — a decimal is what a section number or table cell
+  forges, so it never vouches. That rule only decides whether the marks ADD a refusal; it can
+  never accept a page the route refused. The engine writes the marks and a document cannot remove
+  one, but it can add one (`\message{[7]}`), so they are consulted only when their count equals
+  the PDF's page count — any other length skips the check silently, and then the folio route's
+  residual shapes pass as they did without it — and never resolve, move or accept a page. The
+  parser skips the places TeX copies document text into the log: a whole box display (warning
+  line through the next empty line; an output-routine warning, whose display shares its line, is
+  a block of one line), a TeX error from its `file:line:` or `!` line through the next empty
+  line, and, outside an error, only the FIRST line of a context pair (`l.<n> …`, `<argument> …`)
+  — the line under it is read, because pdfTeX's duplicate-destination warning prints the next
+  page's mark there. Real logs put every genuine mark after the skipped blocks. Known parse gaps,
+  both of which only change the count and so switch the check off: a LaTeX/package-format error
+  (`\GenericError` puts an empty line right after its first line, so the rest of its context and
+  help is read), and a mark glued at column 0 onto a line wrapped at exactly 79 columns
+  (`\batchmode` runs of `] [n]`, a truncated `...` context line), which `(?<!\S)\[` misses.
+  Accepted residuals: an extra and a missed mark can line up to the right count and shift the
+  list, which can refuse a correct label or fail to add a refusal it should (either way never
+  worse than the route's own answer),
+  and a section number opening a competing page (`A`, `S1` above an empty foot) can read as its
+  page number and let a repeat through (back to the route's own answer). The log is opened after
+  an `lstat` refuses a link, plus `O_NOFOLLOW` where it exists; on Windows a link planted between
+  the two is followed, which is harmless only because the marks can do nothing but refuse.
   **Labels in `\include`d chapters** are found by following
   line-anchored `\@input` lines (`findBuildDirAux`): each name is looked up component by component
   in a `readdir` listing of the build dir, **never used as a path** (no symlinks, no `..`; re-checked at

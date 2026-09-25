@@ -74,7 +74,10 @@ const inputSchema = {
         'corroborates, a label past the end ' +
         'of the PDF or defined twice, a label printing as "iv", and every label in a document ' +
         'any of whose labels print roman, is REFUSED rather than mapped onto a page that would ' +
-        'be wrong. Any label that ' +
+        'be wrong. On either route, a page the build .log records as shipped out under a ' +
+        'different page counter (its [n] shipout marks) is refused too, and — without /PageLabels — ' +
+        'so is one whose counter was also shipped on another page that could print the same ' +
+        'number (a restart). Any label that ' +
         'cannot be resolved refuses the whole call — no page is ever guessed, and nothing ' +
         'partial is rendered. Cannot be combined with `pages`; two labels on one page render it ' +
         `once and both are echoed. At most ${MAX_LABELS_PER_CALL} per call.`,
@@ -297,7 +300,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // base a write on. Same reasoning as pdf_geometry's "floats" kind.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
-            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
+            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX, shipouts: true });
             // The PDF's own /PageLabels tree turns "printed page -> page index" from an
             // inference into a lookup. `null` is the common answer (a plain `article` has no
             // such tree), and then the printed page is only a candidate: resolveLabelPages reads
@@ -306,7 +309,8 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             // the document a few more times — render opens it again below — on a labelled call
             // only. Every read sees the same build because they are the same root's build-dir
             // files (locateRootPdf) read under the same lock: the lock alone would not make
-            // that true.
+            // that true. `shipouts: true` reads the .log's shipout marks too, which can only
+            // refuse a resolved page.
             labelPlan = await resolveLabelPages(
               labels,
               aux,
