@@ -17,7 +17,7 @@ import type { Skill } from '../../src/lib/skills.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
- * Review round 3 on project ids (the permissive Unicode rule of round 2):
+ * Project ids under the permissive Unicode rule:
  *
  * 1. `__proto__` must never reach a plain object as a key — `map["__proto__"] = entry` sets the
  *    prototype instead of adding an entry, so a registration "succeeded" and persisted nothing
@@ -54,7 +54,7 @@ let root: string;
 let workspaceRoot: string;
 
 beforeEach(async () => {
-  root = await mkdtemp(path.join(os.tmpdir(), 'ovl-idr3-'));
+  root = await mkdtemp(path.join(os.tmpdir(), 'ovl-idunicode-'));
   workspaceRoot = path.join(root, 'ws');
   await mkdir(workspaceRoot);
   vi.spyOn(console, 'error').mockImplementation(() => undefined);

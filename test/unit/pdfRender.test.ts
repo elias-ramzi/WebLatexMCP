@@ -2229,6 +2229,24 @@ describe('PdfRenderer.pageLabels', () => {
     await expect(new PdfRenderer().pageLabels(pdfPath)).resolves.toBeNull();
   });
 
+  it('answers the tree and the page count together, and refuses the same pdf.js', async () => {
+    // pageLabelsAndCount is what a label lookup reads (one load for both answers); it must say
+    // exactly what the two single answers say, refusal included.
+    const pdfPath = path.join(dir, 'labelled.pdf');
+    await writeFile(pdfPath, minimalPdf(3, 200, 100, { pageLabels: ['i', '1', '2'] }));
+    await expect(new PdfRenderer().pageLabelsAndCount(pdfPath)).resolves.toEqual({
+      pageLabels: ['i', '1', '2'],
+      pageCount: 3,
+    });
+    await writeFile(pdfPath, minimalPdf(2));
+    await expect(new PdfRenderer().pageLabelsAndCount(pdfPath)).resolves.toEqual({
+      pageLabels: null,
+      pageCount: 2,
+    });
+    const renderer = new PdfRenderer(fakeGeometryLoader([{ viewport: idViewport(100, 100) }]));
+    await expect(renderer.pageLabelsAndCount(pdfPath)).rejects.toThrow(/getPageLabels/);
+  });
+
   it('refuses a pdf.js with no getPageLabels rather than calling it "no page labels"', async () => {
     // fakeGeometryLoader's document deliberately does not implement the method. Answering null
     // here would silently downgrade every renumbered document back to the inferred route this

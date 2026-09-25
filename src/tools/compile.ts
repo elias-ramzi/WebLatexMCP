@@ -27,6 +27,7 @@ import {
   LOG_TAIL_LINE_CAP,
 } from '../services/logParser.js';
 import { makeWarningJudge } from '../lib/warningFilter.js';
+import { engineNotFoundHint } from '../services/compiler.js';
 import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -358,8 +359,10 @@ const outputSchema = {
         'when the configured backend was only a default and was not installed, which backend was ' +
         'substituted for it: this appears on a SUCCESSFUL compile too, since it changes how to ' +
         'read everything else (tectonic yields no snippets). Then any known remedy for a ' +
-        'failure: the document uses TikZ externalization and needs a shell-escape retry, or a ' +
-        'package is missing from the local TeX installation. Absent when there is nothing to say.',
+        'failure: the LaTeX engine latexmk tried to run (pdflatex/xelatex/lualatex) is not ' +
+        'installed — said only when the log names no error of its own — or the document uses ' +
+        'TikZ externalization and needs a shell-escape retry, or a package is missing from the ' +
+        'local TeX installation. Absent when there is nothing to say.',
     ),
 };
 
@@ -498,6 +501,11 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // reading the diagnostics they expected — under tectonic, notably, none of them carry a
           // snippet — so say which engine spoke before explaining what it said.
           if (backend.note) hints.push(backend.note);
+          // Next: an engine latexmk could not run explains a failure that otherwise reads as
+          // "FAILED — 0 error(s)" and nothing else. The gate (failed, nothing parsed) and the
+          // wording are the service's; this only places it.
+          const engineHint = engineNotFoundHint(outcome, parsedErrors.length);
+          if (engineHint) hints.push(engineHint);
           if (!shellEscapeOn && needsShellEscape(outcome.log)) {
             hints.push(
               'This document uses TikZ externalization, which needs system calls. Retry compile ' +

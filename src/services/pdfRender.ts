@@ -190,6 +190,12 @@ export interface TextResult {
   skippedPages: number[];
 }
 
+/** The PDF's `/PageLabels` tree (or `null`) and its page count, read off one document load. */
+export interface PageLabelsAndCount {
+  pageLabels: string[] | null;
+  pageCount: number;
+}
+
 export interface PdfRenderService {
   pageCount(pdfPath: string): Promise<number>;
   render(req: RenderRequest): Promise<RenderResult>;
@@ -203,6 +209,11 @@ export interface PdfRenderService {
    * is an answer, never an error.
    */
   pageLabels(pdfPath: string): Promise<string[] | null>;
+  /**
+   * {@link pageLabels} and {@link pageCount} off ONE document load — what a label lookup needs
+   * first, on both of its routes. Two calls would read and parse the whole file twice.
+   */
+  pageLabelsAndCount(pdfPath: string): Promise<PageLabelsAndCount>;
   /** The requested pages' text layer, as merged lines. */
   text(req: TextRequest): Promise<TextResult>;
 }
@@ -807,13 +818,17 @@ export class PdfRenderer implements PdfRenderService {
   async pageLabels(pdfPath: string): Promise<string[] | null> {
     const { doc, destroy } = await this.openDocument(pdfPath);
     try {
-      if (typeof doc.getPageLabels !== 'function') {
-        throw new PdfRenderError(
-          `Cannot read /PageLabels from ${pdfPath}: this pdf.js build exposes no ` +
-            'getPageLabels(). Nothing was guessed.',
-        );
-      }
-      return await doc.getPageLabels();
+      return await readPageLabels(doc, pdfPath);
+    } finally {
+      await destroy();
+    }
+  }
+
+  /** `pageLabels` and `pageCount` off one load of the document, for a label lookup. */
+  async pageLabelsAndCount(pdfPath: string): Promise<PageLabelsAndCount> {
+    const { doc, destroy } = await this.openDocument(pdfPath);
+    try {
+      return { pageLabels: await readPageLabels(doc, pdfPath), pageCount: doc.numPages };
     } finally {
       await destroy();
     }
@@ -1270,6 +1285,18 @@ interface PdfjsDocument {
    * document that does not implement it instead of returning `null`.
    */
   getPageLabels?: () => Promise<string[] | null>;
+}
+
+/** An open document's `/PageLabels` tree, refusing a pdf.js with no `getPageLabels` (see
+ *  `PdfRenderer.pageLabels`). One body for both methods that answer it. */
+async function readPageLabels(doc: PdfjsDocument, pdfPath: string): Promise<string[] | null> {
+  if (typeof doc.getPageLabels !== 'function') {
+    throw new PdfRenderError(
+      `Cannot read /PageLabels from ${pdfPath}: this pdf.js build exposes no ` +
+        'getPageLabels(). Nothing was guessed.',
+    );
+  }
+  return await doc.getPageLabels();
 }
 
 /** A form's own bbox, or a pending transparency-group bbox, before either is bounds-checked. */

@@ -188,10 +188,14 @@ describe('add_citation does not hold the project lock across the network fetch',
           arguments: { project: 'demo', path: 'notes.tex', content: 'peer write\n' },
         })
         .then((res) => ({ res, fetchReleasedFirst: slow.released() }));
+      // The fetch stays blocked until release() below, so `fetchReleasedFirst` is the proof and
+      // this window only turns a pre-fix run (write_file queued behind the lock) into a failure
+      // instead of a hang. It is generous on purpose: a cold Windows runner took over 3s for one
+      // write_file (lock file, session record, shadow), and a wider window weakens nothing.
       const TIMEOUT = Symbol('timeout');
       const raced = await Promise.race([
         write,
-        new Promise<typeof TIMEOUT>((r) => setTimeout(() => r(TIMEOUT), 3000)),
+        new Promise<typeof TIMEOUT>((r) => setTimeout(() => r(TIMEOUT), 15_000)),
       ]);
       expect(raced, 'write_file waited on the lock held across the fetch').not.toBe(TIMEOUT);
       if (raced === TIMEOUT) return;
@@ -212,7 +216,7 @@ describe('add_citation does not hold the project lock across the network fetch',
       await citing.catch(() => undefined);
       await write?.catch(() => undefined);
     }
-  }, 20_000);
+  }, 40_000);
 
   it('a missing .bib is reported without asking the bibliography service', async () => {
     let fetched = false;

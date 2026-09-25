@@ -266,7 +266,7 @@ describe('resolveAssetSource', () => {
     expect(res.origin).toBe('inline base64');
   });
 
-  // --- Reviewer findings: the source allowlist must be checked BEFORE any filesystem access,
+  // --- The source allowlist must be checked BEFORE any filesystem access,
   // not only after realpath/stat, or a caller can use resolveAssetSource as an existence/type
   // oracle over the whole filesystem. ---
 

@@ -87,7 +87,7 @@ export const MAX_PROJECT_ID_LENGTH = 64;
  * a directory, not part of the name. Sixty-four characters are at most 256 bytes, so this only
  * ever binds on 62+ four-byte characters (emoji, rare CJK); a code-point bound alone would let
  * those through to fail at compile time. A new name built from an id must fit under this too —
- * `test/unit/projectIdRound3.test.ts` builds each one from the longest accepted id.
+ * `test/unit/projectIdUnicodeRule.test.ts` builds each one from the longest accepted id.
  */
 export const MAX_PROJECT_ID_BYTES = 246;
 
@@ -184,7 +184,7 @@ function invisibleCharProblem(id: string): string | undefined {
  * rule refusing everything else `escapeInvisibleChars` rewrites (controls, format characters,
  * default-ignorables, U+2028/U+2029, a leading combining mark, and — through the forbidden
  * characters — `\` and `"`), that makes an id the rule accepts displayed verbatim by `quoteId`,
- * so it can be copied back out of a message. `test/unit/projectIdRound4.test.ts` checks this for
+ * so it can be copied back out of a message. `test/unit/projectIdLookalikes.test.ts` checks this for
  * every code point.
  */
 function isJoinerInWord(chars: readonly string[], i: number): boolean {

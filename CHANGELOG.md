@@ -62,9 +62,6 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   directory, some other repository. It now asks git for the absolute path
   (`--path-format=absolute --git-path info/exclude`, which also works in a worktree) and writes
   nothing outside a repository.
-
-### Fixed
-
 - **Tools are callable from clients that validate schemas as JSON Schema 2020-12.** The MCP SDK
   converts every tool's zod schema with no target, which falls back to draft-07 and stamps
   `"$schema": "http://json-schema.org/draft-07/schema#"` on each advertised `inputSchema` and
@@ -76,6 +73,61 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   draft-07 `Client` still accepts them. A test round-trips `listTools()` and compiles every
   advertised schema with strict 2020-12 and draft-07 validators, so a future zod construct that is
   specific to one draft fails in CI instead of in a client.
+- **`labels:` lookups refuse a build whose records cannot be read, instead of resolving it
+  blind** (#194). `render_pages`/`extract_text` decide whether a `pgfpages` layout shifted every
+  label from the build's `.fls` and `.log`; when neither could be read the check was skipped, and
+  an `article` under `\pgfpagesuselayout{resize to}` resolved every label a page late. Every label
+  is now refused (`pgfpagesUnknown`) with advice to compile again or pass `pages:`, and
+  `pdf_geometry kinds: ["floats"]` notes that its pages could not be checked. A zero-byte `.fls` or
+  `.log` — what an interrupted run leaves — counts as unread too. A server compile always leaves a
+  `.log`, so ordinary builds are unaffected. The same holds when the records are readable but are
+  the wrong run's: a compile that stops in the preamble rewrites the `.log` and `.fls` (naming no
+  `pgfpages` yet) and leaves the earlier `.aux` and PDF, so a `resize to` build resolved a page late
+  after a failed recompile. A `.log` that shipped no page beside a PDF with pages now refuses every
+  label (`nothingShipped`: fix the error and compile again), and `pdf_geometry` notes it. A
+  one-page document whose only shipout mark the parser skips (a `\message` starting with `\`
+  just before it) is refused spuriously; a preamble that writes mark-shaped text (`\message{[1]}`)
+  before the error slips past it, and resolves as it did before.
+- **The `pgfpages` refusal says what it saw** (#194). It said the build "loaded pgfpages"; the
+  records only show the file was opened, so the message now says so, names the cases where the
+  refusal is spurious (`pgfpages` loaded without `\pgfpagesuselayout`, or only tested with
+  `\IfFileExists`), and points at `pages: [N]` with the PDF's page count for the last page
+  (`lastpage`'s `LastPage`), as the other whole-build refusals now do. The refusal itself is
+  unchanged: no document-controlled signal can safely tell a layout in use from a load, and none
+  may resolve a page. The beamer `slideMismatch` advice no longer says a `pgfpages` shift is ruled
+  out, since the records it relies on can be wrong.
+- **`labels:` lookups check the resolved page against the log's shipout record** (#194). TeX
+  writes the page counter into the `.log` as it ships each page out (`[1] [1] [2] …`), so a label
+  whose chosen PDF page was shipped under another counter — a title page that reset the counter
+  under an empty foot a table cell forged, for one — is now refused (`unverifiedPage`) on both
+  routes instead of rendered a page early; so is a folio-route label whose printed page's counter
+  was also shipped on another page that could print the same number (an arabic restart with no
+  label before it). A page that resets the counter under another numbering style — an appendix
+  under `\pagenumbering{alph}` or `{Roman}`, a supplement under `S\arabic{page}` — is recognised
+  by the page number it prints and does not count, so the body's labels resolve as before. The
+  record only ever refuses a page, never chooses one, and is used only when its marks number
+  exactly the PDF's pages: a log that cannot be read, a document that writes mark-shaped text
+  (`\message{[3]}`), or a mark cut in a way the parser will not guess at skips it, and the shapes
+  it closes can then still pass. An extra and a missed mark that line up to the right count can
+  refuse a correct label, or miss a refusal (leaving the route's own answer). One change in
+  behaviour: when the counter restarts for back matter or an appendix that prints **no** page
+  number (`\pagestyle{empty}`, `\pagenumbering{gobble}`), the body labels sharing those counters
+  are now refused on the folio route, where 0.7.1 resolved them — a page that prints nothing
+  cannot be told apart from the label's own. Loading `hyperref` resolves them exactly. A refusal
+  that names other PDF pages from the record says they are evidence, not a `pages:` value.
+- **The build `.log` and `.fls` are opened non-blocking**, so a FIFO planted at either path is
+  refused instead of hanging a `labels:` lookup (and `pdf_geometry`) while it holds the project
+  lock, and a failed close no longer turns "no shipout record" into a tool error. An output-routine
+  `\hbox` box warning is now skipped through its display, whose `[n]`-shaped header text was read
+  as shipout marks and switched the check off. A `/PageLabels` lookup opens the PDF once for its
+  tree and page count, rather than twice.
+- **`compile` names a missing engine.** When latexmk could not run `xelatex`, `lualatex` or
+  `pdflatex` (the shell reported it not found), the result was `FAILED … 0 error(s)` with nothing
+  else, while the build dir still held the previous run's `.log` and PDF. The `hint` now names the
+  engine, how to install it, the other engines to pass as `engine:`, and that a project
+  `latexmkrc` may be choosing it. It is fixed server text naming an engine from the allowlist, read
+  off latexmk's own output only on a failed compile with no parsed error, so a document printing a
+  look-alike line cannot mask a real error.
 
 ## [0.7.1] - 2026-09-25
 

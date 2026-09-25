@@ -13,6 +13,7 @@ import { MAX_TEXT_PAGES } from '../../src/services/pdfRender.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import { toPosix } from '../../src/lib/paths.js';
 import type { MinimalPdfOptions } from '../helpers/minimalPdf.js';
+import { PREAMBLE_ABORT_LOG, ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import type { ServerConfig } from '../../src/types.js';
 
 const MAIN_TEX = [
@@ -73,11 +74,22 @@ async function stagePdf(userDir: string, pages: number, opts?: MinimalPdfOptions
   await writeFile(pdfPath, minimalPdf(pages, 300, 200, opts));
 }
 
-/** Stage the `.aux` the last compile would have left, without running latexmk. */
-async function stageAux(userDir: string, content: string): Promise<void> {
+/**
+ * Stage the `.aux` the last compile would have left, without running latexmk — and a `.log`
+ * beside it, since every compile leaves one and a build with neither `.log` nor `.fls` has every
+ * label refused (`'pgfpagesUnknown'`). The default is a stand-in whose shipout marks are not used
+ * ({@link ROUTES_ONLY_LOG}), so a test exercises the label routes alone. `log: null` stages the
+ * unreadable-records state.
+ */
+async function stageAux(
+  userDir: string,
+  content: string,
+  log: string | null = ROUTES_ONLY_LOG,
+): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await mkdir(path.dirname(auxPath), { recursive: true });
   await writeFile(auxPath, content);
+  if (log !== null) await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, log);
 }
 
 function textOf(res: unknown): string {
@@ -175,6 +187,99 @@ describe('extract_text', () => {
     expect(out.pages[0]?.lines).toEqual(['Table 1 caption on page 3', '3']);
     expect(out.resolvedLabels).toEqual([{ label: 'tab:results', printedPage: '3', page: 3 }]);
     expect(out.note).toContain('LAST COMPILE');
+  });
+
+  it("refuses a /PageLabels lookup whose page the log's shipout record contradicts", async () => {
+    // The tree puts printed page "2" on PDF page 4, but the log shipped PDF page 4 with counter 3.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, {
+      pageLabels: ['i', 'ii', '1', '2', '3'],
+      text: (n) => `text of pdf page ${n}`,
+    });
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{1}{2}}\n',
+      'This is pdfTeX, Version 3.141592653\n [1] [2] [1] [3] [4]\n',
+    );
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain(
+      'the PDF\'s /PageLabels tree puts printed page "2" on PDF page 4, but the log\'s shipout ' +
+        'record says PDF page 4 was shipped out with page counter 3',
+    );
+    expect(text).not.toContain('text of pdf page');
+  });
+
+  it("resolves that lookup when the log's shipout record agrees", async () => {
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 5, {
+      pageLabels: ['i', 'ii', '1', '2', '3'],
+      text: (n) => `text of pdf page ${n}`,
+    });
+    await stageAux(
+      userDir,
+      '\\newlabel{tab:results}{{1}{2}}\n',
+      'This is pdfTeX, Version 3.141592653\n [1] [2] [1] [2] [3]\n',
+    );
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(structuredOf(res).resolvedLabels).toEqual([
+      { label: 'tab:results', printedPage: '2', page: 4 },
+    ]);
+  });
+
+  it('refuses a label when neither the .fls nor the .log could be read beside the .aux', async () => {
+    // Same resolution as render_pages, so the same refusal: with no record of what the build
+    // read, a pgfpages layout that shifted every label a page late cannot be ruled out.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3, { text: (n) => `Table 1 caption on page ${n}\n${n}` });
+    await stageAux(userDir, '\\newlabel{tab:results}{{1}{3}}\n', null);
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:results'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('tab:results');
+    expect(text).toMatch(/neither the build's recorder file \(\.fls\) nor its \.log could be read/);
+    expect(text).toContain('pages:');
+    expect(text).not.toMatch(/name pgfpages\.sty/);
+    expect(text).not.toContain('Table 1 caption');
+  });
+
+  it('refuses every label when the last compile stopped before shipping a page', async () => {
+    // Same resolution as render_pages, so the same refusal: a real .log of a compile that
+    // stopped in the preamble holds no shipout mark, beside the earlier run's .aux and 3-page
+    // PDF — even through the PDF's own /PageLabels tree, which the earlier run wrote.
+    const { client, userDir } = await setup();
+    await stagePdf(userDir, 3, {
+      pageLabels: ['1', '2', '3'],
+      text: (n) => `Table 1 caption on page ${n}\n${n}`,
+    });
+    await stageAux(userDir, '\\newlabel{tab:x}{{1}{3}}\n', PREAMBLE_ABORT_LOG);
+
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'poster', labels: ['tab:x'] },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(
+      /"tab:x": the \.aux records it on printed page "3", but the build's \.log/,
+    );
+    expect(text).toMatch(/holds no \[n\] shipout mark \(it records a compile that shipped no page/);
+    expect(text).toMatch(/the last compile stopped before shipping a page/);
+    expect(text).not.toContain('Table 1 caption');
   });
 
   it('resolves a renumbered document’s label through /PageLabels here too', async () => {

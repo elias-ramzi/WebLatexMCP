@@ -57,7 +57,9 @@ const inputSchema = {
         'Resolved exactly as render_pages resolves it — through the build-directory .aux of the ' +
         "LAST COMPILE, converted to a page index through the PDF's own /PageLabels tree when it " +
         'has one — so a label added since the last compile, or one whose reference has not ' +
-        'converged, resolves to a STALE page or not at all. Any label that cannot be resolved ' +
+        'converged, resolves to a STALE page or not at all. Refused in the same cases too, ' +
+        'including every label of a build whose records name pgfpages, cannot be read, or ' +
+        'hold no shipout mark (see render_pages `labels`). Any label that cannot be resolved ' +
         'refuses the whole call; no page is ever guessed. Cannot be combined with `pages`. At ' +
         `most ${MAX_LABELS_PER_CALL} per call.`,
     ),
@@ -201,7 +203,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           // them the same ROOT's build.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
-            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
+            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX, shipouts: true });
             labelPlan = await resolveLabelPages(
               labels,
               aux,

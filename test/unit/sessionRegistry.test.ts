@@ -808,9 +808,9 @@ describe('SessionRegistry', () => {
     });
 
     it('keeps a live-pid record whose sessionId disagrees with its directory, under the directory name', async () => {
-      // Dropping it (round 1) omitted a LIVE session from livePeers, so its shadow entries went
-      // unprotected: `commit scope: "paths"` and `push` saw no live peer. Before that it threw. The
-      // directory is the authority for the id — every caller turns the id back into it.
+      // Dropping it (an earlier fix) omitted a LIVE session from livePeers, so its shadow entries
+      // went unprotected: `commit scope: "paths"` and `push` saw no live peer. Before that it
+      // threw. The directory is the authority for the id — every caller turns the id back into it.
       const registry = new SessionRegistry(root, 'me');
       const dir = sessionDir(root, PROJECT, 'escape');
       await mkdir(dir, { recursive: true });
