@@ -135,10 +135,19 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
         { timeout: 240_000 },
       );
       const s = res.structuredContent as Compiled | undefined;
-      expect(
-        s?.success,
-        `${JSON.stringify(res.content).slice(0, 4000)}\n${String((res.structuredContent as { logTail?: string } | undefined)?.logTail)}`,
-      ).toBe(true);
+      if (s?.success !== true) {
+        // CI's TeX is not this machine's: show the log excerpt and the bibliography tool's own
+        // log, which the engine's log does not carry.
+        const out = res.structuredContent as { logTail?: string; logPath?: string } | undefined;
+        const blg = out?.logPath
+          ? await readFile(path.join(path.dirname(out.logPath), 'main.blg'), 'utf8').catch(
+              (e: unknown) => `(no main.blg: ${String(e)})`,
+            )
+          : '(no logPath)';
+        expect.fail(
+          `${JSON.stringify(res.content).slice(0, 4000)}\n${String(out?.logTail)}\n--- main.blg ---\n${blg.slice(-3000)}`,
+        );
+      }
       return s as Compiled;
     };
     const text = async (args: Record<string, unknown>): Promise<string> => {
