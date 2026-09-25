@@ -14,6 +14,13 @@ not the `.tex`, not the `.bib`. It writes only the review reports, on the local 
 project, and the one `.git/info/exclude` line that keeps them out of git, as step 2 says. Applying a
 suggestion afterwards is a separate, explicit request.
 
+**Check that the server is connected, first.** Every step below — and every agent — runs through
+the `web-latex-mcp` tools: the method loads with `list_skills`, the project with `read_file`, the
+run directory's place with `server_info`. If those tools are not in your tool list, stop and tell
+me the server is not connected in this session, pointing at `docs/install/README.md` (or `/mcp`
+to reconnect). Do not work around it — not by reading `SKILL.md` from disk, not by writing reports
+with the shell — since the agents you would dispatch cannot either.
+
 **Load the method before you touch anything:** `list_skills({ skill: "peer-review" })`. That
 skill is the single source of truth for how to review, what each role returns, and how triage
 works; this command only says who does which part. Where the two could disagree, the skill wins —
@@ -39,19 +46,24 @@ stop and tell me.
    project for `write_file` to write into.
 
    **A bare PDF instead of a project id** (a co-author's draft, a paper with no sources) needs no
-   project: skip `compile` and `check_citations`, put the run directory under the server's
+   project, but it needs poppler: check `command -v pdfinfo pdftotext pdftoppm` first (the first
+   two build `paper.txt`; `Read` needs `pdftoppm` to show a PDF's pages). If any is missing, stop
+   and tell me which, with the install line for this OS (`apt-get install poppler-utils`,
+   `brew install poppler`, or `conda install -c conda-forge poppler`) — **never install it
+   yourself**; that changes my system. Then skip `compile` and `check_citations`, put the run directory under the server's
    workspace as the skill says, copy the PDF there as `paper.pdf`, and build `paper.txt` from it
    exactly as the skill's "A bare PDF" says — one `=== p.<n> ===` marker per page, so every agent
    can tell which page a line is on. Every agent then gets those two paths instead of a project id
    and anchors findings as the skill's evidence anchors say for a bare PDF; the typo pass is one
-   `corrector` per ~8 pages of `paper.txt`, by line range, each range starting at a page marker.
+   `paper-typo-hunter` per ~8 pages of `paper.txt`, by line range, each range starting at a page
+   marker.
 
    **Make sure the agents can open the PDF.** They `Read` the PDF at `pdfPath` (or `paper.pdf` and
    `paper.txt`), and a background agent cannot answer a permission prompt. So `Read` page 1
    yourself, in the foreground, before dispatching: if Claude Code asks, I can allow that
-   directory for the session, and the agents inherit it. If I decline, tell the project's agents
-   to use `render_pages`/`extract_text` instead of `Read` for the PDF; for a bare PDF, which has no
-   such fallback, stop and tell me.
+   directory for the session, and the agents inherit it. If I decline — or `Read` cannot render
+   the page (no `pdftoppm`) — tell the project's agents to use `render_pages`/`extract_text`
+   instead of `Read` for the PDF; for a bare PDF, which has no such fallback, stop and tell me.
 
 3. **Dispatch the panel — in parallel, and independent.** Each agent starts empty and loads the
    skill itself, so each prompt carries only: the project id, the root file, the `pdfPath` and
@@ -65,34 +77,35 @@ stop and tell me.
    the triage. The triage runs on fable too, so one of the three reviews comes from its own
    model; not knowing which one keeps it from favouring that review.
 
-   | Agent                     | Model override | Reviewer id | Saved as                     |
-   | ------------------------- | -------------- | ----------- | ---------------------------- |
-   | `paper-reviewer`          | per `panel.md` | `R1`        | `reports/r1.md`              |
-   | `paper-reviewer`          | per `panel.md` | `R2`        | `reports/r2.md`              |
-   | `paper-reviewer`          | per `panel.md` | `R3`        | `reports/r3.md`              |
-   | `paper-devils-advocate`   | —              | `DA`        | `reports/devils-advocate.md` |
-   | `novelty-scout`           | —              | `NOV`       | `reports/novelty.md`         |
-   | `corrector`, one per file | —              | `TYP`       | `reports/typos.md` (merged)  |
+   | Agent                             | Model override | Reviewer id | Saved as                     |
+   | --------------------------------- | -------------- | ----------- | ---------------------------- |
+   | `paper-reviewer`                  | per `panel.md` | `R1`        | `reports/r1.md`              |
+   | `paper-reviewer`                  | per `panel.md` | `R2`        | `reports/r2.md`              |
+   | `paper-reviewer`                  | per `panel.md` | `R3`        | `reports/r3.md`              |
+   | `paper-devils-advocate`           | —              | `DA`        | `reports/devils-advocate.md` |
+   | `novelty-scout`                   | —              | `NOV`       | `reports/novelty.md`         |
+   | `paper-typo-hunter`, one per file | —              | `TYP`       | `reports/typos.md` (merged)  |
 
    Skip `novelty-scout` when I passed `--no-web` — it sends queries (never the title) to DBLP,
-   Crossref, OpenAlex and the web. For `corrector`, build the file list as `/hunt-typo` does
+   Crossref, OpenAlex and the web. For `paper-typo-hunter`, build the file list as `/hunt-typo` does
    (`.tex`/`.md`, no `.bib`, no build directories; split a file over ~2000 lines across two
    agents), and **leave out everything under `paper-review.local/`** — this run's own
-   `context.md` and `reports/`, and every earlier run's reports, are not the paper. Correctors are
-   **report-only** — never pass apply authorization.
+   `context.md` and `reports/`, and every earlier run's reports, are not the paper. Use
+   `paper-typo-hunter`, never `corrector`: its tool list has no edit tool, so the typo pass is
+   read-only by construction rather than by the prompt.
 
    **Say what the run costs before you launch it**, in one line: how many agents (three full
-   reviewers, the devil's advocate, the novelty scout unless `--no-web`, and the corrector count),
+   reviewers, the devil's advocate, the novelty scout unless `--no-web`, and the typo-hunter count),
    then the triage; that the three reviewers, the devil's advocate and the triage each read the
    whole paper and PDF; and the page count. If the paper is over ~40 pages or there are more than
-   ~25 corrector files, ask me before dispatching — all, a subset of files, or no typo pass.
+   ~25 typo-hunter files, ask me before dispatching — all, a subset of files, or no typo pass.
    Otherwise go ahead.
 
    Launch the panel in the background, at most 8 tool uses per message. Say in one line that it is
    running — naming, unless `--no-web`, that the novelty scout is sending search queries out —
    then wait for the completion notifications; do not poll.
 
-4. **Collect.** Save each reply to its file, and merge the correctors' findings into one
+4. **Collect.** Save each reply to its file, and merge the typo hunters' findings into one
    `reports/typos.md` table in file order. A reply that starts with `failed:`, is empty, or lacks
    its format's headings is re-dispatched **once** with the same prompt; if it fails again, note it
    and carry on.
@@ -105,8 +118,8 @@ stop and tell me.
    send it back to the triage agent once if not.
 
 6. **Report.** Surface `final-review.md` as the skill's "Surfacing the final review" says — in
-   the Claude desktop app, send it as a file I can download (`SendUserFile`, `display: "attach"`);
-   everywhere, show it in full and link it. Then, from the triage log: the predicted outcome, the
+   the Claude desktop app, send it as a file I can download (`SendUserFile`, `display: "attach"`)
+   as part of this step, without waiting to be asked; everywhere, show it in full and link it. Then, from the triage log: the predicted outcome, the
    top of the author action plan, and every item marked UNVERIFIABLE that I must check myself.
    Close with the panel that actually ran (which model each of `R1`–`R3` was, from `panel.md`, and
    any failed agent), the venue assumed, and links to `final-review.md`, `triage-log.md` and

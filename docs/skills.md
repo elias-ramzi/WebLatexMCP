@@ -227,7 +227,7 @@ a triage log with a prioritized action plan and a predicted score range.
 **From a clone of this repo, `/review-paper <project> [venue]` runs it as a panel.** Three independent
 full reviews on Sonnet, Opus and Fable, a devil's advocate on Opus that writes the strongest case for
 rejection, a novelty scout that looks for the closest prior and concurrent work (`--no-web` skips it; its
-queries never contain the paper's title), and one `corrector` per file for typos. None of them sees
+queries never contain the paper's title), and one read-only `paper-typo-hunter` per file for typos. None of them sees
 another's report. A Fable triage agent then re-reads the paper, verifies each finding against it —
 dropping false positives, adjudicating every devil's-advocate critical — and writes the final review.
 The three full reviews reach it blinded (`R1`–`R3`, shuffled each run), since one of them runs on its

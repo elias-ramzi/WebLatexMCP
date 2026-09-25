@@ -23,12 +23,16 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   checklist, and a severity × fixability × confidence label on every weakness, ending in one review
   with six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. The command
   (repo clone only, like `/hunt-typo`) dispatches three full `paper-reviewer`s on Sonnet, Opus and
-  Fable, a `paper-devils-advocate`, a `novelty-scout` and the existing `corrector`s, none of which sees
+  Fable, a `paper-devils-advocate`, a `novelty-scout` and one `paper-typo-hunter` per file, none of which sees
   another's report, and a Fable `review-triage` verifies every finding against the paper before it
   keeps it. The panel is independent because agreement between reviewers is only a signal if they
   could not copy each other; for the same reason triage lets consensus raise a finding's confidence
   but never its severity. The three full reviews reach the triage blinded, as `R1`–`R3` in a fresh
-  random order each run, because the triage runs on the same model as one of them. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
+  random order each run, because the triage runs on the same model as one of them. Every agent is
+  read-only by its tool list, which a test pins; the typo pass uses its own `paper-typo-hunter`
+  rather than `corrector`, which `/hunt-typo` can authorize to edit. The command stops when the
+  server is not connected rather than improvising around it, and on a bare PDF it checks for
+  poppler and names the install line instead of installing it. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
   or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
   copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
   git-excluded `paper-review.local/<timestamp>/` (under the server workspace for a bare PDF, which
@@ -38,6 +42,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The `corrector` agent declares its tools.** It had no `tools:` line, so it held every tool — a
+  shell and file writes included — and stayed report-only by its prompt alone. It now holds the
+  read tools plus `edit_file`, which `/hunt-typo --fix` needs, and a test pins that.
 - **`arxiv-clean-project` no longer runs `rm -rf`.** The scratch copy of the clone is made without
   `.git` (a `tar --exclude`) instead of copied whole and pruned. A submission folder or zip left by
   an earlier run is replaced only after the user agrees, and is moved into the scratchpad, not

@@ -34,7 +34,8 @@ The rules that make triage worth running:
 - **Read the paper yourself before any report** — at least pass 1 and the experiments — and write
   your own claim list first.
 - **Verify before keeping.** Check every CRITICAL and MAJOR against the paper yourself, every
-  "the paper does not…" against the appendix, and drop any typo you cannot find.
+  "the paper does not…" against the appendix, and drop any typo you cannot find. The `CMP`
+  items are the orchestrator's and get checked the same way; log any correction to one.
 - **Consensus raises confidence, never severity**; a single reviewer's verified point can be the
   most important one.
 - **Every devil's-advocate CRITICAL gets a visible verdict** in the log.

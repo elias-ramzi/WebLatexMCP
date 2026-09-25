@@ -18,7 +18,13 @@ const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const MCP = 'mcp__web-latex-mcp__';
 
 /** The review agents, which must never write, compile, commit or push. */
-const REVIEW_AGENTS = ['paper-reviewer', 'paper-devils-advocate', 'novelty-scout', 'review-triage'];
+const REVIEW_AGENTS = [
+  'paper-reviewer',
+  'paper-devils-advocate',
+  'novelty-scout',
+  'review-triage',
+  'paper-typo-hunter',
+];
 
 /** Every tool a review agent may hold: reads, searches, lookups — nothing that writes. */
 const READ_ONLY_TOOLS = new Set([
@@ -116,6 +122,19 @@ describe('review agents stay read-only', () => {
       });
     });
   }
+});
+
+describe('corrector', () => {
+  // /hunt-typo may authorize it to apply fixes, so it holds edit_file — and nothing else that
+  // writes. /review-paper uses the read-only paper-typo-hunter instead.
+  const text = readFileSync(path.join(ROOT, '.claude', 'agents', 'corrector.md'), 'utf8');
+  const tools = frontmatterTools(text);
+
+  it('declares its tools, and writes only through edit_file', () => {
+    expect(tools).toBeDefined();
+    const allowed = new Set([...READ_ONLY_TOOLS, `${MCP}edit_file`]);
+    expect((tools ?? []).filter((tool) => !allowed.has(tool))).toEqual([]);
+  });
 });
 
 describe('bundled skill descriptions', () => {

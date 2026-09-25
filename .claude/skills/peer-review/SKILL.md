@@ -57,7 +57,9 @@ desk-reject for it.
   review is no longer independent.
 - **A bare PDF, no sources** (a co-author's draft): the orchestrator copies it into the run
   directory as `paper.pdf` and builds `paper.txt` from it with one marker line per page, so every
-  line of text is on a known page:
+  line of text is on a known page. It needs poppler (`pdfinfo`, `pdftotext`, and `pdftoppm` for
+  `Read` to show the pages); if any is missing, stop and tell the user how to install it — never
+  install it yourself:
 
   ```bash
   RUN="<run directory>"
@@ -406,9 +408,14 @@ sections, list the paper's **novelty claims** (N1, N2, …) and its key technica
 8–15 queries **from the technical ingredients — never the paper's title or distinctive sentences**,
 since the work is unpublished and may be under anonymous review. Search with `search_references`
 (DBLP, Crossref, OpenAlex) and, where web search is available, arXiv, Semantic Scholar and
-OpenReview — prioritizing the last two years plus the foundational older work. **List only papers
-you actually opened**, with a URL or DOI. Check each against the bibliography (`list_references`):
-cited? discussed? compared against where it should be?
+OpenReview — prioritizing the last two years plus the foundational older work. **Only a paper you
+actually opened** — fetched its page, abstract or PDF and read what it does — goes in "Closest
+related work", with a URL or DOI. A paper you found only as a search snippet or a bibliography
+record goes in "Seen in search, not opened": its overlap is a guess from the snippet, and its
+risk is `unconfirmed` until someone reads it. If every fetch failed (a blocked network, a
+paywall), say so in one line at the top of the report, so nobody mistakes an empty table for "no
+prior work". Check each paper against the bibliography (`list_references`): cited? discussed?
+compared against where it should be?
 
 ```markdown
 # Novelty report
@@ -418,6 +425,10 @@ cited? discussed? compared against where it should be?
 ## Closest related work
 
 | # | Paper (authors, year, venue) | URL/DOI | What it does | Overlap | Cited? | Risk (high/medium/low) |
+
+## Seen in search, not opened
+
+| # | Paper (authors, year, venue) | URL/DOI | Why it may overlap (from the snippet) | Cited? |
 
 ## Assessment per novelty claim — holds / partially holds / at risk, because …
 
@@ -449,7 +460,9 @@ wrong, and one raised by a single reviewer can be the most important.
    or severity), `REJECTED` (a false positive: say where the paper addresses it), or
    `UNVERIFIABLE` (rests on outside knowledge: keep it, hedged or as a question, if plausible and
    important, and flag it for the authors to check). Verify every CRITICAL and MAJOR yourself;
-   check every absence claim against the appendix; drop any typo you cannot find.
+   check every absence claim against the appendix; drop any typo you cannot find. The
+   orchestrator's own `CMP` items are a source like any other: check each one's location in the
+   paper, and log every correction you make to it rather than fixing it silently.
 5. **Final labels** with the severity rubric. **Consensus raises confidence, never severity.**
    Every devil's-advocate CRITICAL gets a visible verdict — upheld at a stated severity, or
    rejected with the evidence. Real disagreements between reviewers are adjudicated on the paper
