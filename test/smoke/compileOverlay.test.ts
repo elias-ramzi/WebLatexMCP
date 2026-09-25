@@ -135,7 +135,10 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
         { timeout: 240_000 },
       );
       const s = res.structuredContent as Compiled | undefined;
-      expect(s?.success, JSON.stringify(res.content).slice(0, 4000)).toBe(true);
+      expect(
+        s?.success,
+        `${JSON.stringify(res.content).slice(0, 4000)}\n${String((res.structuredContent as { logTail?: string } | undefined)?.logTail)}`,
+      ).toBe(true);
       return s as Compiled;
     };
     const text = async (args: Record<string, unknown>): Promise<string> => {
