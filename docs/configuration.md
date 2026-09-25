@@ -518,6 +518,11 @@ only, leaving structured output fully intact for clients that support it (e.g. C
 { "env": { "WEB_LATEX_MCP_NO_OUTPUT_SCHEMA": "1" } }
 ```
 
+Separately, and for every client and every mode, the advertised `inputSchema`/`outputSchema` carry no
+`$schema` key. The MCP SDK stamps a draft-07 marker on them, which a client validating as JSON Schema
+2020-12 (the Claude desktop app's Code tab) refuses as an "unsupported dialect". MCP reads a schema
+without `$schema` as 2020-12. The schema bodies mean the same thing under draft-07 and 2020-12.
+
 ## Session identity probe
 
 `WEB_LATEX_MCP_SESSION_PROBE=1` turns on **diagnostic stderr logging** for one open question: when you
