@@ -17,6 +17,15 @@
       href="https://cdn.jsdelivr.net/npm/reveal.js@6.0.2/dist/theme/white.css"
     />
     <link rel="stylesheet" href="theme.css" />
+    <script>
+      // `?print-pdf` is reveal's print layout, used only to export the PDF (slides/build-pdf.mjs).
+      // That layout waits on animation frames, which headless Chrome stops producing under
+      // --virtual-time-budget, so it never finished and printed one blank page. Timers still
+      // advance there, so in print mode a frame is a 16 ms timeout; presenting is unaffected.
+      if (/print-pdf/i.test(window.location.search)) {
+        window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+      }
+    </script>
   </head>
   <body>
     <div class="reveal">
@@ -67,27 +76,11 @@
                 </g>
               </g>
               <line x1="196" y1="34" x2="196" y2="110" stroke="#3a3a52" stroke-width="1" />
-              <text
-                x="232"
-                y="70"
-                font-size="40"
-                font-weight="700"
-                letter-spacing="-0.5"
-                fill="#ffffff"
-              >
-                <tspan>Web</tspan>
-                <tspan dx="2">L</tspan>
-                <tspan dx="-5" dy="-13" font-size="29">A</tspan>
-                <tspan dx="-3" dy="13" font-size="40">T</tspan>
-                <tspan dy="7">E</tspan>
-                <tspan dy="-7">X</tspan>
-                <tspan dx="1" fill="#7C5CFF">\</tspan>
-                <tspan>MCP</tspan>
-              </text>
-              <text class="mono" x="233" y="102" font-size="13" font-weight="500" fill="#6a6a82">
-                <tspan fill="#7C5CFF">\begin</tspan>
-                {automation}
-              </text>
+              <!-- SVG text renders whitespace between tspans as a space, so each run stays on one line. -->
+              <!-- prettier-ignore -->
+              <text x="232" y="70" font-size="40" font-weight="700" letter-spacing="-0.5" fill="#ffffff"><tspan>Web</tspan><tspan dx="2">L</tspan><tspan dx="-5" dy="-13" font-size="29">A</tspan><tspan dx="-3" dy="13" font-size="40">T</tspan><tspan dy="7">E</tspan><tspan dy="-7">X</tspan><tspan dx="1" fill="#7C5CFF">\</tspan><tspan>MCP</tspan></text>
+              <!-- prettier-ignore -->
+              <text class="mono" x="233" y="102" font-size="13" font-weight="500" fill="#6a6a82"><tspan fill="#7C5CFF">\begin</tspan>{automation}</text>
             </svg>
             <h1>Claude for scientific writing</h1>
             <p class="meta">
@@ -675,6 +668,8 @@
         center: false,
         slideNumber: 'c/t',
         transition: 'fade',
+        // In the PDF, a slide's fragments are shown together on one page, not one page per step.
+        pdfSeparateFragments: false,
         plugins: [RevealNotes],
       });
     </script>

@@ -20,6 +20,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   slide that drifts from the server is a slide to correct. reveal.js and the fonts load from CDNs
   instead of being vendored or added as a dependency, which keeps the repo and `package-lock.json`
   untouched; the cost is that presenting needs a network connection, and the deck's README says so.
+  `npm run slides:pdf` prints it to a PDF through a headless Chrome, Chromium or Edge, with no new
+  dependency. reveal.js's print layout waits on animation frames, which headless Chrome stops
+  producing under `--virtual-time-budget`, so the first build was one blank page; in `?print-pdf`
+  mode alone the deck now runs those frames on timers, which do advance there.
   `slides/` is outside the npm package's `files` list, so none of it ships with the server.
 - **A `.plugin-scanner.toml` for the HOL AI Plugin Scanner**, which the awesome-ai-plugins catalog
   runs before listing the server (#198). It excludes `test/`, where the token-shaped strings the

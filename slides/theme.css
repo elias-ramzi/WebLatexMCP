@@ -35,7 +35,9 @@
 
 .reveal .slides section {
   text-align: left;
-  height: 100%;
+  /* The slide's own height, not 100%: in the print layout a section's parent is the taller PDF
+     page, and 100% pushed the bottom-anchored footer lines off it. */
+  height: var(--slide-height, 100%);
 }
 
 .reveal h2 {
