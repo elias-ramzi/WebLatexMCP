@@ -1,20 +1,35 @@
 /**
  * Overlay variants: the platform edge cases of #214 (the case fold decided by the filesystem, a
  * junction that cannot point at a network path, the skip list judged by realpath), the eviction
- * tie-break of #216, and the project root's `.git` watch of #228.
+ * tie-break of #216, the project root's `.git` watch of #228, and a farm that never lets one
+ * project entry replace another (two names a case-insensitive temp directory holds as one).
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { link, lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import {
   applyOverlay,
   buildLinkFarm,
   evictVariants,
+  farmCollisionMessage,
+  farmTwinMessage,
   junctionFailureMessage,
   junctionRefusal,
   overlayFilesNeverRead,
   overlaySnippetReader,
+  placeOverlayFile,
   probeCaseInsensitive,
   readManifest,
   snapshotSource,
@@ -24,6 +39,7 @@ import {
   variantPaths,
   writeManifest,
 } from '../../src/lib/variants.js';
+import type { CaseProbe } from '../../src/lib/variants.js';
 import { buildDir, buildRoot } from '../../src/services/compiler.js';
 import { FileService } from '../../src/services/fileService.js';
 
@@ -419,5 +435,296 @@ describe("the project root's .git: hooks, config and info are watched (#228)", (
         'diff and discard never show or restore',
     );
     expect(sourceChangedHint(['main.tex', 'sub/.git/x'])).not.toContain('A path under .git');
+  });
+});
+
+describe('a farm never lets one project entry replace another', () => {
+  const posixOnly = it.skipIf(process.platform === 'win32');
+  const refused =
+    /The overlay compile is refused rather than let one replace the other\. A compile without overlay reads its sources from the project itself/;
+  /** The EEXIST backstop's words: an entry already there, blamed on an alias, never on case alone. */
+  const backstop =
+    /already held an entry under the name .* most likely an alias .*case or Unicode normalisation, or a Windows 8\.3 short name/;
+
+  /** A probe that answers `answer` and records every directory it was asked about. */
+  function countingProbe(answer: boolean): { probe: CaseProbe; dirs: string[] } {
+    const dirs: string[] = [];
+    return {
+      dirs,
+      probe: async (dir) => {
+        dirs.push(dir);
+        return answer;
+      },
+    };
+  }
+
+  /** Every regular file under `farm`, followed through its links, read as its source reads. */
+  async function expectFarmMatchesSource(farm: string, src: string): Promise<number> {
+    let seen = 0;
+    const walk = async (rel: string): Promise<void> => {
+      let names: string[];
+      try {
+        names = await readdir(path.join(farm, rel));
+      } catch {
+        return;
+      }
+      for (const name of names) {
+        const r = rel === '' ? name : `${rel}/${name}`;
+        const st = await lstat(path.join(farm, r));
+        if (st.isDirectory()) await walk(r);
+        else {
+          expect(await readFile(path.join(farm, r), 'utf8'), r).toBe(
+            await readFile(path.join(src, r), 'utf8'),
+          );
+          seen++;
+        }
+      }
+    };
+    await walk('');
+    return seen;
+  }
+
+  linuxOnly(
+    'refuses two files, or two directories, differing only in case where the farm folds case',
+    async () => {
+      const src = await tempDir('ovl-twins-');
+      await put(src, 'main.tex', 'main\n');
+      await put(src, 'sec/Notes.tex', 'upper\n');
+      await put(src, 'sec/notes.tex', 'lower\n');
+      const farm = path.join(await tempDir('ovl-twins-dst-'), 'src');
+      await expect(buildLinkFarm(src, farm, { skip: [], caseProbe: insensitive })).rejects.toThrow(
+        /cannot hold both "sec\/Notes\.tex" and "sec\/notes\.tex"/,
+      );
+      await expect(
+        buildLinkFarm(src, `${farm}2`, { skip: [], caseProbe: insensitive }),
+      ).rejects.toThrow(refused);
+      // Refused before either twin was created: nothing in the farm was replaced.
+      await expectFarmMatchesSource(farm, src);
+      await expect(readdir(path.join(farm, 'sec'))).resolves.toEqual([]);
+
+      const dirs = await tempDir('ovl-twins-dirs-');
+      await put(dirs, 'Figs/a.pdf', 'a\n');
+      await put(dirs, 'figs/b.pdf', 'b\n');
+      await expect(
+        buildLinkFarm(dirs, path.join(await tempDir('ovl-twins-dst-'), 'src'), {
+          skip: [],
+          caseProbe: insensitive,
+        }),
+      ).rejects.toThrow(/cannot hold both "Figs" and "figs"/);
+
+      // NTFS and APFS fold Unicode case too, so a non-ASCII pair is refused up front as well —
+      // not left to the EEXIST backstop, which could not name the pair before the first link.
+      const accented = await tempDir('ovl-twins-accent-');
+      await put(accented, 'Été.tex', 'upper\n');
+      await put(accented, 'été.tex', 'lower\n');
+      const accentFarm = path.join(await tempDir('ovl-twins-dst-'), 'src');
+      await expect(
+        buildLinkFarm(accented, accentFarm, { skip: [], caseProbe: insensitive }),
+      ).rejects.toThrow(refused);
+      await expect(readdir(accentFarm)).resolves.toEqual([]);
+    },
+  );
+
+  linuxOnly(
+    'refuses twins under a linked directory an overlay placement materialises',
+    async () => {
+      const src = await tempDir('ovl-twins-mat-');
+      const shared = await tempDir('ovl-twins-shared-');
+      await put(src, 'main.tex', 'main\n');
+      await put(shared, 'x.tex', 'x\n');
+      await put(shared, 'A.tex', 'upper\n');
+      await put(shared, 'a.tex', 'lower\n');
+      await symlink(shared, path.join(src, 'lib'));
+      const farm = path.join(await tempDir('ovl-twins-mat-dst-'), 'src');
+      await buildLinkFarm(src, farm, { skip: [], caseProbe: insensitive });
+      await expect(
+        placeOverlayFile(farm, src, 'lib/x.tex', 'edited\n', { caseProbe: insensitive }),
+      ).rejects.toThrow(/cannot hold both "lib\/A\.tex" and "lib\/a\.tex"/);
+      // Refused before the farm was touched: `lib` is still the link the farm made, not a
+      // half-materialised directory (or no entry at all) left behind by the refusal.
+      expect((await lstat(path.join(farm, 'lib'))).isSymbolicLink()).toBe(true);
+      expect(await readFile(path.join(farm, 'lib', 'x.tex'), 'utf8')).toBe('x\n');
+      expect((await readdir(shared)).sort()).toEqual(['A.tex', 'a.tex', 'x.tex']);
+    },
+  );
+
+  it('probes the farm only when two names fold together, and at most once per check', async () => {
+    // No folding pair, in the farm or in a directory an overlay materialises: no probe at all.
+    const plain = await tempDir('ovl-probe-plain-');
+    const plainShared = await tempDir('ovl-probe-plain-shared-');
+    await put(plain, 'main.tex', 'main\n');
+    await put(plain, 'sec/Intro.tex', 'intro\n');
+    await put(plain, 'sec/outro.tex', 'outro\n');
+    await put(plainShared, 'x.tex', 'x\n');
+    await put(plainShared, 'y.tex', 'y\n');
+    await linkDir(plainShared, path.join(plain, 'lib'));
+    const quiet = countingProbe(true);
+    const plainFarm = path.join(await tempDir('ovl-probe-dst-'), 'src');
+    await buildLinkFarm(plain, plainFarm, { skip: [], caseProbe: quiet.probe });
+    await placeOverlayFile(plainFarm, plain, 'lib/x.tex', 'edited\n', { caseProbe: quiet.probe });
+    expect(quiet.dirs).toEqual([]);
+    expect(await readFile(path.join(plainFarm, 'lib', 'x.tex'), 'utf8')).toBe('edited\n');
+  });
+
+  linuxOnly('asks the probe once for a farm with several folding pairs', async () => {
+    // Two pairs in two directories of one farm, and two in two directories one overlay
+    // placement materialises: each check asks once, in the directory the farm is built in.
+    const src = await tempDir('ovl-probe-pairs-');
+    const shared = await tempDir('ovl-probe-pairs-shared-');
+    await put(src, 'a/Notes.tex', 'upper\n');
+    await put(src, 'a/notes.tex', 'lower\n');
+    await put(src, 'b/Figs/a.pdf', 'a\n');
+    await put(src, 'b/figs/b.pdf', 'b\n');
+    await put(shared, 'A.tex', 'upper\n');
+    await put(shared, 'a.tex', 'lower\n');
+    await put(shared, 'sub/B.tex', 'upper\n');
+    await put(shared, 'sub/b.tex', 'lower\n');
+    await put(shared, 'sub/x.tex', 'x\n');
+    await symlink(shared, path.join(src, 'lib'));
+    const farmParent = await tempDir('ovl-probe-pairs-dst-');
+    const farm = path.join(farmParent, 'src');
+
+    const keeps = countingProbe(false);
+    await buildLinkFarm(src, farm, { skip: [], caseProbe: keeps.probe });
+    expect(keeps.dirs).toEqual([farmParent]);
+    const placing = countingProbe(false);
+    await placeOverlayFile(farm, src, 'lib/sub/x.tex', 'edited\n', { caseProbe: placing.probe });
+    expect(placing.dirs).toEqual([farmParent]);
+    expect(await readFile(path.join(farm, 'lib', 'sub', 'b.tex'), 'utf8')).toBe('lower\n');
+
+    const folds = countingProbe(true);
+    await expect(
+      buildLinkFarm(src, path.join(await tempDir('ovl-probe-pairs-dst-'), 'src'), {
+        skip: [],
+        caseProbe: folds.probe,
+      }),
+    ).rejects.toThrow(/cannot hold both/);
+    expect(folds.dirs).toHaveLength(1);
+  });
+
+  linuxOnly(
+    'leaves a dangling link out of the win32 pair check, as the win32 farm leaves it out',
+    async () => {
+      // win32 places no entry for a dangling link, so `notes.tex -> nowhere` beside `Notes.tex`
+      // is one entry in the farm, not two, and nothing asks the probe; POSIX links it, so the
+      // same pair is still refused there.
+      const src = await tempDir('ovl-dangling-');
+      await put(src, 'Notes.tex', 'upper\n');
+      await symlink(path.join(src, 'nowhere.tex'), path.join(src, 'notes.tex'));
+      const win = countingProbe(true);
+      const winFarm = path.join(await tempDir('ovl-dangling-dst-'), 'src');
+      await buildLinkFarm(src, winFarm, { skip: [], platform: 'win32', caseProbe: win.probe });
+      expect(await readdir(winFarm)).toEqual(['Notes.tex']);
+      expect(await readFile(path.join(winFarm, 'Notes.tex'), 'utf8')).toBe('upper\n');
+      expect(win.dirs).toEqual([]);
+
+      await expect(
+        buildLinkFarm(src, path.join(await tempDir('ovl-dangling-dst-'), 'src'), {
+          skip: [],
+          platform: 'linux',
+          caseProbe: insensitive,
+        }),
+      ).rejects.toThrow(/cannot hold both "Notes\.tex" and "notes\.tex"/);
+    },
+  );
+
+  linuxOnly('mirrors both, each with its own content, where the farm keeps case', async () => {
+    const src = await tempDir('ovl-twins-cs-');
+    await put(src, 'sec/Notes.tex', 'upper\n');
+    await put(src, 'sec/notes.tex', 'lower\n');
+    await put(src, 'Figs/a.pdf', 'a\n');
+    await put(src, 'figs/b.pdf', 'b\n');
+    const farm = path.join(await tempDir('ovl-twins-cs-dst-'), 'src');
+    await buildLinkFarm(src, farm, { skip: [], caseProbe: sensitive });
+    expect(await readFile(path.join(farm, 'sec/Notes.tex'), 'utf8')).toBe('upper\n');
+    expect(await readFile(path.join(farm, 'sec/notes.tex'), 'utf8')).toBe('lower\n');
+    expect(await expectFarmMatchesSource(farm, src)).toBe(4);
+  });
+
+  it('on win32 never copies over, or hard-links onto, an entry the farm already holds', async () => {
+    const src = await tempDir('ovl-excl-');
+    await put(src, 'locked.tex', 'source locked\n');
+    await put(src, 'open.tex', 'source open\n');
+    await chmod(path.join(src, 'locked.tex'), 0o444);
+    cleanups.push(() => chmod(path.join(src, 'locked.tex'), 0o644).catch(() => undefined));
+    // Each farm already holds the entry — what a second name for it leaves on a case-insensitive
+    // temp directory. A read-only file is copied; a writable one is hard-linked, then copied when
+    // that fails: neither may replace what is there.
+    for (const name of ['locked.tex', 'open.tex']) {
+      const farm = path.join(await tempDir('ovl-excl-dst-'), 'src');
+      await put(farm, name, 'already in the farm\n');
+      await expect(
+        buildLinkFarm(src, farm, { skip: [], platform: 'win32', caseProbe: sensitive }),
+        name,
+      ).rejects.toThrow(backstop);
+      expect(await readFile(path.join(farm, name), 'utf8'), name).toBe('already in the farm\n');
+    }
+  });
+
+  posixOnly('turns an EEXIST from symlink or mkdir into the worded refusal', async () => {
+    const src = await tempDir('ovl-eexist-');
+    await put(src, 'main.tex', 'main\n');
+    await put(src, 'sub/x.tex', 'x\n');
+    for (const [rel, plant] of [
+      ['main.tex', (farm: string) => put(farm, 'main.tex', 'planted\n')],
+      ['sub', (farm: string) => mkdir(path.join(farm, 'sub'), { recursive: true })],
+    ] as const) {
+      const farm = path.join(await tempDir('ovl-eexist-dst-'), 'src');
+      await plant(farm);
+      const err = await buildLinkFarm(src, farm, {
+        skip: [],
+        platform: 'linux',
+        caseProbe: sensitive,
+      }).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message, rel).toMatch(refused);
+      expect(err?.message, rel).toMatch(backstop);
+      expect(err?.message, rel).toContain(`"${rel}"`);
+      expect(err?.message, rel).not.toMatch(/^EEXIST/);
+    }
+  });
+
+  linuxOnly(
+    'names the entry already there when the directory holds it under another name',
+    async () => {
+      // A hard link stands in for a case-insensitive directory: two names, one entry.
+      const src = await tempDir('ovl-eexist-twin-');
+      await put(src, 'notes.tex', 'lower\n');
+      const farm = path.join(await tempDir('ovl-eexist-twin-dst-'), 'src');
+      await put(farm, 'notes.tex', 'planted\n');
+      await link(path.join(farm, 'notes.tex'), path.join(farm, 'Notes.tex'));
+      const err = await buildLinkFarm(src, farm, {
+        skip: [],
+        platform: 'linux',
+        caseProbe: sensitive,
+      }).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message).toMatch(backstop);
+      expect(err?.message).toContain(
+        'under the name "notes.tex" (it holds that entry as "Notes.tex")',
+      );
+      // An EEXIST is not evidence of a case pair: the up-front refusal's words are not borrowed.
+      expect(err?.message).not.toMatch(/cannot hold both|differ only in case as one name/);
+    },
+  );
+
+  it('words an unexplained EEXIST as an entry already there, not as a case pair', () => {
+    const unnamed = farmCollisionMessage('sec/NOTESF~1.TEX');
+    expect(unnamed).toMatch(backstop);
+    expect(unnamed).toMatch(refused);
+    expect(unnamed).toContain('under the name "sec/NOTESF~1.TEX" when');
+    expect(unnamed).not.toMatch(
+      /cannot hold both|differ only in case as one name|holds that entry/,
+    );
+    const twins = farmTwinMessage('sec/notes.tex', 'sec/Notes.tex');
+    expect(twins).toContain(
+      'cannot hold both "sec/Notes.tex" and "sec/notes.tex": it treats names that differ only in case as one name',
+    );
+    expect(twins).toMatch(refused);
+    expect(twins).not.toMatch(backstop);
   });
 });

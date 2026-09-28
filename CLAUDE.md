@@ -1021,7 +1021,23 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
     enforces this itself rather than trusting `compile`'s call order; an injected probe writes
     nothing and skips it). A probe that cannot run falls back to the platform default, the side
     that refuses more; an unsafe root is refused outright, not treated as a probe that could not
-    run. A case-sensitive APFS volume therefore keeps `Notes.tex` and `notes.tex` apart. The farm's
+    run. A case-sensitive APFS volume therefore keeps `Notes.tex` and `notes.tex` apart. The
+    converse is refused: two entries of one source directory that fold together under
+    `foldCaseName` (`toLowerCase` — Unicode-aware, unlike git's ASCII-only `foldCase`, since NTFS
+    and APFS fold `É`/`é` too; this is a filesystem collision, not a git lookup) are refused naming
+    both (`farmTwinCheck`, before either is linked, probing the directory the farm is built in only
+    when such a pair exists and at most once per check, and counting only entries the platform's
+    linker places — a win32 dangling link places none) where the farm folds case. That fold
+    **approximates** the filesystem's rather than matching it: it folds pairs NTFS keeps apart
+    (U+212A KELVIN SIGN and `k`, U+2126 OHM SIGN and `ω`, `ẞ` and `ß`) and misses what only a
+    filesystem folds (NFC beside NFD on APFS). That is safe only because an error can merely
+    over-refuse — **the farm never overwrites an entry it holds**, whatever the probe said: copies
+    are `COPYFILE_EXCL`, a hard link's `EEXIST` never falls back to a copy, and any `EEXIST` from
+    `symlink`/`link`/`copyFile`/junction/`mkdir` is refused in words (`farmCollision`) that say the
+    name was already held, most likely by an alias (case, normalisation, or an NTFS 8.3 short name
+    such as `NOTESF~1.TEX` beside `notesfile.tex`) — never the up-front refusal's case-pair words,
+    which only a seen pair earns. Keep both: the win32 copy fallback once wrote `notes.tex` over
+    `Notes.tex` silently. The farm's
     skip list matches the workspace and build root by realpath as well as by spelling (a link, an
     8.3 short name). On win32 a directory the farm must junction whose path a junction cannot
     point at is refused in words (`junctionRefusal`: "a network path" for `\\server\share` and

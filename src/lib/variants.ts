@@ -107,7 +107,10 @@ export interface VariantKey {
   overlay: OverlayEntry[];
 }
 
-/** A name case-folded, the way a case-insensitive filesystem compares it. */
+/**
+ * A name case-folded — an approximation of how a case-insensitive filesystem compares it, which
+ * can over-fold and misses normalisation pairs (see {@link caseTwins}).
+ */
 function foldCaseName(name: string): string {
   return name.toLowerCase();
 }
@@ -152,32 +155,42 @@ export function probeCaseInsensitive(dir: string): Promise<boolean> {
 }
 
 /**
- * How names are compared in `dir`, the directory a collision would happen in: case-folded when
- * the probe says it is case-insensitive, exact when it says not. When the probe cannot run, the
- * platform's default decides (folded on win32 and darwin) — the side that refuses more.
+ * Whether names in `dir`, the directory a collision would happen in, are compared
+ * case-insensitively: the probe's answer, or — when the probe cannot run — the platform's default
+ * (insensitive on win32 and darwin), the side that refuses more.
  *
- * `dir` is always a project's variants directory, under the build root, and the default probe
- * CREATES it and writes into it — so the build root is created (`0700`) or verified by
- * {@link ensureBuildRoot} first, like every other creation of a build dir. `applyOverlay` runs
- * before `compile`'s own check, and probing first would create a project-named directory, and
- * write, in a root another local user planted (a link to their directory), or leave a fresh root
- * world-readable. An unsafe root is refused outright: that is not a probe that "cannot run", and
- * falling back to the platform default would only defer the refusal. An injected probe writes
- * nothing of ours, so it skips the check.
+ * `dir` is always a directory the server owns under the build root — a project's variants
+ * directory, or the directory a variant's farm is built in — and the default probe CREATES it and
+ * writes into it — so the build root is created (`0700`) or verified by {@link ensureBuildRoot}
+ * first, like every other creation of a build dir. `applyOverlay` runs before `compile`'s own
+ * check, and probing first would create a project-named directory, and write, in a root another
+ * local user planted (a link to their directory), or leave a fresh root world-readable. An unsafe
+ * root is refused outright: that is not a probe that "cannot run", and falling back to the
+ * platform default would only defer the refusal. An injected probe writes nothing of ours, so it
+ * skips the check.
+ */
+async function foldsCaseIn(
+  dir: string,
+  opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform },
+): Promise<boolean> {
+  if (opts.caseProbe === undefined) await ensureBuildRoot();
+  try {
+    return await (opts.caseProbe ?? probeCaseInsensitive)(dir);
+  } catch {
+    const platform = opts.platform ?? process.platform;
+    return platform === 'win32' || platform === 'darwin';
+  }
+}
+
+/**
+ * How names are compared in `dir` ({@link foldsCaseIn}): case-folded when it is case-insensitive,
+ * exact when it is not.
  */
 async function nameFoldFor(
   dir: string,
   opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform },
 ): Promise<(name: string) => string> {
-  if (opts.caseProbe === undefined) await ensureBuildRoot();
-  let insensitive: boolean;
-  try {
-    insensitive = await (opts.caseProbe ?? probeCaseInsensitive)(dir);
-  } catch {
-    const platform = opts.platform ?? process.platform;
-    insensitive = platform === 'win32' || platform === 'darwin';
-  }
-  return insensitive ? foldCaseName : (name) => name;
+  return (await foldsCaseIn(dir, opts)) ? foldCaseName : (name) => name;
 }
 
 /**
@@ -294,7 +307,12 @@ function chargeEntry(budget: FarmBudget): void {
   }
 }
 
-/** Copy `src` to `dest`, charging the budget first and refusing in words once it is spent. */
+/**
+ * Copy `src` to `dest`, charging the budget first and refusing in words once it is spent. The copy
+ * is exclusive (`COPYFILE_EXCL`): an entry already at `dest` — a second name for it, on a
+ * case-insensitive temp directory — fails with `EEXIST` rather than being silently replaced, and
+ * {@link linkEntry} turns that into the worded refusal.
+ */
 async function copyCharged(src: string, dest: string, budget: FarmBudget): Promise<void> {
   const size = (await stat(src)).size;
   if (budget.copied + size > budget.maxCopyBytes) {
@@ -308,7 +326,7 @@ async function copyCharged(src: string, dest: string, budget: FarmBudget): Promi
     );
   }
   budget.copied += size;
-  await copyFile(src, dest);
+  await copyFile(src, dest, fsConstants.COPYFILE_EXCL);
 }
 
 /**
@@ -317,14 +335,35 @@ async function copyCharged(src: string, dest: string, budget: FarmBudget): Promi
  *
  * POSIX: a symlink, whatever the entry is. win32, where a symlink needs a privilege most users do
  * not have: a directory (or a link that resolves to one) becomes a junction, and a regular file a
- * hard link — falling back to a copy on any error (another volume, a filesystem without hard
+ * hard link — falling back to a copy on any other error (another volume, a filesystem without hard
  * links). A read-only file is copied rather than hard-linked: hard links share their attributes,
  * and deleting a farm's link (libuv's unlink clears FILE_ATTRIBUTE_READONLY first) would strip
  * read-only from the source file. A link to a file becomes a copy of what it points at (a dangling
  * one is left out). Every copy is charged to `budget`. `rel` is the entry's project-relative
  * POSIX path, for a refusal to name.
+ *
+ * Nothing already at `dest` is ever replaced: an `EEXIST` from the symlink, the junction, the hard
+ * link or the (exclusive) copy is refused in words ({@link farmCollision}) — never a bare Node
+ * error, and never the copy fallback, which used to write the second of two case-variant names
+ * over the first on a case-insensitive temp directory, so the variant compiled the wrong file.
  */
 async function linkEntry(
+  src: string,
+  dest: string,
+  kind: EntryKind,
+  platform: NodeJS.Platform,
+  budget: FarmBudget,
+  rel: string,
+): Promise<void> {
+  try {
+    await linkEntryAs(src, dest, kind, platform, budget, rel);
+  } catch (err) {
+    throw isExists(err) ? await farmCollision(dest, rel, err) : err;
+  }
+}
+
+/** {@link linkEntry}'s mechanics; an `EEXIST` propagates raw, for it to word. */
+async function linkEntryAs(
   src: string,
   dest: string,
   kind: EntryKind,
@@ -341,13 +380,9 @@ async function linkEntry(
     return;
   }
   if (kind === 'symlink') {
-    let isDir: boolean;
-    try {
-      isDir = (await stat(src)).isDirectory();
-    } catch {
-      return; // dangling: nothing a compile could read through it either
-    }
-    if (isDir) await junction(src, dest, rel);
+    const target = await win32LinkTarget(src);
+    if (target === undefined) return; // dangling: nothing a compile could read through it either
+    if (target === 'dir') await junction(src, dest, rel);
     else await copyCharged(src, dest, budget);
     return;
   }
@@ -357,9 +392,176 @@ async function linkEntry(
   }
   try {
     await link(src, dest);
-  } catch {
+  } catch (err) {
+    if (isExists(err)) throw err;
     await copyCharged(src, dest, budget);
   }
+}
+
+/**
+ * What a project link at `src` resolves to, as the win32 farm places it: a directory (a junction),
+ * a file (a copy), or undefined when it dangles — which the win32 farm leaves out.
+ */
+async function win32LinkTarget(src: string): Promise<'dir' | 'file' | undefined> {
+  try {
+    return (await stat(src)).isDirectory() ? 'dir' : 'file';
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether {@link linkEntryAs} places no entry at all for `src` on `platform`: a dangling link on
+ * win32. POSIX symlinks every entry, dangling or not.
+ */
+async function linkerSkips(
+  src: string,
+  kind: EntryKind,
+  platform: NodeJS.Platform,
+): Promise<boolean> {
+  return platform === 'win32' && kind === 'symlink' && (await win32LinkTarget(src)) === undefined;
+}
+
+function isExists(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'EEXIST';
+}
+
+const FARM_REFUSAL_LEAD =
+  "An overlay compile mirrors this project into a private build tree in the server's temp " +
+  'directory, and that directory ';
+
+/**
+ * What every farm refusal ends with. Only the overlay's farm is refused: a compile without
+ * overlay reads its sources from the project itself (its build output still lives in the temp
+ * directory, so this says nothing broader about it).
+ */
+const FARM_REFUSAL_TAIL =
+  ' The overlay compile is refused rather than let one replace the other. A compile without ' +
+  'overlay reads its sources from the project itself and is not refused this way; to use an ' +
+  'overlay, rename one of the two.';
+
+/**
+ * The up-front refusal ({@link farmTwinCheck}): `a` and `b` (project-relative POSIX), two entries
+ * of one source directory whose names differ only in case, where the farm's temp directory was
+ * probed and folds case. Pure.
+ */
+export function farmTwinMessage(a: string, b: string): string {
+  const both = [a, b]
+    .sort()
+    .map((n) => quoteId(n))
+    .join(' and ');
+  return (
+    FARM_REFUSAL_LEAD +
+    `cannot hold both ${both}: it treats names that differ only in case as one name, where the ` +
+    "project's own directory keeps them apart." +
+    FARM_REFUSAL_TAIL
+  );
+}
+
+/**
+ * The backstop refusal ({@link farmCollision}): placing `rel` (project-relative POSIX) failed with
+ * `EEXIST`, and `other`, when known, is the name the farm holds that entry under. An `EEXIST`
+ * says only that the name was taken — by a case or Unicode-normalisation alias, or on NTFS by an
+ * 8.3 short name (`NOTESF~1.TEX` beside `notesfile.tex`) — so it is worded as that, never as a
+ * case pair the up-front check would have named. Pure.
+ */
+export function farmCollisionMessage(rel: string, other?: string): string {
+  const held = other === undefined ? '' : ` (it holds that entry as ${quoteId(other)})`;
+  return (
+    FARM_REFUSAL_LEAD +
+    `already held an entry under the name ${quoteId(rel)}${held} when the build came to place ` +
+    'it — most likely an alias the directory treats as the same name (one differing only in ' +
+    'case or Unicode normalisation, or a Windows 8.3 short name), where the project keeps the ' +
+    'two apart.' +
+    FARM_REFUSAL_TAIL
+  );
+}
+
+/**
+ * {@link farmCollisionMessage} for an `EEXIST` at `dest` (the entry at project-relative `rel`), as
+ * an Error with `err` as its cause. The entry already there is named when it can be found: another
+ * name in `dest`'s directory that is the same directory entry (`lstat` identity) — on a
+ * case-insensitive directory, `dest`'s own name resolves to it. Otherwise only `rel` is named.
+ */
+async function farmCollision(dest: string, rel: string, err: unknown): Promise<Error> {
+  const dir = path.dirname(dest);
+  const own = path.basename(dest);
+  let other: string | undefined;
+  const id = await entryIdentity(dest);
+  if (id !== undefined) {
+    try {
+      const same: string[] = [];
+      for (const name of await readdir(dir)) {
+        if (name !== own && (await entryIdentity(path.join(dir, name))) === id) same.push(name);
+      }
+      // Hard links of one source file share an identity on win32; prefer the case variant.
+      other = same.find((n) => foldCaseName(n) === foldCaseName(own)) ?? same[0];
+    } catch {
+      other = undefined;
+    }
+  }
+  const relDir = path.posix.dirname(rel);
+  const otherRel = other === undefined || relDir === '.' ? other : `${relDir}/${other}`;
+  return new Error(farmCollisionMessage(rel, otherRel), { cause: err });
+}
+
+/**
+ * The first two of `names` (one source directory's mirrored entries) that are one name under
+ * {@link foldCaseName}, or undefined. Pure. That fold (`toLowerCase`) is an approximation of the
+ * farm filesystem's, not a copy of it: it is Unicode-aware, as NTFS and APFS are (git's
+ * ASCII-only fold would miss `É`/`é`), but it also folds pairs NTFS keeps apart — U+212A KELVIN
+ * SIGN with `k`, U+2126 OHM SIGN with `ω`, `ẞ` with `ß` — and misses what only a filesystem
+ * folds (an NFC name beside its NFD form on APFS). Both errors are safe: an extra fold can only
+ * over-refuse a pair the temp directory could have held, and a missed one cannot overwrite
+ * anything, since every placement is exclusive and its `EEXIST` is refused ({@link linkEntry}).
+ */
+function caseTwins(names: string[]): [string, string] | undefined {
+  const seen = new Map<string, string>();
+  for (const name of names) {
+    const key = foldCaseName(name);
+    const earlier = seen.get(key);
+    if (earlier !== undefined) return [earlier, name];
+    seen.set(key, name);
+  }
+  return undefined;
+}
+
+/**
+ * A check, for one farm, that refuses a source directory holding two entries the farm's temp
+ * directory would hold as one — up front, before either is linked, since the second would fail
+ * with `EEXIST` or (a win32 copy, before copies were exclusive) replace the first. The names are
+ * compared under {@link foldCaseName}, and the farm is probed ({@link foldsCaseIn}, in the
+ * directory the farm is built in) only when two names fold together, so a project without such a
+ * pair costs no probe, and the probe's answer is kept for the check's lifetime (one farm, or one
+ * placement). Entries the platform's linker leaves out ({@link linkerSkips}) are not counted. A
+ * pair that fold does not see ({@link caseTwins}) still cannot overwrite anything: its `EEXIST`
+ * is refused by {@link linkEntry}.
+ */
+function farmTwinCheck(
+  farmDir: string,
+  opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform },
+): (relDir: string, entries: FarmEntry[]) => Promise<void> {
+  const platform = opts.platform ?? process.platform;
+  let folds: Promise<boolean> | undefined;
+  return async (relDir, entries) => {
+    if (caseTwins(entries.map((e) => e.name)) === undefined) return;
+    // Only entries the farm will actually hold can collide: a win32 dangling link places nothing.
+    const placed: string[] = [];
+    for (const e of entries) if (!(await linkerSkips(e.src, e.kind, platform))) placed.push(e.name);
+    const twins = caseTwins(placed);
+    if (twins === undefined) return;
+    folds ??= foldsCaseIn(path.dirname(path.resolve(farmDir)), { ...opts, platform });
+    if (!(await folds)) return;
+    const at = (n: string): string => (relDir === '' ? n : `${relDir}/${n}`);
+    throw new Error(farmTwinMessage(at(twins[0]), at(twins[1])));
+  };
+}
+
+/** One source-directory entry the farm mirrors: its name, its absolute source path, its kind. */
+interface FarmEntry {
+  name: string;
+  src: string;
+  kind: EntryKind;
 }
 
 /**
@@ -420,6 +622,7 @@ async function junction(src: string, dest: string, rel: string): Promise<void> {
   try {
     await symlink(src, dest, 'junction');
   } catch (err) {
+    if (isExists(err)) throw err; // a name the farm already holds: linkEntry words it
     throw new Error(junctionFailureMessage(rel, (err as NodeJS.ErrnoException).code), {
       cause: err,
     });
@@ -450,6 +653,12 @@ function kindOf(entry: {
  * entries it created; more than the budget's `maxEntries` is refused, since every one of them is a
  * syscall. Pass `budget` to share it with the {@link placeOverlayFile} calls that follow (a stage
  * does); otherwise a fresh one is made from `maxEntries`/`maxCopyBytes`.
+ *
+ * A source directory holding two entries the farm's temp directory would hold as one (`Notes.tex`
+ * beside `notes.tex` in a case-sensitive project, where the temp directory folds case — the macOS
+ * and Windows default) is refused in words naming both, before either is linked
+ * ({@link farmTwinCheck}; `caseProbe` as for {@link applyOverlay}, run in the directory the farm is
+ * built in); an entry the farm already holds is never replaced ({@link linkEntry}).
  */
 export async function buildLinkFarm(
   projectDir: string,
@@ -460,6 +669,7 @@ export async function buildLinkFarm(
     maxEntries?: number;
     maxCopyBytes?: number;
     budget?: FarmBudget;
+    caseProbe?: CaseProbe;
   },
 ): Promise<number> {
   const skip = new Set(opts.skip.map((p) => path.resolve(p)));
@@ -478,26 +688,36 @@ export async function buildLinkFarm(
   const budget =
     opts.budget ?? newFarmBudget({ maxEntries: opts.maxEntries, maxCopyBytes: opts.maxCopyBytes });
   const base = path.resolve(projectDir);
+  const refuseTwins = farmTwinCheck(farmDir, { caseProbe: opts.caseProbe, platform });
   let count = 0;
   // `srcReal` is `srcDir` through its links: a real directory's realpath is its parent's joined
   // with its name, and a linked one is never walked, so it is resolved once, at the root.
   const walk = async (srcDir: string, srcReal: string, destDir: string): Promise<void> => {
-    const entries = await readdir(srcDir, { withFileTypes: true });
-    for (const entry of entries) {
+    const mirrored: Array<FarmEntry & { real: string }> = [];
+    for (const entry of await readdir(srcDir, { withFileTypes: true })) {
       if (entry.name === '.git') continue;
       const src = path.join(srcDir, entry.name);
       const real = path.join(srcReal, entry.name);
       const kind = kindOf(entry);
       if (kind === undefined) continue;
       if (kind === 'dir' && (skip.has(path.resolve(src)) || skipReal.has(real))) continue;
+      mirrored.push({ name: entry.name, src, real, kind });
+    }
+    await refuseTwins(toPosix(path.relative(base, srcDir)), mirrored);
+    for (const { name, src, real, kind } of mirrored) {
       chargeEntry(budget);
       count++;
-      const dest = path.join(destDir, entry.name);
+      const dest = path.join(destDir, name);
+      const rel = toPosix(path.relative(base, src));
       if (kind === 'dir') {
-        await mkdir(dest);
+        try {
+          await mkdir(dest);
+        } catch (err) {
+          throw isExists(err) ? await farmCollision(dest, rel, err) : err;
+        }
         await walk(src, real, dest);
       } else {
-        await linkEntry(src, dest, kind, platform, budget, toPosix(path.relative(base, src)));
+        await linkEntry(src, dest, kind, platform, budget, rel);
       }
     }
   };
@@ -877,17 +1097,20 @@ export function sourceChangedHint(paths: string[]): string {
  * so writing the file can never write through a link into the source. The file's own link is
  * removed, never written through, and the new file is created exclusively (`wx`). Every entry it
  * creates, and every byte it copies, is charged to `budget` — the stage's one budget, shared with
- * {@link buildLinkFarm}.
+ * {@link buildLinkFarm}. A directory it materialises is judged as {@link buildLinkFarm} judges
+ * one: two entries the farm's temp directory would hold as one are refused, naming both
+ * (`caseProbe` as there), and nothing already in the farm is replaced.
  */
 export async function placeOverlayFile(
   farmDir: string,
   projectDir: string,
   relPosix: string,
   content: string,
-  opts: { platform?: NodeJS.Platform; budget?: FarmBudget } = {},
+  opts: { platform?: NodeJS.Platform; budget?: FarmBudget; caseProbe?: CaseProbe } = {},
 ): Promise<void> {
   const platform = opts.platform ?? process.platform;
   const budget = opts.budget ?? newFarmBudget();
+  const refuseTwins = farmTwinCheck(farmDir, { caseProbe: opts.caseProbe, platform });
   const parts = relPosix.split('/');
   const name = parts.pop();
   if (name === undefined || name === '')
@@ -910,20 +1133,26 @@ export async function placeOverlayFile(
       continue;
     }
     if (!isLink) continue;
-    await unlink(farmCur);
-    await mkdir(farmCur);
+    const mirrored: FarmEntry[] = [];
     for (const entry of await readdir(srcCur, { withFileTypes: true })) {
       if (entry.name === '.git') continue;
       const kind = kindOf(entry);
-      if (kind === undefined) continue;
+      if (kind !== undefined)
+        mirrored.push({ name: entry.name, src: path.join(srcCur, entry.name), kind });
+    }
+    // Before the farm's link is replaced: a refusal leaves the farm as it was.
+    await refuseTwins(relCur, mirrored);
+    await unlink(farmCur);
+    await mkdir(farmCur);
+    for (const { name: child, src: childSrc, kind } of mirrored) {
       chargeEntry(budget);
       await linkEntry(
-        path.join(srcCur, entry.name),
-        path.join(farmCur, entry.name),
+        childSrc,
+        path.join(farmCur, child),
         kind,
         platform,
         budget,
-        `${relCur}/${entry.name}`,
+        `${relCur}/${child}`,
       );
     }
   }
@@ -1424,6 +1653,7 @@ export async function stageVariant(opts: {
   contents: Map<string, string>;
   skip: string[];
   platform?: NodeJS.Platform;
+  caseProbe?: CaseProbe;
   now?: Date;
   maxFarmEntries?: number;
   maxFarmCopyBytes?: number;
@@ -1442,11 +1672,13 @@ export async function stageVariant(opts: {
     skip: opts.skip,
     platform: opts.platform,
     budget,
+    caseProbe: opts.caseProbe,
   });
   for (const [rel, content] of opts.contents) {
     await placeOverlayFile(paths.src, opts.projectDir, rel, content, {
       platform: opts.platform,
       budget,
+      caseProbe: opts.caseProbe,
     });
   }
   await mkdir(paths.out, { recursive: true });

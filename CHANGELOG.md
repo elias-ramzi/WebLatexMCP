@@ -139,8 +139,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   is asked of the filesystem rather than assumed from the platform (#214): the project's by
   identity, and the farm's case fold by a probe in the project's variants directory, run only
   once the build root has been verified, so a case-sensitive APFS volume keeps `Notes.tex` and
-  `notes.tex` apart. The farm recognises the workspace and build directories by realpath as well
-  as by spelling, so a workspace reached through a link or a Windows 8.3 short name is not
+  `notes.tex` apart. The other way round — a case-sensitive project holding two entries whose names
+  differ only in case (`Notes.tex` and `notes.tex`, or `Figs/` and `figs/`), with the farm in a temp
+  directory that folds case, the macOS and Windows default — is refused naming both, where the
+  second name used to fail with a bare `EEXIST`, or on Windows was copied silently over the first
+  so the variant compiled the wrong file (a compile without `overlay` reads its sources from the
+  project itself, and is not refused this way). The farm never overwrites anything it holds: every
+  copy into it is exclusive, and an `EEXIST` is refused in words saying the name was already held,
+  most likely by an alias — case, Unicode normalisation or a Windows 8.3 short name. The farm
+  recognises the workspace and build directories by realpath as well as by spelling, so a workspace reached through a link or a Windows 8.3 short name is not
   mirrored into it; and on Windows a project reached by a network path (`\\server\share`) or a
   device path (`\\.\…`), which a junction cannot point at, is refused with the directory named,
   and a junction that fails anyway is refused in words with its error code, instead of failing
