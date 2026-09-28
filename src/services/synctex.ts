@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
-import { toPosix } from '../lib/paths.js';
+import { climbsOut, toPosix } from '../lib/paths.js';
 
 /**
  * Maps a point on a compiled PDF back to its source `file:line` via the `synctex` CLI (ships with
@@ -50,7 +50,7 @@ function normalizeInput(input: string, projectDir: string): string {
   const abs = path.isAbsolute(input) ? path.normalize(input) : path.resolve(projectDir, input);
   const rel = path.relative(projectDir, abs);
   // Inside the project → relative path; otherwise fall back to the basename.
-  return toPosix(rel && !rel.startsWith('..') ? rel : path.basename(input));
+  return toPosix(rel && !climbsOut(rel) ? rel : path.basename(input));
 }
 
 export class SyncTexService {

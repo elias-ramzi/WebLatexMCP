@@ -44,7 +44,7 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   pre-submission review of an ML paper: a three-pass reading protocol, a claim–evidence map, an ML
   checklist, and a severity × fixability × confidence label on every weakness, ending in one review
   with six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. The command
-  (repo clone only, like `/hunt-typo`) dispatches three full `paper-reviewer`s on Sonnet, Opus and
+  dispatches three full `paper-reviewer`s on Sonnet, Opus and
   Fable, a `paper-devils-advocate`, a `novelty-scout` and one `paper-typo-hunter` per file, none of which sees
   another's report, and a Fable `review-triage` verifies every finding against the paper before it
   keeps it. The panel is independent because agreement between reviewers is only a signal if they
@@ -57,13 +57,48 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   poppler and names the install line instead of installing it. The agents hold no `Grep`/`Glob`,
   which reach past the project, so a review stays on the commit that was compiled; and nothing is
   written into the run directory until the whole panel has returned, since the reviewers search
-  the project it sits in. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
+  the project it sits in. Each reply is then saved verbatim and checked against the saved file
+  (#224): one `search_files` call lists every saved heading, which must match the reply's in text,
+  order and line number; the last section must match verbatim; and the line count and the typo
+  table's row count must agree. A report that fails is re-saved once. Two other ways to keep the
+  orchestrator from retyping 150 KB of panel output were declined. Copying each agent's reply out
+  of the harness's own output files would make a load-bearing step depend on an undocumented
+  format, where a silent change saves a wrong or empty report with no error. Letting each agent
+  write its own report would give the read-only agents a write tool that `write_file` cannot
+  confine to one path, and would write into the run directory while the panel still runs. Before
+  dispatching, the command also checks which build it is reviewing (#225): a best-effort look at
+  the preamble for the venue's review or anonymous switch, and when it is off (a camera-ready or
+  preprint build) one question — review it as a submission, where anonymity and page-limit findings
+  count, or as camera-ready, where they are informational. In an end-to-end run all three
+  reviewers spent their critical finding on the anonymity of a build the authors had compiled
+  camera-ready. A novelty scout that finds the paper itself already public reports it for the
+  authors to check, and the triage never counts it as prior work. The severity rubric is
+  unchanged: a submission build's anonymity leak stays critical. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
   or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
   copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
   git-excluded `paper-review.local/<timestamp>/` (under the server workspace for a bare PDF, which
   the command also accepts), rather than in the chat or a temporary directory, because a review
   that has to be hunted for is not read; and in the Claude desktop app the final review is sent as
   a file to download.
+- **The Claude Code plugin ships the paper commands and the agents they dispatch** (#212).
+  `plugin.json` declared only the skills, so a plugin user had a `peer-review` skill describing a
+  panel they could not run, and none of `/review-paper`, `/hunt-typo`, `/format-latex`,
+  `/review-writing` or `/rewrite-mode`. They now ship, as `/web-latex-mcp:<name>`, with the eight
+  agents they dispatch, listed one file at a time: `.claude/agents` and `.claude/commands` also hold
+  this repository's development tooling (`/implement`, `/implement-issue`, `/review`,
+  `implementer`, `plan-verifier`), which pointing the manifest at the directories would have
+  installed into every user's Claude Code. A test holds every file in the two directories to
+  exactly one of the manifest's lists or an explicit dev list, so a new paper agent cannot be left
+  out and a new dev agent cannot ship by accident, and checks that every agent a shipped command
+  dispatches ships with it. Listing the files was not enough on its own. Claude Code names a
+  plugin-started server's tools `mcp__plugin_web-latex-mcp_web-latex-mcp__<tool>`, and drops an
+  unresolved `tools:` entry silently, so an agent naming only the hand-configured form
+  (`mcp__web-latex-mcp__<tool>`) would have come up under the plugin with `Read` and no server tool
+  at all. Every shipped agent now names each server tool in both forms, and the test pins the
+  pairing. The commands dispatch whichever agent name the session lists
+  (`web-latex-mcp:<agent>` under the plugin, plain `<agent>` from a clone), and `/review-paper`
+  stops rather than substitute a general-purpose agent, which holds write tools. The SkillSpector
+  CI job now scans the shipped agents and commands too, staged from the manifest's own lists.
 - **`compile` can build a what-if variant without the server writing the source** (#205). Pass `overlay` —
   up to 20 files, each with `edit_file`'s edits (100 in total) — and the edits are applied in
   memory and compiled in a private link farm: a mirror of the project's tree whose files link to
@@ -73,16 +108,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   path for an explicitly relative name); a `../` input that leaves the project resolves inside the
   variant's directory instead and fails, where a normal compile reads it. The server writes none
   of the source, the main build, the surfaced PDF, the viewer or the session's records, and
-  records no revision baseline. To narrow what the build itself can write through the farm, an
-  overlay compile runs no shell command unless you pass `shellEscape` or `restrictedShellEscape`
-  — not even TeX Live's default restricted allow-list, whose `makeindex -o` could otherwise write
-  a project file through the farm's links — and says so in `hint` when the document tried to run
-  one; opting in lifts that guarantee. A `latexmkrc` or `.latexmkrc` cannot be overlaid, since
-  latexmk runs it as Perl. Some routes back into the source stay open — the project's own
+  records no revision baseline. Like every compile (#213, below), an overlay compile runs no shell
+  command unless you pass `shellEscape` or `restrictedShellEscape` — here that is also what keeps
+  an allow-listed `makeindex -o` from writing a project file through the farm's links — and says
+  so in `hint` when the document tried to run one; opting in lifts that guarantee. A `latexmkrc`
+  or `.latexmkrc` cannot be overlaid, under any spelling of its case, since latexmk runs it as
+  Perl. Some routes back into the source stay open — the project's own
   latexmkrc still runs and can turn shell escape back on, Lua code under `lualatex` can write with
   `io.open`, and tectonic's `\openout` writes any absolute path — so an overlay compile compares
   the project's files before and after the build (by size, mode, inode and times; nothing is
-  read), following the project's symbolic links as the build does — a file link by its target, a
+  read) — and of the project root's `.git`, its `hooks/`, `config` and `info/`, which the next git
+  command runs or reads, while the rest of `.git` changes on every git call and stays out (#228)
+  — following the project's symbolic links as the build does — a file link by its target, a
   linked directory by its contents — and names any that changed in `hint` (at most 20, fewer when
   their names are long, the rest counted; one under a link was written at the link's target,
   which `status` and `discard` do not reach when it lies outside the project), instead of calling the source untouched — or, when
@@ -92,10 +129,22 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant
   incrementally. An older variant that cannot be removed (a Windows viewer holding its PDF) is
-  reported in `hint`, never failing the compile. `clean: true` on an overlay compile cleans that
-  variant only. An overlaid file the build never opened (by its `.fls` and `.fdb_latexmk`;
-  tectonic writes no `.fls`, so never there) is named in `hint` — on a failed build, as one it
-  stopped before reading. An overlay compile's `rootFile` must be relative to the project, and is
+  reported in `hint`, never failing the compile. Two variants stamped in the same millisecond are
+  ordered by a per-project sequence number kept in the manifest, never by directory listing
+  order, so eviction cannot take the newer (#216). `clean: true` on an overlay compile cleans that
+  variant only. The overlaid files the build never opened (by its `.fls` and `.fdb_latexmk`;
+  tectonic writes no `.fls`, so never there) are named in one `hint` line — in order while their
+  names fit 2000 characters, the rest counted as "and N more" (#216) — on a failed build, as ones
+  it stopped before reading. Naming one file twice is refused, and whether two names are one file
+  is asked of the filesystem rather than assumed from the platform (#214): the project's by
+  identity, and the farm's case fold by a probe in the project's variants directory, run only
+  once the build root has been verified, so a case-sensitive APFS volume keeps `Notes.tex` and
+  `notes.tex` apart. The farm recognises the workspace and build directories by realpath as well
+  as by spelling, so a workspace reached through a link or a Windows 8.3 short name is not
+  mirrored into it; and on Windows a project reached by a network path (`\\server\share`) or a
+  device path (`\\.\…`), which a junction cannot point at, is refused with the directory named,
+  and a junction that fails anyway is refused in words with its error code, instead of failing
+  with a bare Node error. An overlay compile's `rootFile` must be relative to the project, and is
   refused before anything is read or staged otherwise. An absolute (or drive-qualified, such as
   `C:main.tex`) root is refused because latexmk's `-cd` would run the engine in the real project
   directory and compile the unedited source; so is a root reached through a linked directory
@@ -187,7 +236,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   label (`nothingShipped`: fix the error and compile again), and `pdf_geometry` notes it. A
   one-page document whose only shipout mark the parser skips (a `\message` starting with `\`
   just before it) is refused spuriously; a preamble that writes mark-shaped text (`\message{[1]}`)
-  before the error slips past it, and resolves as it did before.
+  before the error slips past this refusal, though no longer past the engine's closing record in
+  the `.log` (#220, below).
 - **The `pgfpages` refusal says what it saw** (#194). It said the build "loaded pgfpages"; the
   records only show the file was opened, so the message now says so, names the cases where the
   refusal is spurious (`pgfpages` loaded without `\pgfpagesuselayout`, or only tested with
@@ -221,6 +271,31 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `\hbox` box warning is now skipped through its display, whose `[n]`-shaped header text was read
   as shipout marks and switched the check off. A `/PageLabels` lookup opens the PDF once for its
   tree and page count, rather than twice.
+- **`labels:` lookups refuse a PDF the last compile did not produce** (#220). Under xelatex an
+  error in the document body writes a new `.aux` and `.log`, but latexmk never runs xdvipdfmx, so
+  the earlier run's PDF stays beside them, and `render_pages`/`extract_text` resolved a label to
+  whatever the old document had on that page. None of the whole-build refusals above saw it: the
+  new `.log` shipped pages, and its shipout marks can number the old PDF's pages exactly — after an
+  ordinary, non-fatal xelatex error, which also skips xdvipdfmx, they always do. Every label of
+  such a build is now refused (`stalePdf`) on either of two records the document cannot write. One
+  is the files' order: a finished compile closes its `.aux` before its PDF, so an `.aux` newer than
+  the PDF by more than 250 ms is a later run's. Measured by hand with TeX Live 2026 under latexmk
+  4.88 on Linux (ext4) — no test reproduces these numbers; the tests pin the decision against
+  staged timestamps — every finished pdflatex, lualatex and xelatex build left the `.aux` older
+  than the PDF, by 8 to 684 ms, and every build that left the earlier PDF beside a new `.aux` left
+  it newer, by 852 to 984 ms with the two compiles back to back. The other is the engine's closing line in the `.log` —
+  `Output written on … (N pages …)`, `No pages of output.` or `no output PDF file produced` —
+  naming a page count other than the PDF's, or no output beside a PDF with pages. That one needs
+  no clock, so it also covers a coarse filesystem's equal timestamps, and it closes the
+  `\message{[1]}` preamble bypass of `nothingShipped`: such a run still closes with "no output",
+  and a pdfTeX or XeTeX document can write a line of that shape only before the engine's own. The
+  closing line is searched for with every line break removed, because a real xelatex log glues
+  `No pages of output.` onto a 79-column statistics line and a line-by-line reader then took a
+  forged record before it; a last record that cannot be parsed counts as none, never as the one
+  before it. Both records only ever refuse, so what remains is a missing refusal, never a wrong
+  page: a run killed before it closed leaves no closing line, LuaTeX's `stop_run` callback can
+  write after it, and the timestamps were measured on Linux ext4 only. The refusal says which record
+  showed it, and `pdf_geometry kinds: ["floats"]` notes the same state without refusing.
 - **`compile` names a missing engine.** When latexmk could not run `xelatex`, `lualatex` or
   `pdflatex` (the shell reported it not found), the result was `FAILED … 0 error(s)` with nothing
   else, while the build dir still held the previous run's `.log` and PDF. The `hint` now names the
@@ -228,6 +303,84 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `latexmkrc` may be choosing it. It is fixed server text naming an engine from the allowlist, read
   off latexmk's own output only on a failed compile with no parsed error, so a document printing a
   look-alike line cannot mask a real error.
+- **`compile` runs no shell command unless you opt in, as its schema always said** (#213).
+  `shellEscape` and `restrictedShellEscape` were described as off by default, but a plain latexmk
+  compile passed no shell-escape flag at all, which leaves the choice to TeX Live's `texmf.cnf` —
+  whose default is `shell_escape = p`, the restricted allow-list. So every compile could run
+  `makeindex`, `repstopdf`, `extractbb` and the rest through `\write18`, relative to the project:
+  `\immediate\write18{makeindex -q -o sections/a.tex /dev/null}` truncated a source file in a
+  compile nobody had opted into. Every latexmk compile now passes `-no-shell-escape` unless one of
+  the two flags is set; the flag is decided in one function, which never returns "no flag". The
+  other fix the issue offered — keep TeX Live's default and correct the schema — would have
+  documented a write into the source rather than closed it. One change in behaviour: a document
+  whose `.eps` figures are converted by `repstopdf`, or that runs `makeindex` through `\write18`,
+  now needs `restrictedShellEscape: true`. When the log shows a command the engine refused, `hint`
+  says so, names the flag that runs it (`shellEscape` under tectonic, which has no restricted
+  mode) and what that costs: the allow-listed helpers run in the project directory, and
+  `makeindex -o` can overwrite a source file. Under tectonic `restrictedShellEscape`, which it
+  ignores, does not count as opting in, so a refused command or a failed TikZ externalization
+  still gets its hint, and an overlay's variant line does not claim shell escape was on. Under `lualatex` a refused command is logged as
+  `system(…) executed.`, because `pdftexcmds.lua` reports the refusing stub `-no-shell-escape`
+  leaves in place, so that line counts as a refusal only when the log carries no
+  `system commands enabled.` banner. The hint is fixed server text, and a forged log line can only
+  add it. A latexmkrc — the project's, or a user or system one — can still turn shell escape back
+  on, since latexmk hands the flag to the engine through `%O`.
+- **The build directory root is per user, and verified before every build** (#215). Builds went
+  under `<tmp>/web-latex-mcp-build/`, one shared, predictable path, so on a multi-user machine
+  another local user could create it first or plant links in it: the server would then compile
+  into a directory it did not own, and the PDF tools would read an `.aux`, `.log` and PDF someone
+  else could swap. On macOS and Linux the root is now `<tmp>/web-latex-mcp-build-<uid>`, created
+  `0700` and checked with `lstat` before anything is built in it. A root that is a symbolic link
+  (or, on Windows, a junction) or not a directory is refused, and on POSIX so is one owned by
+  another user, or one that grants group or other write access. That root is refused, not
+  tightened: a `chmod` would close it without vouching for anything another user placed in it
+  while it was open. A root that others could only read or search is tightened to `0700` and
+  judged again. The refusal names the path and says to remove it or
+  point `TMPDIR` at a private directory. On Windows the root is now
+  `%TEMP%\web-latex-mcp-build-<user name>` (the name cut to one safe path segment), so two
+  accounts sharing one `TEMP` — `TEMP=C:\Temp` on a managed machine — no longer share a root. Its
+  owner and ACL are **not** verified on Windows, only that it is a real directory and not a
+  junction: under a shared `TEMP` another account could still create
+  `web-latex-mcp-build-<your name>` first, with access for everyone, and the server would accept
+  it, so a shared `TEMP` is only as safe as the name. The default per-user
+  `%LOCALAPPDATA%\Temp` is unaffected. When Windows will not report the user name the server
+  refuses to build rather than fall back to a shared name. A `TMPDIR` (`TEMP` on Windows) that
+  names no existing directory is now refused in words — the message names it and says to point it
+  at an existing directory — instead of every compile and PDF read failing with a raw
+  `ENOENT: … mkdir`; the server never creates the temp directory itself. **Behaviour change:** a
+  build root on a POSIX filesystem without real permission bits — WSL's drvfs (`/mnt/c/…`, which
+  reports every entry as `0777`), vfat/exFAT, and some SMB mounts — is now refused on every
+  compile and PDF read, since its mode reports group and other write access that no `chmod` can
+  remove. That is fail-closed by design, not a bug; earlier versions built there. Point `TMPDIR`
+  at a directory on a filesystem with real permissions (the default `/tmp` on WSL is one). The
+  check runs on every compile rather than being remembered: it costs one
+  `mkdir` and one `lstat`, and a remembered success would outlive a root that a `/tmp` cleaner
+  removed and another user then recreated. An overlay compile checks it before applying the
+  overlay, whose case probe already writes under the root, and again as it stages the variant;
+  and `render_pages`, `extract_text`, `pdf_geometry` and the viewer check it before reading a
+  build from under it, main or variant, so they refuse a planted root rather than read a forged
+  PDF, `.aux` or `.log`. The test suite creates the root the server's way before any test runs,
+  since a helper's `mkdir -p` under umask 002 would leave it group-writable. The old
+  shared `/tmp/web-latex-mcp-build` is no longer used and can be deleted.
+- **A directory whose name starts with two dots is no longer taken for the parent** (#227). Seven
+  checks decided whether a `path.relative` result left its base with `rel.startsWith('..')`, which
+  also matches `..foo/main.tex`, a path inside it. Every one erred the refusing way, so nothing
+  escaped, but a file under `..foo/` was refused or reported as outside the project by the sandbox
+  check (`resolveInside`), the symlink-escape guard, link-target naming, the aux `\@input` reader,
+  compile-log and SyncTeX path rebasing, and the workspace's git-exclude entry. All of them, and
+  the overlay farm, now use one `climbsOut` helper in `src/lib/paths.ts`, which takes `..` only as a
+  whole first segment, ended by the platform separator or by `/`. Both are needed: several callers
+  pass a POSIX-joined path, which on Windows carries `/`, and a helper testing only the native
+  separator would have accepted a real climb there — the dangerous direction for a sandbox guard.
+- **A TeX control sequence in a `.bib` is no longer read as a bibliography entry** (#222).
+  `parseBibtex` started an entry at any `@` followed by a word and a brace, so
+  `\@ifundefined{theHchapter}{…}{}` in a `.bib` outside `@preamble` — a `\makeatletter` block, or a
+  `%` line — came back as an entry of type `ifundefined` keyed `theHchapter`, and `check_citations`
+  listed it among the uncited references. An `@` directly after an odd run of backslashes now
+  begins a control sequence, never an entry; an even run is literal backslashes and leaves the `@`
+  free. The issue's other option, keeping the entry under an unknown-type warning, was declined:
+  the preceding `\` makes it a control sequence rather than an entry of any type, and it settles
+  the `%` line too, which BibTeX does not read as a comment.
 
 ## [0.7.1] - 2026-09-25
 

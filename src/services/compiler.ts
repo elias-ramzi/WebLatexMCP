@@ -1,11 +1,12 @@
 import os from 'node:os';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
 import type { CompilerKind } from '../types.js';
 import { toPosix } from '../lib/paths.js';
+import { luatexCommandRefused, needsShellEscape, shellCommandRefused } from './logParser.js';
 
 export type Engine = 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -26,17 +27,15 @@ export interface CompileRequest {
   /**
    * Pass `-shell-restricted`: only TeX's allow-listed binaries may run. Safer than full
    * `shellEscape` and sufficient for most externalization setups. Ignored if `shellEscape` is set.
+   *
+   * With NEITHER set, latexmk gets `-no-shell-escape` (issue #213): TeX Live's own default
+   * (`shell_escape = p` in texmf.cnf) is this restricted mode, so passing no flag at all left the
+   * allow-list on for every compile the caller never opted into — and those commands write
+   * relative to the engine's cwd, the project, so `\write18{makeindex -o sections/a.tex …}`
+   * truncated a source file. Tectonic needs no flag: it runs no shell command without
+   * `shellEscape`.
    */
   restrictedShellEscape?: boolean;
-  /**
-   * Pass `-no-shell-escape` when neither flag above is set, so the engine runs no shell command at
-   * all — not even TeX Live's default restricted allow-list (`shell_escape = p`), which a plain
-   * compile leaves on. Set only by an overlay compile: it runs in a link farm whose files are links
-   * to the source, so an allow-listed `makeindex -o sections/a.tex` would write the source through
-   * them. Ignored when `shellEscape` or `restrictedShellEscape` is set — the caller's opt-in wins.
-   * Tectonic needs nothing here: it runs no shell command unless `shellEscape` is set.
-   */
-  noShellEscape?: boolean;
   /**
    * Directory the backend runs in (its cwd), which `rootFile` is relative to. Default
    * `projectDir`. An overlay compile (`compile`'s `overlay`) points it at the variant's link farm,
@@ -177,6 +176,60 @@ export function engineNotFoundHint(
 }
 
 /**
+ * The compile hint for a shell command the engine refused (`runsystem(<cmd>)...disabled` in a
+ * pdfTeX/XeTeX log, or LuaTeX's `system(<cmd>) ...` record with shell escape off — see
+ * `luatexCommandRefused` in `logParser.ts`), or `undefined` when there is nothing to say. Every latexmk compile now runs with
+ * `-no-shell-escape` unless the caller opted in (#213), so a document that relied on TeX Live's
+ * default restricted allow-list — most often an `.eps` figure converted by `repstopdf`, or
+ * `makeindex` — builds without that command's output, and the caller has to be told which switch
+ * brings it back and what flipping it costs. One hint for every compile; an overlay compile gets
+ * the overlay's own wording, since there the cost is the source itself.
+ *
+ * Gated on the caller NOT having opted in (then the flag was theirs and they know). For a normal
+ * compile it stays quiet when the TikZ-externalization hint already covers the same refusal
+ * (`needsShellEscape`), so one cause does not get two retry instructions; an overlay compile says
+ * it either way, because its version carries the one thing the TikZ hint does not — that opting in
+ * lets the command write the source through the variant's links. Fixed server text: nothing from
+ * the document-controlled log is echoed.
+ */
+export function shellEscapeRefusedHint(
+  log: string,
+  opts: { shellEscapeOn: boolean; overlay: boolean; backend: CompilerKind },
+): string | undefined {
+  if (opts.shellEscapeOn) return undefined;
+  const refused = shellCommandRefused(log) || luatexCommandRefused(log);
+  const tikz = needsShellEscape(log);
+  if (opts.overlay ? !(refused || tikz) : !refused || tikz) return undefined;
+  const retry =
+    opts.backend === 'tectonic'
+      ? 'shellEscape: true (tectonic has no restricted mode, so restrictedShellEscape does not ' +
+        'run it)'
+      : 'restrictedShellEscape: true (or shellEscape: true)';
+  if (opts.overlay) {
+    return (
+      'This overlay compile refused a shell command the document ran (\\write18): an ' +
+      'overlay compile disables shell escape — as every compile does unless you opt in — to ' +
+      "keep the source untouched, since the variant's files are links to it. So this variant " +
+      `can differ from a build with shell escape on. Retrying with ${retry} runs it, but lifts ` +
+      'that guarantee: the command can then write the source through those links.'
+    );
+  }
+  const cost =
+    opts.backend === 'tectonic'
+      ? 'What that costs: the document can then run ARBITRARY shell commands — only for a ' +
+        'project you trust.'
+      : "What that costs: TeX's allow-listed helpers (repstopdf, makeindex, extractbb, …) then " +
+        'run in the project directory and can write files there — makeindex -o can overwrite a ' +
+        'source file. shellEscape: true runs ARBITRARY commands; only for a project you trust.';
+  return (
+    'The engine refused a shell command the document ran (\\write18) — typically repstopdf ' +
+    'converting an .eps figure, or makeindex: compile runs no shell command unless you opt in, ' +
+    "not even TeX's restricted allow-list, so whatever that command would have produced is " +
+    `missing from this build. Retry with ${retry} if the document needs it. ${cost}`
+  );
+}
+
+/**
  * Whether a spawn rejection means "the binary is not there" — `ENOENT`, which is also what a
  * missing binary surfaces as on Windows. Exported because it is the whole of the availability
  * decision: everything else `spawn` can reject with (`EACCES` — present but not executable,
@@ -272,13 +325,246 @@ export function buildDir(projectDir: string): string {
 /**
  * The directory every project's {@link buildDir} sits in. Exported so an overlay compile's link
  * farm can refuse to mirror it, should a project directory ever contain the OS temp dir.
+ *
+ * Per user (#215): a shared, predictable `/tmp/web-latex-mcp-build` let another local user create
+ * it first, or plant links in it, and read or swap the build artifacts the PDF tools trust.
+ * - On POSIX the name carries the uid (`web-latex-mcp-build-<uid>`), and {@link ensureBuildRoot}
+ *   creates it `0700` and verifies its owner and mode before any build goes in.
+ * - On win32 the name carries the user name (`web-latex-mcp-build-<user>`, from
+ *   `os.userInfo().username`, cut to one safe path segment by {@link userPathSegment}), so two
+ *   accounts sharing one `TEMP` (a managed machine with `TEMP=C:\Temp`) never share a root by
+ *   name. **The owner and ACL of the win32 root are NOT verified** — only that it is a real
+ *   directory, not a junction or link. So a shared `TEMP` is only as safe as the name: another
+ *   user can still pre-create `web-latex-mcp-build-<you>` there with an `Everyone:F` ACL and the
+ *   server will accept it. The default `%LOCALAPPDATA%\Temp` is per user, and on it this is moot.
+ *   Two accounts of the same name in different domains (a local `bob` and `CORP\bob`) also map to
+ *   one name. When the user name cannot be read the name falls back to a fixed
+ *   `web-latex-mcp-build-unknown-user`, and {@link ensureBuildRoot} refuses to use it, so nothing
+ *   is ever built or read there.
+ *
+ * A pure path function — it touches no disk, and never throws, so the farm skip lists and
+ * `variants.ts` can call it freely. `who` injects the identity and temp dir for tests. Anything
+ * that CREATES or READS a build dir must go through {@link ensureBuildRoot} first.
  */
-export function buildRoot(): string {
-  return path.join(os.tmpdir(), 'web-latex-mcp-build');
+export function buildRoot(who: Partial<BuildRootIdentity> = {}): string {
+  const tmp = who.tmpdir ?? os.tmpdir();
+  // Keyed on whether the process HAS a uid, not on `process.platform`: Node defines
+  // `process.getuid` on POSIX only, so the two agree in production, and a test that stubs the
+  // platform (to drive a case-folding branch) no longer moves the root out from under the build
+  // it staged. The user name is asked for only where there is no uid: `os.userInfo()` throws on
+  // POSIX for a uid with no passwd entry (common in containers), which must not matter there.
+  const uid = 'uid' in who ? who.uid : process.getuid?.();
+  if (uid !== undefined) return path.join(tmp, `web-latex-mcp-build-${uid}`);
+  const user = currentUserSegment(who.username ?? osUsername);
+  return path.join(tmp, user === undefined ? UNKNOWN_USER_ROOT : `web-latex-mcp-build-${user}`);
 }
 
-/** The build dir a request writes to — its `outDir`, else the project's — created if missing. */
+/** The identity {@link buildRoot} names the root after — injectable for tests. */
+export interface BuildRootIdentity {
+  /** The OS temp dir the root sits in. */
+  tmpdir: string;
+  /** The current user's uid; `undefined` where the process has none (win32). */
+  uid: number | undefined;
+  /** Reads the current user name; may throw. Consulted only when `uid` is `undefined`. */
+  username: () => string;
+}
+
+/**
+ * The root's name when the user name cannot be read; {@link ensureBuildRoot} refuses it by name,
+ * so the decision is the one {@link buildRoot} made, not a second read that could disagree. No
+ * user name maps onto it: {@link userPathSegment} keeps a `.` only before 8 hex digits.
+ */
+const UNKNOWN_USER_ROOT = 'web-latex-mcp-build-unknown.user';
+
+const osUsername = (): string => os.userInfo().username;
+
+/**
+ * Cut a user name down to one safe path segment, deterministically and without letting two
+ * distinct names meet: a name made only of `[A-Za-z0-9_-]` (at most 64 characters) is used as is;
+ * any other has each unsafe character replaced by `_`, is cut to 32 characters, and gets `.` plus
+ * 8 hex digits of its SHA-1. A name used as is never contains `.`, so it can never equal a
+ * rewritten one, and two rewritten names differ in their hash. No `\`, `/`, `:`, `..`, drive
+ * letter or trailing dot or space survives, so the segment cannot leave the temp dir or name a
+ * Windows device path. Returns `undefined` for an empty name — that is no identity at all.
+ */
+export function userPathSegment(raw: string): string | undefined {
+  if (raw.length === 0) return undefined;
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(raw)) return raw;
+  const kept = raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32);
+  return `${kept}.${createHash('sha1').update(raw).digest('hex').slice(0, 8)}`;
+}
+
+/** The current user's {@link userPathSegment}, or `undefined` when the name cannot be read. */
+function currentUserSegment(read: () => string): string | undefined {
+  try {
+    return userPathSegment(read());
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where a build root refusal points the user, by what is wrong. */
+const PRIVATE_ROOT_ADVICE =
+  'The build directory root must be a real directory owned by the user running this server, ' +
+  'with no access for anyone else, so no other local user can read or replace the build output ' +
+  '(the PDF, .aux and .log the PDF tools read back). Remove it if it is yours to remove, or ' +
+  'point TMPDIR (TEMP on Windows) at a private directory, then compile again.';
+
+/** A build root that is not safe to build in; the message names the path and the reason. */
+export class UnsafeBuildRootError extends Error {
+  constructor(
+    readonly root: string,
+    readonly reason: string,
+    advice: string = PRIVATE_ROOT_ADVICE,
+  ) {
+    super(`Refusing to build in ${root}: ${reason}. ${advice}`);
+    this.name = 'UnsafeBuildRootError';
+  }
+}
+
+/** What {@link ensureBuildRoot} needs from the filesystem — injectable for tests. */
+export interface BuildRootFs {
+  mkdir(p: string, opts: { mode: number }): Promise<unknown>;
+  lstat(p: string): Promise<{
+    isDirectory(): boolean;
+    isSymbolicLink(): boolean;
+    uid: number;
+    mode: number;
+  }>;
+  chmod(p: string, mode: number): Promise<void>;
+}
+
+/** The environment {@link ensureBuildRoot} judges against — injectable for tests. */
+export interface BuildRootEnv {
+  platform: NodeJS.Platform;
+  /** The current user's uid; `undefined` where there is none to ask for (win32). */
+  uid: number | undefined;
+  fs: BuildRootFs;
+}
+
+const realBuildRootFs: BuildRootFs = { mkdir, lstat, chmod };
+
+/**
+ * Create the build root if it is missing and verify it before anything is built in it — fail
+ * closed. It must be, by `lstat` (never following a link):
+ * - a real directory, not a symbolic link or a junction (win32 included — a junction `lstat`s as
+ *   a link), and not a file;
+ * - on POSIX, owned by this process's uid, with no group or other permission bits. A root this
+ *   user owns that others could only read or search (a test's `mkdir -p` under umask 022) is
+ *   tightened to `0700` and checked again. A root that grants group or other WRITE access is
+ *   refused, not tightened: a chmod cannot vouch for what was placed in it while it was open. A
+ *   root owned by anyone else is refused, never adopted;
+ * - on win32, nothing more: its owner and ACL are NOT verified. The name is per user
+ *   ({@link buildRoot}), which is the whole of the protection there — enough under the default
+ *   per-user `%LOCALAPPDATA%\Temp`, and only as strong as the name under a shared `TEMP`.
+ *
+ * Two more refusals, before anything is judged: the name {@link buildRoot} falls back to when the
+ * user name cannot be read (it is not per user; refused before the mkdir, so never created), and
+ * a missing temp dir. The mkdir is not recursive, so a `TMPDIR`/`TEMP` that does not exist (its
+ * `ENOENT`) is reported in words — point it at an existing directory — and never created: making
+ * it would pick the owner and mode of a directory other programs share.
+ *
+ * Every creation of a build dir goes through this (`outDirFor`, `applyOverlay`'s case probe,
+ * `stageVariant`, `render_pages` before its PNGs), and so does every read of one outside a compile
+ * (`locateRootPdf` for the main build — `render_pages`, `extract_text`, `pdf_geometry`, the
+ * viewer — and `resolveVariantBuild` for a variant). Deliberately NOT memoised across calls: the
+ * check is one `mkdir` and one `lstat`, and
+ * a remembered success would outlive the directory — a /tmp cleaner that removes the idle root
+ * lets another user recreate it, and a memo would then build straight into theirs. Returns the
+ * root.
+ */
+export async function ensureBuildRoot(
+  root: string = buildRoot(),
+  env: Partial<BuildRootEnv> = {},
+): Promise<string> {
+  const platform = env.platform ?? process.platform;
+  const fs = env.fs ?? realBuildRootFs;
+  const uid = 'uid' in env ? env.uid : platform === 'win32' ? undefined : process.getuid?.();
+  if (path.basename(root) === UNKNOWN_USER_ROOT) {
+    // `buildRoot` could not read the user name, so this name is shared by everyone it happens
+    // to. Refused before the mkdir: nothing is created under a name that is not per user.
+    throw new UnsafeBuildRootError(
+      root,
+      'the current user name could not be determined, so the build root cannot be named per user',
+      'This happens only when the operating system will not report the current user name; run ' +
+        'the server under a regular user account.',
+    );
+  }
+  try {
+    // Not recursive: the parent is the OS temp dir, and a recursive mkdir would silently accept
+    // whatever already sits at `root`. EEXIST is the ordinary case, judged below.
+    await fs.mkdir(root, { mode: 0o700 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      // The parent — the OS temp dir, from TMPDIR/TEMP — is missing (or is not a directory).
+      // Never created here: making it would mean choosing its owner and mode, for a directory
+      // other programs share, on the strength of an environment variable. Say so in words
+      // rather than let a raw `ENOENT: … mkdir` stand for it.
+      const parent = path.dirname(root);
+      throw new UnsafeBuildRootError(
+        root,
+        `the temp directory it goes in, ${parent}, ${code === 'ENOENT' ? 'does not exist' : 'is not a directory'}`,
+        'The server never creates the temp directory itself. Point TMPDIR (TEMP on Windows) at ' +
+          'an existing directory, then compile again.',
+      );
+    }
+    if (code !== 'EEXIST') throw err;
+  }
+  const judge = async (): Promise<{ loose: boolean; writable: boolean }> => {
+    const st = await fs.lstat(root);
+    if (st.isSymbolicLink()) {
+      throw new UnsafeBuildRootError(root, 'it is a symbolic link (or junction), not a directory');
+    }
+    if (!st.isDirectory()) throw new UnsafeBuildRootError(root, 'it is not a directory');
+    // No owner/ACL check on win32 (see the docstring): the per-user name is all there is.
+    if (platform === 'win32') return { loose: false, writable: false };
+    if (uid === undefined) {
+      throw new UnsafeBuildRootError(root, 'the current user id could not be determined');
+    }
+    if (st.uid !== uid) {
+      throw new UnsafeBuildRootError(
+        root,
+        `it is owned by uid ${st.uid}, not by the user running this server (uid ${uid})`,
+      );
+    }
+    return { loose: (st.mode & 0o077) !== 0, writable: (st.mode & 0o022) !== 0 };
+  };
+  const first = await judge();
+  if (first.writable) {
+    // Tightening it now would close the door, not empty the room: whatever another user put in
+    // it while it was writable — a link where a project's build dir goes, a forged PDF, a
+    // group-writable file of ours they rewrote — stays, and a chmod of the root vouches for none
+    // of it. Judging every entry below (owner, mode, kind) would be a deep walk of every build
+    // and variant farm on every call, so the root is refused whole instead.
+    throw new UnsafeBuildRootError(
+      root,
+      'it grants group or other WRITE access, so another user may already have placed entries ' +
+        'in it that tightening it now would not remove',
+    );
+  }
+  if (first.loose) {
+    // Only read/search bits: nobody else could have written into it, so restricting it to its
+    // owner is enough.
+    await fs.chmod(root, 0o700);
+    // Judged again from scratch: the chmod follows a link, so the entry must still be the same
+    // kind of thing, still ours, and now actually tight.
+    if ((await judge()).loose) {
+      throw new UnsafeBuildRootError(
+        root,
+        'it grants group or other access and could not be restricted to its owner (mode 0700)',
+      );
+    }
+  }
+  return root;
+}
+
+/**
+ * The build dir a request writes to — its `outDir`, else the project's — created if missing,
+ * after the build root it lives under has been created or verified ({@link ensureBuildRoot}).
+ */
 async function outDirFor(req: CompileRequest): Promise<string> {
+  await ensureBuildRoot();
   const dir = req.outDir ?? buildDir(req.projectDir);
   await mkdir(dir, { recursive: true });
   return dir;
@@ -356,17 +642,36 @@ export async function mirrorSubdirsForRoot(
 }
 
 /**
- * The engine shell-escape flag for a request, or `undefined` for none. Full `-shell-escape`
- * (arbitrary commands) takes precedence over the safer `-shell-restricted` (allow-list only)
- * when both are set; neither is ever enabled unless the caller explicitly opted in. With neither,
- * `noShellEscape` passes `-no-shell-escape`; otherwise no flag, leaving the TeX installation's
- * own default (TeX Live: restricted) — which a normal compile's argv must keep byte-identical.
+ * The engine shell-escape flag for a request — always one of three, never none. Full
+ * `-shell-escape` (arbitrary commands) takes precedence over the safer `-shell-restricted`
+ * (allow-list only) when both are set; neither is ever enabled unless the caller explicitly opted
+ * in. With neither, `-no-shell-escape`: leaving the flag out does NOT mean "off", it means the TeX
+ * installation's own default, which on TeX Live is the restricted allow-list (`shell_escape = p`)
+ * — so the schema's "never enabled unless you ask" was false for every plain compile (#213).
+ *
+ * latexmk hands the flag to the engine through `%O`, so a latexmkrc that drops `%O` or appends its
+ * own `-shell-escape` after it can still turn shell escape back on; `shellEscapeWasEnabled` reads
+ * the engine's own banner for exactly that reason.
  */
-function shellEscapeFlag(req: CompileRequest): string | undefined {
+function shellEscapeFlag(req: CompileRequest): string {
   if (req.shellEscape) return '-shell-escape';
   if (req.restrictedShellEscape) return '-shell-restricted';
-  if (req.noShellEscape) return '-no-shell-escape';
-  return undefined;
+  return '-no-shell-escape';
+}
+
+/**
+ * Whether the caller's request turns shell escape on for `backend` — what the compile hints and
+ * the variant line judge "the caller opted in" by. `shellEscape` does on both backends;
+ * `restrictedShellEscape` only under latexmk ({@link shellEscapeFlag}): tectonic has no restricted
+ * mode, so its backend passes no flag for it and runs no command, and a caller who passed it is
+ * exactly the one a refused-command hint is for. Pure.
+ */
+export function shellEscapeRequested(
+  req: Pick<CompileRequest, 'shellEscape' | 'restrictedShellEscape'>,
+  backend: CompilerKind,
+): boolean {
+  if (req.shellEscape === true) return true;
+  return req.restrictedShellEscape === true && backend !== 'tectonic';
 }
 
 /**
@@ -381,8 +686,8 @@ export function logBaseDir(rootFile: string): string {
 
 /**
  * The full latexmk argument vector for a request. Pure and exported so the arg construction —
- * in particular that a shell-escape flag is present only when explicitly requested — is unit
- * testable without a TeX install.
+ * in particular that shell escape is enabled only when explicitly requested, and disabled
+ * outright (`-no-shell-escape`) otherwise — is unit testable without a TeX install.
  */
 export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
   const engine = req.engine ?? 'pdflatex';
@@ -400,8 +705,7 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
     '-synctex=1',
     `-outdir=${buildDir}`,
   ];
-  const shellFlag = shellEscapeFlag(req);
-  if (shellFlag) args.push(shellFlag);
+  args.push(shellEscapeFlag(req));
   if (req.clean) args.push('-gg');
   args.push(req.rootFile);
   return args;
@@ -593,7 +897,7 @@ export class TectonicCompiler implements LatexCompiler {
     const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
     // Tectonic has no restricted mode, so `restrictedShellEscape` alone does not widen to full
     // shell escape here; only an explicit `shellEscape` enables system calls. Without it tectonic
-    // runs none at all, so `noShellEscape` needs no flag here.
+    // runs none at all, so it needs no counterpart of latexmk's `-no-shell-escape`.
     if (req.shellEscape) args.push('-Z', 'shell-escape');
 
     const before = await statOrNull(buildPdfPathIn(buildDir, req.rootFile));

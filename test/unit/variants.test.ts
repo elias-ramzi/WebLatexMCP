@@ -1144,18 +1144,13 @@ describe('overlay: a latexmk rc file', () => {
     await expectSame(before, await snapshot(src));
   });
 
-  it('folds case only where the platform does', async () => {
+  it('folds case on every platform: the guard does not stake its answer on a case probe', async () => {
     const src = await tempDir('ovl-rc-');
-    for (const platform of ['darwin', 'win32'] as const) {
+    for (const platform of ['darwin', 'win32', 'linux'] as const) {
       await expect(
         applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform }),
       ).rejects.toThrow(/is a latexmk configuration file/);
     }
-    // On a case-sensitive filesystem `LatexMkRc` is not a file latexmk reads, so it is an
-    // ordinary overlay (here: one that reaches the reader, which is the point).
-    await expect(
-      applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform: 'linux' }),
-    ).rejects.toThrow('read a file before refusing');
   });
 });
 
@@ -1175,7 +1170,7 @@ describe('overlaySnippetReader', () => {
 });
 
 describe('overlay: one file named twice', () => {
-  it('refuses a case variant under the platform fold, before reading anything', async () => {
+  it('refuses a case variant where the farm folds case, before reading anything', async () => {
     const src = await tempDir('ovl-dup-');
     await put(src, 'main.tex', 'x\n');
     const edit = { oldString: 'x', newString: 'y' };
@@ -1187,7 +1182,7 @@ describe('overlay: one file named twice', () => {
           { file: 'main.tex', edits: [edit] },
           { file: 'Main.tex', edits: [{ oldString: 'x', newString: 'z' }] },
         ],
-        { platform: 'darwin' },
+        { caseProbe: async () => true },
       ),
     ).rejects.toThrow(
       'Overlay entry 2 names "Main.tex", the same file as entry 1 ("main.tex"): name each file once',
@@ -1227,7 +1222,7 @@ describe('overlaySnippetReader: another spelling of an overlaid file', () => {
     const reader = overlaySnippetReader(
       new FileService(),
       new Map([['sections/b.tex', 'in memory\n']]),
-      { platform: 'darwin' },
+      { caseProbe: async () => true },
     );
     expect((await reader.read(src, { path: 'sections/B.tex' })).content).toBe('in memory\n');
     await expect(reader.read(src, { path: 'hard.tex' })).rejects.toThrow(

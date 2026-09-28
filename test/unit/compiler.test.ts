@@ -49,13 +49,10 @@ describe('latexmkArgs (shell escape)', () => {
     expect(args).not.toContain('-shell-escape');
   });
 
-  it('passes -no-shell-escape only for a request that asks for it (an overlay compile)', () => {
+  it('passes -no-shell-escape for every request that did not opt in (#213)', () => {
+    // No flag at all is NOT "off": TeX Live's texmf.cnf default is `shell_escape = p`, the
+    // restricted allow-list, so a plain compile has to disable it outright.
     const plain = latexmkArgs(base, BUILD);
-    const disabled = latexmkArgs({ ...base, noShellEscape: true }, BUILD);
-    expect(plain).not.toContain('-no-shell-escape');
-    expect(disabled).toContain('-no-shell-escape');
-    // Nothing else moves: a normal compile's argv is exactly what it was.
-    expect(disabled.filter((a) => a !== '-no-shell-escape')).toEqual(plain);
     expect(plain).toEqual([
       '-pdf',
       '-interaction=nonstopmode',
@@ -63,7 +60,17 @@ describe('latexmkArgs (shell escape)', () => {
       '-cd',
       '-synctex=1',
       `-outdir=${BUILD}`,
+      '-no-shell-escape',
       'main.tex',
+    ]);
+    // Exactly one shell-escape flag, whichever the caller chose; the opt-ins replace it.
+    const flags = (args: string[]) => args.filter((a) => /shell/.test(a));
+    expect(flags(latexmkArgs({ ...base, restrictedShellEscape: true }, BUILD))).toEqual([
+      '-shell-restricted',
+    ]);
+    expect(flags(latexmkArgs({ ...base, shellEscape: true }, BUILD))).toEqual(['-shell-escape']);
+    expect(flags(latexmkArgs({ ...base, shellEscape: false }, BUILD))).toEqual([
+      '-no-shell-escape',
     ]);
   });
 

@@ -53,8 +53,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
-  # NVIDIA SkillSpector over the skills the plugin ships (plugin.json `skills`), each scanned as its
-  # own skill. Any finding fails the job; the README's SkillSpector badge claims exactly this.
+  # NVIDIA SkillSpector over what the plugin ships: the skills (plugin.json `skills`), each scanned
+  # as its own skill, then the agents and commands it lists. Any finding fails the job; the
+  # README's SkillSpector badge claims exactly this.
   # --no-llm keeps it to the static rules (YARA + patterns): no model, no API key, no secret in CI,
   # ~20s. Two flags are deliberately absent: --fail-on-incomplete, because a static-only scan always
   # reports its coverage as "partial" and would fail every run; and a scan of the repo root, which
@@ -71,9 +72,28 @@ jobs:
       - run: >-
           skillspector scan .claude/skills --recursive --no-llm --fail-on-findings
           --format markdown --output skillspector-report.md
-      - name: Publish the report to the log and the job summary
+      # The plugin also ships agents and commands (plugin.json `agents`/`commands`, #212), listed
+      # one by one because .claude/agents and .claude/commands hold this repo's dev tooling too.
+      # Stage exactly the listed files, one directory per kind, and scan those: scanning the
+      # directories would test files no plugin install loads, and miss nothing it does. Both kinds
+      # are scanned before the step fails, so one report never hides the other's findings; an
+      # empty list fails outright rather than passing a scan of nothing.
+      - name: Scan the agents and commands the plugin ships
         if: always()
-        run: tee -a "$GITHUB_STEP_SUMMARY" < skillspector-report.md || true
+        run: |
+          status=0
+          for kind in agents commands; do
+            mkdir -p "shipped/$kind"
+            jq -r --arg kind "$kind" '.[$kind][]' .claude-plugin/plugin.json > "shipped/$kind.list"
+            test -s "shipped/$kind.list" || { echo "plugin.json lists no $kind"; exit 1; }
+            while IFS= read -r file; do cp "$file" "shipped/$kind/"; done < "shipped/$kind.list"
+            skillspector scan "shipped/$kind" --no-llm --fail-on-findings \
+              --format markdown --output "skillspector-$kind.md" || status=1
+          done
+          exit "$status"
+      - name: Publish the reports to the log and the job summary
+        if: always()
+        run: cat skillspector-report.md skillspector-agents.md skillspector-commands.md 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
 
   test:
     name: Test (${{ matrix.os }}, shard ${{ matrix.shard }}/${{ matrix.shards }})

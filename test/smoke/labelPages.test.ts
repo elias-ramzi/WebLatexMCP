@@ -155,6 +155,9 @@ function textOf(res: unknown): string {
 
 describe.skipIf(!available)('label -> page against a real compile', () => {
   const cleanups: Array<() => Promise<unknown>> = [];
+  /** The source directory of the last `compiled()` project, for a test that edits and compiles
+   *  it again. */
+  let lastUserDir = '';
 
   afterEach(async () => {
     for (const c of cleanups.splice(0)) await c();
@@ -163,6 +166,7 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
   async function compiled(tex: string, engine?: 'xelatex' | 'lualatex'): Promise<Client> {
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-ws-'));
     const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-src-'));
+    lastUserDir = userDir;
     cleanups.push(
       () => rm(workspace, { recursive: true, force: true }),
       () => rm(userDir, { recursive: true, force: true }),
@@ -579,4 +583,65 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       for (let s = 2; s <= 8; s++) await landed(client, `fig:s${s}`);
     }
   }, 480_000);
+  it.skipIf(!xelatexAvailable)(
+    "refuses a label whose .aux a stopped xelatex run rewrote beside the earlier run's PDF",
+    async () => {
+      // #220. A 3-page document printing "A 1", "B 2", "C 3" compiles; then an edit that stops
+      // xelatex in the BODY: it writes a new .aux (x on page 1, a on page 2) and .log, and
+      // latexmk never runs xdvipdfmx, so the 3-page PDF stays. `a` used to resolve to PDF page 2,
+      // which shows "B". Then an ordinary error, after which xdvipdfmx does not run either: the
+      // new run ships 3 pages, as many as the old PDF, so only the files' order shows it.
+      const three = (body: string): string =>
+        ['\\documentclass{article}', '\\begin{document}', body, '\\end{document}', ''].join('\n');
+      const client = await compiled(
+        three('A\\label{a}\\newpage B\\label{b}\\newpage C\\label{c}'),
+        'xelatex',
+      );
+      const recompile = async (body: string): Promise<boolean> => {
+        await writeFile(path.join(lastUserDir, 'main.tex'), three(body));
+        const res = await client.callTool({
+          name: 'compile',
+          arguments: { project: 'doc', engine: 'xelatex' },
+        });
+        return (res.structuredContent as { success?: boolean }).success === true;
+      };
+      const lookup = (label: string) =>
+        client.callTool({ name: 'extract_text', arguments: { project: 'doc', labels: [label] } });
+
+      expect(await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage\\input{missingfile}')).toBe(
+        false,
+      );
+      const fatal = await lookup('a');
+      expect(fatal.isError, textOf(fatal)).toBe(true);
+      expect(textOf(fatal)).toContain('is not the output of the last compile');
+      expect(textOf(fatal)).toMatch(
+        /says that run wrote 2 page\(s\) to its \.xdv file, while the PDF has 3 page\(s\)/,
+      );
+      expect(textOf(fatal)).toMatch(/the \.aux was written \d+\.\d s after the PDF/);
+      const geo = await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'doc', kinds: ['floats'] },
+      });
+      expect((geo.structuredContent as { note?: string }).note).toContain(
+        'The PDF beside the .aux is not the output of the last compile',
+      );
+
+      expect(
+        await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage Z\\label{z}\\undefinedmacro'),
+      ).toBe(false);
+      const error = await lookup('a');
+      expect(error.isError, textOf(error)).toBe(true);
+      expect(textOf(error)).toMatch(/the \.aux was written \d+\.\d s after the PDF/);
+      expect(textOf(error)).not.toMatch(/closing line/);
+
+      // Fixed and compiled again, the build is whole and the label resolves to its own page.
+      expect(await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage Z\\label{z}')).toBe(true);
+      const fixed = await lookup('a');
+      expect(fixed.isError ?? false, textOf(fixed)).toBe(false);
+      const out = fixed.structuredContent as unknown as Out;
+      expect(out.resolvedLabels).toEqual([{ label: 'a', printedPage: '2', page: 2 }]);
+      expect(out.pages[0]?.lines).toContain('Y');
+    },
+    240_000,
+  );
 });

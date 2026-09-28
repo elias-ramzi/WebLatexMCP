@@ -19,7 +19,13 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
-import { buildDir, buildPdfPath, buildPdfPathIn, logBaseDir } from '../../src/services/compiler.js';
+import {
+  buildDir,
+  buildPdfPath,
+  buildPdfPathIn,
+  latexmkArgs,
+  logBaseDir,
+} from '../../src/services/compiler.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import { variantPaths, writeManifest } from '../../src/lib/variants.js';
 import { toPosix } from '../../src/lib/paths.js';
@@ -236,8 +242,9 @@ describe('compile with an overlay', () => {
     const { client } = await setup();
     const plain = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
     expect(textOf(plain)).toContain(
-      'The source (checked: no project file changed while it built), the main build, the ' +
-        'surfaced PDF and the viewer are untouched. Shell escape was off for this build.',
+      'The source (checked: no project file changed while it built — of .git, only its ' +
+        'hooks, config and info/ are checked), the main build, the surfaced PDF and the viewer ' +
+        'are untouched. Shell escape was off for this build.',
     );
     const escaped = await client.callTool({
       name: 'compile',
@@ -248,10 +255,10 @@ describe('compile with an overlay', () => {
     );
   });
 
-  it('disables shell escape for a variant the caller did not opt in for, and only then', async () => {
+  it('disables shell escape for a variant the caller did not opt in for, as for any compile', async () => {
     // TeX Live's default `shell_escape = p` runs allow-listed commands with no flag; in the farm a
-    // `makeindex -o sections/b.tex` writes the source through its link. So a variant asks the
-    // backend for -no-shell-escape — and a normal compile's request is exactly what it was.
+    // `makeindex -o sections/b.tex` writes the source through its link. So latexmk gets
+    // -no-shell-escape unless the caller opted in — for a normal compile too (#213).
     const { client, requests } = await setup();
     await client.callTool({ name: 'compile', arguments: {} });
     await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
@@ -261,11 +268,16 @@ describe('compile with an overlay', () => {
     });
     await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY, shellEscape: true } });
     expect(requests).toHaveLength(4);
-    expect(requests.map((r) => r.noShellEscape)).toEqual([undefined, true, undefined, undefined]);
-    expect(requests[0]).not.toHaveProperty('noShellEscape');
+    const shellFlags = requests.map((r) => latexmkArgs(r, '/build').filter((a) => /shell/.test(a)));
+    expect(shellFlags).toEqual([
+      ['-no-shell-escape'],
+      ['-no-shell-escape'],
+      ['-shell-restricted'],
+      ['-shell-escape'],
+    ]);
   });
 
-  it('says when a variant refused a shell command, and never for a normal compile', async () => {
+  it("says when a variant refused a shell command, in the overlay's own words", async () => {
     const { client } = await setup({
       extraLog: 'runsystem(makeindex -q -o sections/b.tex main.tex)...disabled.\n',
     });
@@ -275,9 +287,11 @@ describe('compile with an overlay', () => {
     expect(hintOf(variant)).toContain('an overlay compile disables shell escape');
     expect(hintOf(variant)).toContain('restrictedShellEscape: true');
     expect(textOf(variant)).toContain('lifts that guarantee');
-    // A normal compile never passed -no-shell-escape, so the line is not the server's doing.
+    // A normal compile disables shell escape too (#213) and says so — in its own words, since
+    // there are no links to the source to warn about.
     const plain = await client.callTool({ name: 'compile', arguments: {} });
     expect(hintOf(plain)).not.toContain('disables shell escape');
+    expect(hintOf(plain)).toContain('The engine refused a shell command');
     // Opted in: the caller already knows, and the flag was theirs.
     const optedIn = await client.callTool({
       name: 'compile',

@@ -25,7 +25,7 @@
  * {@link MAX_VARIANTS} variants are kept per project.
  */
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import {
   copyFile,
@@ -42,13 +42,13 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { buildDir, buildPdfPathIn } from '../services/compiler.js';
+import { buildDir, buildPdfPathIn, ensureBuildRoot } from '../services/compiler.js';
 import type { Engine } from '../services/compiler.js';
 import { applyEditsToContent } from '../services/fileService.js';
 import type { AnyEditOp } from '../services/fileService.js';
 import type { CompilerKind } from '../types.js';
 import { childPathInside, escapeInvisibleChars, quoteId } from './projectId.js';
-import { resolveInside, toPosix } from './paths.js';
+import { climbsOut, resolveInside, toPosix } from './paths.js';
 import { matchIsCommented, supportsLineComments } from './rewriteMode.js';
 import type { SnippetReader } from './sourceSnippet.js';
 
@@ -73,8 +73,10 @@ export const MAX_OVERLAY_EDITS = 100;
 const HANDLE_RE = /^v[0-9a-f]{12}$/;
 
 /**
- * The rc files latexmk reads from its working directory, lowercase: an overlay may not name one
- * (compared under the platform's case fold, like every other overlay name).
+ * The rc files latexmk reads from its working directory, lowercase: an overlay may not name one,
+ * compared case-insensitively ALWAYS, whatever the filesystem — latexmk runs the file as Perl, so
+ * this guard does not stake its answer on a case probe, and refusing an overlay of a file named
+ * `LatexMkRc` on a case-sensitive filesystem costs nothing anyone needs.
  */
 const LATEXMK_RC_NAMES = new Set(['latexmkrc', '.latexmkrc']);
 
@@ -105,12 +107,77 @@ export interface VariantKey {
   overlay: OverlayEntry[];
 }
 
+/** A name case-folded, the way a case-insensitive filesystem compares it. */
+function foldCaseName(name: string): string {
+  return name.toLowerCase();
+}
+
 /**
- * A name as the platform's default filesystem compares it — case-folded on win32 and darwin, the
- * rule `samePath` applies — with the platform injectable so the fold is testable anywhere.
+ * Whether a directory compares names case-insensitively — asked of the filesystem, since the
+ * platform name does not say: macOS volumes can be case-sensitive APFS, Windows directories can
+ * carry the per-directory case flag, and a Linux directory can be casefolded. Injectable so a test
+ * can drive either answer anywhere.
  */
-function foldName(name: string, platform: NodeJS.Platform): string {
-  return platform === 'win32' || platform === 'darwin' ? name.toLowerCase() : name;
+export type CaseProbe = (dir: string) => Promise<boolean>;
+
+const caseProbeCache = new Map<string, Promise<boolean>>();
+
+/**
+ * {@link CaseProbe} by experiment: create a uniquely named entry in `dir` (created if missing) and
+ * `lstat` its case-swapped name. Found, and the same entry, is case-insensitive; not found is
+ * case-sensitive. Cached per directory for the process; a probe that fails is not cached, and
+ * throws. Only ever run in a directory the server owns (a project's variants dir under the build
+ * root), never in a project: it writes — and only once {@link ensureBuildRoot} has created or
+ * verified that root, since it creates `dir` with everything above it (see `nameFoldFor`).
+ */
+export function probeCaseInsensitive(dir: string): Promise<boolean> {
+  const key = path.resolve(dir);
+  const cached = caseProbeCache.get(key);
+  if (cached) return cached;
+  const probe = (async () => {
+    await mkdir(key, { recursive: true });
+    const tag = randomBytes(6).toString('hex');
+    const upper = path.join(key, `CaseProbe-${tag}.tmp`);
+    await writeFile(upper, '', { flag: 'wx' });
+    try {
+      const swapped = await entryIdentity(path.join(key, `caseprobe-${tag}.tmp`));
+      return swapped !== undefined && swapped === (await entryIdentity(upper));
+    } finally {
+      await unlink(upper).catch(() => undefined);
+    }
+  })();
+  caseProbeCache.set(key, probe);
+  void probe.catch(() => caseProbeCache.delete(key));
+  return probe;
+}
+
+/**
+ * How names are compared in `dir`, the directory a collision would happen in: case-folded when
+ * the probe says it is case-insensitive, exact when it says not. When the probe cannot run, the
+ * platform's default decides (folded on win32 and darwin) — the side that refuses more.
+ *
+ * `dir` is always a project's variants directory, under the build root, and the default probe
+ * CREATES it and writes into it — so the build root is created (`0700`) or verified by
+ * {@link ensureBuildRoot} first, like every other creation of a build dir. `applyOverlay` runs
+ * before `compile`'s own check, and probing first would create a project-named directory, and
+ * write, in a root another local user planted (a link to their directory), or leave a fresh root
+ * world-readable. An unsafe root is refused outright: that is not a probe that "cannot run", and
+ * falling back to the platform default would only defer the refusal. An injected probe writes
+ * nothing of ours, so it skips the check.
+ */
+async function nameFoldFor(
+  dir: string,
+  opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform },
+): Promise<(name: string) => string> {
+  if (opts.caseProbe === undefined) await ensureBuildRoot();
+  let insensitive: boolean;
+  try {
+    insensitive = await (opts.caseProbe ?? probeCaseInsensitive)(dir);
+  } catch {
+    const platform = opts.platform ?? process.platform;
+    insensitive = platform === 'win32' || platform === 'darwin';
+  }
+  return insensitive ? foldCaseName : (name) => name;
 }
 
 /**
@@ -254,7 +321,8 @@ async function copyCharged(src: string, dest: string, budget: FarmBudget): Promi
  * links). A read-only file is copied rather than hard-linked: hard links share their attributes,
  * and deleting a farm's link (libuv's unlink clears FILE_ATTRIBUTE_READONLY first) would strip
  * read-only from the source file. A link to a file becomes a copy of what it points at (a dangling
- * one is left out). Every copy is charged to `budget`.
+ * one is left out). Every copy is charged to `budget`. `rel` is the entry's project-relative
+ * POSIX path, for a refusal to name.
  */
 async function linkEntry(
   src: string,
@@ -262,13 +330,14 @@ async function linkEntry(
   kind: EntryKind,
   platform: NodeJS.Platform,
   budget: FarmBudget,
+  rel: string,
 ): Promise<void> {
   if (platform !== 'win32') {
     await symlink(src, dest);
     return;
   }
   if (kind === 'dir') {
-    await symlink(src, dest, 'junction');
+    await junction(src, dest, rel);
     return;
   }
   if (kind === 'symlink') {
@@ -278,7 +347,7 @@ async function linkEntry(
     } catch {
       return; // dangling: nothing a compile could read through it either
     }
-    if (isDir) await symlink(src, dest, 'junction');
+    if (isDir) await junction(src, dest, rel);
     else await copyCharged(src, dest, budget);
     return;
   }
@@ -290,6 +359,70 @@ async function linkEntry(
     await link(src, dest);
   } catch {
     await copyCharged(src, dest, budget);
+  }
+}
+
+/**
+ * Why win32 cannot make a junction pointing at `target`, as a refusal naming the entry at `rel`
+ * (project-relative POSIX), or undefined when it can. A junction must point at a local volume, and
+ * libuv takes only a lettered-drive path (`C:\…`, or `\\?\C:\…`): a UNC path (`\\server\share\…`,
+ * `\\?\UNC\…`) or a device path (`\\.\…`) fails with a bare EINVAL. The junction's target is the
+ * entry's own path in the project, never a link's target, so this is a project reached by a
+ * network path. Refused rather than copied: a linked directory is kept ONE link so `..` through
+ * it resolves as in the project, which a copy would silently change, and copying the directory
+ * would pull its whole tree across the network on every overlay compile. Pure.
+ */
+export function junctionRefusal(target: string, rel: string): string | undefined {
+  if (!/^[\\/]{2}/.test(target) || /^[\\/]{2}\?[\\/][A-Za-z]:([\\/]|$)/.test(target)) {
+    return undefined;
+  }
+  // `\\server\share` and `\\?\UNC\server\share` are network paths; any other `\\.\` or `\\?\`
+  // form (`\\.\C:\…`, `\\?\Volume{…}\…`) is a device-namespace path, which need not be remote.
+  const network =
+    !/^[\\/]{2}[.?][\\/]/.test(target) || /^[\\/]{2}\?[\\/]UNC([\\/]|$)/i.test(target);
+  const reached = network
+    ? 'a network path (\\\\server\\share\\…)'
+    : 'a device path (\\\\.\\… or \\\\?\\…) rather than a drive letter';
+  return (
+    `An overlay compile links the directory ${quoteId(rel)} into its private build tree, and on ` +
+    'Windows a directory is linked with a junction, which can only point at a local drive — this ' +
+    `project is reached by ${reached}, so the overlay compile is refused. Compile without ` +
+    'overlay, or open the project by a local drive path (moving it onto a local drive if it is ' +
+    'remote).'
+  );
+}
+
+/**
+ * The refusal for a junction that could not be made, naming `rel` and the error `code`. Only
+ * `EINVAL` — what libuv reports for a target a junction cannot point at — mentions the drive, and
+ * only as the likely cause: a mapped network drive is the one such target no spelling of the path
+ * reveals ({@link junctionRefusal} refuses the others by name), and which code it surfaces as is
+ * not verified here. Any other code (`EPERM`, `EACCES`, `ENOSPC`, …) is reported as what it is,
+ * since pointing the caller at a drive move would send them the wrong way. Pure.
+ */
+export function junctionFailureMessage(rel: string, code: string | undefined): string {
+  const head =
+    `An overlay compile could not link the directory ${quoteId(rel)} into its private build ` +
+    `tree (a junction: ${code ?? 'unknown error'}), so it is refused.`;
+  return code === 'EINVAL'
+    ? `${head} The likely cause is a project on a drive a junction cannot point at (a mapped ` +
+        'network drive, say): compile without overlay, or move the project onto a local drive.'
+    : `${head} Compile without overlay, or clear the cause the error code names and retry.`;
+}
+
+/**
+ * A win32 junction from `dest` to `src` — refused in words, naming `rel`, when `src` cannot be a
+ * junction's target ({@link junctionRefusal}) or when making it fails; never a bare Node error.
+ */
+async function junction(src: string, dest: string, rel: string): Promise<void> {
+  const refusal = junctionRefusal(src, rel);
+  if (refusal !== undefined) throw new Error(refusal);
+  try {
+    await symlink(src, dest, 'junction');
+  } catch (err) {
+    throw new Error(junctionFailureMessage(rel, (err as NodeJS.ErrnoException).code), {
+      cause: err,
+    });
   }
 }
 
@@ -309,7 +442,11 @@ function kindOf(entry: {
  * every file and every symlink becomes ONE link to its absolute source path (a symlinked directory
  * is never walked — its link resolves exactly as the project's does). Entries named `.git` are
  * skipped, and so is any directory in `skip` — the workspace root and the build root, since a
- * local project registered at the launch directory contains the workspace. Returns how many
+ * local project registered at the launch directory contains the workspace. A directory is judged
+ * against `skip` by its spelled path and by its realpath, as {@link snapshotSource} judges it, so
+ * a skip dir spelled through a symbolic link (or a Windows 8.3 short name) is still recognised; a
+ * skip dir that exists but cannot be resolved refuses the farm rather than risk mirroring the
+ * workspace. Returns how many
  * entries it created; more than the budget's `maxEntries` is refused, since every one of them is a
  * syscall. Pass `budget` to share it with the {@link placeOverlayFile} calls that follow (a stage
  * does); otherwise a fresh one is made from `maxEntries`/`maxCopyBytes`.
@@ -326,31 +463,46 @@ export async function buildLinkFarm(
   },
 ): Promise<number> {
   const skip = new Set(opts.skip.map((p) => path.resolve(p)));
+  let skipReal: Set<string>;
+  try {
+    skipReal = new Set(await Promise.all([...skip].map(realpathOrSelf)));
+  } catch (err) {
+    throw new Error(
+      "An overlay compile could not resolve the server's workspace or build directory " +
+        `(${(err as NodeJS.ErrnoException).code ?? 'unknown error'}), which its private build ` +
+        'tree must leave out, so it is refused. Compile without overlay.',
+      { cause: err },
+    );
+  }
   const platform = opts.platform ?? process.platform;
   const budget =
     opts.budget ?? newFarmBudget({ maxEntries: opts.maxEntries, maxCopyBytes: opts.maxCopyBytes });
+  const base = path.resolve(projectDir);
   let count = 0;
-  const walk = async (srcDir: string, destDir: string): Promise<void> => {
+  // `srcReal` is `srcDir` through its links: a real directory's realpath is its parent's joined
+  // with its name, and a linked one is never walked, so it is resolved once, at the root.
+  const walk = async (srcDir: string, srcReal: string, destDir: string): Promise<void> => {
     const entries = await readdir(srcDir, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.name === '.git') continue;
       const src = path.join(srcDir, entry.name);
+      const real = path.join(srcReal, entry.name);
       const kind = kindOf(entry);
       if (kind === undefined) continue;
-      if (kind === 'dir' && skip.has(path.resolve(src))) continue;
+      if (kind === 'dir' && (skip.has(path.resolve(src)) || skipReal.has(real))) continue;
       chargeEntry(budget);
       count++;
       const dest = path.join(destDir, entry.name);
       if (kind === 'dir') {
         await mkdir(dest);
-        await walk(src, dest);
+        await walk(src, real, dest);
       } else {
-        await linkEntry(src, dest, kind, platform, budget);
+        await linkEntry(src, dest, kind, platform, budget, toPosix(path.relative(base, src)));
       }
     }
   };
   await mkdir(farmDir, { recursive: true });
-  await walk(path.resolve(projectDir), farmDir);
+  await walk(base, await realpath(base), farmDir);
   return count;
 }
 
@@ -427,6 +579,20 @@ export class SourceSnapshotError extends Error {
   }
 }
 
+/**
+ * What {@link snapshotSource} watches of the project root's `.git`: the hooks the next git command
+ * runs, the config that can name a hook path, an editor, a pager or an fsmonitor command, and
+ * `info/` (exclude, attributes, sparse-checkout). All small, and rarely written — but not never:
+ * `git config` rewrites `config`, and `git gc`/`repack` refresh `info/refs` — while the rest of
+ * `.git` (`index`, `objects/`, `refs/`, `logs/`) moves on every git call and stays out. What keeps
+ * a git call from showing up as the build's write is that `compile` holds the project lock across
+ * the snapshot, the build and the comparison, so no git call of this server's — nor of a peer
+ * session's, since the lock is a file lock too — can land in between. A git command run outside
+ * the server during the build can, and is then reported as a change: a false alarm, never a
+ * missed write. Sorted.
+ */
+const GIT_WATCHED = ['config', 'hooks', 'info'] as const;
+
 /** `p` through its links, or `p` itself when it does not exist (a skip dir need not). */
 async function realpathOrSelf(p: string): Promise<string> {
   try {
@@ -439,7 +605,12 @@ async function realpathOrSelf(p: string): Promise<string> {
 
 /**
  * Snapshot the project's tree FOLLOWING its symbolic links, reading no file's content — `.git`
- * left out, and two kinds of directory the server owns. A `skip` directory (the workspace) is left
+ * left out but for a narrow part of the project root's, and two kinds of directory the server
+ * owns. Of the root's `.git` directory only {@link GIT_WATCHED} is walked (`config`, `hooks/`,
+ * `info/`): a write there is the most dangerous one a build can make, since the next git command
+ * runs it, while the rest of `.git` changes on every git call and would bury the answer. A `.git`
+ * that is a file (a worktree's gitfile) is recorded like any file; a `.git` anywhere below the root
+ * (a nested repository, or one behind a link) is left out whole. A `skip` directory (the workspace) is left
  * out when a directory IS it, by its spelled path or its realpath — never what lies under it,
  * since in the workspace-local layout a local project contains the workspace and the workspace
  * holds other clones a project link can reach into, and the build writes through such a link like
@@ -508,8 +679,54 @@ export async function snapshotSource(
     skip.has(spelled) || skipReal.has(real) || under.some((t) => isWithin(real, t));
   // Realpaths of every directory walked (or being walked): a link back into one is not re-walked.
   const walked = new Set<string>();
+  type Descend = (dir: string, real: string, relDir: string) => Promise<boolean>;
+  // One entry `name` of `dir` (whose realpath is `real`), recorded and — a directory, or a link
+  // to one — descended into with `descend`. A real directory is recorded as `dir` unless
+  // `markDir` is false (the root's `.git`, whose watched children carry every change). False when
+  // the entry cap was hit.
+  const visit = async (
+    dir: string,
+    real: string,
+    relDir: string,
+    name: string,
+    kind: EntryKind,
+    descend: Descend,
+    markDir = true,
+  ): Promise<boolean> => {
+    const abs = path.join(dir, name);
+    if (kind === 'dir' && skipped(path.resolve(abs), path.join(real, name))) return true;
+    if (entries.size >= max) return false;
+    const rel = relDir === '' ? name : `${relDir}/${name}`;
+    if (kind === 'dir') {
+      if (markDir) entries.set(rel, 'dir');
+      return descend(abs, path.join(real, name), rel);
+    }
+    const own = statSignature(kind, await at(rel, () => lstat(abs, { bigint: true })));
+    if (kind === 'file') {
+      entries.set(rel, own);
+      return true;
+    }
+    let target;
+    try {
+      target = await stat(abs, { bigint: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new SourceSnapshotError(rel, (err as NodeJS.ErrnoException).code ?? 'unknown error');
+      }
+      entries.set(rel, `${own}->dangling`);
+      return true;
+    }
+    if (!target.isDirectory()) {
+      entries.set(rel, `${own}->${statSignature(target.isFile() ? 'file' : 'other', target)}`);
+      return true;
+    }
+    entries.set(rel, `${own}->dir`);
+    const targetReal = await at(rel, () => realpath(abs));
+    if (walked.has(targetReal) || skipped(path.resolve(abs), targetReal)) return true;
+    return descend(abs, targetReal, rel);
+  };
   // `real` is `dir` through its links; a real entry's realpath is `real` joined with its name.
-  const walk = async (dir: string, real: string, relDir: string): Promise<boolean> => {
+  const walk: Descend = async (dir, real, relDir) => {
     walked.add(real);
     const listing = await at(relDir, () => readdir(dir, { withFileTypes: true }));
     // Any fixed order will do — only that both snapshots use the same one matters. The
@@ -517,44 +734,34 @@ export async function snapshotSource(
     // `<` compares UTF-16 code units, which is fixed.
     listing.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of listing) {
-      if (entry.name === '.git') continue;
-      const abs = path.join(dir, entry.name);
       const kind = kindOf(entry);
       if (kind === undefined) continue;
-      if (kind === 'dir' && skipped(path.resolve(abs), path.join(real, entry.name))) continue;
-      if (entries.size >= max) return false;
-      const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
-      if (kind === 'dir') {
-        entries.set(rel, 'dir');
-        if (!(await walk(abs, path.join(real, entry.name), rel))) return false;
+      if (entry.name === '.git') {
+        // Only the project root's `.git`, and only its narrow, stable part (see GIT_WATCHED). A
+        // `.git` FILE (a worktree's gitfile) is recorded as any file is.
+        if (relDir !== '') continue;
+        if (!(await visit(dir, real, relDir, entry.name, kind, walkGit, false))) return false;
         continue;
       }
-      const own = statSignature(kind, await at(rel, () => lstat(abs, { bigint: true })));
-      if (kind === 'file') {
-        entries.set(rel, own);
-        continue;
-      }
-      let target;
+      if (!(await visit(dir, real, relDir, entry.name, kind, walk))) return false;
+    }
+    return true;
+  };
+  // The project root's `.git` directory: only GIT_WATCHED, each walked in full when it exists.
+  const walkGit: Descend = async (dir, real, relDir) => {
+    walked.add(real);
+    for (const name of GIT_WATCHED) {
+      const rel = `${relDir}/${name}`;
+      let st;
       try {
-        target = await stat(abs, { bigint: true });
+        st = await lstat(path.join(dir, name));
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw new SourceSnapshotError(
-            rel,
-            (err as NodeJS.ErrnoException).code ?? 'unknown error',
-          );
-        }
-        entries.set(rel, `${own}->dangling`);
-        continue;
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw new SourceSnapshotError(rel, (err as NodeJS.ErrnoException).code ?? 'unknown error');
       }
-      if (!target.isDirectory()) {
-        entries.set(rel, `${own}->${statSignature(target.isFile() ? 'file' : 'other', target)}`);
-        continue;
-      }
-      entries.set(rel, `${own}->dir`);
-      const targetReal = await at(rel, () => realpath(abs));
-      if (walked.has(targetReal) || skipped(path.resolve(abs), targetReal)) continue;
-      if (!(await walk(abs, targetReal, rel))) return false;
+      const kind = kindOf(st);
+      if (kind === undefined) continue;
+      if (!(await visit(dir, real, relDir, name, kind, walk))) return false;
     }
     return true;
   };
@@ -626,7 +833,9 @@ export const SOURCE_CHANGES_NAMES_BUDGET = 2000;
  * them, and what to do. Names are given in order while there are fewer than
  * {@link SOURCE_CHANGES_NAMED} and their rendered list fits {@link SOURCE_CHANGES_NAMES_BUDGET};
  * naming stops at the first that does not fit, so the named set is a prefix, and the rest are
- * counted. A name is never cut short: a truncated path cannot be passed to a tool.
+ * counted. A name is never cut short: a truncated path cannot be passed to a tool. When a changed
+ * path is the project root's `.git` or under it, a fixed sentence says that status, diff and
+ * discard do not reach it and that the next git command runs or reads it.
  */
 export function sourceChangedHint(paths: string[]): string {
   const named: string[] = [];
@@ -651,7 +860,13 @@ export function sourceChangedHint(paths: string[]): string {
     'tectonic, which restricts no path — or the files were edited by hand meanwhile. Review them ' +
     '(status, diff) and restore what you did not mean to change (discard); a path under a ' +
     "symbolic link, or a link whose target changed, was written at the link's target — check it " +
-    'there; a target outside the project is beyond what status, diff and discard reach.'
+    'there; a target outside the project is beyond what status, diff and discard reach.' +
+    (paths.some((p) => p === '.git' || p.startsWith('.git/'))
+      ? " A path under .git is the repository's own — its hooks, config or info/ — which " +
+        'status, diff and discard never show or restore, and which the next git command runs or ' +
+        'reads: inspect it by hand, and remove what the build wrote, before any git command runs ' +
+        '(commit, push, project_sync, or your own).'
+      : '')
   );
 }
 
@@ -679,9 +894,11 @@ export async function placeOverlayFile(
     throw new Error(`Not a file path: ${quoteValue(relPosix)}`);
   let farmCur = farmDir;
   let srcCur = path.resolve(projectDir);
+  let relCur = '';
   for (const part of parts) {
     farmCur = path.join(farmCur, part);
     srcCur = path.join(srcCur, part);
+    relCur = relCur === '' ? part : `${relCur}/${part}`;
     let isLink: boolean;
     try {
       isLink = (await lstat(farmCur)).isSymbolicLink();
@@ -706,6 +923,7 @@ export async function placeOverlayFile(
         kind,
         platform,
         budget,
+        `${relCur}/${entry.name}`,
       );
     }
   }
@@ -721,6 +939,13 @@ export interface VariantManifest {
   createdAt: string;
   /** When the variant was last compiled — what retention orders by. */
   usedAt: string;
+  /**
+   * The order variants of this project were compiled in: one more than the largest `seq` any of
+   * its manifests held when this one was staged (under the project lock `compile` holds), so it
+   * breaks a tie between two `usedAt` stamps of the same millisecond. Absent from a manifest
+   * written before it existed, which then sorts oldest among its equal-`usedAt` peers.
+   */
+  seq?: number;
   /** The overlaid files, project-relative POSIX. */
   files: string[];
   compiler: CompilerKind;
@@ -749,6 +974,32 @@ export async function readManifest(file: string): Promise<VariantManifest | unde
   } catch {
     return undefined;
   }
+}
+
+/** A manifest's `seq`, when it holds a usable one (a non-negative safe integer). */
+function seqOf(manifest: VariantManifest | undefined): number | undefined {
+  const seq = manifest?.seq;
+  return typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : undefined;
+}
+
+/** Every variant of the project with its manifest (undefined when unreadable), handle order. */
+async function readAllManifests(
+  projectDir: string,
+): Promise<Array<{ handle: string; manifest: VariantManifest | undefined }>> {
+  let names: string[];
+  try {
+    names = await readdir(variantsDir(projectDir));
+  } catch {
+    return [];
+  }
+  const out: Array<{ handle: string; manifest: VariantManifest | undefined }> = [];
+  for (const name of names.filter(isVariantHandle).sort()) {
+    out.push({
+      handle: name,
+      manifest: await readManifest(variantPaths(projectDir, name).manifest),
+    });
+  }
+  return out;
 }
 
 export async function writeManifest(file: string, manifest: VariantManifest): Promise<void> {
@@ -790,7 +1041,8 @@ export function evictionFailureHint(err: unknown): string {
 
 /**
  * Keep `keep` variants of the project — `current` always among them, then the most recently
- * compiled by manifest `usedAt` (an unreadable manifest counts as oldest) — and remove the rest. Only
+ * compiled by manifest `usedAt`, ties broken by `seq` (an unreadable manifest counts as oldest, and
+ * one without `seq` as oldest among its equal-`usedAt` peers) — and remove the rest. Only
  * directories named like a handle are considered. Removal is `rm -rf`, which unlinks a farm's
  * links without following them, so the source behind them is never touched. Every handle is
  * tried: one that cannot be removed (a viewer holding its PDF open on Windows) does not keep the
@@ -802,19 +1054,15 @@ export async function evictVariants(
   keep: number,
   current: string,
 ): Promise<string[]> {
-  let names: string[];
-  try {
-    names = await readdir(variantsDir(projectDir));
-  } catch {
-    return [];
-  }
-  const others: Array<{ handle: string; usedAt: string }> = [];
-  for (const name of names) {
-    if (!isVariantHandle(name) || name === current) continue;
-    const manifest = await readManifest(variantPaths(projectDir, name).manifest);
-    others.push({ handle: name, usedAt: manifest?.usedAt ?? '' });
-  }
-  others.sort((a, b) => (a.usedAt < b.usedAt ? 1 : a.usedAt > b.usedAt ? -1 : 0));
+  const others = (await readAllManifests(projectDir))
+    .filter(({ handle }) => handle !== current)
+    .map(({ handle, manifest }) => ({
+      handle,
+      usedAt: manifest?.usedAt ?? '',
+      seq: seqOf(manifest) ?? -1,
+    }));
+  // Newest first: by `usedAt`, and within one millisecond by `seq` — never by listing order.
+  others.sort((a, b) => (a.usedAt < b.usedAt ? 1 : a.usedAt > b.usedAt ? -1 : b.seq - a.seq));
   const removed: string[] = [];
   const failures: Array<{ handle: string; reason: string }> = [];
   for (const { handle } of others.slice(Math.max(0, keep - 1))) {
@@ -847,6 +1095,8 @@ export async function readVariant(
  * The variant a PDF tool (`render_pages`, `extract_text`, `pdf_geometry`) was asked to read: its
  * root file and build paths. Refuses an invalid handle, a variant that is gone, and a `rootFile`
  * other than the one it was compiled with. Never falls back to the main build or the surfaced PDF.
+ * Verifies the build root first ({@link ensureBuildRoot}), so every read under the variant — its
+ * manifest, PDF, `.aux`, `.log` — and every `render/` write follows a judged root.
  */
 export async function resolveVariantBuild(
   projectDir: string,
@@ -854,6 +1104,9 @@ export async function resolveVariantBuild(
   handle: string,
   rootFile: string | undefined,
 ): Promise<{ rootFile: string; paths: VariantPaths }> {
+  // Before the manifest is read: a variant lives under the build root, which is judged here as a
+  // compile judges it (#215), or a root planted as a link would serve a forged build.
+  await ensureBuildRoot();
   if (!isVariantHandle(handle)) {
     throw new Error(
       `Not a variant handle: ${quoteValue(handle)}. Pass \`variant\` exactly as compile returned ` +
@@ -892,8 +1145,10 @@ export interface OverlayReader {
  *
  * Refused, before anything is read: more than {@link MAX_OVERLAY_EDITS} edits in total, a path
  * that is empty or leaves the project, a latexmk rc file (`latexmkrc`, `.latexmkrc` — Perl latexmk
- * runs from the farm), and a file named twice — after normalisation, and under the
- * platform's case fold (win32, darwin). Refused per file, naming it: a file that does not exist,
+ * runs from the farm; its name compared case-insensitively on every filesystem), and a file named
+ * twice — after normalisation, and case-folded when the filesystem the variant is built on is
+ * case-insensitive ({@link CaseProbe}, run in the project's variants directory: that is where the
+ * two would collide). Refused per file, naming it: a file that does not exist,
  * one that is the same directory entry or hard-linked file as an earlier entry (`Main.tex` beside
  * `main.tex` on a case-insensitive filesystem, wherever it runs: both would be applied to the
  * original and only the second would reach the farm, silently losing the first one's edits), one
@@ -904,9 +1159,8 @@ export async function applyOverlay(
   files: OverlayReader,
   projectDir: string,
   overlay: OverlayEntry[],
-  opts: { platform?: NodeJS.Platform } = {},
+  opts: { platform?: NodeJS.Platform; caseProbe?: CaseProbe } = {},
 ): Promise<Map<string, string>> {
-  const platform = opts.platform ?? process.platform;
   const sameFile = (i: number, rel: string, j: number, earlier: string) =>
     new Error(
       `Overlay entry ${i + 1} names ${quoteId(rel)}, the same file as entry ${j + 1} ` +
@@ -921,6 +1175,14 @@ export async function applyOverlay(
   }
   const normalized: string[] = [];
   const seen = new Map<string, number>();
+  // Two names are one overlay when the FARM would hold them as one entry — the farm is where each
+  // overlaid file is written, and a second placement would replace the first. The project's own
+  // filesystem is answered below, by identity (one entry, or one hard-linked file). Not probed for
+  // a single entry: one file cannot collide with itself.
+  const fold =
+    overlay.length > 1
+      ? await nameFoldFor(variantsDir(projectDir), opts)
+      : (name: string): string => name;
   for (const [i, entry] of overlay.entries()) {
     const abs = resolveInside(projectDir, entry.file);
     const rel = toPosix(path.relative(path.resolve(projectDir), abs));
@@ -930,7 +1192,7 @@ export async function applyOverlay(
     // latexmk reads `latexmkrc`/`.latexmkrc` from the directory it runs in — the farm — and runs
     // it as Perl, whatever the shell-escape flags say, so an overlaid one could write the source
     // through the farm's links. The project's own rc file still runs, as in a normal compile.
-    if (LATEXMK_RC_NAMES.has(foldName(path.posix.basename(rel), platform))) {
+    if (LATEXMK_RC_NAMES.has(foldCaseName(path.posix.basename(rel)))) {
       throw new Error(
         `Overlay entry ${i + 1} (${quoteId(rel)}) is a latexmk configuration file, which latexmk ` +
           'runs as Perl code, so an overlay may not replace it: the variant builds among links to ' +
@@ -938,9 +1200,10 @@ export async function applyOverlay(
           '(edit_file) and compile without overlay, or overlay the .tex files instead.',
       );
     }
-    const earlier = seen.get(foldName(rel, platform));
+    const key = fold(rel);
+    const earlier = seen.get(key);
     if (earlier !== undefined) throw sameFile(i, rel, earlier, normalized[earlier]!);
-    seen.set(foldName(rel, platform), i);
+    seen.set(key, i);
     normalized.push(rel);
   }
   const identities = new Map<string, number>();
@@ -993,8 +1256,8 @@ export async function applyOverlay(
         throw new Error(`${where}: no such file in the project. An overlay edits existing files.`);
       }
     }
-    // The fold above only knows the platform's DEFAULT; this knows the filesystem. Two names for
-    // one directory entry (or one hard-linked file) must not be overlaid twice.
+    // The fold above knows the FARM's filesystem; this knows the project's. Two names for one
+    // directory entry (or one hard-linked file) must not be overlaid twice.
     const identity = await entryIdentity(resolveInside(projectDir, rel));
     if (identity !== undefined) {
       const j = identities.get(identity);
@@ -1014,14 +1277,6 @@ export async function applyOverlay(
     out.set(rel, content);
   }
   return out;
-}
-
-/**
- * Whether a `path.relative` result climbs out of its base: `..` as a whole first segment only, so a
- * directory named `..foo` inside the base is not taken for its parent. Pure.
- */
-function climbsOut(rel: string): boolean {
-  return rel === '..' || rel.startsWith(`..${path.sep}`);
 }
 
 /** Whether absolute `p` is `dir` or lies under it, judged on the strings as given. Pure. */
@@ -1156,8 +1411,9 @@ export async function refuseLinkedRootDir(
  * be built as a variant ({@link refuseLinkedRootDir}; `compile` has already called it before
  * reading the overlay, and it is called again here so no caller stages around it).
  * The farm and every placement share ONE {@link FarmBudget}, so the entry and copy caps bound the
- * whole stage. Writing the manifest stamps `usedAt`: this is what makes a variant the most
- * recently compiled for {@link evictVariants}.
+ * whole stage. Writing the manifest stamps `usedAt` and the next `seq` (read from every manifest of
+ * the project, so the caller must hold the project lock, as `compile` does): this is what makes a
+ * variant the most recently compiled for {@link evictVariants}.
  */
 export async function stageVariant(opts: {
   projectDir: string;
@@ -1172,6 +1428,8 @@ export async function stageVariant(opts: {
   maxFarmEntries?: number;
   maxFarmCopyBytes?: number;
 }): Promise<VariantPaths> {
+  // Self-contained, whoever calls it: the farm is created under the build root (#215).
+  await ensureBuildRoot();
   await refuseLinkedRootDir(opts.projectDir, opts.rootFile, { platform: opts.platform });
   const paths = variantPaths(opts.projectDir, opts.handle);
   await mkdir(paths.root, { recursive: true });
@@ -1194,10 +1452,14 @@ export async function stageVariant(opts: {
   await mkdir(paths.out, { recursive: true });
   const previous = await readManifest(paths.manifest);
   const now = (opts.now ?? new Date()).toISOString();
+  const seq =
+    Math.max(-1, ...(await readAllManifests(opts.projectDir)).map((v) => seqOf(v.manifest) ?? -1)) +
+    1;
   await writeManifest(paths.manifest, {
     rootFile: normalizeRelPosix(opts.rootFile),
     createdAt: previous?.createdAt ?? now,
     usedAt: now,
+    seq,
     files: [...opts.contents.keys()],
     compiler: opts.compiler,
     engine: opts.engine,
@@ -1214,17 +1476,26 @@ export async function stageVariant(opts: {
  * of `Sections/B.tex` on a case-insensitive filesystem). Reading that spelling from disk would
  * number the ORIGINAL file's lines with the variant's line numbers, so a path that is the same
  * directory entry as an overlaid file is served the overlay when the two names are equal under
- * the platform's case fold, and otherwise (a hard link, or a fold this platform does not apply)
- * its snippet is withheld — the read throws, which `readSourceLines` counts as unreadable.
+ * the case fold of the filesystem the variant was built on — the name TeX opened in the farm then
+ * WAS the overlaid file ({@link CaseProbe}, run in the project's variants directory) — and
+ * otherwise (a hard link, or a case variant a case-sensitive farm held apart) its snippet is
+ * withheld — the read throws, which `readSourceLines` counts as unreadable.
  */
 export function overlaySnippetReader(
   files: SnippetReader,
   contents: Map<string, string>,
-  opts: { platform?: NodeJS.Platform } = {},
+  opts: { platform?: NodeJS.Platform; caseProbe?: CaseProbe } = {},
 ): SnippetReader {
-  const platform = opts.platform ?? process.platform;
-  const byFold = new Map<string, string>();
-  for (const rel of contents.keys()) byFold.set(foldName(rel, platform), rel);
+  let byFold: { fold: (name: string) => string; names: Map<string, string> } | undefined;
+  const foldedAs = async (projectDir: string, key: string): Promise<string | undefined> => {
+    if (byFold === undefined) {
+      const fold = await nameFoldFor(variantsDir(projectDir), opts);
+      const names = new Map<string, string>();
+      for (const rel of contents.keys()) names.set(fold(rel), rel);
+      byFold = { fold, names };
+    }
+    return byFold.names.get(byFold.fold(key));
+  };
   let identities: Map<string, string> | undefined;
   const overlaidAs = async (projectDir: string, key: string): Promise<string | undefined> => {
     if (contents.has(key)) return key;
@@ -1245,7 +1516,7 @@ export function overlaySnippetReader(
     }
     const same = identities.get(identity);
     if (same === undefined) return undefined;
-    if (byFold.get(foldName(key, platform)) === same) return same;
+    if ((await foldedAs(projectDir, key)) === same) return same;
     throw new Error(
       `${quoteId(key)} is the overlaid file ${quoteId(same)} under another name; its snippet is ` +
         'withheld rather than read from the unedited file on disk.',
@@ -1343,9 +1614,8 @@ export async function overlayFilesNeverRead(
   paths: VariantPaths,
   rootFile: string,
   files: string[],
-  opts: { platform?: NodeJS.Platform; maxBytes?: number } = {},
+  opts: { platform?: NodeJS.Platform; caseProbe?: CaseProbe; maxBytes?: number } = {},
 ): Promise<string[] | undefined> {
-  const platform = opts.platform ?? process.platform;
   const stem = path.basename(rootFile).replace(/\.tex$/, '');
   const text = await readWholeBuildFile(
     path.join(paths.out, `${stem}.fls`),
@@ -1360,9 +1630,10 @@ export async function overlayFilesNeverRead(
   );
   if (fdb === undefined) return undefined;
   const sources = fdb === null ? [] : parseFdbSources(fdb);
-  const read = new Set(
-    [...inputs, ...sources].map((input) => foldName(path.resolve(pwd, input), platform)),
-  );
+  // The names were opened in the farm, so the farm's filesystem says whether `sections/b.tex`
+  // opened an overlay placed as `Sections/B.tex` — on a case-sensitive one it did not.
+  const fold = await nameFoldFor(path.dirname(paths.root), opts);
+  const read = new Set([...inputs, ...sources].map((input) => fold(path.resolve(pwd, input))));
   // The engine records its cwd as getcwd() reports it — through any link in the temp dir's own
   // path (macOS: /var -> /private/var) — so both spellings of the farm are tried.
   let realFarm = paths.src;
@@ -1372,9 +1643,7 @@ export async function overlayFilesNeverRead(
     // keep the spelling we have
   }
   return files.filter((rel) =>
-    [paths.src, realFarm].every(
-      (farm) => !read.has(foldName(path.resolve(farm, ...rel.split('/')), platform)),
-    ),
+    [paths.src, realFarm].every((farm) => !read.has(fold(path.resolve(farm, ...rel.split('/'))))),
   );
 }
 

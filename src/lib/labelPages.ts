@@ -85,10 +85,18 @@
  *     shipout mark beside a PDF that has pages — TeX writes one for every page it ships — so every
  *     label of such a build is refused as well (`'nothingShipped'`, {@link shippedNothing}).
  *     A document that writes mark-shaped text into the log before the point it stops at
- *     (`\message{[1]}` in the preamble) gets past this: the list is not empty, the length check
- *     turns the shipout check off, and the lookup answers as it did before this refusal existed —
- *     for a `resize to` build, a page late. No text rule can close that, since every log signal
- *     is document-writable; the document's author has to write it.
+ *     (`\message{[1]}` in the preamble) gets past that refusal: the list is not empty, and the
+ *     shipout check behind the routes then runs on the forged marks when their count happens to
+ *     equal the PDF's pages (one forged `[1]` beside a one-page earlier PDF), or is switched off
+ *     when it does not — either way the lookup would answer as it did before the refusal existed.
+ *     What still refuses that build is the engine's own closing line in the `.log` ("No pages of
+ *     output.", or "no output PDF file produced"), which a pdfTeX or XeTeX document cannot write
+ *     after (`'stalePdf'`, {@link staleBuildEvidence}; under LuaTeX a `stop_run` callback can).
+ *     The same refusal covers a compile that stopped AFTER rewriting the `.aux` (#220): xelatex
+ *     on an error in the body writes a new `.aux` and `.log`, xdvipdfmx never runs, and the
+ *     earlier run's PDF stays — the marks are the new run's and may even number the old PDF's
+ *     pages. There the `.aux` is newer than the PDF (a finished compile writes it first), or the
+ *     closing line's page count is not the PDF's.
  *
  *  3. **Without `/PageLabels` the conversion is inferred, then CHECKED, and refused unless the
  *     check passes.** `getPageLabels()` returning `null` is the COMMON case, not an error: a
@@ -254,7 +262,7 @@
  *     feature exists to prevent.
  */
 
-import type { AuxFloatsResult, AuxLabel } from './auxFloats.js';
+import type { AuxFloatsResult, AuxLabel, EngineOutput } from './auxFloats.js';
 import type { PdfRenderService } from '../services/pdfRender.js';
 
 /**
@@ -324,13 +332,18 @@ export interface ResolvedLabel {
  * ({@link shippedNothing}): the `.log` (and
  * the `.fls`) are not that PDF's run, so their pgfpages evidence says nothing about it — the
  * caller must fix what stopped the last compile and compile again, or pass `pages:`.
+ * `'stalePdf'` means the same for a build whose records show that the PDF is not the output of
+ * the LAST compile ({@link staleBuildEvidence}: the `.aux` is newer than the PDF, or the engine's
+ * closing record in the `.log` disagrees with the PDF's page count) — the `.aux`, or the `.log`
+ * whose evidence the lookup rests on, describes a run whose PDF was never written, so the caller
+ * must fix what stopped the last compile and compile again, or pass `pages:`.
  *
  * Which reasons are even reachable depends on how the plan was resolved: `'notAPageNumber'`,
  * `'renumbered'`, `'restarted'`, `'slideMismatch'` and `'unverifiedPage'` belong to the inferred
  * fallback (which a beamer deck always takes),
  * `'printedPageAbsent'` and `'ambiguousPrintedPage'` to the `/PageLabels` lookup. `'notFound'`,
- * `'multiplyDefined'`, `'pgfpagesLayout'`, `'pgfpagesUnknown'` and `'nothingShipped'` belong to
- * both — and so does
+ * `'multiplyDefined'`, `'pgfpagesLayout'`, `'pgfpagesUnknown'`, `'nothingShipped'` and `'stalePdf'`
+ * belong to both — and so does
  * `'unverifiedPage'` with `'shipoutMismatch'`, the one unverified reason the lookup can reach.
  *
  * None of this reaches a tool's `structuredContent`: a failure refuses the call, and only the
@@ -346,6 +359,7 @@ export type LabelFailureReason =
   | 'pgfpagesLayout'
   | 'pgfpagesUnknown'
   | 'nothingShipped'
+  | 'stalePdf'
   | 'printedPageAbsent'
   | 'ambiguousPrintedPage'
   | 'unverifiedPage';
@@ -413,8 +427,8 @@ export interface LabelFailure {
   printedPages?: string[];
   /** `'multiplyDefined'` only: how many further records the cap left out of the list. */
   printedPagesOmitted?: number;
-  /** `'unverifiedPage'`, `'slideMismatch'`, `'pgfpagesLayout'`, `'pgfpagesUnknown'` and
-   *  `'nothingShipped'` only: the label's number as the `.aux` records it
+  /** `'unverifiedPage'`, `'slideMismatch'`, `'pgfpagesLayout'`, `'pgfpagesUnknown'`,
+   *  `'nothingShipped'` and `'stalePdf'` only: the label's number as the `.aux` records it
    *  (the first field of `\newlabel`). Not checked against anything — it is echoed so the
    *  refusal can tell the caller what to search `extract_text`'s output for. */
   number?: string;
@@ -514,6 +528,98 @@ export interface LabelPagePlan {
    *  exactly `pageCount` pages ({@link shipoutVerdict}) — so {@link labelResolutionNote} can say
    *  what was checked. Absent when it was not. */
   shipoutsChecked?: true;
+  /** The records behind a `'stalePdf'` failure ({@link staleBuildEvidence}), so the refusal can
+   *  say what they show. Set whenever they show it, on either route. */
+  stalePdf?: StalePdfEvidence;
+}
+
+/**
+ * How much newer than the PDF the `.aux` may be before the two are taken for different runs.
+ * Measured by hand with TeX Live 2026 under latexmk 4.88 on Linux (ext4) — no test reproduces
+ * these numbers; `test/unit/stalePdf.test.ts` pins the decision against staged timestamps: every
+ * finished build — pdflatex, lualatex and xelatex; a first build with a bibtex cycle and a rerun,
+ * an up-to-date no-op, a comment-only edit, a body edit, a new label forcing a rerun, and a
+ * recompile after a failure — left the `.aux` OLDER than the PDF (by 8 to 684 ms), since LaTeX
+ * closes the `.aux` in `\enddocument` before the engine finishes the PDF and before xdvipdfmx
+ * runs. Every build that left the earlier PDF beside a new `.aux` — xelatex stopped by a fatal
+ * error in the body, shipping fewer pages or as many, and xelatex finishing with an ordinary error,
+ * after which latexmk does not run xdvipdfmx — left it NEWER, by 852 to 984 ms with the two
+ * compiles back to back. That gap cannot be shorter than the second run itself, from start-up to
+ * the `.aux` it closes as it stops (a trivial xelatex document takes 0.5 s on the machine
+ * measured). So the tolerance only has to absorb what is not the engine's order at all — a
+ * filesystem's coarse timestamps, a clock tick, files a test stages by hand — and 250 ms sits
+ * well clear of both measured ranges.
+ */
+export const STALE_PDF_TOLERANCE_MS = 250;
+
+/**
+ * What a build's records show against the PDF a lookup would use — each field present only when
+ * it shows that PDF is not the output of the last compile:
+ *  - `auxNewerByMs` — the `.aux` was written this many milliseconds after the PDF, past
+ *    {@link STALE_PDF_TOLERANCE_MS};
+ *  - `logOutput` — the engine's closing record in the `.log` (`AuxFloatsResult.engineOutput`),
+ *    when it names a page count other than the PDF's, or says the run produced no output while
+ *    the PDF has pages.
+ * `pageCount` is the PDF's, when it was known, for the refusal to name.
+ */
+export interface StalePdfEvidence {
+  auxNewerByMs?: number;
+  logOutput?: EngineOutput;
+  pageCount?: number;
+}
+
+/**
+ * The records showing that the PDF beside the build is not the output of the LAST compile — the
+ * run that wrote the `.aux` (signal one) or the `.log` (signal two; every run rewrites it) — or
+ * `undefined` when none does. Two signals, either one enough, neither of which the
+ * document can write:
+ *
+ *  - **The files' order** (`aux.buildTimes`). A finished compile writes its `.aux` before its PDF
+ *    (LaTeX closes the `.aux` in `\enddocument`; pdfTeX and LuaTeX finish the PDF after that, and
+ *    latexmk runs xdvipdfmx over XeTeX's `.xdv` after that). An `.aux` newer than the PDF, past
+ *    {@link STALE_PDF_TOLERANCE_MS}, is a later run's that never produced a PDF. The case this
+ *    exists for (#220): xelatex stopped by an error in the BODY writes a new `.aux` and `.log`,
+ *    and xdvipdfmx never runs, so the earlier run's PDF stays — and the shipout marks number
+ *    what the new run shipped, which may be as many pages as the old PDF has. The document cannot
+ *    set a file's time; it can only write a file, and writing the PDF would make that file its
+ *    own output.
+ *  - **The engine's closing record** (`aux.engineOutput`, {@link parseEngineOutput}): the last
+ *    thing the engine writes into the `.log` is how many pages it wrote, or that it wrote none. A
+ *    count other than the PDF's, or "none" beside a PDF with pages, is another run's record. This
+ *    one needs no clock: it also catches a stale PDF whose timestamps a coarse filesystem made
+ *    equal, and a run that stopped in the preamble after writing mark-shaped text
+ *    (`\message{[1]}`), which gets past {@link shippedNothing} but still closes with "no output".
+ *    A document can write a line of the same shape only BEFORE the engine's closing one (except
+ *    under LuaTeX, whose `stop_run` callback runs Lua after it), and the last one is taken.
+ *
+ * Both only ever REFUSE: absent records (`buildTimes` or `engineOutput` undefined — no PDF path
+ * given, a file that could not be stat'd, a log that could not be read or holds no closing
+ * record, as a run killed before it closed leaves) add nothing. `pdf.pageCount` is the PDF's
+ * page count when known; `pdf.hasPages` stands in for it when it is not (a PDF that exists: no
+ * engine writes one for a run that shipped nothing).
+ */
+export function staleBuildEvidence(
+  aux: AuxFloatsResult,
+  pdf: { pageCount?: number; hasPages: boolean },
+): StalePdfEvidence | undefined {
+  const evidence: StalePdfEvidence = {};
+  const times = aux.buildTimes;
+  if (times) {
+    const newer = times.auxMs - times.pdfMs;
+    if (newer > STALE_PDF_TOLERANCE_MS) evidence.auxNewerByMs = Math.round(newer);
+  }
+  const out = aux.engineOutput;
+  if (out) {
+    const disagrees =
+      out.kind === 'written'
+        ? pdf.pageCount !== undefined && out.pages !== pdf.pageCount
+        : pdf.pageCount !== undefined
+          ? pdf.pageCount >= 1
+          : pdf.hasPages;
+    if (disagrees) evidence.logOutput = out;
+  }
+  if (evidence.auxNewerByMs === undefined && evidence.logOutput === undefined) return undefined;
+  return pdf.pageCount === undefined ? evidence : { ...evidence, pageCount: pdf.pageCount };
 }
 
 /**
@@ -582,8 +688,9 @@ export function buildPageLabelIndex(
  * layout passes that test — so a deck always takes the printed-page route (`'beamer'`), where a
  * footline printing the slide number is what resolves it. Both layouts are refused before that
  * wherever the build's records name `pgfpages` (`'pgfpagesLayout'`), and so is every label of a
- * build whose records cannot be read (`'pgfpagesUnknown'`) or whose `.log` shipped no page beside
- * a PDF that has pages (`'nothingShipped'`); where the records were read and are
+ * build whose records cannot be read (`'pgfpagesUnknown'`), whose `.log` shipped no page beside
+ * a PDF that has pages (`'nothingShipped'`), or whose records show the PDF is not the output of
+ * the last compile (`'stalePdf'`); where the records were read and are
  * wrong, the second layout, whose footline prints the TRUE slide numbers, is still refused by
  * beamer's own slide record ({@link slideMismatch}).
  */
@@ -646,8 +753,9 @@ export function findNumberingRestart(floats: readonly AuxLabel[]): NumberingRest
  * two apart. Only a build whose records were read and name no `pgfpages`
  * (`AuxFloatsResult.pgfpages === false`) reaches this check — one whose `.fls` or `.log` names it
  * is refused as `'pgfpagesLayout'` first, one whose records could not be read as
- * `'pgfpagesUnknown'`, and one whose `.log` shipped no page beside a PDF with pages as
- * `'nothingShipped'` — so what it catches is what the records cannot show: an
+ * `'pgfpagesUnknown'`, one whose `.log` shipped no page beside a PDF with pages as
+ * `'nothingShipped'`, and one whose PDF is not the `.aux`'s run's as `'stalePdf'` — so what it
+ * catches is what the records cannot show: an
  * `allowframebreaks` label, and a pgfpages shift only if the records were wrong.
  *
  * A label with NO record (a `\newlabel` some package writes itself, e.g. `lastpage`'s
@@ -904,8 +1012,13 @@ export function planLabelPages(
   const pageCount = evidence?.pageCount;
   const shipoutsChecked = usableShipouts(aux, pageCount) !== undefined;
   const nothingShipped = shippedNothing(aux, (pageCount ?? 0) >= 1);
+  const stalePdf = staleBuildEvidence(aux, {
+    ...(pageCount === undefined ? {} : { pageCount }),
+    hasPages: (pageCount ?? 0) >= 1,
+  });
   const verdicts = {
     labelSource,
+    ...(stalePdf ? { stalePdf } : {}),
     ...(pageCount === undefined ? {} : { pageCount }),
     ...(shipoutsChecked ? { shipoutsChecked: true as const } : {}),
     renumberedBy,
@@ -971,15 +1084,32 @@ export function planLabelPages(
       continue;
     }
     if (nothingShipped) {
-      // The .log that said `false` above records a compile that shipped no page, beside a PDF
-      // that has pages: it is not that PDF's run (a preamble error leaves the earlier run's .aux
-      // and PDF, and rewrites the .log and .fls before either names pgfpages), so its evidence
-      // says nothing about this build — and the shift it would rule out is invisible to both
-      // routes. After the two pgfpages reasons, which already refuse every label: this one only
-      // ever adds a refusal where they would have let the routes run.
+      // The records that said `false` above (the .log, or the .fls when the .log is empty) sit
+      // beside a .log that holds no shipout mark — a compile that shipped no page, or an empty
+      // file — while the PDF has pages: they are not that PDF's run (a preamble error leaves the
+      // earlier run's .aux and PDF, and rewrites the .log and .fls before either names
+      // pgfpages), so their evidence says nothing about this build — and the shift it would rule
+      // out is invisible to both routes. After the two pgfpages reasons, which already refuse
+      // every label: this one only ever adds a refusal where they would have let the routes run.
       failed.push({
         label,
         reason: 'nothingShipped',
+        printedPage: entry.page,
+        number: entry.number,
+      });
+      continue;
+    }
+    if (stalePdf) {
+      // The build's records show the PDF beside the .aux is not the last compile's output
+      // (staleBuildEvidence): the .aux is newer than the PDF, or the .log's closing record names
+      // another page count or no output at all — either record alone refuses. Then the .aux and
+      // the PDF may describe different runs, so neither route can check a page against the PDF it
+      // has — a folio or a /PageLabels entry of the OLD document can confirm a page the new one
+      // moved. After nothingShipped, whose message is the more specific one for the preamble
+      // stop both can see; like it, this only ever adds a refusal.
+      failed.push({
+        label,
+        reason: 'stalePdf',
         printedPage: entry.page,
         number: entry.number,
       });
@@ -1200,12 +1330,16 @@ function usableShipouts(
  * `\foo [1`, and a line starting with `\` is skipped as a box display's. That refuses every label
  * of a build that would have resolved — never resolves one — and needs every page's mark lost:
  * with a second page, a lone surviving mark numbers too few pages and the check is simply off.
- * The other residual goes the unsafe way: a document that writes mark-shaped text into the log
- * before the point it stops at (`\message{[1]}` in the preamble, confirmed with real latexmk)
- * leaves the list non-empty, so this does not fire, the length check turns the shipout check off,
- * and the lookup gives the answer it gave before this refusal existed — for a `resize to` build,
- * a page late. No text rule can close that, since every log signal is document-writable; the
- * author has to write it (no real preamble among 338 logs held a mark).
+ * The other residual goes the unsafe way for THIS refusal: a document that writes mark-shaped
+ * text into the log before the point it stops at (`\message{[1]}` in the preamble, confirmed with
+ * real latexmk) leaves the list non-empty, so this does not fire. The shipout check behind the
+ * routes then runs on the forged marks when their count equals the PDF's pages (one forged `[1]`
+ * beside a one-page earlier PDF) and is off when it does not, so either way it adds nothing the
+ * lookup did not do before this refusal existed. No mark rule can close that, since every mark is
+ * document-writable (no real preamble among 338 logs held one); what closes it is the engine's
+ * closing line, which such a run ends with — "No pages of output." or "no output PDF file
+ * produced" — and which a pdfTeX or XeTeX document cannot write after: `'stalePdf'`
+ * ({@link staleBuildEvidence}).
  */
 export function shippedNothing(aux: AuxFloatsResult, pdfHasPages: boolean): boolean {
   return pdfHasPages && aux.shipouts !== undefined && aux.shipouts.length === 0;
@@ -1315,12 +1449,13 @@ function lastPageVerdict(evidence: LabelPageEvidence): NeighbourFolio | undefine
  * it). Empty unless the build's records were read and name no `pgfpages` (`aux.pgfpages ===
  * false`: every label is refused as `'pgfpagesLayout'` or `'pgfpagesUnknown'` otherwise), empty
  * when that `.log` shipped no page ({@link shippedNothing}: every label is refused as
- * `'nothingShipped'`), and empty when the document shows roman renumbering or an arabic restart,
+ * `'nothingShipped'`), empty when the records show the PDF is not the output of the last compile ({@link staleBuildEvidence}: every label is refused as `'stalePdf'`), and empty when the document shows roman renumbering or an arabic restart,
  * or no label reaches the check, since nothing is checked then.
  */
 export function pagesToVerify(labels: string[], aux: AuxFloatsResult, pageCount: number): number[] {
   if (aux.pgfpages !== false) return [];
   if (shippedNothing(aux, pageCount >= 1)) return [];
+  if (staleBuildEvidence(aux, { pageCount, hasPages: pageCount >= 1 })) return [];
   if (aux.floats.some((entry) => isRomanPage(entry.page))) return [];
   if (findNumberingRestart(aux.floats)) return [];
   const shipouts = usableShipouts(aux, pageCount);
@@ -1536,6 +1671,19 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       );
       continue;
     }
+    if (failure.reason === 'stalePdf') {
+      const number =
+        failure.number && failure.number !== ''
+          ? ` Its number is ${quoteLabel(failure.number)}, if you search for the page yourself.`
+          : '';
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: the .aux records it on printed page ` +
+          `${quoteLabel(failure.printedPage ?? '')}, but the PDF beside it is not the output of ` +
+          `the last compile: ${staleRecordsText(plan.stalePdf)}. No page was assumed.` +
+          number,
+      );
+      continue;
+    }
     if (failure.reason === 'slideMismatch') {
       const slides = (failure.slides ?? []).map(quoteLabel).join(' and ');
       const number =
@@ -1652,9 +1800,24 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
         lastPagePointer(plan),
     );
   }
+  if (plan.failed.some((f) => f.reason === 'stalePdf')) {
+    lines.push(
+      '  The last compile did not produce the PDF on disk — typically it stopped on an error. ' +
+        'Under xelatex, an error in the document body rewrites the .aux and .log and leaves the ' +
+        "earlier run's PDF in place, since xdvipdfmx is never run, so the .aux describes a newer " +
+        "document than the PDF; an error in the preamble leaves the earlier run's .aux as well, " +
+        "but the .log (whose records the lookup relies on) is the stopped run's. Either way the " +
+        "build's records and the PDF are not one run. " +
+        'Fix what stopped it and compile again, then retry; or find the page yourself: search ' +
+        'extract_text\'s output (or pdf_geometry kinds: ["text"]) for the label\'s number and ' +
+        'pass pages:. ' +
+        lastPagePointer(plan),
+    );
+  }
   if (plan.failed.some((f) => f.reason === 'slideMismatch')) {
     // Only a build whose records were read and name no pgfpages reaches 'slideMismatch' (the
-    // others refuse as 'pgfpagesLayout', 'pgfpagesUnknown' or 'nothingShipped' first), so one
+    // others refuse as 'pgfpagesLayout', 'pgfpagesUnknown', 'nothingShipped' or 'stalePdf'
+    // first), so one
     // message fits. It names the usual cause without ruling a shift out: a `false` reading can
     // itself be wrong (see slideMismatch).
     lines.push(
@@ -1710,6 +1873,39 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       'with pdf_geometry kinds: ["floats"] and pass pages: explicitly.',
   );
   return lines.join('\n');
+}
+
+/**
+ * What a build's records show against its PDF ({@link staleBuildEvidence}), as a clause for the
+ * `'stalePdf'` refusal — each record that fired, joined, and nothing claimed that did not.
+ */
+export function staleRecordsText(evidence: StalePdfEvidence | undefined): string {
+  const pdfPages = evidence?.pageCount === undefined ? 'pages' : `${evidence.pageCount} page(s)`;
+  const parts: string[] = [];
+  if (evidence?.auxNewerByMs !== undefined) {
+    parts.push(
+      `the .aux was written ${(evidence.auxNewerByMs / 1000).toFixed(1)} s after the PDF, while ` +
+        'a compile that finishes writes its .aux before its PDF',
+    );
+  }
+  const out = evidence?.logOutput;
+  if (out?.kind === 'written') {
+    parts.push(
+      `the engine's closing line in the .log says that run wrote ${out.pages} page(s)` +
+        `${out.ext ? ` to its ${out.ext} file` : ''}, while the PDF has ${pdfPages}`,
+    );
+  } else if (out?.kind === 'noPages') {
+    parts.push(
+      'the engine\'s closing line in the .log is "No pages of output.", while the PDF has ' +
+        pdfPages,
+    );
+  } else if (out?.kind === 'noPdf') {
+    parts.push(
+      'the engine\'s closing line in the .log is "Fatal error occurred, no output PDF file ' +
+        `produced!", while a PDF with ${pdfPages} is beside it`,
+    );
+  }
+  return parts.length > 0 ? parts.join('; and ') : "the build's records disagree with the PDF";
 }
 
 /** The closing pointer of every refusal that refuses a whole build: the one page a caller can

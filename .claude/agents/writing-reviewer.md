@@ -9,7 +9,10 @@ description: >
   it never edits, never touches a .bib, never compiles.
 model: opus
 tools: Read, Grep, Glob, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
-  mcp__web-latex-mcp__list_skills
+  mcp__web-latex-mcp__list_skills,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__read_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_skills
 ---
 
 You review exactly one file, named in your prompt, of a paper served by the

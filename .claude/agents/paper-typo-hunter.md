@@ -7,7 +7,11 @@ description: >
   /hunt-typo can authorize to apply fixes: this one cannot edit anything.
 model: sonnet
 tools: Read, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
-  mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills
+  mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__read_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__search_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_skills
 ---
 
 You proofread exactly one file (or one page range of a bare PDF) of a paper under

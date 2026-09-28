@@ -28,6 +28,12 @@ works; this command only says who does which part. Where the two could disagree,
 except that the dispatch below replaces its "Single-session workflow". If `list_skills` fails,
 stop and tell me.
 
+**The agents ship with this command.** Installed as the Claude Code plugin, they are named
+`web-latex-mcp:<agent>` (`web-latex-mcp:paper-reviewer`, `web-latex-mcp:review-triage`, …);
+launched from a clone of the server repo, plain `<agent>`. Dispatch whichever your agent list
+shows — they are the same files. If neither is listed, stop and tell me; do not substitute a
+general-purpose agent, which has write tools the panel must not hold.
+
 1. **Resolve the target.** If no project id is given, call `list_projects` and ask me which one —
    do not guess. If `list_projects` shows it `cloned: false`, clone it with `project_sync` and say
    so — that is the one way to get the paper. **Never inspect, fetch from or read any other
@@ -43,7 +49,17 @@ stop and tell me.
    directory under the others. Keep the `pdfPath` and `pageCount`; turn every undefined-reference
    and undefined-citation warning into a `CMP-n` item, and add `check_citations`' keys without an
    entry. If the compile fails, stop and show me the first error — a review of a paper that does
-   not build is a review of the wrong thing. Then pick the run directory
+   not build is a review of the wrong thing.
+
+   **Check which build this is**, as the skill's "Which build is under review" says: a best-effort
+   look at the root file's preamble for the venue's review or anonymous switch. When the switch is
+   **off** (a camera-ready or preprint build), ask me one question before going further — review it
+   as a submission, so anonymity and page-limit findings count, or as camera-ready, so they are
+   informational — and wait for the answer. When it is on, or you cannot tell, do not ask: review
+   it as a submission and say which in the summary. Add the answer to the review context as its
+   `Build:` line.
+
+   Then pick the run directory
    `paper-review.local/<YYYYMMDD-HHMM>/` on the local copy and git-exclude it, exactly as the
    skill's "Where the reports go" says — but **write nothing into it until every panel agent has
    returned** (step 4): the reviewers search the project, and a report or note saved there
@@ -57,7 +73,8 @@ stop and tell me.
    two build `paper.txt`; `Read` needs `pdftoppm` to show a PDF's pages). If any is missing, stop
    and tell me which, with the install line for this OS (`apt-get install poppler-utils`,
    `brew install poppler`, or `conda install -c conda-forge poppler`) — **never install it
-   yourself**; that changes my system. Then skip `compile` and `check_citations`, put the run
+   yourself**; that changes my system. Then skip `compile` and `check_citations` (the build check
+   above reads page 1 instead, as the skill says for a bare PDF), put the run
    directory under the server's workspace as the skill says, copy the PDF there as `paper.pdf`
    (the paper itself is the one thing written before dispatch), and build `paper.txt` from it
    exactly as the skill's "A bare PDF" says — one `=== p.<n> ===` marker per page, so every agent
@@ -121,12 +138,37 @@ stop and tell me.
    running — naming, unless `--no-web`, that the novelty scout is sending search queries out —
    then wait for the completion notifications; do not poll.
 
-4. **Collect — once every panel agent has returned**, not as each one does. Then write the run
-   directory: `context.md` (the review context), `reports/compile.md` (the `CMP` items), each
-   reply to its file, and the typo hunters' findings merged into one `reports/typos.md` table in
-   file order. A reply that starts with `failed:`, is empty, or lacks
-   its format's headings is re-dispatched **once** with the same prompt; if it fails again, note it
-   and carry on.
+4. **Collect — once every panel agent has returned**, not as each one does. A reply that starts
+   with `failed:`, is empty, or lacks its format's headings is re-dispatched **once** with the
+   same prompt; if it fails again, note it and carry on. Then write the run directory:
+   `context.md` (the review context), `reports/compile.md` (the `CMP` items), each reply to its
+   file **verbatim** — exactly as the agent returned it, never re-wrapped, tidied, shortened or
+   completed, since the triage verifies what the reviewers actually wrote — and the typo hunters'
+   findings merged into one `reports/typos.md` table in file order.
+
+   **Then check each saved report against its reply**, because every one was retyped through
+   `write_file` and a long retype can drop or smooth text. `write_file` cannot tell you: its
+   `bytesWritten` counts what you sent, and its diff is empty for a git-excluded path. So check
+   the files, which costs a few small calls rather than a second copy of the panel (for a bare
+   PDF, make the same checks with your own `Grep` and `Read` on the run directory):
+   - one `search_files` over `paper-review.local/<run>/reports` (`regex: true`, pattern
+     `^#{1,6}\s`, `filter: "docs"`) lists every saved heading with its line — for each report,
+     the headings must be the reply's heading lines, verbatim and in the same order, **and each
+     at the same line number as in the reply** (count the reply's lines from 1). Equal heading
+     lines mean every section but the last kept its line count, so a paragraph dropped or merged
+     in the middle of a report fails here;
+   - `read_file` of each report from its last heading to the end (`startLine` = that heading's
+     line) must equal the reply's last section verbatim, since a retype that runs short is cut
+     at the end — and the `totalLines` that same call returns must equal the reply's line count
+     (a final newline is not a line);
+   - `reports/typos.md` must hold one row per finding: `read_file` with `endLine: 1` gives its
+     `totalLines`, and the lines below the table header must number the sum of the hunters'
+     `N findings`.
+
+   Re-save a report that fails any check from the reply, once, and check it again; if it still
+   differs, list it among the missing or malformed reports for step 5 and name it in step 6. This
+   check reads only the run directory, and like every write here it happens after the whole panel
+   has returned.
 
 5. **Triage.** Launch `review-triage` in the foreground with: the project id, the root file, the
    `pdfPath`, the review context, the paths of every saved report, and the list
@@ -141,8 +183,8 @@ stop and tell me.
    Now write `panel.md` — which model each of `R1`–`R3` was. Then, from the triage log: the
    predicted outcome, the top of the author action plan, and every item marked UNVERIFIABLE that I must check myself.
    Close with the panel that actually ran (which model each of `R1`–`R3` was, and any failed
-   agent), the venue assumed, and links to `final-review.md`, `triage-log.md` and
-   `reports/`, and name the exclude file that gained the `paper-review.local/` line, if one did.
+   agent), the venue and the build (submission or camera-ready) assumed, and links to
+   `final-review.md`, `triage-log.md` and `reports/`, and name the exclude file that gained the `paper-review.local/` line, if one did.
    Never upload, publish or share the paper or the reviews anywhere.
 
 To review a revision, run the command again: a new run directory, a fresh panel that never sees

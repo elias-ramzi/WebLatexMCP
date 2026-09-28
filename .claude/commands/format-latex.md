@@ -4,7 +4,9 @@ argument-hint: <project id> [--sections-only|--floats-only|--reflow-only]
 ---
 
 Format the LaTeX project below. You do the serial part (splitting the main file) and the
-guardrail compiles; `formatter` agents do the per-file work in parallel.
+guardrail compiles; `formatter` agents do the per-file work in parallel. The agent ships with
+this command: `web-latex-mcp:formatter` from the Claude Code plugin, `formatter` from a clone
+of the server repo — dispatch whichever your agent list shows.
 
 Target: $ARGUMENTS
 

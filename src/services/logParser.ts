@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { StructuredError } from '../types.js';
+import { climbsOut } from '../lib/paths.js';
 
 /**
  * A diagnostic plus how the parser came by its location. Both extra fields are parser provenance
@@ -85,7 +86,7 @@ function normalizeFile(file: string): string {
 function rebase(file: string, baseDir: string): string {
   if (!baseDir || path.posix.isAbsolute(file) || path.win32.isAbsolute(file)) return file;
   const joined = path.posix.normalize(path.posix.join(baseDir, file));
-  return joined.startsWith('..') ? file : joined;
+  return climbsOut(joined) ? file : joined;
 }
 
 /**
@@ -109,7 +110,10 @@ export function needsShellEscape(log: string): boolean {
 /**
  * pdfTeX/XeTeX's record of a `\write18` it refused: `runsystem(<cmd>)...disabled.` (shell escape
  * off) or `...disabled (restricted).` (a command not on the restricted allow-list). A command that
- * ran logs `...executed.` / `...executed safely (allowed).` instead. LuaTeX logs nothing either way.
+ * ran logs `...executed.` / `...executed safely (allowed).` instead. LuaTeX writes neither: its
+ * record comes from pdftexcmds.lua, `system(<cmd>) executed.` whenever `os.execute` exists — which
+ * under `-no-shell-escape` it does, as a refusing stub — so it is read against the enabled banner;
+ * see {@link luatexCommandRefused}.
  */
 const SHELL_COMMAND_REFUSED = /^runsystem\(.*\)\.\.\.disabled\b/m;
 
@@ -120,6 +124,30 @@ const SHELL_COMMAND_REFUSED = /^runsystem\(.*\)\.\.\.disabled\b/m;
  */
 export function shellCommandRefused(log: string): boolean {
   return SHELL_COMMAND_REFUSED.test(unwrapLines(log).join('\n'));
+}
+
+/**
+ * LuaTeX has no `\write18` of its own: `\ShellEscape` and the `.eps` → `repstopdf` conversion reach
+ * `os.execute` through `pdftexcmds.lua`, which logs `system(<cmd>) executed.` whenever
+ * `os.execute` EXISTS — and under `-no-shell-escape` it does exist, as a stub that refuses. So
+ * `executed.` there says nothing about whether the command ran (TL2026 lualatex, checked: the line
+ * is logged and `fig-eps-converted-to.pdf` is never written). `disabled.` is the other branch,
+ * when `os.execute` is absent altogether. `pipe(<cmd>)` is the same code for `io.popen`.
+ */
+const LUATEX_CALL_EXECUTED = /^(?:system|pipe)\(.*\) executed\./m;
+const LUATEX_CALL_DISABLED = /^(?:system|pipe)\(.*\) disabled\./m;
+
+/**
+ * True when a LuaTeX log shows a shell command that did not run: a `disabled.` record, or an
+ * `executed.` record in a run whose log carries no ` system commands enabled.` banner — the banner
+ * `-no-shell-escape` suppresses and every run with shell escape on (restricted or full) prints.
+ * pdfTeX/XeTeX never write this shape (theirs is `runsystem(...)`, {@link shellCommandRefused}).
+ * A document can forge either line with `\typeout`; that only adds a hint, the harmless direction.
+ */
+export function luatexCommandRefused(log: string): boolean {
+  const text = unwrapLines(log).join('\n');
+  if (LUATEX_CALL_DISABLED.test(text)) return true;
+  return LUATEX_CALL_EXECUTED.test(text) && !shellEscapeWasEnabled(text);
 }
 
 /**

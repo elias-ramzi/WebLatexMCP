@@ -10,7 +10,7 @@
     {
       "name": "web-latex-mcp",
       "source": ".",
-      "description": "Read, edit, compile, and commit LaTeX in any git-hosted project, plus the bundled skills for project cleanup, citation audits, and bibliography normalization.",
+      "description": "Read, edit, compile, and commit LaTeX in any git-hosted project, plus the bundled skills for project cleanup, citation audits, bibliography normalization and peer review, and the paper commands and agents that run them.",
       "version": "0.7.1",
       "author": {
         "name": "Elias Ramzi",

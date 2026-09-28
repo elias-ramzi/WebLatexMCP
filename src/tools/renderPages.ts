@@ -6,7 +6,7 @@ import { errorResult } from '../lib/errors.js';
 import { detectRootFile } from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
-import { buildDir } from '../services/compiler.js';
+import { buildDir, ensureBuildRoot } from '../services/compiler.js';
 import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL, PdfRenderError } from '../services/pdfRender.js';
 import type { RenderResult } from '../services/pdfRender.js';
 import { planInlining } from '../lib/inlineBudget.js';
@@ -86,9 +86,12 @@ const inputSchema = {
         'number (a restart). Ahead of both routes, EVERY label of a build is refused when its ' +
         'records (.fls or .log) name pgfpages.sty or pgfmorepages.sty — a \\pgfpagesuselayout ' +
         'puts every label a page late — when neither record can be read (a missing or empty file ' +
-        'counts as unread), or when the .log holds no [n] shipout mark beside a PDF with pages ' +
+        'counts as unread), when the .log holds no [n] shipout mark beside a PDF with pages ' +
         "(the last compile stopped before its first page, so the .aux and PDF are an earlier run's, " +
-        'or the .log is empty): compile again, or find the page and pass `pages`. Any label that ' +
+        'or the .log is empty), or when the PDF is not the output of the last compile — the ' +
+        ".aux is newer than the PDF, or the engine's closing line in the .log names another " +
+        'page count or no output (under xelatex an error in the body leaves the earlier PDF in ' +
+        'place): compile again, or find the page and pass `pages`. Any label that ' +
         'cannot be resolved refuses the whole call — no page is ever guessed, and nothing ' +
         'partial is rendered. Cannot be combined with `pages`; two labels on one page render it ' +
         `once and both are echoed. At most ${MAX_LABELS_PER_CALL} per call.`,
@@ -312,6 +315,10 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // temp build dir's own "render" subdirectory — for a local (in-place) project this is
           // the difference between reading/editing in place and littering it with PNGs.
           const outDir = v ? v.paths.render : path.join(buildDir(dir), 'render');
+          // The one build-dir write outside compile. Both routes above already judged the root
+          // (locateRootPdf, resolveVariantBuild); checked again at the write itself, so the rule
+          // "anything that creates a build dir goes through ensureBuildRoot" holds here locally.
+          await ensureBuildRoot();
 
           // Label resolution reads the build-dir .aux, which is the very file a peer session's
           // compile rewrites in place — so it belongs INSIDE this runExclusive closure, alongside
@@ -324,9 +331,13 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // base a write on. Same reasoning as pdf_geometry's "floats" kind.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
+            // `pdfPath`: the PDF this lookup pairs with the .aux, whose timestamps are compared
+            // (a finished compile writes the .aux first) — so a build that stopped after
+            // rewriting the .aux is refused rather than looked up in the earlier run's PDF.
             const aux = await readAuxFloats(dir, root, {
               max: LABEL_LOOKUP_MAX,
               shipouts: true,
+              pdfPath,
               ...(v ? { buildDir: v.paths.out } : {}),
             });
             // The PDF's own /PageLabels tree turns "printed page -> page index" from an

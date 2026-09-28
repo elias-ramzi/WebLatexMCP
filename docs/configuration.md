@@ -177,7 +177,29 @@ show up as untracked files in your own repo.
 
 In this mode `compile` also **surfaces the PDF** at `<workspace>/.web_latex_mcp/<project>.pdf` (a
 sibling of the clone, so it never dirties the project's git), so you can open the latest build straight
-from your editor rather than hunting through the temp build dir.
+from your editor rather than hunting through the temp build dir (under `<tmp>/web-latex-mcp-build-<uid>`
+on macOS and Linux — per user, created `0700`, and refused if it is a symbolic link, is not owned by you,
+or is writable by others — and `%TEMP%\web-latex-mcp-build-<user name>` on Windows).
+
+About that temp build dir:
+
+- **The temp directory must exist.** It is `TMPDIR` on macOS and Linux (`/tmp` when unset) and `TEMP`
+  on Windows. The server never creates it: if it names no existing directory, every compile and PDF read
+  is refused with a message naming it — point the variable at an existing directory.
+- **On Windows it is per user by name only.** The user name is in the directory name, so two accounts
+  sharing one `TEMP` (a managed machine with `TEMP=C:\Temp`) never share a build dir by accident. The
+  directory's owner and ACL are **not** verified — only that it is a real directory, not a junction — so
+  under a shared `TEMP` another account could still create `web-latex-mcp-build-<your name>` first, with
+  access for everyone, and the server would accept it: a shared `TEMP` is only as safe as the name. The
+  default `%LOCALAPPDATA%\Temp` is private to you, and there this does not arise. If Windows will not
+  report your user name, the server refuses to build rather than use a shared name.
+- **On macOS and Linux it needs a filesystem with real permission bits.** A `TMPDIR` on WSL's drvfs
+  (`/mnt/c/…`, which reports every file as `0777`), on vfat/exFAT, or on an SMB mount without Unix
+  permissions is refused on every compile and PDF read, because the build dir there reads as writable
+  by everyone and no `chmod` can change that. This is deliberate and permanent — the server fails closed
+  rather than build where another user could swap the PDF — and it is a change from earlier versions,
+  which built there. Point `TMPDIR` at a directory on a native filesystem (on WSL, the default `/tmp`
+  is one).
 
 When the launch dir is **not** a git repo — or is your home directory — the default instead falls back
 to the shared home cache `~/.web-latex-mcp/projects`. This keeps clients whose launch directory is

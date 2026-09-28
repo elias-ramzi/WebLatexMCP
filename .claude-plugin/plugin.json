@@ -3,7 +3,7 @@
   "name": "web-latex-mcp",
   "displayName": "WebLatexMCP",
   "version": "0.7.1",
-  "description": "Read, edit, compile, and commit LaTeX in any git-hosted project (Overleaf, GitHub, or any git remote) — the MCP server plus its LaTeX skills (project cleanup, DBLP citation audits, bibliography normalization) in one install.",
+  "description": "Read, edit, compile, and commit LaTeX in any git-hosted project (Overleaf, GitHub, or any git remote) — the MCP server plus its LaTeX skills (project cleanup, DBLP citation audits, bibliography normalization, peer review) and the paper commands and agents that run them (/review-paper, /hunt-typo, /format-latex, /review-writing) in one install.",
   "author": {
     "name": "Elias Ramzi",
     "email": "elias.ramzi@gmail.com"
@@ -13,6 +13,23 @@
   "license": "MIT",
   "keywords": ["latex", "overleaf", "mcp", "bibliography", "dblp", "arxiv"],
   "skills": "./.claude/skills",
+  "commands": [
+    "./.claude/commands/review-paper.md",
+    "./.claude/commands/hunt-typo.md",
+    "./.claude/commands/format-latex.md",
+    "./.claude/commands/review-writing.md",
+    "./.claude/commands/rewrite-mode.md"
+  ],
+  "agents": [
+    "./.claude/agents/paper-reviewer.md",
+    "./.claude/agents/paper-devils-advocate.md",
+    "./.claude/agents/novelty-scout.md",
+    "./.claude/agents/review-triage.md",
+    "./.claude/agents/paper-typo-hunter.md",
+    "./.claude/agents/corrector.md",
+    "./.claude/agents/formatter.md",
+    "./.claude/agents/writing-reviewer.md"
+  ],
   "mcpServers": {
     "web-latex-mcp": {
       "command": "npx",
