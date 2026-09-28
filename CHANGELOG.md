@@ -11,10 +11,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
-- **A reveal.js overview deck under `slides/`** (#226). Twelve slides for presenting the project:
+- **A reveal.js overview deck under `slides/`** (#226). Thirteen slides for presenting the project:
   motivation, how the server sits between Claude and the paper's remote, user setup, requirements,
   a quick-start loop, the HPC-to-Overleaf use case, the PDF viewer and its review comments,
-  citations, the bundled skills, contributing, and a take-home message. The facts are taken from
+  figures drawn in TikZ and checked with `render_pages` and `pdf_geometry`, citations, the bundled
+  skills, contributing, and a take-home message. The facts are taken from
   the docs and the code rather than restated from memory — the requirements from the install
   guides, the viewer from `src/services/viewer.ts`, the tool count from `src/server.ts` — so a
   slide that drifts from the server is a slide to correct. reveal.js and the fonts load from CDNs

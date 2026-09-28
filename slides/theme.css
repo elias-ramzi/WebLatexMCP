@@ -502,6 +502,38 @@
   color: #b6a6ff;
 }
 
+/* ---------- a one-line tip under a slide's steps ---------- */
+
+.tip {
+  font-size: 0.55em;
+  color: var(--muted);
+  background: var(--violet-soft);
+  border-radius: 8px;
+  padding: 0.4em 0.7em;
+  margin-top: 0.4em !important;
+}
+
+/* ---------- figures slide ---------- */
+
+.cols.figures {
+  grid-template-columns: 1fr 1.25fr;
+}
+
+.figure-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.8em;
+}
+
+.figure-row .shot {
+  height: 190px;
+  width: auto;
+}
+
+.figure-row .caption {
+  margin: 0 !important;
+}
+
 /* ---------- closing slide, on the navy background ---------- */
 
 .closing h2 {

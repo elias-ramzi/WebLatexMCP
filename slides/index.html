@@ -409,6 +409,10 @@
                 <li>It compiles and renders the page to check the table fits.</li>
                 <li>You review the diff, and it pushes to Overleaf.</li>
               </ol>
+              <p class="tip">
+                💡 Draw figures in TikZ: Claude can redesign them, and collaborators can edit them
+                in Overleaf.
+              </p>
             </div>
             <div>
               <img
@@ -482,7 +486,68 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 9. Citations -->
+        <!-- ============================================================ 9. Figures -->
+        <section>
+          <p class="kicker">Figures</p>
+          <h2>Figures in TikZ, drawn by Claude</h2>
+          <div class="cols figures">
+            <ol class="steps">
+              <li>
+                Describe the figure — or paste a sketch
+                <span class="bubble">draw the architecture as a TikZ figure</span>
+              </li>
+              <li>
+                Claude writes the TikZ into the paper and compiles it
+                <span class="sub"
+                  >The figure is LaTeX source: fonts and colours match the paper.</span
+                >
+              </li>
+              <li>
+                <span class="tool">render_pages</span> lets it see the result
+                <span class="sub"
+                  >The page as a picture, found by the figure's label — Claude looks at it as you
+                  would.</span
+                >
+              </li>
+              <li>
+                <span class="tool">pdf_geometry</span> measures what the eye misses
+                <span class="sub"
+                  >Boxes in points: a label over a frame, a figure past the margin.</span
+                >
+              </li>
+              <li>It fixes what it saw, recompiles, and looks again.</li>
+            </ol>
+            <div>
+              <img
+                class="shot"
+                src="img/tikz-pictura.png"
+                alt="A system architecture figure drawn in TikZ: simulator, GPU rasterizer, policy and PPO"
+              />
+              <div class="fragment figure-row">
+                <img
+                  class="shot"
+                  src="img/tikz-alberti.png"
+                  alt="A network architecture figure drawn in TikZ: perception branch, MLPs and heads"
+                />
+                <p class="caption">
+                  Both figures: TikZ written by Claude, checked by rendering the page.
+                </p>
+              </div>
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>A figure is source, not a picture</strong> — every revision is a diff you can
+            review.
+          </p>
+          <aside class="notes">
+            No more exporting from a drawing tool and re-uploading a PDF. Claude writes the figure
+            in TikZ, compiles, then renders the page to look at it — overlaps, arrows crossing
+            labels, text too small. pdf_geometry gives the exact boxes when looking is not precise
+            enough.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 10. Citations -->
         <section>
           <p class="kicker">References</p>
           <h2>Citations, checked — not trusted</h2>
@@ -526,7 +591,7 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 10. Skills -->
+        <!-- ============================================================ 11. Skills -->
         <section>
           <p class="kicker">Skills</p>
           <h2>Bundled skills</h2>
@@ -578,7 +643,7 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 11. Contributing -->
+        <!-- ============================================================ 12. Contributing -->
         <section>
           <p class="kicker">Contributing</p>
           <h2>Help make it better</h2>
@@ -616,7 +681,7 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 12. Take home message -->
+        <!-- ============================================================ 13. Take home message -->
         <section data-background-color="#1A1A2E" class="closing">
           <p class="kicker">Take home message</p>
           <h2>Claude as a co-author, on your real paper</h2>
