@@ -160,7 +160,7 @@ general-purpose agent, which has write tools the panel must not hold.
      in the middle of a report fails here. That one search is bounded: it keeps at most 200
      matches and a 20000-character payload, and it windows a line past 200 characters with `…`.
      So if its result reports `omittedByCap` or `omittedBySize` above 0 or `timedOut`, carries a
-     `note`, or returns any heading with `…` in it, do not judge a report from it: take each
+     `note`, or returns any heading with `…` in it, that result is incomplete: take each
      report's heading lines from a `read_file` of that report instead (`search_files` cannot be
      pointed at one file), and only then call a report malformed;
    - `read_file` of each report from its last heading to the end (`startLine` = that heading's

@@ -381,11 +381,14 @@ describe('a directory named like "..foo" at each climbsOut site of the farm (A-D
 });
 
 describe('every fold decision of a variant probes one directory (A-N12)', () => {
-  it("stageVariant asks the probe about the project's variants directory, as applyOverlay does", async () => {
+  it("stageVariant asks the probe about the project's variants directory, as applyOverlay does", async (ctx) => {
     const src = await tempDir('laneA-probedir-');
     await put(src, 'main.tex', 'main\n');
     await put(src, 'sec/Notes.tex', 'upper\n');
     await put(src, 'sec/notes.tex', 'lower\n');
+    // A case-insensitive temp volume (the macOS and Windows defaults) keeps one file, not a
+    // pair, and without a pair the farm never asks the probe anything.
+    if ((await readdir(path.join(src, 'sec'))).length < 2) ctx.skip();
     const dirs: string[] = [];
     const probe: CaseProbe = async (dir) => {
       dirs.push(dir);
