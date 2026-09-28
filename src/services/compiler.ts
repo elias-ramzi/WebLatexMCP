@@ -477,9 +477,13 @@ export async function ensureBuildRoot(
   root: string = buildRoot(),
   env: Partial<BuildRootEnv> = {},
 ): Promise<string> {
-  const platform = env.platform ?? process.platform;
+  // Windows vs POSIX is decided the way `buildRoot` decides it — by whether this process HAS a
+  // uid — not by `process.platform`, so the name and the rules applied to it cannot disagree: a
+  // test stubbing the platform on a win32 runner otherwise got a POSIX judgement of a root with no
+  // uid to own it, and every lookup was refused.
+  const win32 = env.platform !== undefined ? env.platform === 'win32' : !process.getuid;
   const fs = env.fs ?? realBuildRootFs;
-  const uid = 'uid' in env ? env.uid : platform === 'win32' ? undefined : process.getuid?.();
+  const uid = 'uid' in env ? env.uid : win32 ? undefined : process.getuid?.();
   if (path.basename(root) === UNKNOWN_USER_ROOT) {
     // `buildRoot` could not read the user name, so this name is shared by everyone it happens
     // to. Refused before the mkdir: nothing is created under a name that is not per user.
@@ -518,7 +522,7 @@ export async function ensureBuildRoot(
     }
     if (!st.isDirectory()) throw new UnsafeBuildRootError(root, 'it is not a directory');
     // No owner/ACL check on win32 (see the docstring): the per-user name is all there is.
-    if (platform === 'win32') return { loose: false, writable: false };
+    if (win32) return { loose: false, writable: false };
     if (uid === undefined) {
       throw new UnsafeBuildRootError(root, 'the current user id could not be determined');
     }

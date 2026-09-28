@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { chmod, mkdtemp, mkdir, rm, stat, symlink } from 'node:fs/promises';
@@ -172,6 +172,28 @@ describe('userPathSegment (#215)', () => {
 });
 
 describe('ensureBuildRoot (#215), against an injected filesystem', () => {
+  // Windows vs POSIX is judged by whether the process HAS a uid — as `buildRoot` names the root —
+  // never by `process.platform`. The windows-latest leg of #229 failed viewerHint.test.ts: it stubs
+  // the platform to 'darwin', which sent a uid-less win32 process down the POSIX owner check, and
+  // every lookup was refused.
+  it('judges by whether the process has a uid, whatever process.platform says', async () => {
+    const getuid = process.getuid;
+    try {
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+      (process as { getuid?: () => number }).getuid = undefined;
+      const noUid = fakeFs({ kind: 'dir', uid: 0, mode: 0o40700 });
+      await expect(ensureBuildRoot(ROOT, { fs: noUid.fs })).resolves.toBe(ROOT);
+
+      vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+      (process as { getuid?: () => number }).getuid = () => 1000;
+      const foreign = fakeFs({ kind: 'dir', uid: 4242, mode: 0o40700 });
+      await expect(ensureBuildRoot(ROOT, { fs: foreign.fs })).rejects.toThrow(/owned by uid 4242/);
+    } finally {
+      (process as { getuid?: () => number }).getuid = getuid;
+      vi.restoreAllMocks();
+    }
+  });
+
   it('creates a missing root with mode 0700 and accepts it', async () => {
     const f = fakeFs(undefined);
     await expect(ensureBuildRoot(ROOT, posix(f.fs))).resolves.toBe(ROOT);
