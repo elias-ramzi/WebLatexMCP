@@ -673,7 +673,12 @@ describe('PDF tools read a variant by its handle', () => {
       path.join(paths.out, 'main.aux'),
       '\\relax\n\\newlabel{fig:x}{{1}{2}{A caption}{figure.1}{}}\n',
     );
-    await writeFile(path.join(paths.out, 'main.log'), 'This is pdfTeX, Version 3.141592653\n');
+    // One shipout mark per page of the variant's PDF: a label lookup refuses a log that shipped
+    // nothing beside a PDF with pages, so this is also the log that lookup must read.
+    await writeFile(
+      path.join(paths.out, 'main.log'),
+      'This is pdfTeX, Version 3.141592653\n [1] [2] (./main.aux) )\n',
+    );
     const mainPdf = buildPdfPath(clone, 'main.tex');
     await writeFile(mainPdf, minimalPdf(3, 300, 200, { text: (n) => `MAIN page ${n}` }));
     return { variantPdf };
