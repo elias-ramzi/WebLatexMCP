@@ -1,0 +1,543 @@
+/*
+ * WebLatexMCP deck theme — layered on reveal.js's `white` theme.
+ * Colours come from the lockup in assets/weblatexmcp-lockup.svg.
+ */
+
+:root {
+  --navy: #1a1a2e;
+  --violet: #7c5cff;
+  --violet-deep: #5b3ee6;
+  --violet-soft: #efebff;
+  --ink: #1a1a2e;
+  --muted: #5d5d75;
+  --line: #e2e0ec;
+  --card: #f7f6fb;
+  --ok: #1f8a5b;
+  --warn: #b26b00;
+  --warn-soft: #fff4e0;
+}
+
+.reveal {
+  --r-main-font: 'Inter', system-ui, sans-serif;
+  --r-main-font-size: 28px;
+  --r-main-color: var(--ink);
+  --r-heading-font: 'Space Grotesk', 'Inter', sans-serif;
+  --r-heading-color: var(--navy);
+  --r-heading-font-weight: 700;
+  --r-heading-letter-spacing: -0.02em;
+  --r-heading-text-transform: none;
+  --r-heading-line-height: 1.1;
+  --r-code-font: 'JetBrains Mono', ui-monospace, monospace;
+  --r-link-color: var(--violet-deep);
+  --r-link-color-hover: var(--violet);
+  --r-selection-background-color: var(--violet-soft);
+}
+
+.reveal .slides section {
+  text-align: left;
+  height: 100%;
+}
+
+.reveal h2 {
+  font-size: 1.75em;
+  margin-bottom: 0.45em;
+}
+
+.reveal p,
+.reveal li {
+  line-height: 1.4;
+}
+
+.reveal code {
+  font-size: 0.9em;
+  color: var(--violet-deep);
+  background: var(--violet-soft);
+  padding: 0.05em 0.3em;
+  border-radius: 4px;
+}
+
+/* ---------- small building blocks ---------- */
+
+.kicker {
+  font-family: var(--r-code-font);
+  font-size: 0.55em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--violet);
+  margin-bottom: 0.3em !important;
+}
+
+.lede {
+  font-size: 0.9em;
+  color: var(--muted);
+  max-width: 34em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 0.7em;
+}
+
+.tool {
+  display: inline-block;
+  font-family: var(--r-code-font);
+  font-size: 0.62em;
+  color: var(--violet-deep);
+  background: var(--violet-soft);
+  border: 1px solid #ddd4ff;
+  border-radius: 999px;
+  padding: 0.1em 0.6em;
+  margin: 0.1em 0.1em;
+  white-space: nowrap;
+}
+
+.say {
+  font-style: italic;
+  color: var(--navy);
+}
+
+.say::before {
+  content: '“';
+}
+
+.say::after {
+  content: '”';
+}
+
+.footer-line {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding-top: 0.5em;
+  border-top: 1px solid var(--line);
+  font-size: 0.62em;
+  color: var(--muted);
+}
+
+.footer-line strong {
+  color: var(--navy);
+}
+
+/* ---------- layout ---------- */
+
+.cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.2em;
+  align-items: start;
+}
+
+.cols.wide-left {
+  grid-template-columns: 1.25fr 1fr;
+}
+
+.cols.three {
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.8em;
+}
+
+.grid {
+  display: grid;
+  gap: 0.6em;
+}
+
+.grid.two {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.grid.three {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.6em 0.8em;
+  font-size: 0.72em;
+}
+
+.card h3 {
+  font-size: 1.15em;
+  margin: 0 0 0.3em;
+  color: var(--navy);
+}
+
+.card p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.card ul {
+  margin: 0.2em 0 0 1em;
+  color: var(--muted);
+}
+
+.card.accent {
+  border-color: #cfc3ff;
+  background: linear-gradient(180deg, #faf8ff, var(--violet-soft));
+}
+
+.card.warn {
+  background: var(--warn-soft);
+  border-color: #f1d49c;
+}
+
+.card.warn h3 {
+  color: var(--warn);
+}
+
+.card .skill {
+  font-family: var(--r-code-font);
+  font-weight: 600;
+  color: var(--violet-deep);
+  font-size: 0.95em;
+}
+
+/* ---------- numbered steps ---------- */
+
+/* `.reveal ol` sets list-style-type: decimal and outranks a bare class, so match its specificity. */
+.reveal ol.steps,
+.reveal ol.loop {
+  display: block;
+  list-style: none;
+}
+
+.steps {
+  counter-reset: step;
+  margin: 0 !important;
+  padding: 0;
+  font-size: 0.7em;
+}
+
+.steps > li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 2.2em;
+  margin-bottom: 0.55em;
+}
+
+.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0.05em;
+  width: 1.5em;
+  height: 1.5em;
+  border-radius: 50%;
+  background: var(--violet);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.85em;
+  display: grid;
+  place-items: center;
+}
+
+.steps .sub {
+  display: block;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* ---------- screenshots ---------- */
+
+.shot {
+  display: block;
+  max-width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  box-shadow: 0 10px 30px rgb(26 26 46 / 14%);
+  margin: 0 0 0.5em !important;
+}
+
+.caption {
+  font-size: 0.5em;
+  color: var(--muted);
+  margin-top: -0.3em !important;
+}
+
+/* ---------- chips row ---------- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+  font-size: 0.6em;
+}
+
+.chips span {
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.2em 0.75em;
+}
+
+.chips span::before {
+  content: '✓ ';
+  color: var(--ok);
+  font-weight: 700;
+}
+
+/* ---------- architecture flow ---------- */
+
+.flow {
+  display: grid;
+  grid-template-columns: 1fr auto 1.25fr auto 1fr;
+  align-items: stretch;
+  gap: 0.4em;
+  margin: 0.8em 0 1em;
+}
+
+.flow .node {
+  border-radius: 14px;
+  padding: 0.7em 0.8em;
+  font-size: 0.66em;
+  border: 1px solid var(--line);
+  background: var(--card);
+}
+
+.flow .node h3 {
+  font-size: 1.2em;
+  margin: 0 0 0.35em;
+}
+
+.flow .node ul {
+  margin: 0 0 0 1em;
+  color: var(--muted);
+}
+
+.flow .node.core {
+  background: var(--navy);
+  border-color: var(--navy);
+  color: #fff;
+}
+
+.flow .node.core h3 {
+  color: #fff;
+}
+
+.flow .node.core ul {
+  color: #c9c7dc;
+}
+
+.flow .arrow {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  font-size: 0.5em;
+  color: var(--muted);
+  font-family: var(--r-code-font);
+  text-align: center;
+  min-width: 5.5em;
+}
+
+.flow .arrow b {
+  font-size: 2.4em;
+  line-height: 1;
+  color: var(--violet);
+}
+
+/* ---------- chat mock ---------- */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  font-size: 0.66em;
+}
+
+.chat .msg {
+  border-radius: 14px;
+  padding: 0.5em 0.8em;
+  max-width: 92%;
+}
+
+.chat .user {
+  align-self: flex-end;
+  background: var(--navy);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.chat .claude {
+  align-self: flex-start;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 4px;
+}
+
+.chat .claude .tool {
+  font-size: 0.85em;
+}
+
+.diff {
+  font-family: var(--r-code-font);
+  font-size: 0.85em;
+  margin-top: 0.35em;
+  line-height: 1.35;
+}
+
+.diff .del {
+  color: #b42318;
+  background: #fdecea;
+  display: block;
+  padding: 0 0.3em;
+}
+
+.diff .add {
+  color: var(--ok);
+  background: #e7f6ee;
+  display: block;
+  padding: 0 0.3em;
+}
+
+/* ---------- loop ---------- */
+
+.loop {
+  list-style: none;
+  margin: 0 !important;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25em;
+  font-size: 0.62em;
+}
+
+.loop li {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+.loop li .step {
+  min-width: 7.5em;
+  font-weight: 600;
+  color: var(--navy);
+}
+
+.loop li.gate .step {
+  color: var(--warn);
+}
+
+/* ---------- title slide ---------- */
+
+.title-slide {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+
+.title-slide .lockup {
+  width: 78%;
+  height: auto;
+}
+
+.title-slide .lockup .mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+.title-slide h1 {
+  color: #fff;
+  font-size: 1.6em;
+  font-weight: 500;
+  margin-top: 0.6em;
+}
+
+.title-slide .meta {
+  font-family: var(--r-code-font);
+  font-size: 0.5em;
+  color: #9d9bb5;
+}
+
+.title-slide .meta a {
+  color: #b6a6ff;
+}
+
+/* reveal's slide number + progress in brand colours */
+.reveal .progress {
+  color: var(--violet);
+}
+
+.reveal .slide-number {
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--r-code-font);
+  font-size: 13px;
+}
+
+/* ---------- a prompt typed into the chat, on the setup slide ---------- */
+
+.bubble {
+  display: table; /* block-level, but only as wide as its text */
+  margin: 0.2em 0 0.25em;
+  padding: 0.3em 0.8em;
+  background: var(--navy);
+  color: #fff;
+  font-size: 0.92em;
+  border-radius: 14px 14px 14px 4px;
+  box-shadow: 0 4px 12px rgb(26 26 46 / 18%);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* Every message the user types into a chat is labelled as theirs. */
+.bubble::before,
+.chat .user::before {
+  content: 'user: ';
+  font-family: var(--r-code-font);
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #b6a6ff;
+}
+
+/* ---------- closing slide, on the navy background ---------- */
+
+.closing h2 {
+  color: #fff;
+}
+
+.closing .card {
+  background: #24243d;
+  border-color: #3a3a52;
+  font-size: 0.78em;
+}
+
+.closing .card h3 {
+  color: #fff;
+}
+
+.closing .card p {
+  color: #c9c7dc;
+}
+
+.closing .try {
+  display: flex;
+  align-items: center;
+  gap: 0.8em;
+  margin-top: 1.4em;
+}
+
+.closing .try-label {
+  font-family: var(--r-code-font);
+  font-size: 0.55em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--violet);
+}
+
+.closing .bubble {
+  margin: 0;
+  background: #2e2a55;
+  border: 1px solid var(--violet);
+  font-size: 0.7em;
+}
