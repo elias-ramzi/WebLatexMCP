@@ -92,16 +92,16 @@ unless you ask:
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
-- **`/peer-review`** — pre-submission review of an ML paper: summary, strengths, weaknesses, minor weaknesses, questions, typos — from a clone, `/review-paper` runs it as a Sonnet/Opus/Fable panel merged by a Fable triage.
+- **`/peer-review`** — pre-submission review of an ML paper: summary, strengths, weaknesses, minor weaknesses, questions, typos — in Claude Code, `/review-paper` runs it as a Sonnet/Opus/Fable panel merged by a Fable triage.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
 
-Every bundled skill is scanned on each pull request by NVIDIA's
-[SkillSpector](https://github.com/NVIDIA/skillspector) (static rules, `--no-llm`), and any finding
-fails CI. Today every skill scores 0/100 with no findings.
+Every bundled skill, and every command and agent the plugin ships, is scanned on each pull request by
+NVIDIA's [SkillSpector](https://github.com/NVIDIA/skillspector) (static rules, `--no-llm`), and any
+finding fails CI. Today every skill scores 0/100 with no findings.
 
 **How you get them depends on the client:**
 
-- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension), and Claude picks a skill up when your request matches it.
+- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension), and Claude picks a skill up when your request matches it. The plugin also brings the paper commands (`/review-paper`, `/hunt-typo`, `/format-latex`, `/review-writing`, `/rewrite-mode`, named `/web-latex-mcp:<command>`) and the agents they dispatch.
 - **Any MCP client** — nothing to install: every skill ships with the server as an **MCP prompt**, in the client's prompt menu.
 - **Claude Desktop / claude.ai** — for the same automatic behavior, zip each folder under [`.claude/skills/`](.claude/skills/) and upload them under **Customize → Skills**.
 

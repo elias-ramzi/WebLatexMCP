@@ -66,6 +66,23 @@ formatting; all logic lives in services so it is unit-testable without a live MC
 - `src/prompts/skills.ts` — registers each bundled skill (`.claude/skills/*/SKILL.md`, loaded by
   `src/lib/skills.ts`) as an MCP prompt, so clients that don't read `.claude/skills` (Claude Desktop,
   Cursor) can still run them. Add a skill by adding its directory — no code change.
+- `.claude-plugin/plugin.json` — the Claude Code plugin. It points at `.claude/skills` whole, but
+  lists the shipped **commands and agents one file at a time** (#212): `.claude/commands` and
+  `.claude/agents` also hold this repo's dev tooling (`/implement`, `/implement-issue`, `/review`,
+  `implementer`, `plan-verifier`), which a directory entry would install into every user's Claude
+  Code. `test/unit/pluginManifest.test.ts` holds every file there to exactly one of the manifest or
+  its `DEV` list, so a new command or agent is a manifest edit or a test failure, never a silent
+  omission or leak. **A shipped agent's `tools:` names every server tool in both forms**,
+  `mcp__web-latex-mcp__<tool>` (a hand-configured server) and
+  `mcp__plugin_web-latex-mcp_web-latex-mcp__<tool>` (the plugin-started one): Claude Code drops an
+  unresolved entry silently, so a list with only the first form left a plugin-installed agent with
+  no server tool at all. The same test pins the pairing, and `reviewAgents.test.ts` judges the
+  read-only allowlist under both prefixes. **Every shipped agent must carry a `tools:` line at
+  all** — an agent without one inherits every tool the user's session holds (Bash, `commit`,
+  `push`, `delete_file`, `compile`), whatever its prose promises; `formatter` shipped that way.
+  `pluginManifest.test.ts` fails on a shipped agent with no `tools:` line rather than skipping it,
+  and `reviewAgents.test.ts` pins `formatter`'s list (the read-only tools plus `write_file` and
+  `edit_file`).
 - `src/services/*` — the core: `ProjectManager` (id→dir resolution, per-project mutex **+
   cross-process lock**, dynamic registration), `GitService` (simple-git wrapper), `FileService`
   (sandboxed fs), `LatexmkCompiler` (implements the `LatexCompiler` interface), `ReferenceResolver`
@@ -93,7 +110,7 @@ launch dir is a git repo and not the home dir; otherwise it falls back to `~/.we
 `WEB_LATEX_MCP_WORKSPACE=cwd` forces workspace-local; any other value is a path. The git-repo detection
 (`resolveWorkspace` in `src/config.ts`) is injectable so tests stay hermetic. In workspace-local mode
 `compile` also surfaces the PDF at `<workspace>/<id>.pdf` beside the clone (`src/lib/pdfSurface.ts`) —
-build artifacts otherwise live in a temp dir. That copy is a **convenience for the user, never a
+build artifacts otherwise live under a per-user temp build root (see the build-root bullet below). That copy is a **convenience for the user, never a
 source for a tool**: it holds whichever root compiled last, so `render_pages`/`extract_text`/
 `pdf_geometry` read `rootFile`'s own build-dir PDF in every mode (`locateRootPdf`,
 `src/lib/pdfLocate.ts`) and fall back to the surfaced copy only when no `rootFile` was named **and**
@@ -841,6 +858,18 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   a path may be used, never what the file is **called**: the `resolveInside` string stays its one
   identity, or the revision tracker files a baseline under a key the write never looks up — which is how
   the guard silently stopped firing on macOS (`/var` → `/private/var`) and Windows (8.3 short paths).
+  **A `path.relative` result leaves its base only when `climbsOut(rel)` says so** (`src/lib/paths.ts`,
+  #227) — `..` as a whole first segment, ended by `path.sep` **or** `/` — never
+  `rel.startsWith('..')`, which also matches an in-project `..foo/main.tex`. The seven sites that
+  tested it that way (this guard, `resolveInside`, link-target naming, the aux `\@input` reader,
+  log and SyncTeX rebasing, the workspace exclude), the overlay farm and the build dir's mirror
+  of the root file's tree (`mirrorSubdirsForRoot`'s `strictlyInside`, `src/services/compiler.ts`)
+  now share it. The `/` is not optional: several
+  callers hand in a `toPosix`'d or `path.posix`-joined result, which on Windows carries `/`, so a
+  helper testing only `path.sep` there would accept a real climb — the dangerous direction for a
+  sandbox guard. `''` and an absolute result are deliberately left to each caller, which decide
+  them differently — SyncTeX's `normalizeInput` reads an absolute one (an input on another Windows
+  drive, where `path.relative` returns the input itself) as outside, giving the base name.
   **A link out is followed only where the project's owner said so** (`setLinkPolicy`, injected in
   `context.ts` from `ProjectManager.followsUserLinks`): `mode: 'local'` **plus** an explicit
   `followSymlinks: true` — from **every** id that resolves to that directory, failing closed
@@ -913,6 +942,154 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
+- **`compile` runs no shell command unless the caller opted in — including TeX Live's own
+  default.** Leaving the flag out does not mean "off": TeX Live's `texmf.cnf` sets
+  `shell_escape = p`, the restricted allow-list, and those helpers write relative to the engine's
+  cwd, the project — `\write18{makeindex -o sections/a.tex …}` truncated a source file in a
+  compile nobody opted into (#213). So every latexmk compile passes `-no-shell-escape` unless
+  `shellEscape` or `restrictedShellEscape` is set, decided once in `shellEscapeFlag`
+  (`src/services/compiler.ts`), which never returns "no flag"; tectonic needs none, since it runs no
+  shell command without `shellEscape`. Whether the caller **opted in** — what the refusal hints,
+  the TikZ hint and a variant's line judge by — is one function too,
+  `shellEscapeRequested(req, backend)`: under tectonic `restrictedShellEscape` does not count, since tectonic has no
+  restricted mode and runs nothing for it, so that caller still gets the hint (naming
+  `shellEscape: true`) and a variant's line never claims shell escape was on. A document that
+  relied on the default — an `.eps` figure converted by `repstopdf`, `makeindex` — now builds
+  without that command's output, so a refused command gets `shellEscapeRefusedHint` on every
+  compile (in the overlay's own wording for a variant), naming the flag that runs it and what it
+  costs. Under **lualatex** there is no `runsystem` line: `pdftexcmds.lua` logs
+  `system(<cmd>) executed.` whenever `os.execute` exists, and under `-no-shell-escape` it does, as a
+  refusing stub — so `luatexCommandRefused` (`src/services/logParser.ts`, beside
+  `shellCommandRefused`) reads that
+  line as a refusal unless the log's **header** carries a ` system commands enabled.` banner
+  (`engineShellEscapeBanner`, which `-no-shell-escape` suppresses), and `disabled.` always. The log
+  is document-controlled, which is acceptable only because a forged line can do nothing but add a
+  hint. A latexmkrc (the project's, or a user or system one) can still re-enable shell escape —
+  latexmk hands the flag over through `%O` — which is why `engineShellEscapeBanner` reads the
+  engine's own banner. When that banner shows on a compile whose caller set neither flag, every
+  latexmk compile gets a fixed `hint` saying so (`shellEscapeOverriddenHint`,
+  `src/services/compiler.ts`), not only a variant's line; tectonic reads no latexmkrc, so a banner
+  in its log earns no such claim.
+  **Shell escape's state is judged only from the engine's own banner in the log header**
+  (`engineShellEscapeBanner`, `src/services/logParser.ts`: the physical lines before the first
+  `**<input>` line, in a log whose first line is `This is …`), which the engine writes before it
+  reads the document. A `runsystem(…)…disabled (restricted).` line, or a banner-shaped line further
+  down, is `\typeout`-writable: reading one once moved a `-no-shell-escape` run's advice to full
+  `shellEscape` and understated a full override's risk, and reading the banner anywhere added an
+  override warning blaming a latexmkrc that did not exist. The reader has **three answers plus
+  unknown**, and the last two must stay apart: `'full'`, `'restricted'`, `'none'` (a header read,
+  no banner in it) and `undefined` (no header to read — latexmk's captured output, which stands in
+  when no engine `.log` was found, e.g. a latexmkrc that sets `$jobname`; it opens with latexmk's
+  own lines and has no `**` line). Only `'none'` backs the claim that shell escape was off. So: the
+  override warning (`shellEscapeOverriddenHint`) and a variant's "overrode" line fire only on a
+  header banner, and name restricted mode only for a restricted one; a variant's line says
+  "Shell escape was off for this build" only on `'none'` (or under tectonic, which reads no
+  latexmkrc, so its flag is the whole answer), and with no header says whether it was off could
+  not be confirmed; with no header, a banner-shaped line anywhere in the text
+  (`logShowsShellEscapeBanner`) adds only a hedged note that a latexmkrc **may** have turned shell
+  escape on — it asserts nothing and changes no flag advice. `shellEscapeRefusedHint` names only
+  `shellEscape: true` when the header shows **restricted** mode (the refused command is not on
+  TeX's allow-list), and returns nothing at all when the header shows **full** shell escape, which
+  refuses nothing — a refusal line there was the document's. Otherwise which flag it names is
+  decided from the refused commands themselves (`refusedShellCommands`, over the
+  `runsystem(<cmd>)...disabled` and LuaTeX records the hint already rests on): a refused command
+  whose first word is not a TeX engine (`pdflatex|xelatex|lualatex|latex|pdftex|xetex|luatex|etex|tex`,
+  optionally behind a path or quoted, `.exe` allowed) always gets the hint with the
+  `restrictedShellEscape` advice, whatever pgf's TikZ message says; when every refused command is
+  an engine call the advice is `shellEscape: true`, since no allow-list holds an engine; both kinds
+  together get both named. pgf's TikZ failure line is one `\typeout` away from any document, so
+  it drives only things that ADD: the TikZ hint itself,
+  the overlay hint for a TikZ failure with no refusal record, and — in a normal compile, and only
+  when every refused command was an engine call — leaving the retry to the TikZ hint, which names
+  the same flag and cost; it never suppresses a non-engine refusal's hint or moves its advice.
+  The rule: **document-writable lines may only add a hint — never choose the flag, narrow the
+  risk, suppress a hint, or make a false claim.** The refusal records are document-writable too;
+  they may pick between the two flags only because a document can make any refusal genuine by
+  running that very command, so a forged record makes the hint say nothing a real one would not,
+  and because a mix names both flags, no added record can take away the flag a genuine refusal
+  needs. The residual: LuaTeX can rewrite its own `.log` through `io.open`, header included, as it
+  can forge the stale-PDF records. **TikZ externalization never gets `restrictedShellEscape`**: it
+  runs the engine itself, and TeX Live's allow-list (`repstopdf`, `makeindex`, `bibtex`, …) holds
+  no engine, so the TikZ hint (`tikzShellEscapeHint`, `src/services/compiler.ts`) and the
+  collapsed TikZ error name only `shellEscape: true`, with its cost — except under a **full**
+  header banner, where shell escape was on and pgf's message (printed whenever a figure's file is
+  missing, whatever the reason) names no cause a retry would fix: the TikZ hint is silent, and the
+  collapsed error says the calls failed for another reason and points at each figure's own log.
+- **The build root is per user and verified, fail closed** (#215). `buildRoot()` is a pure path
+  function that never throws (identity injectable for tests) — `<tmp>/web-latex-mcp-build-<uid>`
+  where `process.getuid` exists (POSIX), `web-latex-mcp-build-<user>` where it does not (win32:
+  `os.userInfo().username` through `userPathSegment`, which keeps a `[A-Za-z0-9_-]{1,64}` name
+  as is and otherwise replaces the unsafe characters and appends `.` + 8 hex of its SHA-1, so no
+  two names meet and nothing leaves the temp dir). The user name is read **only** in the no-uid
+  branch — `os.userInfo()` throws on POSIX for a uid with no passwd entry (containers). An
+  unreadable user name yields the fixed `web-latex-mcp-build-unknown.user`, which no real name
+  maps onto and which `ensureBuildRoot` refuses **by name before its mkdir**, so the refusal is
+  the decision `buildRoot` made rather than a second read. **On win32 the owner and ACL are not
+  verified** — only that the root is a real directory — so a shared `TEMP` (`C:\Temp` on a managed
+  machine) is only as safe as the per-user name: another account can still pre-create
+  `…-build-<you>` with an `Everyone:F` ACL, and a local `bob` and a domain `bob` share a name.
+  Say so wherever it is documented; do not claim more. It keys on the uid, not
+  `process.platform`, so a test stubbing the platform does not move the root out from
+  under the build it staged, and the farm skip lists and `variants.ts` may call it freely.
+  `ensureBuildRoot` picks its win32/POSIX rules **the same way** (by the uid, unless a test
+  injects `platform`): judging by `process.platform` while naming by the uid sent a uid-less win32
+  process whose platform a test stubbed down the POSIX owner check, and refused every lookup
+  (windows-latest, #229).
+  `ensureBuildRoot()` creates it `0700` (not recursive, which would silently accept whatever sits
+  there — and which would create a missing `TMPDIR`/`TEMP`, choosing the owner and mode of a
+  directory other programs share: an `ENOENT`/`ENOTDIR` from that mkdir is an
+  `UnsafeBuildRootError` naming the missing temp dir and saying to point `TMPDIR` (`TEMP` on
+  Windows) at an existing one, never a raw `mkdir` errno — the temp dir is `os.tmpdir()`:
+  `TMPDIR`, `TMP`, `TEMP`, then `/tmp` on POSIX; `TEMP`, `TMP`, then `%SystemRoot%\temp` on win32,
+  so the variable the advice names is the one that wins, not always the one in effect), then
+  judges it by `lstat`: a symlink or
+  junction or a non-directory is refused; on POSIX
+  so is a root another uid owns, and so is one that grants group or other **write**
+  (`mode & 0o022`) — refused, **never `chmod`ed**, because tightening it closes the door without
+  emptying the room: a chmod cannot vouch for what another user placed in it while it was open,
+  and judging every entry below would be a deep walk of every build on every call. Only a root
+  others could merely read or search is tightened to `0700` and judged again from scratch. It is
+  **not memoised**, on purpose: the check is one `mkdir` and one `lstat`, and a remembered success
+  would outlive a root a `/tmp` cleaner removed and another user recreated. Every creation and
+  every read of a build dir follows a judged root: `outDirFor` (both backends); an overlay
+  `compile` before `applyOverlay`, whose case probe already writes under the root (`nameFoldFor`
+  checks too); `stageVariant` for itself, so `compile` does not re-check before it;
+  `locateRootPdf` (the main-build route of `render_pages`/`extract_text`/`pdf_geometry`, and the
+  viewer); `resolveVariantBuild` (the variant route); and `render_pages` before its PNG write.
+  **What is made below a judged root is never made by a recursive `mkdir`**, which recreated a
+  root removed after its check (a /tmp cleaner) under the process umask — group-writable under
+  umask 002 — and followed a root swapped for a link. The directories a caller asks for below the
+  root are made by one function, `mkdirUnderBuildRoot` (`src/services/compiler.ts`, beside
+  `ensureBuildRoot`): the project's build dir (`outDirFor`), `render_pages`' PNG dir, and the
+  variant farm dir, case probe and `<variant>/out` (`src/lib/variants.ts`). It judges the root
+  first, makes each level on its own (`0700`), keeps an existing level only when it `lstat`s as a
+  real directory, answers an `ENOENT` (the root removed in between) with `ensureBuildRoot` and one
+  retry, and judges the root again after the last level, with the leaf `lstat`ed once more (a
+  non-recursive mkdir still follows a root that became a link). Two makers keep those rules
+  without that function's per-call cost. The subdirectory mirror (`mirrorSubdirs`) judges the root
+  **once per mirror**, then makes the build dir's levels and every mirrored directory by the same
+  rule — non-recursive, `0700`, parents first, an existing entry kept only as a real directory —
+  hands an `ENOENT` to `mkdirUnderBuildRoot`, and judges the root once more at the end (one
+  `mkdirUnderBuildRoot` per directory was several times slower on a 2000-directory project). And
+  the farm's own directories inside the farm dir (`farmMkdir`, `src/lib/variants.ts`) are a plain
+  exclusive, non-recursive `mkdir` (default mode) inside the `0700` farm dir `mkdirUnderBuildRoot`
+  made, whose `EEXIST` is refused as a collision, never adopted. Only a directory outside the
+  build root (a test's temp dir) is made recursively, as asked. The one residual: a root swapped
+  for a link between a judgement and the mkdirs after it still gets **every missing level** made in
+  the link's target — a chain of nested empty directories, and for the mirror the whole mirrored
+  tree, empty — before the re-judge refuses; so does a root a cleaner removed and another user
+  recreated as a plain directory they let us write in. Nothing is ever written into them, and
+  closing it would take an fd-relative `mkdirat`, which Node does not expose. **The
+  root's parent, the temp dir, is not judged at all**: under a world-writable temp dir without the
+  sticky bit another user can rename the root away and put their own in its place between a check
+  and its use. The default `/tmp` is sticky; say so rather than claim more. A refusal reads
+  `Refusing to use build root <root>: <reason>. … then retry.` — worded for the PDF tools, which
+  build nothing, as much as for `compile`.
+  `readAuxFloats` needs no call of its own — every caller reaches it after one of those, under the
+  same lock. A planted root would hand the readers a forged PDF, `.aux` and `.log`; on a read,
+  creating a missing root `0700` only claims the name privately. Tests: the vitest setup file
+  `test/helpers/buildRootSetup.ts` creates the root the server's way before any helper runs,
+  because a helper's `mkdir -p` under umask 002 left it group-writable, which is now refused.
 - **An overlay compile builds a what-if variant in a link farm; the server never writes the
   project, and what the build writes is reported.** `compile`'s `overlay` (`src/lib/variants.ts`,
   whose JSDoc carries the mechanics) applies the edits in memory (`applyEditsToContent`, the pure
@@ -923,19 +1100,85 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
     (`refuseLinkedRootDir`, called by `compile` and again by `stageVariant`). A `..` segment, an
     absolute or drive-qualified path, or a root under a linked directory is refused: latexmk's `-cd`
     resolves physically, so any of them runs the engine inside the SOURCE.
-  - **The farm's links are a write path for the build.** A variant passes `-no-shell-escape` unless
-    the caller opted in (TeX Live's default restricted mode runs `makeindex -o` into a linked file);
-    a normal compile's argv stays byte-identical, pinned by a test. An overlaid `latexmkrc` is
-    refused.
+  - **The farm's links are a write path for the build.** Shell escape stays off unless the caller
+    opted in, as for every compile (the shell-escape bullet above) — in a variant that is also what
+    keeps TeX Live's allow-listed `makeindex -o` from writing a linked source file, so the refusal
+    hint takes the overlay's own wording there. An overlaid `latexmkrc` is refused, its name
+    folded **always** (`foldCaseName`), whatever the filesystem: latexmk runs it as Perl, so this
+    guard does not stake its answer on a case probe — and judged, as `isBibFile` judges a `.bib`,
+    on the name Windows opens too (`isLatexmkRcName`: cut at the first `:`, trailing dots and
+    spaces stripped), so `latexmkrc.`, `latexmkrc `, `latexmkrc::$DATA` and `.latexmkrc.` are
+    refused on every platform.
+  - **Which names are one file is asked of the filesystem, never of `process.platform`** (#214).
+    The project's side is identity (`dev:ino` — one entry, or one hard-linked file). The farm's
+    case fold is probed (`probeCaseInsensitive`) in `<buildDir>/variants`, where two overlaid names
+    would collide — every fold decision of a variant, the farm's twin check included
+    (`stageVariant` passes `probeDir`), probes that one directory — **never in a project, since the probe writes**, and only after
+    `ensureBuildRoot`, since it creates that directory and everything above it (`nameFoldFor`
+    enforces this itself rather than trusting `compile`'s call order; an injected probe writes
+    nothing and skips it). A probe that cannot run falls back to the platform default, the side
+    that refuses more; an unsafe root is refused outright, not treated as a probe that could not
+    run. A case-sensitive APFS volume therefore keeps `Notes.tex` and `notes.tex` apart. The
+    converse is refused: two entries of one source directory that fold together under
+    `foldCaseName` (`toLowerCase` — Unicode-aware, unlike git's ASCII-only `foldCase`, since NTFS
+    and APFS fold `É`/`é` too; this is a filesystem collision, not a git lookup) are refused naming
+    both (`farmTwinCheck`, before either is linked, probing the directory the farm is built in only
+    when such a pair exists and at most once per check, and counting only entries the platform's
+    linker places — a win32 dangling link places none) where the farm folds case. That fold
+    **approximates** the filesystem's rather than matching it: it folds pairs NTFS keeps apart
+    (U+212A KELVIN SIGN and `k`, U+2126 OHM SIGN and `ω`, `ẞ` and `ß`) and misses what only a
+    filesystem folds (NFC beside NFD on APFS). That is safe only because an error can merely
+    over-refuse — **the farm never overwrites an entry it holds**, whatever the probe said: copies
+    are `COPYFILE_EXCL`, a hard link's `EEXIST` never falls back to a copy, and any `EEXIST` from
+    `symlink`/`link`/`copyFile`/junction/`mkdir` is refused in words (`farmCollision`) that say the
+    name was already held, most likely by an alias (case, normalisation, or an NTFS 8.3 short name
+    such as `NOTESF~1.TEX` beside `notesfile.tex`) — never the up-front refusal's case-pair words,
+    which only a seen pair earns. Keep both: the win32 copy fallback once wrote `notes.tex` over
+    `Notes.tex` silently. The farm's
+    skip list matches the workspace and build root by realpath as well as by spelling (a link, an
+    8.3 short name). On win32 a directory the farm must junction whose path a junction cannot
+    point at is refused in words (`junctionRefusal`: "a network path" for `\\server\share` and
+    `\\?\UNC\…`, "a device path" for other `\\.\`/`\\?\` forms), and a junction that fails anyway
+    gets `junctionFailureMessage(rel, code)`, which blames the drive only for `EINVAL` — never a
+    bare Node error.
   - **What cannot be closed is reported, never denied.** The project's own latexmkrc, lualatex's
     `io.open` and tectonic's `\openout` can still write, so `watchSource` compares a before/after
     snapshot (following links, since the farm's links reach their targets) and `hint` names what
     changed. A snapshot that could not complete is "could not be checked", never "unchanged". The
     workspace is skipped by equality only (a local project can contain it, and a link into a sibling
-    clone is still a write); the build root with everything under it. The changed-path names and
-    the failure reason are document-controlled, so both are budgeted.
-  - **Eviction is best-effort**: at most `MAX_VARIANTS` are kept; a removal failure goes to stderr
-    and `hint`, never failing the finished compile.
+    clone is still a write); the build root with everything under it. **Of the project root's
+    `.git`, only `hooks/`, `config`, `config.worktree`, `commondir` and `info/` are watched**
+    (`GIT_WATCHED`, #228) — `commondir` because a build writing `../evil` there makes the next git
+    command read `evil/config` (its `core.fsmonitor` ran on `git status`), and git never writes it
+    in a main repository — **and of `.git/modules`, each submodule's `config`, `config.worktree`,
+    `commondir` and `hooks/`** (`GIT_MODULE_WATCHED`: a directory below `.git/modules` is a
+    submodule git dir when git's `is_git_directory` would say so — `HEAD` a regular file,
+    `objects/` and `refs/` directories — never on a `HEAD` entry alone, and a `modules/` directory
+    itself never is, since a submodule named `HEAD` or `libs/HEAD` put a `HEAD` in `.git/modules`
+    or in the step `libs` and hid every other submodule; a git dir is walked only there and in its
+    own `modules/`, any other directory is a step of a slash-named submodule and only its
+    subdirectories are walked), since `git status` recurses into every
+    submodule. A write there is the most dangerous one a build can make, since the next git command
+    runs or reads it, while the rest of `.git` changes on every git call and would bury the answer.
+    This does **not** rely on those being unwritten by git — `git config` rewrites `config`, and `gc`/`repack`
+    refresh `info/refs` — but on `compile` holding the project lock (a file lock too) across the
+    snapshot, the build and the comparison, so no git call of this server's or a peer session's
+    lands in between. A git command run outside the server during the build shows up as a change:
+    a false alarm, never a missed write. Keep the lock span covering all three. A gitfile `.git` is
+    recorded like any file; a `.git` below the root (a nested repository, or one behind a link) is
+    left out whole. A changed path under `.git` gets a fixed sentence saying `status`/`diff`/
+    `discard` never reach it. The changed-path names and the failure reason are
+    document-controlled, so both are budgeted; so is the list of overlaid files the build never
+    opened (`overlayNeverReadHint`, one line, #216) — the caller's own paths, but up to 20 of
+    `PATH_MAX` each, in both channels, and a count cap of 20 over a list capped at 20 could never
+    fire, so the bound is characters, charged on the sum of both channels (each name as printed
+    plus its JSON-escaped form; `OVERLAY_UNREAD_NAMES_BUDGET`, 2000), as the changed-path names are
+    (`sourceChangedHint`, `SOURCE_CHANGES_NAMES_BUDGET`, 2000).
+  - **Eviction is best-effort**: at most `MAX_VARIANTS` are kept, newest by the manifest's
+    per-project `seq` (#216), strictly increasing under the project lock, so a wall clock stepping
+    back cannot evict the newest; manifests without `seq` (older ones) sort below every one that
+    has it, by `usedAt` among themselves; a `seq` that would pass `Number.MAX_SAFE_INTEGER`
+    renumbers the project's manifests in order first; never by `readdir` order; a removal failure goes to stderr and `hint`, never failing the finished compile.
   - **The PDF tools read a `variant` build only**, never falling back to the main one.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
@@ -1098,20 +1341,77 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   PDF has pages; TeX writes a mark for every page it ships, so it only ever adds a refusal.
   `undefined` marks (not read, or the parse gave up) never trigger it. A mark the parser skips on
   the only page of a one-page PDF (a `\message{\string\foo}` just before it, which starts the line
-  with `\`) refuses spuriously — accepted, since it only refuses. It is not closed against the
-  document, though: mark-shaped text written before the abort point (`\message{[1]}` in the
-  preamble) makes the list non-empty, the length check then switches the cross-check off, and the
-  lookup answers as it did before this refusal existed. No log rule can close that, since the
-  document can write anything a rule would look for. `false` evidence can still
+  with `\`) refuses spuriously — accepted, since it only refuses. The marks do not close it against
+  the document, though: mark-shaped text written before the abort point (`\message{[1]}` in the
+  preamble) makes the list non-empty, so this refusal does not fire, and the shipout cross-check
+  then runs on the forged marks when their count happens to equal the PDF's pages (one forged `[1]`
+  beside a one-page earlier PDF) and is switched off when it does not — either way the lookup
+  answers as it did before this refusal existed. No mark rule can close that, since the document
+  can write any mark a rule would look for; the engine's closing line in the `.log` does
+  (`stalePdf`, #220). `false` evidence can still
   be wrong in ways no record shows, so no message says a shift is ruled out: `slideMismatch` runs
   only on `pgfpages === false`, and its advice gives `allowframebreaks` as the usual cause, not the
   only one. `pdf_geometry kinds: ["floats"]` does not refuse — the index
   is data the caller asked for, and its keys and numbers are true — but flags
-  `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, no
-  record beside it, or each empty) and for a `.log` that shipped nothing carries a note that the
-  pages could not be checked, without the flag.
+  `floatsPagesShifted: true` with a note in both channels, and for `undefined` (an `.aux` read, and
+  neither record beside it readable — a missing or empty file counts as unread) and for a `.log`
+  that shipped nothing carries a note that the pages could not be checked, without the flag.
+  **A PDF the last compile did not produce is refused too** (`stalePdf`, after `nothingShipped`;
+  #220). xelatex stopped by an error in the BODY rewrites the `.aux` and `.log`, latexmk never runs
+  xdvipdfmx, and the earlier run's PDF stays — an ordinary, non-fatal xelatex error does the same
+  — and its shipout marks may number the old PDF's pages exactly, so neither `nothingShipped` nor
+  the shipout check sees it. `staleBuildEvidence` refuses on either of two records a pdfTeX or
+  XeTeX document compiled without shell escape cannot forge — LuaTeX's `lfs.touch` (which works
+  under `-no-shell-escape`) and its `stop_run`, or shell escape on any engine, can defeat both,
+  and a missed refusal then answers as before the check, possibly the wrong page. **The `.aux`
+  STRICTLY newer than the PDF** (`auxNewerThanPdfMs` — no tolerance), from `readBuildTimes` →
+  `AuxFloatsResult.buildTimes`, `lstat`'d (a link or a non-regular file is no evidence) only when
+  the tool passes `pdfPath` to `readAuxFloats`, which records it as `pairedPdf`;
+  `resolveLabelPages` throws when that is not the PDF its `pdfLabelPageReader` opens, so a label
+  tool cannot forget it. A **tectonic** compile first removes the root job's `.aux`, `.fls`,
+  `.log`, `.synctex.gz` and `.fdb_latexmk` from its build dir (`removeRecordsTectonicDoesNotWrite`:
+  regular files and links only, never followed). Tectonic writes only `<job>.pdf` and `<job>.log`
+  there, so a build dir latexmk used before kept latexmk's `.aux` beside tectonic's PDF, and
+  labels resolved from it with neither record firing; with the `.aux` gone, a later latexmk
+  compile also reruns instead of calling tectonic's PDF up to date. A finished
+  compile closes the `.aux` in `\enddocument`, before the PDF is finished. Measured **by hand**
+  (TeX Live 2026, latexmk 4.88, Linux ext4 — no test reproduces the numbers; `stalePdf.test.ts`
+  pins the decision against staged timestamps), every finished pdflatex, lualatex and xelatex
+  build left the `.aux` older than the PDF by 8 to 684 ms. The stale side has **no floor**: a
+  250 ms tolerance once rested on the claim that the gap could not be shorter than the second run
+  itself, and PR #229's "LaTeX compile smoke" runner closed a stopped xelatex run's `.aux` under
+  250 ms after the earlier PDF — the closing record still refused there, but a stopped run
+  shipping as many pages as the old PDF has only this signal, so the tolerance would have resolved
+  a label to the wrong page. Do not reintroduce one. **Equal is not newer**: coarse or truncated
+  timestamps are a non-decreasing function of the write time, so they can make the two equal,
+  never reverse them — equality costs a missed refusal, never a refused finished build. The remaining
+  assumption is one clock stamping both files (true locally, and for one client writing to one NFS
+  server, which stamps both). Tests that stage a build by hand must write the `.aux` first or
+  back-date it (the `stageAux` helpers back-date it 60 s) — any positive gap refuses, and Linux
+  stamps files from a coarse clock tick, so a helper writing the PDF then the `.aux` passes or
+  fails depending on whether the two writes share a tick.
+  **The engine's closing record in the `.log`** (`parseEngineOutput`: the last of
+  `Output written on … (N pages …)`, `No pages of output.`,
+  `==> Fatal error occurred, no output PDF file produced!`) disagreeing with the PDF's page count,
+  or saying there was no output beside a PDF with pages. This needs no clock, and it is what makes
+  the `\message{[1]}` preamble bypass fail closed: a pdfTeX/XeTeX document can write that shape
+  only before the engine's own. Search for it with every line break removed, never line by line —
+  a real xelatex log glues `No pages of output.` onto a 79-column statistics line, and a line
+  reader then takes the forged record before it; a last record that cannot be parsed is
+  `undefined`, never the one before it. A closing-record marker that falls **inside** the last
+  `Output written on <path>` match is part of the file name, not a record (the build dir embeds
+  the project directory's name), and the written record stands. Both records only ever refuse, and
+  absent evidence adds nothing. The residuals are each a missing refusal — never harmless: the
+  lookup then answers as it did before the check, which for #220 was the wrong page. A run killed
+  before it closed leaves no engine record; LuaTeX's `stop_run`/`wrapup_run` callbacks run Lua
+  after the engine's line, and its `lfs.touch` can back-date the `.aux`; any shell-escape build can
+  do both; equal
+  timestamps on a coarse filesystem with a closing record that agrees; the `.aux` and the PDF
+  stamped by two skewed clocks (the one residual that can also refuse a finished build — a
+  refusal, never a wrong page); and timestamps were measured on Linux ext4 only. `pdf_geometry` floats notes the state, without refusing.
   **Behind both routes, the `.log`'s shipout marks** (`[<\count0>…]`, one per page shipped;
-  `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup asks) refuse a
+  `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup or `pdf_geometry`'s
+  floats asks — the latter for its notes, never to refuse) refuse a
   resolved page (`unverifiedPage`/`shipoutMismatch`) unless that PDF page was shipped with the
   label's decimal printed page p as its counter and — on the folio route only, since roman front
   matter under hyperref repeats counters the tree tells apart — no other page shipped with p
@@ -1125,7 +1425,8 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   forges, so it never vouches. That rule only decides whether the marks ADD a refusal; it can
   never accept a page the route refused. The engine writes the marks and a LaTeX document cannot
   remove one (LuaTeX's `start_page_number`/`stop_page_number` callbacks can, and no LaTeX package
-  in TeX Live registers them; a short list only refuses), but it can add one (`\message{[7]}`), so they are consulted only when their count equals
+  in TeX Live registers them; an empty list refuses, a short one switches the check off), but it
+  can add one (`\message{[7]}`), so they are consulted only when their count equals
   the PDF's page count — any other length skips the check silently, and then the folio route's
   residual shapes pass as they did without it — and never resolve, move or accept a page. The
   parser skips the places TeX copies document text into the log: a whole box display (warning
@@ -1173,7 +1474,8 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
     text channel and `structuredContent` costs roughly twice its own length — `diff` did exactly
     that. A budget that counts the content once is wrong by 2x, and so is one that charges the
     _larger_ of the two channels — the caller receives their **sum** (`conflictBudget.ts` did this
-    until its fourth round; `search_files` reached twice its budget the same way). The strongest form
+    until its fourth round; `search_files` reached twice its budget the same way; so did
+    `sourceChangedHint` in `variants.ts` and `overlayNeverReadHint` in `compile`). The strongest form
     is to put the render template beside the cost function and have the cost function **call** it, so
     the two cannot drift (`diffBudget.ts`, `searchBudget.ts`'s `matchRenderCost`, `commitBudget.ts`,
     `extractTextBudget.ts`); where the template has to live elsewhere, pin the constant with
@@ -1454,7 +1756,11 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `helpers/bareRepo.ts` (a `file://` stand-in for the Overleaf remote) — **no network, no secrets**.
   What `file://` cannot exercise — credential injection — runs against `helpers/authHttpRemote.ts`, a
   local smart-HTTP `git http-backend` remote that demands Basic auth, still on loopback only.
-  Branch is `master` to match Overleaf.
+  A test that talks to it should run git hermetically (empty `GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_ASKPASS=""`), as `gitUrlCredentialEcho.test.ts` does: with no token
+  resolved git falls through to the developer's own credential helpers, and a plain `git clone` of
+  a token-bearing URL approves that credential into them keyed by the ephemeral port, which later
+  made an auth-failure test succeed. Branch is `master` to match Overleaf.
 - **The compile boundary is the `LatexCompiler` interface** so nothing needs TeX except the smokes.
   `test/smoke/**` is gated on `latexmk` being installed (`describe.skipIf(!available)`), so it skips
   locally/in the fast CI job and runs in the dedicated `tex-smoke` CI job.

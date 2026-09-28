@@ -177,7 +177,7 @@ show up as untracked files in your own repo.
 
 In this mode `compile` also **surfaces the PDF** at `<workspace>/.web_latex_mcp/<project>.pdf` (a
 sibling of the clone, so it never dirties the project's git), so you can open the latest build straight
-from your editor rather than hunting through the temp build dir.
+from your editor rather than hunting through the temp [build directory](#build-directory).
 
 When the launch dir is **not** a git repo — or is your home directory — the default instead falls back
 to the shared home cache `~/.web-latex-mcp/projects`. This keeps clients whose launch directory is
@@ -192,6 +192,42 @@ To override the default:
 - `cwd` — force workspace-local even when the auto-detection wouldn't (e.g. a non-repo project dir).
 - any **path** (absolute, `~`-relative, or relative to the launch dir) — use that exact directory as
   the shared clone root; nothing is git-excluded.
+
+## Build directory
+
+Build artifacts — the PDF, `.aux`, `.log` and the rest, and each overlay variant — never go into a
+clone or a local project, in any mode: they go under a per-user root in the temp directory,
+`<tmp>/web-latex-mcp-build-<uid>` on macOS and Linux — created `0700`, and refused if it is a symbolic
+link, is not owned by you, or is writable by others — and `<tmp>\web-latex-mcp-build-<user name>` on
+Windows. The root is checked before every compile, and before `render_pages`, `extract_text`,
+`pdf_geometry` and the viewer read a build from under it; a refusal reads
+`Refusing to use build root <path>: <reason>` and says what to do about it.
+
+- **The temp directory must exist.** It is Node's `os.tmpdir()`: on macOS and Linux the first of
+  `TMPDIR`, `TMP` and `TEMP` that is set, else `/tmp`; on Windows `TEMP`, else `TMP`, else
+  `%SystemRoot%\temp`. The server never creates it: if it names no existing directory, every compile
+  and PDF read is refused with a message naming that directory. The message says to point `TMPDIR`
+  (`TEMP` on Windows) at an existing directory, and that always works, since it wins over the others;
+  if you never set it, the path came from `TMP` or `TEMP` (on Windows, from `TMP` or the
+  `%SystemRoot%` default), and correcting that variable works as well.
+- **On Windows it is per user by name only.** The user name is in the directory name, so two accounts
+  sharing one `TEMP` (a managed machine with `TEMP=C:\Temp`) never share a build dir by accident. The
+  directory's owner and ACL are **not** verified — only that it is a real directory, not a junction — so
+  under a shared `TEMP` another account could still create `web-latex-mcp-build-<your name>` first, with
+  access for everyone, and the server would accept it: a shared `TEMP` is only as safe as the name. The
+  default `%LOCALAPPDATA%\Temp` is private to you, and there this does not arise. If Windows will not
+  report your user name, the server refuses to build rather than use a shared name.
+- **On macOS and Linux it needs a filesystem with real permission bits.** A `TMPDIR` on WSL's drvfs
+  (`/mnt/c/…`, which reports every file as `0777`), on vfat/exFAT, or on an SMB mount without Unix
+  permissions is refused on every compile and PDF read, because the build dir there reads as writable
+  by everyone and no `chmod` can change that. This is deliberate and permanent — the server fails closed
+  rather than build where another user could swap the PDF — and it is a change from earlier versions,
+  which built there. Point `TMPDIR` at a directory on a native filesystem (on WSL, the default `/tmp`
+  is one).
+- **The temp directory itself is not checked.** Only the build root is. Under a world-writable temp
+  directory without the sticky bit, another user can rename the root away and put their own in its
+  place between a check and the build or read that follows. The default `/tmp` is sticky; a `TMPDIR`
+  you set should be too, or private to you.
 
 ## Parallel sessions
 

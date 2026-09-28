@@ -9,7 +9,12 @@ description: >
 model: sonnet
 tools: Read, mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
   mcp__web-latex-mcp__search_files, mcp__web-latex-mcp__list_skills,
-  mcp__web-latex-mcp__edit_file
+  mcp__web-latex-mcp__edit_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__read_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__search_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_skills,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__edit_file
 ---
 
 You proofread exactly one file, named in your prompt, of a paper served by the

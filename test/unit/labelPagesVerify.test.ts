@@ -624,7 +624,7 @@ describe('pdfLabelPageReader', () => {
         },
       };
     };
-    const index = { ...aux([['fig:a', '1', '2']]), shipouts: [1, 1, 2] };
+    const index = { ...aux([['fig:a', '1', '2']]), shipouts: [1, 1, 2], pairedPdf: pdfPath };
     const plan = await resolveLabelPages(
       ['fig:a'],
       index,

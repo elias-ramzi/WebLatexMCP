@@ -236,6 +236,21 @@ function parseFields(body: string, macros: Map<string, string>): Record<string, 
 }
 
 /**
+ * Whether the `@` at `at` is part of a TeX control sequence (`\@ifundefined`, `\@input`) rather
+ * than the start of an entry: it is, when an ODD run of backslashes sits directly before it — the
+ * last one then begins the control sequence. An even run is a string of `\\` (literal backslashes)
+ * and leaves the `@` free, so `\\@article{…}` still starts an entry. Without this, a
+ * `\makeatletter`…`\@ifundefined{theHchapter}{…}{}` block pasted into a `.bib` outside `@preamble`
+ * came back as an entry of type `ifundefined` keyed `theHchapter`, and `check_citations` reported
+ * it as an uncited reference (#222). Pure.
+ */
+function startsControlSequence(text: string, at: number): boolean {
+  let run = 0;
+  for (let j = at - 1; j >= 0 && text[j] === '\\'; j--) run++;
+  return run % 2 === 1;
+}
+
+/**
  * Parse a BibTeX database. Tolerant by design: a malformed entry is skipped rather than aborting the
  * file, because the point is to report on a bibliography, not to validate its syntax.
  */
@@ -246,7 +261,9 @@ export function parseBibtex(text: string): ReferenceEntry[] {
   while (i < text.length) {
     const at = text.indexOf('@', i);
     if (at === -1) break;
-    const header = /^@\s*([A-Za-z]+)\s*[{(]/.exec(text.slice(at));
+    const header = startsControlSequence(text, at)
+      ? null
+      : /^@\s*([A-Za-z]+)\s*[{(]/.exec(text.slice(at));
     if (!header) {
       i = at + 1;
       continue;

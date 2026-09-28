@@ -13,7 +13,7 @@ the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-
 | [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                                                                                                                                                                         | local note only          | `/summarize-paper`      |
 | [`proofread-document`](../.claude/skills/proofread-document/SKILL.md)     | Hunts **typos** — spelling, doubled or missing words, agreement, punctuation, quotes, unescaped LaTeX characters, inconsistent hyphenation of a repeated term. Reports each as an exact minimal substitution and applies nothing until you say so. Never rewrites prose for style; never touches a `.bib`.                                                                                                                                                                                                                            | opt-in `.tex`            | `/proofread-document`   |
 | [`review-writing-guide`](../.claude/skills/review-writing-guide/SKILL.md) | Reviews the paper against the [writing guide](writing-guide.md) — tense, first-person overuse, signposting, captions and floats, equation punctuation and notation, citation placement, acronyms, dashes, `\autoref`. Reports prioritized findings with a concrete suggested rewrite each. **Proposes, never applies**; writes nothing at all.                                                                                                                                                                                        | nothing                  | `/review-writing-guide` |
-| [`peer-review`](../.claude/skills/peer-review/SKILL.md)                   | Pre-submission peer review of an ML paper for a major conference: a three-pass reading protocol, a claim–evidence map, an ML checklist (baselines, leakage, seeds, ablations, compute, LLM pitfalls, theory, anonymity), severity × fixability × confidence, and a final review in six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. From a clone, `/review-paper` runs it as an independent multi-model panel merged by a Fable triage. **Reviews, never edits**; writes only git-excluded reports. | local reports only       | `/peer-review`          |
+| [`peer-review`](../.claude/skills/peer-review/SKILL.md)                   | Pre-submission peer review of an ML paper for a major conference: a three-pass reading protocol, a claim–evidence map, an ML checklist (baselines, leakage, seeds, ablations, compute, LLM pitfalls, theory, anonymity), severity × fixability × confidence, and a final review in six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. Claude Code's `/review-paper` runs it as an independent multi-model panel merged by a Fable triage. **Reviews, never edits**; writes only git-excluded reports. | local reports only       | `/peer-review`          |
 | [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and reporting on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong. Emits one ready-to-file issue body per finding, field for field against the repo's issue forms, with a measured environment (version, OS, client, model, install method, toolchain) and no manuscript content. Filed only when you ask.                                                                                                       | nothing                  | `/session-feedback`     |
 
 ## Two ways a skill runs
@@ -34,7 +34,7 @@ for it on its own. A prompt whose procedure acts on a project takes an optional 
 you can scope the run up front instead of being asked; one that does not — `session-feedback` reports on
 the server, never on a paper — takes no argument at all, so a client that binds what you type after the
 prompt name positionally cannot turn the first word into a project id. Because prompts are flat text, a skill that grows bundled scripts or reference
-files would only be partially conveyed — the `SKILL.md` body is what ships. All six current skills are
+files would only be partially conveyed — the `SKILL.md` body is what ships. All nine current skills are
 self-contained, so nothing is lost today.
 
 **As the [`list_skills`](tools.md) tool — model-invoked, no install.** The server also exposes its
@@ -62,9 +62,15 @@ Installs the server _and_ the skills, in every session, from any directory:
 Launching Claude Code from a clone of this repo works too — `.claude/skills` is picked up from the
 working directory. Either way you get `/verify-citations` and friends, model-invoked.
 
+The plugin also installs the paper commands and the agents they dispatch: `/review-paper`,
+`/hunt-typo`, `/format-latex`, `/review-writing` and `/rewrite-mode`, named
+`/web-latex-mcp:review-paper` and so on under the plugin. A clone gets the same files from
+`.claude/commands` and `.claude/agents`, next to this repository's own development tooling
+(`/implement`, `/review`, and their agents), which the plugin leaves out.
+
 ### Any MCP client — nothing to install
 
-The prompts come with the server. Once `web-latex-mcp` is connected, the six skills appear in the
+The prompts come with the server. Once `web-latex-mcp` is connected, the nine skills appear in the
 client's prompt menu, at the version the server shipped with, and the model can reach the same
 procedures through `list_skills`. Nothing to upload, nothing to keep in sync.
 
@@ -224,7 +230,8 @@ The result is one review in six sections — **summary** (the idea, the claims, 
 they are supported), **strengths**, **weaknesses**, **minor weaknesses**, **questions**, **typos** — plus
 a triage log with a prioritized action plan and a predicted score range.
 
-**From a clone of this repo, `/review-paper <project> [venue]` runs it as a panel.** Three independent
+**In Claude Code, `/review-paper <project> [venue]` runs it as a panel** (`/web-latex-mcp:review-paper`
+when installed with the plugin). Three independent
 full reviews on Sonnet, Opus and Fable, a devil's advocate on Opus that writes the strongest case for
 rejection, a novelty scout that looks for the closest prior and concurrent work (`--no-web` skips it; its
 queries never contain the paper's title), and one read-only `paper-typo-hunter` per file for typos. None of them sees
@@ -232,7 +239,12 @@ another's report. A Fable triage agent then re-reads the paper, verifies each fi
 dropping false positives, adjudicating every devil's-advocate critical — and writes the final review.
 The three full reviews reach it blinded (`R1`–`R3`, shuffled each run), since one of them runs on its
 own model. Before dispatching, the command says how many agents will run and how many read the whole
-paper, and asks first for a paper over ~40 pages.
+paper, and asks first for a paper over ~40 pages. It also looks for the venue's review or anonymous
+switch in the preamble: when the build is camera-ready, it asks once whether to review it as a
+submission (anonymity and page-limit findings count) or as camera-ready (they are informational). A
+novelty scout that finds the paper itself already public reports that for you to check — it is never
+counted as prior work. Each saved report is checked against the agent's reply before the triage reads
+it.
 Agreement between reviewers raises confidence, never severity. Anywhere else (an MCP prompt, one agent)
 the skill runs the same roles in sequence in one session, with less independent coverage.
 

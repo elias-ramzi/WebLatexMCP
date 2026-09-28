@@ -6,7 +6,7 @@ import {
   unwrapLines,
   needsShellEscape,
   shellCommandRefused,
-  shellEscapeWasEnabled,
+  engineShellEscapeBanner,
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
@@ -524,27 +524,34 @@ describe('needsShellEscape', () => {
   });
 });
 
-describe('shellEscapeWasEnabled', () => {
-  // An overlay compile asks for -no-shell-escape, but a project latexmkrc can put
-  // `-shell-escape` back after it (or drop %O), and the engine's banner is the only record of it.
-  it("reads the engine's banner, restricted or not, pdfTeX's and LuaTeX's wording", () => {
-    expect(shellEscapeWasEnabled('entering extended mode\n \\write18 enabled.\n')).toBe(true);
-    expect(shellEscapeWasEnabled(' restricted \\write18 enabled.\n')).toBe(true);
-    expect(shellEscapeWasEnabled('This is LuaTeX\n system commands enabled.\n')).toBe(true);
-    expect(shellEscapeWasEnabled(' restricted system commands enabled.')).toBe(true);
+describe('engineShellEscapeBanner', () => {
+  // A latexmkrc can put `-shell-escape` back after latexmk's `-no-shell-escape` (or drop %O), and
+  // the engine's banner — in the log's header, written before the document is read — is the only
+  // record of it that the document cannot write.
+  const header = (banner: string, first = 'This is pdfTeX, Version 3.14159265'): string =>
+    `${first}\nentering extended mode\n${banner}**main.tex\n(./main.tex\n`;
+
+  it("reads the header's banner, restricted or not, pdfTeX's and LuaTeX's wording", () => {
+    expect(engineShellEscapeBanner(header(' \\write18 enabled.\n'))).toBe('full');
+    expect(engineShellEscapeBanner(header(' restricted \\write18 enabled.\n'))).toBe('restricted');
+    const lua = 'This is LuaHBTeX, Version 1.24.0';
+    expect(engineShellEscapeBanner(header(' system commands enabled.\n', lua))).toBe('full');
+    expect(engineShellEscapeBanner(header(' restricted system commands enabled.\n', lua))).toBe(
+      'restricted',
+    );
   });
 
-  it('reads a command that ran, and nothing else', () => {
-    expect(shellEscapeWasEnabled('runsystem(echo PWNED > sections/a.tex)...executed.')).toBe(true);
-    expect(shellEscapeWasEnabled('runsystem(makeindex -q x)...executed safely (allowed).')).toBe(
-      true,
-    );
-    // What -no-shell-escape leaves: no banner line, and a refusal.
-    expect(shellEscapeWasEnabled('entering extended mode\n %&-line parsing enabled.\n')).toBe(
-      false,
-    );
-    expect(shellEscapeWasEnabled('runsystem(makeindex -q x)...disabled.')).toBe(false);
-    expect(shellEscapeWasEnabled('')).toBe(false);
+  it('reads nothing the document can write: a banner or an executed record in the body', () => {
+    // A header read and holding no banner is 'none' — shell escape was off — whatever the body says.
+    expect(engineShellEscapeBanner(header(''))).toBe('none');
+    expect(engineShellEscapeBanner(`${header('')} \\write18 enabled.\n`)).toBe('none');
+    expect(
+      engineShellEscapeBanner(`${header('')}runsystem(echo PWNED > sections/a.tex)...executed.\n`),
+    ).toBe('none');
+    // No `This is` first line, or no `**` line: no header to vouch for.
+    expect(engineShellEscapeBanner(' \\write18 enabled.\n**main.tex\n')).toBe(undefined);
+    expect(engineShellEscapeBanner('This is pdfTeX\n \\write18 enabled.\n')).toBe(undefined);
+    expect(engineShellEscapeBanner('')).toBe(undefined);
   });
 });
 

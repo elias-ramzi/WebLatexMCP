@@ -4,7 +4,9 @@ argument-hint: <project id> [file/dir filter] [--fix]
 ---
 
 Hunt typos in the project below by fanning out one `corrector` agent per file. You are
-the dispatcher and the reviewer; the agents do the reading.
+the dispatcher and the reviewer; the agents do the reading. The agent ships with this
+command: `web-latex-mcp:corrector` from the Claude Code plugin, `corrector` from a clone of
+the server repo — dispatch whichever your agent list shows.
 
 Target: $ARGUMENTS
 

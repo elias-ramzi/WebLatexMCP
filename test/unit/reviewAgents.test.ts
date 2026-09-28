@@ -16,6 +16,16 @@ import { parseSkill } from '../../src/lib/skills.js';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const MCP = 'mcp__web-latex-mcp__';
+/**
+ * The same server's tools when the Claude Code plugin starts it (#212): Claude Code names a
+ * plugin-declared server's tools `mcp__plugin_<plugin>_<server>__<tool>`, so each agent lists
+ * every server tool in both forms (test/unit/pluginManifest.test.ts pins the pairing).
+ */
+const PLUGIN_MCP = 'mcp__plugin_web-latex-mcp_web-latex-mcp__';
+const SERVER_PREFIXES = [MCP, PLUGIN_MCP];
+
+/** `name` under both server prefixes. */
+const serverTool = (name: string): string[] => SERVER_PREFIXES.map((prefix) => `${prefix}${name}`);
 
 /** The review agents, which must never write, compile, commit or push. */
 const REVIEW_AGENTS = [
@@ -37,15 +47,17 @@ const READ_ONLY_TOOLS = new Set([
   'Read',
   'WebSearch',
   'WebFetch',
-  `${MCP}read_file`,
-  `${MCP}list_files`,
-  `${MCP}search_files`,
-  `${MCP}list_skills`,
-  `${MCP}extract_text`,
-  `${MCP}render_pages`,
-  `${MCP}list_references`,
-  `${MCP}check_citations`,
-  `${MCP}search_references`,
+  ...[
+    'read_file',
+    'list_files',
+    'search_files',
+    'list_skills',
+    'extract_text',
+    'render_pages',
+    'list_references',
+    'check_citations',
+    'search_references',
+  ].flatMap(serverTool),
 ]);
 
 /** The Agent Skills limit on a skill's `description`; longer ones are cut or dropped. */
@@ -119,9 +131,10 @@ describe('review agents stay read-only', () => {
       });
 
       it('names only server tools that exist', () => {
-        const serverTools = (tools ?? [])
-          .filter((tool) => tool.startsWith(MCP))
-          .map((tool) => tool.slice(MCP.length));
+        const serverTools = (tools ?? []).flatMap((tool) => {
+          const prefix = SERVER_PREFIXES.find((p) => tool.startsWith(p));
+          return prefix === undefined ? [] : [tool.slice(prefix.length)];
+        });
         expect(serverTools.filter((tool) => !registered.has(tool))).toEqual([]);
       });
     });
@@ -136,8 +149,33 @@ describe('corrector', () => {
 
   it('declares its tools, and writes only through edit_file', () => {
     expect(tools).toBeDefined();
-    const allowed = new Set([...READ_ONLY_TOOLS, `${MCP}edit_file`]);
+    const allowed = new Set([...READ_ONLY_TOOLS, ...serverTool('edit_file')]);
     expect((tools ?? []).filter((tool) => !allowed.has(tool))).toEqual([]);
+  });
+});
+
+describe('formatter', () => {
+  // /format-latex dispatches it onto one section file: it creates figures/ and tables/ files and
+  // rewrites its own file once, so it holds write_file and edit_file — and nothing else that
+  // writes. Its description promises it never compiles and never touches a .bib; the list is what
+  // makes that true, since compile, commit, push, discard, delete_file and Bash are absent.
+  const text = readFileSync(path.join(ROOT, '.claude', 'agents', 'formatter.md'), 'utf8');
+  const tools = frontmatterTools(text);
+
+  it('declares its tools, and writes only through write_file and edit_file', () => {
+    expect(tools).toBeDefined();
+    const allowed = new Set([
+      ...READ_ONLY_TOOLS,
+      ...serverTool('write_file'),
+      ...serverTool('edit_file'),
+    ]);
+    expect((tools ?? []).filter((tool) => !allowed.has(tool))).toEqual([]);
+  });
+
+  it('can load its rules and write its files under either install', () => {
+    for (const tool of ['read_file', 'list_skills', 'write_file']) {
+      for (const name of serverTool(tool)) expect(tools ?? []).toContain(name);
+    }
   });
 });
 

@@ -12,7 +12,7 @@ import {
 } from '../services/pdfRender.js';
 import type { GeometryKind, GeometryResult } from '../services/pdfRender.js';
 import { readAuxFloats, DEFAULT_MAX_FLOATS, PARSE_BOUND } from '../lib/auxFloats.js';
-import { shippedNothing } from '../lib/labelPages.js';
+import { shippedNothing, staleBuildEvidence, staleRecordsText } from '../lib/labelPages.js';
 import { planFloatsPayload, FLOATS_CONTENT_BUDGET } from '../lib/floatsBudget.js';
 import { planGeometryPayload, GEOMETRY_CONTENT_BUDGET } from '../lib/geometryBudget.js';
 import { findVariantPdf, resolveVariantBuild, VARIANT_INPUT_DESCRIPTION } from '../lib/variants.js';
@@ -345,9 +345,10 @@ const outputSchema = {
         'find the page with extract_text instead. Label keys and numbers are unaffected. Loading ' +
         'the package without a layout shifts nothing, but is flagged too. Absent when the build ' +
         'shows no pgfpages. Also absent when neither file could be read (a missing or empty file ' +
-        'counts as unread), or when the .log holds no [n] shipout mark beside a PDF that has ' +
-        "pages (another run's record, or an empty file) — `note` then says the pages are " +
-        'unverified instead, since nothing shows the package was loaded.',
+        'counts as unread), or, when the records name no pgfpages, when the .log holds no [n] ' +
+        "shipout mark beside a PDF that has pages (another run's record, or an empty file) — " +
+        '`note` then says the pages are unverified instead, since nothing shows the package was ' +
+        'loaded.',
     ),
   note: z
     .string()
@@ -358,7 +359,10 @@ const outputSchema = {
         'neither its .fls nor its .log could be read (a missing or empty file counts as ' +
         'unread), or its .log holds no [n] shipout mark beside a PDF that has pages (it ' +
         "records a compile that shipped no page, or is empty, so it is not that PDF's run), so " +
-        'whether they are shifted could not be checked; the page ' +
+        "whether they are shifted could not be checked; the build's records show the PDF is " +
+        'not the output of the last compile (the .aux is newer than the PDF, or the ' +
+        "engine's closing line in the .log names another page count or no output), so the " +
+        'floats pages may not match the PDF; the page ' +
         'geometry hit its size budget (see textOmittedBySize); "floats" requested but no .aux ' +
         'was found in the build directory (nothing has been compiled with that root file yet, ' +
         'or the backend in use does not write one), or the .aux reader could not read an ' +
@@ -512,8 +516,11 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           if (requestedKinds.includes('floats')) {
             // `shipouts: true` for one question only: whether the .log records a compile that
             // shipped no page (the nothing-shipped note below). The marks check nothing else here.
+            // `pdfPath` for one question too: whether the .aux is newer than the PDF beside it
+            // (the stale-PDF note below).
             const auxResult = await readAuxFloats(dir, root, {
               shipouts: true,
+              ...(pdfPath !== undefined ? { pdfPath } : {}),
               ...(v ? { buildDir: v.paths.out } : {}),
             });
             // The size budget is applied AFTER the reader's count cap, over whatever survived it,
@@ -598,8 +605,36 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                   "every one a page later than the label's own. render_pages labels: refuses " +
                   'such a build; fix what stopped the last compile and compile again.'
                 : undefined;
+            // The same state in which labels: refuses every label ('stalePdf'): the build's records
+            // show the PDF is not the output of the last compile — under xelatex, an
+            // error in the body rewrites the .aux and .log and leaves the earlier run's PDF, since
+            // xdvipdfmx never runs. Not beside the nothing-shipped note, which already says the
+            // .log is another run's (and a preamble stop trips both); the pgfpages notes are about
+            // a different record and can stand beside it.
+            const stale =
+              auxResult.total > 0 && nothingShippedNote === undefined
+                ? staleBuildEvidence(auxResult, {
+                    ...(result.pageCount !== undefined ? { pageCount: result.pageCount } : {}),
+                    hasPages: pdfHasPages,
+                  })
+                : undefined;
+            const staleNote = stale
+              ? `The PDF beside the .aux is not the output of the last compile: ` +
+                `${staleRecordsText(stale)}. That compile stopped without writing a PDF — under ` +
+                "xelatex, an error in the document body rewrites the .aux and leaves the earlier run's " +
+                'PDF in place — so these pages may describe a newer document than the PDF, and not ' +
+                'match it. render_pages labels: refuses such a build; fix what stopped the last ' +
+                'compile and compile again.'
+              : undefined;
             floatsNote =
-              [shiftedNote, unverifiedNote, nothingShippedNote, auxResult.note, plan.note]
+              [
+                shiftedNote,
+                unverifiedNote,
+                nothingShippedNote,
+                staleNote,
+                auxResult.note,
+                plan.note,
+              ]
                 .filter(Boolean)
                 .join(' ') || undefined;
           }

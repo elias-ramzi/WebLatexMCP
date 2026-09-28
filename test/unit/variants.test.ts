@@ -991,13 +991,14 @@ describe('snapshotSource / sourceChanges', () => {
   });
 
   it('stops naming once the names would pass their character budget, counting the rest', () => {
-    const long = (c: string) => `${c.repeat(890)}/figure.tex`; // ~900 characters each
+    // ~450 characters each, charged twice (text + JSON): two fit the budget, a third does not.
+    const long = (c: string) => `${c.repeat(440)}/figure.tex`;
     const paths = ['a', 'b', 'c', 'd', 'e'].map(long);
     const hint = sourceChangedHint(paths);
     expect(hint).toContain('5 project file(s)');
     expect(hint).toContain(quoteId(paths[0]!));
     expect(hint).toContain(quoteId(paths[1]!));
-    expect(hint).not.toContain('c'.repeat(890));
+    expect(hint).not.toContain('c'.repeat(440));
     expect(hint).toContain(`${quoteId(paths[1]!)}, and 3 more.`);
   });
 
@@ -1012,12 +1013,14 @@ describe('snapshotSource / sourceChanges', () => {
     expect(hint).not.toContain('b.tex');
   });
 
-  it('bounds the whole hint by the budget plus its fixed prose, in its JSON form', () => {
-    // structuredContent carries the hint as JSON, where `"` and `\` each cost two characters —
-    // the larger of its two channels, and the one the budget is charged in.
-    const jsonLength = (s: string) => JSON.stringify(s).length - 2;
+  // The caller receives the hint twice — the text channel and structuredContent's JSON — so the
+  // names are charged at their SUM, never at the larger channel alone.
+  const jsonLength = (s: string) => JSON.stringify(s).length - 2;
+  const both = (s: string) => s.length + jsonLength(s);
+
+  it('bounds the whole hint by the budget plus its fixed prose, across text and JSON', () => {
     // The prose around the names, rendered with none: what the budget does not cover.
-    const fixed = jsonLength(sourceChangedHint([]));
+    const fixed = both(sourceChangedHint([]));
     const quote = String.fromCharCode(34);
     const bs = String.fromCharCode(92);
     for (const len of [50, 199, 900, 1999, 2500]) {
@@ -1027,36 +1030,33 @@ describe('snapshotSource / sourceChanges', () => {
           (_, i) => `${String(i).padStart(2, '0')}${fill.repeat(len)}`,
         );
         const hint = sourceChangedHint(paths);
-        expect(hint.length).toBeLessThanOrEqual(jsonLength(hint));
-        // The count clause and the total's extra digit are all the prose can grow by.
-        expect(jsonLength(hint), `names of ${len} ${fill}`).toBeLessThanOrEqual(
-          fixed + SOURCE_CHANGES_NAMES_BUDGET + ', and 40 more'.length + 1,
+        // The count clause and the total's extra digit, in both channels, are all the prose adds.
+        expect(both(hint), `names of ${len} ${fill}`).toBeLessThanOrEqual(
+          fixed + SOURCE_CHANGES_NAMES_BUDGET + 2 * (', and 40 more'.length + 1),
         );
       }
     }
   });
 
   it('pins the budget from both sides: names rendering to exactly it fit, one more character does not', () => {
-    // A name full of quotes: 2 characters each in the text, 4 in JSON — so the boundary below
-    // holds only when the budget is charged in the JSON form.
-    const first = `a${String.fromCharCode(34).repeat(300)}`;
-    const jsonLength = (s: string) => JSON.stringify(s).length - 2;
-    // The list quoteId(first) + ', ' + quoteId(fits), in JSON, is the budget exactly.
-    const fill =
-      SOURCE_CHANGES_NAMES_BUDGET -
-      jsonLength(quoteId(first)) -
-      ', '.length -
-      jsonLength(quoteId(''));
-    const fits = `b${'y'.repeat(fill - 1)}`;
-    expect(jsonLength(`${quoteId(first)}, ${quoteId(fits)}`)).toBe(SOURCE_CHANGES_NAMES_BUDGET);
-    // Charged in the text form instead, it would have room to spare.
-    expect(`${quoteId(first)}, ${quoteId(fits)}`.length).toBeLessThan(
+    // A name full of quotes: 2 characters each in the text, 4 in JSON — 6 in all — so the
+    // boundary below holds only when the budget is charged across both channels.
+    const first = `a${String.fromCharCode(34).repeat(100)}`;
+    // The rendered list quoteId(first) + ', ' + quoteId(fits), text + JSON, is the budget exactly;
+    // every letter of `fits` costs one character in each channel.
+    const fixedPart = both(quoteId(first)) + both(', ') + both(quoteId(''));
+    const room = SOURCE_CHANGES_NAMES_BUDGET - fixedPart;
+    expect(room % 2).toBe(0);
+    const fits = `b${'y'.repeat(room / 2 - 1)}`;
+    expect(both(`${quoteId(first)}, ${quoteId(fits)}`)).toBe(SOURCE_CHANGES_NAMES_BUDGET);
+    // Charged in the JSON form alone, it would have room to spare.
+    expect(jsonLength(`${quoteId(first)}, ${quoteId(fits)}`)).toBeLessThan(
       SOURCE_CHANGES_NAMES_BUDGET - 500,
     );
     const exact = sourceChangedHint([first, fits]);
     expect(exact).toContain(`${quoteId(first)}, ${quoteId(fits)}.`);
     expect(exact).not.toContain('more');
-    const over = sourceChangedHint([first, `${fits}z`]);
+    const over = sourceChangedHint([first, `${fits}y`]);
     expect(over).toContain(`${quoteId(first)}, and 1 more.`);
     expect(over).not.toContain('yyyy');
   });
@@ -1144,18 +1144,13 @@ describe('overlay: a latexmk rc file', () => {
     await expectSame(before, await snapshot(src));
   });
 
-  it('folds case only where the platform does', async () => {
+  it('folds case on every platform: the guard does not stake its answer on a case probe', async () => {
     const src = await tempDir('ovl-rc-');
-    for (const platform of ['darwin', 'win32'] as const) {
+    for (const platform of ['darwin', 'win32', 'linux'] as const) {
       await expect(
         applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform }),
       ).rejects.toThrow(/is a latexmk configuration file/);
     }
-    // On a case-sensitive filesystem `LatexMkRc` is not a file latexmk reads, so it is an
-    // ordinary overlay (here: one that reaches the reader, which is the point).
-    await expect(
-      applyOverlay(noReads, src, [{ file: 'LatexMkRc', edits: [edit] }], { platform: 'linux' }),
-    ).rejects.toThrow('read a file before refusing');
   });
 });
 
@@ -1175,7 +1170,7 @@ describe('overlaySnippetReader', () => {
 });
 
 describe('overlay: one file named twice', () => {
-  it('refuses a case variant under the platform fold, before reading anything', async () => {
+  it('refuses a case variant where the farm folds case, before reading anything', async () => {
     const src = await tempDir('ovl-dup-');
     await put(src, 'main.tex', 'x\n');
     const edit = { oldString: 'x', newString: 'y' };
@@ -1187,7 +1182,7 @@ describe('overlay: one file named twice', () => {
           { file: 'main.tex', edits: [edit] },
           { file: 'Main.tex', edits: [{ oldString: 'x', newString: 'z' }] },
         ],
-        { platform: 'darwin' },
+        { caseProbe: async () => true },
       ),
     ).rejects.toThrow(
       'Overlay entry 2 names "Main.tex", the same file as entry 1 ("main.tex"): name each file once',
@@ -1227,7 +1222,7 @@ describe('overlaySnippetReader: another spelling of an overlaid file', () => {
     const reader = overlaySnippetReader(
       new FileService(),
       new Map([['sections/b.tex', 'in memory\n']]),
-      { platform: 'darwin' },
+      { caseProbe: async () => true },
     );
     expect((await reader.read(src, { path: 'sections/B.tex' })).content).toBe('in memory\n');
     await expect(reader.read(src, { path: 'hard.tex' })).rejects.toThrow(

@@ -9,7 +9,7 @@ import {
   realpath,
   readlink,
 } from 'node:fs/promises';
-import { resolveInside, samePath, toPosix } from '../lib/paths.js';
+import { climbsOut, resolveInside, samePath, toPosix } from '../lib/paths.js';
 import {
   splitLines,
   sliceLineRange,
@@ -341,7 +341,7 @@ async function assertNoSymlinkEscape(
 ): Promise<void> {
   const [realRoot, target] = await Promise.all([realpath(projectDir), resolveThroughLinks(abs)]);
   const rel = path.relative(realRoot, target);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (climbsOut(rel) || path.isAbsolute(rel)) {
     throw new Error(`Path escapes the project root through a symlink: "${relPath}"`);
   }
 }
@@ -1257,7 +1257,7 @@ export class FileService {
       return null;
     }
     const rel = path.relative(realRoot, target);
-    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+    if (!climbsOut(rel) && !path.isAbsolute(rel)) {
       return toPosix(rel);
     }
     // Outside the project (only reachable under a local project's followSymlinks) — POSIX-ify so
