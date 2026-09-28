@@ -338,6 +338,15 @@
   min-width: 5.5em;
 }
 
+.flow.four {
+  grid-template-columns: 0.9fr auto 1.35fr auto 1.25fr auto 1fr;
+  margin: 0.9em 0 0.8em;
+}
+
+.flow.four .arrow {
+  min-width: 2.5em;
+}
+
 .flow .arrow b {
   font-size: 2.4em;
   line-height: 1;

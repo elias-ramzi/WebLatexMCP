@@ -420,7 +420,12 @@
                 src="img/hpc-terminal.jpg"
                 alt="Claude Code on the cluster, asked to update draft.tex with a new table"
               />
-              <p class="caption">Claude Code in tmux on the cluster, after a training run.</p>
+              <img
+                class="shot"
+                src="img/hpc-results.png"
+                alt="The results tables and training curves, as they appear in the paper"
+                style="width: 84%"
+              />
             </div>
           </div>
           <p class="footer-line">
@@ -586,7 +591,80 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 11. Skills -->
+        <!-- ============================================================ 11. Peer review -->
+        <section>
+          <p class="kicker">Ongoing work</p>
+          <h2>A peer review before the real one</h2>
+          <p class="lede" style="margin-top: 0">
+            An independent panel of Claude models reviews the paper; a triage agent checks every
+            finding against the paper and writes one review.
+            <span class="bubble">/review-paper my-paper NeurIPS</span>
+          </p>
+          <div class="flow four">
+            <div class="node">
+              <h3>Your paper</h3>
+              <ul>
+                <li>compiled once</li>
+                <li>sources + PDF</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b></div>
+            <div class="node">
+              <h3>Independent panel</h3>
+              <ul>
+                <li>3 full reviews — Sonnet, Opus, Fable</li>
+                <li>a devil's advocate</li>
+                <li>a novelty scout</li>
+                <li>typo hunters, one per file</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b>reports</div>
+            <div class="node core">
+              <h3>Triage</h3>
+              <ul>
+                <li>reads the paper first</li>
+                <li>merges duplicates</li>
+                <li>verifies each finding in the paper</li>
+                <li>drops the false positives</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b></div>
+            <div class="node">
+              <h3>One review</h3>
+              <ul>
+                <li>summary, strengths</li>
+                <li>weaknesses, ranked</li>
+                <li>questions, typos</li>
+              </ul>
+            </div>
+          </div>
+          <div class="grid three">
+            <div class="card">
+              <h3>Independent</h3>
+              <p>No reviewer sees another's report, so agreement between models means something.</p>
+            </div>
+            <div class="card">
+              <h3>Verified</h3>
+              <p>A finding is kept only once it is checked in the paper — appendix included.</p>
+            </div>
+            <div class="card">
+              <h3>Read-only</h3>
+              <p>It reviews, never edits: the reports stay in a local, git-excluded folder.</p>
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>Ongoing</strong> — <code>/review-paper</code> is on <code>dev</code>, not yet
+            released.
+          </p>
+          <aside class="notes">
+            Work in progress: the /review-paper command and the peer-review skill are on dev, not
+            yet released. The three full reviews are blinded — the triage does not know which model
+            wrote which. The design page has the details: severity, fixability and confidence per
+            finding, and the triage log with a verdict for each one.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 12. Skills -->
         <section>
           <p class="kicker">Skills</p>
           <h2>Bundled skills</h2>
@@ -638,7 +716,7 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 12. Contributing -->
+        <!-- ============================================================ 13. Contributing -->
         <section>
           <p class="kicker">Contributing</p>
           <h2>Help make it better</h2>
@@ -676,7 +754,7 @@
           </aside>
         </section>
 
-        <!-- ============================================================ 13. Take home message -->
+        <!-- ============================================================ 14. Take home message -->
         <section data-background-color="#1A1A2E" class="closing">
           <p class="kicker">Take home message</p>
           <h2>Claude as a co-author, on your real paper</h2>
