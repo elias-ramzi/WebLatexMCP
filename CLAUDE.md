@@ -913,6 +913,30 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
+- **An overlay compile builds a what-if variant in a link farm; the server never writes the
+  project, and what the build writes is reported.** `compile`'s `overlay` (`src/lib/variants.ts`,
+  whose JSDoc carries the mechanics) applies the edits in memory (`applyEditsToContent`, the pure
+  half of `FileService.applyEdits`) and compiles in a mirror of the project whose files are links to
+  the source, except the overlaid ones. Nothing goes through FileService's write path: no baseline,
+  no shadow record, no rewrite mode, and the surfaced PDF and viewer are left alone. The rules:
+  - **`rootFile` is judged once, on the raw spelling, before anything is read or staged**
+    (`refuseLinkedRootDir`, called by `compile` and again by `stageVariant`). A `..` segment, an
+    absolute or drive-qualified path, or a root under a linked directory is refused: latexmk's `-cd`
+    resolves physically, so any of them runs the engine inside the SOURCE.
+  - **The farm's links are a write path for the build.** A variant passes `-no-shell-escape` unless
+    the caller opted in (TeX Live's default restricted mode runs `makeindex -o` into a linked file);
+    a normal compile's argv stays byte-identical, pinned by a test. An overlaid `latexmkrc` is
+    refused.
+  - **What cannot be closed is reported, never denied.** The project's own latexmkrc, lualatex's
+    `io.open` and tectonic's `\openout` can still write, so `watchSource` compares a before/after
+    snapshot (following links, since the farm's links reach their targets) and `hint` names what
+    changed. A snapshot that could not complete is "could not be checked", never "unchanged". The
+    workspace is skipped by equality only (a local project can contain it, and a link into a sibling
+    clone is still a write); the build root with everything under it. The changed-path names and
+    the failure reason are document-controlled, so both are budgeted.
+  - **Eviction is best-effort**: at most `MAX_VARIANTS` are kept; a removal failure goes to stderr
+    and `hint`, never failing the finished compile.
+  - **The PDF tools read a `variant` build only**, never falling back to the main one.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location

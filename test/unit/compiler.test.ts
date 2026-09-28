@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, writeFile, rm, stat, symlink, utimes } from 'node:fs/promises';
 import {
   latexmkArgs,
   mirrorSubdirs,
+  mirrorSubdirsForRoot,
   isNotFound,
   probeOnPath,
   collectOutcome,
@@ -46,6 +47,24 @@ describe('latexmkArgs (shell escape)', () => {
     const args = latexmkArgs({ ...base, restrictedShellEscape: true }, BUILD);
     expect(args).toContain('-shell-restricted');
     expect(args).not.toContain('-shell-escape');
+  });
+
+  it('passes -no-shell-escape only for a request that asks for it (an overlay compile)', () => {
+    const plain = latexmkArgs(base, BUILD);
+    const disabled = latexmkArgs({ ...base, noShellEscape: true }, BUILD);
+    expect(plain).not.toContain('-no-shell-escape');
+    expect(disabled).toContain('-no-shell-escape');
+    // Nothing else moves: a normal compile's argv is exactly what it was.
+    expect(disabled.filter((a) => a !== '-no-shell-escape')).toEqual(plain);
+    expect(plain).toEqual([
+      '-pdf',
+      '-interaction=nonstopmode',
+      '-file-line-error',
+      '-cd',
+      '-synctex=1',
+      `-outdir=${BUILD}`,
+      'main.tex',
+    ]);
   });
 
   it('prefers full -shell-escape over restricted when both are set', () => {
@@ -97,6 +116,118 @@ describe('mirrorSubdirs', () => {
 
       expect(await isDir(path.join(dest, 'imgs'))).toBe(true);
       expect(await isDir(path.join(dest, '.git'))).toBe(false);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+      await rm(dest, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('mirrorSubdirsForRoot', () => {
+  async function isDir(p: string): Promise<boolean> {
+    try {
+      return (await stat(p)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  it("also mirrors a subdirectory root's own tree at the build dir root, where -cd writes", async () => {
+    // latexmk's -cd runs the engine in paper/, so `\include{chap/c1}` from paper/main.tex
+    // writes <outdir>/chap/c1.aux. Mirroring the project root alone made only <outdir>/paper/chap,
+    // and the compile died with "I can't write on file `chap/c1.aux'".
+    const src = await mkdtemp(path.join(os.tmpdir(), 'mirror-src-'));
+    const dest = await mkdtemp(path.join(os.tmpdir(), 'mirror-dst-'));
+    try {
+      await mkdir(path.join(src, 'paper', 'chap', 'deep'), { recursive: true });
+      await mkdir(path.join(src, 'shared'), { recursive: true });
+
+      await mirrorSubdirsForRoot(src, dest, 'paper/main.tex');
+
+      expect(await isDir(path.join(dest, 'chap', 'deep'))).toBe(true);
+      // The project-root mirror stays, for writes through ../ paths.
+      expect(await isDir(path.join(dest, 'paper', 'chap', 'deep'))).toBe(true);
+      expect(await isDir(path.join(dest, 'shared'))).toBe(true);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+      await rm(dest, { recursive: true, force: true });
+    }
+  });
+
+  it('skips an absolute, missing or outside root directory without throwing', async () => {
+    // rootFile is caller-supplied: an absolute one used to throw a raw ENOENT (joined under the
+    // project), a missing directory the same, and `../` mirrored a tree outside the project.
+    const base = await mkdtemp(path.join(os.tmpdir(), 'mirror-base-'));
+    const src = path.join(base, 'proj');
+    const dest = path.join(base, 'dest');
+    try {
+      await mkdir(path.join(src, 'inside'), { recursive: true });
+      await mkdir(path.join(base, 'sibling', 'secret', 'deeper'), { recursive: true });
+      await mkdir(dest, { recursive: true });
+      const abs = path.join(base, 'sibling', 'main.tex');
+
+      await mirrorSubdirsForRoot(src, dest, abs);
+      await mirrorSubdirsForRoot(src, dest, 'nope/main.tex');
+      await mirrorSubdirsForRoot(src, dest, '../sibling/main.tex');
+      await mirrorSubdirsForRoot(src, dest, '../../../../../../../../main.tex');
+
+      // Only the project-root mirror ran: nothing of the sibling's tree reached the build dir.
+      expect((await readdir(dest)).sort()).toEqual(['inside']);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('does not follow a root directory that is a link out of the project', async () => {
+    // Containment was judged on the path STRING, then `stat` and `mirrorSubdirs` followed the
+    // link: a committed `paper -> /` made every compile walk the outside tree into the build dir.
+    const base = await mkdtemp(path.join(os.tmpdir(), 'mirror-base-'));
+    const src = path.join(base, 'proj');
+    const dest = path.join(base, 'dest');
+    const outside = path.join(base, 'outside');
+    try {
+      await mkdir(path.join(src, 'inside'), { recursive: true });
+      await mkdir(path.join(outside, 'secret', 'deeper'), { recursive: true });
+      await mkdir(path.join(outside, 'nested', 'more'), { recursive: true });
+      await mkdir(dest, { recursive: true });
+      // 'junction' is ignored on POSIX and is what win32 can create without a privilege.
+      await symlink(outside, path.join(src, 'paper'), 'junction');
+
+      await mirrorSubdirsForRoot(src, dest, 'paper/main.tex');
+      // A root BENEATH the link leaves the project the same way.
+      await mirrorSubdirsForRoot(src, dest, 'paper/nested/main.tex');
+
+      // Only the project-root mirror ran, and it does not descend into the link either.
+      expect((await readdir(dest)).sort()).toEqual(['inside']);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('still mirrors a root directory that is a link to a directory inside the project', async () => {
+    const src = await mkdtemp(path.join(os.tmpdir(), 'mirror-src-'));
+    const dest = await mkdtemp(path.join(os.tmpdir(), 'mirror-dst-'));
+    try {
+      await mkdir(path.join(src, 'real', 'chap', 'deep'), { recursive: true });
+      await symlink(path.join(src, 'real'), path.join(src, 'paper'), 'junction');
+
+      await mirrorSubdirsForRoot(src, dest, 'paper/main.tex');
+
+      // `\include{chap/c1}` from paper/main.tex writes <outdir>/chap/c1.aux: it must exist.
+      expect(await isDir(path.join(dest, 'chap', 'deep'))).toBe(true);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+      await rm(dest, { recursive: true, force: true });
+    }
+  });
+
+  it('adds nothing for a root at the project root', async () => {
+    const src = await mkdtemp(path.join(os.tmpdir(), 'mirror-src-'));
+    const dest = await mkdtemp(path.join(os.tmpdir(), 'mirror-dst-'));
+    try {
+      await mkdir(path.join(src, 'chap'), { recursive: true });
+      await mirrorSubdirsForRoot(src, dest, 'main.tex');
+      expect(await readdir(dest)).toEqual(['chap']);
     } finally {
       await rm(src, { recursive: true, force: true });
       await rm(dest, { recursive: true, force: true });

@@ -357,7 +357,9 @@ describe('render_pages', () => {
     expect(out.note).toContain('LAST COMPILE');
     // Pinned as its own line, not merely somewhere in the text: the provenance note also names
     // the mapping, so a looser assertion passes with the scannable summary line deleted.
-    expect(textOf(res)).toMatch(/labels \(from the last compile's \.aux\): tab:results -> page 4/);
+    expect(textOf(res)).toMatch(
+      /labels \(from the \.aux of the build read\): tab:results -> page 4/,
+    );
     expect(contentOf(res).filter((b) => b.type === 'image')).toHaveLength(1);
   });
 

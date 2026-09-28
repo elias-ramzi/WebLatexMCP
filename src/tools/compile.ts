@@ -23,11 +23,33 @@ import {
   fitFilteredLog,
   logTail,
   needsShellEscape,
+  shellCommandRefused,
+  shellEscapeWasEnabled,
   findMissingPackages,
   LOG_TAIL_LINE_CAP,
 } from '../services/logParser.js';
 import { makeWarningJudge } from '../lib/warningFilter.js';
-import { engineNotFoundHint } from '../services/compiler.js';
+import {
+  applyOverlay,
+  describeEvictionFailure,
+  evictionFailureHint,
+  evictVariants,
+  overlayFilesNeverRead,
+  overlaySnippetReader,
+  refuseLinkedRootDir,
+  sourceChangedHint,
+  stageVariant,
+  variantHandle,
+  variantPaths,
+  watchSource,
+  MAX_OVERLAY_EDITS,
+  MAX_OVERLAY_FILES,
+  MAX_VARIANTS,
+} from '../lib/variants.js';
+import type { SourceCheck } from '../lib/variants.js';
+import { buildRoot, engineNotFoundHint } from '../services/compiler.js';
+import { quoteId } from '../lib/projectId.js';
+import { editItemSchema } from './editFile.js';
 import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -120,6 +142,56 @@ const inputSchema = {
         'warning, not none — so a list you built programmatically and that came out empty widens ' +
         'the result instead of narrowing it.',
     ),
+  overlay: z
+    .array(
+      z.object({
+        file: z.string().describe('Project file to edit for this build, relative to the root.'),
+        edits: z
+          .array(editItemSchema)
+          .min(1)
+          .describe(
+            "edit_file's edits, with edit_file's rules (string or line-range edits, " +
+              'excludeComments; never rewrite preservation), applied in memory to this file.',
+          ),
+      }),
+    )
+    .min(1)
+    .max(MAX_OVERLAY_FILES)
+    .optional()
+    .describe(
+      'Compile a what-if VARIANT instead of the project: these files with these edits applied ' +
+        'in memory, everything else as it is — to measure a change (page count, where a float ' +
+        'lands, whether a table still fits) without the server writing the source. The server ' +
+        'leaves the source, the main build, the surfaced PDF and the viewer as they were, and ' +
+        'records nothing as a change of this session. To keep the build itself from writing ' +
+        'the source through the variant, an overlay compile runs NO shell command unless ' +
+        'shellEscape or restrictedShellEscape is set — not even the restricted allow-list a ' +
+        'normal compile may run by default — so a document that needs one (makeindex, epstopdf, TikZ ' +
+        'externalization) can build differently here, and `hint` says so; and a latexmkrc / ' +
+        '.latexmkrc may not be overlaid (latexmk runs it as Perl). Some routes stay open: the ' +
+        "project's own latexmkrc still runs and can turn shell escape back on, lualatex's Lua " +
+        "io.open needs no shell escape, and tectonic's \\openout writes any absolute path. So " +
+        "the project's files — following its symbolic links, which the build can write " +
+        'through — are compared (size, mode, inode and times; no content read) before and ' +
+        'after the build: any that ' +
+        'changed are named in `hint` — check them and discard what you did not mean — and a ' +
+        'log showing shell escape enabled against the request is reported. The result ' +
+        'carries a `variant` handle; pass it to render_pages / extract_text / pdf_geometry to ' +
+        'inspect that build. Name each file ' +
+        `once (all its edits in one entry); at most ${MAX_OVERLAY_FILES} files and ` +
+        `${MAX_OVERLAY_EDITS} edits in total. A .bib may be overlaid without confirmBibEdit — ` +
+        'the real file is never written. Line numbers in the diagnostics (and snippets) for an ' +
+        "overlaid file refer to the variant's text, not the file on disk. shellEscape or " +
+        'restrictedShellEscape in an overlay compile lets the document write wherever a normal ' +
+        "compile can — including into the source, through the variant's links to it. The " +
+        `${MAX_VARIANTS} most recently compiled variants per project are kept; older ones are ` +
+        'removed. Recompiling the same overlay reuses its variant (incrementally). rootFile ' +
+        'must be relative to the project root — not absolute or drive-qualified (C:), with no ' +
+        '".." segment, and not reached through a linked directory — or the overlay compile is ' +
+        'refused before anything is read. The variant mirrors the project and not its parent: ' +
+        './ and ../ inputs resolve as in the project while they stay inside it, but a ../ input ' +
+        'that leaves the project fails here, where a normal compile reads it.',
+    ),
 };
 
 /** Shared by both arrays; only errors ever carry source context (see {@link errorShape}). */
@@ -184,7 +256,8 @@ const outputSchema = {
     .describe(
       'Path to the compiled PDF. For workspace-local clones this is <workspace>/.web_latex_mcp/' +
         '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path. ' +
-        'POSIX (`/`-separated) on every OS.',
+        "For an overlay compile it is always the variant's own PDF, in its temp build dir " +
+        '(variants/<handle>/out/) — a variant is never surfaced. POSIX (`/`-separated) on every OS.',
     ),
   pdfUrl: z
     .string()
@@ -351,6 +424,15 @@ const outputSchema = {
         'from `hint`, which is about the compile itself (a missing package, a needed ' +
         'shell-escape retry) rather than about what this result could carry.',
     ),
+  variant: z
+    .string()
+    .optional()
+    .describe(
+      'Present only for an overlay compile: the handle of the what-if build it made. Pass it as ' +
+        '`variant` to render_pages, extract_text or pdf_geometry to read that build rather than ' +
+        'the main one. Evicted once it is no longer among the ' +
+        `${MAX_VARIANTS} most recently compiled variants of the project.`,
+    ),
   hint: z
     .string()
     .optional()
@@ -362,7 +444,12 @@ const outputSchema = {
         'failure: the LaTeX engine latexmk tried to run (pdflatex/xelatex/lualatex) is not ' +
         'installed — said only when the log names no error of its own — or the document uses ' +
         'TikZ externalization and needs a shell-escape retry, or a package is missing from the ' +
-        'local TeX installation. Absent when there is nothing to say.',
+        'local TeX installation. For an overlay compile, also: first, the project files the ' +
+        'build changed while it ran (the one thing here you may have to undo); after the engine ' +
+        "note, an overlaid file the build never opened (by the variant's .fls and " +
+        '.fdb_latexmk — so never under tectonic, which writes no .fls), or, on a failed build, ' +
+        'one it stopped before reading; and last, an older variant that could not be removed. ' +
+        'Absent when there is nothing to say.',
     ),
 };
 
@@ -427,7 +514,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'rejected by the client and delivering nothing. Also reports whether the ' +
         'backend actually wrote a fresh PDF (`rebuilt` — false means a peer session already ' +
         'compiled this shared clone and there was nothing to do) and how long this call waited ' +
-        'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended).',
+        'for the project lock before compiling (`lockWaitSec`, with `lockHeldBy` when contended). ' +
+        'Pass `overlay` to compile a what-if variant instead — some files with edit_file-style ' +
+        'edits applied in memory — and measure it (pageCount, render_pages / extract_text / ' +
+        'pdf_geometry with the returned `variant`) without the server writing the source or the ' +
+        'main build ' +
+        '(shell escape is off for an overlay unless you opt in; any project file the build ' +
+        'still changed is named in `hint`).',
       inputSchema,
       outputSchema,
     },
@@ -442,6 +535,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       restrictedShellEscape,
       compiler,
       warningsFilter,
+      overlay,
     }) => {
       try {
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
@@ -451,6 +545,60 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         const backend = await ctx.compiler.select(compiler);
         return await ctx.projectManager.runExclusive(id, async (lock) => {
           const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // An overlay compile builds a variant: the edited text is applied in memory (read
+          // through FileService under the project's link policy, never written back, no baseline)
+          // and compiled in a link farm with its own build dir — see src/lib/variants.ts.
+          let variant:
+            | {
+                handle: string;
+                contents: Map<string, string>;
+                outDir: string;
+                workDir: string;
+                sourceChanges: () => Promise<SourceCheck>;
+              }
+            | undefined;
+          if (overlay) {
+            // The root's spelling and directory path are judged before the overlay is read: a
+            // refusal here must not wait on (or be masked by) an overlay entry's own error.
+            await refuseLinkedRootDir(dir, root);
+            const contents = await applyOverlay(ctx.files, dir, overlay);
+            const handle = variantHandle({
+              rootFile: root,
+              engine,
+              compiler: backend.kind,
+              shellEscape,
+              restrictedShellEscape,
+              overlay,
+            });
+            const skip = [ctx.config.workspaceRoot, buildRoot()];
+            const paths = await stageVariant({
+              projectDir: dir,
+              handle,
+              rootFile: root,
+              engine: engine ?? 'pdflatex',
+              compiler: backend.kind,
+              contents,
+              skip,
+            });
+            // Snapshot the source AFTER staging (on win32 staging hard-links and unlinks source
+            // files, which moves their change time) and compare right after the build, before
+            // eviction does the same. Some routes from the farm back into the source are not the
+            // server's to close (see `snapshotSource`), so the result reports what the build
+            // actually did to the project rather than asserting "untouched". The workspace is
+            // skipped by equality alone (a local project may contain it, and a project link into
+            // a sibling clone is written through like any other); the build root, which the build
+            // writes by design, with everything under it.
+            const sourceChanges = await watchSource(dir, {
+              skip: [ctx.config.workspaceRoot],
+              skipTree: [buildRoot()],
+            });
+            variant = { handle, contents, outDir: paths.out, workDir: paths.src, sourceChanges };
+          }
+          // Shell escape is on unless the caller turned it off? Not for a variant: TeX Live's
+          // default (`shell_escape = p`) runs allow-listed commands with no flag at all, and in
+          // the farm `makeindex -o sections/a.tex` writes the SOURCE file through its link. So a
+          // variant runs none unless the caller opted in; a normal compile's argv is unchanged.
+          const shellEscapeOn = shellEscape || restrictedShellEscape;
           const outcome = await backend.compiler.compile({
             projectDir: dir,
             rootFile: root,
@@ -459,7 +607,37 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             timeoutSec,
             shellEscape,
             restrictedShellEscape,
+            ...(variant
+              ? {
+                  workDir: variant.workDir,
+                  outDir: variant.outDir,
+                  ...(shellEscapeOn ? {} : { noShellEscape: true }),
+                }
+              : {}),
           });
+          const sourceCheck = variant ? await variant.sourceChanges() : undefined;
+          const changedSource = sourceCheck?.changed;
+          // Why it could not be checked, for the variant line: a cause that stays (a committed
+          // link loop) fails every check, so it has to be findable.
+          const uncheckedReason =
+            sourceCheck !== undefined && sourceCheck.changed === undefined
+              ? sourceCheck.reason
+              : undefined;
+          // Retention runs after the compile, under the same lock, and never removes this one. It
+          // is best-effort: an old variant that cannot be removed (a viewer holding its PDF open on
+          // Windows) must not throw away the compile that just finished.
+          let evictionFailure: string | undefined;
+          if (variant) {
+            try {
+              await evictVariants(dir, MAX_VARIANTS, variant.handle);
+            } catch (err) {
+              evictionFailure = evictionFailureHint(err);
+              console.error(
+                `[compile] could not remove an old variant of ${quoteId(id)}: ` +
+                  describeEvictionFailure(err),
+              );
+            }
+          }
           // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
           // to the project root — rebase them there so a `file` is one the caller can open.
           const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
@@ -468,7 +646,12 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Errors carry their source context; warnings do not — a normal build has hundreds of
           // them and attaching a snippet to each would bloat every successful compile's result.
           const { errors: located, omittedLocations: omittedSnippetLocations } =
-            await attachErrorSnippets(ctx.files, dir, parsedErrors);
+            await attachErrorSnippets(
+              // An overlaid file's snippet comes from the text that was compiled, not the disk.
+              variant ? overlaySnippetReader(ctx.files, variant.contents) : ctx.files,
+              dir,
+              parsedErrors,
+            );
           // A path out of the project through a symlink is not handed back as somewhere to read
           // next — for warnings as much as errors, since both come off the same document-written
           // log. Refusing only the snippet read would leave the guard one hop deep.
@@ -495,17 +678,42 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           const missingPackages = findMissingPackages(outcome.log);
           // Never silently retry with shell escape — that would turn a compile into arbitrary code
           // execution without consent. Surface a hint and let the caller opt in explicitly.
-          const shellEscapeOn = shellEscape || restrictedShellEscape;
           const hints: string[] = [];
           // First: it reframes everything below it. A substituted backend means the caller is not
           // reading the diagnostics they expected — under tectonic, notably, none of them carry a
           // snippet — so say which engine spoke before explaining what it said.
           if (backend.note) hints.push(backend.note);
-          // Next: an engine latexmk could not run explains a failure that otherwise reads as
+          // Next: a variant build that wrote the project is the one thing here the caller may
+          // have to undo.
+          if (changedSource !== undefined && changedSource.length > 0) {
+            hints.push(sourceChangedHint(changedSource));
+          }
+          // Then: an engine latexmk could not run explains a failure that otherwise reads as
           // "FAILED — 0 error(s)" and nothing else. The gate (failed, nothing parsed) and the
           // wording are the service's; this only places it.
           const engineHint = engineNotFoundHint(outcome, parsedErrors.length);
           if (engineHint) hints.push(engineHint);
+          // An overlaid file the build never opened changed nothing, and the variant would read as
+          // the main build without a word — say so, naming it. No .fls (tectonic): nothing claimed.
+          // A FAILED build may simply have stopped before reaching it, so it is not told to
+          // overlay another path.
+          if (variant) {
+            const unread = await overlayFilesNeverRead(variantPaths(dir, variant.handle), root, [
+              ...variant.contents.keys(),
+            ]);
+            for (const rel of unread ?? []) {
+              hints.push(
+                outcome.success
+                  ? `The build never read the overlaid file ${quoteId(rel)} (neither its .fls nor ` +
+                      'its .fdb_latexmk lists it), so the overlay had no effect on it — overlay ' +
+                      'the path TeX actually opens instead (the target of a symbolic link, or the ' +
+                      'name the document inputs).'
+                  : `The build stopped before reading the overlaid file ${quoteId(rel)} (neither ` +
+                      'its .fls nor its .fdb_latexmk lists it), so whether the document reads it ' +
+                      'is not known yet — fix the errors and compile again.',
+              );
+            }
+          }
           if (!shellEscapeOn && needsShellEscape(outcome.log)) {
             hints.push(
               'This document uses TikZ externalization, which needs system calls. Retry compile ' +
@@ -513,13 +721,33 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 'this for a project you trust — shell escape lets the .tex run arbitrary commands.',
             );
           }
+          // A variant ran with shell escape disabled (above), so a command a normal compile would
+          // run under the installation's default was refused — say so, and what opting in costs.
+          if (
+            variant &&
+            !shellEscapeOn &&
+            (shellCommandRefused(outcome.log) || needsShellEscape(outcome.log))
+          ) {
+            hints.push(
+              'This overlay compile refused a shell command the document ran (\\write18): an ' +
+                'overlay compile disables shell escape — even the restricted allow-list a normal ' +
+                "compile may run — to keep the source untouched, since the variant's files are " +
+                'links to it. So this variant can differ from a normal build. Retrying with ' +
+                'restrictedShellEscape: true (or shellEscape: true) runs it, but lifts that ' +
+                'guarantee: the command can then write the source through those links.',
+            );
+          }
           if (missingPackages.length > 0)
             hints.push(missingPackageHint(missingPackages, backend.kind));
+          // Last: housekeeping, not this compile — an older variant that could not be removed.
+          if (evictionFailure !== undefined) hints.push(evictionFailure);
           const hint = hints.length > 0 ? hints.join('\n') : undefined;
           // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
           // the user can open the latest build from their editor instead of hunting the temp dir.
+          // Never for a variant: the surfaced copy is the project's latest build, which an
+          // overlay compile does not change.
           let pdfPath = outcome.pdfPath;
-          if (pdfPath && ctx.config.workspaceIsLocal) {
+          if (pdfPath && ctx.config.workspaceIsLocal && !variant) {
             pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
           }
           const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
@@ -597,14 +825,15 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             logPath: outLogPath,
             omittedSnippetLocations,
             ...(diagnostics.note ? { note: diagnostics.note } : {}),
+            ...(variant ? { variant: variant.handle } : {}),
             hint,
           };
           // Name the backend in the text too, not only structuredContent: which engine spoke
           // decides how to read what follows (tectonic attaches no snippets to anything), and the
           // client this rendering exists for is the one that cannot read structuredContent at all.
           let headline = outcome.timedOut
-            ? `compile timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
-            : `${outcome.success ? 'compiled' : 'FAILED'} ${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
+            ? `compile${variant ? ` of variant ${variant.handle}` : ''} timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
+            : `${outcome.success ? 'compiled' : 'FAILED'} ${variant ? `variant ${variant.handle} of ` : ''}${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
               `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
               `${errors.length} error(s), ${shownFilteredWarnings.length} warning(s)` +
               (warningsOmitted > 0 ? ` (${warningsOmitted} filtered out)` : '');
@@ -654,20 +883,49 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Surface the live viewer whenever there's something to look at: its URL if it's already
           // running — saying whether it now shows THIS build, since it follows the auto-detected
           // root and not `rootFile` — else a pointer that the tool exists.
-          const viewerUrl = pdfPath && ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined;
-          const viewerLine = pdfPath
-            ? compileViewerHint(
-                viewerUrl
-                  ? {
-                      url: viewerUrl,
-                      builtRoot: toPosix(root),
-                      shows: await viewerShowsForCompile(ctx.files, ctx.config, id, dir, root),
-                    }
-                  : undefined,
-              )
+          // Not for a variant: the viewer shows the project's own build, which this did not touch.
+          const viewerUrl =
+            pdfPath && !variant && ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined;
+          const viewerLine =
+            pdfPath && !variant
+              ? compileViewerHint(
+                  viewerUrl
+                    ? {
+                        url: viewerUrl,
+                        builtRoot: toPosix(root),
+                        shows: await viewerShowsForCompile(ctx.files, ctx.config, id, dir, root),
+                      }
+                    : undefined,
+                )
+              : '';
+          // Every claim here is one the build's own record backs: the source's state from the
+          // before/after comparison, shell escape's from the engine's banner — the latexmk flag
+          // alone reaches the engine only through %O, which a project latexmkrc can override.
+          const escapeReenabled = !shellEscapeOn && shellEscapeWasEnabled(outcome.log);
+          const variantLine = variant
+            ? `variant ${variant.handle}: pass variant to render_pages / extract_text / ` +
+              'pdf_geometry to inspect it. ' +
+              (changedSource === undefined
+                ? 'The main build, the surfaced PDF and the viewer are untouched; whether the ' +
+                  'build wrote a project file could not be checked this time' +
+                  (uncheckedReason !== undefined ? ` (${uncheckedReason}).` : '.')
+                : changedSource.length > 0
+                  ? `The build CHANGED ${changedSource.length} project file(s) (see hint); ` +
+                    'the main build, the surfaced PDF and the viewer are untouched.'
+                  : 'The source (checked: no project file changed while it built), the main ' +
+                    'build, the surfaced PDF and the viewer are untouched.') +
+              (shellEscapeOn
+                ? " Shell escape was on, so the document's shell commands could write anywhere — " +
+                  "the source included, through the variant's links to it."
+                : escapeReenabled
+                  ? ' Shell escape was requested off, but the log shows it enabled: a ' +
+                    "latexmkrc (the project's own, or a user or system one) overrode the flag, " +
+                    "so the document's shell commands could run."
+                  : ' Shell escape was off for this build.')
             : '';
           const text = [
             headline,
+            variantLine,
             pdfUrl ? `PDF: ${pdfUrl}` : '',
             errorLines,
             dropped,

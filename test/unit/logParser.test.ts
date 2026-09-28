@@ -5,6 +5,8 @@ import {
   logTail,
   unwrapLines,
   needsShellEscape,
+  shellCommandRefused,
+  shellEscapeWasEnabled,
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
@@ -519,6 +521,50 @@ describe('needsShellEscape', () => {
 
   it('is false for an ordinary error with no system-call failure', () => {
     expect(needsShellEscape('./main.tex:3: Undefined control sequence.')).toBe(false);
+  });
+});
+
+describe('shellEscapeWasEnabled', () => {
+  // An overlay compile asks for -no-shell-escape, but a project latexmkrc can put
+  // `-shell-escape` back after it (or drop %O), and the engine's banner is the only record of it.
+  it("reads the engine's banner, restricted or not, pdfTeX's and LuaTeX's wording", () => {
+    expect(shellEscapeWasEnabled('entering extended mode\n \\write18 enabled.\n')).toBe(true);
+    expect(shellEscapeWasEnabled(' restricted \\write18 enabled.\n')).toBe(true);
+    expect(shellEscapeWasEnabled('This is LuaTeX\n system commands enabled.\n')).toBe(true);
+    expect(shellEscapeWasEnabled(' restricted system commands enabled.')).toBe(true);
+  });
+
+  it('reads a command that ran, and nothing else', () => {
+    expect(shellEscapeWasEnabled('runsystem(echo PWNED > sections/a.tex)...executed.')).toBe(true);
+    expect(shellEscapeWasEnabled('runsystem(makeindex -q x)...executed safely (allowed).')).toBe(
+      true,
+    );
+    // What -no-shell-escape leaves: no banner line, and a refusal.
+    expect(shellEscapeWasEnabled('entering extended mode\n %&-line parsing enabled.\n')).toBe(
+      false,
+    );
+    expect(shellEscapeWasEnabled('runsystem(makeindex -q x)...disabled.')).toBe(false);
+    expect(shellEscapeWasEnabled('')).toBe(false);
+  });
+});
+
+describe('shellCommandRefused', () => {
+  it('detects a \\write18 the engine refused, wrapped or not', () => {
+    // What pdfTeX logs under -no-shell-escape, hard-wrapped mid-"...disabled" as a long one is.
+    const wrapped = hardWrap(
+      `runsystem(makeindex -q -o sections/a.tex ${'x'.repeat(31)}.tex)...disabled.`,
+    );
+    expect(wrapped.split('\n')[1]).toBe('.disabled.');
+    expect(shellCommandRefused(wrapped)).toBe(true);
+    expect(shellCommandRefused('runsystem(epstopdf x.eps)...disabled (restricted).')).toBe(true);
+  });
+
+  it('is false for a command that ran, and for a log with no system call', () => {
+    expect(shellCommandRefused('runsystem(makeindex -q x)...executed safely (allowed).')).toBe(
+      false,
+    );
+    expect(shellCommandRefused('runsystem(echo hi)...executed.')).toBe(false);
+    expect(shellCommandRefused(' restricted \\write18 enabled.\n\\write18 disabled.')).toBe(false);
   });
 });
 

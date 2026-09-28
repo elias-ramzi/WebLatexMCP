@@ -107,6 +107,42 @@ export function needsShellEscape(log: string): boolean {
 }
 
 /**
+ * pdfTeX/XeTeX's record of a `\write18` it refused: `runsystem(<cmd>)...disabled.` (shell escape
+ * off) or `...disabled (restricted).` (a command not on the restricted allow-list). A command that
+ * ran logs `...executed.` / `...executed safely (allowed).` instead. LuaTeX logs nothing either way.
+ */
+const SHELL_COMMAND_REFUSED = /^runsystem\(.*\)\.\.\.disabled\b/m;
+
+/**
+ * True when the log shows the engine refused to run a shell command. Un-wraps first, since a long
+ * command hard-wraps across physical lines. An overlay compile runs with shell escape disabled, so
+ * this is how it tells the caller that the variant skipped something a normal compile would run.
+ */
+export function shellCommandRefused(log: string): boolean {
+  return SHELL_COMMAND_REFUSED.test(unwrapLines(log).join('\n'));
+}
+
+/**
+ * The engine's own record that shell escape was on: the start-of-run banner (pdfTeX/XeTeX
+ * ` \write18 enabled.` or ` restricted \write18 enabled.`; LuaTeX ` system commands enabled.` or
+ * ` restricted system commands enabled.`), which `-no-shell-escape` suppresses, or a command that
+ * ran (`runsystem(...)...executed`).
+ */
+const SHELL_ESCAPE_ENABLED =
+  /^ (?:restricted )?(?:\\write18|system commands) enabled\.|^runsystem\(.*\)\.\.\.executed\b/m;
+
+/**
+ * True when the log shows shell escape was enabled for this run. An overlay compile asks latexmk
+ * for `-no-shell-escape`, but that reaches the engine only through `%O`: a project latexmkrc of
+ * `$pdflatex = 'pdflatex %O -shell-escape %S'` (the later flag wins) or one with no `%O` turns it
+ * back on, and this is how the tool knows not to say it was disabled. A document can forge the
+ * banner with `\typeout`, which only makes the tool withdraw that claim — the safe direction.
+ */
+export function shellEscapeWasEnabled(log: string): boolean {
+  return SHELL_ESCAPE_ENABLED.test(unwrapLines(log).join('\n'));
+}
+
+/**
  * TeX's "the file I was told to read does not exist" signatures, in the `-file-line-error` form
  * (`./main.tex:3: LaTeX Error: File \`fontawesome.sty' not found.`), the bare form
  * (`! LaTeX Error: File \`IEEEtran.cls' not found.`) and TeX's own lower-level phrasing

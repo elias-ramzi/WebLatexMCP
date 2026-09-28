@@ -57,6 +57,48 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the command also accepts), rather than in the chat or a temporary directory, because a review
   that has to be hunted for is not read; and in the Claude desktop app the final review is sent as
   a file to download.
+- **`compile` can build a what-if variant without the server writing the source** (#205). Pass `overlay` —
+  up to 20 files, each with `edit_file`'s edits (100 in total) — and the edits are applied in
+  memory and compiled in a private link farm: a mirror of the project's tree whose files link to
+  the originals, except the overlaid ones, which hold the edited text. `./` and `../` inputs,
+  `\include`, `\graphicspath`, a local `.sty` and the bibliography resolve as in the project
+  while they stay inside it (a `TEXINPUTS` overlay cannot do that: kpathsea never searches the
+  path for an explicitly relative name); a `../` input that leaves the project resolves inside the
+  variant's directory instead and fails, where a normal compile reads it. The server writes none
+  of the source, the main build, the surfaced PDF, the viewer or the session's records, and
+  records no revision baseline. To narrow what the build itself can write through the farm, an
+  overlay compile runs no shell command unless you pass `shellEscape` or `restrictedShellEscape`
+  — not even TeX Live's default restricted allow-list, whose `makeindex -o` could otherwise write
+  a project file through the farm's links — and says so in `hint` when the document tried to run
+  one; opting in lifts that guarantee. A `latexmkrc` or `.latexmkrc` cannot be overlaid, since
+  latexmk runs it as Perl. Some routes back into the source stay open — the project's own
+  latexmkrc still runs and can turn shell escape back on, Lua code under `lualatex` can write with
+  `io.open`, and tectonic's `\openout` writes any absolute path — so an overlay compile compares
+  the project's files before and after the build (by size, mode, inode and times; nothing is
+  read), following the project's symbolic links as the build does — a file link by its target, a
+  linked directory by its contents — and names any that changed in `hint` (at most 20, fewer when
+  their names are long, the rest counted; one under a link was written at the link's target,
+  which `status` and `discard` do not reach when it lies outside the project), instead of calling the source untouched — or, when
+  the check cannot run, says so and names why; it also
+  says when the log shows shell escape enabled although the compile asked for it off. The result
+  carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
+  read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
+  compiled variants of a project are kept; recompiling the same overlay reuses its variant
+  incrementally. An older variant that cannot be removed (a Windows viewer holding its PDF) is
+  reported in `hint`, never failing the compile. `clean: true` on an overlay compile cleans that
+  variant only. An overlaid file the build never opened (by its `.fls` and `.fdb_latexmk`;
+  tectonic writes no `.fls`, so never there) is named in `hint` — on a failed build, as one it
+  stopped before reading. An overlay compile's `rootFile` must be relative to the project, and is
+  refused before anything is read or staged otherwise. An absolute (or drive-qualified, such as
+  `C:main.tex`) root is refused because latexmk's `-cd` would run the engine in the real project
+  directory and compile the unedited source; so is a root reached through a linked directory
+  (`paper -> drafts/p1`, `rootFile: "paper/main.tex"`), where the variant would build in the
+  link's target — the source itself — or resolve `../` inputs against the wrong directory. Both
+  refusals name the spelling to pass instead when there is one (`rootFile: "drafts/p1/main.tex"`,
+  the same document; name the overlay files by their real paths too). A root spelled with a `..`
+  segment is refused for a different reason: the variant is staged from the name as written while
+  the engine resolves `..` physically, so `paper/../p1/main.tex` goes through the link into the
+  source, and `../demo/main.tex` names a file the variant's mirror does not hold.
 
 ### Changed
 
@@ -115,6 +157,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   draft-07 `Client` still accepts them. A test round-trips `listTools()` and compiles every
   advertised schema with strict 2020-12 and draft-07 validators, so a future zod construct that is
   specific to one draft fails in CI instead of in a client.
+- **`compile` of a root in a subdirectory no longer fails on `\include`.** latexmk's `-cd` runs
+  the engine in the root file's directory, so `paper/main.tex` doing `\include{chap/c1}` writes
+  `<build>/chap/c1.aux`, but only the project-root tree (`<build>/paper/chap`) was mirrored into
+  the build directory, and the compile died with "I can't write on file `chap/c1.aux'". The root
+  file's own directory tree is now mirrored at the build directory's root too (latexmk only;
+  tectonic runs in the project root). That directory is mirrored only when its real path stays
+  inside the project, so a committed symlink from the root's directory to one outside the project
+  (even to the filesystem root) is skipped rather than walked into the build directory; a link to
+  another directory of the project is still mirrored.
 - **`labels:` lookups refuse a build whose records cannot be read, instead of resolving it
   blind** (#194). `render_pages`/`extract_text` decide whether a `pgfpages` layout shifted every
   label from the build's `.fls` and `.log`; when neither could be read the check was skipped, and
