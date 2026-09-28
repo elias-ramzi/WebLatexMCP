@@ -75,7 +75,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   latexmkrc still runs and can turn shell escape back on, Lua code under `lualatex` can write with
   `io.open`, and tectonic's `\openout` writes any absolute path — so an overlay compile compares
   the project's files before and after the build (by size, mode, inode and times; nothing is
-  read) and names any that changed in `hint`, instead of calling the source untouched; it also
+  read), following the project's symbolic links as the build does — a file link by its target, a
+  linked directory by its contents — and names any that changed in `hint` (at most 20, fewer when
+  their names are long, the rest counted; one under a link was written at the link's target,
+  which `status` and `discard` do not reach when it lies outside the project), instead of calling the source untouched — or, when
+  the check cannot run, says so and names why; it also
   says when the log shows shell escape enabled although the compile asked for it off. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently

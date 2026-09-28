@@ -35,12 +35,19 @@ import {
   stageVariant,
   variantHandle,
   variantPaths,
+  watchSource,
   writeManifest,
   MAX_VARIANTS,
+  SOURCE_CHANGES_NAMES_BUDGET,
+  SOURCE_CHECK_PATH_MAX,
+  SourceSnapshotError,
+  VariantEvictionError,
+  evictionFailureHint,
 } from '../../src/lib/variants.js';
 import type { VariantKey } from '../../src/lib/variants.js';
 import { buildDir } from '../../src/services/compiler.js';
 import { FileService } from '../../src/services/fileService.js';
+import { quoteId } from '../../src/lib/projectId.js';
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -377,6 +384,26 @@ describe('stageVariant: one budget for the whole stage', () => {
   });
 });
 
+describe('evictionFailureHint', () => {
+  it('counts several failures and escapes what their reasons quote', () => {
+    const newline = String.fromCharCode(10);
+    const rlo = String.fromCodePoint(0x202e);
+    const bs = String.fromCharCode(92);
+    const hint = evictionFailureHint(
+      new VariantEvictionError([
+        { handle: 'v000000000001', reason: `EBUSY: /tmp/a${newline}forged line` },
+        { handle: 'v000000000002', reason: `EPERM: /tmp/${rlo}fdp.exe` },
+      ]),
+    );
+    expect(hint).toContain('2 older variants of this project could not be removed');
+    expect(hint).toContain(`/tmp/a${bs}u{A}forged line`);
+    expect(hint).toContain(`/tmp/${bs}u{202E}fdp.exe`);
+    expect(hint).not.toContain(newline);
+    expect(hint).not.toContain(rlo);
+    expect(hint).toContain('this compile is unaffected');
+  });
+});
+
 describe('variant lifecycle', () => {
   it('rebuilding and removing a variant leaves every source file intact', async () => {
     const src = await tempDir('ovl-life-src-');
@@ -621,6 +648,23 @@ describe('refuseLinkedRootDir: a root spelled so the engine resolves it differen
     );
   });
 
+  it('reads a directory named like "..foo" as inside the project, not above it', async () => {
+    const src = await tempDir('ovl-rootdotdir-');
+    await put(src, '..foo/main.tex', 'x\n');
+    await put(src, '..foo/p1/main.tex', 'x\n');
+    // An absolute root inside such a directory: the relative spelling is suggested.
+    await expect(refuseLinkedRootDir(src, path.join(src, '..foo', 'main.tex'))).rejects.toThrow(
+      /absolute.*rootFile: "\.\.foo\/main\.tex"/s,
+    );
+    // A link into one: its real path is inside, so it is offered.
+    await linkDir(path.join(src, '..foo', 'p1'), path.join(src, 'paper'));
+    await expect(refuseLinkedRootDir(src, 'paper/main.tex')).rejects.toThrow(
+      /symbolic link.*rootFile: "\.\.foo\/p1\/main\.tex"/s,
+    );
+    // And the root spelled through it is not a ".." segment.
+    await refuseLinkedRootDir(src, '..foo/main.tex');
+  });
+
   it('refuses every Windows spelling on every platform, before touching the disk', async () => {
     // The project directory does not exist: each refusal is decided on the spelling alone, so it
     // is the same wherever the server runs — a drive prefix included, which only Windows reads.
@@ -672,7 +716,7 @@ describe('snapshotSource / sourceChanges', () => {
     expect(sourceChanges(after!, (await snapshotSource(src, { skip: [] }))!)).toEqual([]);
   });
 
-  it('skips .git and the skipped directories, and never walks a linked directory', async () => {
+  it('skips .git and the skipped directories, and walks a linked directory under its link', async () => {
     const src = await tempDir('ovl-snap-skip-');
     const outside = await tempDir('ovl-snap-out-');
     await put(src, 'main.tex', 'main\n');
@@ -682,10 +726,241 @@ describe('snapshotSource / sourceChanges', () => {
     await linkDir(outside, path.join(src, 'linked'));
     const skip = [path.join(src, 'ws')];
     const before = await snapshotSource(src, { skip });
-    expect([...before!.entries.keys()].sort()).toEqual(['linked', 'main.tex']);
+    expect([...before!.entries.keys()].sort()).toEqual(['linked', 'linked/shared.tex', 'main.tex']);
     await writeFile(path.join(src, '.git/HEAD'), 'moved\n');
     await writeFile(path.join(src, 'ws/state.json'), '{"x":1}\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([]);
+    // The farm links `linked` to the same directory, so the build can write there too.
     await writeFile(path.join(outside, 'shared.tex'), 'changed\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([
+      'linked/shared.tex',
+    ]);
+  });
+
+  posixOnly('names a file link whose target outside the project was rewritten', async () => {
+    const src = await tempDir('ovl-snap-flink-');
+    const outside = await tempDir('ovl-snap-flink-out-');
+    await put(src, 'main.tex', 'main\n');
+    await put(outside, 'notes.tex', 'notes\n');
+    await symlink(path.join(outside, 'notes.tex'), path.join(src, 'notes.tex'));
+    const before = await snapshotSource(src, { skip: [] });
+    // Same length, mtime put back: the link itself is untouched; only the target's ctime moved.
+    const st = await stat(path.join(outside, 'notes.tex'));
+    await writeFile(path.join(outside, 'notes.tex'), 'NOTES\n');
+    await utimes(path.join(outside, 'notes.tex'), st.atime, st.mtime);
+    const mid = await snapshotSource(src, { skip: [] });
+    expect(sourceChanges(before!, mid!)).toEqual(['notes.tex']);
+    // A different length.
+    await writeFile(path.join(outside, 'notes.tex'), 'rewritten at length\n');
+    expect(sourceChanges(mid!, (await snapshotSource(src, { skip: [] }))!)).toEqual(['notes.tex']);
+  });
+
+  it('names a file created or rewritten under a linked directory, by the link path', async () => {
+    const src = await tempDir('ovl-snap-dlink-');
+    const outside = await tempDir('ovl-snap-dlink-out-');
+    await put(src, 'main.tex', 'main\n');
+    await put(outside, 'a.pdf', 'pdf\n');
+    await put(outside, 'deep/b.pdf', 'pdf\n');
+    await linkDir(outside, path.join(src, 'figs'));
+    const before = await snapshotSource(src, { skip: [] });
+    await writeFile(path.join(outside, 'a.pdf'), 'rewritten\n');
+    await put(outside, 'new.tex', 'new\n');
+    await put(outside, 'deep/c.tex', 'c\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip: [] }))!)).toEqual([
+      'figs/a.pdf',
+      'figs/deep/c.tex',
+      'figs/new.tex',
+    ]);
+  });
+
+  posixOnly('names a dangling link whose target the build created', async () => {
+    const src = await tempDir('ovl-snap-dangle-');
+    const outside = await tempDir('ovl-snap-dangle-out-');
+    await put(src, 'main.tex', 'main\n');
+    await symlink(path.join(outside, 'ghost.tex'), path.join(src, 'ghost.tex'));
+    const before = await snapshotSource(src, { skip: [] });
+    expect(before!.entries.has('ghost.tex')).toBe(true);
+    await put(outside, 'ghost.tex', 'written through the link\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip: [] }))!)).toEqual([
+      'ghost.tex',
+    ]);
+  });
+
+  posixOnly(
+    'cannot vouch for a link it cannot stat (a loop), rather than calling it unchanged',
+    async () => {
+      const src = await tempDir('ovl-snap-eloop-');
+      await put(src, 'main.tex', 'main\n');
+      await symlink(path.join(src, 'loop.tex'), path.join(src, 'loop.tex'));
+      const check = await watchSource(src, { skip: [] });
+      const result = await check();
+      expect(result.changed).toBeUndefined();
+      const reason = result.changed === undefined ? result.reason : '';
+      // Which path, and why: a committed loop fails every check, so the reason must be findable.
+      expect(reason).toContain('"loop.tex"');
+      expect(reason).toContain('ELOOP');
+    },
+  );
+
+  it('names a path it could not examine in full while it is short, and by its last name when not', () => {
+    expect(new SourceSnapshotError('sections/loop.tex', 'ELOOP').message).toBe(
+      '"sections/loop.tex" could not be examined (ELOOP)',
+    );
+    // A build-created path: 20 levels of 250 control characters, each shown as an escape.
+    const ctl = String.fromCharCode(1).repeat(250);
+    const deep = Array.from({ length: 20 }, () => ctl).join('/') + `/tail${ctl}`;
+    const message = new SourceSnapshotError(deep, 'ENAMETOOLONG').message;
+    expect(message).toContain('21 levels deep');
+    expect(message).toContain('"tail');
+    expect(message).toContain('…');
+    expect(message).toContain('(ENAMETOOLONG)');
+    const prose = 'a path 21 levels deep, ending in , could not be examined (ENAMETOOLONG)';
+    expect(message.length).toBeLessThanOrEqual(SOURCE_CHECK_PATH_MAX + prose.length);
+    // One long, plain name is cut the same way.
+    const wide = new SourceSnapshotError('x'.repeat(250), 'EACCES').message;
+    expect(wide).toContain('1 level deep');
+    expect(wide.length).toBeLessThanOrEqual(
+      SOURCE_CHECK_PATH_MAX +
+        'a path 1 level deep, ending in , could not be examined (EACCES)'.length,
+    );
+  });
+
+  posixOnly(
+    "says a skip directory it cannot resolve is the server's, not the project root",
+    async () => {
+      const src = await tempDir('ovl-snap-skipbad-');
+      await put(src, 'main.tex', 'main\n');
+      const check = await watchSource(src, { skip: [path.join(src, 'main.tex', 'ws')] });
+      const result = await check();
+      expect(result.changed === undefined ? result.reason : '').toBe(
+        "the server's workspace or build directory could not be resolved (ENOTDIR)",
+      );
+    },
+  );
+
+  it('says why it cannot vouch for a tree past the entry cap', async () => {
+    const src = await tempDir('ovl-snap-capwhy-');
+    await put(src, 'a.tex', 'a\n');
+    await put(src, 'b.tex', 'b\n');
+    const check = await watchSource(src, { skip: [], maxEntries: 1 });
+    const result = await check();
+    expect(result.changed === undefined ? result.reason : '').toContain(
+      'more than 1 files and directories',
+    );
+    // A tree it can check reports its changes, and no reason.
+    const ok = await (await watchSource(src, { skip: [] }))();
+    expect(ok).toEqual({ changed: [] });
+  });
+
+  it('does not walk a skipped directory inside a linked directory', async () => {
+    // `x -> outside`, and `outside/build` is skipped: `x/build` is a REAL directory of the
+    // link's target, so only its realpath says it is the skipped one.
+    const src = await tempDir('ovl-snap-skipin-');
+    const outside = await tempDir('ovl-snap-skipin-out-');
+    await put(src, 'main.tex', 'main\n');
+    await put(outside, 'keep.tex', 'keep\n');
+    await put(outside, 'build/out.log', 'log\n');
+    await linkDir(outside, path.join(src, 'x'));
+    const skip = [path.join(outside, 'build')];
+    const before = await snapshotSource(src, { skip });
+    expect([...before!.entries.keys()].sort()).toEqual(['main.tex', 'x', 'x/keep.tex']);
+    await put(outside, 'build/out.log', 'rewritten\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([]);
+  });
+
+  it('does not walk a link into a directory UNDER a skipped tree, and still walks a project inside one', async () => {
+    const src = await tempDir('ovl-snap-skipunder-');
+    const buildRoot = await tempDir('ovl-snap-skipunder-build-');
+    await put(src, 'main.tex', 'main\n');
+    await put(buildRoot, 'proj/out/main.log', 'log\n');
+    await linkDir(path.join(buildRoot, 'proj'), path.join(src, 'b'));
+    const opts = { skip: [], skipTree: [buildRoot] };
+    const before = await snapshotSource(src, opts);
+    expect([...before!.entries.keys()].sort()).toEqual(['b', 'main.tex']);
+    await put(buildRoot, 'proj/out/main.log', 'the variant build wrote this\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, opts))!)).toEqual([]);
+    // A skipped directory or tree that CONTAINS the project (the workspace holds every clone)
+    // leaves the project itself walked.
+    const ws = await tempDir('ovl-snap-skipunder-ws-');
+    await put(ws, 'clone/main.tex', 'main\n');
+    await put(ws, 'clone/sections/a.tex', 'a\n');
+    for (const o of [{ skip: [ws] }, { skip: [], skipTree: [ws] }]) {
+      const inWs = await snapshotSource(path.join(ws, 'clone'), o);
+      expect([...inWs!.entries.keys()].sort()).toEqual(['main.tex', 'sections', 'sections/a.tex']);
+    }
+  });
+
+  it('skips a directory by equality only, so a link into a sibling clone is still walked', async () => {
+    // The workspace-local layout: a local project registered at the launch directory contains
+    // the workspace, and the workspace holds other clones a project link can reach into.
+    const src = await tempDir('ovl-snap-wslocal-');
+    const ws = path.join(src, '.web_latex_mcp');
+    await put(src, 'main.tex', 'main\n');
+    await put(ws, 'shared/figs/a.pdf', 'pdf\n');
+    await put(ws, '.sessions/p/session.json', '{}\n');
+    await linkDir(path.join(ws, 'shared', 'figs'), path.join(src, 'figs'));
+    const skip = [ws];
+    const before = await snapshotSource(src, { skip });
+    // The workspace itself is left out — its session files change on every call.
+    expect([...before!.entries.keys()].sort()).toEqual(['figs', 'figs/a.pdf', 'main.tex']);
+    await put(ws, 'shared/figs/new.pdf', 'written by the build\n');
+    await writeFile(path.join(ws, 'shared/figs/a.pdf'), 'rewritten at length\n');
+    await put(ws, '.sessions/p/session.json', '{"heartbeat":1}\n');
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([
+      'figs/a.pdf',
+      'figs/new.pdf',
+    ]);
+  });
+
+  it('walks each linked directory once, so a link cycle ends', async () => {
+    const src = await tempDir('ovl-snap-cycle-');
+    const outside = await tempDir('ovl-snap-cycle-out-');
+    await put(src, 'main.tex', 'main\n');
+    await put(src, 'sub/a.tex', 'a\n');
+    await put(outside, 'x.tex', 'x\n');
+    await linkDir(src, path.join(src, 'sub', 'loop')); // the project, from inside it
+    await linkDir(outside, path.join(outside, 'back')); // a directory that holds itself
+    await linkDir(outside, path.join(src, 'ext'));
+    await linkDir(outside, path.join(src, 'ext2')); // a second name for one directory
+    const before = await snapshotSource(src, { skip: [] });
+    expect(before).toBeDefined();
+    const keys = [...before!.entries.keys()].sort();
+    expect(keys).toEqual([
+      'ext',
+      'ext/back',
+      'ext/x.tex',
+      'ext2',
+      'main.tex',
+      'sub',
+      'sub/a.tex',
+      'sub/loop',
+    ]);
+    expect(sourceChanges(before!, (await snapshotSource(src, { skip: [] }))!)).toEqual([]);
+  });
+
+  it('does not walk a skipped directory reached through a link', async () => {
+    const src = await tempDir('ovl-snap-skiplink-');
+    const outside = await tempDir('ovl-snap-skiplink-out-');
+    const shared = await tempDir('ovl-snap-skiplink-shared-');
+    await put(src, 'main.tex', 'main\n');
+    await put(src, 'ws/state.json', '{}\n');
+    await put(outside, 'build/out.log', 'log\n');
+    await put(shared, 'defs.tex', 'defs\n');
+    await linkDir(path.join(src, 'ws'), path.join(src, 'ws-alias'));
+    await linkDir(path.join(outside, 'build'), path.join(src, 'build'));
+    await linkDir(shared, path.join(src, 'shared'));
+    // A skip directory that does not exist is tolerated.
+    const skip = [path.join(src, 'ws'), path.join(outside, 'build'), path.join(outside, 'no-such')];
+    const before = await snapshotSource(src, { skip });
+    expect([...before!.entries.keys()].sort()).toEqual([
+      'build',
+      'main.tex',
+      'shared',
+      'shared/defs.tex',
+      'ws-alias',
+    ]);
+    await writeFile(path.join(src, 'ws/state.json'), '{"x":1}\n');
+    await put(outside, 'build/out.log', 'rewritten\n');
     expect(sourceChanges(before!, (await snapshotSource(src, { skip }))!)).toEqual([]);
   });
 
@@ -703,6 +978,87 @@ describe('snapshotSource / sourceChanges', () => {
     expect(hint).toContain('"f19.tex"');
     expect(hint).not.toContain('"f20.tex"');
     expect(hint).toContain('and 3 more');
+  });
+
+  it('says a path under a link was written at the link target, which status and discard do not reach', () => {
+    const hint = sourceChangedHint(['figs/a.pdf']);
+    expect(hint).toContain('Review them (status, diff)');
+    expect(hint).toContain(
+      "a path under a symbolic link, or a link whose target changed, was written at the link's " +
+        'target — check it there; a target outside the project is beyond what status, diff and ' +
+        'discard reach.',
+    );
+  });
+
+  it('stops naming once the names would pass their character budget, counting the rest', () => {
+    const long = (c: string) => `${c.repeat(890)}/figure.tex`; // ~900 characters each
+    const paths = ['a', 'b', 'c', 'd', 'e'].map(long);
+    const hint = sourceChangedHint(paths);
+    expect(hint).toContain('5 project file(s)');
+    expect(hint).toContain(quoteId(paths[0]!));
+    expect(hint).toContain(quoteId(paths[1]!));
+    expect(hint).not.toContain('c'.repeat(890));
+    expect(hint).toContain(`${quoteId(paths[1]!)}, and 3 more.`);
+  });
+
+  it('says the names are too long when not even the first fits, and names none of it', () => {
+    const huge = `${'x'.repeat(2990)}/main.tex`;
+    const hint = sourceChangedHint([huge, 'b.tex']);
+    expect(hint).toContain(
+      'This overlay compile changed 2 project file(s) while it ran (their names are too long ' +
+        'to list here). An overlay compile writes nothing',
+    );
+    expect(hint).not.toContain('xxxx');
+    expect(hint).not.toContain('b.tex');
+  });
+
+  it('bounds the whole hint by the budget plus its fixed prose, in its JSON form', () => {
+    // structuredContent carries the hint as JSON, where `"` and `\` each cost two characters —
+    // the larger of its two channels, and the one the budget is charged in.
+    const jsonLength = (s: string) => JSON.stringify(s).length - 2;
+    // The prose around the names, rendered with none: what the budget does not cover.
+    const fixed = jsonLength(sourceChangedHint([]));
+    const quote = String.fromCharCode(34);
+    const bs = String.fromCharCode(92);
+    for (const len of [50, 199, 900, 1999, 2500]) {
+      for (const fill of ['p', quote, bs]) {
+        const paths = Array.from(
+          { length: 40 },
+          (_, i) => `${String(i).padStart(2, '0')}${fill.repeat(len)}`,
+        );
+        const hint = sourceChangedHint(paths);
+        expect(hint.length).toBeLessThanOrEqual(jsonLength(hint));
+        // The count clause and the total's extra digit are all the prose can grow by.
+        expect(jsonLength(hint), `names of ${len} ${fill}`).toBeLessThanOrEqual(
+          fixed + SOURCE_CHANGES_NAMES_BUDGET + ', and 40 more'.length + 1,
+        );
+      }
+    }
+  });
+
+  it('pins the budget from both sides: names rendering to exactly it fit, one more character does not', () => {
+    // A name full of quotes: 2 characters each in the text, 4 in JSON — so the boundary below
+    // holds only when the budget is charged in the JSON form.
+    const first = `a${String.fromCharCode(34).repeat(300)}`;
+    const jsonLength = (s: string) => JSON.stringify(s).length - 2;
+    // The list quoteId(first) + ', ' + quoteId(fits), in JSON, is the budget exactly.
+    const fill =
+      SOURCE_CHANGES_NAMES_BUDGET -
+      jsonLength(quoteId(first)) -
+      ', '.length -
+      jsonLength(quoteId(''));
+    const fits = `b${'y'.repeat(fill - 1)}`;
+    expect(jsonLength(`${quoteId(first)}, ${quoteId(fits)}`)).toBe(SOURCE_CHANGES_NAMES_BUDGET);
+    // Charged in the text form instead, it would have room to spare.
+    expect(`${quoteId(first)}, ${quoteId(fits)}`.length).toBeLessThan(
+      SOURCE_CHANGES_NAMES_BUDGET - 500,
+    );
+    const exact = sourceChangedHint([first, fits]);
+    expect(exact).toContain(`${quoteId(first)}, ${quoteId(fits)}.`);
+    expect(exact).not.toContain('more');
+    const over = sourceChangedHint([first, `${fits}z`]);
+    expect(over).toContain(`${quoteId(first)}, and 1 more.`);
+    expect(over).not.toContain('yyyy');
   });
 });
 

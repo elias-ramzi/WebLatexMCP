@@ -46,6 +46,7 @@ import {
   MAX_OVERLAY_FILES,
   MAX_VARIANTS,
 } from '../lib/variants.js';
+import type { SourceCheck } from '../lib/variants.js';
 import { buildRoot, engineNotFoundHint } from '../services/compiler.js';
 import { quoteId } from '../lib/projectId.js';
 import { editItemSchema } from './editFile.js';
@@ -170,7 +171,9 @@ const inputSchema = {
         '.latexmkrc may not be overlaid (latexmk runs it as Perl). Some routes stay open: the ' +
         "project's own latexmkrc still runs and can turn shell escape back on, lualatex's Lua " +
         "io.open needs no shell escape, and tectonic's \\openout writes any absolute path. So " +
-        "the project's files are compared (lstat only) before and after the build: any that " +
+        "the project's files — following its symbolic links, which the build can write " +
+        'through — are compared (size, mode, inode and times; no content read) before and ' +
+        'after the build: any that ' +
         'changed are named in `hint` — check them and discard what you did not mean — and a ' +
         'log showing shell escape enabled against the request is reported. The result ' +
         'carries a `variant` handle; pass it to render_pages / extract_text / pdf_geometry to ' +
@@ -551,7 +554,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 contents: Map<string, string>;
                 outDir: string;
                 workDir: string;
-                sourceChanges: () => Promise<string[] | undefined>;
+                sourceChanges: () => Promise<SourceCheck>;
               }
             | undefined;
           if (overlay) {
@@ -581,8 +584,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             // files, which moves their change time) and compare right after the build, before
             // eviction does the same. Some routes from the farm back into the source are not the
             // server's to close (see `snapshotSource`), so the result reports what the build
-            // actually did to the project rather than asserting "untouched".
-            const sourceChanges = await watchSource(dir, { skip });
+            // actually did to the project rather than asserting "untouched". The workspace is
+            // skipped by equality alone (a local project may contain it, and a project link into
+            // a sibling clone is written through like any other); the build root, which the build
+            // writes by design, with everything under it.
+            const sourceChanges = await watchSource(dir, {
+              skip: [ctx.config.workspaceRoot],
+              skipTree: [buildRoot()],
+            });
             variant = { handle, contents, outDir: paths.out, workDir: paths.src, sourceChanges };
           }
           // Shell escape is on unless the caller turned it off? Not for a variant: TeX Live's
@@ -606,7 +615,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 }
               : {}),
           });
-          const changedSource = variant ? await variant.sourceChanges() : undefined;
+          const sourceCheck = variant ? await variant.sourceChanges() : undefined;
+          const changedSource = sourceCheck?.changed;
+          // Why it could not be checked, for the variant line: a cause that stays (a committed
+          // link loop) fails every check, so it has to be findable.
+          const uncheckedReason =
+            sourceCheck !== undefined && sourceCheck.changed === undefined
+              ? sourceCheck.reason
+              : undefined;
           // Retention runs after the compile, under the same lock, and never removes this one. It
           // is best-effort: an old variant that cannot be removed (a viewer holding its PDF open on
           // Windows) must not throw away the compile that just finished.
@@ -891,9 +907,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               'pdf_geometry to inspect it. ' +
               (changedSource === undefined
                 ? 'The main build, the surfaced PDF and the viewer are untouched; whether the ' +
-                  'build wrote a project file could not be checked this time.'
+                  'build wrote a project file could not be checked this time' +
+                  (uncheckedReason !== undefined ? ` (${uncheckedReason}).` : '.')
                 : changedSource.length > 0
-                  ? `The build CHANGED ${changedSource.length} project file(s) (named in hint); ` +
+                  ? `The build CHANGED ${changedSource.length} project file(s) (see hint); ` +
                     'the main build, the surfaced PDF and the viewer are untouched.'
                   : 'The source (checked: no project file changed while it built), the main ' +
                     'build, the surfaced PDF and the viewer are untouched.') +

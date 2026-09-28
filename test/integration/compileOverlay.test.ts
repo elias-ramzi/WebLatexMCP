@@ -361,6 +361,72 @@ describe('compile with an overlay', () => {
     await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
   });
 
+  it.skipIf(process.platform === 'win32')(
+    'says which path kept the source from being checked, and never calls it unchanged',
+    async () => {
+      // A committed link loop cannot be followed, so every overlay compile fails the check; the
+      // result names the path and the reason, or the caller cannot tell why it never passes.
+      const { client, clone } = await setup();
+      await symlink(path.join(clone, 'loop.tex'), path.join(clone, 'loop.tex'));
+      const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+      expect(res.isError ?? false, textOf(res)).toBe(false);
+      expect(textOf(res)).toContain(
+        'whether the build wrote a project file could not be checked this time ' +
+          '("loop.tex" could not be examined (ELOOP)).',
+      );
+      expect(textOf(res)).not.toContain('checked: no project file changed');
+    },
+  );
+
+  it('names a write through a link into the workspace when a local project contains it', async () => {
+    // The workspace-local layout: a local project registered at the launch dir holds the
+    // workspace, and a project link reaches into a sibling clone. The workspace is left out of
+    // the check by equality only — pinned here at the wiring, since a containment skip there
+    // passes every library test and reports this write as "no project file changed".
+    const project = await tmp('ovl-local-');
+    const workspace = path.join(project, '.web_latex_mcp');
+    await mkdir(path.join(workspace, 'shared', 'figs'), { recursive: true });
+    await mkdir(path.join(project, 'sections'));
+    await writeFile(path.join(project, 'main.tex'), MAIN_TEX);
+    await writeFile(path.join(project, 'sections/b.tex'), B_TEX);
+    // A directory link: a junction on Windows, which needs no privilege.
+    await symlink(path.join(workspace, 'shared', 'figs'), path.join(project, 'figs'), 'junction');
+    const config: ServerConfig = {
+      workspaceRoot: workspace,
+      workspaceIsLocal: true,
+      sessionId: 'test',
+      projects: [{ id: 'loc', mode: 'local', path: project }],
+      defaultProject: 'loc',
+    };
+    const ctx = createContext(
+      config,
+      new CredentialResolver({}),
+      { name: 'Test', email: 'test@example.com' },
+      new ProjectRegistry(workspace),
+    );
+    const requests: CompileRequest[] = [];
+    ctx.compiler = new CompilerResolver('latexmk', false, () =>
+      stubCompiler(requests, {
+        duringBuild: (workDir) => writeFile(path.join(workDir, 'figs', 'new.pdf'), 'x'),
+      }),
+    );
+    const server = createServer(ctx);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    cleanups.push(() => client.close());
+    cleanups.push(() => rm(buildDir(project), { recursive: true, force: true }));
+
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    // The stub really wrote into the sibling directory through the farm's link.
+    expect(await readFile(path.join(workspace, 'shared', 'figs', 'new.pdf'), 'utf8')).toBe('x');
+    const hint = (res.structuredContent as { hint?: string }).hint ?? '';
+    expect(hint).toContain('changed 1 project file(s) while it ran: "figs/new.pdf"');
+    expect(textOf(res)).toContain('CHANGED');
+    expect(textOf(res)).not.toContain('checked: no project file changed');
+  });
+
   it('does not claim shell escape was disabled when the log shows the project re-enabled it', async () => {
     // latexmk's -no-shell-escape reaches the engine only through %O: a project latexmkrc of
     // `$pdflatex = 'pdflatex %O -shell-escape %S'` (or one with no %O) turns it back on, and the

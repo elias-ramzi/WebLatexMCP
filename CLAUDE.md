@@ -944,8 +944,9 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   through the farm's link into the source; `../demo/main.tex` names a file inside the project but,
   in the farm, a sibling of the farm, which is not there) and an absolute root (`-cd` goes straight
   to the source, farm or no farm — refused with the project-relative spelling when it lies inside).
-  A drive-qualified name (`C:main.tex`, `C:\p\main.tex`) counts as absolute on **every** platform,
-  not only win32, so the refusal does not depend on where the server runs. What remains (`./`,
+  A drive-qualified name is refused on **every** platform, not only win32 — absolute
+  (`C:\p\main.tex`) or drive-relative (`C:main.tex`, which Windows resolves against that drive's
+  current directory) — so the refusal does not depend on where the server runs. What remains (`./`,
   doubled separators) normalises to what the OS resolves. Not `TEXINPUTS`: kpathsea never searches
   the path for `./` or `../` names, so those inputs read the source. The farm mirrors the project
   and not its parent, so a `../` input that LEAVES the project resolves inside the variant dir and
@@ -984,11 +985,36 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `openout_any`, so its `\openout` writes any absolute path, the source included. So `compile`
   never asserts the source is untouched: `watchSource` (`snapshotSource`/`sourceChanges`) records
   every project entry by `lstat` — kind, size, mode, inode, mtime and **ctime**, which a restored
-  mtime cannot hide; no content read; walked as the farm is, `.git` and `skip` left out, a linked
-  directory ONE entry — after staging (win32 staging hard-links and unlinks source files, moving
-  their ctime) and again right after the build, before eviction does the same. A changed path is
-  named in `hint` (`sourceChangedHint`, 20 named and the rest counted) and the text says CHANGED;
-  a walk that failed or hit `MAX_FARM_ENTRIES` is "could not be checked", never "unchanged". The
+  mtime cannot hide; no content read; `.git` and `skip` left out — after staging (win32 staging
+  hard-links and unlinks source files, moving their ctime) and again right after the build, before
+  eviction does the same. **The snapshot follows links where the farm does not walk them**: the
+  farm's ONE link to a symlinked directory still reaches its target, so a file link's entry carries
+  its target's `stat` signature too (a dangling link a marker, so the build creating the target is
+  a change), and a linked directory is walked under the link's path (`figs/a.pdf` for
+  `figs -> /shared/figs`). A link to a directory already walked (an ancestor, so a cycle ends, or a
+  second name) is one entry and not walked again; real directories are not deduplicated, so
+  `up -> ..` can list a directory twice — counted toward the cap, and walked in name order so both
+  snapshots agree. Two kinds of server directory are left out, both judged on the spelled path and
+  the realpath. The workspace (`skip`) by **equality only**: in the workspace-local layout a local
+  project registered at the launch dir contains `.web_latex_mcp`, and a project link into a sibling
+  clone (`figs -> .web_latex_mcp/shared/figs`) is written through like any other — containment
+  there skipped it and reported "no project file changed" for a write it made. The directory
+  itself is still left out, since its session files change on every call. The build root
+  (`skipTree`), which the build writes by design, with **every directory under it** (a link to
+  `<buildRoot>/proj` is not walked; a file link into it is still compared) — unless it contains the project. A link that cannot be
+  `stat`ed for any reason but ENOENT fails the walk: "could not be checked", never "unchanged", and
+  the variant line names the path and error code (`SourceSnapshotError`, via `watchSource`'s
+  `SourceCheck.reason`), since a committed link loop fails every check and must be findable. That
+  path is document-controlled, so past `SOURCE_CHECK_PATH_MAX` (200 characters quoted — one path
+  in one sentence) only its last component, cut with `…`, and its depth are named; a skip
+  directory that cannot be resolved says so rather than blaming the project root. A changed path
+  is named in `hint` (`sourceChangedHint`: at most 20 named, and only while their rendered names fit
+  `SOURCE_CHANGES_NAMES_BUDGET` — 2000 characters charged in the JSON form, the larger of the two
+  channels the hint ships in, since the names are document-controlled; a name that does not fit is
+  counted, never truncated) and the text says CHANGED. The hint says that a path under a link, or a
+  link whose target changed, was written at the link's target — and that a target outside the
+  project is beyond what `status`/`diff`/`discard` reach (an in-project one is not).
+  A walk that hit `MAX_FARM_ENTRIES` is "could not be checked" too, with that reason. The
   text's shell-escape clause is likewise read off the engine's banner (`shellEscapeWasEnabled`),
   not off the flag the server passed. The check observes; it never undoes a write, and it cannot
   tell the build's write from a hand edit made meanwhile — the hint says both. The handle is `v` +

@@ -355,20 +355,113 @@ export async function buildLinkFarm(
 }
 
 /**
- * The project's tree as `lstat` sees it, for telling afterwards whether a variant build wrote it:
- * project-relative POSIX path -> a signature of kind, size, mode, inode, mtime and ctime (in ns).
- * The change time is there because it cannot be set back — a rewrite of the same length whose
- * mtime is restored still moves it.
+ * The project's tree as the build can reach it, for telling afterwards whether a variant build
+ * wrote it: project-relative POSIX path -> a signature of kind, size, mode, inode, mtime and ctime
+ * (in ns). The change time is there because it cannot be set back — a rewrite of the same length
+ * whose mtime is restored still moves it. A symbolic link's signature is its own `lstat` plus what
+ * it resolves to: the target file's signature, `dangling`, or `dir` (whose contents are entries of
+ * their own, under the link's path).
  */
 export interface SourceSnapshot {
   entries: Map<string, string>;
 }
 
+/** A signature of one `stat`/`lstat` result — no content read. */
+function statSignature(
+  kind: string,
+  st: { size: bigint; mode: bigint; ino: bigint; mtimeNs: bigint; ctimeNs: bigint },
+): string {
+  return `${kind}:${st.size}:${st.mode}:${st.ino}:${st.mtimeNs}:${st.ctimeNs}`;
+}
+
 /**
- * Snapshot the project's tree the way {@link buildLinkFarm} walks it — `.git` and the `skip`
- * directories left out, a linked directory recorded as ONE entry and never walked — reading no
- * file's content. Undefined when the tree has more than `maxEntries` entries, since a walk that
- * stopped part-way cannot vouch for the rest.
+ * Characters the one path a "could not be checked" reason names may take, quoted. The path is
+ * document-controlled — the build can create it, 255 bytes a component, any depth, and an escaped
+ * control character costs five — and it sits inside one sentence of the variant line, which is
+ * meant to stay a line: a single diagnostic path, not a list, so a tenth of the house 2000.
+ */
+export const SOURCE_CHECK_PATH_MAX = 200;
+
+/** `name` quoted, cut from the end with `…` so the quoted form fits `max` characters. Pure. */
+function quoteCut(name: string, max: number): string {
+  if (quoteId(name).length <= max) return quoteId(name);
+  const chars = [...name];
+  let fit = quoteId('…');
+  for (let k = 1; k <= chars.length; k++) {
+    const q = quoteId(`${chars.slice(0, k).join('')}…`);
+    if (q.length > max) break;
+    fit = q;
+  }
+  return fit;
+}
+
+/**
+ * A failed {@link snapshotSource} walk: which project-relative path could not be examined, and the
+ * error code — or, with no path, that one of the server's own skip directories could not be
+ * resolved. It carries no filesystem message — those quote absolute paths. A path whose quoted
+ * form is past {@link SOURCE_CHECK_PATH_MAX} is named by its last component, cut to fit, and its
+ * depth.
+ */
+export class SourceSnapshotError extends Error {
+  constructor(
+    readonly rel: string | undefined,
+    readonly code: string,
+  ) {
+    super(SourceSnapshotError.describe(rel, code));
+    this.name = 'SourceSnapshotError';
+  }
+
+  private static describe(rel: string | undefined, code: string): string {
+    if (rel === undefined) {
+      return `the server's workspace or build directory could not be resolved (${code})`;
+    }
+    if (quoteId(rel).length <= SOURCE_CHECK_PATH_MAX) {
+      return `${quoteId(rel)} could not be examined (${code})`;
+    }
+    const parts = rel.split('/');
+    const depth = parts.length;
+    return (
+      `a path ${depth} level${depth === 1 ? '' : 's'} deep, ending in ` +
+      `${quoteCut(parts[depth - 1]!, SOURCE_CHECK_PATH_MAX)}, could not be examined (${code})`
+    );
+  }
+}
+
+/** `p` through its links, or `p` itself when it does not exist (a skip dir need not). */
+async function realpathOrSelf(p: string): Promise<string> {
+  try {
+    return await realpath(p);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return p;
+    throw err;
+  }
+}
+
+/**
+ * Snapshot the project's tree FOLLOWING its symbolic links, reading no file's content — `.git`
+ * left out, and two kinds of directory the server owns. A `skip` directory (the workspace) is left
+ * out when a directory IS it, by its spelled path or its realpath — never what lies under it,
+ * since in the workspace-local layout a local project contains the workspace and the workspace
+ * holds other clones a project link can reach into, and the build writes through such a link like
+ * any other. A `skipTree` directory (the build root, which the build writes by design) is left out
+ * with everything under it, so a link to `<buildRoot>/proj` is not walked either — unless it
+ * contains the project itself, where containment would leave out the whole project. Undefined
+ * when the tree has more than `maxEntries` entries, since a walk that stopped part-way cannot
+ * vouch for the rest; a path that cannot be examined throws a {@link SourceSnapshotError} naming
+ * it.
+ *
+ * Links are followed because the build follows them: {@link buildLinkFarm} links a symlinked
+ * directory as ONE entry, but that link reaches the directory's target, so a write under it —
+ * or through a file link into its target — lands outside what an `lstat` of the project records.
+ * So a link's entry carries its target's signature (a dangling one a marker, so creating the
+ * target shows as a change), and a linked directory is walked under the link's own path
+ * (`figs/a.pdf` for `figs -> /shared/figs`). A link to a directory already walked (or being
+ * walked — an ancestor, which is a cycle) is recorded as its one entry and not walked again. Real
+ * directories are not checked that way, so one directory can still be walked under two names
+ * (`up -> ..` then the real path); the duplicates count toward `maxEntries`, and entries are
+ * walked in name order, so they are the same in both snapshots. A link whose target cannot be
+ * `stat`ed for any reason but absence throws (the caller's "could not check"), never reads as
+ * unchanged.
  *
  * Why it exists: the farm's links make the variant's build able to write the source, and some of
  * the routes are not the server's to close — the project's own latexmkrc can put `-shell-escape`
@@ -379,32 +472,93 @@ export interface SourceSnapshot {
  */
 export async function snapshotSource(
   projectDir: string,
-  opts: { skip: string[]; maxEntries?: number },
+  opts: { skip: string[]; skipTree?: string[]; maxEntries?: number },
 ): Promise<SourceSnapshot | undefined> {
-  const skip = new Set(opts.skip.map((p) => path.resolve(p)));
   const max = opts.maxEntries ?? MAX_FARM_ENTRIES;
   const entries = new Map<string, string>();
   const base = path.resolve(projectDir);
-  const walk = async (dir: string, relDir: string): Promise<boolean> => {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
+  // Any failure names the path it was examining: `rel` of '' is the project root itself.
+  const at = async <T>(rel: string, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      throw new SourceSnapshotError(
+        rel === '' ? '.' : rel,
+        (err as NodeJS.ErrnoException).code ?? 'unknown error',
+      );
+    }
+  };
+  const baseReal = await at('', () => realpath(base));
+  const trees = (opts.skipTree ?? []).map((p) => path.resolve(p));
+  const skip = new Set([...opts.skip.map((p) => path.resolve(p)), ...trees]);
+  let skipReal: Set<string>;
+  let treesReal: string[];
+  try {
+    skipReal = new Set(await Promise.all([...skip].map(realpathOrSelf)));
+    treesReal = await Promise.all(trees.map(realpathOrSelf));
+  } catch (err) {
+    throw new SourceSnapshotError(
+      undefined,
+      (err as NodeJS.ErrnoException).code ?? 'unknown error',
+    );
+  }
+  // Containment only for a `skipTree` that does not contain the project.
+  const under = treesReal.filter((t) => !isWithin(baseReal, t));
+  const skipped = (spelled: string, real: string): boolean =>
+    skip.has(spelled) || skipReal.has(real) || under.some((t) => isWithin(real, t));
+  // Realpaths of every directory walked (or being walked): a link back into one is not re-walked.
+  const walked = new Set<string>();
+  // `real` is `dir` through its links; a real entry's realpath is `real` joined with its name.
+  const walk = async (dir: string, real: string, relDir: string): Promise<boolean> => {
+    walked.add(real);
+    const listing = await at(relDir, () => readdir(dir, { withFileTypes: true }));
+    // Any fixed order will do — only that both snapshots use the same one matters. The
+    // filesystem's own need not be stable (NTFS lists in its upcase order, FAT in none), and
+    // `<` compares UTF-16 code units, which is fixed.
+    listing.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of listing) {
       if (entry.name === '.git') continue;
       const abs = path.join(dir, entry.name);
       const kind = kindOf(entry);
       if (kind === undefined) continue;
-      if (kind === 'dir' && skip.has(path.resolve(abs))) continue;
+      if (kind === 'dir' && skipped(path.resolve(abs), path.join(real, entry.name))) continue;
       if (entries.size >= max) return false;
       const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
       if (kind === 'dir') {
         entries.set(rel, 'dir');
-        if (!(await walk(abs, rel))) return false;
+        if (!(await walk(abs, path.join(real, entry.name), rel))) return false;
         continue;
       }
-      const st = await lstat(abs, { bigint: true });
-      entries.set(rel, `${kind}:${st.size}:${st.mode}:${st.ino}:${st.mtimeNs}:${st.ctimeNs}`);
+      const own = statSignature(kind, await at(rel, () => lstat(abs, { bigint: true })));
+      if (kind === 'file') {
+        entries.set(rel, own);
+        continue;
+      }
+      let target;
+      try {
+        target = await stat(abs, { bigint: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new SourceSnapshotError(
+            rel,
+            (err as NodeJS.ErrnoException).code ?? 'unknown error',
+          );
+        }
+        entries.set(rel, `${own}->dangling`);
+        continue;
+      }
+      if (!target.isDirectory()) {
+        entries.set(rel, `${own}->${statSignature(target.isFile() ? 'file' : 'other', target)}`);
+        continue;
+      }
+      entries.set(rel, `${own}->dir`);
+      const targetReal = await at(rel, () => realpath(abs));
+      if (walked.has(targetReal) || skipped(path.resolve(abs), targetReal)) continue;
+      if (!(await walk(abs, targetReal, rel))) return false;
     }
     return true;
   };
-  return (await walk(base, '')) ? { entries } : undefined;
+  return (await walk(base, baseReal, '')) ? { entries } : undefined;
 }
 
 /** The project-relative paths added, removed or changed between two snapshots, sorted. Pure. */
@@ -416,21 +570,40 @@ export function sourceChanges(before: SourceSnapshot, after: SourceSnapshot): st
 }
 
 /**
- * Snapshot the project now and return how to ask, later, what changed since: the sorted changed
- * paths, or undefined when either walk failed or hit the entry cap — "could not check", which a
- * caller must never report as "nothing changed". Never throws: a check that cannot run must not
- * fail the compile it reports on.
+ * What {@link watchSource} found: the sorted changed paths, or — `changed` undefined — why the
+ * project could not be checked, as a message fragment (one path at most, escaped).
+ */
+export type SourceCheck = { changed: string[] } | { changed: undefined; reason: string };
+
+/**
+ * Snapshot the project now and return how to ask, later, what changed since. When either walk
+ * failed or hit the entry cap the answer is "could not check" with its reason, which a caller must
+ * never report as "nothing changed" — and must be able to explain, since a cause that stays (a
+ * committed link loop) fails every check. Never throws: a check that cannot run must not fail the
+ * compile it reports on.
  */
 export async function watchSource(
   projectDir: string,
-  opts: { skip: string[]; maxEntries?: number },
-): Promise<() => Promise<string[] | undefined>> {
-  const snap = () => snapshotSource(projectDir, opts).catch(() => undefined);
+  opts: { skip: string[]; skipTree?: string[]; maxEntries?: number },
+): Promise<() => Promise<SourceCheck>> {
+  const max = opts.maxEntries ?? MAX_FARM_ENTRIES;
+  const snap = async (): Promise<SourceSnapshot | string> => {
+    try {
+      return (
+        (await snapshotSource(projectDir, opts)) ??
+        `the project has more than ${max} files and directories, counting through its links`
+      );
+    } catch (err) {
+      return err instanceof SourceSnapshotError ? err.message : 'the project could not be walked';
+    }
+  };
   const before = await snap();
   return async () => {
-    if (before === undefined) return undefined;
+    if (typeof before === 'string') return { changed: undefined, reason: before };
     const after = await snap();
-    return after === undefined ? undefined : sourceChanges(before, after);
+    return typeof after === 'string'
+      ? { changed: undefined, reason: after }
+      : { changed: sourceChanges(before, after) };
   };
 }
 
@@ -438,20 +611,47 @@ export async function watchSource(
 const SOURCE_CHANGES_NAMED = 20;
 
 /**
- * The `hint` for a variant build that changed project files: which ones (the first
- * {@link SOURCE_CHANGES_NAMED}, the rest counted), what can have written them, and what to do.
+ * Characters the hint's list of names may take, rendered (each quoted name and the `, ` between
+ * them). The names are document-controlled — `\openout` can create a path of any depth, 255 bytes
+ * a component — and the hint ships twice, in the text channel and in `structuredContent`, so the
+ * list is budgeted, not merely counted, and charged in its JSON form — the larger of the two,
+ * where every `"` and `\` of a quoted name costs two characters. The house figure for a merely
+ * diagnostic share: the names only point at what is shown in full elsewhere — by `status` and
+ * `diff` for a path in the repository, and at the link's target for one under a link.
+ */
+export const SOURCE_CHANGES_NAMES_BUDGET = 2000;
+
+/**
+ * The `hint` for a variant build that changed project files: which ones, what can have written
+ * them, and what to do. Names are given in order while there are fewer than
+ * {@link SOURCE_CHANGES_NAMED} and their rendered list fits {@link SOURCE_CHANGES_NAMES_BUDGET};
+ * naming stops at the first that does not fit, so the named set is a prefix, and the rest are
+ * counted. A name is never cut short: a truncated path cannot be passed to a tool.
  */
 export function sourceChangedHint(paths: string[]): string {
-  const named = paths.slice(0, SOURCE_CHANGES_NAMED).map(quoteId).join(', ');
-  const more = paths.length - SOURCE_CHANGES_NAMED;
+  const named: string[] = [];
+  let used = 0;
+  for (const p of paths.slice(0, SOURCE_CHANGES_NAMED)) {
+    // JSON.stringify(x).length - 2: the name as structuredContent carries it, without its quotes.
+    const cost = (named.length > 0 ? ', '.length : 0) + JSON.stringify(quoteId(p)).length - 2;
+    if (used + cost > SOURCE_CHANGES_NAMES_BUDGET) break;
+    named.push(quoteId(p));
+    used += cost;
+  }
+  const more = paths.length - named.length;
+  const which =
+    named.length === 0 && paths.length > 0
+      ? ' (their names are too long to list here)'
+      : `: ${named.join(', ')}${more > 0 ? `, and ${more} more` : ''}`;
   return (
-    `This overlay compile changed ${paths.length} project file(s) while it ran: ${named}` +
-    (more > 0 ? `, and ${more} more` : '') +
+    `This overlay compile changed ${paths.length} project file(s) while it ran${which}` +
     '. An overlay compile writes nothing to the project itself, but the build can, through the ' +
     "variant's links to the source: shell escape (if you opted in, or the project's own " +
     'latexmkrc turned it back on), Lua code under lualatex (io.open), or \\openout under ' +
     'tectonic, which restricts no path — or the files were edited by hand meanwhile. Review them ' +
-    '(status, diff) and restore what you did not mean to change (discard).'
+    '(status, diff) and restore what you did not mean to change (discard); a path under a ' +
+    "symbolic link, or a link whose target changed, was written at the link's target — check it " +
+    'there; a target outside the project is beyond what status, diff and discard reach.'
   );
 }
 
@@ -817,6 +1017,20 @@ export async function applyOverlay(
 }
 
 /**
+ * Whether a `path.relative` result climbs out of its base: `..` as a whole first segment only, so a
+ * directory named `..foo` inside the base is not taken for its parent. Pure.
+ */
+function climbsOut(rel: string): boolean {
+  return rel === '..' || rel.startsWith(`..${path.sep}`);
+}
+
+/** Whether absolute `p` is `dir` or lies under it, judged on the strings as given. Pure. */
+function isWithin(p: string, dir: string): boolean {
+  const rel = path.relative(dir, p);
+  return rel === '' || (!climbsOut(rel) && !path.isAbsolute(rel));
+}
+
+/**
  * Refuse an overlay compile whose root file sits under a symbolic link (a junction on win32 —
  * `lstat` reports one as a link) somewhere in its DIRECTORY path within the project.
  *
@@ -865,9 +1079,7 @@ export async function refuseLinkedRootDir(
         ? path.relative(path.resolve(projectDir), path.resolve(rootFile))
         : '';
     const relSpelling =
-      inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)
-        ? toPosix(inside)
-        : undefined;
+      inside !== '' && !climbsOut(inside) && !path.isAbsolute(inside) ? toPosix(inside) : undefined;
     const what =
       driveQualified && !path.win32.isAbsolute(rootFile)
         ? 'is spelled with a drive prefix, which Windows reads as an absolute or drive-relative ' +
@@ -916,7 +1128,7 @@ export async function refuseLinkedRootDir(
     try {
       const target = await realpath(path.join(base, ...dirs));
       const inside = path.relative(await realpath(base), target);
-      if (inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside)) {
+      if (inside !== '' && !climbsOut(inside) && !path.isAbsolute(inside)) {
         realRoot = path.posix.join(toPosix(inside), path.posix.basename(rel));
       }
     } catch {
