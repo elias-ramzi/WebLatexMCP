@@ -338,6 +338,15 @@
   min-width: 5.5em;
 }
 
+.flow.four {
+  grid-template-columns: 0.9fr auto 1.35fr auto 1.25fr auto 1fr;
+  margin: 0.9em 0 0.8em;
+}
+
+.flow.four .arrow {
+  min-width: 2.5em;
+}
+
 .flow .arrow b {
   font-size: 2.4em;
   line-height: 1;
@@ -500,6 +509,30 @@
   font-size: 0.85em;
   font-weight: 600;
   color: #b6a6ff;
+}
+
+/* ---------- a one-line tip under a slide's steps ---------- */
+
+.tip {
+  font-size: 0.55em;
+  color: var(--muted);
+  background: var(--violet-soft);
+  border-radius: 8px;
+  padding: 0.4em 0.7em;
+  margin-top: 0.4em !important;
+}
+
+/* ---------- figures slide ---------- */
+
+.cols.figures {
+  grid-template-columns: 1fr 1.25fr;
+}
+
+/* The taller figure, as large as the space under the wide one allows. */
+.figure-second {
+  height: 300px;
+  width: auto;
+  margin: 0 auto !important;
 }
 
 /* ---------- closing slide, on the navy background ---------- */
