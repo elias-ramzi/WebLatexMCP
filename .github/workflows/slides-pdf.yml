@@ -1,0 +1,98 @@
+# Rebuilds slides/WebLatexMCP.pdf when a pull request changes the deck, and commits it to the PR's
+# branch, so the committed PDF never falls behind the slides.
+#
+# Why the push needs its own token:
+#   - `dev` requires every CI check on a PR's head commit, and a commit pushed with the workflow's
+#     own GITHUB_TOKEN starts no workflow. Pushed that way, the PDF commit would carry no checks and
+#     the PR could not be merged. So the push uses SLIDES_PDF_TOKEN, a fine-grained personal access
+#     token with Contents: read and write on this repository; its push runs CI like any other.
+#   - Without that secret (not set up yet, or a fork's PR, which is never given secrets), the PDF is
+#     still built and attached to the run as an artifact, and the run warns that nothing was
+#     committed. Download it and commit it by hand.
+#
+# Why it does not loop: the token's push starts this workflow again, and `pull_request` path
+# filters look at the whole PR, which still changes the slides. Chrome stamps a creation date into
+# every PDF, so a rebuild always differs. The run therefore stops when the head commit changes the
+# PDF and nothing else — the commit this workflow makes, or a PDF rebuilt and committed by hand.
+name: Slides PDF
+
+on:
+  pull_request:
+    paths:
+      - 'slides/**'
+      - '!slides/README.md'
+      - '!slides/WebLatexMCP.pdf'
+
+concurrency:
+  group: slides-pdf-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Rebuild the slides PDF
+    runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.SLIDES_PDF_TOKEN != '' }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # The branch itself, not the merge commit a pull_request run checks out by default.
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.SLIDES_PDF_TOKEN || github.token }}
+          fetch-depth: 2
+
+      - name: Skip a head commit that only changes the PDF
+        id: skip
+        run: |
+          changed="$(git diff-tree --no-commit-id --name-only -r HEAD)"
+          if [ "$changed" = "slides/WebLatexMCP.pdf" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "The head commit changes only the PDF; nothing to rebuild."
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          node-version: 22
+
+      # The deck uses emoji; the runner image has no colour emoji font.
+      - name: Install an emoji font
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-color-emoji
+
+      - name: Build the PDF
+        if: steps.skip.outputs.skip != 'true'
+        run: node slides/build-pdf.mjs
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          name: WebLatexMCP-slides
+          path: slides/WebLatexMCP.pdf
+
+      - name: Commit the PDF to the PR branch
+        if: steps.skip.outputs.skip != 'true' && env.HAS_TOKEN == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add slides/WebLatexMCP.pdf
+          if git diff --cached --quiet; then
+            echo "The PDF is unchanged."
+            exit 0
+          fi
+          git commit -m 'docs(slides): rebuild the deck PDF'
+          git push origin "HEAD:refs/heads/$HEAD_REF"
+
+      - name: Report that nothing was committed
+        if: steps.skip.outputs.skip != 'true' && env.HAS_TOKEN != 'true'
+        run: |
+          echo "::warning file=slides/WebLatexMCP.pdf::No SLIDES_PDF_TOKEN secret, so the rebuilt" \
+               "PDF was not committed. Download the WebLatexMCP-slides artifact from this run and" \
+               "commit it, or add the secret (see slides/README.md)."

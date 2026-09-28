@@ -26,6 +26,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   no new dependency. reveal.js's print layout waits on animation frames, which headless Chrome stops
   producing under `--virtual-time-budget`, so the first build was one blank page; in `?print-pdf`
   mode alone the deck now runs those frames on timers, which do advance there.
+  A pull request that changes the deck gets the PDF rebuilt and committed to its branch by the
+  `Slides PDF` workflow. The push uses a `SLIDES_PDF_TOKEN` secret rather than the workflow's own
+  token, because a commit pushed with that token starts no CI and `dev` refuses a head commit
+  without its required checks. Without the secret — or on a fork's PR — the PDF is attached to the
+  run as an artifact and the run warns. The workflow stops when the head commit changes only the
+  PDF, since its own push starts it again and a rebuilt PDF always differs by its creation date.
   `slides/` is outside the npm package's `files` list, so none of it ships with the server.
 - **A `.plugin-scanner.toml` for the HOL AI Plugin Scanner**, which the awesome-ai-plugins catalog
   runs before listing the server (#198). It excludes `test/`, where the token-shaped strings the

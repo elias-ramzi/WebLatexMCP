@@ -27,7 +27,13 @@ npm run slides:pdf -- out/deck.pdf  # or a path of your choice
 
 `build-pdf.mjs` prints the deck with a headless Chrome, Chromium or Edge — the first one it finds
 on `PATH` or in the usual install locations, including a Windows browser from WSL. Set `CHROME_PATH`
-to choose one. Each slide is one page, with its step-by-step reveals shown together. Rebuild and
-commit the PDF whenever the slides change, so the two stay in step.
+to choose one. Each slide is one page, with its step-by-step reveals shown together.
+
+A pull request that changes the deck gets the PDF rebuilt for it: the `Slides PDF` workflow
+(`.github/workflows/slides-pdf.yml`) builds it and commits it to the PR's branch. That push uses
+the `SLIDES_PDF_TOKEN` repository secret, a fine-grained personal access token with **Contents:
+read and write** on this repository — a push with the workflow's own token would start no CI, and
+`dev` refuses a head commit without its checks. Without the secret (or on a fork's PR), the run
+attaches the PDF as the `WebLatexMCP-slides` artifact and warns instead; download it and commit it.
 
 The deck needs a network connection for reveal.js and the fonts.
