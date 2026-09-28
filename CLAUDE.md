@@ -913,126 +913,30 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   failure marked the exact setup this fallback exists to rescue as broken. Tectonic bundles its own
   XeTeX and fetches its own packages, so those are category errors, not findings — grade them
   against `effective` or the `warn` above is decorative.
-- **An overlay compile builds a what-if variant in a link farm; the server never writes the project, and what the build writes is reported.**
-  `compile`'s `overlay` (`src/lib/variants.ts`) applies `edit_file`'s edits in memory
-  (`applyEditsToContent`, the pure half of `FileService.applyEdits`, so both refuse the same edits)
-  to files read through `readTextExact` — the project's link policy, **no baseline** — and compiles
-  in `buildDir(dir)/variants/<handle>/src/`: a mirror of the project tree whose every file is a
-  link to its absolute source path (a symlinked directory is ONE link, never walked; `.git`, the
-  workspace and the build root are skipped; win32 uses junctions, hard links and copies), except
-  the overlaid files, which are real files — an overlaid path under a linked directory
-  materialises that directory first, so nothing is written through a link. The backend runs there
-  (`CompileRequest.workDir`) into the variant's own `out/` (`outDir`), whose directory scaffold is
-  mirrored from the SOURCE as for every compile (`mirrorSubdirsForRoot`): the root file's own
-  directory is mirrored at `out/`'s root for latexmk's `-cd` only when its **realpath** stays inside
-  the project's — judged on the string, a committed `paper -> /` made every compile walk `/` — and
-  `mirrorSubdirs` never descends into a linked directory (`Dirent` types), so the walk cannot loop.
-  **`rootFile` is judged by one function, on the raw spelling the caller gave, before anything is
-  read or staged** (`refuseLinkedRootDir`: `compile` calls it ahead of `applyOverlay`, and
-  `stageVariant` calls it again first thing, so no caller of `stageVariant` can stage around it).
-  **A root file under a linked directory is refused**: in the farm that directory is ONE link to
-  the source's absolute path, so latexmk's `-cd` would run the engine physically inside the SOURCE
-  — reading none of the overlays, writing relative names into the source — and an overlay that
-  materialised the directory would resolve `\input{../common/x}` against the link's parent instead
-  of its target's, a silently different document. Every directory component of the root is
-  `lstat`ed (a junction reads as a link on win32), whatever the backend; the refusal names the link
-  and the real-path `rootFile` to pass instead (a normal compile of which is the same document). A
-  root at the project root has no components to judge; a normal compile is unchanged. **The link
-  check judges the normalised spelling while the backend gets the raw one**, so every spelling for
-  which the two can resolve differently is refused first: any `..` segment (`paper/../p1/main.tex`
-  normalises to a `p1/` that does not exist, ending the check, while `-cd` resolves it physically
-  through the farm's link into the source; `../demo/main.tex` names a file inside the project but,
-  in the farm, a sibling of the farm, which is not there) and an absolute root (`-cd` goes straight
-  to the source, farm or no farm — refused with the project-relative spelling when it lies inside).
-  A drive-qualified name is refused on **every** platform, not only win32 — absolute
-  (`C:\p\main.tex`) or drive-relative (`C:main.tex`, which Windows resolves against that drive's
-  current directory) — so the refusal does not depend on where the server runs. What remains (`./`,
-  doubled separators) normalises to what the OS resolves. Not `TEXINPUTS`: kpathsea never searches
-  the path for `./` or `../` names, so those inputs read the source. The farm mirrors the project
-  and not its parent, so a `../` input that LEAVES the project resolves inside the variant dir and
-  fails where a normal compile reads it — a stated limit, not a guarantee. The entry cap and the
-  win32 copy cap are **per stage**: `stageVariant` threads one `FarmBudget` through `buildLinkFarm`
-  and every `placeOverlayFile`, whose materialisation of a linked directory links each of its
-  children. **The server
-  never reads through the farm** — TeX reads what a normal compile would, so the farm adds no read
-  surface; the only project files read are the overlaid ones — **except on win32**, where the
-  farm's copy fallback does read files through the server: a file symlink is copied (a symlink
-  needs a privilege there), and so is a file a hard link cannot reach (another drive than the temp
-  dir) or a read-only one (a hard link shares its attributes, and deleting the farm would clear
-  the source's read-only bit), all charged against `MAX_FARM_COPY_BYTES` (512 MiB). Two entries
-  naming one file (a case variant, a hard link: judged by `lstat` dev+ino, after the platform's
-  case fold) are refused, since only the second would reach the farm; and the variant's `.fls` (what the engine
-  opened) and `.fdb_latexmk` (what latexmk's other rules read — biber's `.bib`) are checked after
-  the compile, so an overlaid file the build never opened is named in `hint` rather
-  than producing a variant silently identical to the main build. Nothing goes through FileService's
-  write path (no shadow record, no baseline, no rewrite mode), and the surfaced PDF and the viewer
-  are left alone. **The farm's links are also a write path for the BUILD**, and two doors through
-  them are shut: a variant compile with neither `shellEscape` nor `restrictedShellEscape` passes
-  `-no-shell-escape` (`CompileRequest.noShellEscape`, set only by `compile` for a variant — a
-  normal compile's argv stays byte-identical, pinned by a test), because TeX Live's default
-  `shell_escape = p` runs allow-listed commands with no flag at all, and a `makeindex -o` into
-  `sections/a.tex` from the farm truncated the source file behind that link; a refused command
-  (`shellCommandRefused`, pdfTeX's `runsystem(...)...disabled`) or a TikZ-externalization failure
-  gets a `hint` saying the variant ran without shell escape and that opting in lifts the
-  guarantee. Tectonic takes no flag for this (it runs no command without `-Z shell-escape`) — which
-  settles its shell escape and nothing else. And an overlay entry named `latexmkrc`/`.latexmkrc`
-  (basename, under the platform's case fold) is refused before anything is read, since latexmk
-  runs it as Perl from its working directory. **Three doors stay open, and are reported rather
-  than closed:** the project's OWN rc file still runs (it is the project's code, not the
-  caller's), and `-no-shell-escape` reaches the engine only through `%O` — an rc of
-  `'pdflatex %O -shell-escape %S'`, or one with no `%O`, turns shell escape back on; under
-  `lualatex` the document's Lua `io.open` writes whatever the flag says; and tectonic has no
-  `openout_any`, so its `\openout` writes any absolute path, the source included. So `compile`
-  never asserts the source is untouched: `watchSource` (`snapshotSource`/`sourceChanges`) records
-  every project entry by `lstat` — kind, size, mode, inode, mtime and **ctime**, which a restored
-  mtime cannot hide; no content read; `.git` and `skip` left out — after staging (win32 staging
-  hard-links and unlinks source files, moving their ctime) and again right after the build, before
-  eviction does the same. **The snapshot follows links where the farm does not walk them**: the
-  farm's ONE link to a symlinked directory still reaches its target, so a file link's entry carries
-  its target's `stat` signature too (a dangling link a marker, so the build creating the target is
-  a change), and a linked directory is walked under the link's path (`figs/a.pdf` for
-  `figs -> /shared/figs`). A link to a directory already walked (an ancestor, so a cycle ends, or a
-  second name) is one entry and not walked again; real directories are not deduplicated, so
-  `up -> ..` can list a directory twice — counted toward the cap, and walked in name order so both
-  snapshots agree. Two kinds of server directory are left out, both judged on the spelled path and
-  the realpath. The workspace (`skip`) by **equality only**: in the workspace-local layout a local
-  project registered at the launch dir contains `.web_latex_mcp`, and a project link into a sibling
-  clone (`figs -> .web_latex_mcp/shared/figs`) is written through like any other — containment
-  there skipped it and reported "no project file changed" for a write it made. The directory
-  itself is still left out, since its session files change on every call. The build root
-  (`skipTree`), which the build writes by design, with **every directory under it** (a link to
-  `<buildRoot>/proj` is not walked; a file link into it is still compared) — unless it contains the project. A link that cannot be
-  `stat`ed for any reason but ENOENT fails the walk: "could not be checked", never "unchanged", and
-  the variant line names the path and error code (`SourceSnapshotError`, via `watchSource`'s
-  `SourceCheck.reason`), since a committed link loop fails every check and must be findable. That
-  path is document-controlled, so past `SOURCE_CHECK_PATH_MAX` (200 characters quoted — one path
-  in one sentence) only its last component, cut with `…`, and its depth are named; a skip
-  directory that cannot be resolved says so rather than blaming the project root. A changed path
-  is named in `hint` (`sourceChangedHint`: at most 20 named, and only while their rendered names fit
-  `SOURCE_CHANGES_NAMES_BUDGET` — 2000 characters charged in the JSON form, the larger of the two
-  channels the hint ships in, since the names are document-controlled; a name that does not fit is
-  counted, never truncated) and the text says CHANGED. The hint says that a path under a link, or a
-  link whose target changed, was written at the link's target — and that a target outside the
-  project is beyond what `status`/`diff`/`discard` reach (an in-project one is not).
-  A walk that hit `MAX_FARM_ENTRIES` is "could not be checked" too, with that reason. The
-  text's shell-escape clause is likewise read off the engine's banner (`shellEscapeWasEnabled`),
-  not off the flag the server passed. The check observes; it never undoes a write, and it cannot
-  tell the build's write from a hand edit made meanwhile — the hint says both. The handle is `v` +
-  12 hex of SHA-256 over root, engine, backend, shell-escape flags and the normalised overlay, so
-  the same overlay reuses its `out/`; a caller-supplied handle is checked by `isVariantHandle`
-  **before** any path join (`childPathInside`). After each overlay compile, under the lock, all but
-  the `MAX_VARIANTS` (4) most recently compiled variants are removed (`rm -rf`, which unlinks a
-  farm's links without following them), never the one just compiled — best-effort: every handle is
-  tried, the failures are collected and thrown together (`VariantEvictionError`), and `compile`
-  logs them to stderr and reports them in `hint` (escaped like any supplied value, since the
-  message carries filesystem paths), never letting them throw away the finished compile. "Most
-  recently compiled" is the manifest's `usedAt`, which only `stageVariant` stamps. A
-  `.fdb_latexmk` that exists but is unusable (over the size cap, unreadable) makes the never-read
-  check claim nothing, like an unusable `.fls`; only a MISSING one lets the `.fls` stand alone. On
-  a failed build the never-read hint says the build stopped before reading the file, never that the
-  caller should overlay another path. The
-  PDF tools take `variant` and read that build only — its PDF, `.aux`/`.log` (`readAuxFloats`'
-  `buildDir`) and its own `render/` — never falling back to the main build.
+- **An overlay compile builds a what-if variant in a link farm; the server never writes the
+  project, and what the build writes is reported.** `compile`'s `overlay` (`src/lib/variants.ts`,
+  whose JSDoc carries the mechanics) applies the edits in memory (`applyEditsToContent`, the pure
+  half of `FileService.applyEdits`) and compiles in a mirror of the project whose files are links to
+  the source, except the overlaid ones. Nothing goes through FileService's write path: no baseline,
+  no shadow record, no rewrite mode, and the surfaced PDF and viewer are left alone. The rules:
+  - **`rootFile` is judged once, on the raw spelling, before anything is read or staged**
+    (`refuseLinkedRootDir`, called by `compile` and again by `stageVariant`). A `..` segment, an
+    absolute or drive-qualified path, or a root under a linked directory is refused: latexmk's `-cd`
+    resolves physically, so any of them runs the engine inside the SOURCE.
+  - **The farm's links are a write path for the build.** A variant passes `-no-shell-escape` unless
+    the caller opted in (TeX Live's default restricted mode runs `makeindex -o` into a linked file);
+    a normal compile's argv stays byte-identical, pinned by a test. An overlaid `latexmkrc` is
+    refused.
+  - **What cannot be closed is reported, never denied.** The project's own latexmkrc, lualatex's
+    `io.open` and tectonic's `\openout` can still write, so `watchSource` compares a before/after
+    snapshot (following links, since the farm's links reach their targets) and `hint` names what
+    changed. A snapshot that could not complete is "could not be checked", never "unchanged". The
+    workspace is skipped by equality only (a local project can contain it, and a link into a sibling
+    clone is still a write); the build root with everything under it. The changed-path names and
+    the failure reason are document-controlled, so both are budgeted.
+  - **Eviction is best-effort**: at most `MAX_VARIANTS` are kept; a removal failure goes to stderr
+    and `hint`, never failing the finished compile.
+  - **The PDF tools read a `variant` build only**, never falling back to the main one.
 - **Source context is shown only where it can be vouched for.** `compile` attaches the 5 lines around
   each error (`src/lib/errorSnippets.ts`, over the shared `src/lib/sourceSnippet.ts` that `list_comments`
   uses too). Showing the wrong five lines under a `>` marker is worse than showing none, so a location
