@@ -10,6 +10,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -749,10 +750,13 @@ describe('PDF tools read a variant by its handle', () => {
       variantPdf,
       minimalPdf(2, 300, 200, { text: (n) => `VARIANT page ${n}, Figure 1 caption\n${n}` }),
     );
-    await writeFile(
-      path.join(paths.out, 'main.aux'),
-      '\\relax\n\\newlabel{fig:x}{{1}{2}{A caption}{figure.1}{}}\n',
-    );
+    const variantAux = path.join(paths.out, 'main.aux');
+    await writeFile(variantAux, '\\relax\n\\newlabel{fig:x}{{1}{2}{A caption}{figure.1}{}}\n');
+    // A finished compile closes its .aux before its PDF, and a label lookup refuses a build whose
+    // .aux is the newer by any margin ('stalePdf', #220). Back-date the staged one so the order the
+    // steps ran in cannot read as a stale build.
+    const past = new Date(Date.now() - 60_000);
+    await utimes(variantAux, past, past);
     // One shipout mark per page of the variant's PDF: a label lookup refuses a log that shipped
     // nothing beside a PDF with pages, so this is also the log that lookup must read.
     await writeFile(

@@ -583,6 +583,12 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       for (let s = 2; s <= 8; s++) await landed(client, `fig:s${s}`);
     }
   }, 480_000);
+
+  /** The `.aux`-newer-than-the-PDF clause, however short the gap: a fast runner's stopped run
+   *  closed its `.aux` well under a second (under 250 ms, PR #229's CI) after the earlier PDF. */
+  const STALE_AUX_CLAUSE =
+    /the \.aux was written (?:\d+\.\d s|[1-9]\d{0,2} ms|less than 1 ms) after the PDF/;
+
   it.skipIf(!xelatexAvailable)(
     "refuses a label whose .aux a stopped xelatex run rewrote beside the earlier run's PDF",
     async () => {
@@ -617,7 +623,7 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       expect(textOf(fatal)).toMatch(
         /says that run wrote 2 page\(s\) to its \.xdv file, while the PDF has 3 page\(s\)/,
       );
-      expect(textOf(fatal)).toMatch(/the \.aux was written \d+\.\d s after the PDF/);
+      expect(textOf(fatal)).toMatch(STALE_AUX_CLAUSE);
       const geo = await client.callTool({
         name: 'pdf_geometry',
         arguments: { project: 'doc', kinds: ['floats'] },
@@ -631,7 +637,7 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       ).toBe(false);
       const error = await lookup('a');
       expect(error.isError, textOf(error)).toBe(true);
-      expect(textOf(error)).toMatch(/the \.aux was written \d+\.\d s after the PDF/);
+      expect(textOf(error)).toMatch(STALE_AUX_CLAUSE);
       expect(textOf(error)).not.toMatch(/closing line/);
 
       // Fixed and compiled again, the build is whole and the label resolves to its own page.

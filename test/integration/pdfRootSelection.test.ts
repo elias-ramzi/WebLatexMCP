@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -36,6 +36,11 @@ async function stageMainAux(userDir: string): Promise<void> {
   const auxPath = buildAuxPath(userDir, 'main.tex');
   await writeFile(auxPath, MAIN_AUX);
   await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, ROUTES_ONLY_LOG);
+  // A finished compile closes its .aux before its PDF, and a label lookup refuses a build whose
+  // .aux is the newer by any margin ('stalePdf', #220). Back-date the staged one so the order the
+  // steps ran in, and any pause a slow runner puts between them, cannot read as a stale build.
+  const past = new Date(Date.now() - 60_000);
+  await utimes(auxPath, past, past);
 }
 
 const cleanups: Array<() => Promise<unknown>> = [];

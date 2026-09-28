@@ -106,10 +106,9 @@ async function stageAux(
   await mkdir(path.dirname(auxPath), { recursive: true });
   await writeFile(auxPath, content);
   if (log !== null) await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, log);
-  // A finished compile closes its .aux before its PDF, and labels: refuse a build whose .aux is
-  // the newer by more than STALE_PDF_TOLERANCE_MS ('stalePdf', #220). Back-date the staged one so
-  // the order the steps ran in, and any pause a slow runner puts between them, cannot read as a
-  // stale build.
+  // A finished compile closes its .aux before its PDF, and a label lookup refuses a build whose
+  // .aux is the newer by any margin ('stalePdf', #220). Back-date the staged one so the order the
+  // steps ran in, and any pause a slow runner puts between them, cannot read as a stale build.
   const past = new Date(Date.now() - 60_000);
   await utimes(auxPath, past, past);
 }

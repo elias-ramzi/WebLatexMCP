@@ -4,11 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseEngineOutput, parseShipoutMarks } from '../../src/lib/auxFloats.js';
 import type { AuxFloatsResult } from '../../src/lib/auxFloats.js';
-import {
-  STALE_PDF_TOLERANCE_MS,
-  staleBuildEvidence,
-  staleRecordsText,
-} from '../../src/lib/labelPages.js';
+import { staleBuildEvidence, staleRecordsText } from '../../src/lib/labelPages.js';
 import { ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 
 /**
@@ -129,15 +125,20 @@ describe('staleBuildEvidence', () => {
     expect(staleBuildEvidence(aux({}), { pageCount: 3, hasPages: true })).toBeUndefined();
   });
 
-  it('fires on an .aux newer than the PDF past the tolerance, never at or under it', () => {
+  it('fires on an .aux strictly newer than the PDF, never on one as old or older', () => {
     const at = (newer: number) =>
       staleBuildEvidence(aux({ buildTimes: { auxMs: 10_000 + newer, pdfMs: 10_000 } }), {
         hasPages: true,
       });
-    expect(at(-500)).toBeUndefined();
+    // Older, as every finished build leaves them (8 to 684 ms measured), and equal, as a coarse
+    // filesystem can leave them: neither is newer.
+    expect(at(-684)).toBeUndefined();
+    expect(at(-8)).toBeUndefined();
     expect(at(0)).toBeUndefined();
-    expect(at(STALE_PDF_TOLERANCE_MS)).toBeUndefined();
-    expect(at(STALE_PDF_TOLERANCE_MS + 0.5)).toEqual({ auxNewerByMs: 251 });
+    // Any positive gap, however small (#229's CI runner: under 250 ms).
+    expect(at(0.3)).toEqual({ auxNewerByMs: 0 });
+    expect(at(1)).toEqual({ auxNewerByMs: 1 });
+    expect(at(40)).toEqual({ auxNewerByMs: 40 });
     expect(at(1_400)).toEqual({ auxNewerByMs: 1_400 });
   });
 
@@ -175,6 +176,16 @@ describe('staleBuildEvidence', () => {
         "before its PDF; and the engine's closing line in the .log says that run wrote 2 " +
         'page(s) to its .xdv file, while the PDF has 3 page(s)',
     );
+    // A gap under a second is named in milliseconds, never rounded to "0.0 s after".
+    expect(staleRecordsText({ auxNewerByMs: 40 })).toBe(
+      'the .aux was written 40 ms after the PDF, while a compile that finishes writes its .aux ' +
+        'before its PDF',
+    );
+    expect(staleRecordsText({ auxNewerByMs: 0 })).toMatch(
+      /^the \.aux was written less than 1 ms after the PDF, /,
+    );
+    expect(staleRecordsText({ auxNewerByMs: 999 })).toMatch(/written 999 ms after the PDF/);
+    expect(staleRecordsText({ auxNewerByMs: 1_000 })).toMatch(/written 1\.0 s after the PDF/);
     expect(staleRecordsText({ logOutput: { kind: 'noPages' } })).toBe(
       'the engine\'s closing line in the .log is "No pages of output.", while the PDF has pages',
     );

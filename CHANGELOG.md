@@ -285,12 +285,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   new `.log` shipped pages, and its shipout marks can number the old PDF's pages exactly — after an
   ordinary, non-fatal xelatex error, which also skips xdvipdfmx, they always do. Every label of
   such a build is now refused (`stalePdf`) on either of two records the document cannot write. One
-  is the files' order: a finished compile closes its `.aux` before its PDF, so an `.aux` newer than
-  the PDF by more than 250 ms is a later run's. Measured by hand with TeX Live 2026 under latexmk
-  4.88 on Linux (ext4) — no test reproduces these numbers; the tests pin the decision against
-  staged timestamps — every finished pdflatex, lualatex and xelatex build left the `.aux` older
-  than the PDF, by 8 to 684 ms, and every build that left the earlier PDF beside a new `.aux` left
-  it newer, by 852 to 984 ms with the two compiles back to back. The other is the engine's closing line in the `.log` —
+  is the files' order: a finished compile closes its `.aux` before its PDF, so an `.aux` strictly
+  newer than the PDF, by any margin, is a later run's. Measured by hand with TeX Live 2026 under
+  latexmk 4.88 on Linux (ext4) — no test reproduces these numbers; the tests pin the decision
+  against staged timestamps — every finished pdflatex, lualatex and xelatex build left the `.aux`
+  older than the PDF, by 8 to 684 ms. The other side has no floor: a stopped run measured 852 to
+  984 ms newer back to back on one machine, but closed its `.aux` under 250 ms after the earlier
+  PDF on a fast CI runner, so no tolerance is applied. Equal times are not newer: a coarse
+  filesystem's timestamps can make the two equal, never reverse them, and that costs only a missed
+  refusal. The other is the engine's closing line in the `.log` —
   `Output written on … (N pages …)`, `No pages of output.` or `no output PDF file produced` —
   naming a page count other than the PDF's, or no output beside a PDF with pages. That one needs
   no clock, so it also covers a coarse filesystem's equal timestamps, and it closes the

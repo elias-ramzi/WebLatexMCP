@@ -211,19 +211,28 @@ describe('a PDF that is not the output of the last compile refuses every label',
     }
   });
 
-  it('ignores an .aux newer by no more than the tolerance, and refuses one a millisecond past it', async () => {
-    const pdfPath = await stage(OLD_AUX, log('bodyError-xelatex'), 250);
+  it('refuses an .aux a millisecond newer than the PDF, and resolves one as old or older', async () => {
+    // Equal times — what a filesystem with coarse or truncated timestamps can make of a finished
+    // build — are not "newer": the lookup resolves, and the closing record (agreeing here) is the
+    // only check left, which is the safe direction for such a filesystem.
+    const pdfPath = await stage(OLD_AUX, log('bodyError-xelatex'), 0);
     const index = await readAuxFloats(proj!, 'main.tex', { max: 20_000, shipouts: true, pdfPath });
     const plan = await resolveLabelPages(['b'], index, reader);
     expect(plan.failed).toEqual([]);
     expect(plan.pages).toEqual([2]);
 
-    const older = new Date(new Date('2026-09-28T12:00:00Z').getTime() - 251);
-    await utimes(pdfPath, older, older);
-    const past = await readAuxFloats(proj!, 'main.tex', { max: 20_000, shipouts: true, pdfPath });
-    expect((await resolveLabelPages(['b'], past, reader)).failed.map((f) => f.reason)).toEqual([
-      'stalePdf',
-    ]);
+    const auxTime = new Date('2026-09-28T12:00:00Z').getTime();
+    const at = async (pdfMs: number) => {
+      await utimes(pdfPath, new Date(pdfMs), new Date(pdfMs));
+      const idx = await readAuxFloats(proj!, 'main.tex', { max: 20_000, shipouts: true, pdfPath });
+      return resolveLabelPages(['b'], idx, reader);
+    };
+    // One millisecond: a stopped run that closed its .aux right after the earlier PDF.
+    const past = await at(auxTime - 1);
+    expect(past.failed.map((f) => f.reason)).toEqual(['stalePdf']);
+    expect(labelRefusalMessage(past, index)).toContain('the .aux was written 1 ms after the PDF');
+    // Older, as a finished build leaves them.
+    expect((await at(auxTime + 8)).failed).toEqual([]);
   });
 });
 

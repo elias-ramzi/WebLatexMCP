@@ -974,6 +974,10 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   Say so wherever it is documented; do not claim more. It keys on the uid, not
   `process.platform`, so a test stubbing the platform does not move the root out from
   under the build it staged, and the farm skip lists and `variants.ts` may call it freely.
+  `ensureBuildRoot` picks its win32/POSIX rules **the same way** (by the uid, unless a test
+  injects `platform`): judging by `process.platform` while naming by the uid sent a uid-less win32
+  process whose platform a test stubbed down the POSIX owner check, and refused every lookup
+  (windows-latest, #229).
   `ensureBuildRoot()` creates it `0700` (not recursive, which would silently accept whatever sits
   there — and which would create a missing `TMPDIR`/`TEMP`, choosing the owner and mode of a
   directory other programs share: an `ENOENT`/`ENOTDIR` from that mkdir is an
@@ -1250,16 +1254,25 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   xdvipdfmx, and the earlier run's PDF stays — an ordinary, non-fatal xelatex error does the same
   — and its shipout marks may number the old PDF's pages exactly, so neither `nothingShipped` nor
   the shipout check sees it. `staleBuildEvidence` refuses on either of two records the document
-  cannot write. **The `.aux` newer than the PDF** past `STALE_PDF_TOLERANCE_MS` (250 ms), from
-  `readBuildTimes` → `AuxFloatsResult.buildTimes`, stat'd only when the tool passes `pdfPath` to
-  `readAuxFloats` — so every label tool must pass the PDF it pairs with the `.aux`. A finished
+  cannot write. **The `.aux` STRICTLY newer than the PDF** (`auxNewerThanPdfMs` — no tolerance),
+  from `readBuildTimes` → `AuxFloatsResult.buildTimes`, stat'd only when the tool passes `pdfPath`
+  to `readAuxFloats` — so every label tool must pass the PDF it pairs with the `.aux`. A finished
   compile closes the `.aux` in `\enddocument`, before the PDF is finished. Measured **by hand**
   (TeX Live 2026, latexmk 4.88, Linux ext4 — no test reproduces the numbers; `stalePdf.test.ts`
   pins the decision against staged timestamps), every finished pdflatex, lualatex and xelatex
-  build left the `.aux` older than the PDF by 8 to 684 ms, and every build that left the earlier
-  PDF beside a new `.aux` left it newer by 852 to 984 ms with the two compiles back to back — a gap
-  no shorter than the second run itself. Tests that stage a
-  build by hand must write the `.aux` first or back-date it, or a slow runner reads them as stale.
+  build left the `.aux` older than the PDF by 8 to 684 ms. The stale side has **no floor**: a
+  250 ms tolerance once rested on the claim that the gap could not be shorter than the second run
+  itself, and PR #229's "LaTeX compile smoke" runner closed a stopped xelatex run's `.aux` under
+  250 ms after the earlier PDF — the closing record still refused there, but a stopped run
+  shipping as many pages as the old PDF has only this signal, so the tolerance would have resolved
+  a label to the wrong page. Do not reintroduce one. **Equal is not newer**: coarse or truncated
+  timestamps are a non-decreasing function of the write time, so they can make the two equal,
+  never reverse them — equality costs only a missed refusal, the safe direction. The remaining
+  assumption is one clock stamping both files (true locally, and for one client writing to one NFS
+  server, which stamps both). Tests that stage a build by hand must write the `.aux` first or
+  back-date it (the `stageAux` helpers back-date it 60 s) — any positive gap refuses, and Linux
+  stamps files from a coarse clock tick, so a helper writing the PDF then the `.aux` passes or
+  fails depending on whether the two writes share a tick.
   **The engine's closing record in the `.log`** (`parseEngineOutput`: the last of
   `Output written on … (N pages …)`, `No pages of output.`,
   `==> Fatal error occurred, no output PDF file produced!`) disagreeing with the PDF's page count,
@@ -1271,8 +1284,9 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `undefined`, never the one before it. Both records only ever refuse, and absent evidence adds
   nothing. The residuals are each only a missing refusal: a run killed before it closed leaves no
   engine record; LuaTeX's `stop_run`/`wrapup_run` callbacks run Lua after the engine's line; equal
-  timestamps on a coarse filesystem with a closing record that agrees; and timestamps were
-  measured on Linux ext4 only. `pdf_geometry` floats notes the state, without refusing.
+  timestamps on a coarse filesystem with a closing record that agrees; the `.aux` and the PDF
+  stamped by two skewed clocks (the one residual that can also refuse a finished build — a
+  refusal, never a wrong page); and timestamps were measured on Linux ext4 only. `pdf_geometry` floats notes the state, without refusing.
   **Behind both routes, the `.log`'s shipout marks** (`[<\count0>…]`, one per page shipped;
   `readShipoutMarks`, `AuxFloatsResult.shipouts`, read only when a label lookup or `pdf_geometry`'s
   floats asks — the latter for its notes, never to refuse) refuse a

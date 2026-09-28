@@ -262,7 +262,7 @@
  *     feature exists to prevent.
  */
 
-import type { AuxFloatsResult, AuxLabel, EngineOutput } from './auxFloats.js';
+import type { AuxFloatsResult, AuxLabel, BuildTimes, EngineOutput } from './auxFloats.js';
 import type { PdfRenderService } from '../services/pdfRender.js';
 
 /**
@@ -534,29 +534,47 @@ export interface LabelPagePlan {
 }
 
 /**
- * How much newer than the PDF the `.aux` may be before the two are taken for different runs.
- * Measured by hand with TeX Live 2026 under latexmk 4.88 on Linux (ext4) — no test reproduces
- * these numbers; `test/unit/stalePdf.test.ts` pins the decision against staged timestamps: every
- * finished build — pdflatex, lualatex and xelatex; a first build with a bibtex cycle and a rerun,
- * an up-to-date no-op, a comment-only edit, a body edit, a new label forcing a rerun, and a
- * recompile after a failure — left the `.aux` OLDER than the PDF (by 8 to 684 ms), since LaTeX
- * closes the `.aux` in `\enddocument` before the engine finishes the PDF and before xdvipdfmx
- * runs. Every build that left the earlier PDF beside a new `.aux` — xelatex stopped by a fatal
- * error in the body, shipping fewer pages or as many, and xelatex finishing with an ordinary error,
- * after which latexmk does not run xdvipdfmx — left it NEWER, by 852 to 984 ms with the two
- * compiles back to back. That gap cannot be shorter than the second run itself, from start-up to
- * the `.aux` it closes as it stops (a trivial xelatex document takes 0.5 s on the machine
- * measured). So the tolerance only has to absorb what is not the engine's order at all — a
- * filesystem's coarse timestamps, a clock tick, files a test stages by hand — and 250 ms sits
- * well clear of both measured ranges.
+ * How many milliseconds after the PDF the `.aux` was written, when it was written STRICTLY after
+ * it — the files' order that marks the PDF as an earlier run's — or `undefined` when the `.aux` is
+ * as old as the PDF or older. There is deliberately no tolerance.
+ *
+ * A finished build closes its `.aux` before the PDF is finished: LaTeX closes it in
+ * `\enddocument`, before pdfTeX and LuaTeX finish the PDF and before latexmk runs xdvipdfmx over
+ * XeTeX's `.xdv`. Measured by hand with TeX Live 2026 under latexmk 4.88 on Linux (ext4) — no
+ * test reproduces these numbers; `test/unit/stalePdf.test.ts` pins the decision against staged
+ * timestamps — every finished build (pdflatex, lualatex and xelatex; a first build with a bibtex
+ * cycle and a rerun, an up-to-date no-op, a comment-only edit, a body edit, a new label forcing a
+ * rerun, and a recompile after a failure) left the `.aux` OLDER than the PDF, by 8 to 684 ms.
+ *
+ * The gap on the other side has no floor. A build that leaves the earlier PDF beside a new `.aux`
+ * — xelatex stopped by an error in the body, or finishing with an ordinary one, after which
+ * latexmk does not run xdvipdfmx — measured 852 to 984 ms newer back to back on the machine
+ * measured (456 ms for the stopped run on a later rerun there). A 250 ms tolerance was set on the
+ * reasoning that the gap could not be shorter than the second run itself. That was false: on a
+ * fast CI runner (PR #229, the "LaTeX compile smoke" job) the stopped xelatex run of a document
+ * that stops early closed its `.aux` less than 250 ms after the earlier run's PDF, and the
+ * tolerance swallowed it. There the closing record still refused, but a stopped run that ships as
+ * many pages as the old PDF has only this signal, so the tolerance would have resolved a label to
+ * the wrong page.
+ *
+ * Equal is not newer. A filesystem's coarse or truncated timestamps are a non-decreasing function
+ * of the write time: they can make the two times EQUAL, never reverse them, so an equal pair costs
+ * at most a missed refusal — the safe direction on such a filesystem, where the engine's closing
+ * record ({@link staleBuildEvidence}) is still read. The one thing the tolerance ever absorbed was
+ * test helpers writing the PDF before the `.aux`; those back-date the `.aux` instead. The
+ * remaining assumption is that one clock stamps both files — true on a local disk, and for files
+ * one client writes to one NFS server, which stamps both itself.
  */
-export const STALE_PDF_TOLERANCE_MS = 250;
+export function auxNewerThanPdfMs(times: BuildTimes): number | undefined {
+  const newer = times.auxMs - times.pdfMs;
+  return newer > 0 ? newer : undefined;
+}
 
 /**
  * What a build's records show against the PDF a lookup would use — each field present only when
  * it shows that PDF is not the output of the last compile:
- *  - `auxNewerByMs` — the `.aux` was written this many milliseconds after the PDF, past
- *    {@link STALE_PDF_TOLERANCE_MS};
+ *  - `auxNewerByMs` — the `.aux` was written this many milliseconds after the PDF (strictly
+ *    after it, {@link auxNewerThanPdfMs}), rounded;
  *  - `logOutput` — the engine's closing record in the `.log` (`AuxFloatsResult.engineOutput`),
  *    when it names a page count other than the PDF's, or says the run produced no output while
  *    the PDF has pages.
@@ -576,8 +594,8 @@ export interface StalePdfEvidence {
  *
  *  - **The files' order** (`aux.buildTimes`). A finished compile writes its `.aux` before its PDF
  *    (LaTeX closes the `.aux` in `\enddocument`; pdfTeX and LuaTeX finish the PDF after that, and
- *    latexmk runs xdvipdfmx over XeTeX's `.xdv` after that). An `.aux` newer than the PDF, past
- *    {@link STALE_PDF_TOLERANCE_MS}, is a later run's that never produced a PDF. The case this
+ *    latexmk runs xdvipdfmx over XeTeX's `.xdv` after that). An `.aux` strictly newer than the
+ *    PDF ({@link auxNewerThanPdfMs}) is a later run's that never produced a PDF. The case this
  *    exists for (#220): xelatex stopped by an error in the BODY writes a new `.aux` and `.log`,
  *    and xdvipdfmx never runs, so the earlier run's PDF stays — and the shipout marks number
  *    what the new run shipped, which may be as many pages as the old PDF has. The document cannot
@@ -603,11 +621,8 @@ export function staleBuildEvidence(
   pdf: { pageCount?: number; hasPages: boolean },
 ): StalePdfEvidence | undefined {
   const evidence: StalePdfEvidence = {};
-  const times = aux.buildTimes;
-  if (times) {
-    const newer = times.auxMs - times.pdfMs;
-    if (newer > STALE_PDF_TOLERANCE_MS) evidence.auxNewerByMs = Math.round(newer);
-  }
+  const newer = aux.buildTimes ? auxNewerThanPdfMs(aux.buildTimes) : undefined;
+  if (newer !== undefined) evidence.auxNewerByMs = Math.round(newer);
   const out = aux.engineOutput;
   if (out) {
     const disagrees =
@@ -1884,7 +1899,7 @@ export function staleRecordsText(evidence: StalePdfEvidence | undefined): string
   const parts: string[] = [];
   if (evidence?.auxNewerByMs !== undefined) {
     parts.push(
-      `the .aux was written ${(evidence.auxNewerByMs / 1000).toFixed(1)} s after the PDF, while ` +
+      `the .aux was written ${gapText(evidence.auxNewerByMs)} after the PDF, while ` +
         'a compile that finishes writes its .aux before its PDF',
     );
   }
@@ -1906,6 +1921,13 @@ export function staleRecordsText(evidence: StalePdfEvidence | undefined): string
     );
   }
   return parts.length > 0 ? parts.join('; and ') : "the build's records disagree with the PDF";
+}
+
+/** A gap between two file times, as the refusal names it: seconds to one decimal from a second
+ *  up, milliseconds below — a gap the check fired on is never printed as "0.0 s". */
+function gapText(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`;
+  return ms < 1 ? 'less than 1 ms' : `${ms} ms`;
 }
 
 /** The closing pointer of every refusal that refuses a whole build: the one page a caller can
