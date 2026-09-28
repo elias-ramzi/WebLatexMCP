@@ -152,7 +152,8 @@ jobs:
       # (404 on ghostscript, a texlive-binaries dependency). Refresh the lists first.
       - name: Refresh apt package lists
         run: sudo apt-get update
-      # TeX Live + latexmk via apt (no bibtex/biber is needed). texlive-pictures brings pgf:
+      # TeX Live + latexmk via apt (bibtex, not biber: the overlay smoke's bibliography falls back
+      # to bibtex when biber is absent). texlive-pictures brings pgf:
       # beamer cannot load without pgfmath, and the label smokes compile pgfpages layouts. Without
       # it those smokes fail to compile rather than skip, which is the point: they are the
       # real-compile evidence for the label checks. texlive-xetex brings xelatex, which one label
@@ -171,11 +172,18 @@ jobs:
       # intermittently (a cache miss installs cleanly and passes; a hit does not). Recreate them so
       # a cache hit matches a fresh install: the filename database (mktexlsr), the font maps
       # (updmap-sys), and — the one that caused the flaky *first* compile — the format files
-      # (fmtutil-sys), which are built at install time and never shipped in the .debs.
+      # (fmtutil-sys), which are built at install time and never shipped in the .debs. And
+      # `/usr/bin/bibtex` itself: texlive-binaries ships only `bibtex.original` and its post-install
+      # makes the command an update-alternatives link, so a cache hit has no `bibtex` and latexmk
+      # stops at the bibliography step with no .blg.
       - name: Refresh TeX Live databases
         run: |
           sudo mktexlsr
           sudo updmap-sys
           sudo fmtutil-sys --all
+          if ! command -v bibtex >/dev/null; then
+            sudo update-alternatives --install /usr/bin/bibtex bibtex /usr/bin/bibtex.original 100
+          fi
+          bibtex --version | head -1
       - run: npm ci
       - run: npm run test:smoke
