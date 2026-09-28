@@ -519,19 +519,11 @@
   grid-template-columns: 1fr 1.25fr;
 }
 
-.figure-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 0.8em;
-}
-
-.figure-row .shot {
-  height: 190px;
+/* The taller figure, as large as the space under the wide one allows. */
+.figure-second {
+  height: 300px;
   width: auto;
-}
-
-.figure-row .caption {
-  margin: 0 !important;
+  margin: 0 auto !important;
 }
 
 /* ---------- closing slide, on the navy background ---------- */
