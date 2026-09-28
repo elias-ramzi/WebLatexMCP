@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
-import { climbsOut, toPosix } from '../lib/paths.js';
+import { climbsOut } from '../lib/paths.js';
 
 /**
  * Maps a point on a compiled PDF back to its source `file:line` via the `synctex` CLI (ships with
@@ -45,12 +45,24 @@ export function parseSyncTexEdit(stdout: string, projectDir: string): SyncTexLoc
   return { file: normalizeInput(file, projectDir), line };
 }
 
-/** Normalize a synctex `Input:` path to a clean, project-relative POSIX path. */
-function normalizeInput(input: string, projectDir: string): string {
-  const abs = path.isAbsolute(input) ? path.normalize(input) : path.resolve(projectDir, input);
-  const rel = path.relative(projectDir, abs);
-  // Inside the project → relative path; otherwise fall back to the basename.
-  return toPosix(rel && !climbsOut(rel) ? rel : path.basename(input));
+/** The slice of `node:path` {@link normalizeInput} uses, injectable so win32 rules test anywhere. */
+export type PathRules = Pick<
+  typeof path,
+  'isAbsolute' | 'normalize' | 'resolve' | 'relative' | 'basename' | 'sep'
+>;
+
+/**
+ * Normalize a synctex `Input:` path to a clean, project-relative POSIX path.
+ *
+ * Exported only so the win32 branch can be tested on any host (`rules` = `path.win32`).
+ */
+export function normalizeInput(input: string, projectDir: string, rules: PathRules = path): string {
+  const abs = rules.isAbsolute(input) ? rules.normalize(input) : rules.resolve(projectDir, input);
+  const native = rules.relative(projectDir, abs);
+  const rel = native.split(rules.sep).join('/');
+  // Inside the project → relative path; otherwise fall back to the basename. On Windows an input
+  // on another drive has no relative form, and `relative` hands back the absolute `D:\…` itself.
+  return rel && !climbsOut(rel) && !rules.isAbsolute(native) ? rel : rules.basename(input);
 }
 
 export class SyncTexService {

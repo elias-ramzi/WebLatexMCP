@@ -18,7 +18,7 @@
 
 import type { Dirent } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, open, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { lstat, open, readdir, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { buildAuxPath, buildAuxPathIn } from '../services/compiler.js';
 import { MAX_READ_BYTES } from '../services/fileService.js';
@@ -887,6 +887,12 @@ export interface AuxFloatsResult {
    *  rewrote without producing a PDF ({@link readBuildTimes}); `labelPages.ts` uses it only to
    *  REFUSE (`'stalePdf'`). Never spread into a tool's `structuredContent`. */
   buildTimes?: BuildTimes;
+  /** The `pdfPath` the caller named (`readAuxFloats(…, { pdfPath })`), whether or not it could be
+   *  stat'd: the PDF this index was read to be paired with. `resolveLabelPages` refuses to run
+   *  when it is not the PDF its reader opens, so a label lookup that forgets to name the PDF — and
+   *  with it the `buildTimes` check — fails loudly instead of silently skipping that check. Never
+   *  spread into a tool's `structuredContent`. */
+  pairedPdf?: string;
   /** Present when no `.aux` was found in the build directory, or when the root `.aux` inputs
    *  (`\@input`, which `\include` writes) a file that could not be read — so the index may be
    *  missing that chapter's labels. Absent otherwise. */
@@ -1567,12 +1573,12 @@ const OUTPUT_EXT = /\.(pdf|xdv|dvi)$/i;
  * `undefined` when there is none.
  *
  * The engine writes this record itself as it terminates (`close_files_and_terminate`), after
- * everything the document could have written, and a pdfTeX or XeTeX document has no way to run
- * code after that point. So a document that `\typeout`s a record of the same shape only ever
- * writes it BEFORE the real one, and the last one is the engine's — including in a run that
- * stopped on a fatal error, whose closing record says so (`\message{[1]}` and a forged
- * `Output written on main.pdf (3 pages …)` in a preamble that then fails still end in
- * "no output", real pdflatex, xelatex and lualatex logs).
+ * everything the document could have written, and a pdfTeX or XeTeX document compiled without
+ * shell escape has no way to run code after that point. So a document that `\typeout`s a record
+ * of the same shape only ever writes it BEFORE the real one, and the last one is the engine's —
+ * including in a run that stopped on a fatal error, whose closing record says so
+ * (`\message{[1]}` and a forged `Output written on main.pdf (3 pages …)` in a preamble that then
+ * fails still end in "no output", real pdflatex, xelatex and lualatex logs).
  *
  * The records are searched for in the log with EVERY line break removed, not line by line, for
  * that reason: TeX wraps the log at 79 columns, and the engine's record can be glued onto the line
@@ -1582,11 +1588,19 @@ const OUTPUT_EXT = /\.(pdf|xdv|dvi)$/i;
  * forged line before it became "the last". A record found last whose count cannot be read gives
  * `undefined` — never the one before it.
  *
- * Two residuals, both only ever the absence of a refusal the record would have added: a run killed
- * before it closed (a timeout) leaves no engine record, so a forged one can then be the last; and
- * LuaTeX runs Lua after that point (the `stop_run`/`wrapup_run` callbacks), where a document can
- * write anything. And one that can misread the count: a file name that itself holds
- * `(<n> pages, <b> bytes).`. What the record is used for bounds all three: it can only REFUSE a
+ * A closing-record marker that falls INSIDE the last written record's match is part of its file
+ * name, not a record of its own — the build directory embeds the project directory's name, so a
+ * project called `No pages of output. draft` writes that marker into the engine's own
+ * `Output written on <path>` — and the written record stands.
+ *
+ * Three residuals, each only ever the absence of a refusal the record would have added: a run
+ * killed before it closed (a timeout) leaves no engine record, so a forged one can then be the
+ * last; LuaTeX runs Lua after that point (the `stop_run`/`wrapup_run` callbacks), where a document
+ * can write anything; and with shell escape on, a command the document starts can outlive the
+ * engine and append to the log after it closed. A missing refusal is not a harmless one — the
+ * lookup then answers as it did before this record was read, which for #220 was the wrong page.
+ * And one residual that can misread the count: a file name that itself holds
+ * `(<n> pages, <b> bytes).`. What the record is used for bounds all of them: it can only REFUSE a
  * label (`labelPages.ts`, `'stalePdf'`), never resolve one.
  */
 export function parseEngineOutput(log: string): EngineOutput | undefined {
@@ -1596,9 +1610,16 @@ export function parseEngineOutput(log: string): EngineOutput | undefined {
   const noPdf = text.lastIndexOf(FATAL_NO_PDF_MARKER);
   const last = Math.max(written, noPages, noPdf);
   if (last < 0) return undefined;
-  if (last === noPages) return { kind: 'noPages' };
-  if (last === noPdf) return { kind: 'noPdf' };
-  const m = OUTPUT_WRITTEN.exec(text.slice(written, written + OUTPUT_WRITTEN_SPAN));
+  const m =
+    written >= 0 ? OUTPUT_WRITTEN.exec(text.slice(written, written + OUTPUT_WRITTEN_SPAN)) : null;
+  // A marker INSIDE the last written record is part of its file name, not a record of its own:
+  // the build directory embeds the project directory's name, and a project called
+  // "No pages of output. draft" puts that text in the engine's own `Output written on <path>`.
+  // Only a marker past the end of that record's match is a later word — and every other marker
+  // falls in the record when the last one does, since it is the last.
+  const insideWritten = m !== null && last < written + m[0].length;
+  if (!insideWritten && last === noPages) return { kind: 'noPages' };
+  if (!insideWritten && last === noPdf) return { kind: 'noPdf' };
   if (!m) return undefined;
   const ext = OUTPUT_EXT.exec(m[1] ?? '')?.[0]?.toLowerCase();
   return { kind: 'written', pages: Number(m[2]), ...(ext ? { ext } : {}) };
@@ -1606,22 +1627,30 @@ export function parseEngineOutput(log: string): EngineOutput | undefined {
 
 /**
  * The modification times of `auxPath` and `pdfPath` ({@link BuildTimes}), or `undefined` when
- * either cannot be stat'd — no evidence either way, since what they are used for can only add a
- * refusal (`labelPages.ts`, `'stalePdf'`).
+ * either cannot be `lstat`'d or is not a regular file — a symbolic link is judged as itself, never
+ * by what it points at, as {@link readWholeBuildLog} judges the `.log`. No evidence either way,
+ * since what they are used for can only add a refusal (`labelPages.ts`, `'stalePdf'`).
  *
  * The engine writes both files, and the order is fixed for a run that finishes: LaTeX closes the
  * `.aux` in `\enddocument`, before pdfTeX and LuaTeX finish the PDF and before latexmk runs
  * xdvipdfmx over XeTeX's `.xdv`. A run that rewrote the `.aux` and then stopped without a PDF —
  * XeTeX on an error in the body, whose `.xdv` xdvipdfmx is then never run over — leaves the
- * EARLIER run's PDF beside a newer `.aux`. A document cannot set a file's time; it can only write
- * a file, and writing the PDF would make that file the document's own output anyway.
+ * EARLIER run's PDF beside a newer `.aux`.
+ *
+ * A pdfTeX or XeTeX document compiled without shell escape cannot set a file's time: it can only
+ * write a file, and writing the PDF would make that file the document's own output anyway. That
+ * is not true of every build. A LuaTeX document can (`\directlua{lfs.touch(…)}` ran under
+ * `-no-shell-escape` with TeX Live 2026 lualatex), and with shell escape on any engine's document
+ * can, so such a build can back-date its `.aux` past the PDF. That only ever removes a refusal
+ * this signal would have added: the lookup then answers as it did before the check existed.
  */
 export async function readBuildTimes(
   auxPath: string,
   pdfPath: string,
 ): Promise<BuildTimes | undefined> {
   try {
-    const [aux, pdf] = await Promise.all([stat(auxPath), stat(pdfPath)]);
+    const [aux, pdf] = await Promise.all([lstat(auxPath), lstat(pdfPath)]);
+    if (!aux.isFile() || !pdf.isFile()) return undefined;
     return { auxMs: aux.mtimeMs, pdfMs: pdf.mtimeMs };
   } catch {
     return undefined;
@@ -1639,7 +1668,8 @@ export async function readBuildTimes(
  * engine's closing output record into `engineOutput` ({@link parseEngineOutput}) — for a label
  * lookup, which checks its resolved pages against them, and for `pdf_geometry`'s floats notes.
  * `pdfPath` names the PDF the caller will pair with this `.aux`, and stats both into `buildTimes`
- * ({@link readBuildTimes}).
+ * ({@link readBuildTimes}); it is recorded as `pairedPdf`, and a label lookup
+ * (`resolveLabelPages`) refuses an index that was not read with the PDF it opens.
  */
 export async function readAuxFloats(
   projectDir: string,
@@ -1654,6 +1684,7 @@ export async function readAuxFloats(
     opts?.buildDir !== undefined
       ? buildAuxPathIn(opts.buildDir, rootFile)
       : buildAuxPath(projectDir, rootFile);
+  const paired = opts?.pdfPath !== undefined ? { pairedPdf: opts.pdfPath } : {};
 
   let auxContent: string;
   try {
@@ -1669,6 +1700,7 @@ export async function readAuxFloats(
         indeterminate: 0,
         unreadInputs: 0,
         beamerNav: false,
+        ...paired,
         note:
           `No .aux found in the build directory (${toPosix(auxPath)}) — nothing has been ` +
           'compiled with this root file yet, or the compile backend in use did not write one.',
@@ -1737,6 +1769,7 @@ export async function readAuxFloats(
     ...(shipouts === undefined ? {} : { shipouts }),
     ...(engineOutput === undefined ? {} : { engineOutput }),
     ...(buildTimes === undefined ? {} : { buildTimes }),
+    ...paired,
     ...(note === undefined ? {} : { note }),
   };
 }

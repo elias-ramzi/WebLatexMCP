@@ -90,7 +90,7 @@ describe.skipIf(process.platform === 'win32')('compile overlay: planted build ro
     expect(res.isError).toBe(true);
     const text = JSON.stringify(res.content);
     // The build-root refusal, not the overlay's own "not found": the root was judged first.
-    expect(text).toContain('Refusing to build in');
+    expect(text).toContain('Refusing to use build root');
     expect(text).toContain('symbolic link');
     expect(text).not.toMatch(/not found/i);
     expect(ran).toBe(0);

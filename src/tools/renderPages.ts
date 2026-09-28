@@ -333,7 +333,8 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           if (labels) {
             // `pdfPath`: the PDF this lookup pairs with the .aux, whose timestamps are compared
             // (a finished compile writes the .aux first) — so a build that stopped after
-            // rewriting the .aux is refused rather than looked up in the earlier run's PDF.
+            // rewriting the .aux is refused rather than looked up in the earlier run's PDF. It
+            // must be the PDF the reader below opens: resolveLabelPages throws otherwise.
             const aux = await readAuxFloats(dir, root, {
               max: LABEL_LOOKUP_MAX,
               shipouts: true,

@@ -1,12 +1,18 @@
 import os from 'node:os';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { chmod, lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, realpath, stat, unlink } from 'node:fs/promises';
 import { execCapture } from '../lib/exec.js';
 import type { ExecResult } from '../lib/exec.js';
 import type { CompilerKind } from '../types.js';
-import { toPosix } from '../lib/paths.js';
-import { luatexCommandRefused, needsShellEscape, shellCommandRefused } from './logParser.js';
+import { climbsOut, toPosix } from '../lib/paths.js';
+import {
+  engineShellEscapeBanner,
+  logShowsShellEscapeBanner,
+  needsShellEscape,
+  refusedShellCommands,
+  shellEscapeRestrictedInEffect,
+} from './logParser.js';
 
 export type Engine = 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -185,37 +191,84 @@ export function engineNotFoundHint(
  * brings it back and what flipping it costs. One hint for every compile; an overlay compile gets
  * the overlay's own wording, since there the cost is the source itself.
  *
- * Gated on the caller NOT having opted in (then the flag was theirs and they know). For a normal
- * compile it stays quiet when the TikZ-externalization hint already covers the same refusal
- * (`needsShellEscape`), so one cause does not get two retry instructions; an overlay compile says
- * it either way, because its version carries the one thing the TikZ hint does not — that opting in
- * lets the command write the source through the variant's links. Fixed server text: nothing from
- * the document-controlled log is echoed.
+ * Gated on the caller NOT having opted in (then the flag was theirs and they know). Which
+ * commands were refused comes from the engine's refusal records ({@link refusedShellCommands}),
+ * split into engine calls (`pdflatex …`, what TikZ externalization runs) and everything else
+ * (repstopdf, makeindex, …). A refused command that is NOT an engine call always gets this hint,
+ * with the `restrictedShellEscape` advice the allow-list may honour — whatever pgf's TikZ message
+ * says, since that message is one `\typeout` away from any document: it may add the TikZ hint
+ * beside this one, never suppress this one or move its advice to the more powerful flag. When the
+ * only refused commands are engine calls, the advice is `shellEscape: true`, since no allow-list
+ * holds an engine; when both kinds were refused it names both, so no added record can drop the
+ * flag a genuine refusal needs; and a normal compile then stays quiet when the TikZ-externalization hint is
+ * given (`needsShellEscape`), which names the same flag and the same cost, so one cause does not
+ * get two retry instructions. An overlay compile says it either way (and for a TikZ failure with
+ * no refusal record), because its version carries the one thing the TikZ hint does not — that
+ * opting in lets the command write the source through the variant's links. Fixed server text:
+ * nothing from the document-controlled log is echoed.
+ *
+ * When restricted shell escape was already in effect for the run ({@link
+ * shellEscapeRestrictedInEffect}: the restricted banner in the log's HEADER — here always a
+ * latexmkrc's doing, since the caller did not opt in), the refused command is one TeX's allow-list
+ * does not hold, and `restrictedShellEscape: true` would run nothing new: the hint then names only
+ * `shellEscape: true`, with its own cost. Whether restricted mode was on is decided on evidence
+ * the document cannot write — the header banner, never a `runsystem(…)...disabled (restricted).`
+ * line, which `\typeout` can forge. And when that header shows FULL shell escape
+ * ({@link engineShellEscapeBanner} `'full'`), there is no hint at all: full shell escape refuses
+ * nothing, so any refusal line in the log was written by the document.
  */
 export function shellEscapeRefusedHint(
   log: string,
   opts: { shellEscapeOn: boolean; overlay: boolean; backend: CompilerKind },
 ): string | undefined {
   if (opts.shellEscapeOn) return undefined;
-  const refused = shellCommandRefused(log) || luatexCommandRefused(log);
+  // Full shell escape refuses nothing: under the engine's own full banner, a refusal record is the
+  // document's `\typeout`, and advice to retry with a lesser flag would answer a refusal that
+  // never happened.
+  if (engineShellEscapeBanner(log) === 'full') return undefined;
+  const refused = refusedShellCommands(log);
+  // A refused command that is not an engine call: the allow-list may hold it. Decided from the
+  // refusal records alone, so a TikZ line (document-writable) can neither suppress this hint nor
+  // move its advice to the more powerful flag.
+  const nonEngine = refused.other > 0;
+  const engineOnly = !nonEngine && refused.engine > 0;
   const tikz = needsShellEscape(log);
-  if (opts.overlay ? !(refused || tikz) : !refused || tikz) return undefined;
+  if (!nonEngine) {
+    // Only engine calls refused, or none: a normal compile leaves a TikZ failure to the TikZ hint,
+    // which names the same flag and cost; an overlay compile still says what opting in costs.
+    if (opts.overlay ? !(engineOnly || tikz) : !engineOnly || tikz) return undefined;
+  }
+  const restricted = opts.backend !== 'tectonic' && shellEscapeRestrictedInEffect(log);
   const retry =
     opts.backend === 'tectonic'
       ? 'shellEscape: true (tectonic has no restricted mode, so restrictedShellEscape does not ' +
         'run it)'
-      : 'restrictedShellEscape: true (or shellEscape: true)';
+      : restricted
+        ? `shellEscape: true (${RESTRICTED_ALREADY_ON})`
+        : nonEngine
+          ? refused.engine > 0
+            ? `restrictedShellEscape: true (or shellEscape: true, which the refused engine call ` +
+              `among them needs: ${ENGINE_NOT_ON_ALLOW_LIST})`
+            : 'restrictedShellEscape: true (or shellEscape: true)'
+          : engineOnly
+            ? `shellEscape: true (${ENGINE_NOT_ON_ALLOW_LIST})`
+            : `shellEscape: true (${TIKZ_NOT_ON_ALLOW_LIST})`;
   if (opts.overlay) {
     return (
-      'This overlay compile refused a shell command the document ran (\\write18): an ' +
-      'overlay compile disables shell escape — as every compile does unless you opt in — to ' +
-      "keep the source untouched, since the variant's files are links to it. So this variant " +
-      `can differ from a build with shell escape on. Retrying with ${retry} runs it, but lifts ` +
-      'that guarantee: the command can then write the source through those links.'
+      'This overlay compile refused a shell command the document ran (\\write18): ' +
+      (restricted
+        ? "shell escape was restricted to TeX's allow-list for this run, which does not hold " +
+          'that command (an overlay compile otherwise disables shell escape, to keep the ' +
+          "source untouched, since the variant's files are links to it). "
+        : 'an overlay compile disables shell escape — as every compile does unless you opt in ' +
+          "— to keep the source untouched, since the variant's files are links to it. ") +
+      `So this variant can differ from a build with shell escape on. Retrying with ${retry} ` +
+      'runs it, but lifts that guarantee: the command can then write the source through those ' +
+      'links.'
     );
   }
   const cost =
-    opts.backend === 'tectonic'
+    opts.backend === 'tectonic' || restricted || !nonEngine
       ? 'What that costs: the document can then run ARBITRARY shell commands — only for a ' +
         'project you trust.'
       : "What that costs: TeX's allow-listed helpers (repstopdf, makeindex, extractbb, …) then " +
@@ -223,9 +276,122 @@ export function shellEscapeRefusedHint(
         'source file. shellEscape: true runs ARBITRARY commands; only for a project you trust.';
   return (
     'The engine refused a shell command the document ran (\\write18) — typically repstopdf ' +
-    'converting an .eps figure, or makeindex: compile runs no shell command unless you opt in, ' +
-    "not even TeX's restricted allow-list, so whatever that command would have produced is " +
-    `missing from this build. Retry with ${retry} if the document needs it. ${cost}`
+    'converting an .eps figure, or makeindex: ' +
+    (restricted
+      ? "shell escape was restricted to TeX's allow-list for this run, and the command is not on " +
+        'it, so whatever it would have produced is missing from this build. '
+      : "compile runs no shell command unless you opt in, not even TeX's restricted allow-list, " +
+        'so whatever that command would have produced is missing from this build. ') +
+    `Retry with ${retry} if the document needs it. ${cost}`
+  );
+}
+
+/**
+ * Why `restrictedShellEscape: true` is not offered when restricted mode was already on: the
+ * caller did not opt in, so a latexmkrc turned it on, and the refused command is not on the list.
+ */
+const RESTRICTED_ALREADY_ON =
+  "this run already had TeX's restricted allow-list on — a latexmkrc turned it on — and the " +
+  'command is not on it, so restrictedShellEscape: true would not run it';
+
+/**
+ * Why `restrictedShellEscape: true` is never offered for TikZ externalization: it runs the engine
+ * itself (`pdflatex -halt-on-error … -jobname …`), and TeX Live's allow-list
+ * (`kpsewhich -var-value shell_escape_commands`: bibtex, extractbb, kpsewhich, makeindex,
+ * repstopdf, …) holds no engine, so restricted mode refuses every externalization call.
+ */
+const TIKZ_NOT_ON_ALLOW_LIST =
+  "TeX's restricted allow-list never holds the engine call TikZ externalization makes, so " +
+  'restrictedShellEscape does not run it';
+
+/**
+ * Why `restrictedShellEscape: true` does not run a refused engine call — the whole retry when
+ * every refused command ran an engine, and the reason `shellEscape` is named beside it otherwise.
+ */
+const ENGINE_NOT_ON_ALLOW_LIST =
+  "TeX's restricted allow-list never holds a TeX engine, so restrictedShellEscape does not run " +
+  'an engine call';
+
+/**
+ * The compile hint for a TikZ-externalizing document whose system calls were blocked
+ * ({@link needsShellEscape}), or `undefined` when there is nothing to say (the caller opted in, or
+ * the log shows no such failure). It names `shellEscape: true` only, with its cost: tectonic has
+ * no restricted mode, and under latexmk restricted shell escape never runs externalization's
+ * engine call ({@link TIKZ_NOT_ON_ALLOW_LIST}) — whether or not a latexmkrc already turned it on,
+ * so the advice depends on no line of the document-writable log beyond the failure itself. That
+ * failure line is pgf's own message, which a document can `\typeout`: it is allowed to drive this
+ * hint only because the hint merely ADDS advice — it suppresses no other hint and moves no other
+ * hint's flag ({@link shellEscapeRefusedHint}). Under the engine's FULL header banner
+ * ({@link engineShellEscapeBanner} `'full'`) it says nothing, as the refusal hint says nothing:
+ * shell escape was on, so pgf's message (printed whenever the figure's file is missing) names no
+ * cause a retry would fix. Fixed server text: nothing from the log is echoed.
+ */
+export function tikzShellEscapeHint(
+  log: string,
+  opts: { shellEscapeOn: boolean; backend: CompilerKind },
+): string | undefined {
+  if (opts.shellEscapeOn || !needsShellEscape(log)) return undefined;
+  if (engineShellEscapeBanner(log) === 'full') return undefined;
+  return (
+    'This document uses TikZ externalization, which compiles each figure by running the engine ' +
+    'through a system call. Retry compile with shellEscape: true (' +
+    (opts.backend === 'tectonic'
+      ? 'tectonic has no restricted mode, so restrictedShellEscape does not run it'
+      : TIKZ_NOT_ON_ALLOW_LIST) +
+    '). What that costs: the document can then run ARBITRARY shell commands — only enable it ' +
+    'for a project you trust.'
+  );
+}
+
+/**
+ * The compile hint for a compile whose caller left shell escape off while the engine's log shows
+ * it on ({@link engineShellEscapeBanner}) — or `undefined` when there is nothing to say. latexmk
+ * hands `-no-shell-escape` to the engine only through `%O`, so a latexmkrc (the project's, or a
+ * user or system one) of `$pdflatex = 'pdflatex %O -shell-escape %S'`, or one with no `%O`, turns
+ * it back on, and the document's shell commands can then run on a compile whose caller was told
+ * none would. Said on every compile, not only in a variant's line: the surprise is the same.
+ * Tectonic reads no latexmkrc and prints no banner, so a banner in its log is not a latexmkrc's
+ * doing and gets no claim that it was.
+ *
+ * Both whether to warn and how much risk to name are read from the log's HEADER alone
+ * ({@link engineShellEscapeBanner}), which the engine writes before it reads the document. Read
+ * anywhere, a banner the document `\typeout`s on a genuine `-no-shell-escape` run added a warning
+ * blaming a latexmkrc that does not exist; every run with shell escape genuinely on prints the
+ * banner in its header. And only the engine's own restricted banner narrows the risk to
+ * "allow-listed commands", so a forged restricted line under a genuine full override cannot
+ * understate it. A log whose header cannot be delimited — latexmk's captured output, when no
+ * engine `.log` was found — gets no warning, only, when a banner-shaped line stands anywhere in it
+ * ({@link logShowsShellEscapeBanner}), a hedged note that asserts nothing: the engine's real
+ * banner does appear there, but so could a document's `\typeout`, so the note says a latexmkrc
+ * MAY have turned shell escape on and names no risk it cannot back. Fixed server text: nothing
+ * from the log is echoed.
+ */
+export function shellEscapeOverriddenHint(
+  log: string,
+  opts: { shellEscapeOn: boolean; backend: CompilerKind },
+): string | undefined {
+  if (opts.shellEscapeOn || opts.backend === 'tectonic') return undefined;
+  const banner = engineShellEscapeBanner(log);
+  if (banner === undefined) {
+    return logShowsShellEscapeBanner(log)
+      ? 'Shell escape was requested off; the build output shows a shell-escape banner, but no ' +
+          'engine log confirms it (none with a readable header was found for this build): a ' +
+          "latexmkrc (the project's own, or a user or system one) may have turned shell escape " +
+          'on. Check the latexmkrc if that was not meant.'
+      : undefined;
+  }
+  if (banner === 'none') return undefined;
+  const restricted = banner === 'restricted';
+  return (
+    "Shell escape was requested off, but the engine's log shows it enabled" +
+    (restricted ? " (restricted to TeX's allow-list)" : '') +
+    ": a latexmkrc (the project's own, or a user or system one) overrode -no-shell-escape, so " +
+    "the document's " +
+    (restricted
+      ? 'allow-listed shell commands (repstopdf, makeindex, …) could run and write files in the ' +
+        'project directory.'
+      : 'shell commands could run — ARBITRARY ones.') +
+    ' Remove the override from the latexmkrc if that was not meant.'
   );
 }
 
@@ -339,7 +505,7 @@ export function buildDir(projectDir: string): string {
  *   server will accept it. The default `%LOCALAPPDATA%\Temp` is per user, and on it this is moot.
  *   Two accounts of the same name in different domains (a local `bob` and `CORP\bob`) also map to
  *   one name. When the user name cannot be read the name falls back to a fixed
- *   `web-latex-mcp-build-unknown-user`, and {@link ensureBuildRoot} refuses to use it, so nothing
+ *   `web-latex-mcp-build-unknown.user`, and {@link ensureBuildRoot} refuses to use it, so nothing
  *   is ever built or read there.
  *
  * A pure path function — it touches no disk, and never throws, so the farm skip lists and
@@ -408,16 +574,20 @@ const PRIVATE_ROOT_ADVICE =
   'The build directory root must be a real directory owned by the user running this server, ' +
   'with no access for anyone else, so no other local user can read or replace the build output ' +
   '(the PDF, .aux and .log the PDF tools read back). Remove it if it is yours to remove, or ' +
-  'point TMPDIR (TEMP on Windows) at a private directory, then compile again.';
+  'point TMPDIR (TEMP on Windows) at a private directory, then retry.';
 
-/** A build root that is not safe to build in; the message names the path and the reason. */
+/**
+ * A build root that is not safe to use; the message names the path and the reason. Worded for
+ * every caller, not only `compile`: `render_pages`, `extract_text`, `pdf_geometry` and the viewer
+ * read under the root and build nothing, so the message says "use", and the remedy says "retry".
+ */
 export class UnsafeBuildRootError extends Error {
   constructor(
     readonly root: string,
     readonly reason: string,
     advice: string = PRIVATE_ROOT_ADVICE,
   ) {
-    super(`Refusing to build in ${root}: ${reason}. ${advice}`);
+    super(`Refusing to use build root ${root}: ${reason}. ${advice}`);
     this.name = 'UnsafeBuildRootError';
   }
 }
@@ -510,7 +680,7 @@ export async function ensureBuildRoot(
         root,
         `the temp directory it goes in, ${parent}, ${code === 'ENOENT' ? 'does not exist' : 'is not a directory'}`,
         'The server never creates the temp directory itself. Point TMPDIR (TEMP on Windows) at ' +
-          'an existing directory, then compile again.',
+          'an existing directory, then retry.',
       );
     }
     if (code !== 'EEXIST') throw err;
@@ -563,14 +733,150 @@ export async function ensureBuildRoot(
   return root;
 }
 
+/** The refusal for an entry under the build root that is a link or not a directory. */
+function unusableBuildDirError(dir: string, isLink: boolean, cause?: unknown): Error {
+  return new Error(
+    `Refusing to use build directory ${dir}: it is ` +
+      (isLink ? 'a symbolic link (or junction)' : 'not a directory') +
+      ', so the build would go somewhere else. Remove it if it is yours to remove, then retry.',
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * Seams for tests: how the build root is judged ({@link ensureBuildRoot} unless given), so a test
+ * can count the judgements or remove the root between two of them.
+ */
+export interface BuildRootDeps {
+  ensureRoot?: (root: string) => Promise<unknown>;
+}
+
+/**
+ * Where `dir` stands relative to the build root `root`, under the path flavour `p` (the
+ * platform's, unless a test hands in `path.win32` or `path.posix`): the root itself; outside it
+ * (a caller's own directory, such as a test's temp dir); or below it, with every directory from
+ * the root's child down to `dir`, in creation order. Pure.
+ *
+ * The levels come from `p.dirname` — never from splitting on `p.sep`, which a name holding the
+ * other platform's separator (a POSIX `out\dir`, under a test's stubbed separator) cut into levels
+ * that are not there — and the walk stops at the root as `p.relative` compares it
+ * (case-insensitively on win32, as the root/outside decision did), so a differently-cased
+ * spelling of the root never walks on up to the drive.
+ */
+export function buildRootLevels(
+  root: string,
+  dir: string,
+  p: typeof path = path,
+):
+  | { kind: 'root' }
+  | { kind: 'outside'; abs: string }
+  | { kind: 'below'; abs: string; levels: string[] } {
+  const abs = p.resolve(dir);
+  const rel = p.relative(root, abs);
+  if (rel === '') return { kind: 'root' };
+  if (climbsOut(rel) || p.isAbsolute(rel)) return { kind: 'outside', abs };
+  const levels: string[] = [];
+  for (
+    let cur = abs;
+    p.relative(root, cur) !== '' && p.dirname(cur) !== cur;
+    cur = p.dirname(cur)
+  ) {
+    levels.unshift(cur);
+  }
+  return { kind: 'below', abs, levels };
+}
+
+/**
+ * Create `dir`, and every missing directory between it and the build root, for a directory the
+ * server owns under that root — WITHOUT a recursive mkdir, which would also recreate the root
+ * itself under the process umask (group-writable under umask 002), or build straight into another
+ * user's, had a /tmp cleaner removed it since the caller's {@link ensureBuildRoot}. What makes the
+ * directories a caller asks for below the root: the project's build dir (`outDirFor`),
+ * `render_pages`' PNG dir, and the variant farm dir, case probe and variant output dir
+ * (`src/lib/variants.ts`). Two makers apply its rules without calling it per directory:
+ * {@link mirrorSubdirs}, which judges the root once per mirror and falls back to this on an
+ * `ENOENT`, and the farm's `farmMkdir` (`src/lib/variants.ts`), a plain exclusive, non-recursive
+ * `mkdir` inside the `0700` farm dir this made, whose `EEXIST` is refused, never adopted.
+ *
+ * The residual: a root swapped for a link — or removed and recreated by another user as a plain
+ * directory we may write in — between a judgement and the mkdirs after it still gets every
+ * missing level made in the link's target, a chain of nested empty directories, before the
+ * re-judge refuses. Nothing is ever written into them; closing it would take an fd-relative
+ * `mkdirat`, which Node does not expose.
+ *
+ * The root is judged first ({@link ensureBuildRoot}: created `0700` if missing, refused if it is
+ * a link or not ours), since even a non-recursive mkdir of the first level follows a root that is
+ * a link. Each level is then made on its own (`0700`), an existing one kept only when it `lstat`s
+ * as a real directory, never a link. An `ENOENT` means the root (or a level just made) vanished,
+ * so the root is judged again — recreated `0700`, or refused — and the whole path retried once.
+ * The root is judged once more after the last level, and `dir` itself `lstat`ed again, so whatever
+ * the caller writes next follows a root that is still ours. A `dir` equal to the root is only
+ * {@link ensureBuildRoot}'s to make. A `dir` not under the build root (a caller's own, such as a
+ * test's temp dir) is made recursively, as asked, and judged no further.
+ */
+export async function mkdirUnderBuildRoot(dir: string, deps: BuildRootDeps = {}): Promise<void> {
+  const ensureRoot = deps.ensureRoot ?? ensureBuildRoot;
+  const root = buildRoot();
+  const where = buildRootLevels(root, dir);
+  if (where.kind === 'root') {
+    await ensureRoot(root);
+    return;
+  }
+  if (where.kind === 'outside') {
+    await mkdir(where.abs, { recursive: true });
+    return;
+  }
+  const { abs, levels } = where;
+  // Judged first as well, rather than trusting the caller to have: even a non-recursive mkdir of
+  // the first level follows a root that is a link, and would leave an entry in its target.
+  await ensureRoot(root);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      for (const cur of levels) {
+        try {
+          await mkdir(cur, { mode: 0o700 });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+          // Kept only as a real directory: a link there would take everything below elsewhere.
+          const st = await lstat(cur);
+          if (st.isSymbolicLink() || !st.isDirectory()) {
+            throw unusableBuildDirError(cur, st.isSymbolicLink(), err);
+          }
+        }
+      }
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || attempt > 0) throw err;
+      // The root went away after the check: make it again the verified way, then retry once.
+      await ensureRoot(root);
+    }
+  }
+  // Judged again now that the dir exists: a root recreated or replaced in the meantime is refused
+  // (or, recreated merely readable by others, tightened) before anything is built in it.
+  await ensureRoot(root);
+  const st = await lstat(abs);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw unusableBuildDirError(abs, st.isSymbolicLink());
+  }
+}
+
 /**
  * The build dir a request writes to — its `outDir`, else the project's — created if missing,
  * after the build root it lives under has been created or verified ({@link ensureBuildRoot}).
+ *
+ * The root is judged BEFORE the mkdir, so what the mkdir may do in between counts: a
+ * `mkdir(dir, { recursive: true })` recreated a root removed after the check (a /tmp cleaner)
+ * under the process umask — group-writable under umask 002 — and followed a link planted there.
+ * So the dir is made by {@link mkdirUnderBuildRoot}, which judges the root first, makes each level
+ * under it on its own and judges the root again after — an overlay's deeper `<variant>/out`
+ * included. A caller-given `outDir` outside the build root (a test's) is made recursively.
  */
-async function outDirFor(req: CompileRequest): Promise<string> {
-  await ensureBuildRoot();
+export async function outDirFor(req: CompileRequest, deps: BuildRootDeps = {}): Promise<string> {
+  // Every compile judges the root, whatever its `outDir`: one outside the root still builds only
+  // on a machine whose root is sound.
+  await (deps.ensureRoot ?? ensureBuildRoot)(buildRoot());
   const dir = req.outDir ?? buildDir(req.projectDir);
-  await mkdir(dir, { recursive: true });
+  await mkdirUnderBuildRoot(dir, deps);
   return dir;
 }
 
@@ -586,14 +892,78 @@ function workDirFor(req: CompileRequest): string {
  * `.dpth`, `.pdf`). Those subdirectories exist in the source but not in the fresh build dir, so
  * the write fails with "I can't write on file". Recreating every source subdirectory is the
  * simple, robust fix — no preamble parsing, no special-casing `imgs`. `.git` is skipped.
+ *
+ * Never a recursive mkdir, with the safety of {@link mkdirUnderBuildRoot} but not its cost per
+ * directory (two root judgements and a walk from the root each — several times slower on a
+ * project of 2000 directories): the build root is judged ONCE ({@link ensureBuildRoot}), then `buildDir`'s
+ * levels and every mirrored directory are made one at a time, parents before children, each by a
+ * non-recursive `mkdir` (`0700`), an existing one kept only when it `lstat`s as a real directory,
+ * never a link — so every parent a `mkdir` resolves through was itself made or verified by this
+ * walk. An `ENOENT` means the root (or a level) vanished mid-walk: that directory is then made by
+ * {@link mkdirUnderBuildRoot}, which judges the root again (recreating it `0700`, or refusing it)
+ * and makes each level under it. The root is judged once more at the end, and `buildDir`
+ * `lstat`ed, so nothing is built after the mirror under a root that is no longer ours. A
+ * `buildDir` outside the build root (a test's own) is made recursively, as asked, and judged no
+ * further.
  */
-export async function mirrorSubdirs(srcDir: string, buildDir: string): Promise<void> {
+export async function mirrorSubdirs(
+  srcDir: string,
+  buildDir: string,
+  deps: BuildRootDeps = {},
+): Promise<void> {
+  const root = buildRoot();
+  const where = buildRootLevels(root, buildDir);
+  if (where.kind === 'outside') {
+    await walkSubdirs(srcDir, buildDir, async (dest) => {
+      await mkdir(dest, { recursive: true });
+    });
+    return;
+  }
+  const ensureRoot = deps.ensureRoot ?? ensureBuildRoot;
+  await ensureRoot(root);
+  const makeLevel = async (dest: string): Promise<void> => {
+    try {
+      await mkdir(dest, { mode: 0o700 });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        // The root, or a level above, went away after the check: made the verified way.
+        await mkdirUnderBuildRoot(dest, deps);
+        return;
+      }
+      if (code !== 'EEXIST') throw err;
+      // Kept only as a real directory: a link there would take everything below elsewhere.
+      const st = await lstat(dest);
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        throw unusableBuildDirError(dest, st.isSymbolicLink(), err);
+      }
+    }
+  };
+  if (where.kind === 'below') for (const level of where.levels) await makeLevel(level);
+  await walkSubdirs(srcDir, buildDir, makeLevel);
+  // Judged again now that the tree exists: a root recreated or replaced in the meantime is refused
+  // (or, recreated merely readable by others, tightened) before anything is built in it.
+  await ensureRoot(root);
+  if (where.kind === 'below') {
+    const st = await lstat(where.abs);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw unusableBuildDirError(where.abs, st.isSymbolicLink());
+    }
+  }
+}
+
+/** {@link mirrorSubdirs}' walk: `make` each source subdirectory's twin, parents first. */
+async function walkSubdirs(
+  srcDir: string,
+  destDir: string,
+  make: (dest: string) => Promise<void>,
+): Promise<void> {
   const entries = await readdir(srcDir, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name === '.git') continue;
-    const dest = path.join(buildDir, entry.name);
-    await mkdir(dest, { recursive: true });
-    await mirrorSubdirs(path.join(srcDir, entry.name), dest);
+    const dest = path.join(destDir, entry.name);
+    await make(dest);
+    await walkSubdirs(path.join(srcDir, entry.name), dest, make);
   }
 }
 
@@ -631,7 +1001,7 @@ export async function mirrorSubdirsForRoot(
   // `to` lies strictly below `from`: not `from` itself, and not outside it.
   const strictlyInside = (from: string, to: string): boolean => {
     const rel = path.relative(from, to);
-    return !(rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
+    return !(rel === '' || climbsOut(rel) || path.isAbsolute(rel));
   };
   if (!strictlyInside(root, abs)) return;
   let real: string;
@@ -654,8 +1024,8 @@ export async function mirrorSubdirsForRoot(
  * — so the schema's "never enabled unless you ask" was false for every plain compile (#213).
  *
  * latexmk hands the flag to the engine through `%O`, so a latexmkrc that drops `%O` or appends its
- * own `-shell-escape` after it can still turn shell escape back on; `shellEscapeWasEnabled` reads
- * the engine's own banner for exactly that reason.
+ * own `-shell-escape` after it can still turn shell escape back on; `engineShellEscapeBanner`
+ * reads the engine's own banner, in the log's header, for exactly that reason.
  */
 function shellEscapeFlag(req: CompileRequest): string {
   if (req.shellEscape) return '-shell-escape';
@@ -874,6 +1244,52 @@ export class LatexmkCompiler implements LatexCompiler {
 }
 
 /**
+ * The root job's records in a build dir that a tectonic compile does not write: tectonic puts only
+ * `<job>.pdf` and `<job>.log` into `--outdir` (with `--keep-logs`; checked with tectonic 0.17 — no
+ * `.aux` or `.fls` without `--keep-intermediates`, no `.synctex.gz` without `--synctex`), and
+ * leaves whatever else is there. The `.log` is listed because tectonic writes it only when it gets
+ * that far, and an earlier latexmk run's would otherwise be read back as this run's.
+ */
+const TECTONIC_UNWRITTEN_RECORDS = ['.aux', '.fls', '.log', '.synctex.gz', '.fdb_latexmk'];
+
+/**
+ * Remove the root job's {@link TECTONIC_UNWRITTEN_RECORDS} from a build dir before a tectonic
+ * compile, so no record of an earlier latexmk compile into the same dir survives beside the PDF
+ * tectonic writes: the label route read that `.aux` as this build's and resolved pages from a
+ * different engine's layout, and neither stale-PDF signal fires (the `.aux` is OLDER than the new
+ * PDF, and tectonic's closing record agrees with it). Removing the `.aux` also fixes the other
+ * direction: with it gone, a later latexmk compile reruns the engine instead of calling tectonic's
+ * PDF up to date from its own database (the `.fdb_latexmk` goes too, for the same reason).
+ *
+ * Fail closed and never through a link: each name is `lstat`ed, and a regular file or a link is
+ * unlinked (`unlink` removes a link, never its target); anything else — a directory at that
+ * name — is left, since no reader takes it for a record. Only the root job's names are touched:
+ * an `\include`d chapter's `.aux` is reached only through the root `.aux`, which is gone.
+ */
+async function removeRecordsTectonicDoesNotWrite(
+  buildDir: string,
+  rootFile: string,
+): Promise<void> {
+  const job = path.basename(rootFile).replace(/\.tex$/, '');
+  for (const ext of TECTONIC_UNWRITTEN_RECORDS) {
+    const p = path.join(buildDir, `${job}${ext}`);
+    let st;
+    try {
+      st = await lstat(p);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
+    if (!st.isFile() && !st.isSymbolicLink()) continue;
+    try {
+      await unlink(p);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+}
+
+/**
  * Compiles with tectonic. Self-contained (bundles its own TeX and fetches packages on
  * demand into a local cache), so no system TeX install is needed — at the cost of a
  * network round-trip on the first, cold-cache compile.
@@ -897,6 +1313,8 @@ export class TectonicCompiler implements LatexCompiler {
     // No root-directory mirror here (see `mirrorSubdirsForRoot`): tectonic takes no `-cd`, so its
     // relative paths already resolve against the project root, which this mirrors.
     await mirrorSubdirs(req.projectDir, buildDir);
+    // Before anything runs: a failed run must not leave an earlier latexmk build's records either.
+    await removeRecordsTectonicDoesNotWrite(buildDir, req.rootFile);
 
     const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
     // Tectonic has no restricted mode, so `restrictedShellEscape` alone does not widen to full

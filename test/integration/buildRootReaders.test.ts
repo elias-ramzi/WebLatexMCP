@@ -134,12 +134,12 @@ describe.skipIf(process.platform === 'win32')('PDF readers: planted build root (
       const what = `${JSON.stringify(call)} -> ${text}`;
       // Soft, so one run shows every route that is not refused rather than only the first.
       expect.soft(res.isError, what).toBe(true);
-      expect.soft(text, what).toContain(`Refusing to build in ${buildRoot()}`);
+      expect.soft(text, what).toContain(`Refusing to use build root ${buildRoot()}`);
       expect.soft(text, what).toContain('symbolic link');
     }
     // The viewer locates its PDF through the same check.
     await expect(locateViewerPdf(config, 'poster', userDir, 'main.tex')).rejects.toThrow(
-      'Refusing to build in',
+      'Refusing to use build root',
     );
 
     // Nothing was written into their directory — no render/ PNGs — and nothing was rewritten.

@@ -223,7 +223,8 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
             // `pdfPath`, as in render_pages: the PDF paired with the .aux, whose timestamps are
-            // compared, so a build that stopped after rewriting the .aux is refused.
+            // compared, so a build that stopped after rewriting the .aux is refused. It must be
+            // the PDF the reader below opens: resolveLabelPages throws otherwise.
             const aux = await readAuxFloats(dir, root, {
               max: LABEL_LOOKUP_MAX,
               shipouts: true,

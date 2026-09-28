@@ -61,6 +61,15 @@ const OLD_AUX =
   '\\relax \n\\newlabel{a}{{}{1}{}{}{}}\n\\newlabel{b}{{}{2}{}{}{}}\n' +
   '\\newlabel{c}{{}{3}{}{}{}}\n\\gdef \\@abspage@last{3}\n';
 
+/**
+ * The files'-order clause of a `'stalePdf'` refusal, whatever gap it names. A filesystem with
+ * 1-second (or 2-second) timestamps truncates both times, so a staged gap of 1 ms or 1.4 s can
+ * read back as "1.0 s" or "2.0 s": only a gap of whole, even seconds survives as written, and
+ * only such a gap is asserted as exact text (the first test below, 10 s).
+ */
+const STALE_AUX_CLAUSE =
+  /the \.aux was written (?:\d+\.\d s|\d+ ms|less than 1 ms) after the PDF, while a compile that finishes writes its \.aux before its PDF/;
+
 let proj: string | undefined;
 afterEach(async () => {
   if (proj) {
@@ -92,7 +101,8 @@ async function stage(aux: string, logText: string, pdfAgeMs: number): Promise<st
 
 describe('a PDF that is not the output of the last compile refuses every label', () => {
   it('xelatex stopped in the body after two pages: `a` is refused, not resolved to "B"', async () => {
-    const pdfPath = await stage(FATAL_AUX, log('bodyFatal-xelatex'), 1_400);
+    // 10 s: whole, even seconds, so the gap reads back exactly on any timestamp granularity.
+    const pdfPath = await stage(FATAL_AUX, log('bodyFatal-xelatex'), 10_000);
     const index = await readAuxFloats(proj!, 'main.tex', {
       max: 20_000,
       shipouts: true,
@@ -113,7 +123,7 @@ describe('a PDF that is not the output of the last compile refuses every label',
     const msg = labelRefusalMessage(plan, index);
     expect(msg).toContain(
       '"a": the .aux records it on printed page "2", but the PDF beside it is not the output ' +
-        'of the last compile: the .aux was written 1.4 s after the PDF, while a ' +
+        'of the last compile: the .aux was written 10.0 s after the PDF, while a ' +
         "compile that finishes writes its .aux before its PDF; and the engine's closing line " +
         'in the .log says that run wrote 2 page(s) to its .xdv file, while the PDF has 3 ' +
         'page(s). No page was assumed.',
@@ -148,7 +158,7 @@ describe('a PDF that is not the output of the last compile refuses every label',
     const plan = await resolveLabelPages(['a'], index, reader);
     expect(plan.failed).toEqual([{ label: 'a', reason: 'stalePdf', printedPage: '2', number: '' }]);
     const msg = labelRefusalMessage(plan, index);
-    expect(msg).toContain('the .aux was written 1.4 s after the PDF');
+    expect(msg).toMatch(STALE_AUX_CLAUSE);
     expect(msg).not.toMatch(/closing line/);
 
     // The same files in the order a FINISHED build leaves them (the .aux closed in \enddocument,
@@ -230,7 +240,8 @@ describe('a PDF that is not the output of the last compile refuses every label',
     // One millisecond: a stopped run that closed its .aux right after the earlier PDF.
     const past = await at(auxTime - 1);
     expect(past.failed.map((f) => f.reason)).toEqual(['stalePdf']);
-    expect(labelRefusalMessage(past, index)).toContain('the .aux was written 1 ms after the PDF');
+    // The clause, not its "1 ms": a 1 s timestamp granularity reads this gap back as "1.0 s".
+    expect(labelRefusalMessage(past, index)).toMatch(STALE_AUX_CLAUSE);
     // Older, as a finished build leaves them.
     expect((await at(auxTime + 8)).failed).toEqual([]);
   });

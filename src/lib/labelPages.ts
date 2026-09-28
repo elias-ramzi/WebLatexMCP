@@ -90,8 +90,9 @@
  *     equal the PDF's pages (one forged `[1]` beside a one-page earlier PDF), or is switched off
  *     when it does not — either way the lookup would answer as it did before the refusal existed.
  *     What still refuses that build is the engine's own closing line in the `.log` ("No pages of
- *     output.", or "no output PDF file produced"), which a pdfTeX or XeTeX document cannot write
- *     after (`'stalePdf'`, {@link staleBuildEvidence}; under LuaTeX a `stop_run` callback can).
+ *     output.", or "no output PDF file produced"), which a pdfTeX or XeTeX document without shell
+ *     escape cannot write after (`'stalePdf'`, {@link staleBuildEvidence}; under LuaTeX a
+ *     `stop_run` callback can, and with shell escape so can a command the document starts).
  *     The same refusal covers a compile that stopped AFTER rewriting the `.aux` (#220): xelatex
  *     on an error in the body writes a new `.aux` and `.log`, xdvipdfmx never runs, and the
  *     earlier run's PDF stays — the marks are the new run's and may even number the old PDF's
@@ -559,11 +560,12 @@ export interface LabelPagePlan {
  *
  * Equal is not newer. A filesystem's coarse or truncated timestamps are a non-decreasing function
  * of the write time: they can make the two times EQUAL, never reverse them, so an equal pair costs
- * at most a missed refusal — the safe direction on such a filesystem, where the engine's closing
- * record ({@link staleBuildEvidence}) is still read. The one thing the tolerance ever absorbed was
- * test helpers writing the PDF before the `.aux`; those back-date the `.aux` instead. The
- * remaining assumption is that one clock stamps both files — true on a local disk, and for files
- * one client writes to one NFS server, which stamps both itself.
+ * at most a missed refusal, never a refused finished build. A missed refusal is not harmless —
+ * the lookup then answers as it did before this check existed — but on such a filesystem the
+ * engine's closing record ({@link staleBuildEvidence}) is still read. The one thing the
+ * tolerance ever absorbed was test helpers writing the PDF before the `.aux`; those back-date the
+ * `.aux` instead. The remaining assumption is that one clock stamps both files — true on a local
+ * disk, and for files one client writes to one NFS server, which stamps both itself.
  */
 export function auxNewerThanPdfMs(times: BuildTimes): number | undefined {
   const newer = times.auxMs - times.pdfMs;
@@ -589,8 +591,9 @@ export interface StalePdfEvidence {
 /**
  * The records showing that the PDF beside the build is not the output of the LAST compile — the
  * run that wrote the `.aux` (signal one) or the `.log` (signal two; every run rewrites it) — or
- * `undefined` when none does. Two signals, either one enough, neither of which the
- * document can write:
+ * `undefined` when none does. Two signals, either one enough, neither of which a pdfTeX or
+ * XeTeX document compiled without shell escape can forge (a LuaTeX document, or any document
+ * with shell escape on, can defeat both — see the end of this comment):
  *
  *  - **The files' order** (`aux.buildTimes`). A finished compile writes its `.aux` before its PDF
  *    (LaTeX closes the `.aux` in `\enddocument`; pdfTeX and LuaTeX finish the PDF after that, and
@@ -598,23 +601,30 @@ export interface StalePdfEvidence {
  *    PDF ({@link auxNewerThanPdfMs}) is a later run's that never produced a PDF. The case this
  *    exists for (#220): xelatex stopped by an error in the BODY writes a new `.aux` and `.log`,
  *    and xdvipdfmx never runs, so the earlier run's PDF stays — and the shipout marks number
- *    what the new run shipped, which may be as many pages as the old PDF has. The document cannot
- *    set a file's time; it can only write a file, and writing the PDF would make that file its
- *    own output.
+ *    what the new run shipped, which may be as many pages as the old PDF has. A pdfTeX or XeTeX
+ *    document without shell escape cannot set a file's time; it can only write a file, and
+ *    writing the PDF would make that file its own output.
  *  - **The engine's closing record** (`aux.engineOutput`, {@link parseEngineOutput}): the last
  *    thing the engine writes into the `.log` is how many pages it wrote, or that it wrote none. A
  *    count other than the PDF's, or "none" beside a PDF with pages, is another run's record. This
  *    one needs no clock: it also catches a stale PDF whose timestamps a coarse filesystem made
  *    equal, and a run that stopped in the preamble after writing mark-shaped text
  *    (`\message{[1]}`), which gets past {@link shippedNothing} but still closes with "no output".
- *    A document can write a line of the same shape only BEFORE the engine's closing one (except
- *    under LuaTeX, whose `stop_run` callback runs Lua after it), and the last one is taken.
+ *    A pdfTeX or XeTeX document without shell escape can write a line of the same shape only
+ *    BEFORE the engine's closing one, and the last one is taken.
+ *
+ * Neither holds against every document. A LuaTeX document can set a file's time without shell
+ * escape (`\directlua{lfs.touch(…)}` back-dated an `.aux` under `-no-shell-escape`, TeX Live 2026
+ * lualatex) and can write the `.log` after the engine's closing record (a `stop_run` callback);
+ * with shell escape on, any engine's document can do both through a shell command. Such a build
+ * can defeat both signals, and what that costs is a missing refusal: the lookup then answers as
+ * it did before the check existed — for #220, the earlier run's page, the wrong one.
  *
  * Both only ever REFUSE: absent records (`buildTimes` or `engineOutput` undefined — no PDF path
- * given, a file that could not be stat'd, a log that could not be read or holds no closing
- * record, as a run killed before it closed leaves) add nothing. `pdf.pageCount` is the PDF's
- * page count when known; `pdf.hasPages` stands in for it when it is not (a PDF that exists: no
- * engine writes one for a run that shipped nothing).
+ * given, a file that could not be `lstat`'d or is not a regular file, a log that could not be
+ * read or holds no closing record, as a run killed before it closed leaves) add nothing.
+ * `pdf.pageCount` is the PDF's page count when known; `pdf.hasPages` stands in for it when it is
+ * not (a PDF that exists: no engine writes one for a run that shipped nothing).
  */
 export function staleBuildEvidence(
   aux: AuxFloatsResult,
@@ -1353,8 +1363,8 @@ function usableShipouts(
  * lookup did not do before this refusal existed. No mark rule can close that, since every mark is
  * document-writable (no real preamble among 338 logs held one); what closes it is the engine's
  * closing line, which such a run ends with — "No pages of output." or "no output PDF file
- * produced" — and which a pdfTeX or XeTeX document cannot write after: `'stalePdf'`
- * ({@link staleBuildEvidence}).
+ * produced" — and which a pdfTeX or XeTeX document without shell escape cannot write after:
+ * `'stalePdf'` ({@link staleBuildEvidence}, which says what LuaTeX and shell escape can do).
  */
 export function shippedNothing(aux: AuxFloatsResult, pdfHasPages: boolean): boolean {
   return pdfHasPages && aux.shipouts !== undefined && aux.shipouts.length === 0;
@@ -1505,6 +1515,11 @@ export function pagesToVerify(labels: string[], aux: AuxFloatsResult, pageCount:
 /** What {@link resolveLabelPages} reads out of the PDF. Plain functions, so the resolution is
  *  unit-testable against canned data; {@link pdfLabelPageReader} adapts the real renderer. */
 export interface LabelPageReader {
+  /** The PDF this reader opens, when it opens a file ({@link pdfLabelPageReader} always does).
+   *  {@link resolveLabelPages} then requires the `.aux` index to have been read with this very
+   *  PDF (`AuxFloatsResult.pairedPdf`). A canned reader in a test opens no file and leaves it
+   *  out. */
+  readonly pdfPath?: string;
   pageLabels(): Promise<readonly string[] | null>;
   pageCount(): Promise<number>;
   /** The text layer of each requested (in-range) page. */
@@ -1526,6 +1541,17 @@ export async function resolveLabelPages(
   aux: AuxFloatsResult,
   reader: LabelPageReader,
 ): Promise<LabelPagePlan> {
+  // The `.aux` newer than the PDF is one of the two stale-PDF signals (staleBuildEvidence), and
+  // it is gathered only when `readAuxFloats` was told which PDF it pairs with. A lookup that
+  // forgot to say — or named another PDF than the one read here — would silently check nothing,
+  // so it is a programming error, thrown before the PDF is opened.
+  if (reader.pdfPath !== undefined && aux.pairedPdf !== reader.pdfPath) {
+    throw new Error(
+      'Internal error: the .aux index for this label lookup was not read with the PDF this ' +
+        'lookup reads (readAuxFloats needs the same pdfPath), so whether that PDF is the output ' +
+        'of the last compile could not be checked. No page was assumed.',
+    );
+  }
   const pageLabels = await reader.pageLabels();
   const pageCount = await reader.pageCount();
   if (usablePageLabelIndex(aux, pageLabels).index) {
@@ -1552,6 +1578,7 @@ export function pdfLabelPageReader(
   const load = (): ReturnType<PdfRenderService['pageLabelsAndCount']> =>
     (info ??= renderer.pageLabelsAndCount(pdfPath));
   return {
+    pdfPath,
     pageLabels: async () => (await load()).pageLabels,
     pageCount: async () => (await load()).pageCount,
     pageText: async (pages) => {

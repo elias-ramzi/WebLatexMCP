@@ -100,6 +100,11 @@ and the venue style's `\usepackage` options. As the current templates go (check 
   `\usepackage[accepted]{icml2025}`; `\iclrfinalcopy`; or a style whose default is the
   camera-ready build, loaded with no review option — `\usepackage{cvpr}`, `\usepackage{acl}`,
   `\usepackage{aaai25}`, ECCV's `eccv` style without `review`.
+- **`acmart` is the exception to "review means on"**: there `review` only adds line numbers and
+  hides nothing, and `anonymous` alone is what anonymises. So for `acmart` only `anonymous`
+  counts as on; `\documentclass[sigconf,review]{acmart}` without it is **off** (many ACM venues
+  review single-blind), and its named authors are never an anonymity leak on the strength of
+  the `review` option.
 - **Unknown**: anything else — no venue style you recognise, or options you cannot read.
 
 On a **bare PDF** there is no preamble: page 1 decides. "Anonymous" authors, a paper ID, or

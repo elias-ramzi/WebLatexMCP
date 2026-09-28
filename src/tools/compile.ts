@@ -22,8 +22,7 @@ import {
   parseLog,
   fitFilteredLog,
   logTail,
-  needsShellEscape,
-  shellEscapeWasEnabled,
+  engineShellEscapeBanner,
   findMissingPackages,
   LOG_TAIL_LINE_CAP,
 } from '../services/logParser.js';
@@ -50,8 +49,10 @@ import {
   buildRoot,
   engineNotFoundHint,
   ensureBuildRoot,
+  shellEscapeOverriddenHint,
   shellEscapeRefusedHint,
   shellEscapeRequested,
+  tikzShellEscapeHint,
 } from '../services/compiler.js';
 import { quoteId } from '../lib/projectId.js';
 import { editItemSchema } from './editFile.js';
@@ -61,20 +62,22 @@ import type { CompilerKind } from '../types.js';
 const RAW_TAIL_LINES = 400;
 
 /**
- * Characters the never-read hint's list of names may take, rendered — each quoted name and the
- * `, ` between them, charged in its JSON form (the larger channel: every `"` and `\` of a quoted
- * name costs two). The house figure for a merely diagnostic share (as `sourceChangedHint`'s
- * `SOURCE_CHANGES_NAMES_BUDGET`): the names only point back at entries of the caller's own
- * `overlay`, which it already holds in full.
+ * Characters the never-read hint's list of names may take, rendered, summed over BOTH channels the
+ * hint ships in — each quoted name and the `, ` between them, charged once as the text channel
+ * prints it and once in its JSON form inside `structuredContent` (where every `"` and `\` of a
+ * quoted name costs two). The caller receives the sum, so charging only the larger channel let the
+ * list reach twice this figure. The house figure for a merely diagnostic share (as
+ * `sourceChangedHint`'s `SOURCE_CHANGES_NAMES_BUDGET`): the names only point back at entries of
+ * the caller's own `overlay`, which it already holds in full.
  */
 export const OVERLAY_UNREAD_NAMES_BUDGET = 2000;
 
 /**
  * The `hint` for overlaid files the variant build never opened (#216): ONE line for all of them,
  * not one per file. The names are the caller's own paths — up to `MAX_OVERLAY_FILES` of them, each
- * up to PATH_MAX — and the hint ships in both channels, so the list is budgeted by rendered size
- * ({@link OVERLAY_UNREAD_NAMES_BUDGET}), the `capList` shape: names in order while they fit, the
- * rest counted as `, and N more` in the same sentence. The named set is a prefix, and a name is
+ * up to PATH_MAX — and the hint ships in both channels, so the list is budgeted by its rendered
+ * size in the two summed ({@link OVERLAY_UNREAD_NAMES_BUDGET}), the `capList` shape: names in
+ * order while they fit, the rest counted as `, and N more` in the same sentence. The named set is a prefix, and a name is
  * never cut short — a truncated path is not one the caller can find in its overlay. There is no
  * separate count cap: the overlay itself is capped at `MAX_OVERLAY_FILES` (20, the house figure),
  * so a count cap of 20 here could never fire; the character budget is the bound that binds.
@@ -86,10 +89,13 @@ export function overlayNeverReadHint(paths: string[], success: boolean): string 
   const named: string[] = [];
   let used = 0;
   for (const p of paths) {
-    // JSON.stringify(x).length - 2: the name as structuredContent carries it, without its quotes.
-    const cost = (named.length > 0 ? ', '.length : 0) + JSON.stringify(quoteId(p)).length - 2;
+    const shown = quoteId(p);
+    // Text channel: the name as printed. structuredContent: JSON.stringify(x).length - 2, the name
+    // as the JSON string carries it, without the quotes that belong to the whole hint.
+    const cost =
+      (named.length > 0 ? 2 * ', '.length : 0) + shown.length + JSON.stringify(shown).length - 2;
     if (used + cost > OVERLAY_UNREAD_NAMES_BUDGET) break;
-    named.push(quoteId(p));
+    named.push(shown);
     used += cost;
   }
   const more = paths.length - named.length;
@@ -136,9 +142,10 @@ const inputSchema = {
         '(which is this restricted mode), so a document whose .eps figures are converted by ' +
         'repstopdf, or that runs makeindex through \\write18, needs this set (`hint` says so when ' +
         'the log shows a refused command). The cost: those helpers run in the project directory ' +
-        'and can write files there (makeindex -o can overwrite a source file). The safer way to ' +
-        'enable TikZ externalization (\\tikzexternalize), and enough for most setups. Prefer ' +
-        'this over shellEscape. Tectonic has no restricted mode and ignores it.',
+        'and can write files there (makeindex -o can overwrite a source file). Prefer this over ' +
+        'shellEscape for those helpers. It does NOT enable TikZ externalization ' +
+        '(\\tikzexternalize): that runs the engine itself, which the allow-list never holds — ' +
+        'only shellEscape does. Tectonic has no restricted mode and ignores it.',
     ),
   shellEscape: z
     .boolean()
@@ -146,8 +153,10 @@ const inputSchema = {
     .describe(
       'Pass -shell-escape, letting the .tex run ARBITRARY shell commands during compilation. ' +
         'Default false. SECURITY: only enable for a project you trust — the document comes from a ' +
-        'shared remote others can write to. Never enabled automatically; try restrictedShellEscape ' +
-        'first, and enable this only when the caller explicitly wants it.',
+        'shared remote others can write to. Never enabled automatically, and only when the caller ' +
+        'explicitly wants it. The one flag that enables TikZ externalization (\\tikzexternalize), ' +
+        "which runs the engine itself — no helper on TeX's allow-list. For a refused repstopdf or " +
+        'makeindex, try restrictedShellEscape first.',
     ),
   rawLog: z
     .boolean()
@@ -231,9 +240,10 @@ const inputSchema = {
         "project's own latexmkrc still runs and can turn shell escape back on, lualatex's Lua " +
         "io.open needs no shell escape, and tectonic's \\openout writes any absolute path. So " +
         "the project's files — following its symbolic links, which the build can write " +
-        'through — are compared (size, mode, inode and times; no content read) — of the ' +
-        "project root's .git only hooks/, config and info/, which the next git command runs or " +
-        'reads, since the rest of .git changes on every git call — before and after the build: ' +
+        'through — are compared (size, mode, inode and times; no content read) — of a .git ' +
+        'directory at the project root only what the next git command runs or reads its ' +
+        'configuration from (hooks/, config, …), since the rest of .git changes on every git ' +
+        'call — before and after the build: ' +
         'any that ' +
         'changed are named in `hint` — check them and discard what you did not mean — and a ' +
         'log showing shell escape enabled against the request is reported. The result ' +
@@ -506,14 +516,17 @@ const outputSchema = {
         'installed — said only when the log names no error of its own — or the document uses ' +
         'TikZ externalization and needs a shell-escape retry, or the engine refused a shell ' +
         'command the document ran (repstopdf for an .eps figure, makeindex: shell escape is off ' +
-        'unless you opt in) — naming the flag that runs it and what enabling it costs — or a ' +
+        'unless you opt in) — naming the flag that runs it and what enabling it costs — or the ' +
+        "engine's log shows shell escape enabled although this call left it off (a latexmkrc " +
+        'overrode -no-shell-escape, so the document could run shell commands), or a ' +
         'package is missing from the ' +
         'local TeX installation. For an overlay compile, also: first, the project files the ' +
         'build changed while it ran (the one thing here you may have to undo); after the engine ' +
         "note, the overlaid files the build never opened (by the variant's .fls and " +
         '.fdb_latexmk — so never under tectonic, which writes no .fls), or, on a failed build, ' +
         'the ones it stopped before reading — one line naming them in order while they fit ' +
-        `${OVERLAY_UNREAD_NAMES_BUDGET} characters, the rest counted as "and N more"; and last, ` +
+        `${OVERLAY_UNREAD_NAMES_BUDGET} characters (text and structuredContent together), the ` +
+        'rest counted as "and N more"; and last, ' +
         'an older variant that could not be removed. ' +
         'Absent when there is nothing to say.',
     ),
@@ -565,9 +578,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         'when known — an error also carries the 5 source lines around it, so you rarely need a ' +
         'read_file to interpret it) plus a de-noised log tail — only errors, warnings, and the output summary, ' +
         'not the font/memory dump (pass rawLog: true for the unfiltered tail). Does not touch the ' +
-        'Overleaf remote. TikZ externalization (\\tikzexternalize) needs system calls: retry with ' +
-        'restrictedShellEscape: true (preferred) or shellEscape: true — the latter lets the .tex ' +
-        'run ARBITRARY shell commands, so only enable it for a trusted project. Shell escape is ' +
+        'Overleaf remote. TikZ externalization (\\tikzexternalize) runs the engine through a ' +
+        'system call, which only shellEscape: true allows (restrictedShellEscape does not: TeX’s ' +
+        'allow-list holds no engine) — it lets the .tex run ARBITRARY shell commands, so only ' +
+        'enable it for a trusted project. Shell escape is ' +
         'never enabled automatically: without either flag latexmk gets -no-shell-escape, so not ' +
         'even TeX Live’s default restricted allow-list runs (an .eps figure needing repstopdf, or ' +
         'makeindex via \\write18, then needs restrictedShellEscape: true), and when the log shows ' +
@@ -782,17 +796,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
               hints.push(overlayNeverReadHint(unread, outcome.success));
             }
           }
-          if (!shellEscapeOn && needsShellEscape(outcome.log)) {
-            hints.push(
-              'This document uses TikZ externalization, which needs system calls. Retry compile ' +
-                (backend.kind === 'tectonic'
-                  ? 'with shellEscape: true (tectonic has no restricted mode, so ' +
-                    'restrictedShellEscape does not run it). '
-                  : 'with restrictedShellEscape: true (preferred) or shellEscape: true. ') +
-                'Only enable this for a project you trust — shell escape lets the .tex run ' +
-                'arbitrary commands.',
-            );
-          }
+          // The service words it: shellEscape: true only, since TeX's restricted allow-list never
+          // holds the engine call externalization makes.
+          const tikzHint = tikzShellEscapeHint(outcome.log, {
+            shellEscapeOn,
+            backend: backend.kind,
+          });
+          if (tikzHint) hints.push(tikzHint);
           // Shell escape was off (above), so a command the installation's default would have run
           // — repstopdf for an .eps figure, makeindex — was refused: say which switch brings it
           // back and what flipping it costs. One hint for every compile; the service words it.
@@ -802,6 +812,13 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             backend: backend.kind,
           });
           if (refusedHint) hints.push(refusedHint);
+          // The opposite surprise: the caller left shell escape off, and the engine's own banner
+          // says it was on anyway — for every compile, not only a variant's line below.
+          const overriddenHint = shellEscapeOverriddenHint(outcome.log, {
+            shellEscapeOn,
+            backend: backend.kind,
+          });
+          if (overriddenHint) hints.push(overriddenHint);
           if (missingPackages.length > 0)
             hints.push(missingPackageHint(missingPackages, backend.kind));
           // Last: housekeeping, not this compile — an older variant that could not be removed.
@@ -966,7 +983,16 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // Every claim here is one the build's own record backs: the source's state from the
           // before/after comparison, shell escape's from the engine's banner — the latexmk flag
           // alone reaches the engine only through %O, which a project latexmkrc can override.
-          const escapeReenabled = !shellEscapeOn && shellEscapeWasEnabled(outcome.log);
+          // The banner is read from the log's header only, which the engine writes before the
+          // document: one the document `\typeout`s into the body would blame a latexmkrc that
+          // does not exist. "Off" needs the header READ and holding no banner ('none'); with no
+          // header to read (no engine .log found — latexmk's captured output stood in) neither
+          // "on" nor "off" is claimed. Tectonic reads no latexmkrc, so there the flag it was
+          // given is the whole answer.
+          const headerBanner = engineShellEscapeBanner(outcome.log);
+          const escapeReenabled =
+            !shellEscapeOn && (headerBanner === 'full' || headerBanner === 'restricted');
+          const escapeOffConfirmed = headerBanner === 'none' || backend.kind === 'tectonic';
           const variantLine = variant
             ? `variant ${variant.handle}: pass variant to render_pages / extract_text / ` +
               'pdf_geometry to inspect it. ' +
@@ -977,9 +1003,10 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                 : changedSource.length > 0
                   ? `The build CHANGED ${changedSource.length} project file(s) (see hint); ` +
                     'the main build, the surfaced PDF and the viewer are untouched.'
-                  : 'The source (checked: no project file changed while it built — of .git, ' +
-                    'only its hooks, config and info/ are checked), the main build, the ' +
-                    'surfaced PDF and the viewer are untouched.') +
+                  : 'The source (checked: no project file changed while it built — of a .git ' +
+                    'directory at the project root, if there is one, only what git runs or ' +
+                    'reads its configuration from, such as hooks/ and config, is checked), the ' +
+                    'main build, the surfaced PDF and the viewer are untouched.') +
               (shellEscapeOn
                 ? " Shell escape was on, so the document's shell commands could write anywhere — " +
                   "the source included, through the variant's links to it."
@@ -987,7 +1014,11 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
                   ? ' Shell escape was requested off, but the log shows it enabled: a ' +
                     "latexmkrc (the project's own, or a user or system one) overrode the flag, " +
                     "so the document's shell commands could run."
-                  : ' Shell escape was off for this build.')
+                  : escapeOffConfirmed
+                    ? ' Shell escape was off for this build.'
+                    : ' Whether shell escape was off for this build could not be confirmed: no ' +
+                      'engine log with a readable header was found for it (a latexmkrc that ' +
+                      'renames the job leaves the log where the server does not look).')
             : '';
           const text = [
             headline,

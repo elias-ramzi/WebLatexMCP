@@ -251,7 +251,7 @@ describe('ensureBuildRoot (#215), against an injected filesystem', () => {
       const f = fakeFs({ kind: 'dir', uid: 1000, mode });
       const err = await ensureBuildRoot(ROOT, posix(f.fs)).catch((e: unknown) => e);
       expect(err, mode.toString(8)).toBeInstanceOf(UnsafeBuildRootError);
-      expect((err as Error).message).toContain(`Refusing to build in ${ROOT}`);
+      expect((err as Error).message).toContain(`Refusing to use build root ${ROOT}`);
       expect((err as Error).message).toContain('group or other WRITE access');
       expect((err as Error).message).toContain('Remove it');
       expect(
@@ -307,7 +307,7 @@ describe('ensureBuildRoot (#215), against an injected filesystem', () => {
         (e: unknown) => e,
       );
       expect(err, platform).toBeInstanceOf(UnsafeBuildRootError);
-      expect((err as Error).message).toContain(`Refusing to build in ${root}`);
+      expect((err as Error).message).toContain(`Refusing to use build root ${root}`);
       expect((err as Error).message).toContain('current user name could not be determined');
       expect(f.calls, platform).toEqual([]);
     }
@@ -332,7 +332,7 @@ describe('ensureBuildRoot (#215), against an injected filesystem', () => {
       const err = await ensureBuildRoot(ROOT, posix(fs)).catch((e: unknown) => e);
       expect(err, code).toBeInstanceOf(UnsafeBuildRootError);
       const msg = (err as Error).message;
-      expect(msg).toContain(`Refusing to build in ${ROOT}`);
+      expect(msg).toContain(`Refusing to use build root ${ROOT}`);
       expect(msg).toContain(`the temp directory it goes in, /tmp, ${says}`);
       expect(msg).toContain('Point TMPDIR (TEMP on Windows) at an existing directory');
       expect(msg).not.toContain(code);

@@ -257,3 +257,116 @@ describe('compile: the overlay "never read" hint is one budgeted line (#216)', (
     await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
   });
 });
+
+function textOf(res: unknown): string {
+  const content = (res as { content?: Array<{ type: string; text?: string }> }).content ?? [];
+  return content.map((c) => c.text ?? '').join('\n');
+}
+
+describe('compile: a latexmkrc that turned shell escape back on is reported on every compile', () => {
+  const HEADER = 'This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024)\n';
+
+  it('says so in both channels when the banner shows full shell escape', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    // What `$pdflatex = 'pdflatex %O -shell-escape %S'` produces: the later flag wins.
+    behaviour.log = `${HEADER} \\write18 enabled.\n**main.tex\n(./main.tex)\n`;
+    const res = await client.callTool({ name: 'compile', arguments: {} });
+    expect(res.isError ?? false, JSON.stringify(res.content)).toBe(false);
+    const hint = hintOf(res);
+    expect(hint).toContain("Shell escape was requested off, but the engine's log shows it enabled");
+    expect(hint).toContain('overrode -no-shell-escape');
+    expect(hint).toContain('ARBITRARY');
+    expect(textOf(res)).toContain(
+      "Shell escape was requested off, but the engine's log shows it enabled",
+    );
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+
+  it('names restricted mode when that is what the banner shows', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    behaviour.log = `${HEADER} restricted \\write18 enabled.\n**main.tex\n(./main.tex)\n`;
+    const res = await client.callTool({ name: 'compile', arguments: {} });
+    const hint = hintOf(res);
+    expect(hint).toContain("shows it enabled (restricted to TeX's allow-list)");
+    expect(textOf(res)).toContain("shows it enabled (restricted to TeX's allow-list)");
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+
+  it('is quiet when the caller opted in, or when no banner shows', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    behaviour.log = `${HEADER} \\write18 enabled.\n`;
+    for (const args of [{ shellEscape: true }, { restrictedShellEscape: true }]) {
+      const res = await client.callTool({ name: 'compile', arguments: args });
+      expect(hintOf(res), JSON.stringify(args)).not.toContain('requested off');
+    }
+    behaviour.log = `${HEADER}**main.tex\n`;
+    const plain = await client.callTool({ name: 'compile', arguments: {} });
+    expect(hintOf(plain)).not.toContain('requested off');
+  });
+});
+
+describe('compile: a refusal under restricted mode a latexmkrc forced names only shellEscape', () => {
+  // The engine's banner in the log's header — before the `**` line, where the document cannot
+  // write — is the only evidence of restricted mode that counts.
+  const RESTRICTED = 'This is pdfTeX\n restricted \\write18 enabled.\n**main.tex\n(./main.tex\n';
+
+  it('TikZ externalization: the retry names shellEscape: true, not restrictedShellEscape', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    behaviour.log =
+      RESTRICTED +
+      'runsystem(pdflatex -halt-on-error -jobname "imgs/tikzmain-figure0" "...")...disabled ' +
+      '(restricted).\n' +
+      TIKZ_FAILURE;
+    const res = await client.callTool({ name: 'compile', arguments: {} });
+    const hint = hintOf(res);
+    expect(hint).toContain('TikZ externalization');
+    expect(hint).toContain('Retry compile with shellEscape: true');
+    expect(hint).not.toContain('restrictedShellEscape: true (preferred)');
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+
+  it('another refused command: the retry names shellEscape: true only', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    behaviour.log = `${RESTRICTED}runsystem(gnuplot fig.gp)...disabled (restricted).\n`;
+    const res = await client.callTool({ name: 'compile', arguments: {} });
+    const hint = hintOf(res);
+    expect(hint).toContain('The engine refused a shell command');
+    expect(hint).toContain('Retry with shellEscape: true');
+    expect(hint).not.toContain('restrictedShellEscape: true (or');
+  });
+});
+
+describe('compile: an overlay compile names every unread file in one line', () => {
+  it('two unread overlaid files: one line naming both', async () => {
+    const files: Record<string, string> = {
+      'main.tex': MAIN_TEX,
+      'a.tex': 'x\n',
+      'b.tex': 'x\n',
+    };
+    const { client } = await setup(files);
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: {
+        rootFile: 'main.tex',
+        overlay: ['a.tex', 'b.tex'].map((file) => ({
+          file,
+          edits: [{ oldString: 'x', newString: 'y' }],
+        })),
+      },
+    });
+    expect(res.isError ?? false, JSON.stringify(res.content)).toBe(false);
+    const lines = hintOf(res)
+      .split('\n')
+      .filter((l) => l.includes('never read'));
+    expect(lines).toEqual([
+      'The build never read the overlaid files "a.tex", "b.tex" (neither its .fls nor its ' +
+        '.fdb_latexmk lists them), so the overlay had no effect on them — overlay the path TeX ' +
+        'actually opens instead (the target of a symbolic link, or the name the document inputs).',
+    ]);
+    // The variant line claims only what the source check covers, not a list of .git entries
+    // that grows with what is watched (and that a project without its own .git does not have).
+    expect(textOf(res)).toContain('no project file changed while it built');
+    expect(textOf(res)).not.toContain('only its hooks, config and info/ are checked');
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+});

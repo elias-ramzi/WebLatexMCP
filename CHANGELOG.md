@@ -60,19 +60,24 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the project it sits in. Each reply is then saved verbatim and checked against the saved file
   (#224): one `search_files` call lists every saved heading, which must match the reply's in text,
   order and line number; the last section must match verbatim; and the line count and the typo
-  table's row count must agree. A report that fails is re-saved once. Two other ways to keep the
+  table's row count must agree (the table's header and `|---|` lines are not rows). `search_files`
+  is capped, so when it reports a cut or a timeout, or returns a heading windowed with `…`, the
+  headings are taken from a `read_file` of the report instead, never read as a malformed report. A
+  report that fails is re-saved once. Two other ways to keep the
   orchestrator from retyping 150 KB of panel output were declined. Copying each agent's reply out
   of the harness's own output files would make a load-bearing step depend on an undocumented
   format, where a silent change saves a wrong or empty report with no error. Letting each agent
   write its own report would give the read-only agents a write tool that `write_file` cannot
   confine to one path, and would write into the run directory while the panel still runs. Before
   dispatching, the command also checks which build it is reviewing (#225): a best-effort look at
-  the preamble for the venue's review or anonymous switch, and when it is off (a camera-ready or
-  preprint build) one question — review it as a submission, where anonymity and page-limit findings
+  the preamble for the venue's review or anonymous switch — for `acmart` only `anonymous`
+  counts, since `review` merely adds line numbers and many ACM venues review single-blind — and
+  when it is off (a camera-ready or preprint build) one question — review it as a submission, where anonymity and page-limit findings
   count, or as camera-ready, where they are informational. In an end-to-end run all three
   reviewers spent their critical finding on the anonymity of a build the authors had compiled
   camera-ready. A novelty scout that finds the paper itself already public reports it for the
-  authors to check, and the triage never counts it as prior work. The severity rubric is
+  authors to check, even when it saw the paper only as a search snippet, and the triage never
+  counts it as prior work. The severity rubric is
   unchanged: a submission build's anonymity leak stays critical. The skill is self-contained, since the `SKILL.md` body is all an MCP prompt
   or `list_skills` conveys, and every agent loads it through `list_skills` rather than a restated
   copy. Everything is read-only on the paper. Every run is recorded on the local copy it reviews, in a
@@ -112,29 +117,42 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   command unless you pass `shellEscape` or `restrictedShellEscape` — here that is also what keeps
   an allow-listed `makeindex -o` from writing a project file through the farm's links — and says
   so in `hint` when the document tried to run one; opting in lifts that guarantee. A `latexmkrc`
-  or `.latexmkrc` cannot be overlaid, under any spelling of its case, since latexmk runs it as
-  Perl. Some routes back into the source stay open — the project's own
+  or `.latexmkrc` cannot be overlaid, under any spelling of its case or any name Windows opens as
+  one (`latexmkrc.`, `latexmkrc `, `latexmkrc::$DATA`, `.latexmkrc.`, refused on every platform),
+  since latexmk runs it as Perl. Some routes back into the source stay open — the project's own
   latexmkrc still runs and can turn shell escape back on, Lua code under `lualatex` can write with
   `io.open`, and tectonic's `\openout` writes any absolute path — so an overlay compile compares
   the project's files before and after the build (by size, mode, inode and times; nothing is
-  read) — and of the project root's `.git`, its `hooks/`, `config` and `info/`, which the next git
-  command runs or reads, while the rest of `.git` changes on every git call and stays out (#228)
+  read) — and of the project root's `.git`, its `hooks/`, `config`, `config.worktree`, `commondir`
+  and `info/`, and under `.git/modules` each submodule's `config`, `config.worktree`, `commondir`
+  and `hooks/` (a submodule's git directory recognised as git recognises one: a `HEAD` file or
+  symbolic link, beside `objects/` and `refs/` — directories or links to them — or a `commondir`
+  file), which the next git command runs or reads (a `commondir` makes git read another
+  directory's config and hooks, and `git status` recurses into every submodule), while the rest of
+  `.git` changes on every git call and stays out (#228)
   — following the project's symbolic links as the build does — a file link by its target, a
   linked directory by its contents — and names any that changed in `hint` (at most 20, fewer when
-  their names are long, the rest counted; one under a link was written at the link's target,
+  their names are long — the list is budgeted over the text and `structuredContent` together —
+  the rest counted; one under a link was written at the link's target,
   which `status` and `discard` do not reach when it lies outside the project), instead of calling the source untouched — or, when
   the check cannot run, says so and names why; it also
-  says when the log shows shell escape enabled although the compile asked for it off. The result
+  says, as every latexmk compile now does (#213, below), when the log shows shell escape enabled
+  although the compile asked for it off — and says shell escape was off only when the engine's
+  log header was read and shows no banner; with no engine log to read (a latexmkrc that renames
+  the job), it says that could not be confirmed. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
   compiled variants of a project are kept; recompiling the same overlay reuses its variant
   incrementally. An older variant that cannot be removed (a Windows viewer holding its PDF) is
-  reported in `hint`, never failing the compile. Two variants stamped in the same millisecond are
-  ordered by a per-project sequence number kept in the manifest, never by directory listing
-  order, so eviction cannot take the newer (#216). `clean: true` on an overlay compile cleans that
+  reported in `hint`, never failing the compile. Variants are ordered by a per-project sequence
+  number kept in the manifest — the compile order, whatever the wall clock says — never by their
+  timestamps or by directory listing order, so eviction cannot take the newer of two stamped in
+  the same millisecond, or the newest after the clock stepped back (#216); a manifest written
+  before the number existed ranks below every one that has it. `clean: true` on an overlay compile cleans that
   variant only. The overlaid files the build never opened (by its `.fls` and `.fdb_latexmk`;
   tectonic writes no `.fls`, so never there) are named in one `hint` line — in order while their
-  names fit 2000 characters, the rest counted as "and N more" (#216) — on a failed build, as ones
+  names fit 2000 characters over the text and `structuredContent` together, the rest counted as
+  "and N more" (#216) — on a failed build, as ones
   it stopped before reading. Naming one file twice is refused, and whether two names are one file
   is asked of the filesystem rather than assumed from the platform (#214): the project's by
   identity, and the farm's case fold by a probe in the project's variants directory, run only
@@ -165,9 +183,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
-- **The `corrector` agent declares its tools.** It had no `tools:` line, so it held every tool — a
-  shell and file writes included — and stayed report-only by its prompt alone. It now holds the
-  read tools plus `edit_file`, which `/hunt-typo --fix` needs, and a test pins that.
+- **The `corrector` and `formatter` agents declare their tools.** Neither had a `tools:` line, so
+  each held every tool the session held — a shell, `commit`, `push`, `delete_file` and `compile`
+  included — and kept to its job by its prompt alone; `formatter`'s description promises it never
+  compiles. `corrector` now holds the read tools plus `edit_file`, which `/hunt-typo --fix` needs,
+  and `formatter` the read tools plus `write_file` and `edit_file`, both in both prefix forms; tests
+  pin each list. The plugin manifest test now fails on a shipped agent with no `tools:` line,
+  where it used to skip it.
 - **`arxiv-clean-project` no longer runs `rm -rf`.** The scratch copy of the clone is made without
   `.git` (a `tar --exclude`) instead of copied whole and pruned. A submission folder or zip left by
   an earlier run is replaced only after the user agrees, and is moved into the scratchpad, not
@@ -284,7 +306,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   whatever the old document had on that page. None of the whole-build refusals above saw it: the
   new `.log` shipped pages, and its shipout marks can number the old PDF's pages exactly — after an
   ordinary, non-fatal xelatex error, which also skips xdvipdfmx, they always do. Every label of
-  such a build is now refused (`stalePdf`) on either of two records the document cannot write. One
+  such a build is now refused (`stalePdf`) on either of two records a pdfTeX or XeTeX document
+  compiled without shell escape cannot forge. One
   is the files' order: a finished compile closes its `.aux` before its PDF, so an `.aux` strictly
   newer than the PDF, by any margin, is a later run's. Measured by hand with TeX Live 2026 under
   latexmk 4.88 on Linux (ext4) — no test reproduces these numbers; the tests pin the decision
@@ -302,9 +325,21 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   closing line is searched for with every line break removed, because a real xelatex log glues
   `No pages of output.` onto a 79-column statistics line and a line-by-line reader then took a
   forged record before it; a last record that cannot be parsed counts as none, never as the one
-  before it. Both records only ever refuse, so what remains is a missing refusal, never a wrong
-  page: a run killed before it closed leaves no closing line, LuaTeX's `stop_run` callback can
-  write after it, and the timestamps were measured on Linux ext4 only. The refusal says which record
+  before it. A marker inside the engine's own `Output written on <path>` record is part of the
+  file name, not a record, so a project directory named with `No pages of output.` does not have
+  every label refused. An `.aux` or PDF that is a symbolic link, or not a regular file, gives no
+  timestamp evidence. Both records only ever refuse, so what remains is a missing refusal, and
+  the lookup then answers as it did before this check existed — for this bug, the old PDF's page:
+  a run killed before it closed leaves no closing line; a LuaTeX document can back-date the
+  `.aux` (`lfs.touch` works even under `-no-shell-escape`) or write after the closing line (a
+  `stop_run` callback); with shell escape on, any document can do both; and the timestamps were
+  measured on Linux ext4 only. A label lookup whose `.aux` was not read with the PDF it opens is
+  an internal error, not a lookup that silently skips the timestamp check. Under tectonic a
+  compile now first removes the root's `.aux`, `.fls`, `.log`, `.synctex.gz` and `.fdb_latexmk`
+  from its build directory (regular files and links, never followed): tectonic writes only the
+  PDF and the `.log` there, so a build directory latexmk had used kept latexmk's `.aux` beside
+  tectonic's PDF, labels resolved from it with neither record firing, and a later latexmk compile
+  called tectonic's PDF up to date. The refusal says which record
   showed it, and `pdf_geometry kinds: ["floats"]` notes the same state without refusing.
 - **`compile` names a missing engine.** When latexmk could not run `xelatex`, `lualatex` or
   `pdflatex` (the shell reported it not found), the result was `FAILED … 0 error(s)` with nothing
@@ -331,10 +366,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   ignores, does not count as opting in, so a refused command or a failed TikZ externalization
   still gets its hint, and an overlay's variant line does not claim shell escape was on. Under `lualatex` a refused command is logged as
   `system(…) executed.`, because `pdftexcmds.lua` reports the refusing stub `-no-shell-escape`
-  leaves in place, so that line counts as a refusal only when the log carries no
+  leaves in place, so that line counts as a refusal unless the log's header carries a
   `system commands enabled.` banner. The hint is fixed server text, and a forged log line can only
-  add it. A latexmkrc — the project's, or a user or system one — can still turn shell escape back
-  on, since latexmk hands the flag to the engine through `%O`.
+  add it. Which flag it names comes from the refused commands themselves: a refused command that
+  is not a TeX engine call (`repstopdf`, `makeindex`, …) gets `restrictedShellEscape`, whatever
+  else the log says — a TikZ externalization message, which a document can write, adds the TikZ
+  hint beside it but never removes it or changes its advice; refused engine calls alone get
+  `shellEscape`, which no allow-list replaces, and both kinds together get both. A latexmkrc — the project's, or a user or system one — can still turn shell escape back
+  on, since latexmk hands the flag to the engine through `%O`; when the engine's log shows it on
+  although the call set neither flag, every latexmk compile now says so in `hint`, naming
+  restricted mode when the banner is the restricted one (tectonic reads no latexmkrc and gets no
+  such claim). When that override left restricted mode in effect, the refused-command hint names
+  only `shellEscape: true`, since `restrictedShellEscape` would run nothing more; when it left full
+  shell escape on, no command was refused and there is no refused-command hint at all. Shell
+  escape's state is read only from the engine's own banner at the head of the log, before the
+  document is read, so no line the document writes can add the override warning, take the flag a
+  refused command needs out of a hint, change how much risk it states, or bring back a refusal
+  hint under full shell escape. When no engine log could be read — latexmk's own output stands in
+  when a latexmkrc renames the job — a banner in that output adds only a note that a latexmkrc
+  may have turned shell escape on, and nothing claims it was off.
+- **TikZ externalization advice no longer offers `restrictedShellEscape`.** The hint, the
+  collapsed error, the compile tool's description and the docs called it preferred for
+  `\tikzexternalize`, but externalization runs the engine itself and TeX Live's restricted
+  allow-list (`repstopdf`, `makeindex`, `bibtex`, …) holds no engine, so that retry could never
+  work. They now name `shellEscape: true` only, with its cost; `restrictedShellEscape` stays the
+  advice for a refused `repstopdf` or `makeindex`. When the engine's log header shows shell
+  escape fully on, pgf's "did NOT result in a usable output file" (printed whenever a figure is
+  missing, whatever the reason) is no longer blamed on shell escape: there is no TikZ hint, and
+  the collapsed error says the calls failed for another reason and points at each figure's log.
 - **The build directory root is per user, and verified before every build** (#215). Builds went
   under `<tmp>/web-latex-mcp-build/`, one shared, predictable path, so on a multi-user machine
   another local user could create it first or plant links in it: the server would then compile
@@ -345,8 +404,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   another user, or one that grants group or other write access. That root is refused, not
   tightened: a `chmod` would close it without vouching for anything another user placed in it
   while it was open. A root that others could only read or search is tightened to `0700` and
-  judged again. The refusal names the path and says to remove it or
-  point `TMPDIR` at a private directory. On Windows the root is now
+  judged again. The refusal (`Refusing to use build root …`, worded for the PDF tools as well
+  as `compile`) names the path and says to remove it or point `TMPDIR` at a private directory.
+  The temp directory is Node's `os.tmpdir()`: `TMPDIR`, else `TMP`, else `TEMP`, else `/tmp` on
+  macOS and Linux; `TEMP`, else `TMP`, else `%SystemRoot%\temp` on Windows — so setting `TMPDIR`
+  (`TEMP` on Windows) overrides whichever one is in effect. The directories below the root —
+  the project's build dir, its mirrored subdirectories (the root judged once per mirror, not once
+  per directory), `render_pages`' image dir and an overlay's
+  variant — are made one level at a time, never by a recursive `mkdir`, which recreated a root removed between
+  the check and the build (a `/tmp` cleaner) under the process umask, or followed a root swapped
+  for a link: a vanished root is made again the verified way, `0700`, the root is judged again
+  once they exist, and a level that is a link is refused. The root's parent, the temp directory
+  itself, is not checked: under a world-writable temp directory without the sticky bit, another
+  user can rename the root away and put their own in its place between a check and the build or
+  read that follows. The default `/tmp` is sticky; a `TMPDIR` should be too, or private. On Windows the root is now
   `%TEMP%\web-latex-mcp-build-<user name>` (the name cut to one safe path segment), so two
   accounts sharing one `TEMP` — `TEMP=C:\Temp` on a managed machine — no longer share a root. Its
   owner and ACL are **not** verified on Windows, only that it is a real directory and not a
@@ -377,11 +448,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   also matches `..foo/main.tex`, a path inside it. Every one erred the refusing way, so nothing
   escaped, but a file under `..foo/` was refused or reported as outside the project by the sandbox
   check (`resolveInside`), the symlink-escape guard, link-target naming, the aux `\@input` reader,
-  compile-log and SyncTeX path rebasing, and the workspace's git-exclude entry. All of them, and
-  the overlay farm, now use one `climbsOut` helper in `src/lib/paths.ts`, which takes `..` only as a
+  compile-log and SyncTeX path rebasing, and the workspace's git-exclude entry. All of them, the
+  overlay farm and the build directory's mirror of the root file's directory tree now use one
+  `climbsOut` helper in `src/lib/paths.ts`, which takes `..` only as a
   whole first segment, ended by the platform separator or by `/`. Both are needed: several callers
   pass a POSIX-joined path, which on Windows carries `/`, and a helper testing only the native
   separator would have accepted a real climb there — the dangerous direction for a sandbox guard.
+  SyncTeX's path rebasing also treats an input on another Windows drive, where `path.relative`
+  returns an absolute path, as outside the project: it gets the base name, as every outside input
+  does, where it came back as the other drive's full path.
 - **A TeX control sequence in a `.bib` is no longer read as a bibliography entry** (#222).
   `parseBibtex` started an entry at any `@` followed by a word and a brace, so
   `\@ifundefined{theHchapter}{…}{}` in a `.bib` outside `@preamble` — a `\makeatletter` block, or a

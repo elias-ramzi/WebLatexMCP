@@ -112,7 +112,7 @@ describe.skipIf(isWin)('a compile refuses a planted build root (#215)', () => {
     })
       .compile({ projectDir: project, rootFile: 'main.tex' })
       .catch((e: unknown) => e);
-    expect((err as Error).message).toContain(`Refusing to build in ${buildRoot()}`);
+    expect((err as Error).message).toContain(`Refusing to use build root ${buildRoot()}`);
     expect((err as Error).message).toContain(`${missing}, does not exist`);
     expect((err as Error).message).toContain('Point TMPDIR (TEMP on Windows) at an existing');
     expect(ran).toBe(0);

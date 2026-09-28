@@ -88,16 +88,18 @@ function textOf(res: unknown): string {
     .join('\n');
 }
 
+/** Exact text, so the staged gap is 10 s — whole, even seconds, which read back unchanged on a
+ *  filesystem with 1-second or 2-second timestamps (a 1.4 s gap reads back as 2.0 s there). */
 const RECORDS =
   'the PDF beside it is not the output of the last compile: the .aux was written ' +
-  '1.4 s after the PDF, while a compile that finishes writes its .aux before its PDF; and the ' +
+  '10.0 s after the PDF, while a compile that finishes writes its .aux before its PDF; and the ' +
   "engine's closing line in the .log says that run wrote 2 page(s) to its .xdv file, while the " +
   'PDF has 3 page(s). No page was assumed.';
 
 describe('a stale PDF beside a newer .aux, through the tools (#220)', () => {
   it('extract_text refuses the label instead of returning the old page 2 ("B")', async () => {
     const { client, userDir } = await setup();
-    await stage(userDir, 1_400);
+    await stage(userDir, 10_000);
     const res = await client.callTool({
       name: 'extract_text',
       arguments: { project: 'doc', labels: ['a'] },
@@ -136,7 +138,7 @@ describe('a stale PDF beside a newer .aux, through the tools (#220)', () => {
 
   it('render_pages refuses it too, before anything is rendered', async () => {
     const { client, userDir } = await setup();
-    await stage(userDir, 1_400);
+    await stage(userDir, 10_000);
     const res = await client.callTool({
       name: 'render_pages',
       arguments: { project: 'doc', labels: ['a'], inline: false },
@@ -147,7 +149,7 @@ describe('a stale PDF beside a newer .aux, through the tools (#220)', () => {
 
   it('pdf_geometry kinds: ["floats"] returns the index with a note that the PDF is not its run', async () => {
     const { client, userDir } = await setup();
-    await stage(userDir, 1_400);
+    await stage(userDir, 10_000);
     const res = await client.callTool({
       name: 'pdf_geometry',
       arguments: { project: 'doc', kinds: ['floats'] },
@@ -164,7 +166,7 @@ describe('a stale PDF beside a newer .aux, through the tools (#220)', () => {
     // timestamps speak (a written count has nothing to be compared with).
     expect(out.note).toContain(
       'The PDF beside the .aux is not the output of the last compile: the .aux was ' +
-        'written 1.4 s after the PDF, while a compile that finishes writes its .aux before its ' +
+        'written 10.0 s after the PDF, while a compile that finishes writes its .aux before its ' +
         'PDF. That compile stopped without writing a PDF',
     );
     expect(textOf(res)).toContain('is not the output of the last compile');

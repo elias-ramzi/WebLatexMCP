@@ -57,6 +57,8 @@ interface StubBehaviour {
   failEarly?: boolean;
   /** Appended to a successful run's log. */
   extraLog?: string;
+  /** Put before a successful run's log: the engine's own header, where its shell-escape banner is. */
+  logHeader?: string;
   /** Run inside the build, with the directory the engine was handed. */
   duringBuild?: (workDir: string) => Promise<void>;
 }
@@ -96,7 +98,10 @@ function stubCompiler(requests: CompileRequest[], behaviour: StubBehaviour = {})
         `PWD ${path.join(workDir, logBaseDir(req.rootFile))}\nINPUT main.tex\nINPUT ./sections/b.tex\n`,
       );
       // One error located in the overlaid file, so the snippet has to come from the variant.
-      const log = './sections/b.tex:1: Undefined control sequence.\n' + (behaviour.extraLog ?? '');
+      const log =
+        (behaviour.logHeader ?? '') +
+        './sections/b.tex:1: Undefined control sequence.\n' +
+        (behaviour.extraLog ?? '');
       return {
         success: true,
         pdfPath,
@@ -117,7 +122,11 @@ async function tmp(prefix: string): Promise<string> {
 }
 
 async function setup(
-  opts: { extraLog?: string; duringBuild?: (workDir: string) => Promise<void> } = {},
+  opts: {
+    extraLog?: string;
+    logHeader?: string;
+    duringBuild?: (workDir: string) => Promise<void>;
+  } = {},
 ) {
   const remote = await createFakeRemote({
     'main.tex': MAIN_TEX,
@@ -140,7 +149,11 @@ async function setup(
     new ProjectRegistry(workspace),
   );
   const requests: CompileRequest[] = [];
-  const behaviour: StubBehaviour = { extraLog: opts.extraLog, duringBuild: opts.duringBuild };
+  const behaviour: StubBehaviour = {
+    extraLog: opts.extraLog,
+    logHeader: opts.logHeader,
+    duringBuild: opts.duringBuild,
+  };
   ctx.compiler = new CompilerResolver('latexmk', false, () => stubCompiler(requests, behaviour));
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -240,11 +253,15 @@ describe('compile with an overlay', () => {
   });
 
   it('qualifies "untouched" when shell escape was on', async () => {
-    const { client } = await setup();
+    // "off" is said only on the engine's own header, read and holding no banner.
+    const { client } = await setup({
+      logHeader: 'This is pdfTeX, Version 3.141592653-2.6-1.40.26\n**main.tex\n',
+    });
     const plain = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
     expect(textOf(plain)).toContain(
-      'The source (checked: no project file changed while it built — of .git, only its ' +
-        'hooks, config and info/ are checked), the main build, the surfaced PDF and the viewer ' +
+      'The source (checked: no project file changed while it built — of a .git directory at ' +
+        'the project root, if there is one, only what git runs or reads its configuration from, ' +
+        'such as hooks/ and config, is checked), the main build, the surfaced PDF and the viewer ' +
         'are untouched. Shell escape was off for this build.',
     );
     const escaped = await client.callTool({
@@ -445,12 +462,67 @@ describe('compile with an overlay', () => {
   it('does not claim shell escape was disabled when the log shows the project re-enabled it', async () => {
     // latexmk's -no-shell-escape reaches the engine only through %O: a project latexmkrc of
     // `$pdflatex = 'pdflatex %O -shell-escape %S'` (or one with no %O) turns it back on, and the
-    // engine's banner is what says so.
-    const { client } = await setup({ extraLog: ' \\write18 enabled.\n' });
+    // engine's banner — in the log's header, which the engine writes before it reads the
+    // document — is what says so.
+    const { client } = await setup({
+      logHeader:
+        'This is pdfTeX, Version 3.141592653-2.6-1.40.26\n \\write18 enabled.\n**main.tex\n',
+    });
     const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
     expect(res.isError ?? false, textOf(res)).toBe(false);
     expect(textOf(res)).not.toMatch(/shell escape was disabled/i);
+    expect(textOf(res)).not.toContain('Shell escape was off for this build.');
     expect(textOf(res)).toContain("a latexmkrc (the project's own, or a user or system one)");
+  });
+
+  it('a banner the document wrote into the body blames no latexmkrc in the variant line', async () => {
+    // A genuine -no-shell-escape run (no banner in the header) whose document `\typeout`s the
+    // banner's shape: nothing re-enabled shell escape, and no latexmkrc overrode anything.
+    const { client } = await setup({
+      logHeader: 'This is pdfTeX, Version 3.141592653-2.6-1.40.26\n**main.tex\n',
+      extraLog: ' \\write18 enabled.\n',
+    });
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(textOf(res)).toContain('Shell escape was off for this build.');
+    expect(textOf(res)).not.toContain('latexmkrc');
+  });
+
+  /**
+   * What `collectOutcome` hands back when the engine's `.log` is not where the server looks (a
+   * latexmkrc setting `$jobname`): latexmk's captured output, latexmk's own lines first, and no
+   * `**` line — so no header the server can vouch for. Lines 1–3 are verbatim from a TL2019 run
+   * whose rc also appended `-shell-escape`.
+   */
+  const LATEXMK_STDOUT = (banner: boolean): string =>
+    "Latexmk: applying rule 'pdflatex'...\n" +
+    'This is pdfTeX, Version 3.14159265-2.6-1.40.20 (TeX Live 2019/Debian) (preloaded format=pdflatex)\n' +
+    (banner ? ' \\write18 enabled.\n' : '') +
+    'entering extended mode\n(./main.tex\n';
+
+  it('with no engine log to read, the variant line does not claim shell escape was off', async () => {
+    const { client } = await setup({ logHeader: LATEXMK_STDOUT(false) });
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(textOf(res)).not.toContain('Shell escape was off for this build.');
+    expect(textOf(res)).toContain(
+      'Whether shell escape was off for this build could not be confirmed',
+    );
+    // Nothing in the output says it was on, so nothing is added.
+    expect(textOf(res)).not.toContain('shell-escape banner');
+  });
+
+  it('with no engine log to read, a banner in the output adds a hedged note, never a claim', async () => {
+    const { client } = await setup({ logHeader: LATEXMK_STDOUT(true) });
+    const res = await client.callTool({ name: 'compile', arguments: { overlay: OVERLAY } });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    expect(textOf(res)).not.toContain('Shell escape was off for this build.');
+    expect(textOf(res)).toContain(
+      'Whether shell escape was off for this build could not be confirmed',
+    );
+    const hint = (res.structuredContent as { hint?: string }).hint ?? '';
+    expect(hint).toContain('shows a shell-escape banner, but no engine log confirms it');
+    expect(hint).not.toContain('overrode');
   });
 
   it('refuses a root spelled with `..`, absolute or drive-qualified, before reading or staging anything', async () => {

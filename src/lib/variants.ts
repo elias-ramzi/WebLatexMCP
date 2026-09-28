@@ -27,6 +27,7 @@
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import {
   copyFile,
   link,
@@ -42,7 +43,12 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { buildDir, buildPdfPathIn, ensureBuildRoot } from '../services/compiler.js';
+import {
+  buildDir,
+  buildPdfPathIn,
+  ensureBuildRoot,
+  mkdirUnderBuildRoot,
+} from '../services/compiler.js';
 import type { Engine } from '../services/compiler.js';
 import { applyEditsToContent } from '../services/fileService.js';
 import type { AnyEditOp } from '../services/fileService.js';
@@ -53,7 +59,7 @@ import { matchIsCommented, supportsLineComments } from './rewriteMode.js';
 import type { SnippetReader } from './sourceSnippet.js';
 
 /**
- * Variants kept per project: the most recently compiled (manifest `usedAt`); the rest are removed
+ * Variants kept per project: the most recently compiled (manifest `seq`); the rest are removed
  * after each overlay compile.
  */
 export const MAX_VARIANTS = 4;
@@ -79,6 +85,23 @@ const HANDLE_RE = /^v[0-9a-f]{12}$/;
  * `LatexMkRc` on a case-sensitive filesystem costs nothing anyone needs.
  */
 const LATEXMK_RC_NAMES = new Set(['latexmkrc', '.latexmkrc']);
+
+/**
+ * Whether the final component of `rel` (project-relative POSIX) names a latexmk rc file — judged,
+ * as `isBibFile` judges a `.bib`, on the literal name AND on the name Windows would open: win32
+ * strips trailing dots and spaces from the final component, and `name:stream[:$DATA]` addresses a
+ * stream of `name`, so `latexmkrc.`, `latexmkrc `, `latexmkrc::$DATA` and `.latexmkrc.` all write
+ * the rc file there. The final component is cut at its first `:`, then stripped of trailing dots
+ * and spaces, then case-folded. On every platform: on POSIX the second reading refuses a file
+ * literally named `latexmkrc.`, which costs one refusal — the fail-safe direction. Pure.
+ */
+function isLatexmkRcName(rel: string): boolean {
+  const base = path.posix.basename(rel);
+  if (LATEXMK_RC_NAMES.has(foldCaseName(base))) return true;
+  const colon = base.indexOf(':');
+  const windowsName = (colon === -1 ? base : base.slice(0, colon)).replace(/[. ]+$/, '');
+  return LATEXMK_RC_NAMES.has(foldCaseName(windowsName));
+}
 
 /** A caller-supplied handle, validated BEFORE it is ever joined into a path. */
 export function isVariantHandle(s: string): boolean {
@@ -131,14 +154,15 @@ const caseProbeCache = new Map<string, Promise<boolean>>();
  * case-sensitive. Cached per directory for the process; a probe that fails is not cached, and
  * throws. Only ever run in a directory the server owns (a project's variants dir under the build
  * root), never in a project: it writes — and only once {@link ensureBuildRoot} has created or
- * verified that root, since it creates `dir` with everything above it (see `nameFoldFor`).
+ * verified that root, since it creates `dir` with everything above it (see `nameFoldFor`; below
+ * the root, level by level and with the root judged again, {@link mkdirUnderBuildRoot}).
  */
 export function probeCaseInsensitive(dir: string): Promise<boolean> {
   const key = path.resolve(dir);
   const cached = caseProbeCache.get(key);
   if (cached) return cached;
   const probe = (async () => {
-    await mkdir(key, { recursive: true });
+    await mkdirUnderBuildRoot(key);
     const tag = randomBytes(6).toString('hex');
     const upper = path.join(key, `CaseProbe-${tag}.tmp`);
     await writeFile(upper, '', { flag: 'wx' });
@@ -506,6 +530,18 @@ async function farmCollision(dest: string, rel: string, err: unknown): Promise<E
 }
 
 /**
+ * Create the farm directory `dest` (the entry at project-relative `rel`), never adopting one
+ * already there: an `EEXIST` is refused in words ({@link farmCollision}), like every placement.
+ */
+async function farmMkdir(dest: string, rel: string): Promise<void> {
+  try {
+    await mkdir(dest);
+  } catch (err) {
+    throw isExists(err) ? await farmCollision(dest, rel, err) : err;
+  }
+}
+
+/**
  * The first two of `names` (one source directory's mirrored entries) that are one name under
  * {@link foldCaseName}, or undefined. Pure. That fold (`toLowerCase`) is an approximation of the
  * farm filesystem's, not a copy of it: it is Unicode-aware, as NTFS and APFS are (git's
@@ -530,16 +566,17 @@ function caseTwins(names: string[]): [string, string] | undefined {
  * A check, for one farm, that refuses a source directory holding two entries the farm's temp
  * directory would hold as one — up front, before either is linked, since the second would fail
  * with `EEXIST` or (a win32 copy, before copies were exclusive) replace the first. The names are
- * compared under {@link foldCaseName}, and the farm is probed ({@link foldsCaseIn}, in the
- * directory the farm is built in) only when two names fold together, so a project without such a
- * pair costs no probe, and the probe's answer is kept for the check's lifetime (one farm, or one
- * placement). Entries the platform's linker leaves out ({@link linkerSkips}) are not counted. A
+ * compared under {@link foldCaseName}, and the farm is probed ({@link foldsCaseIn}, in
+ * `probeDir` — a stage passes the project's variants directory, where every other fold decision
+ * of a variant is probed — else the directory the farm is built in) only when two names fold
+ * together, so a project without such a pair costs no probe, and the probe's answer is kept for
+ * the check's lifetime (one farm, or one placement). Entries the platform's linker leaves out ({@link linkerSkips}) are not counted. A
  * pair that fold does not see ({@link caseTwins}) still cannot overwrite anything: its `EEXIST`
  * is refused by {@link linkEntry}.
  */
 function farmTwinCheck(
   farmDir: string,
-  opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform },
+  opts: { caseProbe?: CaseProbe; platform?: NodeJS.Platform; probeDir?: string },
 ): (relDir: string, entries: FarmEntry[]) => Promise<void> {
   const platform = opts.platform ?? process.platform;
   let folds: Promise<boolean> | undefined;
@@ -550,7 +587,10 @@ function farmTwinCheck(
     for (const e of entries) if (!(await linkerSkips(e.src, e.kind, platform))) placed.push(e.name);
     const twins = caseTwins(placed);
     if (twins === undefined) return;
-    folds ??= foldsCaseIn(path.dirname(path.resolve(farmDir)), { ...opts, platform });
+    folds ??= foldsCaseIn(opts.probeDir ?? path.dirname(path.resolve(farmDir)), {
+      caseProbe: opts.caseProbe,
+      platform,
+    });
     if (!(await folds)) return;
     const at = (n: string): string => (relDir === '' ? n : `${relDir}/${n}`);
     throw new Error(farmTwinMessage(at(twins[0]), at(twins[1])));
@@ -657,8 +697,13 @@ function kindOf(entry: {
  * A source directory holding two entries the farm's temp directory would hold as one (`Notes.tex`
  * beside `notes.tex` in a case-sensitive project, where the temp directory folds case — the macOS
  * and Windows default) is refused in words naming both, before either is linked
- * ({@link farmTwinCheck}; `caseProbe` as for {@link applyOverlay}, run in the directory the farm is
- * built in); an entry the farm already holds is never replaced ({@link linkEntry}).
+ * ({@link farmTwinCheck}; `caseProbe` as for {@link applyOverlay}, run in `probeDir`, else in the
+ * directory the farm is built in); an entry the farm already holds is never replaced
+ * ({@link linkEntry}).
+ *
+ * The default probe WRITES — into `probeDir`, or `dirname(farmDir)` without one — and creates
+ * `farmDir` with every missing directory above it, so `farmDir` (and `probeDir`) must be a
+ * directory the server owns under the build root, never one a caller named.
  */
 export async function buildLinkFarm(
   projectDir: string,
@@ -670,6 +715,7 @@ export async function buildLinkFarm(
     maxCopyBytes?: number;
     budget?: FarmBudget;
     caseProbe?: CaseProbe;
+    probeDir?: string;
   },
 ): Promise<number> {
   const skip = new Set(opts.skip.map((p) => path.resolve(p)));
@@ -688,7 +734,11 @@ export async function buildLinkFarm(
   const budget =
     opts.budget ?? newFarmBudget({ maxEntries: opts.maxEntries, maxCopyBytes: opts.maxCopyBytes });
   const base = path.resolve(projectDir);
-  const refuseTwins = farmTwinCheck(farmDir, { caseProbe: opts.caseProbe, platform });
+  const refuseTwins = farmTwinCheck(farmDir, {
+    caseProbe: opts.caseProbe,
+    platform,
+    probeDir: opts.probeDir,
+  });
   let count = 0;
   // `srcReal` is `srcDir` through its links: a real directory's realpath is its parent's joined
   // with its name, and a linked one is never walked, so it is resolved once, at the root.
@@ -710,18 +760,14 @@ export async function buildLinkFarm(
       const dest = path.join(destDir, name);
       const rel = toPosix(path.relative(base, src));
       if (kind === 'dir') {
-        try {
-          await mkdir(dest);
-        } catch (err) {
-          throw isExists(err) ? await farmCollision(dest, rel, err) : err;
-        }
+        await farmMkdir(dest, rel);
         await walk(src, real, dest);
       } else {
         await linkEntry(src, dest, kind, platform, budget, rel);
       }
     }
   };
-  await mkdir(farmDir, { recursive: true });
+  await mkdirUnderBuildRoot(farmDir);
   await walk(base, await realpath(base), farmDir);
   return count;
 }
@@ -801,8 +847,12 @@ export class SourceSnapshotError extends Error {
 
 /**
  * What {@link snapshotSource} watches of the project root's `.git`: the hooks the next git command
- * runs, the config that can name a hook path, an editor, a pager or an fsmonitor command, and
- * `info/` (exclude, attributes, sparse-checkout). All small, and rarely written — but not never:
+ * runs, the config that can name a hook path, an editor, a pager or an fsmonitor command,
+ * `config.worktree` (read on top of `config` once `extensions.worktreeConfig` is set), `commondir`
+ * (which makes git read ANOTHER directory's config and hooks — `../evil` there ran
+ * `evil/config`'s `core.fsmonitor` on the next `git status`; git never writes it in a main
+ * repository), and `info/` (exclude, attributes, sparse-checkout). `modules/` is walked apart,
+ * narrower still ({@link GIT_MODULE_WATCHED}). All small, and rarely written — but not never:
  * `git config` rewrites `config`, and `git gc`/`repack` refresh `info/refs` — while the rest of
  * `.git` (`index`, `objects/`, `refs/`, `logs/`) moves on every git call and stays out. What keeps
  * a git call from showing up as the build's write is that `compile` holds the project lock across
@@ -811,7 +861,19 @@ export class SourceSnapshotError extends Error {
  * the server during the build can, and is then reported as a change: a false alarm, never a
  * missed write. Sorted.
  */
-const GIT_WATCHED = ['config', 'hooks', 'info'] as const;
+const GIT_WATCHED = ['commondir', 'config', 'config.worktree', 'hooks', 'info'] as const;
+
+/**
+ * What {@link snapshotSource} watches in a submodule's git directory (`.git/modules/<name>/`,
+ * nested ones under `modules/` again): what `git status` in the superproject — which recurses
+ * into every submodule — reads a command from or runs. `info/` is left out, and so are the
+ * `index`, `objects/`, `refs/` and `logs/` git moves on every call. A directory under
+ * `.git/modules` is a submodule's git directory when git's `is_git_directory` would say so — a
+ * regular `HEAD` file, `objects/` and `refs/` directories — and a `modules/` directory itself
+ * never is; any other is a step of a slash-named submodule's name (`libs/foo`), and only its
+ * subdirectories are walked.
+ */
+const GIT_MODULE_WATCHED = new Set(['commondir', 'config', 'config.worktree', 'hooks']);
 
 /** `p` through its links, or `p` itself when it does not exist (a skip dir need not). */
 async function realpathOrSelf(p: string): Promise<string> {
@@ -826,11 +888,12 @@ async function realpathOrSelf(p: string): Promise<string> {
 /**
  * Snapshot the project's tree FOLLOWING its symbolic links, reading no file's content — `.git`
  * left out but for a narrow part of the project root's, and two kinds of directory the server
- * owns. Of the root's `.git` directory only {@link GIT_WATCHED} is walked (`config`, `hooks/`,
- * `info/`): a write there is the most dangerous one a build can make, since the next git command
- * runs it, while the rest of `.git` changes on every git call and would bury the answer. A `.git`
- * that is a file (a worktree's gitfile) is recorded like any file; a `.git` anywhere below the root
- * (a nested repository, or one behind a link) is left out whole. A `skip` directory (the workspace) is left
+ * owns. Of the root's `.git` directory only {@link GIT_WATCHED} is walked (`commondir`, `config`,
+ * `config.worktree`, `hooks/`, `info/`), and of its `modules/` only each submodule's
+ * {@link GIT_MODULE_WATCHED}: a write there is the most dangerous one a build can make, since the
+ * next git command runs it, while the rest of `.git` changes on every git call and would bury the
+ * answer. A `.git` that is a file (a worktree's gitfile) is recorded like any file; a `.git`
+ * anywhere below the root (a nested repository, or one behind a link) is left out whole. A `skip` directory (the workspace) is left
  * out when a directory IS it, by its spelled path or its realpath — never what lies under it,
  * since in the workspace-local layout a local project contains the workspace and the workspace
  * holds other clones a project link can reach into, and the build writes through such a link like
@@ -967,10 +1030,14 @@ export async function snapshotSource(
     }
     return true;
   };
-  // The project root's `.git` directory: only GIT_WATCHED, each walked in full when it exists.
+  // The project root's `.git` directory: only GIT_WATCHED, each walked in full when it exists,
+  // and `modules/` through walkModules.
   const walkGit: Descend = async (dir, real, relDir) => {
     walked.add(real);
-    for (const name of GIT_WATCHED) {
+    for (const [name, descend] of [
+      ...GIT_WATCHED.map((n): [string, Descend] => [n, walk]),
+      ['modules', walkModules] as [string, Descend],
+    ]) {
       const rel = `${relDir}/${name}`;
       let st;
       try {
@@ -981,10 +1048,66 @@ export async function snapshotSource(
       }
       const kind = kindOf(st);
       if (kind === undefined) continue;
-      if (!(await visit(dir, real, relDir, name, kind, walk))) return false;
+      if (!(await visit(dir, real, relDir, name, kind, descend))) return false;
     }
     return true;
   };
+  // A `modules/` directory — the root's `.git/modules`, or one inside a submodule's git
+  // directory — and every directory under it: a submodule's git directory, of which only
+  // GIT_MODULE_WATCHED is walked in full and `modules/` again through here; or a step of a
+  // slash-named submodule's name, of which only the subdirectories are walked. The `modules/`
+  // directory itself is never a git directory (`container`), whatever its entries: a submodule
+  // named `HEAD` put a `HEAD` there. Below it, a git directory is judged the way git's
+  // `is_git_directory` judges one — `HEAD` a regular file or a symbolic link
+  // (`core.preferSymlinkRefs`), and either `objects/` and `refs/` directories or a `commondir`
+  // file, through which a git directory shares another's objects and refs — never by a `HEAD`
+  // entry alone, which a submodule named `libs/HEAD` puts in the step `libs`. `objects` and `refs`
+  // may be links to directories, as git's `access()` check allows: those two alone are `stat`ed,
+  // which follows a link, only to decide this — the walk itself still never follows one. Either
+  // mistake left the submodule's config and hooks unwatched. Bounded like the rest of the walk:
+  // every directory recorded counts toward `maxEntries`.
+  const isGitDir = async (dir: string, listing: Dirent[]): Promise<boolean> => {
+    const entry = (name: string): Dirent | undefined => listing.find((e) => e.name === name);
+    const head = entry('HEAD');
+    if (!head || !(head.isFile() || head.isSymbolicLink())) return false;
+    if (entry('commondir')?.isFile()) return true;
+    const isDirOrLinkToOne = async (name: string): Promise<boolean> => {
+      const e = entry(name);
+      if (!e) return false;
+      if (e.isDirectory()) return true;
+      if (!e.isSymbolicLink()) return false;
+      try {
+        return (await stat(path.join(dir, name))).isDirectory();
+      } catch {
+        return false;
+      }
+    };
+    return (await isDirOrLinkToOne('objects')) && (await isDirOrLinkToOne('refs'));
+  };
+  const modulesWalker =
+    (container: boolean): Descend =>
+    async (dir, real, relDir) => {
+      walked.add(real);
+      const listing = await at(relDir, () => readdir(dir, { withFileTypes: true }));
+      listing.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      const gitDir = !container && (await isGitDir(dir, listing));
+      for (const entry of listing) {
+        const kind = kindOf(entry);
+        if (kind === undefined) continue;
+        let descend: Descend | undefined;
+        if (gitDir) {
+          if (GIT_MODULE_WATCHED.has(entry.name)) descend = walk;
+          else if (entry.name === 'modules') descend = walkModules;
+        } else if (kind !== 'file') {
+          descend = walkModuleStep;
+        }
+        if (descend === undefined) continue;
+        if (!(await visit(dir, real, relDir, entry.name, kind, descend))) return false;
+      }
+      return true;
+    };
+  const walkModules: Descend = modulesWalker(true);
+  const walkModuleStep: Descend = modulesWalker(false);
   return (await walk(base, baseReal, '')) ? { entries } : undefined;
 }
 
@@ -1039,21 +1162,23 @@ const SOURCE_CHANGES_NAMED = 20;
 
 /**
  * Characters the hint's list of names may take, rendered (each quoted name and the `, ` between
- * them). The names are document-controlled — `\openout` can create a path of any depth, 255 bytes
- * a component — and the hint ships twice, in the text channel and in `structuredContent`, so the
- * list is budgeted, not merely counted, and charged in its JSON form — the larger of the two,
- * where every `"` and `\` of a quoted name costs two characters. The house figure for a merely
- * diagnostic share: the names only point at what is shown in full elsewhere — by `status` and
- * `diff` for a path in the repository, and at the link's target for one under a link.
+ * them), summed over BOTH channels it ships in. The names are document-controlled — `\openout`
+ * can create a path of any depth, 255 bytes a component — and the hint ships twice, in the text
+ * channel and in `structuredContent`, so the caller receives the list twice: it is budgeted, not
+ * merely counted, and every name is charged its text length plus its JSON length (where every `"`
+ * and `\` of a quoted name costs two characters) — never the larger channel alone, which bounds
+ * each channel and not what arrives. The house figure for a merely diagnostic share: the names
+ * only point at what is shown in full elsewhere — by `status` and `diff` for a path in the
+ * repository, and at the link's target for one under a link.
  */
 export const SOURCE_CHANGES_NAMES_BUDGET = 2000;
 
 /**
  * The `hint` for a variant build that changed project files: which ones, what can have written
  * them, and what to do. Names are given in order while there are fewer than
- * {@link SOURCE_CHANGES_NAMED} and their rendered list fits {@link SOURCE_CHANGES_NAMES_BUDGET};
- * naming stops at the first that does not fit, so the named set is a prefix, and the rest are
- * counted. A name is never cut short: a truncated path cannot be passed to a tool. When a changed
+ * {@link SOURCE_CHANGES_NAMED} and their rendered list, text and JSON together, fits
+ * {@link SOURCE_CHANGES_NAMES_BUDGET}; naming stops at the first that does not fit, so the named
+ * set is a prefix, and the rest are counted. A name is never cut short: a truncated path cannot be passed to a tool. When a changed
  * path is the project root's `.git` or under it, a fixed sentence says that status, diff and
  * discard do not reach it and that the next git command runs or reads it.
  */
@@ -1061,10 +1186,13 @@ export function sourceChangedHint(paths: string[]): string {
   const named: string[] = [];
   let used = 0;
   for (const p of paths.slice(0, SOURCE_CHANGES_NAMED)) {
-    // JSON.stringify(x).length - 2: the name as structuredContent carries it, without its quotes.
-    const cost = (named.length > 0 ? ', '.length : 0) + JSON.stringify(quoteId(p)).length - 2;
+    // The text channel's length plus JSON.stringify(x).length - 2, the name as structuredContent
+    // carries it without its quotes: the caller receives both.
+    const quoted = quoteId(p);
+    const cost =
+      (named.length > 0 ? 2 * ', '.length : 0) + quoted.length + JSON.stringify(quoted).length - 2;
     if (used + cost > SOURCE_CHANGES_NAMES_BUDGET) break;
-    named.push(quoteId(p));
+    named.push(quoted);
     used += cost;
   }
   const more = paths.length - named.length;
@@ -1082,7 +1210,8 @@ export function sourceChangedHint(paths: string[]): string {
     "symbolic link, or a link whose target changed, was written at the link's target — check it " +
     'there; a target outside the project is beyond what status, diff and discard reach.' +
     (paths.some((p) => p === '.git' || p.startsWith('.git/'))
-      ? " A path under .git is the repository's own — its hooks, config or info/ — which " +
+      ? " A path under .git is the repository's own — its hooks, config, commondir or info/, " +
+        "or a submodule's config or hooks — which " +
         'status, diff and discard never show or restore, and which the next git command runs or ' +
         'reads: inspect it by hand, and remove what the build wrote, before any git command runs ' +
         '(commit, push, project_sync, or your own).'
@@ -1099,18 +1228,29 @@ export function sourceChangedHint(paths: string[]): string {
  * creates, and every byte it copies, is charged to `budget` — the stage's one budget, shared with
  * {@link buildLinkFarm}. A directory it materialises is judged as {@link buildLinkFarm} judges
  * one: two entries the farm's temp directory would hold as one are refused, naming both
- * (`caseProbe` as there), and nothing already in the farm is replaced.
+ * (`caseProbe` and `probeDir` as there — the default probe writes into `probeDir`, or
+ * `dirname(farmDir)` without one, so both must be the server's own), and nothing already in the
+ * farm is replaced.
  */
 export async function placeOverlayFile(
   farmDir: string,
   projectDir: string,
   relPosix: string,
   content: string,
-  opts: { platform?: NodeJS.Platform; budget?: FarmBudget; caseProbe?: CaseProbe } = {},
+  opts: {
+    platform?: NodeJS.Platform;
+    budget?: FarmBudget;
+    caseProbe?: CaseProbe;
+    probeDir?: string;
+  } = {},
 ): Promise<void> {
   const platform = opts.platform ?? process.platform;
   const budget = opts.budget ?? newFarmBudget();
-  const refuseTwins = farmTwinCheck(farmDir, { caseProbe: opts.caseProbe, platform });
+  const refuseTwins = farmTwinCheck(farmDir, {
+    caseProbe: opts.caseProbe,
+    platform,
+    probeDir: opts.probeDir,
+  });
   const parts = relPosix.split('/');
   const name = parts.pop();
   if (name === undefined || name === '')
@@ -1129,7 +1269,7 @@ export async function placeOverlayFile(
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       // Not mirrored (under a skipped directory): the overlaid file stands alone there.
       chargeEntry(budget);
-      await mkdir(farmCur);
+      await farmMkdir(farmCur, relCur);
       continue;
     }
     if (!isLink) continue;
@@ -1143,7 +1283,7 @@ export async function placeOverlayFile(
     // Before the farm's link is replaced: a refusal leaves the farm as it was.
     await refuseTwins(relCur, mirrored);
     await unlink(farmCur);
-    await mkdir(farmCur);
+    await farmMkdir(farmCur, relCur);
     for (const { name: child, src: childSrc, kind } of mirrored) {
       chargeEntry(budget);
       await linkEntry(
@@ -1166,13 +1306,14 @@ export interface VariantManifest {
   /** The root file, project-relative POSIX. */
   rootFile: string;
   createdAt: string;
-  /** When the variant was last compiled — what retention orders by. */
+  /** When the variant was last compiled — what retention orders manifests without `seq` by. */
   usedAt: string;
   /**
    * The order variants of this project were compiled in: one more than the largest `seq` any of
-   * its manifests held when this one was staged (under the project lock `compile` holds), so it
-   * breaks a tie between two `usedAt` stamps of the same millisecond. Absent from a manifest
-   * written before it existed, which then sorts oldest among its equal-`usedAt` peers.
+   * its manifests held when this one was staged (under the project lock `compile` holds). What
+   * retention orders by ({@link evictVariants}) — not `usedAt`, which a wall clock stepping back
+   * can reorder. Absent from a manifest written before it existed, which then sorts below every
+   * manifest that has one, by `usedAt` among its like.
    */
   seq?: number;
   /** The overlaid files, project-relative POSIX. */
@@ -1269,29 +1410,40 @@ export function evictionFailureHint(err: unknown): string {
 }
 
 /**
+ * Variants in retention order, newest first: by `seq` — strictly increasing across compiles under
+ * the project lock, so it is the compile order whatever the wall clock did (a clock stepped back
+ * between two compiles used to make the older one look newer and evict the newest) — and, below
+ * every manifest that has one, the manifests without a usable `seq` (written before it existed),
+ * ordered among themselves by `usedAt`; an unreadable manifest counts as oldest of all. Never by
+ * listing order. Pure.
+ */
+function byRecency<T extends { manifest: VariantManifest | undefined }>(variants: T[]): T[] {
+  const key = (v: T) => ({ seq: seqOf(v.manifest) ?? -1, usedAt: v.manifest?.usedAt ?? '' });
+  return [...variants].sort((x, y) => {
+    const a = key(x);
+    const b = key(y);
+    if (a.seq !== b.seq) return b.seq - a.seq;
+    return a.usedAt < b.usedAt ? 1 : a.usedAt > b.usedAt ? -1 : 0;
+  });
+}
+
+/**
  * Keep `keep` variants of the project — `current` always among them, then the most recently
- * compiled by manifest `usedAt`, ties broken by `seq` (an unreadable manifest counts as oldest, and
- * one without `seq` as oldest among its equal-`usedAt` peers) — and remove the rest. Only
- * directories named like a handle are considered. Removal is `rm -rf`, which unlinks a farm's
- * links without following them, so the source behind them is never touched. Every handle is
- * tried: one that cannot be removed (a viewer holding its PDF open on Windows) does not keep the
- * rest, and the failures are thrown together afterwards as a {@link VariantEvictionError}.
- * Returns the removed handles.
+ * compiled ({@link byRecency}: by `seq`, then the manifests without one by `usedAt`) — and remove
+ * the rest. Only directories named like a handle are considered. Removal is `rm -rf`, which
+ * unlinks a farm's links without following them, so the source behind them is never touched.
+ * Every handle is tried: one that cannot be removed (a viewer holding its PDF open on Windows)
+ * does not keep the rest, and the failures are thrown together afterwards as a
+ * {@link VariantEvictionError}. Returns the removed handles.
  */
 export async function evictVariants(
   projectDir: string,
   keep: number,
   current: string,
 ): Promise<string[]> {
-  const others = (await readAllManifests(projectDir))
-    .filter(({ handle }) => handle !== current)
-    .map(({ handle, manifest }) => ({
-      handle,
-      usedAt: manifest?.usedAt ?? '',
-      seq: seqOf(manifest) ?? -1,
-    }));
-  // Newest first: by `usedAt`, and within one millisecond by `seq` — never by listing order.
-  others.sort((a, b) => (a.usedAt < b.usedAt ? 1 : a.usedAt > b.usedAt ? -1 : b.seq - a.seq));
+  const others = byRecency(
+    (await readAllManifests(projectDir)).filter(({ handle }) => handle !== current),
+  );
   const removed: string[] = [];
   const failures: Array<{ handle: string; reason: string }> = [];
   for (const { handle } of others.slice(Math.max(0, keep - 1))) {
@@ -1304,6 +1456,27 @@ export async function evictVariants(
   }
   if (failures.length > 0) throw new VariantEvictionError(failures);
   return removed;
+}
+
+/**
+ * The `seq` for the variant `current` about to be staged: one more than the largest any manifest
+ * of the project holds. When that would not be a safe integer (a manifest at
+ * `Number.MAX_SAFE_INTEGER`), the other variants are renumbered `0, 1, …` in their
+ * {@link byRecency} order first — rewriting their manifests, under the project lock the caller
+ * holds — so the order is kept and the next `seq` is small again, rather than one that no longer
+ * reads back as a `seq` (and so sorts as oldest).
+ */
+async function nextSeq(projectDir: string, current: string): Promise<number> {
+  const all = await readAllManifests(projectDir);
+  const next = Math.max(-1, ...all.map((v) => seqOf(v.manifest) ?? -1)) + 1;
+  if (Number.isSafeInteger(next)) return next;
+  const oldestFirst = byRecency(
+    all.filter((v) => v.handle !== current && v.manifest !== undefined),
+  ).reverse();
+  for (const [i, { handle, manifest }] of oldestFirst.entries()) {
+    await writeManifest(variantPaths(projectDir, handle).manifest, { ...manifest!, seq: i });
+  }
+  return oldestFirst.length;
 }
 
 /**
@@ -1374,7 +1547,8 @@ export interface OverlayReader {
  *
  * Refused, before anything is read: more than {@link MAX_OVERLAY_EDITS} edits in total, a path
  * that is empty or leaves the project, a latexmk rc file (`latexmkrc`, `.latexmkrc` — Perl latexmk
- * runs from the farm; its name compared case-insensitively on every filesystem), and a file named
+ * runs from the farm; its name compared case-insensitively on every filesystem, and also as the
+ * name Windows opens, {@link isLatexmkRcName}), and a file named
  * twice — after normalisation, and case-folded when the filesystem the variant is built on is
  * case-insensitive ({@link CaseProbe}, run in the project's variants directory: that is where the
  * two would collide). Refused per file, naming it: a file that does not exist,
@@ -1420,8 +1594,9 @@ export async function applyOverlay(
     }
     // latexmk reads `latexmkrc`/`.latexmkrc` from the directory it runs in — the farm — and runs
     // it as Perl, whatever the shell-escape flags say, so an overlaid one could write the source
-    // through the farm's links. The project's own rc file still runs, as in a normal compile.
-    if (LATEXMK_RC_NAMES.has(foldCaseName(path.posix.basename(rel)))) {
+    // through the farm's links. Judged on the name Windows opens too (`latexmkrc.`). The
+    // project's own rc file still runs, as in a normal compile.
+    if (isLatexmkRcName(rel)) {
       throw new Error(
         `Overlay entry ${i + 1} (${quoteId(rel)}) is a latexmk configuration file, which latexmk ` +
           'runs as Perl code, so an overlay may not replace it: the variant builds among links to ' +
@@ -1662,31 +1837,34 @@ export async function stageVariant(opts: {
   await ensureBuildRoot();
   await refuseLinkedRootDir(opts.projectDir, opts.rootFile, { platform: opts.platform });
   const paths = variantPaths(opts.projectDir, opts.handle);
-  await mkdir(paths.root, { recursive: true });
+  await mkdirUnderBuildRoot(paths.root);
   await rm(paths.src, { recursive: true, force: true });
   const budget = newFarmBudget({
     maxEntries: opts.maxFarmEntries,
     maxCopyBytes: opts.maxFarmCopyBytes,
   });
+  // Every fold decision of a variant is probed in one directory: the project's variants dir,
+  // where `applyOverlay`, `overlaySnippetReader` and `overlayFilesNeverRead` probe too.
+  const probeDir = variantsDir(opts.projectDir);
   await buildLinkFarm(opts.projectDir, paths.src, {
     skip: opts.skip,
     platform: opts.platform,
     budget,
     caseProbe: opts.caseProbe,
+    probeDir,
   });
   for (const [rel, content] of opts.contents) {
     await placeOverlayFile(paths.src, opts.projectDir, rel, content, {
       platform: opts.platform,
       budget,
       caseProbe: opts.caseProbe,
+      probeDir,
     });
   }
-  await mkdir(paths.out, { recursive: true });
+  await mkdirUnderBuildRoot(paths.out);
   const previous = await readManifest(paths.manifest);
   const now = (opts.now ?? new Date()).toISOString();
-  const seq =
-    Math.max(-1, ...(await readAllManifests(opts.projectDir)).map((v) => seqOf(v.manifest) ?? -1)) +
-    1;
+  const seq = await nextSeq(opts.projectDir, opts.handle);
   await writeManifest(paths.manifest, {
     rootFile: normalizeRelPosix(opts.rootFile),
     createdAt: previous?.createdAt ?? now,

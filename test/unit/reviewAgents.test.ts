@@ -154,6 +154,31 @@ describe('corrector', () => {
   });
 });
 
+describe('formatter', () => {
+  // /format-latex dispatches it onto one section file: it creates figures/ and tables/ files and
+  // rewrites its own file once, so it holds write_file and edit_file — and nothing else that
+  // writes. Its description promises it never compiles and never touches a .bib; the list is what
+  // makes that true, since compile, commit, push, discard, delete_file and Bash are absent.
+  const text = readFileSync(path.join(ROOT, '.claude', 'agents', 'formatter.md'), 'utf8');
+  const tools = frontmatterTools(text);
+
+  it('declares its tools, and writes only through write_file and edit_file', () => {
+    expect(tools).toBeDefined();
+    const allowed = new Set([
+      ...READ_ONLY_TOOLS,
+      ...serverTool('write_file'),
+      ...serverTool('edit_file'),
+    ]);
+    expect((tools ?? []).filter((tool) => !allowed.has(tool))).toEqual([]);
+  });
+
+  it('can load its rules and write its files under either install', () => {
+    for (const tool of ['read_file', 'list_skills', 'write_file']) {
+      for (const name of serverTool(tool)) expect(tools ?? []).toContain(name);
+    }
+  });
+});
+
 describe('bundled skill descriptions', () => {
   const dir = path.join(ROOT, '.claude', 'skills');
   const skillDirs = readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory());

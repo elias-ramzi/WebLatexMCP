@@ -178,9 +178,23 @@ describe('shipped agents reach the server under either install', () => {
 
   const prefix = pluginToolPrefix(manifest.name, servers[0] ?? '');
   for (const entry of listed(manifest, 'agents')) {
+    const name = path.posix.basename(entry, '.md');
     const tools = frontmatterTools(readFileSync(path.join(ROOT, entry), 'utf8'));
-    if (tools === undefined) continue; // no list: the agent inherits every tool, both forms
-    it(`${path.posix.basename(entry, '.md')} names each server tool in both forms`, () => {
+    /**
+     * A shipped agent without a `tools:` line inherits EVERY tool the user's session holds —
+     * Bash, `commit`, `push`, `delete_file`, `compile` — whatever its prose promises. `formatter`
+     * shipped that way, describing itself as never compiling. So every agent the plugin installs
+     * must carry an explicit allowlist; a missing one fails here rather than being skipped.
+     */
+    it(`${name} declares a tools: allowlist (without one it inherits every tool)`, () => {
+      expect(
+        tools,
+        `${entry} has no tools: line in its frontmatter, so it inherits Bash, commit, push and every other tool`,
+      ).toBeDefined();
+      expect(tools!.length).toBeGreaterThan(0);
+    });
+    if (tools === undefined) continue; // reported by the test above
+    it(`${name} names each server tool in both forms`, () => {
       const manual = tools
         .filter((tool) => tool.startsWith(MANUAL))
         .map((tool) => tool.slice(MANUAL.length))

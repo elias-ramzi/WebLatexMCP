@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { mkdirUnderBuildRoot } from './compiler.js';
 import type { Box, Matrix, TextItemLike } from '../lib/pdfGeometry.js';
 import {
   IDENTITY,
@@ -745,7 +746,9 @@ export class PdfRenderer implements PdfRenderService {
       const pageCount = doc.numPages;
       const { pages: selected, skipped } = selectPages(req.pages, pageCount);
 
-      await mkdir(req.outDir, { recursive: true });
+      // Never a recursive mkdir: under the build root it would recreate a root a /tmp cleaner
+      // removed since the caller's check, under the process umask.
+      await mkdirUnderBuildRoot(req.outDir);
 
       const rendered: RenderedPage[] = [];
       for (const pageNum of selected) {

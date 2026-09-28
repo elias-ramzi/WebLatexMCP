@@ -28,15 +28,43 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-let prevPrompt: string | undefined;
-beforeAll(() => {
+/**
+ * Git runs hermetically here: no global or system config, no askpass. Every clone below talks to
+ * a remote demanding Basic auth, and with no token resolved the server leaves git its OWN
+ * credential helpers — the developer's. `clonedLegacyProject`'s plain `git clone` of a
+ * token-bearing URL also `approve`s that credential into them, keyed by the server's ephemeral
+ * port, so each run stored `git:<TOKEN>@127.0.0.1:<port>` in the real credential store; a later
+ * run whose remote drew one of those ports then authenticated the "fails on auth" clone from the
+ * store and saw it succeed (`isError` undefined). An empty `GIT_CONFIG_GLOBAL` closes both halves:
+ * nothing is asked of, or written into, a helper this file does not own. `GIT_ASKPASS=''` because
+ * git consults askpass even under `GIT_TERMINAL_PROMPT=0`, and an empty value stops the lookup
+ * before `core.askPass`/`SSH_ASKPASS`.
+ */
+const HERMETIC_ENV = [
+  'GIT_TERMINAL_PROMPT',
+  'GIT_CONFIG_GLOBAL',
+  'GIT_CONFIG_NOSYSTEM',
+  'GIT_ASKPASS',
+];
+const prevEnv = new Map<string, string | undefined>();
+let gitHome = '';
+beforeAll(async () => {
+  for (const key of HERMETIC_ENV) prevEnv.set(key, process.env[key]);
+  gitHome = await mkdtemp(path.join(os.tmpdir(), 'ovl-urlcred-git-'));
+  const globalConfig = path.join(gitHome, 'gitconfig');
+  await writeFile(globalConfig, '');
   // What `src/index.ts` sets for the server process: fail on a missing credential, never prompt.
-  prevPrompt = process.env.GIT_TERMINAL_PROMPT;
   process.env.GIT_TERMINAL_PROMPT = '0';
+  process.env.GIT_CONFIG_GLOBAL = globalConfig;
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  process.env.GIT_ASKPASS = '';
 });
-afterAll(() => {
-  if (prevPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
-  else process.env.GIT_TERMINAL_PROMPT = prevPrompt;
+afterAll(async () => {
+  for (const [key, value] of prevEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  await rm(gitHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 const TOKEN = 'tok-8c1dSECRETa77e';

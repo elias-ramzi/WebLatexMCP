@@ -233,7 +233,7 @@ describe('the default case probe writes only in a verified build root (#215 rule
     await symlink(theirs, root);
     await expect(
       withTmpdir(tmp, () => applyOverlay(new FileService(), src, twoEntries)),
-    ).rejects.toThrow(/Refusing to build in .*symbolic link/);
+    ).rejects.toThrow(/Refusing to .*symbolic link/);
     // Nothing named after the project, and no probe file, ever landed in their directory.
     expect(await readdir(theirs)).toEqual([]);
   });
@@ -344,7 +344,7 @@ describe('eviction breaks a usedAt tie on seq (#216.1)', () => {
     );
   });
 
-  it('sorts a manifest without seq oldest among its equal-usedAt peers, and usedAt first', async () => {
+  it('orders by seq first, and a manifest without seq below every one that has it', async () => {
     const src = await tempDir('ovl-seq-old-');
     const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString();
     const write = async (handle: string, usedAt: string, seq?: number) => {
@@ -362,14 +362,16 @@ describe('eviction breaks a usedAt tie on seq (#216.1)', () => {
     };
     const current = 'v0000000000cc';
     await write(current, at(0), 0);
-    await write('v000000000001', at(5)); // no seq: older than its tie
+    await write('v000000000001', at(50)); // no seq: older than every manifest that has one
     await write('v000000000002', at(5), 3);
     await write('v000000000003', at(5), 1);
-    await write('v000000000004', at(9), 0); // latest usedAt wins over any seq
+    await write('v000000000004', at(9), 0); // a later usedAt does not outrank a larger seq
     await write('v000000000005', at(1), 9);
-    const removed = await evictVariants(src, 4, current);
-    // Newest first: 004 (usedAt 9), 002 (5, seq 3), 003 (5, seq 1), 001 (5, no seq), 005 (1).
-    expect(removed.sort()).toEqual(['v000000000001', 'v000000000005']);
+    await write('v000000000006', at(40)); // no seq, and older than 001 by usedAt
+    const removed = await evictVariants(src, 5, current);
+    // Newest first: 005 (seq 9), 002 (seq 3), 003 (seq 1), 004 (seq 0), then the manifests without
+    // seq by usedAt: 001 (50), 006 (40).
+    expect(removed).toEqual(['v000000000001', 'v000000000006']);
   });
 });
 
@@ -431,8 +433,8 @@ describe("the project root's .git: hooks, config and info are watched (#228)", (
     const hint = sourceChangedHint(['.git/hooks/post-checkout', 'main.tex']);
     expect(hint).toContain('".git/hooks/post-checkout"');
     expect(hint).toContain(
-      "A path under .git is the repository's own — its hooks, config or info/ — which status, " +
-        'diff and discard never show or restore',
+      "A path under .git is the repository's own — its hooks, config, commondir or info/, or a " +
+        "submodule's config or hooks — which status, diff and discard never show or restore",
     );
     expect(sourceChangedHint(['main.tex', 'sub/.git/x'])).not.toContain('A path under .git');
   });

@@ -132,42 +132,148 @@ export function shellCommandRefused(log: string): boolean {
  * `os.execute` EXISTS — and under `-no-shell-escape` it does exist, as a stub that refuses. So
  * `executed.` there says nothing about whether the command ran (TL2026 lualatex, checked: the line
  * is logged and `fig-eps-converted-to.pdf` is never written). `disabled.` is the other branch,
- * when `os.execute` is absent altogether. `pipe(<cmd>)` is the same code for `io.popen`.
+ * when `os.execute` is absent altogether. `pipe(<cmd>)` is the same code for `io.popen`. Group 1
+ * is the command, group 2 which of the two records it is.
  */
-const LUATEX_CALL_EXECUTED = /^(?:system|pipe)\(.*\) executed\./m;
-const LUATEX_CALL_DISABLED = /^(?:system|pipe)\(.*\) disabled\./m;
+const LUATEX_CALL_RECORD = /^(?:system|pipe)\((.*)\) (executed|disabled)\./gm;
 
 /**
  * True when a LuaTeX log shows a shell command that did not run: a `disabled.` record, or an
- * `executed.` record in a run whose log carries no ` system commands enabled.` banner — the banner
- * `-no-shell-escape` suppresses and every run with shell escape on (restricted or full) prints.
- * pdfTeX/XeTeX never write this shape (theirs is `runsystem(...)`, {@link shellCommandRefused}).
- * A document can forge either line with `\typeout`; that only adds a hint, the harmless direction.
+ * `executed.` record in a run whose log HEADER carries no ` system commands enabled.` banner — the
+ * banner `-no-shell-escape` suppresses and every run with shell escape on (restricted or full)
+ * prints ({@link engineShellEscapeBanner}). pdfTeX/XeTeX never write this shape (theirs is
+ * `runsystem(...)`, {@link shellCommandRefused}). A document can forge either record with
+ * `\typeout`, which only adds a hint, the harmless direction; the banner is read from the header
+ * alone, never anywhere in the log, because there a forged banner in the body would SUPPRESS the
+ * hint.
  */
 export function luatexCommandRefused(log: string): boolean {
-  const text = unwrapLines(log).join('\n');
-  if (LUATEX_CALL_DISABLED.test(text)) return true;
-  return LUATEX_CALL_EXECUTED.test(text) && !shellEscapeWasEnabled(text);
+  return luatexRefusedCommands(log).length > 0;
 }
 
 /**
- * The engine's own record that shell escape was on: the start-of-run banner (pdfTeX/XeTeX
- * ` \write18 enabled.` or ` restricted \write18 enabled.`; LuaTeX ` system commands enabled.` or
- * ` restricted system commands enabled.`), which `-no-shell-escape` suppresses, or a command that
- * ran (`runsystem(...)...executed`).
+ * The commands a LuaTeX log records as not run, in the order they appear: every `disabled.`
+ * record, and every `executed.` record when the header shows no enabled banner (`'none'`, or no
+ * header to read — the reading that adds a hint, never the one that suppresses it). See
+ * {@link luatexCommandRefused}.
  */
-const SHELL_ESCAPE_ENABLED =
-  /^ (?:restricted )?(?:\\write18|system commands) enabled\.|^runsystem\(.*\)\.\.\.executed\b/m;
+function luatexRefusedCommands(log: string): string[] {
+  const text = unwrapLines(log).join('\n');
+  const banner = engineShellEscapeBanner(log);
+  const executedCounts = banner !== 'full' && banner !== 'restricted';
+  const cmds: string[] = [];
+  for (const m of text.matchAll(LUATEX_CALL_RECORD)) {
+    if (m[2] === 'disabled' || executedCounts) cmds.push(m[1] ?? '');
+  }
+  return cmds;
+}
+
+/** pdfTeX/XeTeX's refusal record, every one; group 1 is the command. */
+const SHELL_COMMAND_REFUSED_ALL = /^runsystem\((.*)\)\.\.\.disabled\b/gm;
 
 /**
- * True when the log shows shell escape was enabled for this run. An overlay compile asks latexmk
- * for `-no-shell-escape`, but that reaches the engine only through `%O`: a project latexmkrc of
- * `$pdflatex = 'pdflatex %O -shell-escape %S'` (the later flag wins) or one with no `%O` turns it
- * back on, and this is how the tool knows not to say it was disabled. A document can forge the
- * banner with `\typeout`, which only makes the tool withdraw that claim — the safe direction.
+ * A command line that runs a TeX engine: `pdflatex`, `xelatex`, `lualatex`, `latex`, `pdftex`,
+ * `xetex`, `luatex`, `etex` or `tex` as its first word, optionally behind a directory and quoted,
+ * optionally `.exe`. What TikZ externalization runs (`pdflatex -halt-on-error … -jobname …`), and
+ * what TeX Live's restricted allow-list (`shell_escape_commands`: bibtex, extractbb, kpsewhich,
+ * makeindex, repstopdf, …) never holds.
  */
-export function shellEscapeWasEnabled(log: string): boolean {
-  return SHELL_ESCAPE_ENABLED.test(unwrapLines(log).join('\n'));
+const ENGINE_COMMAND =
+  /^\s*"?(?:[^\s"]*[\\/])?(?:pdflatex|xelatex|lualatex|latex|pdftex|xetex|luatex|etex|tex)(?:\.exe)?"?(?=\s|$)/i;
+
+/**
+ * The shell commands this log records the engine refusing — pdfTeX/XeTeX's
+ * `runsystem(<cmd>)...disabled` and LuaTeX's records as {@link luatexCommandRefused} reads them —
+ * split by whether each runs a TeX engine ({@link ENGINE_COMMAND}). Which retry flag a refusal
+ * hint names is decided from these, the refusal records the hint already rests on, never from
+ * pgf's TikZ message: an engine call is on no allow-list, so only `shellEscape` runs it, while
+ * any other refused command (repstopdf, makeindex, …) may be on it. Un-wraps first, as
+ * {@link shellCommandRefused} does.
+ */
+export function refusedShellCommands(log: string): { engine: number; other: number } {
+  const text = unwrapLines(log).join('\n');
+  const cmds = [
+    ...[...text.matchAll(SHELL_COMMAND_REFUSED_ALL)].map((m) => m[1] ?? ''),
+    ...luatexRefusedCommands(log),
+  ];
+  const engine = cmds.filter((c) => ENGINE_COMMAND.test(c)).length;
+  return { engine, other: cmds.length - engine };
+}
+
+/**
+ * The first line of every log pdfTeX, XeTeX and LuaTeX write (`This is pdfTeX, Version …`,
+ * `This is XeTeX, …`, `This is LuaHBTeX, …`) and the line that ends the header: `**` followed by
+ * the first input line the engine was given (`**main.tex`, `**\input ./main.tex`).
+ */
+const LOG_FIRST_LINE = /^This is \S/;
+const HEADER_END = /^\*\*/;
+/** The banner line itself; group 1 is set for restricted mode. */
+const SHELL_ESCAPE_BANNER = /^ (restricted )?(?:\\write18|system commands) enabled\.\s*$/;
+
+/**
+ * The engine's start-of-run shell-escape banner, as the log's HEADER shows it: `'full'` for
+ * pdfTeX/XeTeX's ` \write18 enabled.` or LuaTeX's ` system commands enabled.`, `'restricted'` for
+ * ` restricted \write18 enabled.` / ` restricted system commands enabled.`, `'none'` when the
+ * header was read and shows neither (`-no-shell-escape` suppresses the line), and `undefined` —
+ * unknown — when there is no header to read. Keep the last two apart: only `'none'` supports the
+ * claim that shell escape was off.
+ *
+ * The header is every physical line before the first `**` line, in a log whose first line is the
+ * engine's `This is …` line. The engine writes all of it before it reads a byte of the document,
+ * so, unlike any later line, the document cannot write into it with `\typeout` (checked against
+ * TeX Live 2019 pdflatex and TeX Live 2023/2026 xelatex and lualatex logs in `test/fixtures`).
+ * The `.log` is the engine's own; latexmk writes nothing into it. A log that does not open with
+ * `This is`, or has no `**` line — latexmk's captured output, used when no `.log` was found (a
+ * latexmkrc that sets `$jobname` leaves it under another name), where the document's terminal
+ * output comes first — has no header this reader will vouch for, so the answer is `undefined`:
+ * neither "on" nor "off" may be claimed from it, and whatever a caller does with it must be the
+ * safe reading ({@link logShowsShellEscapeBanner} is the most it may add).
+ * Physical lines, not {@link unwrapLines}: the header's lines are written unwrapped, and joining a
+ * 79-column first line to the banner would hide it.
+ *
+ * The residual this does not close: a LuaTeX document can rewrite any byte of its own `.log`
+ * through Lua's `io.open`, which needs no shell escape — as it can forge the stale-PDF records.
+ */
+export function engineShellEscapeBanner(log: string): 'full' | 'restricted' | 'none' | undefined {
+  const lines = log.split(/\r\n|\n|\r/);
+  if (!LOG_FIRST_LINE.test(lines[0] ?? '')) return undefined;
+  const end = lines.findIndex((l) => HEADER_END.test(l));
+  if (end < 0) return undefined;
+  let banner: 'full' | 'restricted' | 'none' = 'none';
+  for (const line of lines.slice(1, end)) {
+    const m = SHELL_ESCAPE_BANNER.exec(line);
+    if (m) banner = m[1] ? 'restricted' : 'full';
+  }
+  return banner;
+}
+
+/**
+ * True when the log's header shows restricted shell escape was in effect for this run
+ * ({@link engineShellEscapeBanner}) — the caller asked for it, or a latexmkrc turned it on without
+ * being asked (latexmk hands `-no-shell-escape` over through `%O`, which an rc can drop or
+ * override). A command refused then is one the allow-list does not hold, so advising
+ * `restrictedShellEscape: true` cannot run it: only `shellEscape: true` can.
+ *
+ * Only the header banner counts. A `runsystem(<cmd>)...disabled (restricted).` refusal, or a
+ * banner-shaped line further down, is exactly what a document's `\typeout` writes, and reading it
+ * here moved a genuine `-no-shell-escape` run's advice from `restrictedShellEscape` to full
+ * `shellEscape` (blaming a latexmkrc that did not exist), and made a genuine full override read as
+ * "only allow-listed commands". A header that cannot be delimited says "not restricted", which
+ * keeps the less powerful advice and the larger stated risk.
+ */
+export function shellEscapeRestrictedInEffect(log: string): boolean {
+  return engineShellEscapeBanner(log) === 'restricted';
+}
+
+/**
+ * True when a banner-shaped line (` \write18 enabled.`, ` restricted system commands enabled.`, …)
+ * stands on any physical line of the text — header or not. Document-writable, so it may only ever
+ * ADD a hedged note, for the one case {@link engineShellEscapeBanner} cannot answer: no header to
+ * read (latexmk's captured output, where the engine's real banner does appear, on the line after
+ * `This is …`, but so could a document's `\typeout`). Never read it where a header was read.
+ */
+export function logShowsShellEscapeBanner(log: string): boolean {
+  return log.split(/\r\n|\n|\r/).some((l) => SHELL_ESCAPE_BANNER.test(l));
 }
 
 /**
@@ -206,23 +312,53 @@ export function findMissingPackages(log: string): string[] {
 
 /**
  * TikZ externalization emits one identical "system call did NOT result in a usable output file"
- * error per figure — they share a single cause (shell escape disabled), so collapse them into one
- * diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.
+ * error per figure — they share a single cause (usually shell escape disabled), so collapse them
+ * into one diagnostic instead of flooding the caller with N opaque `Package tikz Error` entries.
+ *
+ * The retry names `shellEscape: true` only: externalization runs the engine itself (`pdflatex
+ * -halt-on-error … -jobname …`), which TeX Live's restricted allow-list (`shell_escape_commands`:
+ * bibtex, extractbb, kpsewhich, makeindex, repstopdf, …) never holds, so `restrictedShellEscape`
+ * cannot run it. The header banner ({@link engineShellEscapeBanner}) changes how the cause is
+ * described, never which flag is named — except under a FULL banner, where shell escape was on
+ * and pgf's "did NOT result in a usable output file … enabled system calls" (printed whenever the
+ * figure's file is missing, whatever the reason) is no evidence against it: the calls ran and
+ * failed for another reason, so there is no retry to advise, only each figure's own log to read.
  */
-function collapseShellEscapeErrors(errors: ParsedDiagnostic[]): ParsedDiagnostic[] {
+function collapseShellEscapeErrors(
+  errors: ParsedDiagnostic[],
+  headerBanner: () => 'full' | 'restricted' | 'none' | undefined,
+): ParsedDiagnostic[] {
   const matched = errors.filter((e) => SHELL_ESCAPE_FAILURE.test(e.message));
   if (matched.length <= 1) return errors;
-  const collapsed: ParsedDiagnostic = {
-    severity: 'error',
-    // Deliberately unattributed. This entry stands for N figures, so the first one's file and line
-    // are not its location — inheriting them pointed the caller (and the snippet layer) at one
-    // arbitrary figure's source, where nothing is wrong, as though it were the error site.
-    message:
-      `TikZ externalization failed for ${matched.length} figures: the system call did NOT ` +
-      'result in a usable output file because shell escape is disabled. Retry compile with ' +
-      'restrictedShellEscape: true (or shellEscape: true) to enable system calls.',
-    rule: 'shell escape disabled',
-  };
+  const banner = headerBanner();
+  const lead =
+    `TikZ externalization failed for ${matched.length} figures: the system call did NOT ` +
+    'result in a usable output file';
+  // Deliberately unattributed. This entry stands for N figures, so the first one's file and line
+  // are not its location — inheriting them pointed the caller (and the snippet layer) at one
+  // arbitrary figure's source, where nothing is wrong, as though it were the error site.
+  const collapsed: ParsedDiagnostic =
+    banner === 'full'
+      ? {
+          severity: 'error',
+          message:
+            `${lead}, although shell escape was on for this run, so the externalization calls ` +
+            "failed for another reason: see each figure's own log (the .log the figure's " +
+            'system call writes beside it in the build directory).',
+          rule: 'TikZ externalization failed',
+        }
+      : {
+          severity: 'error',
+          message:
+            lead +
+            (banner === 'restricted'
+              ? ": shell escape was restricted to TeX's allow-list. "
+              : ' because shell escape is disabled. ') +
+            'Retry compile with shellEscape: true to enable system calls (restrictedShellEscape ' +
+            "cannot run it: TeX's allow-list never holds the engine call externalization makes). " +
+            'It lets the document run ARBITRARY shell commands — only for a project you trust.',
+          rule: 'shell escape disabled',
+        };
   return [collapsed, ...errors.filter((e) => !SHELL_ESCAPE_FAILURE.test(e.message))];
 }
 
@@ -685,7 +821,10 @@ export function parseLog(log: string, opts: { baseDir?: string } = {}): ParsedLo
     }
   }
 
-  return { errors: collapseShellEscapeErrors(dedupe(errors)), warnings: dedupe(warnings) };
+  return {
+    errors: collapseShellEscapeErrors(dedupe(errors), () => engineShellEscapeBanner(log)),
+    warnings: dedupe(warnings),
+  };
 }
 
 /**

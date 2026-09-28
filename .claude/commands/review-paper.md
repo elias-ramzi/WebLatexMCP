@@ -52,8 +52,9 @@ general-purpose agent, which has write tools the panel must not hold.
    not build is a review of the wrong thing.
 
    **Check which build this is**, as the skill's "Which build is under review" says: a best-effort
-   look at the root file's preamble for the venue's review or anonymous switch. When the switch is
-   **off** (a camera-ready or preprint build), ask me one question before going further — review it
+   look at the root file's preamble for the venue's review or anonymous switch (for `acmart`, only
+   `anonymous` counts: its `review` option adds line numbers and hides nothing, so
+   `\documentclass[sigconf,review]{acmart}` is off). When the switch is **off** (a camera-ready or preprint build), ask me one question before going further — review it
    as a submission, so anonymity and page-limit findings count, or as camera-ready, so they are
    informational — and wait for the answer. When it is on, or you cannot tell, do not ask: review
    it as a submission and say which in the summary. Add the answer to the review context as its
@@ -156,14 +157,20 @@ general-purpose agent, which has write tools the panel must not hold.
      the headings must be the reply's heading lines, verbatim and in the same order, **and each
      at the same line number as in the reply** (count the reply's lines from 1). Equal heading
      lines mean every section but the last kept its line count, so a paragraph dropped or merged
-     in the middle of a report fails here;
+     in the middle of a report fails here. That one search is bounded: it keeps at most 200
+     matches and a 20000-character payload, and it windows a line past 200 characters with `…`.
+     So if its result reports `omittedByCap` or `omittedBySize` above 0 or `timedOut`, carries a
+     `note`, or returns any heading with `…` in it, do not judge a report from it: take each
+     report's heading lines from a `read_file` of that report instead (`search_files` cannot be
+     pointed at one file), and only then call a report malformed;
    - `read_file` of each report from its last heading to the end (`startLine` = that heading's
      line) must equal the reply's last section verbatim, since a retype that runs short is cut
      at the end — and the `totalLines` that same call returns must equal the reply's line count
      (a final newline is not a line);
-   - `reports/typos.md` must hold one row per finding: `read_file` with `endLine: 1` gives its
-     `totalLines`, and the lines below the table header must number the sum of the hunters'
-     `N findings`.
+   - `reports/typos.md` must hold one row per finding. Write it as the table alone, starting at
+     line 1: a header row, its `|---|` separator line, then one row per finding. Neither the
+     header row nor the separator line is a finding, so `read_file` with `endLine: 1` gives its
+     `totalLines`, and `totalLines` minus 2 must equal the sum of the hunters' `N findings`.
 
    Re-save a report that fails any check from the reply, once, and check it again; if it still
    differs, list it among the missing or malformed reports for step 5 and name it in step 6. This
