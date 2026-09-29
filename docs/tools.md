@@ -626,9 +626,12 @@ two opt-in flags:
 > too), since the document's shell commands could then run. It names restricted mode only when that
 > banner is the restricted one; otherwise it warns that arbitrary commands could run. A banner-shaped
 > line the document wrote further down the log adds no such warning. When no engine log can be read (a
-> latexmkrc that renames the job leaves only latexmk's own output), a banner in that output adds only a
-> note that a latexmkrc _may_ have turned shell escape on, and an overlay's variant line says whether
-> shell escape was off could not be confirmed rather than claiming it was.
+> latexmkrc that renames the job leaves only latexmk's own output), nothing in that output is read as the
+> engine's header, even when it opens with the engine's own first line (as latexmk 4.67 prints it under
+> `$silent = 1`): a banner there adds only a note that a latexmkrc _may_ have turned shell escape on, an
+> overlay's variant line says whether shell escape was off could not be confirmed rather than claiming it
+> was, and the collapsed TikZ externalization error says the calls failed _usually_ because shell escape
+> is disabled.
 
 Independently of the flags, `compile` mirrors the project's subdirectory structure into its build
 directory, so a document that writes to a relative path (like externalization's `imgs/` cache) no longer

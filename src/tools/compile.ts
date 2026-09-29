@@ -731,8 +731,11 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           }
           // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
           // to the project root — rebase them there so a `file` is one the caller can open.
+          // Captured output (no engine .log found) has no header anything may rest on.
+          const logSource = { capturedOutput: outcome.capturedOutput === true };
           const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
             baseDir: outcome.logBaseDir,
+            ...logSource,
           });
           // Errors carry their source context; warnings do not — a normal build has hundreds of
           // them and attaching a snippet to each would bloat every successful compile's result.
@@ -799,6 +802,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // The service words it: shellEscape: true only, since TeX's restricted allow-list never
           // holds the engine call externalization makes.
           const tikzHint = tikzShellEscapeHint(outcome.log, {
+            ...logSource,
             shellEscapeOn,
             backend: backend.kind,
           });
@@ -807,6 +811,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // — repstopdf for an .eps figure, makeindex — was refused: say which switch brings it
           // back and what flipping it costs. One hint for every compile; the service words it.
           const refusedHint = shellEscapeRefusedHint(outcome.log, {
+            ...logSource,
             shellEscapeOn,
             overlay: variant !== undefined,
             backend: backend.kind,
@@ -815,6 +820,7 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // The opposite surprise: the caller left shell escape off, and the engine's own banner
           // says it was on anyway — for every compile, not only a variant's line below.
           const overriddenHint = shellEscapeOverriddenHint(outcome.log, {
+            ...logSource,
             shellEscapeOn,
             backend: backend.kind,
           });
@@ -987,9 +993,9 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
           // document: one the document `\typeout`s into the body would blame a latexmkrc that
           // does not exist. "Off" needs the header READ and holding no banner ('none'); with no
           // header to read (no engine .log found — latexmk's captured output stood in) neither
-          // "on" nor "off" is claimed. Tectonic reads no latexmkrc, so there the flag it was
-          // given is the whole answer.
-          const headerBanner = engineShellEscapeBanner(outcome.log);
+          // "on" nor "off" is claimed, whatever that output opens with. Tectonic reads no
+          // latexmkrc, so there the flag it was given is the whole answer.
+          const headerBanner = engineShellEscapeBanner(outcome.log, logSource);
           const escapeReenabled =
             !shellEscapeOn && (headerBanner === 'full' || headerBanner === 'restricted');
           const escapeOffConfirmed = headerBanner === 'none' || backend.kind === 'tectonic';
