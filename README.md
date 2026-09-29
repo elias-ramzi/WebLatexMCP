@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="assets/weblatexmcp-lockup-beta.svg" alt="WebLatexMCP — public beta" width="100%" />
+<img src="assets/weblatexmcp-lockup.svg" alt="WebLatexMCP" width="100%" />
 
 # WebLatexMCP
 
 **Edit, compile, and sync your Overleaf projects with Claude.**
 
-[![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
+[![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
 &nbsp;
 [![NVIDIA SkillSpector: 0 findings](https://img.shields.io/badge/SkillSpector-0%20findings-76B900?logo=nvidia&logoColor=white)](#skills)
 &nbsp;
@@ -29,14 +29,6 @@
 [![Mistral](https://img.shields.io/badge/Mistral-FA520F?logo=mistralai&logoColor=white)](docs/install/mistral.md)
 
 </div>
-
-> [!WARNING]
-> **Public beta — early development.** WebLatexMCP is now public, but it's in its early stages and
-> under active development. Expect bugs, rough edges, and incomplete features. Editing and git operations
-> touch real projects, so review diffs before you push. Please
-> [report anything you run into](https://github.com/elias-ramzi/WebLatexMCP/issues) — bug reports and
-> feedback are hugely welcome. Run [`/session-feedback`](.claude/skills/session-feedback/SKILL.md) at
-> the end of a session and it writes the report for you.
 
 ---
 

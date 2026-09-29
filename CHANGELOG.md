@@ -9,6 +9,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-29
+
 ### Added
 
 - **A reveal.js overview deck under `slides/`** (#226). Fourteen slides for presenting the project:
@@ -183,6 +185,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   source, and `../demo/main.tex` names a file the variant's mirror does not hold.
 
 ### Changed
+
+- **The README no longer calls the project a public beta.** The headline image is the plain
+  `assets/weblatexmcp-lockup.svg` instead of the `-beta` lockup, and the "Public beta — early
+  development" warning is gone; the maturity note and the feedback invitation stay under Contributing.
+  The CI badge reads only push runs on `main` (`?branch=main&event=push`), so the back-merge PR's run,
+  which GitHub files under `main` too, cannot turn it red.
 
 - **The `corrector` and `formatter` agents declare their tools.** Neither had a `tools:` line, so
   each held every tool the session held — a shell, `commit`, `push`, `delete_file` and `compile`
