@@ -34,6 +34,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   without its required checks. Without the secret — or on a fork's PR — the PDF is attached to the
   run as an artifact and the run warns. The workflow stops when the head commit changes only the
   PDF, since its own push starts it again and a rebuilt PDF always differs by its creation date.
+  It runs only on pull requests into `dev`, and never on one from `main`: the release PR's head is
+  `dev` and the back-merge PR's is `main`, both protected, so its push there was refused and the
+  run failed.
   `slides/` is outside the npm package's `files` list, so none of it ships with the server.
 - **A `.plugin-scanner.toml` for the HOL AI Plugin Scanner**, which the awesome-ai-plugins catalog
   runs before listing the server (#198). It excludes `test/`, where the token-shaped strings the

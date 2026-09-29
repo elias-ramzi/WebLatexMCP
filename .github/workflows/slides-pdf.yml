@@ -14,10 +14,16 @@
 # filters look at the whole PR, which still changes the slides. Chrome stamps a creation date into
 # every PDF, so a rebuild always differs. The run therefore stops when the head commit changes the
 # PDF and nothing else — the commit this workflow makes, or a PDF rebuilt and committed by hand.
+#
+# Why only pull requests into dev, and never one from main: `dev` and `main` are protected and take
+# changes only through a pull request, so a push to either is refused. The release PR (dev → main)
+# and the back-merge PR (main → dev) have one of them as their head branch, and the deck they carry
+# was already rebuilt on the PR that brought it into dev.
 name: Slides PDF
 
 on:
   pull_request:
+    branches: [dev]
     paths:
       - 'slides/**'
       - '!slides/README.md'
@@ -33,6 +39,7 @@ permissions:
 jobs:
   build:
     name: Rebuild the slides PDF
+    if: github.event.pull_request.head.ref != 'main'
     runs-on: ubuntu-latest
     env:
       HAS_TOKEN: ${{ secrets.SLIDES_PDF_TOKEN != '' }}
