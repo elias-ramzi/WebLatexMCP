@@ -13,6 +13,7 @@ import {
   refusedShellCommands,
   shellEscapeRestrictedInEffect,
 } from './logParser.js';
+import type { LogSource } from './logParser.js';
 
 export type Engine = 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -62,6 +63,14 @@ export interface CompileOutcome {
   /** Raw log content (the .log file when available, otherwise captured stdout/stderr). */
   log: string;
   logPath?: string;
+  /**
+   * `true` when no engine `.log` was found and `log` is the backend's captured stdout/stderr.
+   * Nothing in that text is read as the engine's header ({@link engineShellEscapeBanner}), whatever
+   * it opens with: latexmk 4.67 under `$silent = 1` starts it with the engine's `This is …` line,
+   * and the document's terminal output follows, so a document could write a header of its own.
+   * Pass it on to every reader of the header (`parseLog` and the shell-escape hints).
+   */
+  capturedOutput?: boolean;
   timedOut: boolean;
   /**
    * Directory the engine ran in, relative to the project root ('' for the root itself). The log's
@@ -184,7 +193,7 @@ export function engineNotFoundHint(
 /**
  * The compile hint for a shell command the engine refused (`runsystem(<cmd>)...disabled` in a
  * pdfTeX/XeTeX log, or LuaTeX's `system(<cmd>) ...` record with shell escape off — see
- * `luatexCommandRefused` in `logParser.ts`), or `undefined` when there is nothing to say. Every latexmk compile now runs with
+ * `refusedShellCommands` in `logParser.ts`), or `undefined` when there is nothing to say. Every latexmk compile now runs with
  * `-no-shell-escape` unless the caller opted in (#213), so a document that relied on TeX Live's
  * default restricted allow-list — most often an `.eps` figure converted by `repstopdf`, or
  * `makeindex` — builds without that command's output, and the caller has to be told which switch
@@ -219,14 +228,14 @@ export function engineNotFoundHint(
  */
 export function shellEscapeRefusedHint(
   log: string,
-  opts: { shellEscapeOn: boolean; overlay: boolean; backend: CompilerKind },
+  opts: { shellEscapeOn: boolean; overlay: boolean; backend: CompilerKind } & LogSource,
 ): string | undefined {
   if (opts.shellEscapeOn) return undefined;
   // Full shell escape refuses nothing: under the engine's own full banner, a refusal record is the
   // document's `\typeout`, and advice to retry with a lesser flag would answer a refusal that
   // never happened.
-  if (engineShellEscapeBanner(log) === 'full') return undefined;
-  const refused = refusedShellCommands(log);
+  if (engineShellEscapeBanner(log, opts) === 'full') return undefined;
+  const refused = refusedShellCommands(log, opts);
   // A refused command that is not an engine call: the allow-list may hold it. Decided from the
   // refusal records alone, so a TikZ line (document-writable) can neither suppress this hint nor
   // move its advice to the more powerful flag.
@@ -238,7 +247,7 @@ export function shellEscapeRefusedHint(
     // which names the same flag and cost; an overlay compile still says what opting in costs.
     if (opts.overlay ? !(engineOnly || tikz) : !engineOnly || tikz) return undefined;
   }
-  const restricted = opts.backend !== 'tectonic' && shellEscapeRestrictedInEffect(log);
+  const restricted = opts.backend !== 'tectonic' && shellEscapeRestrictedInEffect(log, opts);
   const retry =
     opts.backend === 'tectonic'
       ? 'shellEscape: true (tectonic has no restricted mode, so restrictedShellEscape does not ' +
@@ -328,10 +337,10 @@ const ENGINE_NOT_ON_ALLOW_LIST =
  */
 export function tikzShellEscapeHint(
   log: string,
-  opts: { shellEscapeOn: boolean; backend: CompilerKind },
+  opts: { shellEscapeOn: boolean; backend: CompilerKind } & LogSource,
 ): string | undefined {
   if (opts.shellEscapeOn || !needsShellEscape(log)) return undefined;
-  if (engineShellEscapeBanner(log) === 'full') return undefined;
+  if (engineShellEscapeBanner(log, opts) === 'full') return undefined;
   return (
     'This document uses TikZ externalization, which compiles each figure by running the engine ' +
     'through a system call. Retry compile with shellEscape: true (' +
@@ -359,8 +368,8 @@ export function tikzShellEscapeHint(
  * blaming a latexmkrc that does not exist; every run with shell escape genuinely on prints the
  * banner in its header. And only the engine's own restricted banner narrows the risk to
  * "allow-listed commands", so a forged restricted line under a genuine full override cannot
- * understate it. A log whose header cannot be delimited — latexmk's captured output, when no
- * engine `.log` was found — gets no warning, only, when a banner-shaped line stands anywhere in it
+ * understate it. A log whose header cannot be delimited, and latexmk's captured output
+ * (`opts.capturedOutput`, when no engine `.log` was found) whatever it opens with, gets no warning, only, when a banner-shaped line stands anywhere in it
  * ({@link logShowsShellEscapeBanner}), a hedged note that asserts nothing: the engine's real
  * banner does appear there, but so could a document's `\typeout`, so the note says a latexmkrc
  * MAY have turned shell escape on and names no risk it cannot back. Fixed server text: nothing
@@ -368,10 +377,10 @@ export function tikzShellEscapeHint(
  */
 export function shellEscapeOverriddenHint(
   log: string,
-  opts: { shellEscapeOn: boolean; backend: CompilerKind },
+  opts: { shellEscapeOn: boolean; backend: CompilerKind } & LogSource,
 ): string | undefined {
   if (opts.shellEscapeOn || opts.backend === 'tectonic') return undefined;
-  const banner = engineShellEscapeBanner(log);
+  const banner = engineShellEscapeBanner(log, opts);
   if (banner === undefined) {
     return logShowsShellEscapeBanner(log)
       ? 'Shell escape was requested off; the build output shows a shell-escape banner, but no ' +
@@ -1177,6 +1186,8 @@ export async function collectOutcome(
     log = await readFile(logPath, 'utf8');
     resolvedLogPath = logPath;
   } else {
+    // Captured output, never an engine log: its first line may still be the engine's `This is …`
+    // (latexmk 4.67 under `$silent = 1`), so the header readers are told not to trust it.
     log = `${res.stdout}\n${res.stderr}`;
   }
 
@@ -1196,6 +1207,7 @@ export async function collectOutcome(
     durationSec,
     log,
     logPath: resolvedLogPath,
+    ...(resolvedLogPath === undefined ? { capturedOutput: true } : {}),
     timedOut: res.timedOut,
     logBaseDir: logBase,
     rebuilt,

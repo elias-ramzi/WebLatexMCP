@@ -40,7 +40,10 @@ const REPSTOPDF_REFUSED =
   'runsystem(repstopdf --outfile=fig-eps-converted-to.pdf fig.eps)...disabled.\n';
 
 /** An engine that succeeds, opening only main.tex, and logs `behaviour.log`. */
-function stubCompiler(requests: CompileRequest[], behaviour: { log: string }) {
+function stubCompiler(
+  requests: CompileRequest[],
+  behaviour: { log: string; capturedOutput?: boolean },
+) {
   return {
     isAvailable: async () => true,
     compile: async (req: CompileRequest): Promise<CompileOutcome> => {
@@ -59,6 +62,7 @@ function stubCompiler(requests: CompileRequest[], behaviour: { log: string }) {
         pdfPath,
         durationSec: 0.1,
         log: behaviour.log,
+        ...(behaviour.capturedOutput ? { capturedOutput: true } : {}),
         timedOut: false,
         logBaseDir: logBaseDir(req.rootFile),
         rebuilt: true,
@@ -86,7 +90,7 @@ async function setup(files: Record<string, string>, backend: CompilerKind = 'lat
     new ProjectRegistry(workspace),
   );
   const requests: CompileRequest[] = [];
-  const behaviour = { log: '' };
+  const behaviour: { log: string; capturedOutput?: boolean } = { log: '' };
   ctx.compiler = new CompilerResolver(backend, true, () => stubCompiler(requests, behaviour));
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -108,6 +112,32 @@ const MAIN_TEX = '\\documentclass{article}\n\\begin{document}\nHi.\n\\end{docume
 function hintOf(res: unknown): string {
   return (res as { structuredContent?: { hint?: string } }).structuredContent?.hint ?? '';
 }
+
+describe('compile: captured output is never read as an engine header (#232)', () => {
+  it('a document-forged header in latexmk 4.67 captured output claims nothing', async () => {
+    const { client, behaviour } = await setup({ 'main.tex': MAIN_TEX });
+    // TL2019 latexmk under `$silent = 1` opens its captured output with the engine's own line;
+    // a `\nonstopmode` document then writes a banner and a `**` line before the engine's.
+    behaviour.log =
+      'This is pdfTeX, Version 3.14159265-2.6-1.40.20 (TeX Live 2019/Debian)\n' +
+      ' \\write18 enabled.\n**x\nentering extended mode\n(./main.tex\n' +
+      TIKZ_FAILURE +
+      '\n' +
+      TIKZ_FAILURE.replace(/figure0/g, 'figure1');
+    behaviour.capturedOutput = true;
+    const res = await client.callTool({ name: 'compile', arguments: {} });
+    const hint = hintOf(res);
+    expect(hint).not.toContain('overrode -no-shell-escape');
+    expect(hint).toContain('may have turned shell escape on');
+    expect(hint).toContain('This document uses TikZ externalization');
+    const errors =
+      (res.structuredContent as { errors?: Array<{ message: string }> } | undefined)?.errors ?? [];
+    const collapsed = errors.find((e) => e.message.startsWith('TikZ externalization failed'));
+    expect(collapsed?.message).toContain('usually because shell escape is disabled');
+    expect(collapsed?.message).not.toContain('although shell escape was on');
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
+  });
+});
 
 describe('compile: a refused shell command gets a hint on every compile (#213)', () => {
   it('names restrictedShellEscape and its cost when a plain compile refused repstopdf', async () => {

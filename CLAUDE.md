@@ -959,8 +959,8 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   compile (in the overlay's own wording for a variant), naming the flag that runs it and what it
   costs. Under **lualatex** there is no `runsystem` line: `pdftexcmds.lua` logs
   `system(<cmd>) executed.` whenever `os.execute` exists, and under `-no-shell-escape` it does, as a
-  refusing stub — so `luatexCommandRefused` (`src/services/logParser.ts`, beside
-  `shellCommandRefused`) reads that
+  refusing stub — so `refusedShellCommands` (`src/services/logParser.ts`, which also counts
+  pdfTeX/XeTeX's `runsystem(…)…disabled` records) reads that
   line as a refusal unless the log's **header** carries a ` system commands enabled.` banner
   (`engineShellEscapeBanner`, which `-no-shell-escape` suppresses), and `disabled.` always. The log
   is document-controlled, which is acceptable only because a forged line can do nothing but add a
@@ -978,14 +978,22 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
   `shellEscape` and understated a full override's risk, and reading the banner anywhere added an
   override warning blaming a latexmkrc that did not exist. The reader has **three answers plus
   unknown**, and the last two must stay apart: `'full'`, `'restricted'`, `'none'` (a header read,
-  no banner in it) and `undefined` (no header to read — latexmk's captured output, which stands in
-  when no engine `.log` was found, e.g. a latexmkrc that sets `$jobname`; it opens with latexmk's
-  own lines and has no `**` line). Only `'none'` backs the claim that shell escape was off. So: the
+  no banner in it) and `undefined` (no header to read). **Captured output is never a header,
+  whatever it opens with**: when no engine `.log` was found (e.g. a latexmkrc that sets
+  `$jobname`), `collectOutcome` hands back latexmk's captured stdout/stderr and sets
+  `CompileOutcome.capturedOutput`, and every header reader (`parseLog`, `refusedShellCommands`,
+  the three hint functions, the variant line) takes it as `LogSource` and answers `undefined`.
+  Judging by the text alone is not enough: latexmk 4.88 opens that output with a `Latexmk:` line,
+  but latexmk 4.67 (TeX Live 2019) under an rc setting `$silent = 1` opens it with the engine's own
+  `This is pdfTeX…`, and a `\nonstopmode` document can then `\write16` a banner and a `**` line of
+  its own before the engine's (#232). Only `'none'` backs the claim that shell escape was off. So: the
   override warning (`shellEscapeOverriddenHint`) and a variant's "overrode" line fire only on a
   header banner, and name restricted mode only for a restricted one; a variant's line says
   "Shell escape was off for this build" only on `'none'` (or under tectonic, which reads no
   latexmkrc, so its flag is the whole answer), and with no header says whether it was off could
-  not be confirmed; with no header, a banner-shaped line anywhere in the text
+  not be confirmed, as the collapsed TikZ error does ("usually because shell escape is disabled",
+  rule `TikZ externalization failed`, never the unhedged "because shell escape is disabled");
+  with no header, a banner-shaped line anywhere in the text
   (`logShowsShellEscapeBanner`) adds only a hedged note that a latexmkrc **may** have turned shell
   escape on — it asserts nothing and changes no flag advice. `shellEscapeRefusedHint` names only
   `shellEscape: true` when the header shows **restricted** mode (the refused command is not on
@@ -1152,8 +1160,9 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
     command read `evil/config` (its `core.fsmonitor` ran on `git status`), and git never writes it
     in a main repository — **and of `.git/modules`, each submodule's `config`, `config.worktree`,
     `commondir` and `hooks/`** (`GIT_MODULE_WATCHED`: a directory below `.git/modules` is a
-    submodule git dir when git's `is_git_directory` would say so — `HEAD` a regular file,
-    `objects/` and `refs/` directories — never on a `HEAD` entry alone, and a `modules/` directory
+    submodule git dir when git's `is_git_directory` would say so — `HEAD` a regular file or a
+    symbolic link, and either a `commondir` file or `objects/` and `refs/` that are directories or
+    links to one (`isGitDir`) — never on a `HEAD` entry alone, and a `modules/` directory
     itself never is, since a submodule named `HEAD` or `libs/HEAD` put a `HEAD` in `.git/modules`
     or in the step `libs` and hid every other submodule; a git dir is walked only there and in its
     own `modules/`, any other directory is a step of a slash-named submodule and only its

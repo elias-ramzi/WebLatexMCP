@@ -138,7 +138,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the check cannot run, says so and names why; it also
   says, as every latexmk compile now does (#213, below), when the log shows shell escape enabled
   although the compile asked for it off — and says shell escape was off only when the engine's
-  log header was read and shows no banner; with no engine log to read (a latexmkrc that renames
+  log header was read and shows no banner, or under tectonic, which reads no latexmkrc, so the
+  flag it was given is the whole answer; with no engine log to read (a latexmkrc that renames
   the job), it says that could not be confirmed. The result
   carries a `variant` handle, which `render_pages`, `extract_text` and `pdf_geometry` accept to
   read that build (its PDF, `.aux` and `.log`) instead of the main one. The four most recently
@@ -383,8 +384,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   document is read, so no line the document writes can add the override warning, take the flag a
   refused command needs out of a hint, change how much risk it states, or bring back a refusal
   hint under full shell escape. When no engine log could be read — latexmk's own output stands in
-  when a latexmkrc renames the job — a banner in that output adds only a note that a latexmkrc
-  may have turned shell escape on, and nothing claims it was off.
+  when a latexmkrc renames the job — nothing in that output is read as the engine's header, even
+  when it opens with the engine's own `This is pdfTeX…` line, as latexmk 4.67 (TeX Live 2019)
+  prints it under `$silent = 1`, where a document could otherwise write a banner of its own ahead
+  of the engine's (#232). A banner in that output adds only a note that a latexmkrc may have
+  turned shell escape on, and nothing claims it was off: the collapsed TikZ externalization error
+  then says the calls failed "usually because shell escape is disabled", and that this could not
+  be confirmed (#232).
 - **TikZ externalization advice no longer offers `restrictedShellEscape`.** The hint, the
   collapsed error, the compile tool's description and the docs called it preferred for
   `\tikzexternalize`, but externalization runs the engine itself and TeX Live's restricted
