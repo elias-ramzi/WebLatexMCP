@@ -9,6 +9,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Changed
+
+- **The post-release back-merge PR no longer waits for someone to approve its checks.**
+  `back-merge.yml` opened the `main` → `dev` PR with the workflow's own `GITHUB_TOKEN`, and GitHub
+  holds the `pull_request` runs of such a PR as `action_required`. `dev` requires one of them
+  (`CHANGELOG [Unreleased] updated`), so auto-merge stalled after every release until the runs
+  were approved by hand; the held CI run most likely also explains the README's CI badge reading as
+  failing meanwhile. The workflow now opens and auto-merges the PR with a `BACK_MERGE_TOKEN` secret,
+  a fine-grained personal access token, whose runs start without approval. Without the secret it
+  falls back to `GITHUB_TOKEN` and warns that the runs need approving. `docs/versioning.md` says how
+  to set it up.
+
 ## [0.8.0] - 2026-09-29
 
 ### Added
