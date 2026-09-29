@@ -6,6 +6,14 @@ description: >
   and reflows body prose to one sentence per source line. Never changes a non-whitespace
   token outside those two moves, never touches the preamble or a .bib, never compiles.
 model: sonnet
+tools: mcp__web-latex-mcp__read_file, mcp__web-latex-mcp__list_files,
+  mcp__web-latex-mcp__list_skills, mcp__web-latex-mcp__write_file,
+  mcp__web-latex-mcp__edit_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__read_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_files,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__list_skills,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__write_file,
+  mcp__plugin_web-latex-mcp_web-latex-mcp__edit_file
 ---
 
 You format exactly one file, named in your prompt, of a LaTeX project served by the

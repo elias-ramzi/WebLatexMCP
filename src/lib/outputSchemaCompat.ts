@@ -14,6 +14,17 @@ import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
  *
  * The strip happens at the transport boundary (post-serialization shaping), so the server stays
  * spec-compliant internally and the decision can be made per-connection from the negotiated client.
+ *
+ * Separately, and for **every** client, the same hook drops the root `$schema` of each advertised
+ * `inputSchema`/`outputSchema` (`stripSchemaDialect`). The SDK (1.29, and 1.30 still) converts zod
+ * with no target, which falls back to draft-07 and stamps
+ * `"$schema": "http://json-schema.org/draft-07/schema#"` on every schema; a client validating with a
+ * 2020-12-only Ajv (the Claude desktop app's Code tab) refuses such a schema outright — "unsupported
+ * dialect" — and no call reaches the server. MCP reads a schema without `$schema` as 2020-12, and the
+ * bodies zod emits here are dialect-neutral (no `definitions`, no array-form `items`), so the SDK's own
+ * draft-07 `Client` compiles them unchanged. Stamping 2020-12 instead would trade one client's refusal
+ * for another's. `test/unit/schemaDialect.test.ts` compiles every advertised schema under both
+ * dialects, which is what keeps "dialect-neutral" true as the schemas grow.
  */
 
 /** `clientInfo.name` values known to choke on `outputSchema`. */
@@ -58,19 +69,41 @@ export function stripOutputSchema(message: JSONRPCMessage): void {
 }
 
 /**
- * Wrap `transport.send` so outgoing tool schemas/results are stripped when appropriate. In `auto`
- * mode the decision is made per message from the negotiated `clientInfo` (available once the client
- * has initialized, which is always before it requests `tools/list`). `never` installs nothing.
+ * Drop the root `$schema` from every tool's `inputSchema` and `outputSchema` in an outgoing
+ * `tools/list` result, mutating the message in place (see the module comment for why). Other
+ * messages are left untouched.
+ */
+export function stripSchemaDialect(message: JSONRPCMessage): void {
+  if (!('result' in message) || typeof message.result !== 'object' || message.result === null)
+    return;
+  const tools = (message.result as Record<string, unknown>).tools;
+  if (!Array.isArray(tools)) return;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== 'object') continue;
+    for (const key of ['inputSchema', 'outputSchema']) {
+      const schema = (tool as Record<string, unknown>)[key];
+      if (schema && typeof schema === 'object') delete (schema as Record<string, unknown>).$schema;
+    }
+  }
+}
+
+/**
+ * Wrap `transport.send` so outgoing tool schemas/results are shaped for the client. The `$schema`
+ * strip applies in every mode, `never` included. Whether `outputSchema`/`structuredContent` are
+ * also stripped is decided per message in `auto` mode from the negotiated `clientInfo` (available
+ * once the client has initialized, which is always before it requests `tools/list`).
  */
 export function installOutputSchemaCompat(
   server: McpServer,
   transport: Transport,
   mode: OutputSchemaMode = outputSchemaMode(),
 ): void {
-  if (mode === 'never') return;
   const origSend = transport.send.bind(transport);
   transport.send = (message, options) => {
-    const strip = mode === 'always' || isIncompatibleClient(server.server.getClientVersion()?.name);
+    stripSchemaDialect(message);
+    const strip =
+      mode === 'always' ||
+      (mode === 'auto' && isIncompatibleClient(server.server.getClientVersion()?.name));
     if (strip) stripOutputSchema(message);
     return origSend(message, options);
   };

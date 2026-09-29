@@ -20,9 +20,10 @@ import type { Dirent } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, readdir, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { buildAuxPath } from '../services/compiler.js';
+import { buildAuxPath, buildAuxPathIn } from '../services/compiler.js';
 import { MAX_READ_BYTES } from '../services/fileService.js';
-import { toPosix } from './paths.js';
+import { unwrapLines } from '../services/logParser.js';
+import { climbsOut, toPosix } from './paths.js';
 
 export interface AuxLabel {
   label: string;
@@ -757,6 +758,29 @@ function isCleverefShadow(label: string): boolean {
   return CLEVEREF_SHADOW_SUFFIXES.some((suffix) => label.endsWith(suffix));
 }
 
+/**
+ * What a TeX run's `.log` says the run produced, off the engine's own closing record
+ * ({@link parseEngineOutput}):
+ *  - `'written'` — `Output written on <file> (<n> pages, <b> bytes).`: the run shipped `pages`
+ *    pages to its output file, whose extension is `ext` when it is one the server's engines write
+ *    (`.pdf` under pdfTeX and LuaTeX, `.xdv` under XeTeX, whose PDF xdvipdfmx then makes page for
+ *    page);
+ *  - `'noPages'` — `No pages of output.`: the run shipped nothing, so it wrote no output file;
+ *  - `'noPdf'` — `==> Fatal error occurred, no output PDF file produced!`: pdfTeX or LuaTeX
+ *    stopped on a fatal error and did not finish (pdfTeX removes) the PDF it had begun.
+ */
+export type EngineOutput =
+  | { kind: 'written'; pages: number; ext?: string }
+  | { kind: 'noPages' }
+  | { kind: 'noPdf' };
+
+/** Modification times, in milliseconds since the epoch, of a build's `.aux` and of the PDF a tool
+ *  pairs with it ({@link readBuildTimes}). */
+export interface BuildTimes {
+  auxMs: number;
+  pdfMs: number;
+}
+
 export interface AuxFloatsResult {
   /** Real (non-shadow) labels, capped at `opts.max` (default DEFAULT_MAX_FLOATS), in the order
    *  LaTeX reads them — the root's records with each `\@input`-ed file's spliced in where the
@@ -832,10 +856,43 @@ export interface AuxFloatsResult {
   /** Whether the build that wrote this `.aux` loaded `pgfpages` ({@link readPgfpagesEvidence}):
    *  `true` when its recorder file (`.fls`) or its `.log` names `pgfpages.sty`, `false` when at
    *  least one of the two was read and neither does, and absent when neither could be read (no
-   *  `.aux` at all, or a backend that wrote neither), which leaves label resolution as it was.
-   *  `labelPages.ts` refuses every label of a `true` build: a pgfpages layout shifts every
-   *  `\newlabel` a page late. Never spread into a tool's `structuredContent`. */
+   *  `.aux` at all, or a backend that wrote neither). A zero-byte file counts as unread: it is
+   *  what an interrupted run leaves, not a record. `labelPages.ts` refuses every label of a
+   *  `true` build (`'pgfpagesLayout'`): a pgfpages layout shifts every `\newlabel` a page late.
+   *  It refuses every label when this is absent too (`'pgfpagesUnknown'`), since the shift is
+   *  invisible everywhere else, and `pdf_geometry` then notes that its floats pages are
+   *  unverified; only `false` lets a label resolve. Never spread into a tool's
+   *  `structuredContent`. */
   pgfpages?: boolean;
+  /** The page counter (`\count0`) each PDF page was shipped out with, in page order, read off the
+   *  shipout marks of the build's `.log` ({@link readShipoutMarks}). Present only when the
+   *  caller asked for it (`readAuxFloats(…, { shipouts: true })`) and the log was read and parsed
+   *  whole; absent otherwise — never a partial list. `labelPages.ts` uses it only to REFUSE: a
+   *  label whose resolved page was shipped under another counter, when its length is the PDF's
+   *  page count; and every label (`'nothingShipped'`) when it is EMPTY beside a PDF with pages,
+   *  since the log is then a run that shipped nothing, not the PDF's. Never spread into a tool's
+   *  `structuredContent`. */
+  shipouts?: readonly number[];
+  /** The engine's own last word on what the run that wrote the build's `.log` produced
+   *  ({@link parseEngineOutput}) — how many pages it wrote to its output file, or that it
+   *  produced no output at all. Read in the same pass as `shipouts`, so present only when the
+   *  caller asked for those and the log was read and ends in such a record; absent otherwise.
+   *  `labelPages.ts` uses it only to REFUSE (`'stalePdf'`): a record that disagrees with the PDF
+   *  beside it says that PDF is not this run's output. Never spread into a tool's
+   *  `structuredContent`. */
+  engineOutput?: EngineOutput;
+  /** When the caller named the PDF it will pair with this `.aux` (`readAuxFloats(…, { pdfPath })`)
+   *  and both could be stat'd: each file's modification time, in milliseconds. A compile that
+   *  finishes writes its `.aux` BEFORE its PDF, so an `.aux` newer than the PDF is one a later run
+   *  rewrote without producing a PDF ({@link readBuildTimes}); `labelPages.ts` uses it only to
+   *  REFUSE (`'stalePdf'`). Never spread into a tool's `structuredContent`. */
+  buildTimes?: BuildTimes;
+  /** The `pdfPath` the caller named (`readAuxFloats(…, { pdfPath })`), whether or not it could be
+   *  stat'd: the PDF this index was read to be paired with. `resolveLabelPages` refuses to run
+   *  when it is not the PDF its reader opens, so a label lookup that forgets to name the PDF — and
+   *  with it the `buildTimes` check — fails loudly instead of silently skipping that check. Never
+   *  spread into a tool's `structuredContent`. */
+  pairedPdf?: string;
   /** Present when no `.aux` was found in the build directory, or when the root `.aux` inputs
    *  (`\@input`, which `\include` writes) a file that could not be read — so the index may be
    *  missing that chapter's labels. Absent otherwise. */
@@ -1024,7 +1081,7 @@ async function readListedAux(
     const st = await lstat(abs);
     if (!st.isFile()) return 'notInBuildDir';
     const rel = path.relative(buildReal, await realpath(abs));
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return 'notInBuildDir';
+    if (rel === '' || climbsOut(rel) || path.isAbsolute(rel)) return 'notInBuildDir';
     if (st.size > MAX_READ_BYTES) return 'tooLarge';
     return await readFile(abs, 'utf8');
   } catch (err) {
@@ -1186,16 +1243,29 @@ const LOG_PGFPAGES =
   /(?:^|[\s(/\\])pgf(?:more)?pages\.sty(?=[\s)]|$)|^Package: pgf(?:more)?pages\s|^\\pgfpages@shipoutbox=\\box/m;
 
 /**
+ * The flags both build-file readers open with. `O_NOFOLLOW` refuses a symbolic link at the final
+ * component where the platform has it. `O_NONBLOCK`, as in `assetImport.ts`, keeps a FIFO at the
+ * name from blocking the `open` until a writer appears — forever, with the project lock held; the
+ * FIFO is then refused by the regular-file check on the handle. On a regular file it changes
+ * nothing, and on Windows, where neither constant is defined, both fall back to 0.
+ */
+const BUILD_FILE_OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+
+/**
  * Up to `MAX_READ_BYTES` from the start of a build-dir file, as text, or `undefined` when there is
  * no such regular file. Opened without following a symbolic link (where the platform can say so)
- * and checked to be a regular file on the open handle. Only the start is read: `pgfpages` is a
- * preamble package, so both of its marks sit near the top of either file, and a build large
- * enough to reach the cap is not read in full for a question the preamble answers.
+ * and without blocking on a FIFO ({@link BUILD_FILE_OPEN_FLAGS}), and checked to be a regular file
+ * on the open handle. Only the start is read: `pgfpages` is a preamble package, so both of its
+ * marks sit near the top of either file, and a build large enough to reach the cap is not read in
+ * full for a question the preamble answers. Any other failure to open, stat or read propagates;
+ * a failure to CLOSE does not, since it says nothing about the bytes already read and would
+ * otherwise replace the error a failed read is propagating.
  */
 async function readBuildFileHead(file: string): Promise<string | undefined> {
   let handle;
   try {
-    handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    handle = await open(file, BUILD_FILE_OPEN_FLAGS);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ELOOP' || code === 'ENOTDIR' || code === 'EISDIR') {
@@ -1211,7 +1281,7 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
     const { bytesRead } = await handle.read(buf, 0, length, 0);
     return buf.subarray(0, bytesRead).toString('utf8');
   } finally {
-    await handle.close();
+    await handle.close().catch(() => {});
   }
 }
 
@@ -1231,19 +1301,360 @@ async function readBuildFileHead(file: string): Promise<string | undefined> {
  *    (`--keep-logs`) and no `.fls`; it keeps no `.aux` either, so no label resolves there anyway.
  *
  * Either one naming `pgfpages.sty` (or `pgfmorepages.sty`) is `true`: the answer only ever
- * refuses, so the union is the safe reading. `false` needs at least one of the two read and neither naming it. `undefined` —
- * neither readable — means nothing is known, and label resolution goes on as it did before this
- * check existed; that is a known gap, not a verdict. Loading the package without calling
- * `\pgfpagesuselayout` does not shift anything, and is still `true`: the build's records show the
- * package, not the layout, and over-refusing is the direction to err in.
+ * refuses, so the union is the safe reading. `false` needs at least one of the two read and
+ * neither naming it. A ZERO-BYTE file counts as unread, not as a record naming nothing: it is
+ * what an interrupted run leaves, and reading one as `false` let the label routes run on a real
+ * `resize to` build and resolve every label a page late. Only zero bytes: a file holding anything
+ * at all is judged on what it holds, as before — the narrowest rule that closes the case seen,
+ * rather than a guess at which non-empty contents are "really" empty. `undefined` — neither read
+ * — means nothing is known, and that is not a
+ * pass: `labelPages.ts` refuses every label of such a build (`'pgfpagesUnknown'`) and
+ * `pdf_geometry` notes that its floats pages are unverified. Every compile leaves a `.log`, so
+ * this state means the records were removed or unreadable, and failing closed costs a recompile.
+ * Loading the package without calling `\pgfpagesuselayout` does not shift anything, and is still
+ * `true`: the build's records show the package, not the layout, and over-refusing is the
+ * direction to err in. The same holds for a file merely opened — the `.fls` records one that
+ * `\IfFileExists{pgfpages.sty}` only tested for — which is likewise `true`.
  */
 export async function readPgfpagesEvidence(auxPath: string): Promise<boolean | undefined> {
   const stem = auxPath.slice(0, -path.extname(auxPath).length);
-  const fls = await readBuildFileHead(`${stem}.fls`);
+  // `|| undefined`: a zero-byte file is no record (above).
+  const fls = (await readBuildFileHead(`${stem}.fls`)) || undefined;
   if (fls !== undefined && FLS_PGFPAGES.test(fls)) return true;
-  const log = await readBuildFileHead(`${stem}.log`);
+  const log = (await readBuildFileHead(`${stem}.log`)) || undefined;
   if (log !== undefined && LOG_PGFPAGES.test(log)) return true;
   return fls === undefined && log === undefined ? undefined : false;
+}
+
+/**
+ * The largest `.log` read for its shipout marks. Unlike the pgfpages evidence (a preamble
+ * question, answered by the head of the file), the marks run through the whole log, so it is read
+ * whole or not at all: a log past this cap yields no marks rather than the marks of its first
+ * part. 8 MiB is far past any real log — a 130-page document writes under 4 KB of marks.
+ */
+export const MAX_SHIPOUT_LOG_BYTES = 8 * 1024 * 1024;
+
+/**
+ * One shipout mark: `[`, `\count0`, then `.`-separated `\count1`..`\count9` up to the last
+ * nonzero one, followed by `]` (a page shipped with nothing more to say), `{` (the font map file
+ * pdfTeX loads with the first page), `<` (an image or font file written into it; LuaTeX puts no
+ * space before it), whitespace or the end of the line. TeX puts a space before the `[` whenever
+ * the line already holds something, and starts a new line instead when the terminal line is
+ * nearly full, so a mark is only ever at the start of a line or after whitespace. Bounded: ten
+ * digits hold any `\count` value, and there are nine further counters at most.
+ */
+const SHIPOUT_MARK = /(?<!\S)\[(-?\d{1,10})(?:\.-?\d{1,10}){0,9}(?=[\]{<\s]|$)/g;
+
+/** The first line of a box warning, whose display (the lines up to the next empty one) quotes the
+ *  document. `Tight`/`Loose` are what TeX writes when `\hbadness`/`\vbadness` is set low. */
+const BOX_WARNING = /^(?:Overfull|Underfull|Tight|Loose) \\[hv]box \(/;
+
+/** A `\vbox` warning raised while the output routine was active: TeX's `vpack` puts its display
+ *  (` []`) on the warning's own line, so the block is that one line. Only the `\vbox` form:
+ *  `hpack` ends the warning's line before the display, so an `\hbox` one (`Overfull \hbox …
+ *  has occurred while \output is active`, then the display — a header's text, say — then ` []`
+ *  and an empty line) is a block through the next empty line like any other. */
+const OUTPUT_ACTIVE_VBOX_WARNING = /^\S+ \\vbox \(.*has occurred while \\output is active/;
+
+/**
+ * The first line of a TeX error: `<file>:<line>: ` under `-file-line-error` (which the server
+ * always passes), `! ` otherwise. TeX follows it with the error's context, its help text and an
+ * empty line (`error`), all before anything else is written — so the block through that empty
+ * line holds no mark, only document text the context and a document's `\errhelp` quote.
+ */
+const ERROR_START = /^(?:! |(?:\.\/)?[^:\s][^:]*\.\w+:\d+: )/;
+
+/**
+ * The first line of a context pair outside an error — a pdfTeX warning shows the context too
+ * (`destination with the same identifier … has been already used`) — which quotes the source up
+ * to where TeX stopped: `l.<n> ` for a line of a file, or one of TeX's token-list descriptors
+ * (`<*>`, `<argument>`, `<inserted text>`, `<to be read again>`, `<read 0>`, …). Lower-case
+ * letters and spaces only, so an image or font path (`</usr/…/cmr10.pfb>`) is not one. Only
+ * this line is skipped: nothing ends the pair's second line, and the page shipped next writes its
+ * mark onto it (`                   [1`, a real pdflatex + hyperref log).
+ */
+const ERROR_CONTEXT = /^(?:l\.\d+ |<(?:\*|read \*|read \d+|[a-z][a-z ]{0,20})> )/;
+
+/**
+ * The page counter of every page a TeX run shipped out, in order, off its `.log` — or `undefined`
+ * when the log cannot be read that way.
+ *
+ * TeX's `ship_out` writes `[<\count0>…` into the log as it ships each page, and `]` when done, and
+ * a document has no way to stop it (short of LuaTeX's `start_page_number`/`stop_page_number`
+ * callbacks, which no LaTeX package in TeX Live 2026 registers, and whose suppression only leaves
+ * the list short or empty — a refusal in `labelPages.ts`, or its check off), so the k-th mark is
+ * the counter PDF page k was shipped with (verified over real pdflatex, xelatex and lualatex
+ * builds: see `test/unit/shipoutMarks.test.ts`).
+ * A document CAN add text that looks like a mark (`\message{[7]}`, a box display quoting
+ * "see [1]"), so the result is evidence that may only refuse a page, and its length is checked
+ * against the PDF's page count before it is used at all (`labelPages.ts`).
+ *
+ * The log is first rejoined across TeX's 79-column hard wrap (`unwrapLines`), which can cut a
+ * mark, or an image path inside one. Then the places where TeX copies the DOCUMENT's text into
+ * the log are skipped, since that text can hold `see [12]`:
+ *
+ *  - a box display ({@link BOX_WARNING}): from its `Overfull \hbox`/`Underfull \vbox`/… line
+ *    through the next empty line — every line of it, whatever it starts with (`[]`, a font
+ *    `\OT1/…`, `$` for a math node, a space for glue). TeX ends every display with an empty line
+ *    before anything else is written (`end_diagnostic`), and over real pdflatex, xelatex and
+ *    lualatex builds that shipped a page right after a box warning the page's mark always came
+ *    after that line, never inside the block. The one exception to "through the next empty
+ *    line" is a `\vbox` warning raised inside the output routine (`Overfull \vbox … has
+ *    occurred while \output is active []`), whose display is on its own line and whose ONE
+ *    following empty line the 79-column rejoin swallows when that line is exactly 79 columns —
+ *    so it is a block of one line, and the page's mark after it is kept. The `\hbox` form of
+ *    that warning is no exception: its display (a `fancyhdr` header quoting `see [3]`, say)
+ *    follows on the next lines, then ` []` and the empty line, as for any other box;
+ *  - an error ({@link ERROR_START}): from its `./main.tex:3: …` line through the next empty
+ *    line — its context quotes the source (`l.3 Text \foo` / `see [12] here`) and its help can be
+ *    the document's own `\errhelp`. A primitive TeX error writes nothing else before that empty
+ *    line; a LaTeX- or package-format error (`\GenericError`) writes an empty line right after
+ *    its first line, so its context and help are then read like any other line — a known gap
+ *    that can only add marks, so the length check switches the cross-check off;
+ *  - outside an error, the first line of a context pair ({@link ERROR_CONTEXT}: `l.<n> …`,
+ *    `<argument> …`), which a pdfTeX warning prints. Its SECOND line is read: nothing ends it, and
+ *    over real pdflatex builds with hyperref the next page's mark was written onto it — so a
+ *    document text quoted there still counts, and can only make the list too long;
+ *  - any other line starting with `[]` or `\`, which is how a box display's own lines begin
+ *    when a display turns up without its warning line.
+ *
+ * The one wrong VALUE this could read is a mark cut by a wrap the rejoin did not see (TeX's column count
+ * and the line's length disagree when the line holds a string TeX does not count or, under LuaTeX,
+ * a multi-byte character): `[12` / `3]` would read as 12. So a mark that ends its line while the
+ * next line starts with a digit or a `.` gives up on the whole log, rather than read one number
+ * wrong in a list of the right length. Decode the log as latin1 before calling this: pdfTeX wraps
+ * at 79 BYTES, so one byte must be one character for the rejoin to see a wrapped line that holds
+ * a non-ASCII file name.
+ */
+export function parseShipoutMarks(log: string): number[] | undefined {
+  const lines = unwrapLines(log);
+  const marks: number[] = [];
+  // Inside a block that runs to the next empty line: a box display, or an error message with its
+  // context and help.
+  let inBlock = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (inBlock) {
+      if (line === '') inBlock = false;
+      continue;
+    }
+    if (BOX_WARNING.test(line)) {
+      inBlock = !OUTPUT_ACTIVE_VBOX_WARNING.test(line);
+      continue;
+    }
+    if (ERROR_START.test(line)) {
+      inBlock = true;
+      continue;
+    }
+    if (ERROR_CONTEXT.test(line)) continue;
+    if (line.startsWith('[]') || line.startsWith('\\')) continue;
+    for (const m of line.matchAll(SHIPOUT_MARK)) {
+      if (m.index + m[0].length === line.length && /^[0-9.]/.test(lines[i + 1] ?? '')) {
+        return undefined;
+      }
+      marks.push(Number(m[1]));
+    }
+  }
+  return marks;
+}
+
+/**
+ * The shipout marks ({@link parseShipoutMarks}) of the `.log` beside `auxPath` (same job name),
+ * or `undefined` when there is none, it is not a regular file, it is a symbolic link, it cannot be
+ * read for any reason, or it is larger than {@link MAX_SHIPOUT_LOG_BYTES}. Read whole, and
+ * checked to be a regular file on the open handle.
+ *
+ * A symbolic link at the log is refused on every platform: `lstat` first, then an open with
+ * `O_NOFOLLOW` where the platform has it (not Windows, where `fs.constants.O_NOFOLLOW` is
+ * undefined). Where it does not, a link planted between the `lstat` and the `open` would be
+ * followed — a window this function does not close, and does not need to: the marks can only
+ * ever REFUSE a label (and a list that does not number the PDF's pages is not used at all), so a
+ * swapped-in file can at worst refuse a label that would have resolved, never resolve one. A
+ * FIFO swapped in there is refused without blocking the `open` ({@link BUILD_FILE_OPEN_FLAGS}).
+ *
+ * Every failure is "no marks" rather than an error, because the marks can only add a refusal: a
+ * lookup without them runs exactly as it did before they were read. Kept apart from
+ * {@link readPgfpagesEvidence}, whose tri-state it must not change.
+ */
+export async function readShipoutMarks(auxPath: string): Promise<number[] | undefined> {
+  return (await readLogRecords(auxPath)).shipouts;
+}
+
+/**
+ * The `.log` beside `auxPath`, whole, decoded as latin1 (see {@link parseShipoutMarks}), or
+ * `undefined` on every failure — under exactly the guards {@link readShipoutMarks} documents: no
+ * symbolic link, a regular file on the open handle, no FIFO blocking the open, and no larger than
+ * {@link MAX_SHIPOUT_LOG_BYTES}.
+ */
+async function readWholeBuildLog(auxPath: string): Promise<string | undefined> {
+  const stem = auxPath.slice(0, -path.extname(auxPath).length);
+  const logPath = `${stem}.log`;
+  let handle;
+  try {
+    if (!(await lstat(logPath)).isFile()) return undefined;
+    handle = await open(logPath, BUILD_FILE_OPEN_FLAGS);
+  } catch {
+    return undefined;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.size > MAX_SHIPOUT_LOG_BYTES) return undefined;
+    // One byte past the size the stat gave, so a log that grew since is refused rather than cut.
+    const buf = Buffer.alloc(st.size + 1);
+    let length = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buf, length, buf.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+      if (length === buf.length) return undefined;
+    }
+    return buf.subarray(0, length).toString('latin1');
+  } catch {
+    return undefined;
+  } finally {
+    // A failed close must not escape either: every failure here is "no record".
+    await handle.close().catch(() => {});
+  }
+}
+
+/** What {@link readLogRecords} gives for a log it was not asked to read. */
+const NO_LOG_RECORDS: { shipouts?: number[]; engineOutput?: EngineOutput } = {};
+
+/**
+ * Both records a label lookup reads off the build's `.log`, from ONE read of it
+ * ({@link readWholeBuildLog}): its shipout marks ({@link parseShipoutMarks}) and the engine's
+ * closing output record ({@link parseEngineOutput}). Each is absent when it could not be had —
+ * every failure is "no record", since either one can only add a refusal.
+ */
+async function readLogRecords(
+  auxPath: string,
+): Promise<{ shipouts?: number[]; engineOutput?: EngineOutput }> {
+  const log = await readWholeBuildLog(auxPath);
+  if (log === undefined) return {};
+  let shipouts: number[] | undefined;
+  let engineOutput: EngineOutput | undefined;
+  try {
+    shipouts = parseShipoutMarks(log);
+  } catch {
+    shipouts = undefined;
+  }
+  try {
+    engineOutput = parseEngineOutput(log);
+  } catch {
+    engineOutput = undefined;
+  }
+  return {
+    ...(shipouts === undefined ? {} : { shipouts }),
+    ...(engineOutput === undefined ? {} : { engineOutput }),
+  };
+}
+
+/** `Output written on <file> (<n> page[s], <b> bytes).`, as the engine closes a run that shipped
+ *  pages, matched from the marker on: the file name up to the FIRST `(<n> pages, <b> bytes).`
+ *  after it, since the text that follows the record (pdfTeX's `PDF statistics:`, a SyncTeX line)
+ *  is not the record's. */
+const OUTPUT_WRITTEN = /^Output written on (.*?) \((\d{1,10}) pages?, \d{1,20} bytes\)\./;
+const OUTPUT_WRITTEN_MARKER = 'Output written on ';
+/** How far past its marker a written record is looked for: a whole file path and the counts. */
+const OUTPUT_WRITTEN_SPAN = 8192;
+/** What XeTeX (and pdfTeX) write instead when the run shipped nothing. */
+const NO_PAGES_MARKER = 'No pages of output.';
+/** What pdfTeX and LuaTeX write last when a fatal error stopped the run (after `<file>:<line>:`
+ *  with `-file-line-error`, after `!` otherwise). */
+const FATAL_NO_PDF_MARKER = '==> Fatal error occurred, no output PDF file produced!';
+/** The output-file extensions named back in {@link EngineOutput}: the three the server's engines
+ *  write. Anything else is left out rather than echoed, since the name is the job's. */
+const OUTPUT_EXT = /\.(pdf|xdv|dvi)$/i;
+
+/**
+ * The engine's closing record of what the run produced — whichever of the three records an engine
+ * closes a run with comes LAST in the log: `Output written on … (<n> pages, <b> bytes).`,
+ * `No pages of output.`, or `==> Fatal error occurred, no output PDF file produced!` — or
+ * `undefined` when there is none.
+ *
+ * The engine writes this record itself as it terminates (`close_files_and_terminate`), after
+ * everything the document could have written, and a pdfTeX or XeTeX document compiled without
+ * shell escape has no way to run code after that point. So a document that `\typeout`s a record
+ * of the same shape only ever writes it BEFORE the real one, and the last one is the engine's —
+ * including in a run that stopped on a fatal error, whose closing record says so
+ * (`\message{[1]}` and a forged `Output written on main.pdf (3 pages …)` in a preamble that then
+ * fails still end in "no output", real pdflatex, xelatex and lualatex logs).
+ *
+ * The records are searched for in the log with EVERY line break removed, not line by line, for
+ * that reason: TeX wraps the log at 79 columns, and the engine's record can be glued onto the line
+ * before it (a statistics line exactly 79 columns long, in a real xelatex log) or split where the
+ * wrap width and the line's length disagree (a non-ASCII path under an engine that counts
+ * characters, not bytes). Read line by line, either one made the record unrecognisable, and the
+ * forged line before it became "the last". A record found last whose count cannot be read gives
+ * `undefined` — never the one before it.
+ *
+ * A closing-record marker that falls INSIDE the last written record's match is part of its file
+ * name, not a record of its own — the build directory embeds the project directory's name, so a
+ * project called `No pages of output. draft` writes that marker into the engine's own
+ * `Output written on <path>` — and the written record stands.
+ *
+ * Three residuals, each only ever the absence of a refusal the record would have added: a run
+ * killed before it closed (a timeout) leaves no engine record, so a forged one can then be the
+ * last; LuaTeX runs Lua after that point (the `stop_run`/`wrapup_run` callbacks), where a document
+ * can write anything; and with shell escape on, a command the document starts can outlive the
+ * engine and append to the log after it closed. A missing refusal is not a harmless one — the
+ * lookup then answers as it did before this record was read, which for #220 was the wrong page.
+ * And one residual that can misread the count: a file name that itself holds
+ * `(<n> pages, <b> bytes).`. What the record is used for bounds all of them: it can only REFUSE a
+ * label (`labelPages.ts`, `'stalePdf'`), never resolve one.
+ */
+export function parseEngineOutput(log: string): EngineOutput | undefined {
+  const text = log.replace(/[\r\n]/g, '');
+  const written = text.lastIndexOf(OUTPUT_WRITTEN_MARKER);
+  const noPages = text.lastIndexOf(NO_PAGES_MARKER);
+  const noPdf = text.lastIndexOf(FATAL_NO_PDF_MARKER);
+  const last = Math.max(written, noPages, noPdf);
+  if (last < 0) return undefined;
+  const m =
+    written >= 0 ? OUTPUT_WRITTEN.exec(text.slice(written, written + OUTPUT_WRITTEN_SPAN)) : null;
+  // A marker INSIDE the last written record is part of its file name, not a record of its own:
+  // the build directory embeds the project directory's name, and a project called
+  // "No pages of output. draft" puts that text in the engine's own `Output written on <path>`.
+  // Only a marker past the end of that record's match is a later word — and every other marker
+  // falls in the record when the last one does, since it is the last.
+  const insideWritten = m !== null && last < written + m[0].length;
+  if (!insideWritten && last === noPages) return { kind: 'noPages' };
+  if (!insideWritten && last === noPdf) return { kind: 'noPdf' };
+  if (!m) return undefined;
+  const ext = OUTPUT_EXT.exec(m[1] ?? '')?.[0]?.toLowerCase();
+  return { kind: 'written', pages: Number(m[2]), ...(ext ? { ext } : {}) };
+}
+
+/**
+ * The modification times of `auxPath` and `pdfPath` ({@link BuildTimes}), or `undefined` when
+ * either cannot be `lstat`'d or is not a regular file — a symbolic link is judged as itself, never
+ * by what it points at, as {@link readWholeBuildLog} judges the `.log`. No evidence either way,
+ * since what they are used for can only add a refusal (`labelPages.ts`, `'stalePdf'`).
+ *
+ * The engine writes both files, and the order is fixed for a run that finishes: LaTeX closes the
+ * `.aux` in `\enddocument`, before pdfTeX and LuaTeX finish the PDF and before latexmk runs
+ * xdvipdfmx over XeTeX's `.xdv`. A run that rewrote the `.aux` and then stopped without a PDF —
+ * XeTeX on an error in the body, whose `.xdv` xdvipdfmx is then never run over — leaves the
+ * EARLIER run's PDF beside a newer `.aux`.
+ *
+ * A pdfTeX or XeTeX document compiled without shell escape cannot set a file's time: it can only
+ * write a file, and writing the PDF would make that file the document's own output anyway. That
+ * is not true of every build. A LuaTeX document can (`\directlua{lfs.touch(…)}` ran under
+ * `-no-shell-escape` with TeX Live 2026 lualatex), and with shell escape on any engine's document
+ * can, so such a build can back-date its `.aux` past the PDF. That only ever removes a refusal
+ * this signal would have added: the lookup then answers as it did before the check existed.
+ */
+export async function readBuildTimes(
+  auxPath: string,
+  pdfPath: string,
+): Promise<BuildTimes | undefined> {
+  try {
+    const [aux, pdf] = await Promise.all([lstat(auxPath), lstat(pdfPath)]);
+    if (!aux.isFile() || !pdf.isFile()) return undefined;
+    return { auxMs: aux.mtimeMs, pdfMs: pdf.mtimeMs };
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1252,15 +1663,28 @@ export async function readPgfpagesEvidence(auxPath: string): Promise<boolean | u
  * that comes back as
  * `{ floats: [], omitted: 0, total: 0, dropped: 0, refused: 0, indeterminate: 0, note }`. Any
  * other read failure (e.g. unreadable permissions) propagates, since that is a real problem the
- * caller should see, not a normal "not compiled yet" state.
+ * caller should see, not a normal "not compiled yet" state. `shipouts: true` also reads the
+ * `.log`'s shipout marks into `shipouts` ({@link readShipoutMarks}) and, in the same read, the
+ * engine's closing output record into `engineOutput` ({@link parseEngineOutput}) — for a label
+ * lookup, which checks its resolved pages against them, and for `pdf_geometry`'s floats notes.
+ * `pdfPath` names the PDF the caller will pair with this `.aux`, and stats both into `buildTimes`
+ * ({@link readBuildTimes}); it is recorded as `pairedPdf`, and a label lookup
+ * (`resolveLabelPages`) refuses an index that was not read with the PDF it opens.
  */
 export async function readAuxFloats(
   projectDir: string,
   rootFile: string,
-  opts?: { max?: number },
+  opts?: { max?: number; shipouts?: boolean; buildDir?: string; pdfPath?: string },
 ): Promise<AuxFloatsResult> {
   const max = opts?.max ?? DEFAULT_MAX_FLOATS;
-  const auxPath = buildAuxPath(projectDir, rootFile);
+  // `buildDir` reads another build of the same root — an overlay compile's variant `out/` —
+  // instead of the project's own. Everything below (the \@input walk, the pgfpages evidence, the
+  // shipout marks) is derived from this one path, so it all reads that build.
+  const auxPath =
+    opts?.buildDir !== undefined
+      ? buildAuxPathIn(opts.buildDir, rootFile)
+      : buildAuxPath(projectDir, rootFile);
+  const paired = opts?.pdfPath !== undefined ? { pairedPdf: opts.pdfPath } : {};
 
   let auxContent: string;
   try {
@@ -1276,6 +1700,7 @@ export async function readAuxFloats(
         indeterminate: 0,
         unreadInputs: 0,
         beamerNav: false,
+        ...paired,
         note:
           `No .aux found in the build directory (${toPosix(auxPath)}) — nothing has been ` +
           'compiled with this root file yet, or the compile backend in use did not write one.',
@@ -1326,6 +1751,10 @@ export async function readAuxFloats(
 
   const note = unreadInputsNote(inputWalk);
   const pgfpages = await readPgfpagesEvidence(auxPath);
+  const { shipouts, engineOutput } =
+    opts?.shipouts === true ? await readLogRecords(auxPath) : NO_LOG_RECORDS;
+  const buildTimes =
+    opts?.pdfPath !== undefined ? await readBuildTimes(auxPath, opts.pdfPath) : undefined;
   return {
     floats,
     omitted: total - floats.length,
@@ -1337,6 +1766,10 @@ export async function readAuxFloats(
     beamerNav: inputWalk.beamerNav,
     ...(inputWalk.beamerSlides.size > 0 ? { beamerSlides: inputWalk.beamerSlides } : {}),
     ...(pgfpages === undefined ? {} : { pgfpages }),
+    ...(shipouts === undefined ? {} : { shipouts }),
+    ...(engineOutput === undefined ? {} : { engineOutput }),
+    ...(buildTimes === undefined ? {} : { buildTimes }),
+    ...paired,
     ...(note === undefined ? {} : { note }),
   };
 }

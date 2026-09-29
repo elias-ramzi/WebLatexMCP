@@ -24,7 +24,7 @@ describe('projectIdProblem', () => {
       'Thesis_2026',
       'cvpr-26.v2',
       'x'.repeat(64),
-      // Safe as a directory name, so accepted since review round 2 (they worked before 0.7).
+      // Safe as a directory name, so accepted (they worked before 0.7).
       'my paper',
       '_x',
       'été',
@@ -116,7 +116,7 @@ describe('stripGitUrlCredentials / redactGitUrlCredentials', () => {
 
 describe('stripGitUrlCredentials — which bare userinfo is a token', () => {
   // Bare (colon-less) userinfo that is an access token: removed whole. Every one of these was
-  // kept, and so persisted, before review round 3.
+  // kept, and so persisted, by an earlier version.
   it.each([
     // Bitbucket Data Center HTTP access token: base64, so `+`, `/`, `=` (percent-encoded or raw).
     'NjE0ODM2NzY0NjU0OoGa1+kB2fTGP2JbSdh3o9Xh',

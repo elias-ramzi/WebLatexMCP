@@ -1,12 +1,14 @@
 <div align="center">
 
-<img src="assets/weblatexmcp-lockup-beta.svg" alt="WebLatexMCP — public beta" width="100%" />
+<img src="assets/weblatexmcp-lockup.svg" alt="WebLatexMCP" width="100%" />
 
 # WebLatexMCP
 
 **Edit, compile, and sync your Overleaf projects with Claude.**
 
-[![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
+[![CI](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/elias-ramzi/WebLatexMCP/actions/workflows/ci.yml)
+&nbsp;
+[![NVIDIA SkillSpector: 0 findings](https://img.shields.io/badge/SkillSpector-0%20findings-76B900?logo=nvidia&logoColor=white)](#skills)
 &nbsp;
 ![Node ≥ 20](https://img.shields.io/badge/node-%E2%89%A5%2020-3C873A?logo=node.js&logoColor=white)
 &nbsp;
@@ -28,14 +30,6 @@
 
 </div>
 
-> [!WARNING]
-> **Public beta — early development.** WebLatexMCP is now public, but it's in its early stages and
-> under active development. Expect bugs, rough edges, and incomplete features. Editing and git operations
-> touch real projects, so review diffs before you push. Please
-> [report anything you run into](https://github.com/elias-ramzi/WebLatexMCP/issues) — bug reports and
-> feedback are hugely welcome. Run [`/session-feedback`](.claude/skills/session-feedback/SKILL.md) at
-> the end of a session and it writes the report for you.
-
 ---
 
 **WebLatexMCP lets Claude work on your paper the way a co-author would** — rewriting the paragraph
@@ -49,6 +43,7 @@ every change, and nothing reaches Overleaf until you say so.
 - 🧪 **Local compiles** — two backends run on your machine: `latexmk`, which is what Overleaf runs, or `tectonic`.
 - 👀 **Live PDF viewer + review comments** — a viewer that hot-reloads on every compile, in a browser or a **VS Code** tab. Select text in the PDF to leave a note, and Claude applies it at the right source line.
 - 📚 **Citations checked, not trusted** — API (CrossRef, OpenAlex) calls to verify, or add citations.
+- 🧑‍⚖️ **Pre-submission peer review** — a multi-model reviewer panel, merged into one verified review ([how it works](https://claude.ai/artifact/Kg5Zuk3wvu9XfprmPgv2rR)).
 - 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
 
@@ -89,11 +84,16 @@ unless you ask:
 - **`/format-bibliography`** — deduplicate, normalize cite keys, harmonize venues, propagate renames into `\cite`s.
 - **`/proofread-document`** — hunt typos (spelling, doubled words, agreement, punctuation, LaTeX escapes).
 - **`/review-writing-guide`** — review the paper against the [writing guide](docs/writing-guide.md) and report prioritized suggestions with a concrete rewrite each.
+- **`/peer-review`** — pre-submission review of an ML paper: summary, strengths, weaknesses, minor weaknesses, questions, typos — in Claude Code, `/review-paper` runs it as a Sonnet/Opus/Fable panel merged by a Fable triage.
 - **`/summarize-paper`** — write/update a small local summary of the paper (git-excluded) so future sessions start fast.
+
+Every bundled skill, and every command and agent the plugin ships, is scanned on each pull request by
+NVIDIA's [SkillSpector](https://github.com/NVIDIA/skillspector) (static rules, `--no-llm`), and any
+finding fails CI. Today every skill scores 0/100 with no findings.
 
 **How you get them depends on the client:**
 
-- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension), and Claude picks a skill up when your request matches it.
+- **Claude Code** — [install the plugin](#claude-code-cli-or-the-vs-code-extension), and Claude picks a skill up when your request matches it. The plugin also brings the paper commands (`/review-paper`, `/hunt-typo`, `/format-latex`, `/review-writing`, `/rewrite-mode`, named `/web-latex-mcp:<command>`) and the agents they dispatch.
 - **Any MCP client** — nothing to install: every skill ships with the server as an **MCP prompt**, in the client's prompt menu.
 - **Claude Desktop / claude.ai** — for the same automatic behavior, zip each folder under [`.claude/skills/`](.claude/skills/) and upload them under **Customize → Skills**.
 

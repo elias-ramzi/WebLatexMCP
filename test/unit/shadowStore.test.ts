@@ -588,7 +588,7 @@ describe('ShadowStore', () => {
     });
 
     it('refresh does not advance an unrecorded entry even when a non-overlapping HEAD change merges cleanly (#64 regression)', async () => {
-      // Reproduces the reviewer's probe: a write reached the working tree and was folded into the
+      // Reproduces the probe: a write reached the working tree and was folded into the
       // shadow, but a LATER write on the same path failed to record (`markUnrecorded`) — so the
       // shadow is missing that latest edit. A peer's unrelated commit then lands, and a bare
       // three-way merge of the (stale) shadow onto the new HEAD succeeds cleanly, which must NOT

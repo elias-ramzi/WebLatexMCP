@@ -123,7 +123,7 @@ describe('planFloatsPayload', () => {
   });
 
   it('charges the JSON-ESCAPED size, so a backslash-heavy label costs more than its raw length', () => {
-    // This is conflictBudget.ts's round-2 bug reproduced here so it cannot ship twice: a `\label`
+    // This is a bug conflictBudget.ts once had, reproduced here so it cannot ship twice: a `\label`
     // is document-controlled LaTeX, and LaTeX is backslash-dense.
     const escaped = entry('\\'.repeat(10), '2', '2');
     expect(escaped.label.length).toBe(10);

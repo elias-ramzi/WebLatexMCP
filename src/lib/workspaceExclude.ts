@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { toPosix } from './paths.js';
+import { climbsOut, toPosix } from './paths.js';
 
 /** Marker line so we only ever manage a single, idempotent block in the exclude file. */
 const EXCLUDE_HEADER = '# added by web-latex-mcp (workspace-local clones)';
@@ -39,7 +39,7 @@ export async function excludeWorkspaceFromHostGit(
 
     // Anchor the pattern to the repo root so it matches only this workspace dir.
     const rel = toPosix(path.relative(repoRoot, workspaceRoot));
-    if (!rel || rel.startsWith('..')) return undefined;
+    if (!rel || climbsOut(rel)) return undefined;
     const pattern = `/${rel}/`;
 
     const excludePath = path.join(repoRoot, '.git', 'info', 'exclude');

@@ -1,6 +1,6 @@
 ---
 name: verify-citations
-description: Verify the references of a document against DBLP, Crossref and OpenAlex — check each one's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write an audit report you can open, and optionally annotate the entries you confirmed. Works whatever shape the bibliography has — a BibTeX .bib, a LaTeX thebibliography, or a reference list written as prose in a markdown or plain-text document — and whether the document is on a git remote (Overleaf, GitHub) or is just a directory on this machine with no remote at all. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a paper, proposal, or draft. Read-only for the bibliography by default (the report is a separate local file, never pushed); never changes it without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
+description: Verify the references of a document against DBLP, Crossref and OpenAlex — check each one's title, authors, venue (handling abbreviations like CVPR/NeurIPS), and publication year, flag anything doubtful for the user, write an audit report you can open (kept out of git through the repository's local .git/info/exclude, never committed), and optionally annotate the entries you confirmed. Works whatever shape the bibliography has — a BibTeX .bib, a LaTeX thebibliography, or a reference list written as prose in a markdown or plain-text document — and whether the document is on a git remote (Overleaf, GitHub) or is just a directory on this machine with no remote at all. Use when the user asks to "verify", "check", "audit", or "validate" the citations / bibliography / references of a paper, proposal, or draft. Read-only for the bibliography by default (the report is a separate local file, never pushed); never changes it without explicit permission. Operates on projects served by the web-latex-mcp MCP server.
 project: optional
 ---
 
@@ -420,13 +420,21 @@ so **ask before writing it**, and offer both:
 
 - **Write it to the project directory** (`write_file`, path `citation-report.local.md`). If the
   directory is inside a git repo and you have a shell, keep it out of that repo the same way — this
-  edits only `.git/info/exclude`, which is local to their checkout and never committed:
+  adds one line to that repo's `.git/info/exclude`, which is local to their checkout and never
+  committed. **Say so when you ask**, since it is a file of theirs too:
 
   ```bash
   DIR="<path from list_projects>"
   NOTE="citation-report.local.md"
-  git -C "$DIR" rev-parse --show-toplevel   # nothing? then it is not in a repo — no exclude needed
-  printf '%s\n' "$NOTE" >> "$(git -C "$DIR" rev-parse --git-dir)/info/exclude"
+  # --path-format=absolute: a plain --git-dir prints a bare `.git` at the top level, which the
+  # append would resolve against the shell's own directory, i.e. some other repository.
+  if EXCLUDE=$(git -C "$DIR" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null); then
+    mkdir -p "$(dirname "$EXCLUDE")"
+    grep -qxF "$NOTE" "$EXCLUDE" 2>/dev/null || printf '%s\n' "$NOTE" >> "$EXCLUDE"
+    git -C "$DIR" check-ignore "$NOTE"   # must echo the filename → confirms it's ignored
+  else
+    echo "not inside a git repo: nothing to exclude"
+  fi
   ```
 
   If you have no shell (Claude Desktop, Cursor), say plainly that the file will show up as untracked

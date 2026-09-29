@@ -5,7 +5,9 @@ argument-hint: <project id> [file/dir filter] [--sonnet]
 
 Review the project below against the LaTeX writing guide by fanning out one
 `writing-reviewer` agent per file. You are the dispatcher and the editor of the final
-report; the agents do the reading.
+report; the agents do the reading. The agent ships with this command:
+`web-latex-mcp:writing-reviewer` from the Claude Code plugin, `writing-reviewer` from a clone
+of the server repo — dispatch whichever your agent list shows.
 
 Target: $ARGUMENTS
 

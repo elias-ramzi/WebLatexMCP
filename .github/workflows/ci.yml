@@ -42,8 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -52,6 +52,48 @@ jobs:
       - run: npm run format:check
       - run: npm run typecheck
       - run: npm run build
+
+  # NVIDIA SkillSpector over what the plugin ships: the skills (plugin.json `skills`), each scanned
+  # as its own skill, then the agents and commands it lists. Any finding fails the job; the
+  # README's SkillSpector badge claims exactly this.
+  # --no-llm keeps it to the static rules (YARA + patterns): no model, no API key, no secret in CI,
+  # ~20s. Two flags are deliberately absent: --fail-on-incomplete, because a static-only scan always
+  # reports its coverage as "partial" and would fail every run; and a scan of the repo root, which
+  # inventories node_modules for ~8 minutes and inspects nothing, since it looks for SKILL.md files.
+  # A finding is fixed in the skill, not suppressed — there is no baseline file on purpose.
+  skillspector:
+    name: SkillSpector scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+      - run: >-
+          skillspector scan .claude/skills --recursive --no-llm --fail-on-findings
+          --format markdown --output skillspector-report.md
+      # The plugin also ships agents and commands (plugin.json `agents`/`commands`, #212), listed
+      # one by one because .claude/agents and .claude/commands hold this repo's dev tooling too.
+      # Stage exactly the listed files, one directory per kind, and scan those: scanning the
+      # directories would test files no plugin install loads, and miss nothing it does. Both kinds
+      # are scanned before the step fails, so one report never hides the other's findings; an
+      # empty list fails outright rather than passing a scan of nothing.
+      - name: Scan the agents and commands the plugin ships
+        if: always()
+        run: |
+          status=0
+          for kind in agents commands; do
+            mkdir -p "shipped/$kind"
+            jq -r --arg kind "$kind" '.[$kind][]' .claude-plugin/plugin.json > "shipped/$kind.list"
+            test -s "shipped/$kind.list" || { echo "plugin.json lists no $kind"; exit 1; }
+            while IFS= read -r file; do cp "$file" "shipped/$kind/"; done < "shipped/$kind.list"
+            skillspector scan "shipped/$kind" --no-llm --fail-on-findings \
+              --format markdown --output "skillspector-$kind.md" || status=1
+          done
+          exit "$status"
+      - name: Publish the reports to the log and the job summary
+        if: always()
+        run: cat skillspector-report.md skillspector-agents.md skillspector-commands.md 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
 
   test:
     name: Test (${{ matrix.os }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
@@ -99,8 +141,8 @@ jobs:
     # If a legitimate run starts approaching it, find out what got slower rather than raising it.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -120,8 +162,8 @@ jobs:
     # Same reasoning; here the cold-cache apt/TeX Live steps are the slow ones, not the tests.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -130,28 +172,38 @@ jobs:
       # (404 on ghostscript, a texlive-binaries dependency). Refresh the lists first.
       - name: Refresh apt package lists
         run: sudo apt-get update
-      # TeX Live + latexmk via apt (no bibtex/biber is needed). texlive-pictures brings pgf:
+      # TeX Live + latexmk via apt (bibtex, not biber: the overlay smoke's bibliography falls back
+      # to bibtex when biber is absent). texlive-pictures brings pgf:
       # beamer cannot load without pgfmath, and the label smokes compile pgfpages layouts. Without
       # it those smokes fail to compile rather than skip, which is the point: they are the
-      # real-compile evidence for the label checks. (texlive-latex-extra is left out on purpose —
-      # it depends on Java; no smoke may need lastpage or lipsum.) Cached with
+      # real-compile evidence for the label checks. texlive-xetex brings xelatex, which one label
+      # smoke compiles under (lualatex already ships with texlive-latex-base's binaries).
+      # (texlive-latex-extra is left out on purpose — it depends on Java; no smoke may need
+      # lastpage or lipsum.) Cached with
       # cache-apt-pkgs-action so warm runs restore the .debs instead of re-downloading; bump
       # `version` to bust the cache.
       - name: Set up TeX Live
-        uses: awalsh128/cache-apt-pkgs-action@v1
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
-          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended texlive-pictures
-          version: 1.1
+          packages: latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended texlive-pictures texlive-xetex
+          version: 1.2
       # cache-apt-pkgs-action restores the .deb payloads but skips dpkg's post-install, so on a
       # warm cache the pieces that post-install generates are missing and latexmk fails
       # intermittently (a cache miss installs cleanly and passes; a hit does not). Recreate them so
       # a cache hit matches a fresh install: the filename database (mktexlsr), the font maps
       # (updmap-sys), and — the one that caused the flaky *first* compile — the format files
-      # (fmtutil-sys), which are built at install time and never shipped in the .debs.
+      # (fmtutil-sys), which are built at install time and never shipped in the .debs. And
+      # `/usr/bin/bibtex` itself: texlive-binaries ships only `bibtex.original` and its post-install
+      # makes the command an update-alternatives link, so a cache hit has no `bibtex` and latexmk
+      # stops at the bibliography step with no .blg.
       - name: Refresh TeX Live databases
         run: |
           sudo mktexlsr
           sudo updmap-sys
           sudo fmtutil-sys --all
+          if ! command -v bibtex >/dev/null; then
+            sudo update-alternatives --install /usr/bin/bibtex bibtex /usr/bin/bibtex.original 100
+          fi
+          bibtex --version | head -1
       - run: npm ci
       - run: npm run test:smoke

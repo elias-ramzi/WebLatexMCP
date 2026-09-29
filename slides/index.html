@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebLatexMCP</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
+    />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@6.0.2/dist/reveal.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/reveal.js@6.0.2/dist/theme/white.css"
+    />
+    <link rel="stylesheet" href="theme.css" />
+    <script>
+      // `?print-pdf` is reveal's print layout, used only to export the PDF (slides/build-pdf.mjs).
+      // That layout waits on animation frames, which headless Chrome stops producing under
+      // --virtual-time-budget, so it never finished and printed one blank page. Timers still
+      // advance there, so in print mode a frame is a 16 ms timeout; presenting is unaffected.
+      if (/print-pdf/i.test(window.location.search)) {
+        window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+      }
+    </script>
+  </head>
+  <body>
+    <div class="reveal">
+      <div class="slides">
+        <!-- ============================================================ 1. Title -->
+        <section data-background-color="#1A1A2E">
+          <div class="title-slide">
+            <svg
+              class="lockup"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 600 150"
+              font-family="'Space Grotesk', sans-serif"
+              role="img"
+              aria-label="WebLatexMCP"
+            >
+              <g transform="translate(-52,-52)">
+                <line
+                  x1="76"
+                  y1="92"
+                  x2="103"
+                  y2="148"
+                  stroke="#ffffff"
+                  stroke-width="5.7"
+                  stroke-linecap="round"
+                />
+                <g transform="translate(120,80) scale(1.6667)">
+                  <path
+                    d="M11 5 C8 5 7.5 8 7.5 12.5 C7.5 18 6 23 2 24 C6 25 7.5 30 7.5 35.5 C7.5 40 8 43 11 43"
+                    fill="none"
+                    stroke="#ffffff"
+                    stroke-width="3.2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M37 5 C40 5 40.5 8 40.5 12.5 C40.5 18 42 23 46 24 C42 25 40.5 30 40.5 35.5 C40.5 40 40 43 37 43"
+                    fill="none"
+                    stroke="#ffffff"
+                    stroke-width="3.2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                  <g transform="translate(9 9) scale(1.25)" fill="#7C5CFF" fill-rule="evenodd">
+                    <path
+                      d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"
+                    />
+                  </g>
+                </g>
+              </g>
+              <line x1="196" y1="34" x2="196" y2="110" stroke="#3a3a52" stroke-width="1" />
+              <!-- SVG text renders whitespace between tspans as a space, so each run stays on one line. -->
+              <!-- prettier-ignore -->
+              <text x="232" y="70" font-size="40" font-weight="700" letter-spacing="-0.5" fill="#ffffff"><tspan>Web</tspan><tspan dx="2">L</tspan><tspan dx="-5" dy="-13" font-size="29">A</tspan><tspan dx="-3" dy="13" font-size="40">T</tspan><tspan dy="7">E</tspan><tspan dy="-7">X</tspan><tspan dx="1" fill="#7C5CFF">\</tspan><tspan>MCP</tspan></text>
+              <!-- prettier-ignore -->
+              <text class="mono" x="233" y="102" font-size="13" font-weight="500" fill="#6a6a82"><tspan fill="#7C5CFF">\begin</tspan>{automation}</text>
+            </svg>
+            <h1>Claude for scientific writing</h1>
+            <p class="meta">
+              public beta · v0.7.1 ·
+              <a href="https://github.com/elias-ramzi/WebLatexMCP"
+                >github.com/elias-ramzi/WebLatexMCP</a
+              >
+            </p>
+          </div>
+          <aside class="notes">
+            WebLatexMCP: an MCP server that lets Claude read, edit, compile and push your LaTeX
+            paper — Overleaf, GitHub, or a plain local folder. Public beta, MIT licensed.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 2. Motivation -->
+        <section>
+          <p class="kicker">Motivation</p>
+          <h2>Write papers straight from Claude</h2>
+          <p class="lede">
+            No more copy-pasting paragraphs between a chat tab and Overleaf. Claude works on the
+            real project: it reads the <code>.tex</code>, edits it, compiles it, and looks at the
+            typeset page.
+          </p>
+          <div class="grid two" style="margin-top: 0.8em">
+            <div class="card">
+              <h3>Write &amp; rewrite</h3>
+              <p>
+                Rewrite the paragraph you point at; turn experiment results into a table or a
+                figure.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Discuss citations</h3>
+              <p>
+                Search and check references against DBLP, Crossref and OpenAlex — never typed from
+                memory.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Comment the draft</h3>
+              <p>
+                Select text in the PDF, leave a note, and Claude edits the matching source line.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Hunt for typos</h3>
+              <p>
+                Bundled skills proofread, review against a writing guide, and prepare the arXiv
+                upload.
+              </p>
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>You stay the author:</strong> every change comes back as a diff, and nothing
+            reaches Overleaf until you say so.
+          </p>
+          <aside class="notes">
+            The pitch: Claude as a co-author on the actual project, not a chat window you copy text
+            in and out of. Four things it does well: writing, citations, acting on review comments,
+            and proofreading.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 3. How it fits together -->
+        <section>
+          <p class="kicker">Overview</p>
+          <h2>How it fits together</h2>
+          <div class="flow">
+            <div class="node">
+              <h3>You + Claude</h3>
+              <ul>
+                <li>Claude Code — CLI, VS Code</li>
+                <li>Claude Desktop</li>
+                <li>Claude Code on the web / iPad</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>⇄</b>MCP<br />stdio</div>
+            <div class="node core">
+              <h3>web-latex-mcp</h3>
+              <ul>
+                <li>runs on your machine — 38 tools</li>
+                <li>a local git clone per paper</li>
+                <li>local compile: <code>latexmk</code> or <code>tectonic</code></li>
+                <li>live PDF viewer + comments</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>⇄</b>git<br />pull / push</div>
+            <div class="node">
+              <h3>Your paper</h3>
+              <ul>
+                <li>Overleaf (Git integration)</li>
+                <li>GitHub, any git remote</li>
+                <li>or a plain local folder</li>
+              </ul>
+            </div>
+          </div>
+          <div class="grid three">
+            <div class="card">
+              <h3>Never auto-merges</h3>
+              <p>
+                Pull is fast-forward only; push refuses when behind. A conflict comes back to you to
+                resolve.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Tokens stay private</h3>
+              <p>
+                Kept in your OS keychain — never in <code>.git/config</code>, never in the chat,
+                scrubbed from output.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Parallel sessions</h3>
+              <p>
+                Several Claude sessions can share one clone; each commit holds only its own
+                session's lines.
+              </p>
+            </div>
+          </div>
+          <aside class="notes">
+            Added to the draft flow: one picture of the architecture. The server is a local process
+            speaking MCP over stdio; it keeps a clone of the paper and talks git to Overleaf. Three
+            guarantees worth saying out loud.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 4. User setup -->
+        <section>
+          <p class="kicker">Getting started</p>
+          <h2>User setup</h2>
+          <div class="cols wide-left">
+            <ol class="steps">
+              <li>
+                Point Claude at the repo and ask it to set it up
+                <span class="bubble"
+                  >Please set up the MCP server<br /><span class="nowrap"
+                    >https://github.com/elias-ramzi/WebLatexMCP</span
+                  ></span
+                >
+                <span class="sub"
+                  >Or, in Claude Desktop, drag in <code>web-latex-mcp.mcpb</code>: one-click
+                  install.</span
+                >
+              </li>
+              <li>
+                Create a Git authentication token
+                <span class="sub"
+                  ><a href="https://www.overleaf.com/user/settings">overleaf.com/user/settings</a> →
+                  Git integration.</span
+                >
+              </li>
+              <li>
+                Hand over the token
+                <span class="bubble">Open the credential portal</span>
+                <span class="sub"
+                  >A local page stores the token in your OS keychain — it never goes through the
+                  chat.</span
+                >
+              </li>
+              <li>
+                Overleaf needs a premium account for its <strong>Git integration</strong>
+                <span class="sub">Menu → Integrations → Git.</span>
+              </li>
+              <li>
+                Register your paper
+                <span class="bubble">Add https://git.overleaf.com/… as “thesis”</span>
+                <span class="sub"
+                  >Claude registers the project and clones it; it persists across sessions.</span
+                >
+              </li>
+            </ol>
+            <div>
+              <img
+                class="shot"
+                src="img/credential-portal.jpg"
+                alt="The local credential portal page"
+                style="width: 72%"
+              />
+              <img
+                class="shot"
+                src="img/overleaf-integrations.jpg"
+                alt="Overleaf Integrations menu, Git entry"
+                style="width: 46%"
+              />
+            </div>
+          </div>
+          <div class="footer-line">
+            <div class="chips">
+              <strong style="align-self: center; margin-right: 0.3em">Used successfully on</strong>
+              <span>Claude Code · VS Code in WSL</span>
+              <span>Claude Code CLI in WSL</span>
+              <span>Claude Code on iPad</span>
+              <span>Claude Desktop on macOS</span>
+            </div>
+          </div>
+          <aside class="notes">
+            Setup is conversational: Claude installs the server itself. Overleaf's Git integration
+            is a premium feature. The credential portal is a 127.0.0.1 page, so the token goes
+            straight to the keychain. Tested surfaces are listed at the bottom; Gemini, Copilot and
+            Mistral guides exist but are unverified.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 5. Requirements -->
+        <section>
+          <p class="kicker">Getting started</p>
+          <h2>Requirements</h2>
+          <div class="cols">
+            <div>
+              <div class="card">
+                <h3>Always</h3>
+                <ul>
+                  <li><strong>Node.js ≥ 20</strong> (npm / npx)</li>
+                  <li><strong>git ≥ 2.25</strong> — <code>gh</code> optional</li>
+                  <li>macOS, Linux or Windows (WSL included)</li>
+                </ul>
+              </div>
+              <p class="small muted" style="margin-top: 0.8em">
+                TeX is <strong>optional</strong>: editing, syncing and the PDF viewer work without
+                it. Only <code>compile</code> needs a backend.
+              </p>
+            </div>
+            <div class="grid">
+              <div class="card accent">
+                <h3>TeX Live + latexmk</h3>
+                <ul>
+                  <li>What Overleaf runs — the closest match</li>
+                  <li>Several GB for a full install</li>
+                  <li>Errors come back with the 5 source lines around them</li>
+                </ul>
+              </div>
+              <div class="card">
+                <h3>Tectonic</h3>
+                <ul>
+                  <li>One lightweight binary, fetches packages on demand</li>
+                  <li>Output can differ slightly from Overleaf</li>
+                  <li>No source snippets on errors</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <p class="footer-line">
+            Not sure what is installed? Ask Claude to run <code>doctor</code>. A missing
+            <em>default</em> backend falls back to the other one — and says so; a backend you chose
+            never does.
+          </p>
+          <aside class="notes">
+            Checked against the install guides: Node 20+, git 2.25+. TeX only for compile. latexmk
+            is the default and what Overleaf uses; tectonic is the light option. doctor reports
+            engines, the TeX distribution and where packages can be installed.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 6. Quick start -->
+        <section>
+          <p class="kicker">Basic usage</p>
+          <h2>Quick start</h2>
+          <div class="cols wide-left">
+            <div class="chat">
+              <div class="msg user">
+                Sync “thesis” and tighten the second paragraph of the introduction.
+              </div>
+              <div class="msg claude">
+                <span class="tool">project_sync</span><span class="tool">read_file</span
+                ><span class="tool">edit_file</span>
+                <div class="diff">
+                  <span class="del"
+                    >- In this work, we propose a novel method that is able to …</span
+                  >
+                  <span class="add">+ We propose a method that …</span>
+                </div>
+              </div>
+              <div class="msg claude">
+                <span class="tool">compile</span> Compiles cleanly — no errors, no new warnings.
+              </div>
+              <div class="msg user">Looks good. Commit and push.</div>
+              <div class="msg claude">
+                <span class="tool">commit</span><span class="tool">push</span> Pushed 1 commit — it
+                is on Overleaf.
+              </div>
+            </div>
+            <div>
+              <p class="small muted" style="margin-top: 0">The loop behind every request:</p>
+              <ol class="loop">
+                <li><span class="step">sync</span><span class="tool">project_sync</span></li>
+                <li>
+                  <span class="step">read &amp; edit</span><span class="tool">read_file</span
+                  ><span class="tool">edit_file</span>
+                </li>
+                <li>
+                  <span class="step">compile</span><span class="tool">compile</span
+                  ><span class="tool">render_pages</span>
+                </li>
+                <li class="gate">
+                  <span class="step">you review</span><span class="tool">diff</span>
+                </li>
+                <li><span class="step">commit</span><span class="tool">commit</span></li>
+                <li><span class="step">publish</span><span class="tool">push</span></li>
+              </ol>
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>Instead of copy-pasting in the browser:</strong> Claude edits the file itself,
+            and you read the diff.
+          </p>
+          <aside class="notes">
+            The basic use case: help writing without the copy-paste round trip. Claude syncs, edits,
+            compiles to find out what actually broke, and only commits and pushes when asked.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 7. HPC -->
+        <section>
+          <p class="kicker">Use case</p>
+          <h2>From HPC clusters to Overleaf</h2>
+          <div class="cols">
+            <div>
+              <p class="lede" style="margin-top: 0">
+                The Claude Code session that launched and watched the runs on the cluster (Jean Zay)
+                also has the paper.
+              </p>
+              <ol class="steps" style="margin-top: 0.6em !important">
+                <li>It fetches the results where they were written — logs, CSVs.</li>
+                <li>It writes the LaTeX table into <code>draft.tex</code>.</li>
+                <li>It compiles and renders the page to check the table fits.</li>
+                <li>You review the diff, and it pushes to Overleaf.</li>
+              </ol>
+              <p class="tip">
+                💡 Draw figures in TikZ: Claude can redesign them, and collaborators can edit them
+                in Overleaf.
+              </p>
+            </div>
+            <div>
+              <img
+                class="shot"
+                src="img/hpc-terminal.jpg"
+                alt="Claude Code on the cluster, asked to update draft.tex with a new table"
+              />
+              <img
+                class="shot"
+                src="img/hpc-results.png"
+                alt="The results tables and training curves, as they appear in the paper"
+                style="width: 84%"
+              />
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>No numbers copied by hand</strong> — from the run to the paper in one session.
+          </p>
+          <aside class="notes">
+            Create tables after fetching the results on Jean Zay, straight from Claude. The prompt
+            in the screenshot is literally "please update draft.tex with a new table for knn
+            evaluation". Below it: the tables and training curves that ended up in the paper.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 8. Viewer -->
+        <section>
+          <p class="kicker">Review</p>
+          <h2>Becoming the reviewer</h2>
+          <div class="cols">
+            <ol class="steps">
+              <li>
+                <span class="tool">viewer</span> opens the PDF in your browser or a VS Code tab
+                <span class="sub"
+                  >pdf.js on <code>127.0.0.1</code> — the PDF never leaves your machine.</span
+                >
+              </li>
+              <li>
+                It hot-reloads on every compile
+                <span class="sub">and keeps your page and scroll position.</span>
+              </li>
+              <li>Select text in the PDF and leave a note.</li>
+              <li>SyncTeX maps the selection back to its source <code>file:line</code>.</li>
+              <li>
+                Ask Claude to act on them
+                <span class="bubble">please resolve comments</span>
+                <span class="sub"
+                  ><span class="tool">list_comments</span> hands Claude each note, the quoted text
+                  and the 5 source lines around it; it edits, then
+                  <span class="tool">resolve_comments</span> clears the markers.</span
+                >
+              </li>
+            </ol>
+            <div>
+              <img
+                class="shot"
+                src="img/viewer-comment.jpg"
+                alt="A note attached to a text selection in the viewer"
+              />
+              <img
+                class="shot fragment"
+                src="img/viewer-highlight.jpg"
+                alt="The commented passage, highlighted"
+              />
+              <img
+                class="shot fragment"
+                src="img/resolve-prompt.jpg"
+                alt="Prompt: please resolve comments"
+                style="width: 80%"
+              />
+            </div>
+          </div>
+          <aside class="notes">
+            The viewer is a small local web server started on demand. It polls for a new build and
+            reloads in place. Comments are working notes for the session — kept in memory, not
+            written anywhere. SyncTeX is what turns a click on the PDF into a source line.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 9. Figures -->
+        <section>
+          <p class="kicker">Figures</p>
+          <h2>Figures in TikZ, drawn by Claude</h2>
+          <div class="cols figures">
+            <ol class="steps">
+              <li>
+                Describe the figure — or paste a sketch
+                <span class="bubble">draw the architecture as a TikZ figure</span>
+              </li>
+              <li>
+                Claude writes the TikZ into the paper and compiles it
+                <span class="sub"
+                  >The figure is LaTeX source: fonts and colours match the paper.</span
+                >
+              </li>
+              <li>
+                <span class="tool">render_pages</span> lets it see the result
+                <span class="sub"
+                  >The page as a picture, found by the figure's label — Claude looks at it as you
+                  would.</span
+                >
+              </li>
+              <li>
+                <span class="tool">pdf_geometry</span> measures what the eye misses
+                <span class="sub"
+                  >Boxes in points: a label over a frame, a figure past the margin.</span
+                >
+              </li>
+              <li>It fixes what it saw, recompiles, and looks again.</li>
+            </ol>
+            <div>
+              <img
+                class="shot"
+                src="img/tikz-pictura.png"
+                alt="A system architecture figure drawn in TikZ: simulator, GPU rasterizer, policy and PPO"
+              />
+              <img
+                class="shot fragment figure-second"
+                src="img/tikz-alberti.png"
+                alt="A network architecture figure drawn in TikZ: perception branch, MLPs and heads"
+              />
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>A figure is source, not a picture</strong> — every revision is a diff you can
+            review.
+          </p>
+          <aside class="notes">
+            No more exporting from a drawing tool and re-uploading a PDF. Claude writes the figure
+            in TikZ, compiles, then renders the page to look at it — overlaps, arrows crossing
+            labels, text too small. pdf_geometry gives the exact boxes when looking is not precise
+            enough.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 10. Citations -->
+        <section>
+          <p class="kicker">References</p>
+          <h2>Citations, checked — not trusted</h2>
+          <div class="cols three">
+            <div class="card">
+              <h3>Search</h3>
+              <p>
+                <span class="tool">search_references</span> asks DBLP, then Crossref, then OpenAlex.
+                A substitute is always reported; a source you pin is never swapped.
+              </p>
+            </div>
+            <div class="card accent">
+              <h3>Add — gated</h3>
+              <p>
+                <span class="tool">add_citation</span> re-fetches the canonical BibTeX from the
+                service, server-side. The entry text never comes from the model; plain edits to a
+                <code>.bib</code> are refused without your explicit OK.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Report</h3>
+              <p>
+                <span class="tool">check_citations</span> finds undefined, uncited, duplicate and
+                incomplete entries — in a <code>.bib</code>, a <code>thebibliography</code>, or a
+                prose list. <code>/verify-citations</code> checks each title, author list, venue and
+                year.
+              </p>
+            </div>
+          </div>
+          <div class="card warn" style="margin-top: 1em">
+            <h3>Caveat</h3>
+            <p>
+              dblp.org now sits behind an anti-bot challenge, so today Crossref and OpenAlex do most
+              of the work.
+            </p>
+          </div>
+          <aside class="notes">
+            Three backends behind one resolver. The key point is the gate: a BibTeX entry is fetched
+            from the issuing service, so it cannot be hallucinated. OpenAlex publishes no BibTeX, so
+            its records are fetched from Crossref by DOI, and a record with no DOI is refused.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 11. Peer review -->
+        <section>
+          <p class="kicker">Ongoing work</p>
+          <h2>A peer review before the real one</h2>
+          <p class="lede" style="margin-top: 0">
+            An independent panel of Claude models reviews the paper; a triage agent checks every
+            finding against the paper and writes one review.
+            <span class="bubble">/review-paper my-paper NeurIPS</span>
+          </p>
+          <div class="flow four">
+            <div class="node">
+              <h3>Your paper</h3>
+              <ul>
+                <li>compiled once</li>
+                <li>sources + PDF</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b></div>
+            <div class="node">
+              <h3>Independent panel</h3>
+              <ul>
+                <li>3 full reviews — Sonnet, Opus, Fable</li>
+                <li>a devil's advocate</li>
+                <li>a novelty scout</li>
+                <li>typo hunters, one per file</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b>reports</div>
+            <div class="node core">
+              <h3>Triage</h3>
+              <ul>
+                <li>reads the paper first</li>
+                <li>merges duplicates</li>
+                <li>verifies each finding in the paper</li>
+                <li>drops the false positives</li>
+              </ul>
+            </div>
+            <div class="arrow"><b>→</b></div>
+            <div class="node">
+              <h3>One review</h3>
+              <ul>
+                <li>summary, strengths</li>
+                <li>weaknesses, ranked</li>
+                <li>questions, typos</li>
+              </ul>
+            </div>
+          </div>
+          <div class="grid three">
+            <div class="card">
+              <h3>Independent</h3>
+              <p>No reviewer sees another's report, so agreement between models means something.</p>
+            </div>
+            <div class="card">
+              <h3>Verified</h3>
+              <p>A finding is kept only once it is checked in the paper — appendix included.</p>
+            </div>
+            <div class="card">
+              <h3>Read-only</h3>
+              <p>It reviews, never edits: the reports stay in a local, git-excluded folder.</p>
+            </div>
+          </div>
+          <p class="footer-line">
+            <strong>Ongoing</strong> — <code>/review-paper</code> is on <code>dev</code>, not yet
+            released.
+          </p>
+          <aside class="notes">
+            Work in progress: the /review-paper command and the peer-review skill are on dev, not
+            yet released. The three full reviews are blinded — the triage does not know which model
+            wrote which. The design page has the details: severity, fixability and confidence per
+            finding, and the triage log with a verdict for each one.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 12. Skills -->
+        <section>
+          <p class="kicker">Skills</p>
+          <h2>Bundled skills</h2>
+          <div class="grid three">
+            <div class="card accent">
+              <span class="skill">/arxiv-clean-project</span>
+              <p>Strip comments and <code>\todo</code>s for the arXiv upload.</p>
+            </div>
+            <div class="card accent">
+              <span class="skill">/verify-citations</span>
+              <p>Audit every reference and write a citation report.</p>
+            </div>
+            <div class="card accent">
+              <span class="skill">/format-bibliography</span>
+              <p>Deduplicate, rename keys, harmonise venues.</p>
+            </div>
+            <div class="card accent">
+              <span class="skill">/format-latex-project</span>
+              <p>Per-section files, one float per file, one sentence per line.</p>
+            </div>
+            <div class="card">
+              <span class="skill">/proofread-document</span>
+              <p>Hunt typos: spelling, doubled words, agreement, escapes.</p>
+            </div>
+            <div class="card">
+              <span class="skill">/review-writing-guide</span>
+              <p>Review the paper against the writing guide.</p>
+            </div>
+            <div class="card">
+              <span class="skill">/peer-review</span>
+              <p>A pre-submission review, from a multi-model panel.</p>
+            </div>
+            <div class="card">
+              <span class="skill">/summarize-paper</span>
+              <p>A local cheat-sheet so the next session starts fast.</p>
+            </div>
+            <div class="card">
+              <span class="skill">/session-feedback</span>
+              <p>Turn a session into ready-to-file issues.</p>
+            </div>
+          </div>
+          <p class="footer-line">
+            Each skill <strong>stops at the diff</strong> · ships with the server as an MCP prompt,
+            in any client · scanned by NVIDIA SkillSpector on every PR.
+          </p>
+          <aside class="notes">
+            The four highlighted ones are the draft's list: prepare for arXiv, citation report,
+            format bib, format LaTeX project. None of them commits or pushes on its own.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 13. Contributing -->
+        <section>
+          <p class="kicker">Contributing</p>
+          <h2>Help make it better</h2>
+          <div class="cols three">
+            <div class="card accent">
+              <h3>Indirectly</h3>
+              <p>
+                Run <code>/session-feedback</code> at the end of a session: it writes ready-to-file
+                issues, scrubbed of anything private, and files nothing without your yes.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Pull requests</h3>
+              <p>
+                The repo accepts PRs. Tests use a local bare repo — no secrets, no network. CI runs
+                on Linux, macOS and Windows.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Suggest features</h3>
+              <p>
+                Open an issue with the bug-report or feature-request form. Bug reports are hugely
+                welcome.
+              </p>
+            </div>
+          </div>
+          <p style="margin-top: 1.4em; text-align: center">
+            <a href="https://github.com/elias-ramzi/WebLatexMCP"
+              >github.com/elias-ramzi/WebLatexMCP</a
+            >
+          </p>
+          <aside class="notes">
+            Three ways in, from least to most effort. session-feedback is the easy one: the evidence
+            is in the transcript, and it evaporates when the session closes.
+          </aside>
+        </section>
+
+        <!-- ============================================================ 14. Take home message -->
+        <section data-background-color="#1A1A2E" class="closing">
+          <p class="kicker">Take home message</p>
+          <h2>Claude as a co-author, on your real paper</h2>
+          <div class="grid two">
+            <div class="card">
+              <h3>No more copy-paste</h3>
+              <p>
+                Claude reads, edits and compiles the project itself, and looks at the typeset page.
+              </p>
+            </div>
+            <div class="card">
+              <h3>Citations are fetched, not invented</h3>
+              <p>BibTeX comes from Crossref, OpenAlex or DBLP, never from the model.</p>
+            </div>
+            <div class="card">
+              <h3>Review in the PDF</h3>
+              <p>Comment on the page like a reviewer; Claude finds the source line and fixes it.</p>
+            </div>
+            <div class="card">
+              <h3>Other features are hidden!</h3>
+              <p>
+                Ask Claude what web-latex-mcp can do — skills, peer review, arXiv cleanup, and more.
+              </p>
+            </div>
+          </div>
+          <div class="try">
+            <span class="try-label">Try it</span>
+            <span class="bubble"
+              >Please set up the MCP server
+              <span class="nowrap">https://github.com/elias-ramzi/WebLatexMCP</span></span
+            >
+          </div>
+          <aside class="notes">
+            Four things to remember. Then the one-line setup: paste this into Claude Code and it
+            does the rest. Feedback through /session-feedback is the most useful contribution.
+          </aside>
+        </section>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@6.0.2/dist/reveal.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@6.0.2/dist/plugin/notes.js"></script>
+    <script>
+      Reveal.initialize({
+        hash: true,
+        width: 1280,
+        height: 720,
+        margin: 0.06,
+        center: false,
+        slideNumber: 'c/t',
+        transition: 'fade',
+        // In the PDF, a slide's fragments are shown together on one page, not one page per step.
+        pdfSeparateFragments: false,
+        plugins: [RevealNotes],
+      });
+    </script>
+  </body>
+</html>

@@ -10,7 +10,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
-import { LatexmkCompiler, buildDir } from '../../src/services/compiler.js';
+import { LatexmkCompiler, buildDir, buildPdfPath } from '../../src/services/compiler.js';
+import { readAuxFloats } from '../../src/lib/auxFloats.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -100,6 +101,19 @@ function hasBeamer(): boolean {
 }
 const beamerAvailable = available && hasBeamer();
 
+/** Whether an engine binary answers on PATH. latexmk being installed says nothing about which
+ *  engines are, and a missing one fails the compile rather than skipping the test. */
+function hasEngine(engine: 'xelatex' | 'lualatex'): boolean {
+  try {
+    execFileSync(engine, ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const xelatexAvailable = available && hasEngine('xelatex');
+const lualatexAvailable = available && hasEngine('lualatex');
+
 /**
  * A plain `\documentclass{beamer}` deck (hyperref by default) whose first frame has three
  * `\pause` slides: beamer's /PageLabels number FRAMES ("1","1","1","2",...) while the .aux
@@ -141,14 +155,18 @@ function textOf(res: unknown): string {
 
 describe.skipIf(!available)('label -> page against a real compile', () => {
   const cleanups: Array<() => Promise<unknown>> = [];
+  /** The source directory of the last `compiled()` project, for a test that edits and compiles
+   *  it again. */
+  let lastUserDir = '';
 
   afterEach(async () => {
     for (const c of cleanups.splice(0)) await c();
   });
 
-  async function compiled(tex: string): Promise<Client> {
+  async function compiled(tex: string, engine?: 'xelatex' | 'lualatex'): Promise<Client> {
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-ws-'));
     const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-labelsmoke-src-'));
+    lastUserDir = userDir;
     cleanups.push(
       () => rm(workspace, { recursive: true, force: true }),
       () => rm(userDir, { recursive: true, force: true }),
@@ -171,9 +189,24 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     cleanups.push(() => client.close());
 
-    const res = await client.callTool({ name: 'compile', arguments: { project: 'doc' } });
+    const res = await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc', ...(engine ? { engine } : {}) },
+    });
     const structured = res.structuredContent as Record<string, unknown>;
-    expect(structured.success, JSON.stringify(res.content)).toBe(true);
+    // On failure, say which build and show its log excerpt: the result text alone names no
+    // error when latexmk exits non-zero without a TeX error, and CI's TeX is not this machine's.
+    expect(
+      structured.success,
+      `${engine ?? 'pdflatex'}: ${JSON.stringify(res.content)}\n${String(structured.logTail)}\n${String(structured.hint ?? '')}`,
+    ).toBe(true);
+    // Every real build here is ordinary TeX output, so its .log's shipout marks must number
+    // exactly the PDF's pages: a shorter or longer parse would silently skip the shipout check
+    // (and a wrong sequence of the right length would refuse labels it should not).
+    const aux = await readAuxFloats(userDir, 'main.tex', { max: 20_000, shipouts: true });
+    const pageCount = await ctx.pdfRenderer.pageCount(buildPdfPath(userDir, 'main.tex'));
+    expect(aux.shipouts, 'shipout marks read').toBeDefined();
+    expect(aux.shipouts, 'one shipout mark per PDF page').toHaveLength(pageCount);
     return client;
   }
 
@@ -420,7 +453,9 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
       for (const label of ['fig:a', 'fig:b', 'fig:c']) {
         const got = await landed(client, label);
         expect(got.page, label).toBeUndefined();
-        expect(got.text, label).toMatch(/this build loaded pgfpages/);
+        expect(got.text, label).toMatch(
+          /this build's records \(its recorder file or log\) name pgfpages\.sty/,
+        );
       }
     }
   }, 240_000);
@@ -439,10 +474,180 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     240_000,
   );
 
+  it("refuses the shifted table-bottom residual through the log's shipout record", async () => {
+    // `[titlepage]`, `\pagestyle{empty}`, and a tabular ending in a bare cell at each page foot
+    // that reads as the PDF page index. The folio route accepted figb, figc and figd one page early
+    // (each candidate's last line reads its printed page, and the next page's reads the next
+    // number); the .log shipped the pages as [1] [1] [2] [3] [4], which refuses them.
+    const client = await compiled(fixtureTex('tableBottomShifted'));
+    for (const label of ['figa', 'figb', 'figc', 'figd']) {
+      const got = await landed(client, label);
+      expect(got.page, label).toBeUndefined();
+    }
+    for (const label of ['figb', 'figc', 'figd']) {
+      const got = await landed(client, label);
+      expect(got.text, label).toMatch(/the log's shipout record says PDF page \d was shipped out/);
+    }
+  }, 240_000);
+
+  /** Compile each doc and check every body label resolves to its own page, by its marker. */
+  async function expectBodyResolves(
+    docs: Array<[string, string, 'xelatex' | 'lualatex' | undefined]>,
+  ): Promise<void> {
+    for (const [name, tex, engine] of docs) {
+      const client = await compiled(tex, engine);
+      const res = await client.callTool({
+        name: 'extract_text',
+        arguments: { project: 'doc', labels: ['figa', 'figb', 'figc', 'figd'] },
+      });
+      expect(res.isError ?? false, `${name}: ${textOf(res)}`).toBe(false);
+      const out = res.structuredContent as unknown as Out;
+      expect(
+        out.resolvedLabels?.map((r) => r.page),
+        name,
+      ).toEqual([1, 2, 3, 4]);
+      for (const r of out.resolvedLabels ?? []) {
+        const mark = 'MK' + r.label;
+        const shown = out.pages.find((p) => p.page === r.page);
+        expect(
+          shown?.lines?.some((l) => l.includes(mark)),
+          `${name}: ${r.label} -> ${r.page}`,
+        ).toBe(true);
+      }
+    }
+  }
+
+  it('resolves the body of a document whose appendix resets the counter under alph, S or Roman', async () => {
+    // No hyperref. The body prints 1-4; the appendix resets the page counter under
+    // \pagenumbering{alph}, `S\arabic{page}` or \pagenumbering{Roman}, so the log ships
+    // [1] [2] [3] [4] [1] [2]. The appendix pages print "a", "S1", "I" — no second "1" — so
+    // every body label resolves to its own page, as it did before the log was read.
+    // The Roman variant drops the appendix label: a label printing "I" refuses every label of the
+    // document as renumbered, with or without the log.
+    const roman = fixtureTex('appendixAlph')
+      .replace('\\pagenumbering{alph}', '\\pagenumbering{Roman}')
+      .replace('\\fig{appa}', '');
+    await expectBodyResolves([
+      ['appendixAlph', fixtureTex('appendixAlph'), undefined],
+      ['suppPrefixed', fixtureTex('suppPrefixed'), undefined],
+      ['appendixRoman', roman, undefined],
+    ]);
+  }, 480_000);
+
+  it.skipIf(!lualatexAvailable)(
+    'resolves the body of a document whose appendix resets the counter, under lualatex',
+    async () => {
+      await expectBodyResolves([
+        ['appendixAlph (lualatex)', fixtureTex('appendixAlph'), 'lualatex'],
+      ]);
+    },
+    240_000,
+  );
+
+  it.skipIf(!xelatexAvailable)(
+    'resolves the body of a document whose supplement prints S-prefixed pages, under xelatex',
+    async () => {
+      await expectBodyResolves([['suppPrefixed (xelatex)', fixtureTex('suppPrefixed'), 'xelatex']]);
+    },
+    240_000,
+  );
+
+  async function expectRestartRefused(engine?: 'lualatex'): Promise<void> {
+    const client = await compiled(fixtureTex('restartUnlabelled'), engine);
+    for (const label of ['suppb', 'figa']) {
+      const got = await landed(client, label);
+      expect(got.page, `${engine ?? 'pdflatex'} ${label}`).toBeUndefined();
+      expect(got.text).toMatch(/the log's shipout record shows page counter \d on PDF page \d/);
+    }
+  }
+
+  it('still refuses an arabic restart with no label before it, by its shipout record', async () => {
+    // Main paper 1-4, then \setcounter{page}{1} (arabic) and a supplement whose label suppb is
+    // on its printed page 2 (PDF page 6); the last page prints no number. The .aux reads 1, 2 and
+    // the last page is silent, so the folio route alone resolves suppb to the main paper's page
+    // 2; the log ships [1] [2] [3] [4] [1] [2] [3] and PDF page 6 prints "2" too.
+    await expectRestartRefused();
+  }, 240_000);
+
+  it.skipIf(!lualatexAvailable)(
+    'still refuses an arabic restart with no label before it, under lualatex',
+    async () => {
+      await expectRestartRefused('lualatex');
+    },
+    240_000,
+  );
+
   it('never resolves a section-per-page "Page N" / "N/M" / "– N –" document wrongly', async () => {
     for (const doc of ['secpagePageN', 'secpageSlashOf', 'secpageDash']) {
       const client = await compiled(fixtureTex(doc));
       for (let s = 2; s <= 8; s++) await landed(client, `fig:s${s}`);
     }
   }, 480_000);
+
+  /** The `.aux`-newer-than-the-PDF clause, however short the gap: a fast runner's stopped run
+   *  closed its `.aux` well under a second (under 250 ms, PR #229's CI) after the earlier PDF. */
+  const STALE_AUX_CLAUSE =
+    /the \.aux was written (?:\d+\.\d s|[1-9]\d{0,2} ms|less than 1 ms) after the PDF/;
+
+  it.skipIf(!xelatexAvailable)(
+    "refuses a label whose .aux a stopped xelatex run rewrote beside the earlier run's PDF",
+    async () => {
+      // #220. A 3-page document printing "A 1", "B 2", "C 3" compiles; then an edit that stops
+      // xelatex in the BODY: it writes a new .aux (x on page 1, a on page 2) and .log, and
+      // latexmk never runs xdvipdfmx, so the 3-page PDF stays. `a` used to resolve to PDF page 2,
+      // which shows "B". Then an ordinary error, after which xdvipdfmx does not run either: the
+      // new run ships 3 pages, as many as the old PDF, so only the files' order shows it.
+      const three = (body: string): string =>
+        ['\\documentclass{article}', '\\begin{document}', body, '\\end{document}', ''].join('\n');
+      const client = await compiled(
+        three('A\\label{a}\\newpage B\\label{b}\\newpage C\\label{c}'),
+        'xelatex',
+      );
+      const recompile = async (body: string): Promise<boolean> => {
+        await writeFile(path.join(lastUserDir, 'main.tex'), three(body));
+        const res = await client.callTool({
+          name: 'compile',
+          arguments: { project: 'doc', engine: 'xelatex' },
+        });
+        return (res.structuredContent as { success?: boolean }).success === true;
+      };
+      const lookup = (label: string) =>
+        client.callTool({ name: 'extract_text', arguments: { project: 'doc', labels: [label] } });
+
+      expect(await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage\\input{missingfile}')).toBe(
+        false,
+      );
+      const fatal = await lookup('a');
+      expect(fatal.isError, textOf(fatal)).toBe(true);
+      expect(textOf(fatal)).toContain('is not the output of the last compile');
+      expect(textOf(fatal)).toMatch(
+        /says that run wrote 2 page\(s\) to its \.xdv file, while the PDF has 3 page\(s\)/,
+      );
+      expect(textOf(fatal)).toMatch(STALE_AUX_CLAUSE);
+      const geo = await client.callTool({
+        name: 'pdf_geometry',
+        arguments: { project: 'doc', kinds: ['floats'] },
+      });
+      expect((geo.structuredContent as { note?: string }).note).toContain(
+        'The PDF beside the .aux is not the output of the last compile',
+      );
+
+      expect(
+        await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage Z\\label{z}\\undefinedmacro'),
+      ).toBe(false);
+      const error = await lookup('a');
+      expect(error.isError, textOf(error)).toBe(true);
+      expect(textOf(error)).toMatch(STALE_AUX_CLAUSE);
+      expect(textOf(error)).not.toMatch(/closing line/);
+
+      // Fixed and compiled again, the build is whole and the label resolves to its own page.
+      expect(await recompile('X\\label{x}\\newpage Y\\label{a}\\newpage Z\\label{z}')).toBe(true);
+      const fixed = await lookup('a');
+      expect(fixed.isError ?? false, textOf(fixed)).toBe(false);
+      const out = fixed.structuredContent as unknown as Out;
+      expect(out.resolvedLabels).toEqual([{ label: 'a', printedPage: '2', page: 2 }]);
+      expect(out.pages[0]?.lines).toContain('Y');
+    },
+    240_000,
+  );
 });

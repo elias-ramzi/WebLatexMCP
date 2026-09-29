@@ -277,7 +277,7 @@ describe('FileService binary asset read/write', () => {
 });
 
 describe('FileService out-of-band guard: byte vs string baseline agreement', () => {
-  // Reproduces the reviewer's scenario: add_asset writes a figure via writeBytes (which records
+  // Reproduces the scenario: add_asset writes a figure via writeBytes (which records
   // a Buffer baseline), then a later mutation on the SAME file re-reads it as a *string* to check
   // staleness. For non-UTF-8 bytes those two hashes never agree, so the refusal-site checks were
   // comparing a byte baseline against a decoded-string rehash of THE SERVER'S OWN WRITE and

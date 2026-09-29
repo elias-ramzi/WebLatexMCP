@@ -59,7 +59,7 @@ body:
       label: How was it installed?
       description: Which dependencies shipped with the server depends on this, so bugs do too.
       options:
-        - npx web-latex-mcp
+        - npx (the npm package, run on demand)
         - npm install -g web-latex-mcp
         - .mcpb bundle (Claude Desktop)
         - Claude Code plugin

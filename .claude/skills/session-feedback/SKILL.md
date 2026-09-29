@@ -1,6 +1,6 @@
 ---
 name: session-feedback
-description: Close a working session by turning what actually happened into a feedback report for WebLatexMCP itself — what broke, what was clumsy, what is missing, what the docs did not say — ranked by impact and emitted as ready-to-file GitHub issue bodies that match the repo's issue forms field for field, stamped with a measured environment (server version, OS, client, model, install method, toolchain) and scrubbed of anything private. Use at the end of a session, or when the user asks to "give feedback", "write a retrospective", "what should I report", "how did this session go", or "file an issue about the MCP server". Reports on the *server and its skills*, never on the paper: it changes no file in the project, commits nothing, and pushes nothing.
+description: Close a working session by turning what actually happened into a feedback report for WebLatexMCP itself — what broke, what was clumsy, what is missing, what the docs did not say — ranked by impact and emitted as ready-to-file GitHub issue bodies that match the repo's issue forms field for field, stamped with a measured environment (server version, OS, client, model, install method, toolchain) and scrubbed of anything private. Use at the end of a session, or when the user asks to "give feedback", "write a retrospective", "what should I report", "how did this session go", or "file an issue about the MCP server". Reports on the *server and its skills*, never on the paper: it changes no file of the paper, commits nothing, and pushes nothing (a report the user asks to keep inside a clone is git-excluded through that clone's local .git/info/exclude).
 project: none
 ---
 
@@ -104,7 +104,8 @@ session to look at.
      unasked. Default path: `web-latex-mcp-feedback-<YYYY-MM-DD>.md` in the directory the client was
      launched from.
    - **`gh` missing, unauthenticated, or offline** — there is no filing route, so the report would exist
-     only in the transcript and be lost when the session closes. **Write it without asking** to
+     only in the transcript and be lost when the session closes. **Always write it**, and name the path
+     in your reply, to
      `.claude/session_feedbacks/web-latex-mcp-feedback-<YYYY-MM-DD>.md`, relative to the directory the
      client was launched from, creating the directory if it is not there. It holds the chat summary and
      every issue block verbatim, so the user (or a later session with a logged-in `gh`) can file it
@@ -128,8 +129,9 @@ session to look at.
    **Never** write the report with `write_file`, and never place it inside a project clone or a local
    project directory: it is not part of the user's manuscript, and inside a clone it is one `commit`
    away from being pushed to their co-authors. `.claude/session_feedbacks/` is the agent's own working
-   directory, not the paper's. If the user insists on a path inside a clone, git-exclude it first via
-   that clone's `.git/info/exclude` (the trick `summarize-paper` uses).
+   directory, not the paper's. If the user insists on a path inside a clone, tell them this also adds
+   one line to that clone's `.git/info/exclude` (local to the checkout, never committed), then
+   git-exclude it there first — the trick `summarize-paper` uses.
 
 9. **Offer to file.** Filing is outward-facing and public, so it needs an explicit yes — never file as a
    side effect of writing the report, and never as a side effect of step 8's write. Show the exact
@@ -156,25 +158,36 @@ characters, naming the tool: `bug: edit_file refuses after project_sync rewrites
 **One issue per finding.** Never bundle unrelated findings — an issue should be one thing that can be
 closed. Two findings with the same root cause are one issue.
 
-This skill mutates nothing: no `write_file` into a project, no `commit`, no `push`, no `compile`. If a
-finding needs a fix in the user's paper, that is a separate request they make separately.
+This skill leaves the paper alone: no `write_file` into a project, no `commit`, no `push`, no
+`compile`. Its only writes are the report of step 8 and, when the user insists on a path inside a clone,
+the one `.git/info/exclude` line that keeps it out of git. If a finding needs a fix in the user's
+paper, that is a separate request they make separately.
 
 ## The environment block
 
 Measure these once, reuse in every block. Where a command is given, run it — do not answer from memory.
 
-| Fact                 | How to get it                                                                                                                                                           |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server version       | `server_info` → `version`. Running from a clone, add the commit: `git -C <repo> rev-parse --short HEAD`.                                                                |
-| Is it the latest?    | `npm view web-latex-mcp version` (best-effort, network). "0.4.0, latest is 0.5.0" pre-empts the first reply every stale report gets.                                    |
-| OS, arch, WSL        | `uname -sr -m` on Unix, `cmd /c ver` on Windows. WSL shows as `microsoft` in `uname -r` — say so, its path and locking behavior differ: `Ubuntu 24.04 (WSL2) · x86_64`. |
-| Node version         | `node --version`. The client spawns the server, possibly with a different Node than your shell's — if they could differ, say which one you measured.                    |
-| MCP client + version | Claude Code CLI (`claude --version`), Claude Code VS Code extension, Claude Desktop, Cursor, Gemini CLI, GitHub Copilot, or another MCP client. **Ask** — see below.    |
-| Model                | Which AI drove the session (`Claude Opus 5`, `Mistral Large`, …). Name what you are sure of; an exact build number you do not know is `unknown`, not a guess.           |
-| Install method       | `npx web-latex-mcp`, global npm, the `.mcpb` bundle, the Claude Code plugin, or from a clone. It decides which dependencies shipped, so it decides which bugs exist.    |
-| Compiler + TeX       | `doctor` → configured compiler, engines, TeX distribution and year. Only when the session compiled; omit otherwise rather than padding.                                 |
-| Workspace + project  | `server_info` → `workspaceLocal`; `list_projects` → git or local in-place, and the **host** (Overleaf / GitHub / GitLab / other). The host, never the URL.              |
-| Parallel sessions    | Was `WEB_LATEX_MCP_SESSION` set, or another client working the same clone? Concurrency bugs are unreadable without it.                                                  |
+- **Server version** — `server_info` → `version`. Running from a clone, add the commit:
+  `git -C <repo> rev-parse --short HEAD`.
+- **Is it the latest?** — `npm view web-latex-mcp version` (best-effort, network). "0.4.0, latest is
+  0.5.0" pre-empts the first reply every stale report gets.
+- **OS, arch, WSL** — `uname -sr -m` on Unix, `cmd /c ver` on Windows. WSL shows as `microsoft` in
+  `uname -r` — say so, its path and locking behavior differ: `Ubuntu 24.04 (WSL2) · x86_64`.
+- **Node version** — `node --version`. The client spawns the server, possibly with a different Node
+  than your shell's — if they could differ, say which one you measured.
+- **MCP client + version** — Claude Code CLI (`claude --version`), Claude Code VS Code extension,
+  Claude Desktop, Cursor, Gemini CLI, GitHub Copilot, or another MCP client. **Ask** — see below.
+- **Model** — which AI drove the session (`Claude Opus 5`, `Mistral Large`, …). Name what you are
+  sure of; an exact build number you do not know is `unknown`, not a guess.
+- **Install method** — npx (the package run straight from npm), global npm, the `.mcpb` bundle, the
+  Claude Code plugin, or from a clone. It decides which dependencies shipped, so it decides which bugs
+  exist.
+- **Compiler + TeX** — `doctor` → configured compiler, engines, TeX distribution and year. Only when
+  the session compiled; omit otherwise rather than padding.
+- **Workspace + project** — `server_info` → `workspaceLocal`; `list_projects` → git or local in-place,
+  and the **host** (Overleaf / GitHub / GitLab / other). The host, never the URL.
+- **Parallel sessions** — was `WEB_LATEX_MCP_SESSION` set, or another client working the same clone?
+  Concurrency bugs are unreadable without it.
 
 **What you cannot measure, ask for — once, in one message, before printing.** The client, the model, and
 the install method cannot be read from inside the session; the user answers all three in a line. If they
@@ -256,7 +269,7 @@ v22.14.0
 
 ### How was it installed?
 
-npx web-latex-mcp
+npx (the npm package, run on demand)
 
 ### MCP client
 

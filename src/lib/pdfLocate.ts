@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { stat } from 'node:fs/promises';
 import type { ServerConfig } from '../types.js';
-import { buildPdfPath } from '../services/compiler.js';
+import { buildPdfPath, ensureBuildRoot } from '../services/compiler.js';
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -80,6 +80,12 @@ export interface RootPdfRequest {
  * promise, and it outlives a wiped temp build dir. Once a root is named, or an `.aux` is read, a
  * missing build PDF returns undefined (the caller says "compile first") rather than a copy that
  * may belong to a different root.
+ *
+ * It verifies the build root first ({@link ensureBuildRoot}) and throws its refusal. Every PDF
+ * reader's main-build route comes through here — `render_pages`, `extract_text`, `pdf_geometry`
+ * (every kind, `floats` alone included) and the viewer — so the `.aux`/`.log` those tools read
+ * next, and the PNGs `render_pages` writes, sit under a root already judged. The variant route is
+ * covered by `resolveVariantBuild` instead.
  */
 export async function locateRootPdf(
   config: ServerConfig,
@@ -88,6 +94,10 @@ export async function locateRootPdf(
   rootFile: string,
   request: RootPdfRequest,
 ): Promise<string | undefined> {
+  // The build root is judged before anything under it is stat'ed, as a compile judges it before
+  // building (#215): a root planted as a link to another user's directory would hand this reader
+  // a forged PDF. Fail closed — even the surfaced fallback is not offered past a refused root.
+  await ensureBuildRoot();
   const built = buildPdfPath(dir, rootFile);
   if (await exists(built)) return built;
   if (config.workspaceIsLocal && !request.rootNamed && !request.readsAux) {

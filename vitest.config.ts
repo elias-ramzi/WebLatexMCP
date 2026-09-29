@@ -22,6 +22,8 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    // Creates the build root 0700 before any helper can mkdir it under the process umask.
+    setupFiles: ['test/helpers/buildRootSetup.ts'],
     testTimeout: TEST_TIMEOUT_MS,
     hookTimeout: TEST_TIMEOUT_MS,
     coverage: {

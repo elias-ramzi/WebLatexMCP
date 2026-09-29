@@ -4,16 +4,17 @@ The repo bundles task-specific skills that drive the [tools](tools.md) — each 
 nothing is committed or pushed unless you ask. How you install them, and how you invoke them, depends on
 the client: see [Installing](#installing) and [Two ways a skill runs](#two-ways-a-skill-runs).
 
-| Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                                                                    | Mutates                  | Invoke                  |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------- |
-| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                                                                                  | `.tex`                   | `/format-latex-project` |
-| [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`.                                                         | `.tex` (in-place mode)   | `/arxiv-clean-project`  |
-| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, Crossref and OpenAlex, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                                                | local report; opt-in bib | `/verify-citations`     |
-| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                                                                  | `.bib` + `.tex`          | `/format-bibliography`  |
-| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                                                                   | local note only          | `/summarize-paper`      |
-| [`proofread-document`](../.claude/skills/proofread-document/SKILL.md)     | Hunts **typos** — spelling, doubled or missing words, agreement, punctuation, quotes, unescaped LaTeX characters, inconsistent hyphenation of a repeated term. Reports each as an exact minimal substitution and applies nothing until you say so. Never rewrites prose for style; never touches a `.bib`.                                                                                                                      | opt-in `.tex`            | `/proofread-document`   |
-| [`review-writing-guide`](../.claude/skills/review-writing-guide/SKILL.md) | Reviews the paper against the [writing guide](writing-guide.md) — tense, first-person overuse, signposting, captions and floats, equation punctuation and notation, citation placement, acronyms, dashes, `\autoref`. Reports prioritized findings with a concrete suggested rewrite each. **Proposes, never applies**; writes nothing at all.                                                                                  | nothing                  | `/review-writing-guide` |
-| [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and reporting on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong. Emits one ready-to-file issue body per finding, field for field against the repo's issue forms, with a measured environment (version, OS, client, model, install method, toolchain) and no manuscript content. Filed only when you ask. | nothing                  | `/session-feedback`     |
+| Skill                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Mutates                  | Invoke                  |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------- |
+| [`format-latex-project`](../.claude/skills/format-latex-project/SKILL.md) | Splits the monolithic main file into per-section `\input{sections/…}` files and reflows body prose to one sentence per line. Cosmetic-only — compiles before/after, the PDF must be unchanged.                                                                                                                                                                                                                                                                                                                                        | `.tex`                   | `/format-latex-project` |
+| [`arxiv-clean-project`](../.claude/skills/arxiv-clean-project/SKILL.md)   | Runs [arxiv-latex-cleaner](https://github.com/google-research/arxiv-latex-cleaner) to strip `%` comments and delete draft macros (`\todo`, `\note`, review environments), optionally shrinking figures for arXiv's 50MB limit. Produces a separate `…_arXiv` copy or applies the cleaning in place. **Intentionally changes the PDF**; `.bib` is kept via `--keep_bib`.                                                                                                                                                               | `.tex` (in-place mode)   | `/arxiv-clean-project`  |
+| [`verify-citations`](../.claude/skills/verify-citations/SKILL.md)         | Audits a document's references (title, authors, venue, year) against DBLP, Crossref and OpenAlex, flags discrepancies for you, writes a local audit report, and optionally marks confirmed entries. Reads a `.bib`, a LaTeX `thebibliography`, or a markdown reference list, on a git project or a local folder. **Read-only for the bibliography** unless you approve a change.                                                                                                                                                      | local report; opt-in bib | `/verify-citations`     |
+| [`format-bibliography`](../.claude/skills/format-bibliography/SKILL.md)   | Deduplicates entries, normalizes cite keys to one scheme, harmonizes venue names, and enforces a single field policy — propagating key renames into your `\cite`s. Permission-gated; compile is the guardrail.                                                                                                                                                                                                                                                                                                                        | `.bib` + `.tex`          | `/format-bibliography`  |
+| [`summarize-paper`](../.claude/skills/summarize-paper/SKILL.md)           | Writes/updates a small local markdown summary of the paper (section + file map, contributions, results) so future sessions get oriented fast. Kept out of git via the clone's `.git/info/exclude` — local-only, never pushed.                                                                                                                                                                                                                                                                                                         | local note only          | `/summarize-paper`      |
+| [`proofread-document`](../.claude/skills/proofread-document/SKILL.md)     | Hunts **typos** — spelling, doubled or missing words, agreement, punctuation, quotes, unescaped LaTeX characters, inconsistent hyphenation of a repeated term. Reports each as an exact minimal substitution and applies nothing until you say so. Never rewrites prose for style; never touches a `.bib`.                                                                                                                                                                                                                            | opt-in `.tex`            | `/proofread-document`   |
+| [`review-writing-guide`](../.claude/skills/review-writing-guide/SKILL.md) | Reviews the paper against the [writing guide](writing-guide.md) — tense, first-person overuse, signposting, captions and floats, equation punctuation and notation, citation placement, acronyms, dashes, `\autoref`. Reports prioritized findings with a concrete suggested rewrite each. **Proposes, never applies**; writes nothing at all.                                                                                                                                                                                        | nothing                  | `/review-writing-guide` |
+| [`peer-review`](../.claude/skills/peer-review/SKILL.md)                   | Pre-submission peer review of an ML paper for a major conference: a three-pass reading protocol, a claim–evidence map, an ML checklist (baselines, leakage, seeds, ablations, compute, LLM pitfalls, theory, anonymity), severity × fixability × confidence, and a final review in six sections — summary, strengths, weaknesses, minor weaknesses, questions, typos. Claude Code's `/review-paper` runs it as an independent multi-model panel merged by a Fable triage. **Reviews, never edits**; writes only git-excluded reports. | local reports only       | `/peer-review`          |
+| [`session-feedback`](../.claude/skills/session-feedback/SKILL.md)         | Ends a session by reviewing what actually happened and reporting on **the server itself** — what broke, what cost too many calls, what capability was missing, what the docs got wrong. Emits one ready-to-file issue body per finding, field for field against the repo's issue forms, with a measured environment (version, OS, client, model, install method, toolchain) and no manuscript content. Filed only when you ask.                                                                                                       | nothing                  | `/session-feedback`     |
 
 ## Two ways a skill runs
 
@@ -33,7 +34,7 @@ for it on its own. A prompt whose procedure acts on a project takes an optional 
 you can scope the run up front instead of being asked; one that does not — `session-feedback` reports on
 the server, never on a paper — takes no argument at all, so a client that binds what you type after the
 prompt name positionally cannot turn the first word into a project id. Because prompts are flat text, a skill that grows bundled scripts or reference
-files would only be partially conveyed — the `SKILL.md` body is what ships. All six current skills are
+files would only be partially conveyed — the `SKILL.md` body is what ships. All nine current skills are
 self-contained, so nothing is lost today.
 
 **As the [`list_skills`](tools.md) tool — model-invoked, no install.** The server also exposes its
@@ -61,9 +62,15 @@ Installs the server _and_ the skills, in every session, from any directory:
 Launching Claude Code from a clone of this repo works too — `.claude/skills` is picked up from the
 working directory. Either way you get `/verify-citations` and friends, model-invoked.
 
+The plugin also installs the paper commands and the agents they dispatch: `/review-paper`,
+`/hunt-typo`, `/format-latex`, `/review-writing` and `/rewrite-mode`, named
+`/web-latex-mcp:review-paper` and so on under the plugin. A clone gets the same files from
+`.claude/commands` and `.claude/agents`, next to this repository's own development tooling
+(`/implement`, `/review`, and their agents), which the plugin leaves out.
+
 ### Any MCP client — nothing to install
 
-The prompts come with the server. Once `web-latex-mcp` is connected, the six skills appear in the
+The prompts come with the server. Once `web-latex-mcp` is connected, the nine skills appear in the
 client's prompt menu, at the version the server shipped with, and the model can reach the same
 procedures through `list_skills`. Nothing to upload, nothing to keep in sync.
 
@@ -205,6 +212,50 @@ in a later section. Every finding quotes the source, names the guide section it 
 the concrete replacement; anything that cannot be tied to a rule is dropped as taste. **It writes nothing** —
 no `.tex`, no `.bib`, not even a report file — and the findings come back in the reply. Ask Claude to
 "review the writing" or "does this follow the writing guide".
+
+## `peer-review` — review the paper before a reviewer does
+
+Reviews an ML paper the way the strongest competent reviewer at the target venue would, **before it is
+submitted**, so every problem it finds is one you can still fix. It reads the sources and the compiled PDF
+in three passes, builds a **claim–evidence map** (each claim, the evidence offered, and the gap), walks an
+ML checklist — baselines tuned with equal effort, test-set tuning and leakage, seed variance, ablations
+that control for parameters and compute, efficiency and scaling claims, LLM-specific pitfalls, theory,
+reproducibility, and the desk-reject risks (anonymity, page limit, hidden prompts) — and labels every
+weakness with a **severity** (critical / major / minor), its **fixability before the deadline** (quick /
+moderate / hard), and a **confidence**. Every point is anchored to a `file.tex:line` and to the figure,
+table or section a reader sees; a "the paper does not report X" is only allowed after the appendix was
+checked.
+
+The result is one review in six sections — **summary** (the idea, the claims, the results and how well
+they are supported), **strengths**, **weaknesses**, **minor weaknesses**, **questions**, **typos** — plus
+a triage log with a prioritized action plan and a predicted score range.
+
+**In Claude Code, `/review-paper <project> [venue]` runs it as a panel** (`/web-latex-mcp:review-paper`
+when installed with the plugin). Three independent
+full reviews on Sonnet, Opus and Fable, a devil's advocate on Opus that writes the strongest case for
+rejection, a novelty scout that looks for the closest prior and concurrent work (`--no-web` skips it; its
+queries never contain the paper's title), and one read-only `paper-typo-hunter` per file for typos. None of them sees
+another's report. A Fable triage agent then re-reads the paper, verifies each finding against it —
+dropping false positives, adjudicating every devil's-advocate critical — and writes the final review.
+The three full reviews reach it blinded (`R1`–`R3`, shuffled each run), since one of them runs on its
+own model. Before dispatching, the command says how many agents will run and how many read the whole
+paper, and asks first for a paper over ~40 pages. It also looks for the venue's review or anonymous
+switch in the preamble: when the build is camera-ready, it asks once whether to review it as a
+submission (anonymity and page-limit findings count) or as camera-ready (they are informational). A
+novelty scout that finds the paper itself already public reports that for you to check — it is never
+counted as prior work. Each saved report is checked against the agent's reply before the triage reads
+it.
+Agreement between reviewers raises confidence, never severity. Anywhere else (an MCP prompt, one agent)
+the skill runs the same roles in sequence in one session, with less independent coverage.
+
+It **never edits the paper**. Every run is recorded on the local copy it reviews, under
+`paper-review.local/<timestamp>/` — the final review, the triage log and each panel report — at the
+clone root, git-excluded before the first write so `commit` cannot pick it up and nothing reaches
+your remote; in a local project's own directory (excluded from its repo's git too); or, for a bare
+PDF with no project (`/review-paper paper.pdf`), under the server's workspace. The final review
+then reaches you three ways: as a **file to download** in the Claude desktop app, as a clickable
+link, and in full in the reply. Ask Claude to "review my paper before submission" or "what would
+reviewers say".
 
 ## `session-feedback` — report back on the server itself
 

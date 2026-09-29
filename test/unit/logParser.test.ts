@@ -5,6 +5,8 @@ import {
   logTail,
   unwrapLines,
   needsShellEscape,
+  refusedShellCommands,
+  engineShellEscapeBanner,
   findMissingPackages,
 } from '../../src/services/logParser.js';
 
@@ -213,8 +215,11 @@ describe('parseLog', () => {
     ].join('\n');
     const { errors } = parseLog(log);
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ severity: 'error', rule: 'shell escape disabled' });
+    // No engine header to read, so nothing shows shell escape was off: the cause is hedged (#232).
+    expect(errors[0]).toMatchObject({ severity: 'error', rule: 'TikZ externalization failed' });
     expect(errors[0]?.message).toMatch(/3 figures/);
+    expect(errors[0]?.message).toContain('usually because shell escape is disabled');
+    expect(errors[0]?.message).not.toContain(' because shell escape is disabled.');
     expect(errors[0]?.message).toMatch(/restrictedShellEscape: true|shellEscape: true/);
     // It stands for N figures, so it claims no location: inheriting the first figure's file and
     // line pointed the caller (and the source snippet) at a line where nothing is wrong.
@@ -519,6 +524,77 @@ describe('needsShellEscape', () => {
 
   it('is false for an ordinary error with no system-call failure', () => {
     expect(needsShellEscape('./main.tex:3: Undefined control sequence.')).toBe(false);
+  });
+});
+
+describe('engineShellEscapeBanner', () => {
+  // A latexmkrc can put `-shell-escape` back after latexmk's `-no-shell-escape` (or drop %O), and
+  // the engine's banner — in the log's header, written before the document is read — is the only
+  // record of it that the document cannot write.
+  const header = (banner: string, first = 'This is pdfTeX, Version 3.14159265'): string =>
+    `${first}\nentering extended mode\n${banner}**main.tex\n(./main.tex\n`;
+
+  it("reads the header's banner, restricted or not, pdfTeX's and LuaTeX's wording", () => {
+    expect(engineShellEscapeBanner(header(' \\write18 enabled.\n'))).toBe('full');
+    expect(engineShellEscapeBanner(header(' restricted \\write18 enabled.\n'))).toBe('restricted');
+    const lua = 'This is LuaHBTeX, Version 1.24.0';
+    expect(engineShellEscapeBanner(header(' system commands enabled.\n', lua))).toBe('full');
+    expect(engineShellEscapeBanner(header(' restricted system commands enabled.\n', lua))).toBe(
+      'restricted',
+    );
+  });
+
+  it('reads nothing the document can write: a banner or an executed record in the body', () => {
+    // A header read and holding no banner is 'none' — shell escape was off — whatever the body says.
+    expect(engineShellEscapeBanner(header(''))).toBe('none');
+    expect(engineShellEscapeBanner(`${header('')} \\write18 enabled.\n`)).toBe('none');
+    expect(
+      engineShellEscapeBanner(`${header('')}runsystem(echo PWNED > sections/a.tex)...executed.\n`),
+    ).toBe('none');
+    // No `This is` first line, or no `**` line: no header to vouch for.
+    expect(engineShellEscapeBanner(' \\write18 enabled.\n**main.tex\n')).toBe(undefined);
+    expect(engineShellEscapeBanner('This is pdfTeX\n \\write18 enabled.\n')).toBe(undefined);
+    expect(engineShellEscapeBanner('')).toBe(undefined);
+  });
+});
+
+describe('refusedShellCommands', () => {
+  const none = { engine: 0, other: 0 };
+
+  it('counts a \\write18 the engine refused, wrapped or not', () => {
+    // What pdfTeX logs under -no-shell-escape, hard-wrapped mid-"...disabled" as a long one is.
+    const wrapped = hardWrap(
+      `runsystem(makeindex -q -o sections/a.tex ${'x'.repeat(31)}.tex)...disabled.`,
+    );
+    expect(wrapped.split('\n')[1]).toBe('.disabled.');
+    expect(refusedShellCommands(wrapped)).toEqual({ engine: 0, other: 1 });
+    expect(refusedShellCommands('runsystem(epstopdf x.eps)...disabled (restricted).')).toEqual({
+      engine: 0,
+      other: 1,
+    });
+  });
+
+  it('counts nothing for a command that ran, or for a log with no system call', () => {
+    expect(refusedShellCommands('runsystem(makeindex -q x)...executed safely (allowed).')).toEqual(
+      none,
+    );
+    expect(refusedShellCommands('runsystem(echo hi)...executed.')).toEqual(none);
+    expect(refusedShellCommands(' restricted \\write18 enabled.\n\\write18 disabled.')).toEqual(
+      none,
+    );
+  });
+
+  it("reads a LuaTeX executed record against the header's banner, never a forged one", () => {
+    const lua = (banner: string): string =>
+      `This is LuaHBTeX, Version 1.24.0\n${banner}**main.tex\n` +
+      'system(repstopdf fig.eps) executed.\n';
+    // No banner in the header: pdftexcmds' `executed.` is the refusing stub's.
+    expect(refusedShellCommands(lua(''))).toEqual({ engine: 0, other: 1 });
+    expect(refusedShellCommands(lua(' system commands enabled.\n'))).toEqual(none);
+    // Captured output is no header, whatever it opens with: the record counts (#232).
+    expect(
+      refusedShellCommands(lua(' system commands enabled.\n'), { capturedOutput: true }),
+    ).toEqual({ engine: 0, other: 1 });
   });
 });
 

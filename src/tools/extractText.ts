@@ -20,6 +20,11 @@ import {
 } from '../lib/labelPages.js';
 import type { LabelPagePlan } from '../lib/labelPages.js';
 import {
+  locateVariantPdf,
+  resolveVariantBuild,
+  VARIANT_INPUT_DESCRIPTION,
+} from '../lib/variants.js';
+import {
   EXTRACT_TEXT_CONTENT_BUDGET,
   planExtractedText,
   renderTextPageBlock,
@@ -27,6 +32,7 @@ import {
 
 const inputSchema = {
   project: z.string().optional(),
+  variant: z.string().optional().describe(VARIANT_INPUT_DESCRIPTION),
   rootFile: z
     .string()
     .optional()
@@ -57,7 +63,10 @@ const inputSchema = {
         'Resolved exactly as render_pages resolves it — through the build-directory .aux of the ' +
         "LAST COMPILE, converted to a page index through the PDF's own /PageLabels tree when it " +
         'has one — so a label added since the last compile, or one whose reference has not ' +
-        'converged, resolves to a STALE page or not at all. Any label that cannot be resolved ' +
+        'converged, resolves to a STALE page or not at all. Refused in the same cases too, ' +
+        'including every label of a build whose records name pgfpages, cannot be read, or ' +
+        'hold no shipout mark, or show that the PDF is not the output of the last compile ' +
+        '(see render_pages `labels`). Any label that cannot be resolved ' +
         'refuses the whole call; no page is ever guessed. Cannot be combined with `pages`. At ' +
         `most ${MAX_LABELS_PER_CALL} per call.`,
     ),
@@ -86,6 +95,10 @@ const pageShape = z.object({
 });
 
 const outputSchema = {
+  variant: z
+    .string()
+    .optional()
+    .describe('The variant handle this read, echoed back; absent when the main build was read.'),
   pdfPath: z
     .string()
     .describe('The compiled PDF the text was read from. POSIX (`/`-separated) on every OS.'),
@@ -161,7 +174,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, labels }) => {
+    async ({ project, rootFile, pages, labels, variant }) => {
       try {
         // Rejected, never silently resolved — the same house rule render_pages and `diff` apply.
         if (labels && pages) {
@@ -183,12 +196,20 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           // No recordBaseline: nothing here reads a caller-named file through FileService, and a
           // baseline would wrongly claim the caller could now base a write on a file it only
           // used to find a PDF. Same reasoning as render_pages.
-          const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // A variant is read from its own out/ and nowhere else — as render_pages reads one.
+          const v =
+            variant !== undefined
+              ? await resolveVariantBuild(dir, id, variant, rootFile)
+              : undefined;
+          const root = v ? v.rootFile : (rootFile ?? (await detectRootFile(ctx.files, dir)));
           // The ROOT's build PDF — same rule and reason as render_pages (see locateRootPdf).
-          const pdfPath = await locateRootPdf(ctx.config, id, dir, root, {
-            rootNamed: rootFile !== undefined,
-            readsAux: labels !== undefined,
-          });
+          const pdfPath =
+            v && variant !== undefined
+              ? await locateVariantPdf(variant, v)
+              : await locateRootPdf(ctx.config, id, dir, root, {
+                  rootNamed: rootFile !== undefined,
+                  readsAux: labels !== undefined,
+                });
           if (!pdfPath) {
             throw new Error(
               `No compiled PDF found for project "${id}". Run compile first, then extract_text.`,
@@ -201,7 +222,15 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
           // them the same ROOT's build.
           let labelPlan: LabelPagePlan | undefined;
           if (labels) {
-            const aux = await readAuxFloats(dir, root, { max: LABEL_LOOKUP_MAX });
+            // `pdfPath`, as in render_pages: the PDF paired with the .aux, whose timestamps are
+            // compared, so a build that stopped after rewriting the .aux is refused. It must be
+            // the PDF the reader below opens: resolveLabelPages throws otherwise.
+            const aux = await readAuxFloats(dir, root, {
+              max: LABEL_LOOKUP_MAX,
+              shipouts: true,
+              pdfPath,
+              ...(v ? { buildDir: v.paths.out } : {}),
+            });
             labelPlan = await resolveLabelPages(
               labels,
               aux,
@@ -242,6 +271,7 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
 
           const { pdfPath: outPdfPath } = toPosixOut({ pdfPath });
           const structuredContent = {
+            ...(variant !== undefined ? { variant } : {}),
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
             pages: plan.pages,
@@ -250,9 +280,11 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
             note,
           };
 
-          const header = `text of ${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}`;
+          const header =
+            `text of ${result.pages.length} of ${result.pageCount} page(s) from ${outPdfPath}` +
+            (variant !== undefined ? ` (variant ${variant})` : '');
           const labelLine = labelPlan
-            ? `  labels (from the last compile's .aux): ${describeResolvedLabels(labelPlan.resolved)}`
+            ? `  labels (from the .aux of the build read${variant !== undefined ? ` — variant ${variant}` : ''}): ${describeResolvedLabels(labelPlan.resolved)}`
             : '';
           // Rendered from the already-cut plan, never from `result`: the text channel is the
           // other half of what the budget charged.

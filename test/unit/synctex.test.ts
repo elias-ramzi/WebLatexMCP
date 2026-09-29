@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseSyncTexEdit, SyncTexService } from '../../src/services/synctex.js';
+import path from 'node:path';
+import { normalizeInput, parseSyncTexEdit, SyncTexService } from '../../src/services/synctex.js';
 import type { Runner } from '../../src/services/synctex.js';
 
 const OK = (stdout: string) => ({ code: 0, stdout, stderr: '', timedOut: false });
@@ -44,6 +45,27 @@ describe('parseSyncTexEdit', () => {
       file: 'shared.tex',
       line: 3,
     });
+  });
+});
+
+// Windows rules applied on any host: a SyncTeX `Input:` on another drive is not in the project,
+// but `path.win32.relative` answers it with an absolute `D:\\…` rather than a `..` climb.
+describe('normalizeInput under win32 path rules', () => {
+  const proj = 'C:\\Users\\u\\proj';
+
+  it('falls back to the basename for an input on another drive', () => {
+    expect(normalizeInput('D:\\shared\\refs\\shared.tex', proj, path.win32)).toBe('shared.tex');
+  });
+
+  it('falls back to the basename for an input above the project on the same drive', () => {
+    expect(normalizeInput('C:\\Users\\u\\other\\x.tex', proj, path.win32)).toBe('x.tex');
+  });
+
+  it('keeps an in-project input project-relative and POSIX', () => {
+    expect(normalizeInput('C:\\Users\\u\\proj\\.\\sections\\intro.tex', proj, path.win32)).toBe(
+      'sections/intro.tex',
+    );
+    expect(normalizeInput('.\\main.tex', proj, path.win32)).toBe('main.tex');
   });
 });
 

@@ -605,9 +605,9 @@ describe('withFileLock never wedges on a holder that can no longer release', () 
 
   it('reclaims a vouched live pid whose record stayed stale and unchanged across two observations', async () => {
     // A SIGKILLed holder whose pid was reused on the same boot (Windows reuses pids quickly): the
-    // pid answers and the record vouches for it, so round 1's "never by age" kept the lock for as
-    // long as the unrelated process lived, and every mutating tool timed out. Our parent process
-    // stands in for that unrelated live process: alive, on this boot, and not us.
+    // pid answers and the record vouches for it, so an earlier "never by age" rule kept the lock
+    // for as long as the unrelated process lived, and every mutating tool timed out. Our parent
+    // process stands in for that unrelated live process: alive, on this boot, and not us.
     await writeFile(
       lock,
       JSON.stringify({

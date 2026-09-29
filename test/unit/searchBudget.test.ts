@@ -13,7 +13,7 @@ import type { SearchMatch, SkippedFile } from '../../src/lib/searchFiles.js';
  * The assertion that matters in every test here is the same one: `JSON.stringify(plan.matches)`
  * — the exact string the client receives inside `structuredContent` — is no longer than the
  * budget. A count cap is not a bound on that, and neither is an accounting that charges content
- * only: issue #68's second round of bugs was precisely a budget that counted content and not the
+ * only: a later bug under issue #68 was precisely a budget that counted content and not the
  * punctuation and escaping wrapped around it, so a payload of many small elements blew the same
  * limit with its content nowhere near it.
  */

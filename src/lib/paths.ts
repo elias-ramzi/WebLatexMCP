@@ -33,6 +33,23 @@ export function samePath(a: string, b: string): boolean {
 }
 
 /**
+ * Whether a `path.relative` result climbs out of its base: `..` as a WHOLE first segment only, so a
+ * directory named `..foo` inside the base is not taken for its parent (#227). `rel.startsWith('..')`
+ * — what seven call sites used to test — also matches `..foo/main.tex`, a legitimate path inside.
+ *
+ * Both `path.sep` and `/` end the segment: several callers hand in a POSIX-joined or `toPosix`'d
+ * result, which on Windows carries `/` where the native form carries `\`. On a POSIX host the two
+ * are the same character, so a `\` there is an ordinary filename byte and not a separator.
+ *
+ * Deliberately silent about the two other shapes a `path.relative` result can take, because every
+ * caller already decides those for itself and they differ: `''` (the base itself — allowed by
+ * `resolveInside`, refused by the aux reader) and an absolute path (another drive on Windows). Pure.
+ */
+export function climbsOut(rel: string): boolean {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith(`..${path.sep}`);
+}
+
+/**
  * Resolve a user-supplied relative path against a project root, rejecting anything
  * that escapes the root (`..`, absolute paths, symlink-style traversal in the string).
  * Returns the absolute resolved path. Allows the root itself (empty/`.` relative path).
@@ -44,7 +61,7 @@ export function resolveInside(root: string, relPath: string): string {
   const normalizedRoot = path.resolve(root);
   const resolved = path.resolve(normalizedRoot, relPath);
   const rel = path.relative(normalizedRoot, resolved);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (climbsOut(rel) || path.isAbsolute(rel)) {
     throw new Error(`Path escapes the project root: "${relPath}"`);
   }
   return resolved;

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
@@ -11,6 +11,7 @@ import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import { buildDir, buildPdfPath, buildAuxPath } from '../../src/services/compiler.js';
 import { toPosix } from '../../src/lib/paths.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
+import { ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /*
@@ -25,6 +26,22 @@ import type { ServerConfig } from '../../src/types.js';
 
 const MAIN_TEX = '\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n';
 const MAIN_AUX = '\\relax\n\\newlabel{fig:x}{{1}{3}{A caption}{figure.1}{}}\n';
+
+/**
+ * Stage main.tex's `.aux` — and a `.log` beside it, as a compile always leaves one: a build with
+ * neither `.log` nor `.fls` has every label refused (`'pgfpagesUnknown'`). A stand-in whose
+ * shipout marks are not used ({@link ROUTES_ONLY_LOG}), so the lookup runs the routes alone.
+ */
+async function stageMainAux(userDir: string): Promise<void> {
+  const auxPath = buildAuxPath(userDir, 'main.tex');
+  await writeFile(auxPath, MAIN_AUX);
+  await writeFile(`${auxPath.slice(0, -'.aux'.length)}.log`, ROUTES_ONLY_LOG);
+  // A finished compile closes its .aux before its PDF, and a label lookup refuses a build whose
+  // .aux is the newer by any margin ('stalePdf', #220). Back-date the staged one so the order the
+  // steps ran in, and any pause a slow runner puts between them, cannot read as a stale build.
+  const past = new Date(Date.now() - 60_000);
+  await utimes(auxPath, past, past);
+}
 
 const cleanups: Array<() => Promise<unknown>> = [];
 
@@ -60,7 +77,7 @@ async function setup(opts: { stageMain: boolean }): Promise<Harness> {
       mainPdf,
       minimalPdf(3, 300, 200, { text: (n) => `MAIN page ${n}, Figure 1 caption\n${n}` }),
     );
-    await writeFile(buildAuxPath(userDir, 'main.tex'), MAIN_AUX);
+    await stageMainAux(userDir);
   }
   // The surfaced copy, left by a later compile of a DIFFERENT root (a 5-page supplement).
   const surfaced = path.join(workspace, 'poster.pdf');
@@ -170,7 +187,7 @@ describe('PDF tools read the requested root’s build, not the last-surfaced cop
   it('refuses rather than pairing the .aux with the surfaced copy when the root has no build', async () => {
     const { client, userDir } = await setup({ stageMain: false });
     // A compile that died after writing main.aux but before producing main.pdf.
-    await writeFile(buildAuxPath(userDir, 'main.tex'), MAIN_AUX);
+    await stageMainAux(userDir);
     const res = await client.callTool({
       name: 'render_pages',
       arguments: { project: 'poster', labels: ['fig:x'], inline: false },
