@@ -22,6 +22,7 @@
       "args": ["${__dirname}/dist/index.js"],
       "env": {
         "WEB_LATEX_MCP_WORKSPACE": "${user_config.workspace}",
+        "WEB_LATEX_MCP_INSTALL_KIND": "desktop-extension",
         "OVERLEAF_GIT_TOKEN": "${user_config.overleaf_token}",
         "GITHUB_TOKEN": "${user_config.github_token}"
       }

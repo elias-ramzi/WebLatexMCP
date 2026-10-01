@@ -6,7 +6,9 @@ import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
+import { createContext } from '../../src/context.js';
 import type { AppContext } from '../../src/context.js';
+import { CredentialResolver } from '../../src/services/auth.js';
 import {
   BUNDLE_ASSET,
   MAX_BUNDLE_BYTES,
@@ -103,7 +105,12 @@ function fakeFetch(
   return Object.assign(f, { urls });
 }
 
-async function extensionRoot(): Promise<string> {
+/**
+ * A copy of the repository with no `.git`: what a GitHub "Source code" archive, degit or a Docker
+ * image that drops `.git` leaves. It carries `manifest.json` (it sits at the repo root), so it is
+ * exactly the tree that used to be taken for the Desktop extension.
+ */
+async function manifestOnlyRoot(): Promise<string> {
   const root = await tmp('wlm-upd-root-');
   await writeFile(path.join(root, 'manifest.json'), '{}');
   return root;
@@ -112,7 +119,9 @@ async function extensionRoot(): Promise<string> {
 /**
  * Every service a test builds goes through here: an opener that only records (never the real
  * `xdg-open`/`open`/`start`) and a temp `tmpDir` (never the real temp dir), so a regression that
- * reaches the open or the write cannot leave this process.
+ * reaches the open or the write cannot leave this process. The install kind defaults to the
+ * Desktop extension, ASSERTED as its manifest asserts it; a test that wants the server to work it
+ * out passes `installKind: undefined` (and a `packageRoot`).
  */
 async function makeService(
   opts: Omit<UpdateServiceOptions, 'open' | 'tmpDir'> & { tmpDir?: string; opens?: boolean },
@@ -121,7 +130,8 @@ async function makeService(
   const opened: string[] = [];
   const { opens = true, ...rest } = opts;
   const svc = new UpdateService({
-    packageRoot: await extensionRoot(),
+    packageRoot: await tmp('wlm-upd-pkg-'),
+    installKind: 'desktop-extension',
     currentVersion: '0.8.0',
     ...rest,
     tmpDir,
@@ -165,13 +175,110 @@ describe('version comparison', () => {
 });
 
 describe('detectInstallKind', () => {
-  it('tells a git checkout, the .mcpb bundle and an npm install apart', async () => {
-    const source = await tmp('wlm-upd-src-');
-    await mkdir(path.join(source, '.git'));
-    await writeFile(path.join(source, 'manifest.json'), '{}');
-    expect(detectInstallKind(source)).toBe('source');
-    expect(detectInstallKind(await extensionRoot())).toBe('desktop-extension');
+  it('never infers the Desktop extension from manifest.json (a copy of the repo without .git)', async () => {
+    expect(detectInstallKind(await manifestOnlyRoot())).toBe('npm');
+    expect(detectInstallKind(await manifestOnlyRoot(), undefined)).toBe('npm');
+    expect(
+      new UpdateService({
+        packageRoot: await manifestOnlyRoot(),
+        currentVersion: '0.8.0',
+      }).installKind(),
+    ).toBe('npm');
+  });
+
+  it('takes an asserted kind over anything on disk', async () => {
+    const checkout = await tmp('wlm-upd-src-');
+    await mkdir(path.join(checkout, '.git'));
+    await writeFile(path.join(checkout, 'manifest.json'), '{}');
+    expect(detectInstallKind(checkout, 'desktop-extension')).toBe('desktop-extension');
+    expect(detectInstallKind(checkout, 'npm')).toBe('npm');
+    const bare = await tmp('wlm-upd-npm-');
+    expect(detectInstallKind(bare, 'source')).toBe('source');
+    expect(detectInstallKind(await manifestOnlyRoot(), 'npm')).toBe('npm');
+    expect(
+      new UpdateService({ packageRoot: checkout, installKind: 'desktop-extension' }).installKind(),
+    ).toBe('desktop-extension');
+  });
+
+  it('reads a git checkout — a .git directory, or a .git file as in a worktree — as source', async () => {
+    const checkout = await tmp('wlm-upd-src-');
+    await mkdir(path.join(checkout, '.git'));
+    expect(detectInstallKind(checkout)).toBe('source');
+    const worktree = await tmp('wlm-upd-wt-');
+    await writeFile(path.join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/x\n');
+    expect(detectInstallKind(worktree)).toBe('source');
     expect(detectInstallKind(await tmp('wlm-upd-npm-'))).toBe('npm');
+  });
+});
+
+interface ManifestEnvs {
+  server?: {
+    mcp_config?: {
+      env?: Record<string, string>;
+      platform_overrides?: Record<string, { env?: Record<string, string> }>;
+    };
+  };
+}
+
+/**
+ * Every env block Claude Desktop may launch the server with that does not assert the extension:
+ * `base` for `mcp_config.env`, else the platform name. A platform override's `env` REPLACES the
+ * base block (mcpb does not merge them), so each one must carry the key itself.
+ */
+function envsMissingInstallKind(manifest: ManifestEnvs): string[] {
+  const config = manifest.server?.mcp_config;
+  const blocks: Array<[string, Record<string, string> | undefined]> = [['base', config?.env]];
+  for (const [platform, override] of Object.entries(config?.platform_overrides ?? {})) {
+    if (override.env !== undefined) blocks.push([platform, override.env]);
+  }
+  return blocks
+    .filter(([, env]) => env?.WEB_LATEX_MCP_INSTALL_KIND !== 'desktop-extension')
+    .map(([name]) => name);
+}
+
+describe('the Desktop extension asserts its install kind', () => {
+  it('sets WEB_LATEX_MCP_INSTALL_KIND=desktop-extension in every env block of manifest.json', async () => {
+    // Only Claude Desktop launches the server through these env blocks; dropping the line would
+    // make every extension install read as npm and stop update_server from installing.
+    const manifest = JSON.parse(
+      await readFile(new URL('../../manifest.json', import.meta.url), 'utf8'),
+    ) as ManifestEnvs;
+    expect(envsMissingInstallKind(manifest)).toEqual([]);
+  });
+
+  it('flags a platform override whose env would replace the base block without the key', () => {
+    const asserted = { WEB_LATEX_MCP_INSTALL_KIND: 'desktop-extension' };
+    expect(
+      envsMissingInstallKind({
+        server: {
+          mcp_config: {
+            env: asserted,
+            platform_overrides: {
+              win32: { env: { PATH: 'C:\\extra' } },
+              darwin: { env: { ...asserted, PATH: '/extra' } },
+              linux: {},
+            },
+          },
+        },
+      }),
+    ).toEqual(['win32']);
+    expect(envsMissingInstallKind({ server: { mcp_config: {} } })).toEqual(['base']);
+  });
+});
+
+describe('createContext', () => {
+  it("hands the config's asserted install kind to the updater", async () => {
+    const workspace = await tmp('wlm-upd-ws-');
+    // The package root this test runs from is a git checkout (or worktree), so without the
+    // pass-through both of these would read as `source`.
+    for (const installKind of ['desktop-extension', 'npm'] as const) {
+      const ctx = createContext(
+        { workspaceRoot: workspace, sessionId: 'test', projects: [], installKind },
+        new CredentialResolver({}),
+        { name: 'Test', email: 'test@example.com' },
+      );
+      expect(ctx.updater.installKind()).toBe(installKind);
+    }
   });
 });
 
@@ -546,12 +653,32 @@ describe('update_server tool', () => {
 
   it('gives an npm install advice instead of downloading', async () => {
     const fetch = fakeFetch(release('v0.9.0'));
-    const { svc, opened } = await makeService({ fetch, packageRoot: await tmp('wlm-upd-npm-') });
+    const { svc, opened } = await makeService({ fetch, installKind: 'npm' });
     const { sc } = await call(await connect(svc), { install: true });
     expect(sc).toMatchObject({ installKind: 'npm', action: 'manual' });
     expect(String(sc.advice)).toContain('web-latex-mcp@0.9.0');
     expect(fetch.urls).toHaveLength(1);
     expect(opened).toEqual([]);
+  });
+
+  it('gives a copy of the repo without .git (manifest.json, nothing asserted) npm advice, never the bundle', async () => {
+    const fetch = fakeFetch(release('v0.9.0'));
+    const { svc, opened, tmpDir } = await makeService({
+      fetch,
+      packageRoot: await manifestOnlyRoot(),
+      installKind: undefined,
+    });
+    const { sc, text } = await call(await connect(svc), { install: true });
+    expect(sc).toMatchObject({
+      installKind: 'npm',
+      updateAvailable: true,
+      action: 'manual',
+      advice: manualUpdateAdvice('npm', '0.9.0'),
+    });
+    expect(text).not.toContain('Claude Desktop prompt');
+    expect(fetch.urls.some((u) => u.includes('/releases/download/'))).toBe(false);
+    expect(opened).toEqual([]);
+    expect(await readdir(tmpDir)).toEqual([]);
   });
 
   it('surfaces a refused download as a tool error', async () => {
@@ -599,7 +726,7 @@ describe('update_server tool', () => {
     it('gives an npm install its own advice', async () => {
       const { svc } = await makeService({
         fetch: fakeFetch(release('v0.9.0')),
-        packageRoot: await tmp('wlm-upd-npm-'),
+        installKind: 'npm',
         currentVersion: 'unknown',
       });
       const { sc } = await call(await connect(svc), { install: true });

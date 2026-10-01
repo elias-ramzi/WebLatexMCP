@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix } from '../lib/paths.js';
 import { quoteId } from '../lib/projectId.js';
+import { INSTALL_KINDS } from '../lib/installKind.js';
 import { BUNDLE_ASSET, isComparableVersion, manualUpdateAdvice } from '../services/updater.js';
 
 const inputSchema = {
@@ -30,10 +31,12 @@ const outputSchema = {
         'compared (unreadable, or a pre-release); `advice` then says how to update by hand.',
     ),
   installKind: z
-    .enum(['desktop-extension', 'npm', 'source'])
+    .enum(INSTALL_KINDS)
     .describe(
       'How this server was installed: the Claude Desktop extension (.mcpb), an npm package, or a ' +
-        'git checkout. Only the extension is updated through this tool.',
+        'git checkout. Only the extension is updated through this tool. The extension is ' +
+        'recognised only because its manifest sets WEB_LATEX_MCP_INSTALL_KIND; without that ' +
+        'variable, a git checkout is "source" and anything else "npm".',
     ),
   releaseUrl: z.string().describe('The release page on GitHub.'),
   action: z

@@ -8,6 +8,9 @@ import { getServerVersion } from '../lib/version.js';
 import { openFile } from '../lib/openFile.js';
 import { toPosix } from '../lib/paths.js';
 import { escapeInvisibleChars, quoteId } from '../lib/projectId.js';
+import type { InstallKind } from '../lib/installKind.js';
+
+export type { InstallKind } from '../lib/installKind.js';
 
 /**
  * Checks for, and fetches, a newer release of this server.
@@ -38,13 +41,6 @@ const LATEST_RELEASE_API = `https://api.github.com/repos/${RELEASE_REPO}/release
 export const MAX_BUNDLE_BYTES = 200 * 1024 * 1024;
 const API_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
-
-/**
- * How this server was installed, read off the package root it runs from: a git checkout has
- * `.git`; the `.mcpb` bundle ships `manifest.json` (npm's `files` list leaves it out); anything
- * else came from npm.
- */
-export type InstallKind = 'desktop-extension' | 'npm' | 'source';
 
 export interface UpdateResponse {
   ok: boolean;
@@ -101,6 +97,11 @@ export interface UpdateServiceOptions {
   fetch?: UpdateFetch;
   /** The package root this server runs from (where `package.json` sits). */
   packageRoot?: string;
+  /**
+   * The install kind the launcher asserted (`WEB_LATEX_MCP_INSTALL_KIND`, set by the Desktop
+   * extension's manifest). Wins over anything read off `packageRoot` — see `detectInstallKind`.
+   */
+  installKind?: InstallKind;
   currentVersion?: string;
   /** Opens a file with the OS's default handler (`openFile`: on win32 the path never reaches cmd). */
   open?: (target: string) => Promise<boolean>;
@@ -135,9 +136,23 @@ export function isNewer(latest: string, current: string): boolean {
   return false;
 }
 
-export function detectInstallKind(packageRoot: string): InstallKind {
+/**
+ * How this server was installed. The Desktop extension is known only because its launcher says so:
+ * the extension's `manifest.json` sets `WEB_LATEX_MCP_INSTALL_KIND=desktop-extension` in the env
+ * Claude Desktop starts the server with, and an asserted kind (`asserted`) always wins. Without
+ * one, a package root holding `.git` (a directory, or the file a worktree has) is a `source`
+ * checkout, and anything else is `npm`.
+ *
+ * An assertion, never an inference: `manifest.json` on disk is NOT read as the extension, because
+ * it sits at the repository root, so every copy of the repository without `.git` (a GitHub
+ * "Source code" archive, degit, a Docker image that drops `.git`, a copied folder) carries it —
+ * and the extension is the one kind `update_server` acts on, downloading the `.mcpb` and opening
+ * it, which would offer a second install in Claude Desktop while the copy actually running stays
+ * stale. Mistaking such a copy for npm costs only advice that does not fit; nothing is downloaded.
+ */
+export function detectInstallKind(packageRoot: string, asserted?: InstallKind): InstallKind {
+  if (asserted !== undefined) return asserted;
   if (existsSync(path.join(packageRoot, '.git'))) return 'source';
-  if (existsSync(path.join(packageRoot, 'manifest.json'))) return 'desktop-extension';
   return 'npm';
 }
 
@@ -173,6 +188,7 @@ const defaultFetch: UpdateFetch = (url, init) => fetch(url, init);
 export class UpdateService {
   private readonly fetchImpl: UpdateFetch;
   private readonly packageRoot: string;
+  private readonly assertedKind: InstallKind | undefined;
   private readonly currentVersion: string;
   private readonly open: (target: string) => Promise<boolean>;
   private readonly tmpDir: string;
@@ -180,6 +196,7 @@ export class UpdateService {
   constructor(opts: UpdateServiceOptions = {}) {
     this.fetchImpl = opts.fetch ?? defaultFetch;
     this.packageRoot = opts.packageRoot ?? defaultPackageRoot();
+    this.assertedKind = opts.installKind;
     this.currentVersion = opts.currentVersion ?? getServerVersion();
     this.open = opts.open ?? openFile;
     // Resolved now: `os.tmpdir()` returns a relative TMPDIR as is, and `openFile` opens only an
@@ -188,7 +205,7 @@ export class UpdateService {
   }
 
   installKind(): InstallKind {
-    return detectInstallKind(this.packageRoot);
+    return detectInstallKind(this.packageRoot, this.assertedKind);
   }
 
   async check(): Promise<UpdateCheck & { release: LatestRelease }> {

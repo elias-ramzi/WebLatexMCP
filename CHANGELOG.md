@@ -18,7 +18,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   digest is refused), and opens it, so Claude Desktop shows its own install prompt. Nothing is
   installed until you confirm there. The download URL is pinned to this repository's
   `releases/download/<tag>/`. For an npm or git-checkout install, nothing is downloaded and the tool
-  says what to run instead.
+  says what to run instead. The extension is recognised only because its manifest sets the new
+  `WEB_LATEX_MCP_INSTALL_KIND`, never from files on disk; without it a git checkout is `source` and
+  anything else `npm`.
 
 ### Changed
 

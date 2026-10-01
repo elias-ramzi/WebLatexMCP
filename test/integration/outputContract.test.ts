@@ -970,9 +970,10 @@ describe('output contract: update_server', () => {
       () => rm(packageRoot, { recursive: true, force: true }),
       () => rm(tmpDir, { recursive: true, force: true }),
     );
-    await writeFile(path.join(packageRoot, 'manifest.json'), '{}');
     ctx.updater = new UpdateService({
       packageRoot,
+      // Asserted, as the extension's manifest asserts it: nothing on disk names the extension.
+      installKind: 'desktop-extension',
       tmpDir,
       currentVersion: '0.8.0',
       open: async () => true,

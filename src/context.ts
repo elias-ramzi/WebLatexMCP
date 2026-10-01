@@ -230,6 +230,8 @@ export function createContext(
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),
-    updater: new UpdateService(),
+    // The install kind is the launcher's assertion (the Desktop extension's manifest sets
+    // WEB_LATEX_MCP_INSTALL_KIND); unset, the updater never infers the extension.
+    updater: new UpdateService({ installKind: config.installKind }),
   };
 }
