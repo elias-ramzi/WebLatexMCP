@@ -3,6 +3,7 @@ import type { Stats } from 'node:fs';
 import path from 'node:path';
 import { execCapture } from '../lib/exec.js';
 import { toPosix } from '../lib/paths.js';
+import { WORKSPACE_SETTING } from '../lib/workspaceNote.js';
 import { isNotFound, spawnFailureReason } from './compiler.js';
 import { COMPILER_KINDS } from './compilerResolver.js';
 import { PdfRenderer } from './pdfRender.js';
@@ -500,7 +501,7 @@ export class DoctorService {
       if (!ok) {
         hints.push(
           `The workspace root (${shownWorkspace}) is not writable — set ` +
-            'WEB_LATEX_MCP_WORKSPACE to a directory you own.',
+            `${WORKSPACE_SETTING} to a directory you own.`,
         );
       }
     }

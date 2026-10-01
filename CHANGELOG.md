@@ -35,7 +35,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   in that fallback workspace when the server is using another one.
 - **The tools you meet first say which workspace is in use and how to move it.** `list_projects`'
   empty state, `register_project`'s result for a git project, and the `credential_portal` page name
-  the workspace folder and where to change it (`WEB_LATEX_MCP_WORKSPACE`, which the Desktop
+  the workspace folder and where to change it, and `doctor`'s unwritable-workspace hint names the
+  extension's field too (`WEB_LATEX_MCP_WORKSPACE`, which the Desktop
   extension sets from its settings form). Moving it is still a restart-time setting only; no tool
   changes it.
 - **The post-release back-merge PR no longer waits for someone to approve its checks.**
