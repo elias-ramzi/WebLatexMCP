@@ -221,6 +221,19 @@ export function readProjectRegistryDefault(workspaceRoot: string): string | unde
   return undefined;
 }
 
+/**
+ * How many usable projects the registry in `workspaceRoot` holds — for naming a workspace this
+ * server is NOT using, so unlike `readRegistryFile` it reports nothing on stderr about that
+ * file's invalid entries, and an unreadable file counts as none.
+ */
+export function countRegisteredProjects(workspaceRoot: string): number {
+  const read = readRawRegistry(registryPath(workspaceRoot));
+  if (!read.ok) return 0;
+  return Object.entries(read.raw).filter(
+    ([id, value]) => projectIdProblem(id) === undefined && entrySchema.safeParse(value).success,
+  ).length;
+}
+
 /** A configured registry the server can read from and persist to. */
 export class ProjectRegistry {
   private readonly filePath: string;

@@ -11,6 +11,7 @@ import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
 import { assertValidProjectId, quoteId } from '../lib/projectId.js';
 import { assertRegistrableRootFile } from '../lib/rootFileSpelling.js';
 import { droppedRegistrationFields, registrationDroppedNote } from '../lib/registration.js';
+import { workspaceNote } from '../lib/workspaceNote.js';
 import type { ProjectConfig } from '../types.js';
 
 // Re-exported for `test/unit/registerProjectFields.test.ts`, which predates its move to the lib.
@@ -431,6 +432,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               ? `Cloned at ${outPath}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
+            ` ${workspaceNote(ctx.config.workspaceRoot)}` +
             credentialsNote +
             defaultRegistrationNote(ctx, makeDefault) +
             registrationDroppedNote(cfg.id, dropped);

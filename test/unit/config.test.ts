@@ -48,6 +48,16 @@ describe('loadConfig', () => {
     expect(cfg.workspaceIsLocal).toBe(false);
   });
 
+  it('names the fallback workspace only when it is not the one in use', () => {
+    const fallback = path.join(os.homedir(), '.web-latex-mcp', 'projects');
+    expect(loadConfig({}, '/some/dir', notInRepo).fallbackWorkspaceRoot).toBeUndefined();
+    expect(
+      loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/latex-workspace' }, '/some/dir', notInRepo)
+        .fallbackWorkspaceRoot,
+    ).toBe(fallback);
+    expect(loadConfig({}, '/work/paper', inRepo).fallbackWorkspaceRoot).toBe(fallback);
+  });
+
   it('expands a leading ~ in the workspace root', () => {
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/tex-projects' });
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));

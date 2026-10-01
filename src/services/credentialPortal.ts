@@ -29,6 +29,11 @@ export type CredentialStoreFn = (
 export interface PortalTarget {
   host: string;
   username: string;
+  /**
+   * Shown on the page with where to change it, since in Claude Desktop the portal is the one
+   * page of this server the user sees. Display only: the page cannot change it.
+   */
+  workspaceRoot?: string;
 }
 
 export interface PortalOutcome {
@@ -260,10 +265,19 @@ and stored in your OS keychain — it never goes through Claude or the chat.</p>
     placeholder="e.g. your Overleaf Git authentication token">
   <button type="submit">Store in keychain</button>
 </form>
-<p class="note">Overleaf: create one under Account Settings → Git integration →
+${this.workspaceHtml(target)}<p class="note">Overleaf: create one under Account Settings → Git integration →
 <a href="${OVERLEAF_TOKEN_URL}" target="_blank" rel="noopener noreferrer">Git authentication token</a>.
 GitHub: a Personal Access Token with <code>repo</code> scope.</p>
 </body></html>`;
+  }
+
+  private workspaceHtml(target: PortalTarget): string {
+    if (!target.workspaceRoot) return '';
+    return `<p class="note">Your projects are cloned into
+<code>${escapeHtml(target.workspaceRoot)}</code>. To use another folder, change it in Claude Desktop
+under Settings → Extensions → WebLatexMCP → Clone workspace folder (or set
+<code>WEB_LATEX_MCP_WORKSPACE</code>), then restart the server.</p>
+`;
   }
 
   private resultHtml(message: string, ok: boolean): string {
