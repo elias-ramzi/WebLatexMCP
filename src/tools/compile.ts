@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { detectRootFile } from '../lib/rootFile.js';
+import { resolveRootFile } from '../lib/rootFile.js';
 import { toFileUrl, toPosix, toPosixOut } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
 import { compileViewerHint, viewerShowsForCompile } from '../lib/viewerHint.js';
@@ -116,7 +116,12 @@ export function overlayNeverReadHint(paths: string[], success: boolean): string 
 
 const inputSchema = {
   project: z.string().optional(),
-  rootFile: z.string().optional().describe('Root .tex file. Auto-detected when omitted.'),
+  rootFile: z
+    .string()
+    .optional()
+    .describe(
+      "Root .tex file. When omitted: the project's registered rootFile, else auto-detected.",
+    ),
   engine: z.enum(['pdflatex', 'xelatex', 'lualatex']).optional().describe('Default pdflatex.'),
   compiler: z
     .enum(['latexmk', 'tectonic'])
@@ -628,7 +633,14 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
         // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
         const backend = await ctx.compiler.select(compiler);
         return await ctx.projectManager.runExclusive(id, async (lock) => {
-          const root = rootFile ?? (await detectRootFile(ctx.files, dir));
+          // The caller's root, else the project's registered one, else auto-detection — the one
+          // order every tool and the viewer use (resolveRootFile).
+          const { rootFile: root } = await resolveRootFile(
+            ctx.files,
+            dir,
+            ctx.projectManager.getProjectConfig(id).rootFile,
+            rootFile,
+          );
           // An overlay compile builds a variant: the edited text is applied in memory (read
           // through FileService under the project's link policy, never written back, no baseline)
           // and compiled in a link farm with its own build dir — see src/lib/variants.ts.
@@ -969,23 +981,33 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
             .filter(Boolean)
             .join('\n');
           // Surface the live viewer whenever there's something to look at: its URL if it's already
-          // running — saying whether it now shows THIS build, since it follows the auto-detected
-          // root and not `rootFile` — else a pointer that the tool exists.
+          // running — saying whether it now shows THIS build, since it follows the project's root
+          // (registered, else auto-detected) and not `rootFile` — else a pointer that the tool
+          // exists, naming the root it would show when that is not this one.
           // Not for a variant: the viewer shows the project's own build, which this did not touch.
+          // Judged whether or not the viewer runs: an idle one is still worth a line when it
+          // would open on another root than the one just built.
           const viewerUrl =
             pdfPath && !variant && ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined;
-          const viewerLine =
+          const viewerShows =
             pdfPath && !variant
-              ? compileViewerHint(
-                  viewerUrl
-                    ? {
-                        url: viewerUrl,
-                        builtRoot: toPosix(root),
-                        shows: await viewerShowsForCompile(ctx.files, ctx.config, id, dir, root),
-                      }
-                    : undefined,
+              ? await viewerShowsForCompile(
+                  ctx.files,
+                  ctx.config,
+                  id,
+                  dir,
+                  ctx.projectManager.getProjectConfig(id).rootFile,
+                  root,
                 )
-              : '';
+              : undefined;
+          const viewerLine = viewerShows
+            ? compileViewerHint(
+                viewerUrl
+                  ? { url: viewerUrl, builtRoot: toPosix(root), shows: viewerShows }
+                  : undefined,
+                { builtRoot: toPosix(root), shows: viewerShows },
+              )
+            : '';
           // Every claim here is one the build's own record backs: the source's state from the
           // before/after comparison, shell escape's from the engine's banner — the latexmk flag
           // alone reaches the engine only through %O, which a project latexmkrc can override.

@@ -38,7 +38,7 @@ describe('compileViewerHint', () => {
     const hint = compileViewerHint({
       url,
       builtRoot: 'supp.tex',
-      shows: { kind: 'other-root', shownRoot: 'main.tex' },
+      shows: { kind: 'other-root', shownRoot: 'main.tex', source: 'detected' },
     });
     expect(hint).toContain(url);
     expect(hint).not.toMatch(/refreshed/);
@@ -50,11 +50,47 @@ describe('compileViewerHint', () => {
     const hint = compileViewerHint({
       url,
       builtRoot: 'supp.tex',
-      shows: { kind: 'surfaced-copy', shownRoot: 'main.tex' },
+      shows: { kind: 'surfaced-copy', shownRoot: 'main.tex', source: 'detected' },
     });
     expect(hint).not.toMatch(/refreshed/);
     expect(hint).toMatch(/surfaced copy/);
     expect(hint).toMatch(/no source location/);
+  });
+
+  it('says the viewer still shows nothing when its root has no build', () => {
+    const hint = compileViewerHint({
+      url,
+      builtRoot: 'root.tex',
+      shows: { kind: 'no-build', shownRoot: 'tpl/main.tex', source: 'detected' },
+    });
+    expect(hint).not.toMatch(/refreshed/);
+    expect(hint).toContain('"tpl/main.tex" (auto-detected)');
+    expect(hint).toMatch(/shows nothing/);
+    expect(hint).toMatch(/register_project .*rootFile: "root\.tex"/);
+  });
+
+  it('names a registered root as registered', () => {
+    const hint = compileViewerHint({
+      url,
+      builtRoot: 'supp.tex',
+      shows: { kind: 'other-root', shownRoot: 'root.tex', source: 'registered' },
+    });
+    expect(hint).toContain(`"root.tex" (the project's registered rootFile)`);
+  });
+
+  // The reported case: the viewer was opened AFTER the compile, so no running-viewer line could
+  // have said it was waiting on another root.
+  it('names the root an idle viewer would show when it is not this build', () => {
+    const hint = compileViewerHint(undefined, {
+      builtRoot: 'root.tex',
+      shows: { kind: 'no-build', shownRoot: 'tpl/main.tex', source: 'detected' },
+    });
+    expect(hint).toMatch(/`viewer`/);
+    expect(hint).toMatch(/would show "tpl\/main\.tex" \(auto-detected\), not this build/);
+    expect(hint).toMatch(/rootFile: "root\.tex"/);
+    expect(
+      compileViewerHint(undefined, { builtRoot: 'x.tex', shows: { kind: 'this-build' } }),
+    ).toBe(compileViewerHint(undefined));
   });
 
   it('claims nothing about which build it shows when that is unknown', () => {
@@ -68,8 +104,8 @@ describe('compileViewerHint', () => {
     expect(hint).toMatch(/`viewer`/);
     expect(hint).toMatch(/comments/);
     expect(hint).not.toContain('127.0.0.1');
-    // It follows the auto-detected root, not every compile.
-    expect(hint).toMatch(/auto-detected root/);
+    // It follows the project's root (registered, else auto-detected), not every compile.
+    expect(hint).toMatch(/registered rootFile, else the auto-detected root/);
     expect(hint).not.toMatch(/on every compile/);
   });
 });
@@ -127,17 +163,45 @@ describe('viewerShowsForCompile', () => {
     const files = new FileService();
     for (const platform of ['darwin', 'win32'] as const) {
       vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
-      expect(await viewerShowsForCompile(files, config, 'p', dir, 'Main.tex')).toEqual({
+      expect(await viewerShowsForCompile(files, config, 'p', dir, undefined, 'Main.tex')).toEqual({
         kind: 'this-build',
       });
     }
     vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
-    expect(await viewerShowsForCompile(files, config, 'p', dir, 'Main.tex')).toEqual({
+    expect(await viewerShowsForCompile(files, config, 'p', dir, undefined, 'Main.tex')).toEqual({
       kind: 'other-root',
       shownRoot: 'main.tex',
+      source: 'detected',
     });
-    expect(await viewerShowsForCompile(files, config, 'p', dir, 'main.tex')).toEqual({
+    expect(await viewerShowsForCompile(files, config, 'p', dir, undefined, 'main.tex')).toEqual({
       kind: 'this-build',
+    });
+  });
+
+  // A registered rootFile is what the viewer follows — a nested template main.tex must not win.
+  it('follows the registered root over auto-detection', async () => {
+    const { dir, config } = await builtProject();
+    const files = new FileService();
+    await writeFile(path.join(dir, 'root.tex'), '\\documentclass{article}\n');
+    const pdf = buildPdfPath(dir, 'root.tex');
+    await writeFile(pdf, '%PDF-1.4\n');
+    expect(await viewerShowsForCompile(files, config, 'p', dir, 'root.tex', 'root.tex')).toEqual({
+      kind: 'this-build',
+    });
+    expect(await viewerShowsForCompile(files, config, 'p', dir, 'root.tex', 'main.tex')).toEqual({
+      kind: 'other-root',
+      shownRoot: 'root.tex',
+      source: 'registered',
+    });
+  });
+
+  it('reports no-build when the root the viewer follows was never compiled', async () => {
+    const { dir, config } = await builtProject();
+    const files = new FileService();
+    expect(await viewerShowsForCompile(files, config, 'p', dir, 'root.tex', 'main.tex')).toEqual({
+      kind: 'no-build',
+      shownRoot: 'root.tex',
+      source: 'registered',
     });
   });
 });

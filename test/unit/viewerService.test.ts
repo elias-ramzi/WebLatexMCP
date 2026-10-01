@@ -21,6 +21,8 @@ describe('ViewerService', () => {
     viewer = new ViewerService({
       knownIds: () => ['demo'],
       resolvePdfPath: async (id) => (id === 'demo' && hasPdf ? pdf : null),
+      resolveRoot: async (id) =>
+        id === 'demo' ? { rootFile: 'tpl/main.tex', source: 'detected' } : null,
       // Stand in for the synctex-backed resolver: attach a fixed source location.
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 42 }),
       listComments: (id) => store.list(id),
@@ -190,6 +192,24 @@ describe('ViewerService', () => {
     await utimes(pdf, later, later);
     const v2 = await (await fetch(`${base}/p/demo/version`)).text();
     expect(v2).not.toBe(v1);
+  });
+
+  // The page says WHICH root it waits for, so a build of another root is not read as "nothing
+  // compiled" (the reported case: a nested template main.tex detected over the real root).
+  it('names the root it waits for in the version 404, and in rootFor', async () => {
+    hasPdf = false;
+    try {
+      const r = await fetch(`${base}/p/demo/version`);
+      expect(r.status).toBe(404);
+      expect(await r.json()).toEqual({ rootFile: 'tpl/main.tex', source: 'detected' });
+      expect(await viewer.rootFor('demo')).toEqual({
+        rootFile: 'tpl/main.tex',
+        source: 'detected',
+      });
+      expect(await viewer.rootFor('nope')).toBeNull();
+    } finally {
+      hasPdf = true;
+    }
   });
 
   it('404s the PDF and version before anything is compiled', async () => {

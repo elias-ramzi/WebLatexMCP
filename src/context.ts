@@ -19,7 +19,7 @@ import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
-import { detectRootFile } from './lib/rootFile.js';
+import { resolveRootFile } from './lib/rootFile.js';
 import { locateViewerPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
@@ -124,17 +124,30 @@ export function createContext(
 
   // The viewer shows a project's PDF and (for comments) resolves a clicked PDF point to source via
   // synctex. Both come from ONE `locateViewerPdf` call, so the page a click lands on and the
-  // synctex that maps it are the same root's build: the detected root's build-dir PDF, where its
+  // synctex that maps it are the same root's build: the project root's build-dir PDF, where its
   // `.synctex.gz` lives, or — when that build is gone — the surfaced copy with no synctex mapping,
   // since that copy holds whichever root compiled last. Constructed here but not listening — it
   // binds a port only when the `viewer` tool is first called.
-  const viewerPdf = async (id: string) => {
+  // The root is the project's registered `rootFile`, else the auto-detected one — the order
+  // `compile` and the PDF tools use too (`resolveRootFile`).
+  const viewerRoot = async (id: string) => {
     const { dir } = await projectManager.requireProjectDir(id);
-    const root = await detectRootFile(files, dir);
-    return { dir, located: await locateViewerPdf(config, id, dir, root) };
+    const root = await resolveRootFile(files, dir, projectManager.getProjectConfig(id).rootFile);
+    return { dir, root };
+  };
+  const viewerPdf = async (id: string) => {
+    const { dir, root } = await viewerRoot(id);
+    return { dir, located: await locateViewerPdf(config, id, dir, root.rootFile) };
   };
   const viewer = new ViewerService({
     knownIds: () => projectManager.knownIds(),
+    resolveRoot: async (id) => {
+      try {
+        return (await viewerRoot(id)).root;
+      } catch {
+        return null; // not cloned / no .tex yet — the page says only that nothing is compiled
+      }
+    },
     resolvePdfPath: async (id) => {
       try {
         return (await viewerPdf(id)).located?.pdf ?? null;

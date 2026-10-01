@@ -3,7 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { openBrowser } from '../lib/openBrowser.js';
-import { shouldOpenExternally, viewerHint } from '../lib/viewerHint.js';
+import { describeViewerRoot, shouldOpenExternally, viewerHint } from '../lib/viewerHint.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -28,6 +28,20 @@ const outputSchema = {
   url: z.string().describe('Localhost viewer URL for the project.'),
   opened: z.boolean().describe('Whether a browser was launched.'),
   target: z.enum(['browser', 'vscode']),
+  rootFile: z
+    .string()
+    .optional()
+    .describe(
+      'The root .tex whose build the viewer shows. Absent when it cannot be told yet (the ' +
+        'project is not cloned, or holds no .tex).',
+    ),
+  rootSource: z
+    .enum(['registered', 'detected'])
+    .optional()
+    .describe(
+      '"registered": the rootFile the project was registered with. "detected": auto-detected, ' +
+        'because none was registered — register the project with a rootFile to show another.',
+    ),
 };
 
 export function registerViewer(server: McpServer, ctx: AppContext): void {
@@ -37,7 +51,8 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
       title: 'Open a live PDF viewer (browser or VSCode tab)',
       description:
         'Start (if needed) a local viewer for the compiled PDF and return its URL. It shows the ' +
-        'auto-detected root file (main.tex, else the first .tex with a \\documentclass) and ' +
+        'root file the project was registered with (rootFile), else the auto-detected one ' +
+        '(main.tex, else the shallowest .tex with a \\documentclass), named in the result, and ' +
         'renders it with pdf.js (zoom/scroll/search, select-to-comment), hot-reloading whenever ' +
         'that root is recompiled and preserving your page and scroll position. For clients ' +
         'without a PDF surface (e.g. Claude Desktop) it auto-opens your browser; in VSCode pass ' +
@@ -68,10 +83,21 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         const url = ctx.viewer.urlFor(id)!;
         const resolvedTarget = target ?? ctx.config.viewerTarget ?? 'browser';
         const opened = shouldOpenExternally(resolvedTarget, open) ? await openBrowser(url) : false;
+        const root = await ctx.viewer.rootFor(id);
+        // The viewer is never handed a root by a call, so 'argument' cannot come back here.
+        const rootSource = root?.source === 'registered' ? 'registered' : 'detected';
+        const text =
+          viewerHint(url, resolvedTarget, opened) +
+          (root ? `\nIt shows ${describeViewerRoot(root.rootFile, root.source)}.` : '');
 
         return {
-          content: [{ type: 'text', text: viewerHint(url, resolvedTarget, opened) }],
-          structuredContent: { url, opened, target: resolvedTarget },
+          content: [{ type: 'text', text }],
+          structuredContent: {
+            url,
+            opened,
+            target: resolvedTarget,
+            ...(root ? { rootFile: root.rootFile, rootSource } : {}),
+          },
         };
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());

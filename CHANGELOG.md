@@ -21,6 +21,22 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   falls back to `GITHUB_TOKEN` and warns that the runs need approving. `docs/versioning.md` says how
   to set it up.
 
+### Fixed
+
+- **`compile`, the PDF tools and the viewer now use the `rootFile` a project was registered with.**
+  The value was stored in `registry.json` (and accepted in `WEB_LATEX_MCP_PROJECTS`) but read by
+  nothing: every call that omitted `rootFile` auto-detected, and detection returned any nested
+  `<dir>/main.tex` first. A project whose root is a top-level `root.tex` beside a vendored
+  template's `tpl/main.tex` compiled the template, and the viewer waited forever for the
+  template's build ("No compiled PDF yet") whatever was compiled. A call's own `rootFile` still
+  wins; then the registered one; then detection, which now takes a top-level `main.tex`, else the
+  shallowest `.tex` holding `\documentclass` (a `main.tex` first at each depth), else the
+  shallowest `main.tex`, else the first `.tex`.
+- **The viewer says which root it shows.** The `viewer` result names it (`rootFile`, `rootSource`:
+  `registered` or `detected`), the page names the root it is waiting for while that root has no
+  build, and `compile` says when the viewer — running or not yet opened — shows another root or
+  nothing at all, and how to make it follow the root just built.
+
 ## [0.8.0] - 2026-09-29
 
 ### Added

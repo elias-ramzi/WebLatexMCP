@@ -110,7 +110,7 @@ It logs `server ready on stdio` to **stderr** and waits for JSON-RPC (Ctrl-C to 
 ## Notes specific to Mistral
 
 - **The PDF viewer works here.** `viewer` starts a local, loopback-only viewer and opens it in your
-  browser — handy from a terminal agent. It hot-reloads whenever the auto-detected root file is recompiled, and you can select text in
+  browser — handy from a terminal agent. It hot-reloads whenever the project's root file (its registered `rootFile`, else the auto-detected one) is recompiled, and you can select text in
   the PDF to leave review comments for the model to apply. See [Tools](../tools.md).
 - **In-context guides.** The writing and concurrency guides are surfaced both as MCP `instructions`
   and as fetchable **resources** (`guide://latex/writing-guide`, `guide://latex/concurrency`), so they

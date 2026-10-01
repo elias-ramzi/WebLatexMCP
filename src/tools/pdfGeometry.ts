@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { detectRootFile } from '../lib/rootFile.js';
+import { resolveRootFile } from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import {
@@ -26,9 +26,10 @@ const inputSchema = {
     .describe(
       'Root .tex file whose build this reads: its build-dir PDF (and, for kinds: ["floats"], ' +
         'its .aux), in every workspace mode — pass the same rootFile you compiled with to read ' +
-        'a non-default root. Auto-detected when omitted. Only when it is omitted and no .aux is ' +
-        'read does a missing build PDF fall back to the surfaced <workspace>/<id>.pdf ' +
-        '(workspace-local mode), which holds whichever root compiled last.',
+        'a non-default root. When omitted: the rootFile the project was registered with, ' +
+        'else auto-detected. Only when neither names a root and no .aux is read does a ' +
+        'missing build PDF fall back to the surfaced <workspace>/<id>.pdf (workspace-local ' +
+        'mode), which holds whichever root compiled last.',
     ),
   pages: z
     .array(z.number().int().positive())
@@ -455,7 +456,16 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             variant !== undefined
               ? await resolveVariantBuild(dir, id, variant, rootFile)
               : undefined;
-          const root = v ? v.rootFile : (rootFile ?? (await detectRootFile(ctx.files, dir)));
+          // A registered root ties the call to one root as an explicit one does (resolveRootFile).
+          const resolved = v
+            ? { rootFile: v.rootFile, source: 'argument' as const }
+            : await resolveRootFile(
+                ctx.files,
+                dir,
+                ctx.projectManager.getProjectConfig(id).rootFile,
+                rootFile,
+              );
+          const root = resolved.rootFile;
           const requestedKinds = kinds ?? ['text', 'images'];
           // The ROOT's build PDF, never the surfaced copy once a root is named or "floats" reads
           // the .aux: the surfaced copy holds whichever root compiled last, and measuring it
@@ -463,7 +473,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
           const pdfPath = v
             ? await findVariantPdf(v)
             : await locateRootPdf(ctx.config, id, dir, root, {
-                rootNamed: rootFile !== undefined,
+                rootNamed: resolved.source !== 'detected',
                 readsAux: requestedKinds.includes('floats'),
               });
 

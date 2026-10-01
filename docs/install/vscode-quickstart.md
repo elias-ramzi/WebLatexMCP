@@ -112,7 +112,7 @@ steps, so nothing leaves your machine implicitly.
 ## See the PDF as a tab in VS Code
 
 The `viewer` tool serves a live PDF viewer on `http://127.0.0.1:<port>` (renders with pdf.js —
-zoom, scroll, search, select-to-comment; hot-reloads whenever the auto-detected root is recompiled). VS Code can show that URL
+zoom, scroll, search, select-to-comment; hot-reloads whenever the project's root — its registered `rootFile`, else the auto-detected one — is recompiled). VS Code can show that URL
 as an **editor tab** via its built-in **Simple Browser**, so you never leave the editor.
 
 **1 · Tell the server you're in VS Code.** In your MCP server config's `env`, set:
@@ -124,7 +124,7 @@ as an **editor tab** via its built-in **Simple Browser**, so you never leave the
 
 **2 · Open it.** Ask Claude to `compile`, then “open the viewer”. It returns a `127.0.0.1` URL.
 Open the **Command Palette** (`Cmd/Ctrl+Shift+P`) → **“Simple Browser: Show”** → paste the URL.
-The tab stays live and refreshes whenever the auto-detected root is recompiled — dock it beside
+The tab stays live and refreshes whenever the project's root is recompiled — dock it beside
 your `.tex`.
 
 **One-key open (optional).** With the port pinned, add a keybinding (`Cmd/Ctrl+Shift+P` →
