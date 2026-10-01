@@ -6,6 +6,7 @@ import { toPosixOut } from '../lib/paths.js';
 import type { SyncResult } from '../services/gitService.js';
 import { enrichPullRefusal } from '../lib/peerRefusal.js';
 import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
+import { planSyncRegistration } from '../lib/syncRegistration.js';
 
 const inputSchema = {
   project: z
@@ -59,6 +60,11 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
       outputSchema,
     },
     async ({ project, mode = 'auto', gitUrl }) => {
+      // What a re-pointing registration dropped (`planSyncRegistration`). Declared outside the
+      // `try` because the registration below happens BEFORE the clone/pull, so a sync that then
+      // fails (a typo'd gitUrl) has still replaced the held config: the error must name the loss
+      // too, or a retry with the right URL — judged against the typo config — never would.
+      let droppedNote = '';
       try {
         // `registerProject` holds the URL without any http(s) secret; the caller must hear that
         // the token they pasted was not used — on success, and above all on a failed clone/pull,
@@ -72,7 +78,17 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           if (!project) {
             throw new Error('Registering a project with gitUrl also requires a project id.');
           }
-          ctx.projectManager.registerProject({ id: project, gitUrl });
+          // A re-stated URL keeps the registration's other fields; a re-point replaces it, and
+          // the result text names what that dropped. Judged against the config this replaces —
+          // the one this process holds, env winning over the registry (`planSyncRegistration`).
+          const plan = planSyncRegistration(
+            project,
+            gitUrl,
+            ctx.projectManager.heldConfig(project),
+          );
+          ctx.projectManager.registerProject(plan.next);
+          // Only once the replace happened: a registration that refuses replaced nothing.
+          droppedNote = plan.note;
         }
         const cfg = ctx.projectManager.requireGitProject(project, 'sync with');
         const dir = ctx.projectManager.projectPath(cfg.id);
@@ -138,13 +154,19 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
               type: 'text',
               text: `${cfg.id}: ${result.action} (ahead ${result.ahead}, behind ${result.behind})${
                 result.diverged ? ' — diverged, resolve manually before pushing' : ''
-              }${result.note ? `\n${result.note}` : ''}${credentialsNote}`,
+              }${result.note ? `\n${result.note}` : ''}${droppedNote}${credentialsNote}`,
             },
           ],
           structuredContent: { ...payload },
         };
       } catch (err) {
-        return errorResult(err, ctx.credentials.allSecrets());
+        // Same shape as `withCredentialsNote`: the note rides on the message, the original error
+        // stays the cause, and `errorResult` scrubs the whole text as before.
+        const reported =
+          droppedNote && err instanceof Error
+            ? new Error(`${err.message}${droppedNote}`, { cause: err })
+            : err;
+        return errorResult(reported, ctx.credentials.allSecrets());
       }
     },
   );

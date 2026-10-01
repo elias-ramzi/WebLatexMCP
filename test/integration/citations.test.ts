@@ -80,7 +80,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       pdfRenderer: new PdfRenderer(),
       viewer: new ViewerService({
         knownIds: () => [],
-        resolvePdfPath: async () => null,
+        locatePdf: async () => ({ pdf: null, root: null }),
         addComment: async () => {
           throw new Error('not used');
         },

@@ -113,11 +113,21 @@ launch dir is a git repo and not the home dir; otherwise it falls back to `~/.we
 build artifacts otherwise live under a per-user temp build root (see the build-root bullet below). That copy is a **convenience for the user, never a
 source for a tool**: it holds whichever root compiled last, so `render_pages`/`extract_text`/
 `pdf_geometry` read `rootFile`'s own build-dir PDF in every mode (`locateRootPdf`,
-`src/lib/pdfLocate.ts`) and fall back to the surfaced copy only when no `rootFile` was named **and**
-no `.aux` is read (`labels`, `floats` are per root). The viewer follows the same rule
-(`locateViewerPdf`, one call for the page shown and the SyncTeX that maps a click): when it shows the
-surfaced fallback, `synctexPdf` is `null` and a comment is kept without a source location rather than
-mapped through another root's build. `ProjectManager` also supports runtime registration.
+`src/lib/pdfLocate.ts`) and fall back to the surfaced copy only when no `rootFile` was named — by the
+call or registered with the project (`resolveRootFile`, `src/lib/rootFile.ts`: the call's `rootFile`, else
+the registered one, else detection, for `compile`, the PDF tools and the viewer alike) — **and**
+no `.aux` is read (`labels`, `floats` are per root). The viewer follows the same rule with one
+difference (`locateViewerPdf`, one call for the page shown and the SyncTeX that maps a click): its root
+is never treated as named, so even a registered root with no build falls back to the surfaced copy
+there, and `compile`'s viewer hint says so (`surfaced-copy`). When it shows the surfaced fallback, `synctexPdf` is `null` and a comment is kept without a source location rather than
+mapped through another root's build. `ProjectManager` also supports runtime registration. The
+registered root is read through `ProjectManager.registeredRootFile`, never `getProjectConfig(id).rootFile`:
+for a project not in `WEB_LATEX_MCP_PROJECTS` (`ServerConfig.envProjectIds`) it reads the registry's
+current entry when that entry names the same location, so a peer session's re-registration takes
+effect without a restart; every other field keeps the in-process snapshot. That is a synchronous
+`registry.json` read per call — including each viewer `/version` poll (every 1.5 s per open page) —
+accepted as small; `upsert` writes by temp-file-plus-rename, so the read needs no lock, and a failed
+read falls back to the in-process root.
 
 ## Conventions that aren't obvious
 

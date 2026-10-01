@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { Comment, NewComment } from './commentStore.js';
+import type { ResolvedRoot } from '../lib/rootFile.js';
 
 /**
  * A lazily-started localhost web server that shows a project's compiled PDF in the browser and
@@ -32,11 +33,32 @@ export interface CommentInput {
   note: string;
 }
 
+/**
+ * What one root resolution tells the viewer about a project: the PDF it shows (null when nothing
+ * is compiled yet) and the root it follows (null when that cannot be told — not cloned, no .tex).
+ */
+export interface ViewerLocation {
+  pdf: string | null;
+  root: ResolvedRoot | null;
+}
+
 export interface ViewerDeps {
   /** Known project ids, for routing/validation (configured + runtime-registered). */
   knownIds(): string[];
-  /** Absolute path to a project's current PDF, or null when nothing is compiled yet. */
-  resolvePdfPath(id: string): Promise<string | null>;
+  /**
+   * The project's current PDF and the root it was located from, from ONE root resolution — the
+   * page polls `/version` every 1.5 s, and while nothing is built that request needs both (the
+   * 404 names the root), so resolving the root once for each (an auto-detection lists the tree
+   * and reads .tex files) doubled the work. Never throws: what cannot be told is null.
+   */
+  locatePdf(id: string): Promise<ViewerLocation>;
+  /**
+   * The root whose build the viewer shows — the registered `rootFile`, else the auto-detected one
+   * — or null when it cannot be told (not cloned, no .tex). Used only to NAME that root in the
+   * `viewer` tool's result ({@link ViewerService.rootFor}), so no PDF is looked for; optional for
+   * that reason.
+   */
+  resolveRoot?(id: string): Promise<ResolvedRoot | null>;
   /** Store a viewer comment (resolving its source location via synctex); returns the stored comment. */
   addComment(id: string, input: NewComment): Promise<Comment>;
   /** Open comments for a project (for the viewer to render markers). */
@@ -273,6 +295,35 @@ eventBus.on('pagesinit', () => {
 
 let cur = null;
 function setDot(c) { dot.style.background = c; }
+
+// Name the root the viewer is waiting for, so a build of ANOTHER root (compile with a different
+// rootFile) is not mistaken for "nothing compiled". Text nodes only: the name is the project's.
+let emptyKey = null;
+function showEmpty(info) {
+  const root = info && typeof info.rootFile === 'string' ? info.rootFile : null;
+  const key = root === null ? '' : String(info.source) + ':' + root;
+  if (key !== emptyKey) {
+    emptyKey = key;
+    empty.textContent = '';
+    if (root === null) {
+      empty.append('No compiled PDF yet. ');
+    } else {
+      const name = document.createElement('code');
+      name.textContent = root;
+      empty.append(
+        'Showing ', name,
+        info.source === 'registered'
+          ? ' (the project\u2019s registered root file): not compiled yet. '
+          : ' (auto-detected root): not compiled yet. If another file is the document, register ' +
+            'the project with that rootFile. ',
+      );
+    }
+    const cmd = document.createElement('code');
+    cmd.textContent = 'compile';
+    empty.append('Run ', cmd, ' in Claude \u2014 this updates automatically.');
+  }
+  empty.setAttribute('data-show', '');
+}
 function flash(t) { msg.textContent = t; setTimeout(() => { msg.textContent = 'live — reloads on compile'; }, 1500); }
 
 // Zoom controls (the PDFViewer component has no toolbar of its own). Manual currentScale
@@ -327,7 +378,9 @@ async function tick() {
       setDot('#3fb950');
     } else {
       cur = null;
-      empty.setAttribute('data-show', '');
+      let info = null;
+      try { info = await r.json(); } catch {}
+      showEmpty(info);
       setDot('#d29922');
     }
   } catch { setDot('#f85149'); }
@@ -671,6 +724,24 @@ export class ViewerService {
     return this.baseUrl !== undefined;
   }
 
+  /** The root this viewer shows for a project, or null when it cannot be told. Never throws. */
+  async rootFor(id: string): Promise<ResolvedRoot | null> {
+    try {
+      return (await this.deps.resolveRoot?.(id)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** {@link ViewerDeps.locatePdf}, held to its never-throw contract. */
+  private async locate(id: string): Promise<ViewerLocation> {
+    try {
+      return await this.deps.locatePdf(id);
+    } catch {
+      return { pdf: null, root: null };
+    }
+  }
+
   /** `http://127.0.0.1:<port>/p/<id>` for a project, or undefined if the server isn't running. */
   urlFor(id: string): string | undefined {
     return this.baseUrl ? `${this.baseUrl}/p/${encodeURIComponent(id)}` : undefined;
@@ -928,7 +999,7 @@ export class ViewerService {
   }
 
   private async sendPdf(res: http.ServerResponse, id: string): Promise<void> {
-    const pdf = await this.deps.resolvePdfPath(id);
+    const { pdf } = await this.locate(id);
     if (!pdf) {
       res
         .writeHead(404, { 'Content-Type': 'text/plain' })
@@ -949,9 +1020,11 @@ export class ViewerService {
   }
 
   private async sendVersion(res: http.ServerResponse, id: string): Promise<void> {
-    const pdf = await this.deps.resolvePdfPath(id);
+    // One resolution answers both: the PDF, and the root a 404 names.
+    const { pdf, root } = await this.locate(id);
     if (!pdf) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' }).end();
+      // The 404 names the root the page is waiting for, so it can say so (see showEmpty).
+      this.sendJson(res, 404, root ? { rootFile: root.rootFile, source: root.source } : {});
       return;
     }
     const st = await stat(pdf);

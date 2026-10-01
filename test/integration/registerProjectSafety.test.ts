@@ -1,13 +1,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry, registryPath } from '../../src/services/projectRegistry.js';
+import { sessionStateDir } from '../../src/lib/sessionPaths.js';
 import type { ProjectConfig, ServerConfig } from '../../src/types.js';
 
 /**
@@ -111,5 +113,123 @@ describe('register_project safety', () => {
     });
     expect(second.isError).toBe(true);
     expect(textOf(second)).toContain('"a"');
+  });
+
+  describe('refuses a rootFile spelled so it cannot name a file in the project', () => {
+    const refused: Array<[string, RegExp]> = [
+      ['/abs/main.tex', /is an absolute path/],
+      ['C:main.tex', /is spelled with a drive prefix/],
+      ['C:\\p\\main.tex', /is an absolute path/],
+      ['../main.tex', /has a "\.\." segment/],
+      ['sub/../main.tex', /has a "\.\." segment/],
+    ];
+
+    async function registryBytes(workspace: string): Promise<string | undefined> {
+      try {
+        return await readFile(registryPath(workspace), 'utf8');
+      } catch {
+        return undefined;
+      }
+    }
+
+    it('for a local project, persisting nothing', async () => {
+      const { client, root, workspace } = await setup();
+      const dir = path.join(root, 'draft');
+      await mkdir(dir);
+      for (const [rootFile, message] of refused) {
+        const before = await registryBytes(workspace);
+        const res = await client.callTool({
+          name: 'register_project',
+          arguments: { project: 'draft', path: dir, rootFile },
+        });
+        expect(res.isError, rootFile).toBe(true);
+        expect(textOf(res), rootFile).toMatch(message);
+        expect(textOf(res), rootFile).toMatch(/relative to the project root/);
+        expect(await registryBytes(workspace), rootFile).toBe(before);
+        // Refused before the project lock is taken, so not even its directory is left behind.
+        expect(existsSync(sessionStateDir(workspace, 'draft')), rootFile).toBe(false);
+      }
+      const listed = await client.callTool({ name: 'list_projects', arguments: {} });
+      expect(textOf(listed)).not.toContain('draft');
+    });
+
+    // A file literally named `C:main.tex` exists only where `:` is allowed in a name.
+    it.skipIf(process.platform === 'win32')(
+      'for a local project pointed at a .tex whose own name is refused, persisting nothing and leaving no lock directory',
+      async () => {
+        const { client, root, workspace } = await setup();
+        const dir = path.join(root, 'draft');
+        await mkdir(dir);
+        await writeFile(path.join(dir, 'C:main.tex'), '\\documentclass{article}\n');
+        const res = await client.callTool({
+          name: 'register_project',
+          arguments: { project: 'draft', path: path.join(dir, 'C:main.tex') },
+        });
+        expect(res.isError).toBe(true);
+        expect(textOf(res)).toMatch(/is spelled with a drive prefix/);
+        expect(await registryBytes(workspace)).toBeUndefined();
+        expect(existsSync(sessionStateDir(workspace, 'draft'))).toBe(false);
+      },
+    );
+
+    it('for a local project, suggesting the relative spelling of an absolute root inside it', async () => {
+      const { client, root } = await setup();
+      const dir = path.join(root, 'draft');
+      await mkdir(path.join(dir, 'sub'), { recursive: true });
+      const res = await client.callTool({
+        name: 'register_project',
+        arguments: { project: 'draft', path: dir, rootFile: path.join(dir, 'sub', 'main.tex') },
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain('rootFile: "sub/main.tex"');
+    });
+
+    it('for a git project, before anything is persisted or cloned', async () => {
+      const { client, workspace } = await setup();
+      for (const [rootFile, message] of refused) {
+        const before = await registryBytes(workspace);
+        const res = await client.callTool({
+          name: 'register_project',
+          arguments: {
+            project: 'paper',
+            gitUrl: 'https://git.example/paper.git',
+            rootFile,
+            clone: false,
+          },
+        });
+        expect(res.isError, rootFile).toBe(true);
+        expect(textOf(res), rootFile).toMatch(message);
+        expect(await registryBytes(workspace), rootFile).toBe(before);
+        expect(existsSync(sessionStateDir(workspace, 'paper')), rootFile).toBe(false);
+      }
+      expect(await registryBytes(workspace)).toBeUndefined();
+    });
+
+    it('accepts a relative rootFile, a backslash one included', async () => {
+      const { client, root, workspace } = await setup();
+      const dir = path.join(root, 'draft');
+      await mkdir(dir);
+      const local = await client.callTool({
+        name: 'register_project',
+        arguments: { project: 'draft', path: dir, rootFile: 'sub/main.tex' },
+      });
+      expect(local.isError).toBeFalsy();
+      const git = await client.callTool({
+        name: 'register_project',
+        arguments: {
+          project: 'paper',
+          gitUrl: 'https://git.example/paper.git',
+          rootFile: 'sub\\main.tex',
+          clone: false,
+        },
+      });
+      expect(git.isError).toBeFalsy();
+      const stored = JSON.parse((await registryBytes(workspace)) ?? '{}') as Record<
+        string,
+        { rootFile?: string }
+      >;
+      expect(JSON.stringify(stored)).toContain('"rootFile":"sub/main.tex"');
+      expect(JSON.stringify(stored)).toContain('"rootFile":"sub\\\\main.tex"');
+    });
   });
 });

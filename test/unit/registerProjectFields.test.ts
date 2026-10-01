@@ -25,10 +25,10 @@ describe('droppedRegistrationFields', () => {
     };
     const next: ProjectConfig = { id: 'paper', gitUrl: 'https://git.overleaf.com/def' };
     expect(droppedRegistrationFields(previous, next)).toEqual([
-      'rootFile=main.tex',
-      'branch=master',
-      'username=alice',
-      'tokenEnv=PAPER_TOKEN',
+      { name: 'rootFile', value: 'main.tex' },
+      { name: 'branch', value: 'master' },
+      { name: 'username', value: 'alice' },
+      { name: 'tokenEnv', value: 'PAPER_TOKEN' },
     ]);
   });
 
@@ -58,8 +58,8 @@ describe('droppedRegistrationFields', () => {
     };
     const next: ProjectConfig = { id: 'draft', mode: 'local', path: '/home/user/draft' };
     expect(droppedRegistrationFields(previous, next)).toEqual([
-      'rootFile=main.tex',
-      'followSymlinks=true',
+      { name: 'rootFile', value: 'main.tex' },
+      { name: 'followSymlinks', value: true },
     ]);
   });
 
@@ -74,10 +74,10 @@ describe('droppedRegistrationFields', () => {
     };
     const next: ProjectConfig = { id: 'paper', mode: 'local', path: '/home/user/paper' };
     expect(droppedRegistrationFields(previous, next)).toEqual([
-      'rootFile=main.tex',
-      'branch=master',
-      'username=alice',
-      'tokenEnv=PAPER_TOKEN',
+      { name: 'rootFile', value: 'main.tex' },
+      { name: 'branch', value: 'master' },
+      { name: 'username', value: 'alice' },
+      { name: 'tokenEnv', value: 'PAPER_TOKEN' },
     ]);
   });
 
@@ -91,8 +91,8 @@ describe('droppedRegistrationFields', () => {
     };
     const next: ProjectConfig = { id: 'draft', gitUrl: 'https://git.overleaf.com/draft' };
     expect(droppedRegistrationFields(previous, next)).toEqual([
-      'rootFile=main.tex',
-      'followSymlinks=true',
+      { name: 'rootFile', value: 'main.tex' },
+      { name: 'followSymlinks', value: true },
     ]);
   });
 
@@ -121,7 +121,9 @@ describe('droppedRegistrationFields', () => {
     };
     // branch is git-only and cannot be carried onto a local config, so it is still dropped —
     // only rootFile (repeated) must be absent from the list.
-    expect(droppedRegistrationFields(previous, next)).toEqual(['branch=master']);
+    expect(droppedRegistrationFields(previous, next)).toEqual([
+      { name: 'branch', value: 'master' },
+    ]);
   });
 
   it('does not report followSymlinks=false when the new registration omits it', () => {
