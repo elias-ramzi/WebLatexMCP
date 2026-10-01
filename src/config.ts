@@ -585,6 +585,7 @@ export function loadConfig(
     workspaceIsLocal,
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
+    envProjectIds: envProjects.map((p) => p.id),
     ...(skippedProjects.length > 0 ? { skippedProjects } : {}),
     defaultProject,
     defaultProjectExplicit,

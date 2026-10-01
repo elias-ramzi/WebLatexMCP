@@ -12,6 +12,8 @@ describe('ViewerService', () => {
   let viewer: ViewerService;
   let base: string;
   let store: CommentStore;
+  /** Root resolutions per request: `locatePdf` resolves once, `resolveRoot` once more. */
+  let resolutions = 0;
 
   beforeAll(async () => {
     dir = await mkdtemp(path.join(os.tmpdir(), 'ovl-viewer-'));
@@ -20,9 +22,17 @@ describe('ViewerService', () => {
     store = new CommentStore();
     viewer = new ViewerService({
       knownIds: () => ['demo'],
-      resolvePdfPath: async (id) => (id === 'demo' && hasPdf ? pdf : null),
-      resolveRoot: async (id) =>
-        id === 'demo' ? { rootFile: 'tpl/main.tex', source: 'detected' } : null,
+      locatePdf: async (id) => {
+        resolutions++;
+        return {
+          pdf: id === 'demo' && hasPdf ? pdf : null,
+          root: id === 'demo' ? { rootFile: 'tpl/main.tex', source: 'detected' } : null,
+        };
+      },
+      resolveRoot: async (id) => {
+        resolutions++;
+        return id === 'demo' ? { rootFile: 'tpl/main.tex', source: 'detected' } : null;
+      },
       // Stand in for the synctex-backed resolver: attach a fixed source location.
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 42 }),
       listComments: (id) => store.list(id),
@@ -212,6 +222,46 @@ describe('ViewerService', () => {
     }
   });
 
+  // The page polls /version every 1.5 s while nothing is built; the 404 needs the PDF AND the
+  // root, and resolving the root once for each doubled an auto-detection on every poll.
+  it('resolves the root once per 404 version poll, and still names it', async () => {
+    hasPdf = false;
+    try {
+      resolutions = 0;
+      const r = await fetch(`${base}/p/demo/version`);
+      expect(r.status).toBe(404);
+      expect(await r.json()).toEqual({ rootFile: 'tpl/main.tex', source: 'detected' });
+      expect(resolutions).toBe(1);
+    } finally {
+      hasPdf = true;
+    }
+  });
+
+  // A dep that breaks its never-throw contract still yields a 404, not a dropped request.
+  it('answers a 404 with an empty body when locating throws', async () => {
+    const other = new ViewerService({
+      knownIds: () => ['demo'],
+      locatePdf: async () => {
+        throw new Error('boom');
+      },
+      addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
+      listComments: (id) => store.list(id),
+      updateComment: (id, cid, note) => store.update(id, cid, { note }),
+      deleteComment: (id, cid) => store.remove(id, cid),
+      undoDelete: (id) => store.undo(id),
+      resolveComments: (id, ids) => store.resolve(id, ids),
+    });
+    const url = await other.start(0);
+    try {
+      const r = await fetch(`${url!}/p/demo/version`);
+      expect(r.status).toBe(404);
+      expect(await r.json()).toEqual({});
+      expect((await fetch(`${url!}/p/demo/pdf`)).status).toBe(404);
+    } finally {
+      await other.close();
+    }
+  });
+
   it('404s the PDF and version before anything is compiled', async () => {
     hasPdf = false;
     try {
@@ -385,7 +435,7 @@ describe('ViewerService', () => {
   it('closes promptly with an unread response body still open', async () => {
     const other = new ViewerService({
       knownIds: () => ['demo'],
-      resolvePdfPath: async () => pdf,
+      locatePdf: async () => ({ pdf, root: null }),
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
       listComments: (id) => store.list(id),
       updateComment: (id, cid, note) => store.update(id, cid, { note }),

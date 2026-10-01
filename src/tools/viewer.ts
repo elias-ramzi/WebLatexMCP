@@ -32,8 +32,10 @@ const outputSchema = {
     .string()
     .optional()
     .describe(
-      'The root .tex whose build the viewer shows. Absent when it cannot be told yet (the ' +
-        'project is not cloned, or holds no .tex).',
+      "The root .tex the viewer follows. It shows that root's build, or — in workspace-local " +
+        'mode, while that root has no build — the surfaced <workspace>/<id>.pdf, which holds ' +
+        'whichever root compiled last (a comment made on it carries no source location). Absent ' +
+        'when it cannot be told yet (the project is not cloned, or holds no .tex).',
     ),
   rootSource: z
     .enum(['registered', 'detected'])
@@ -50,11 +52,13 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
     {
       title: 'Open a live PDF viewer (browser or VSCode tab)',
       description:
-        'Start (if needed) a local viewer for the compiled PDF and return its URL. It shows the ' +
-        'root file the project was registered with (rootFile), else the auto-detected one ' +
-        '(main.tex, else the shallowest .tex with a \\documentclass), named in the result, and ' +
-        'renders it with pdf.js (zoom/scroll/search, select-to-comment), hot-reloading whenever ' +
-        'that root is recompiled and preserving your page and scroll position. For clients ' +
+        'Start (if needed) a local viewer for the compiled PDF and return its URL. It follows the ' +
+        'root file the project was registered with (rootFile), else the auto-detected one (a ' +
+        'top-level main.tex, else the shallowest .tex with a \\documentclass), named in the ' +
+        "result, and renders that root's build (in workspace-local mode, while it has none, the " +
+        'surfaced copy of whichever root compiled last) with pdf.js (zoom/scroll/search, ' +
+        'select-to-comment), hot-reloading whenever it is recompiled and preserving your page ' +
+        'and scroll position. For clients ' +
         'without a PDF surface (e.g. Claude Desktop) it auto-opens your browser; in VSCode pass ' +
         'target:"vscode" (or set WEB_LATEX_MCP_VIEWER_TARGET=vscode) to get the URL to open as a ' +
         'Simple Browser tab. The server binds to loopback only and starts on demand. Run compile ' +
@@ -88,7 +92,7 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         const rootSource = root?.source === 'registered' ? 'registered' : 'detected';
         const text =
           viewerHint(url, resolvedTarget, opened) +
-          (root ? `\nIt shows ${describeViewerRoot(root.rootFile, root.source)}.` : '');
+          (root ? `\nIt follows ${describeViewerRoot(root.rootFile, root.source)}.` : '');
 
         return {
           content: [{ type: 'text', text }],

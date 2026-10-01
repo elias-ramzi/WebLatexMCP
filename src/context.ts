@@ -132,7 +132,7 @@ export function createContext(
   // `compile` and the PDF tools use too (`resolveRootFile`).
   const viewerRoot = async (id: string) => {
     const { dir } = await projectManager.requireProjectDir(id);
-    const root = await resolveRootFile(files, dir, projectManager.getProjectConfig(id).rootFile);
+    const root = await resolveRootFile(files, dir, projectManager.registeredRootFile(id));
     return { dir, root };
   };
   const viewerPdf = async (id: string) => {
@@ -148,11 +148,21 @@ export function createContext(
         return null; // not cloned / no .tex yet — the page says only that nothing is compiled
       }
     },
-    resolvePdfPath: async (id) => {
+    // One root resolution per request: the page's `/version` poll needs the PDF and, while there
+    // is none, the root it waits for.
+    locatePdf: async (id) => {
+      let resolved: Awaited<ReturnType<typeof viewerRoot>>;
       try {
-        return (await viewerPdf(id)).located?.pdf ?? null;
+        resolved = await viewerRoot(id);
       } catch {
-        return null; // not cloned / no root / no PDF yet — page waits for a compile
+        return { pdf: null, root: null }; // not cloned / no .tex yet — page waits for a compile
+      }
+      const { dir, root } = resolved;
+      try {
+        const located = await locateViewerPdf(config, id, dir, root.rootFile);
+        return { pdf: located?.pdf ?? null, root };
+      } catch {
+        return { pdf: null, root }; // no PDF to be had — the page still names the root it awaits
       }
     },
     addComment: async (id, input) => {

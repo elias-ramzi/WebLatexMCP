@@ -55,6 +55,7 @@ import type { AnyEditOp } from '../services/fileService.js';
 import type { CompilerKind } from '../types.js';
 import { childPathInside, escapeInvisibleChars, quoteId } from './projectId.js';
 import { climbsOut, resolveInside, toPosix } from './paths.js';
+import { rootFileSpellingProblem } from './rootFileSpelling.js';
 import { matchIsCommented, supportsLineComments } from './rewriteMode.js';
 import type { SnippetReader } from './sourceSnippet.js';
 
@@ -1715,7 +1716,14 @@ function isWithin(p: string, dir: string): boolean {
  * drive-qualified name (`C:\p\main.tex`, or drive-relative `C:main.tex`) is refused with them on
  * EVERY platform, not only win32: whether a root is accepted must not depend on where the server
  * runs. What is left (`./`, doubled or trailing separators, backslashes) normalises to what the OS
- * resolves.
+ * resolves. The spelling is judged by {@link rootFileSpellingProblem} (`./rootFileSpelling.js`),
+ * which `register_project` shares, so a root it accepts is never refused here for its spelling.
+ *
+ * `opts.registered`: the root is the project's registered `rootFile`, used because the call named
+ * none. Every refusal then ends with one more sentence saying so and how to change it (pass
+ * `rootFile`, or register again — in `WEB_LATEX_MCP_PROJECTS` when the project is configured
+ * there), since the caller is otherwise told about a spelling they never wrote. Without it, every
+ * message is exactly as before the option existed.
  *
  * This is the one check of an overlay's root: `compile` calls it on the caller's raw spelling
  * before the overlay is read, and {@link stageVariant} again before anything is staged.
@@ -1723,24 +1731,20 @@ function isWithin(p: string, dir: string): boolean {
 export async function refuseLinkedRootDir(
   projectDir: string,
   rootFile: string,
-  opts: { platform?: NodeJS.Platform } = {},
+  opts: { platform?: NodeJS.Platform; registered?: boolean } = {},
 ): Promise<void> {
-  const platform = opts.platform ?? process.platform;
-  const raw = toPosix(rootFile).replace(/\\/g, '/');
-  const posixAbsolute = path.posix.isAbsolute(raw);
-  // A drive prefix, on every platform: absolute (`C:/p`) or drive-relative (`C:main.tex`) on win32.
-  const driveQualified = /^[A-Za-z]:/.test(raw);
-  if (posixAbsolute || driveQualified || path.win32.isAbsolute(rootFile)) {
-    // Suggest a relative spelling only for a path absolute on the platform that resolves it here;
-    // a drive-relative name resolves against that drive's current directory, which says nothing.
-    const inside =
-      platform === process.platform && path.isAbsolute(rootFile)
-        ? path.relative(path.resolve(projectDir), path.resolve(rootFile))
-        : '';
-    const relSpelling =
-      inside !== '' && !climbsOut(inside) && !path.isAbsolute(inside) ? toPosix(inside) : undefined;
+  // Said only when the caller did not name the root: they are told where it came from.
+  const registered = (fix: string): string =>
+    opts.registered === true
+      ? ' It is the rootFile the project was registered with (register_project or ' +
+        'WEB_LATEX_MCP_PROJECTS), used because this call named none — pass rootFile, or ' +
+        `register the project again with ${fix} (for a project configured in ` +
+        'WEB_LATEX_MCP_PROJECTS, change it there).'
+      : '';
+  const spelling = rootFileSpellingProblem(rootFile, { projectDir, platform: opts.platform });
+  if (spelling !== undefined && spelling.kind !== 'dotdot') {
     const what =
-      driveQualified && !path.win32.isAbsolute(rootFile)
+      spelling.kind === 'drive'
         ? 'is spelled with a drive prefix, which Windows reads as an absolute or drive-relative ' +
           'path (so it is refused on every platform)'
         : 'is an absolute path';
@@ -1748,18 +1752,20 @@ export async function refuseLinkedRootDir(
       `The root file ${quoteId(rootFile)} ${what}, and an overlay compile builds in a private ` +
         'mirror of the project, which such a root would bypass: the engine would run outside ' +
         'the mirror — in the source directory itself when the root is in the project. ' +
-        (relSpelling !== undefined
-          ? `Name it relative to the project root — rootFile: ${quoteId(relSpelling)}.`
-          : 'Name it relative to the project root.'),
+        (spelling.relSpelling !== undefined
+          ? `Name it relative to the project root — rootFile: ${quoteId(spelling.relSpelling)}.`
+          : 'Name it relative to the project root.') +
+        registered('a relative rootFile'),
     );
   }
-  if (raw.split('/').includes('..')) {
+  if (spelling?.kind === 'dotdot') {
     throw new Error(
       `The root file ${quoteId(rootFile)} is spelled with a ".." segment, and an overlay compile ` +
         'refuses one: the engine resolves ".." physically — through a symbolic link, into the ' +
         "link's target — while the variant is staged from the name as written, so the two can " +
         'name different directories, one of them the source itself. Name the root by its path ' +
-        'from the project root, without "..".',
+        'from the project root, without "..".' +
+        registered('a relative rootFile'),
     );
   }
   const rel = normalizeRelPosix(rootFile);
@@ -1778,7 +1784,8 @@ export async function refuseLinkedRootDir(
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw new Error(
         `Cannot check whether the root file's directory ${quoteId(linkRel)} is a symbolic link, ` +
-          'so the overlay compile is refused.',
+          'so the overlay compile is refused.' +
+          registered('another rootFile'),
         { cause: err },
       );
     }
@@ -1803,7 +1810,12 @@ export async function refuseLinkedRootDir(
             'normal compile treats as the same document — and name the overlay files by their ' +
             'real paths too.'
           : 'Its target is not a directory inside the project, so it cannot be an overlay root; ' +
-            'compile without overlay, or move the document into the project.'),
+            'compile without overlay, or move the document into the project.') +
+        registered(
+          realRoot !== undefined
+            ? `rootFile: ${quoteId(realRoot)}`
+            : 'a rootFile outside the linked directory',
+        ),
     );
   }
 }

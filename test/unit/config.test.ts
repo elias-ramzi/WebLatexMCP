@@ -124,6 +124,28 @@ describe('loadConfig', () => {
     });
   });
 
+  it('names exactly the env-configured ids in envProjectIds, overlap included', () => {
+    // ProjectManager reads a project's registered rootFile from the live registry unless the env
+    // configured it (env always wins) — and the merged `projects` list alone cannot say which.
+    const persisted = () => [
+      { id: 'thesis', gitUrl: 'https://git.overleaf.com/persisted' },
+      { id: 'notes', gitUrl: 'https://git.overleaf.com/notes' },
+    ];
+    const cfg = loadConfig(
+      {
+        WEB_LATEX_MCP_PROJECTS: JSON.stringify({
+          thesis: { gitUrl: 'https://git.overleaf.com/env' },
+          talk: { gitUrl: 'https://git.overleaf.com/talk' },
+        }),
+      },
+      '/some/dir',
+      () => false,
+      persisted,
+    );
+    expect([...(cfg.envProjectIds ?? [])].sort()).toEqual(['talk', 'thesis']);
+    expect(cfg.projects.map((p) => p.id).sort()).toEqual(['notes', 'talk', 'thesis']);
+  });
+
   it('accepts a default project that only exists in the persisted registry', () => {
     // (d) from the issue-60 task: an env default naming a registry-only project — this passed
     // before the fix too (loadConfig already validated against the env+registry merge), so it's

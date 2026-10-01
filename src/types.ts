@@ -32,7 +32,10 @@ export interface GitProjectConfig {
   mode?: 'git';
   /** Git remote URL (e.g. https://git.overleaf.com/<id> or https://github.com/<owner>/<repo>). Stored tokenless. */
   gitUrl: string;
-  /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
+  /**
+   * Optional LaTeX root file (e.g. main.tex). `compile`, the PDF tools and the viewer use it when a call
+   * omits `rootFile` (`resolveRootFile`); auto-detected when unset.
+   */
   rootFile?: string;
   /** Optional branch to clone/track. Defaults to the remote's default branch. */
   branch?: string;
@@ -53,7 +56,10 @@ export interface LocalProjectConfig {
   mode: 'local';
   /** Absolute path to the directory holding the document. Files are read and written here. */
   path: string;
-  /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
+  /**
+   * Optional LaTeX root file (e.g. main.tex). `compile`, the PDF tools and the viewer use it when a call
+   * omits `rootFile` (`resolveRootFile`); auto-detected when unset.
+   */
   rootFile?: string;
   /**
    * Follow a symlink that leaves this directory — default **false**, like any other project.
@@ -128,6 +134,14 @@ export interface ServerConfig {
    * the stderr note at startup is invisible to an MCP client. Optional; undefined means none.
    */
   skippedProjects?: SkippedProject[];
+  /**
+   * Ids of `projects` that came from `WEB_LATEX_MCP_PROJECTS` (after id validation), as opposed to
+   * the persisted registry — `loadConfig` merges the two into one list, with env winning. Read by
+   * `ProjectManager.registeredRootFile`: an env-configured project's root always comes from the env,
+   * while a registry-loaded one follows the registry's current entry. Optional so the many test
+   * fixtures constructing `ServerConfig` need no change; undefined means none.
+   */
+  envProjectIds?: string[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
   /**

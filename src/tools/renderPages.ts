@@ -3,7 +3,12 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { resolveRootFile } from '../lib/rootFile.js';
+import { quoteId } from '../lib/projectId.js';
+import {
+  assertRegisteredRootExists,
+  describeRootSource,
+  resolveRootFile,
+} from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import { buildDir, ensureBuildRoot } from '../services/compiler.js';
@@ -287,9 +292,10 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
         // render can make a peer session's write wait — bounded by the 30s lock timeout in
         // src/lib/fileLock.ts. This is a deliberate, documented trade, not a bug.
         return await ctx.projectManager.runExclusive(id, async () => {
-          // No recordBaseline: nothing here reads a caller-named file through FileService, and
-          // detectRootFile itself records no baseline (see rootFile.ts) — recording one here would
-          // wrongly claim the caller could now base a write on a file it only used to find a PDF.
+          // No recordBaseline: the only FileService reads here are assertRegisteredRootExists
+          // checking that a registered root is there and detectRootFile sniffing for the root, and
+          // neither records a baseline (see rootFile.ts) — recording one would wrongly claim the
+          // caller could now base a write on a file it only used to find a PDF.
           // A variant (an overlay compile's what-if build) is read from its own out/ and
           // nowhere else: its root, its PDF, its .aux, and its own render/ for the PNGs.
           const v =
@@ -302,10 +308,14 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             : await resolveRootFile(
                 ctx.files,
                 dir,
-                ctx.projectManager.getProjectConfig(id).rootFile,
+                ctx.projectManager.registeredRootFile(id),
                 rootFile,
               );
           const root = resolved.rootFile;
+          // A registered root that is not in the project is refused in its own words (the main
+          // build only — a variant carries its own root): it otherwise read as "No compiled PDF
+          // found … Run compile first", even right after another root compiled.
+          if (!v) await assertRegisteredRootExists(ctx.files, dir, id, resolved);
           // The ROOT's build PDF, never the surfaced copy once a root is named or an .aux is
           // read: the surfaced copy holds whichever root compiled last, and pairing it with this
           // root's .aux would render another root's page for a label (see locateRootPdf).
@@ -318,7 +328,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
                 });
           if (!pdfPath) {
             throw new Error(
-              `No compiled PDF found for project "${id}". Run compile first, then render_pages.`,
+              `No compiled PDF found for project ${quoteId(id)}${describeRootSource(resolved)}. Run compile first, then render_pages.`,
             );
           }
           // Invariant: nothing is ever written inside the project directory. PNGs go under the

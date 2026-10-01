@@ -423,6 +423,141 @@ describe('ProjectManager', () => {
     });
   });
 
+  describe('heldConfig', () => {
+    it('loads a peer registration made after startup on a miss', async () => {
+      // `project_sync { gitUrl }` judges what it replaces against this. An id a peer registered
+      // since startup is not in the in-process snapshot yet; without the reload on a miss the
+      // fields it carries would be invisible, so a re-stated URL would drop them unreported.
+      const store = makeFakeRegistry();
+      const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, store);
+      await store.upsert({
+        id: 'p',
+        gitUrl: 'https://git.overleaf.com/p',
+        rootFile: 'main.tex',
+        branch: 'main',
+      });
+
+      expect(pm.heldConfig('p')).toEqual({
+        id: 'p',
+        gitUrl: 'https://git.overleaf.com/p',
+        rootFile: 'main.tex',
+        branch: 'main',
+      });
+    });
+  });
+
+  describe('registeredRootFile', () => {
+    // Session A loaded `paper` at startup; peer session B re-registers it afterwards. The
+    // in-process snapshot never refreshes an id it already holds, so the root must be read from
+    // the registry's CURRENT entry, or A keeps compiling (and serving) the old root.
+    const gitPaper = { id: 'paper', gitUrl: 'https://git.overleaf.com/def' } as const;
+
+    function managerWith(
+      store: ProjectRegistryStore | undefined,
+      inProcess: ProjectConfig,
+      envProjectIds?: string[],
+    ): ProjectManager {
+      return new ProjectManager(
+        {
+          workspaceRoot,
+          sessionId: 'test',
+          projects: [inProcess],
+          ...(envProjectIds ? { envProjectIds } : {}),
+        },
+        store,
+      );
+    }
+
+    it('follows a peer re-registration that set a new rootFile', async () => {
+      const store = makeFakeRegistry();
+      store.entries = [{ ...gitPaper, rootFile: 'old.tex' }];
+      const pm = managerWith(store, { ...gitPaper, rootFile: 'old.tex' });
+      await store.upsert({ ...gitPaper, rootFile: 'new.tex' });
+      expect(pm.registeredRootFile('paper')).toBe('new.tex');
+      // Only the root follows the registry: the snapshot itself is not replaced.
+      expect(pm.getProjectConfig('paper').rootFile).toBe('old.tex');
+    });
+
+    it('follows a peer re-registration that dropped the rootFile (back to detection)', async () => {
+      const store = makeFakeRegistry();
+      store.entries = [{ ...gitPaper, rootFile: 'old.tex' }];
+      const pm = managerWith(store, { ...gitPaper, rootFile: 'old.tex' });
+      await store.upsert({ ...gitPaper });
+      expect(pm.registeredRootFile('paper')).toBeUndefined();
+    });
+
+    it('follows a peer re-registration of a local project at the same path', async () => {
+      const store = makeFakeRegistry();
+      const local: ProjectConfig = { id: 'paper', mode: 'local', path: workspaceRoot };
+      store.entries = [local];
+      const pm = managerWith(store, local);
+      await store.upsert({ ...local, rootFile: 'paper.tex' });
+      expect(pm.registeredRootFile('paper')).toBe('paper.tex');
+    });
+
+    it('keeps the env-configured root even when the registry says otherwise', () => {
+      const store = makeFakeRegistry();
+      store.entries = [{ ...gitPaper, rootFile: 'registry.tex' }];
+      const pm = managerWith(store, { ...gitPaper, rootFile: 'env.tex' }, ['paper']);
+      expect(pm.registeredRootFile('paper')).toBe('env.tex');
+    });
+
+    it('keeps the in-process root when the registry entry names another remote', () => {
+      const store = makeFakeRegistry();
+      store.entries = [
+        { id: 'paper', gitUrl: 'https://git.overleaf.com/other', rootFile: 'x.tex' },
+      ];
+      const pm = managerWith(store, { ...gitPaper, rootFile: 'old.tex' });
+      expect(pm.registeredRootFile('paper')).toBe('old.tex');
+    });
+
+    it('keeps the in-process root when the registry entry names another directory or mode', () => {
+      const store = makeFakeRegistry();
+      store.entries = [
+        {
+          id: 'paper',
+          mode: 'local',
+          path: path.join(workspaceRoot, 'elsewhere'),
+          rootFile: 'x.tex',
+        },
+      ];
+      const local = managerWith(store, {
+        id: 'paper',
+        mode: 'local',
+        path: workspaceRoot,
+        rootFile: 'old.tex',
+      });
+      expect(local.registeredRootFile('paper')).toBe('old.tex');
+      const git = managerWith(store, { ...gitPaper, rootFile: 'old.tex' });
+      expect(git.registeredRootFile('paper')).toBe('old.tex');
+    });
+
+    it('keeps the in-process root when no registry is wired, or it has no entry', () => {
+      expect(
+        managerWith(undefined, { ...gitPaper, rootFile: 'old.tex' }).registeredRootFile('paper'),
+      ).toBe('old.tex');
+      expect(
+        managerWith(makeFakeRegistry(), { ...gitPaper, rootFile: 'old.tex' }).registeredRootFile(
+          'paper',
+        ),
+      ).toBe('old.tex');
+    });
+
+    it('keeps the in-process root when the registry cannot be read', () => {
+      const store = makeFakeRegistry();
+      store.read = () => {
+        throw new Error('EACCES');
+      };
+      const pm = managerWith(store, { ...gitPaper, rootFile: 'old.tex' });
+      expect(pm.registeredRootFile('paper')).toBe('old.tex');
+    });
+
+    it('throws like getProjectConfig for an unknown id', () => {
+      const pm = managerWith(makeFakeRegistry(), { ...gitPaper });
+      expect(() => pm.registeredRootFile('ghost')).toThrow(/Unknown project "ghost"/);
+    });
+  });
+
   it('falls back to the registry’s persisted default when the config has none', () => {
     const store = makeFakeRegistry();
     store.entries = [{ id: 'paper', gitUrl: 'https://git.overleaf.com/def' }];

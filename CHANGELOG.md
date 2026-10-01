@@ -27,15 +27,32 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   The value was stored in `registry.json` (and accepted in `WEB_LATEX_MCP_PROJECTS`) but read by
   nothing: every call that omitted `rootFile` auto-detected, and detection returned any nested
   `<dir>/main.tex` first. A project whose root is a top-level `root.tex` beside a vendored
-  template's `tpl/main.tex` compiled the template, and the viewer waited forever for the
-  template's build ("No compiled PDF yet") whatever was compiled. A call's own `rootFile` still
-  wins; then the registered one; then detection, which now takes a top-level `main.tex`, else the
-  shallowest `.tex` holding `\documentclass` (a `main.tex` first at each depth), else the
-  shallowest `main.tex`, else the first `.tex`.
+  template's `tpl/main.tex` compiled the template, and the viewer waited forever for the template's
+  build ("No compiled PDF yet") whatever was compiled. A call's own `rootFile` still wins; then the
+  registered one; then detection, which now takes a top-level `main.tex`, else the shallowest `.tex`
+  holding `\documentclass` (a `main.tex` first at each depth), else the shallowest `main.tex`, else
+  the first `.tex`. **On upgrade**, a `rootFile` already stored for a project now takes effect —
+  including the `"rootFile":"main.tex"` the install guides put in `WEB_LATEX_MCP_PROJECTS`, and the
+  one `register_project` infers when `path` names a `.tex` — and a project with no registered root
+  and no top-level `main.tex` may now build another file: depth now comes first and a `main.tex`
+  below the top level must hold `\documentclass` to be preferred, so the shallowest `.tex` holding
+  `\documentclass` wins (a `main.tex` first at its depth), over any deeper `main.tex` and over the
+  first such `.tex` in listing order. A registered root that `compile` and the PDF tools cannot use
+  — missing, not a file, unreadable, an absolute or drive-prefixed path (the relative spelling is
+  offered when it lies in the project), or outside the project (a climbing `..` path, a link out of
+  it) — is refused, naming the registration and the ways out, instead of failing inside latexmk or
+  reporting "Run compile first"; an explicit `rootFile` is not checked. `register_project` now
+  refuses a `rootFile` that is absolute, has a drive prefix or a `..` segment (an entry already in
+  `registry.json` or `WEB_LATEX_MCP_PROJECTS` is never refused at load). A session follows a peer's
+  re-registration of the root without a restart (the root is read from `registry.json` for a project
+  not configured in `WEB_LATEX_MCP_PROJECTS`), and `project_sync` with the gitUrl a project was
+  registered with keeps its `rootFile`, `branch`, `username` and `tokenEnv` instead of dropping them
+  for the rest of the session.
 - **The viewer says which root it shows.** The `viewer` result names it (`rootFile`, `rootSource`:
   `registered` or `detected`), the page names the root it is waiting for while that root has no
-  build, and `compile` says when the viewer — running or not yet opened — shows another root or
-  nothing at all, and how to make it follow the root just built.
+  build, and `compile` says when the viewer — running or not yet opened — shows another root,
+  nothing at all, or this build only as the surfaced copy (no source locations), and how to make
+  it follow the root just built.
 
 ## [0.8.0] - 2026-09-29
 

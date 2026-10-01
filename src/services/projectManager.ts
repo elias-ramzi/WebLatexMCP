@@ -54,6 +54,18 @@ function usableLoadedId(
 }
 
 /**
+ * Whether two configs for one id name the same project: the same mode, and the same `gitUrl` (git)
+ * or the same resolved `path` (local) — compared as `registerProject` holds them and
+ * `assertDirUnclaimed` resolves them.
+ */
+function sameLocation(a: ProjectConfig, b: ProjectConfig): boolean {
+  if (isLocalProject(a) || isLocalProject(b)) {
+    return isLocalProject(a) && isLocalProject(b) && path.resolve(a.path) === path.resolve(b.path);
+  }
+  return a.gitUrl === b.gitUrl;
+}
+
+/**
  * The persisted registry ProjectManager reads to pick up runtime registrations and writes to make
  * them durable. Kept as a narrow interface so the manager stays unit-testable without touching the
  * filesystem (see `src/services/projectRegistry.ts` for the real store).
@@ -110,10 +122,16 @@ export class ProjectManager {
    * or a hand edit can change the file at any time.
    */
   private readonly skippedProjects: SkippedProject[];
+  /**
+   * Ids configured through `WEB_LATEX_MCP_PROJECTS` (`ServerConfig.envProjectIds`). Env always wins
+   * over the registry, so `registeredRootFile` never lets a registry entry override one of these.
+   */
+  private readonly envProjectIds: ReadonlySet<string>;
 
   constructor(config: ServerConfig, registry?: ProjectRegistryStore) {
     this.workspaceRoot = config.workspaceRoot;
     this.skippedProjects = [...(config.skippedProjects ?? [])];
+    this.envProjectIds = new Set(config.envProjectIds ?? []);
     // `loadConfig` already drops (and reports) an id `src/lib/projectId.ts` refuses; this keeps a
     // config built any other way from putting one where `projectPath` would throw on it.
     this.projects = new Map(
@@ -323,7 +341,8 @@ export class ProjectManager {
   /**
    * What a re-registration of `id` is about to replace, so `register_project` can report which
    * stored fields it would silently drop (`upsert` replaces the whole entry — see
-   * `droppedRegistrationFields` in `src/tools/registerProject.ts`).
+   * `droppedRegistrationFields` in `src/lib/registration.ts`). `project_sync { gitUrl }` asks
+   * `heldConfig` instead: it replaces only the in-process config.
    *
    * Prefers the registry's OWN current entry when it has one — a peer session may have
    * re-registered `id` since this process last looked, the same reasoning `setDefaultProject`
@@ -341,6 +360,60 @@ export class ProjectManager {
    */
   previousRegistration(id: string): ProjectConfig | undefined {
     return this.registry?.read().find((p) => p.id === id) ?? this.projects.get(id);
+  }
+
+  /**
+   * The config this process holds for `id` — what `getProjectConfig(id)` returns, including the
+   * registry entry it loads on a miss — or `undefined` where that would throw (an id held nowhere).
+   * An env-configured id answers with its env config even when the registry holds an entry for it:
+   * env wins over the registry, so this is the config a runtime `registerProject(id)` replaces.
+   *
+   * Unlike `previousRegistration`, which prefers the registry's entry because it is about what a
+   * persisting re-registration overwrites on disk; `project_sync { gitUrl }` persists nothing and
+   * replaces only the in-process config, so it asks this.
+   */
+  heldConfig(id: string): ProjectConfig | undefined {
+    if (!this.projects.has(id)) this.reloadFromRegistry();
+    return this.projects.get(id);
+  }
+
+  /**
+   * The `rootFile` registered for `id` — the root `compile`, the PDF tools and the viewer use when
+   * a call names none — read from the registry's CURRENT entry rather than this process's snapshot.
+   *
+   * Why: `this.projects` is a snapshot. When peer session B re-registers `paper` with a new
+   * `rootFile` (persisted to `<workspace>/registry.json`), this session's entry is never refreshed —
+   * `reloadFromRegistry` only fills in MISSING ids — so it kept compiling and serving the old root
+   * until a restart, and the hints' advice to "register the project again with rootFile" did
+   * nothing for a viewer this session owns.
+   *
+   * - An env-configured id (`WEB_LATEX_MCP_PROJECTS`) answers from the in-process config: env always
+   *   wins over the registry, as it does at startup.
+   * - Otherwise, when the registry's current entry for `id` names the SAME project location as the
+   *   in-process config (same mode; same `gitUrl` for git, same resolved `path` for local), its
+   *   `rootFile` is the answer — `undefined` included, when the peer re-registered without one
+   *   (back to auto-detection).
+   * - Otherwise — no registry wired, no entry (a project registered in-session by
+   *   `project_sync { gitUrl }`, which does not persist), an entry pointing elsewhere, or a
+   *   registry that cannot be read — the in-process config's `rootFile`.
+   *
+   * Only the root follows the registry here; every other field keeps the existing snapshot
+   * semantics, and `this.projects` is never replaced or written. Throws the same "Unknown project"
+   * error as `getProjectConfig` for an unknown id. A synchronous read of the registry file, once
+   * per call — callers read it once and pass the value on.
+   */
+  registeredRootFile(id: string): string | undefined {
+    const held = this.getProjectConfig(id);
+    if (this.envProjectIds.has(id) || !this.registry) return held.rootFile;
+    let current: ProjectConfig | undefined;
+    try {
+      current = this.registry.read().find((p) => p.id === id);
+    } catch {
+      // `ProjectRegistry.read()` reads an unparseable file as empty rather than throwing, but a
+      // store that does throw must not fail a compile over a setting it only refines.
+      return held.rootFile;
+    }
+    return current !== undefined && sameLocation(current, held) ? current.rootFile : held.rootFile;
   }
 
   /**

@@ -33,15 +33,30 @@ export interface CommentInput {
   note: string;
 }
 
+/**
+ * What one root resolution tells the viewer about a project: the PDF it shows (null when nothing
+ * is compiled yet) and the root it follows (null when that cannot be told — not cloned, no .tex).
+ */
+export interface ViewerLocation {
+  pdf: string | null;
+  root: ResolvedRoot | null;
+}
+
 export interface ViewerDeps {
   /** Known project ids, for routing/validation (configured + runtime-registered). */
   knownIds(): string[];
-  /** Absolute path to a project's current PDF, or null when nothing is compiled yet. */
-  resolvePdfPath(id: string): Promise<string | null>;
+  /**
+   * The project's current PDF and the root it was located from, from ONE root resolution — the
+   * page polls `/version` every 1.5 s, and while nothing is built that request needs both (the
+   * 404 names the root), so resolving the root once for each (an auto-detection lists the tree
+   * and reads .tex files) doubled the work. Never throws: what cannot be told is null.
+   */
+  locatePdf(id: string): Promise<ViewerLocation>;
   /**
    * The root whose build the viewer shows — the registered `rootFile`, else the auto-detected one
-   * — or null when it cannot be told (not cloned, no .tex). Used only to NAME that root, on the
-   * page while nothing is compiled and in the `viewer` tool's result; optional for that reason.
+   * — or null when it cannot be told (not cloned, no .tex). Used only to NAME that root in the
+   * `viewer` tool's result ({@link ViewerService.rootFor}), so no PDF is looked for; optional for
+   * that reason.
    */
   resolveRoot?(id: string): Promise<ResolvedRoot | null>;
   /** Store a viewer comment (resolving its source location via synctex); returns the stored comment. */
@@ -718,6 +733,15 @@ export class ViewerService {
     }
   }
 
+  /** {@link ViewerDeps.locatePdf}, held to its never-throw contract. */
+  private async locate(id: string): Promise<ViewerLocation> {
+    try {
+      return await this.deps.locatePdf(id);
+    } catch {
+      return { pdf: null, root: null };
+    }
+  }
+
   /** `http://127.0.0.1:<port>/p/<id>` for a project, or undefined if the server isn't running. */
   urlFor(id: string): string | undefined {
     return this.baseUrl ? `${this.baseUrl}/p/${encodeURIComponent(id)}` : undefined;
@@ -975,7 +999,7 @@ export class ViewerService {
   }
 
   private async sendPdf(res: http.ServerResponse, id: string): Promise<void> {
-    const pdf = await this.deps.resolvePdfPath(id);
+    const { pdf } = await this.locate(id);
     if (!pdf) {
       res
         .writeHead(404, { 'Content-Type': 'text/plain' })
@@ -996,10 +1020,11 @@ export class ViewerService {
   }
 
   private async sendVersion(res: http.ServerResponse, id: string): Promise<void> {
-    const pdf = await this.deps.resolvePdfPath(id);
+    // One resolution answers both: the PDF, and the root a 404 names.
+    const { pdf, root } = await this.locate(id);
     if (!pdf) {
       // The 404 names the root the page is waiting for, so it can say so (see showEmpty).
-      this.sendJson(res, 404, (await this.rootFor(id)) ?? {});
+      this.sendJson(res, 404, root ? { rootFile: root.rootFile, source: root.source } : {});
       return;
     }
     const st = await stat(pdf);

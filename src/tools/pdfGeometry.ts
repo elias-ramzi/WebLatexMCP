@@ -2,7 +2,12 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { resolveRootFile } from '../lib/rootFile.js';
+import { quoteId } from '../lib/projectId.js';
+import {
+  assertRegisteredRootExists,
+  describeRootSource,
+  resolveRootFile,
+} from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
 import { toPosixOut } from '../lib/paths.js';
 import {
@@ -446,9 +451,10 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
         // the build-dir PDF (and, for "floats", the build-dir .aux) that a peer session's compile
         // can rewrite mid-read.
         return await ctx.projectManager.runExclusive(id, async () => {
-          // No recordBaseline anywhere in this handler: nothing here reads a caller-named project
-          // file through FileService. detectRootFile records no baseline itself (see rootFile.ts),
-          // and the .aux read (readAuxFloats) goes through node:fs directly, never FileService —
+          // No recordBaseline anywhere in this handler: the only FileService reads here find the
+          // root (detectRootFile) or check that a registered one is there
+          // (assertRegisteredRootExists), and neither records a baseline (see rootFile.ts);
+          // the .aux read (readAuxFloats) goes through node:fs directly, never FileService —
           // recording a baseline would wrongly claim the caller could now base a write on a file
           // it only used to locate a PDF/aux.
           // A variant is read from its own out/ and nowhere else — as render_pages reads one.
@@ -462,10 +468,14 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             : await resolveRootFile(
                 ctx.files,
                 dir,
-                ctx.projectManager.getProjectConfig(id).rootFile,
+                ctx.projectManager.registeredRootFile(id),
                 rootFile,
               );
           const root = resolved.rootFile;
+          // A registered root that is not in the project is refused in its own words (the main
+          // build only — a variant carries its own root): it otherwise read as "No compiled PDF
+          // found … Run compile first", even right after another root compiled.
+          if (!v) await assertRegisteredRootExists(ctx.files, dir, id, resolved);
           const requestedKinds = kinds ?? ['text', 'images'];
           // The ROOT's build PDF, never the surfaced copy once a root is named or "floats" reads
           // the .aux: the surfaced copy holds whichever root compiled last, and measuring it
@@ -502,7 +512,7 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
                 v
                   ? `Variant ${variant} has no PDF: its compile did not produce one. Fix the ` +
                       'overlay and compile it again.'
-                  : `No compiled PDF found for project "${id}". Run compile first, then pdf_geometry.`,
+                  : `No compiled PDF found for project ${quoteId(id)}${describeRootSource(resolved)}. Run compile first, then pdf_geometry.`,
               );
             }
             result = await ctx.pdfRenderer.geometry({ pdfPath, pages, kinds: pageKinds });

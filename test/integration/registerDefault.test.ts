@@ -57,7 +57,10 @@ async function setup(
   return { client, workspace };
 }
 
-/** Tool text, the way the other integration tests read it (the SDK result type is a union). */
+/**
+ * Tool text, the way the other integration tests read it (the SDK result type is a union) — as
+ * JSON, so a `"` in the text reads `\\"` here.
+ */
 function textOf(res: unknown): string {
   return JSON.stringify((res as { content?: unknown }).content ?? '');
 }
@@ -204,7 +207,7 @@ describe('register_project reports dropped fields on a silent re-registration', 
     });
 
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain('dropping its rootFile=main.tex, branch=master');
+    expect(textOf(res)).toContain('dropping its rootFile=\\"main.tex\\", branch=\\"master\\"');
   });
 
   it('says nothing about dropped fields when the re-registration repeats them', async () => {
@@ -295,6 +298,6 @@ describe('register_project reports dropped fields on a silent re-registration', 
     });
 
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain('dropping its branch=master');
+    expect(textOf(res)).toContain('dropping its branch=\\"master\\"');
   });
 });

@@ -687,6 +687,73 @@ describe('refuseLinkedRootDir: a root spelled so the engine resolves it differen
       }
     }
   });
+
+  const DOTDOT_MESSAGE =
+    'The root file "sub/../main.tex" is spelled with a ".." segment, and an overlay compile ' +
+    'refuses one: the engine resolves ".." physically — through a symbolic link, into the ' +
+    "link's target — while the variant is staged from the name as written, so the two can name " +
+    'different directories, one of them the source itself. Name the root by its path from the ' +
+    'project root, without "..".';
+  const DRIVE_MESSAGE =
+    'The root file "C:main.tex" is spelled with a drive prefix, which Windows reads as an ' +
+    'absolute or drive-relative path (so it is refused on every platform), and an overlay ' +
+    'compile builds in a private mirror of the project, which such a root would bypass: the ' +
+    'engine would run outside the mirror — in the source directory itself when the root is in ' +
+    'the project. Name it relative to the project root.';
+  const REGISTERED_SENTENCE =
+    ' It is the rootFile the project was registered with (register_project or ' +
+    'WEB_LATEX_MCP_PROJECTS), used because this call named none — pass rootFile, or register ' +
+    'the project again with a relative rootFile (for a project configured in ' +
+    'WEB_LATEX_MCP_PROJECTS, change it there).';
+
+  async function refusal(promise: Promise<void>): Promise<string> {
+    try {
+      await promise;
+    } catch (err) {
+      return (err as Error).message;
+    }
+    throw new Error('expected a refusal');
+  }
+
+  it('keeps its messages byte-for-byte when the root was not registered', async () => {
+    const nowhere = path.join(os.tmpdir(), 'ovl-no-such-project', 'p');
+    expect(await refusal(refuseLinkedRootDir(nowhere, 'sub/../main.tex'))).toBe(DOTDOT_MESSAGE);
+    expect(await refusal(refuseLinkedRootDir(nowhere, 'C:main.tex'))).toBe(DRIVE_MESSAGE);
+    expect(await refusal(refuseLinkedRootDir(nowhere, 'C:main.tex', { registered: false }))).toBe(
+      DRIVE_MESSAGE,
+    );
+  });
+
+  it('says a refused root is the registered one, when the call named none', async () => {
+    const nowhere = path.join(os.tmpdir(), 'ovl-no-such-project', 'p');
+    expect(
+      await refusal(refuseLinkedRootDir(nowhere, 'sub/../main.tex', { registered: true })),
+    ).toBe(DOTDOT_MESSAGE + REGISTERED_SENTENCE);
+    expect(await refusal(refuseLinkedRootDir(nowhere, 'C:main.tex', { registered: true }))).toBe(
+      DRIVE_MESSAGE + REGISTERED_SENTENCE,
+    );
+    const abs = await refusal(
+      refuseLinkedRootDir(nowhere, path.join(nowhere, 'main.tex'), { registered: true }),
+    );
+    expect(abs).toMatch(
+      /is an absolute path.*rootFile: "main\.tex"\. It is the rootFile the project was registered with/s,
+    );
+  });
+
+  it('says a root under a linked directory is the registered one, when the call named none', async () => {
+    const src = await tempDir('ovl-rootlink-reg-');
+    await put(src, 'drafts/p1/main.tex', 'x\n');
+    await linkDir(path.join(src, 'drafts', 'p1'), path.join(src, 'paper'));
+    const plain = await refusal(refuseLinkedRootDir(src, 'paper/main.tex'));
+    expect(plain).not.toMatch(/registered/);
+    const registered = await refusal(
+      refuseLinkedRootDir(src, 'paper/main.tex', { registered: true }),
+    );
+    expect(registered.startsWith(plain)).toBe(true);
+    expect(registered.slice(plain.length)).toMatch(
+      /^ It is the rootFile the project was registered with \(register_project or WEB_LATEX_MCP_PROJECTS\), used because this call named none — pass rootFile, or register the project again with rootFile: "drafts\/p1\/main\.tex"/,
+    );
+  });
 });
 
 describe('snapshotSource / sourceChanges', () => {

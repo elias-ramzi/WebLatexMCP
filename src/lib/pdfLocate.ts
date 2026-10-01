@@ -28,8 +28,10 @@ export interface ViewerPdf {
  * Locate the PDF the viewer shows for a project without recompiling, and the synctex source a
  * click on it resolves through — ONE decision, so the two can never name different roots.
  *
- * It follows {@link locateRootPdf}'s rule for an unnamed root that reads no `.aux`: the detected
- * root's build-dir PDF first, in every workspace mode. It used to prefer the surfaced copy
+ * It follows {@link locateRootPdf}'s rule for an unnamed root that reads no `.aux`: the viewer's root
+ * (the registered `rootFile`, else the detected one — `resolveRootFile`) and its build-dir PDF first, in
+ * every workspace mode. Unlike the PDF tools, the viewer never counts a registered root as named, so
+ * it falls back to the surfaced copy for one too. It used to prefer the surfaced copy
  * (`<workspace>/<id>.pdf`), which holds whichever root compiled LAST, while a comment's click was
  * mapped through the detected root's build synctex — so after compiling a supplement the viewer
  * showed the supplement and filed each comment against the main document's file and line,
@@ -56,7 +58,10 @@ export async function locateViewerPdf(
 
 /** What ties a PDF-reading call to one particular root — see {@link locateRootPdf}. */
 export interface RootPdfRequest {
-  /** The caller passed `rootFile` explicitly, rather than leaving it to auto-detection. */
+  /**
+   * The root was named — by the call's `rootFile` or by the project's registered one — rather than
+   * left to auto-detection (`resolveRootFile`'s `source !== 'detected'`).
+   */
   rootNamed: boolean;
   /** The call also reads the root's build-dir `.aux` (`labels`, or pdf_geometry's `floats`). */
   readsAux: boolean;
