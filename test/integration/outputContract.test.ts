@@ -24,7 +24,7 @@
  *    shape of assertion that can catch a key nobody knew to look for.
  *
  * The same sweep then runs over the local-project read/write tools, the PDF readers, the
- * git-backed set and the four bibliography tools — **all 38 registered tools** — so the audit
+ * git-backed set, the four bibliography tools and `update_server` — **all 39 registered tools** — so the audit
  * that was a throwaway script becomes something CI re-runs on every commit. The last four in
  * (`list_references`, `check_citations`, `search_references`, `add_citation`) needed fixtures
  * rather than a decision: `list_references` was held back only until #137's fix landed (#142),
@@ -50,6 +50,7 @@
  *    accepts that silently too; `expectUndeclaredField` is the helper for pinning it, per field.
  */
 import { describe, it, expect, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -66,6 +67,7 @@ import { ReferenceResolver } from '../../src/services/referenceResolver.js';
 import { DblpService } from '../../src/services/dblp.js';
 import { CrossrefService } from '../../src/services/crossref.js';
 import { OpenAlexService } from '../../src/services/openalex.js';
+import { UpdateService } from '../../src/services/updater.js';
 import { buildPdfPath, logBaseDir } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
 import {
@@ -513,7 +515,7 @@ describe('output contract: the git-backed tools', () => {
   /**
    * And what the hole cost, which is the part a "merely undocumented field" reading missed.
    *
-   * `zod`'s JSON Schema conversion marks every object `additionalProperties: false` — all 38
+   * `zod`'s JSON Schema conversion marks every object `additionalProperties: false` — all 39
    * advertised schemas, every nested object in them — and the SDK's own `Client` compiles an ajv
    * validator per schema during `listTools()` and checks every later `callTool` result against
    * it. So for any client built on the SDK (i.e. every one that lists tools at startup, which is
@@ -957,8 +959,8 @@ describe('output contract: the bibliography tools', () => {
 /**
  * Every registered tool is named in an audit call in this file.
  *
- * The file's claim is "all 38", and a claim like that goes stale the moment someone registers a
- * 39th tool — silently, because nothing else here would fail. Asserted against this file's own
+ * The file's claim is "all 39", and a claim like that goes stale the moment someone registers a
+ * 40th tool — silently, because nothing else here would fail. Asserted against this file's own
  * source rather than against what the tests above happened to run, so it holds under
  * `vitest -t <one test>` too, and so a failure names the missing tool instead of depending on
  * which tests the runner selected.
@@ -966,6 +968,54 @@ describe('output contract: the bibliography tools', () => {
  * It says nothing about whether the call it finds reaches a real result — `auditCall`'s own
  * `isError` check is what covers that, per tool.
  */
+describe('output contract: update_server', () => {
+  it('publishes every key it returns, on the branch that downloads a bundle', async () => {
+    const { client, ctx } = await localHarness();
+    // Canned GitHub answers and an opener that opens nothing: no network, no window. `install`
+    // with a newer release on the extension install is the branch that emits every optional key.
+    const bundle = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]);
+    const tag = 'v99.0.0';
+    const assetUrl = `https://github.com/elias-ramzi/WebLatexMCP/releases/download/${tag}/web-latex-mcp.mcpb`;
+    const packageRoot = await mkdtemp(path.join(os.tmpdir(), 'wlm-contract-pkg-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'wlm-contract-upd-'));
+    cleanups.push(
+      () => rm(packageRoot, { recursive: true, force: true }),
+      () => rm(tmpDir, { recursive: true, force: true }),
+    );
+    await writeFile(path.join(packageRoot, 'manifest.json'), '{}');
+    ctx.updater = new UpdateService({
+      packageRoot,
+      tmpDir,
+      currentVersion: '0.8.0',
+      open: async () => true,
+      fetch: async (url) => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({
+          tag_name: tag,
+          assets: [
+            {
+              name: 'web-latex-mcp.mcpb',
+              browser_download_url: assetUrl,
+              size: bundle.length,
+              digest: `sha256:${createHash('sha256').update(bundle).digest('hex')}`,
+            },
+          ],
+        }),
+        arrayBuffer: async () => {
+          expect(url).toBe(assetUrl);
+          return new Uint8Array(bundle).buffer;
+        },
+      }),
+    });
+
+    const out = await auditCall(client, 'update_server', { install: true });
+    expect(out).toMatchObject({ updateAvailable: true, action: 'opened' });
+    expect(out.bundlePath).toBeDefined();
+  });
+});
+
 describe('output contract: coverage of the tool list', () => {
   it('names every advertised tool in an auditCall', async () => {
     const source = await readFile(fileURLToPath(import.meta.url), 'utf8');

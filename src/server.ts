@@ -36,6 +36,7 @@ import { registerServerInfo } from './tools/serverInfo.js';
 import { registerAddWritingConvention } from './tools/addWritingConvention.js';
 import { registerListSkills } from './tools/listSkills.js';
 import { registerDoctor } from './tools/doctor.js';
+import { registerUpdateServer } from './tools/updateServer.js';
 import { registerWritingGuide } from './resources/writingGuide.js';
 import { registerConcurrencyGuide } from './resources/concurrencyGuide.js';
 import { registerSkillPrompts } from './prompts/skills.js';
@@ -126,6 +127,7 @@ export function createServer(
     isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
   });
   registerDoctor(server, ctx);
+  registerUpdateServer(server, ctx);
 
   if (writingGuide) registerWritingGuide(server, writingGuide);
   if (concurrencyGuide) registerConcurrencyGuide(server, concurrencyGuide);
