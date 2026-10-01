@@ -7,6 +7,7 @@ import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
   loadConfig,
   parseRewriteMode,
+  parseInstallKind,
   parseExtraWritingGuide,
   parseReferenceSource,
   parseContactEmail,
@@ -426,6 +427,65 @@ describe('parseRewriteMode', () => {
       loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo)
         .rewriteModeExplicit,
     ).toBe(true);
+  });
+});
+
+describe('parseInstallKind', () => {
+  const notInRepo = () => false;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('accepts each install kind, trimmed and case-insensitively', () => {
+    for (const kind of ['desktop-extension', 'npm', 'source'] as const) {
+      expect(parseInstallKind(kind)).toBe(kind);
+      expect(parseInstallKind(`  ${kind.toUpperCase()}  `)).toBe(kind);
+    }
+    expect(parseInstallKind('  desktop-extension  ')).toBe('desktop-extension');
+  });
+
+  it('is unset when unset, empty, or whitespace-only — and says nothing', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseInstallKind(undefined)).toBeUndefined();
+    expect(parseInstallKind('')).toBeUndefined();
+    expect(parseInstallKind(' \t ')).toBeUndefined();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('ignores an unrecognised value (never throws) and names it on stderr, never stdout', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(parseInstallKind('bogus')).toBeUndefined();
+    stdoutSpy.mockRestore();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const message = String(errorSpy.mock.calls[0]?.[0]);
+    expect(message).toContain('WEB_LATEX_MCP_INSTALL_KIND "bogus"');
+    for (const kind of ['desktop-extension', 'npm', 'source']) expect(message).toContain(kind);
+    expect(logSpy).not.toHaveBeenCalled();
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+
+  it('escapes a control or bidi character in the rejected value', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(parseInstallKind('np\u0007m‮')).toBeUndefined();
+    const message = String(spy.mock.calls[0]?.[0]);
+    expect(message).not.toContain('‮');
+    expect(message).not.toContain('\u0007');
+    expect(message).toContain('\\u{202E}"');
+  });
+
+  it('wires the value into loadConfig as installKind, and leaves it unset otherwise', () => {
+    expect(loadConfig({}, '/some/dir', notInRepo).installKind).toBeUndefined();
+    expect(
+      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'desktop-extension' }, '/some/dir', notInRepo)
+        .installKind,
+    ).toBe('desktop-extension');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(
+      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'mcpb' }, '/some/dir', notInRepo).installKind,
+    ).toBeUndefined();
   });
 });
 

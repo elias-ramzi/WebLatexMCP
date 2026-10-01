@@ -33,6 +33,23 @@ works, PDFs included: `compile` (and its `pageCount`), `extract_text`, `pdf_geom
 you need page images, install the server from npm instead (see the [install guides](README.md));
 `doctor` reports which case you are in.
 
+## Update
+
+Ask Claude from any chat:
+
+> 👽 Is there an update for web-latex-mcp? If so, install it.
+
+Claude calls [`update_server`](../tools.md), which compares the running version with the
+[latest release](https://github.com/elias-ramzi/WebLatexMCP/releases/latest). With `install: true` it
+downloads `web-latex-mcp.mcpb`, checks it against the SHA-256 digest GitHub publishes for that file,
+and opens it. Claude Desktop then shows its usual install prompt. **Confirm it there**, and the
+extension restarts on the new version (`server_info` reports which one is running). If the bundle
+could not be opened automatically, or no install prompt appears, drag the file whose path the tool
+gives onto the Claude Desktop window.
+
+You can still update by hand: download the new `.mcpb` from the releases page and install it the same
+way as the first time.
+
 ## Add your project — from the chat, not the config
 
 You don't list projects in the form. Once the extension is on, just tell Claude the git URL:

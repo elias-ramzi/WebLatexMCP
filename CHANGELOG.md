@@ -9,6 +9,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **`update_server`: update the Claude Desktop extension from the chat.** Ask Claude to check for an
+  update and it compares the running version with the latest GitHub release; with `install: true`
+  it downloads the release's `web-latex-mcp.mcpb`, verifies it against the SHA-256 digest GitHub
+  publishes for the asset (plus its declared size and the zip signature — a release without a
+  digest is refused), and opens it, so Claude Desktop shows its own install prompt. Nothing is
+  installed until you confirm there. The download URL is pinned to this repository's
+  `releases/download/<tag>/`. For an npm or git-checkout install, nothing is downloaded and the tool
+  says what to run instead. The extension is recognised only because its manifest sets the new
+  `WEB_LATEX_MCP_INSTALL_KIND`, never from files on disk; without it a git checkout is `source` and
+  anything else `npm`.
+
 ### Changed
 
 - **The post-release back-merge PR no longer waits for someone to approve its checks.**

@@ -142,9 +142,9 @@ read falls back to the in-process root.
   `\u{…}`, and every valid id displays verbatim), and rejected env values through `quoteEnvValue`
   (`src/config.ts`, the same escaping, cut at 120 characters with the true length):
   `WEB_LATEX_MCP_COMPILER`, `_VIEWER_TARGET`, `_VIEWER_PORT`, `_WRITING_GUIDE_EXTRA`,
-  `_REFERENCE_SOURCE`, `_REWRITE_MODE`, `_CONTACT_EMAIL`. The session recorder's stderr warnings quote
-  their file path the same way. A new message naming a caller- or config-supplied string uses one of
-  these, never a bare template literal.
+  `_REFERENCE_SOURCE`, `_REWRITE_MODE`, `_CONTACT_EMAIL`, `_INSTALL_KIND`. The session recorder's
+  stderr warnings quote their file path the same way. A new message naming a caller- or
+  config-supplied string uses one of these, never a bare template literal.
 - **Tool return shape.** `CallToolResult` has an index signature that named types/consts don't satisfy,
   so `structuredContent` must be a **fresh object literal** — spread it: `structuredContent: { ...result }`.
   Use `errorResult(err, ctx.credentials.allSecrets())` (from `src/lib/errors.ts`) in every handler's catch

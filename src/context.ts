@@ -18,6 +18,7 @@ import { ShadowStore } from './services/shadowStore.js';
 import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
+import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
 import { resolveRootFile } from './lib/rootFile.js';
 import { locateViewerPdf } from './lib/pdfLocate.js';
@@ -71,6 +72,8 @@ export interface AppContext {
   rewriteModes: RewriteModeStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
   credentialPortal: CredentialPortal;
+  /** Checks GitHub for a newer release and fetches the Desktop bundle — see `src/services/updater.ts`. */
+  updater: UpdateService;
 }
 
 export function createContext(
@@ -227,5 +230,8 @@ export function createContext(
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),
+    // The install kind is the launcher's assertion (the Desktop extension's manifest sets
+    // WEB_LATEX_MCP_INSTALL_KIND); unset, the updater never infers the extension.
+    updater: new UpdateService({ installKind: config.installKind }),
   };
 }

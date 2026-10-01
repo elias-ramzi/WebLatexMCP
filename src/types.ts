@@ -1,5 +1,6 @@
 import type { RewriteMode } from './lib/rewriteMode.js';
 import type { ReferenceSourceId } from './lib/referenceKey.js';
+import type { InstallKind } from './lib/installKind.js';
 
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
@@ -178,6 +179,13 @@ export interface ServerConfig {
    * only way a reporting tool can avoid presenting the default as the user's own configuration.
    */
   rewriteModeExplicit?: boolean;
+  /**
+   * How the launcher says this server was installed, from `WEB_LATEX_MCP_INSTALL_KIND`
+   * (`parseInstallKind` in `src/config.ts`) — set by the Desktop extension's manifest, normally
+   * never by hand. Unset (or an unrecognised value, which is ignored) leaves `update_server` to
+   * tell a git checkout from an npm install; it never infers the extension.
+   */
+  installKind?: InstallKind;
   /**
    * Absolute path to an ADDITIONAL writing guide, appended to (never replacing) the base one.
    * From `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, which accepts a path or a `file://` URL.
