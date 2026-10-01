@@ -956,18 +956,6 @@ describe('output contract: the bibliography tools', () => {
   });
 });
 
-/**
- * Every registered tool is named in an audit call in this file.
- *
- * The file's claim is "all 39", and a claim like that goes stale the moment someone registers a
- * 40th tool — silently, because nothing else here would fail. Asserted against this file's own
- * source rather than against what the tests above happened to run, so it holds under
- * `vitest -t <one test>` too, and so a failure names the missing tool instead of depending on
- * which tests the runner selected.
- *
- * It says nothing about whether the call it finds reaches a real result — `auditCall`'s own
- * `isError` check is what covers that, per tool.
- */
 describe('output contract: update_server', () => {
   it('publishes every key it returns, on the branch that downloads a bundle', async () => {
     const { client, ctx } = await localHarness();
@@ -1003,10 +991,16 @@ describe('output contract: update_server', () => {
             },
           ],
         }),
-        arrayBuffer: async () => {
-          expect(url).toBe(assetUrl);
-          return new Uint8Array(bundle).buffer;
-        },
+        // Only the download reads the body; the release listing is read through `json`.
+        body:
+          url === assetUrl
+            ? new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array(bundle));
+                  controller.close();
+                },
+              })
+            : null,
       }),
     });
 
@@ -1016,6 +1010,18 @@ describe('output contract: update_server', () => {
   });
 });
 
+/**
+ * Every registered tool is named in an audit call in this file.
+ *
+ * The file's claim is "all 39", and a claim like that goes stale the moment someone registers a
+ * 40th tool — silently, because nothing else here would fail. Asserted against this file's own
+ * source rather than against what the tests above happened to run, so it holds under
+ * `vitest -t <one test>` too, and so a failure names the missing tool instead of depending on
+ * which tests the runner selected.
+ *
+ * It says nothing about whether the call it finds reaches a real result — `auditCall`'s own
+ * `isError` check is what covers that, per tool.
+ */
 describe('output contract: coverage of the tool list', () => {
   it('names every advertised tool in an auditCall', async () => {
     const source = await readFile(fileURLToPath(import.meta.url), 'utf8');

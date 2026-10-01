@@ -44,8 +44,8 @@ Claude calls [`update_server`](../tools.md), which compares the running version 
 downloads `web-latex-mcp.mcpb`, checks it against the SHA-256 digest GitHub publishes for that file,
 and opens it. Claude Desktop then shows its usual install prompt. **Confirm it there**, and the
 extension restarts on the new version (`server_info` reports which one is running). If the bundle
-could not be opened automatically, the tool gives its path; drag that file onto the Claude Desktop
-window.
+could not be opened automatically, or no install prompt appears, drag the file whose path the tool
+gives onto the Claude Desktop window.
 
 You can still update by hand: download the new `.mcpb` from the releases page and install it the same
 way as the first time.

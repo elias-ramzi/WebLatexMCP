@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getServerVersion } from '../lib/version.js';
-import { openBrowser } from '../lib/openBrowser.js';
+import { openFile } from '../lib/openFile.js';
+import { toPosix } from '../lib/paths.js';
+import { escapeInvisibleChars, quoteId } from '../lib/projectId.js';
 
 /**
  * Checks for, and fetches, a newer release of this server.
@@ -27,7 +29,12 @@ import { openBrowser } from '../lib/openBrowser.js';
 export const RELEASE_REPO = 'elias-ramzi/WebLatexMCP';
 export const BUNDLE_ASSET = 'web-latex-mcp.mcpb';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${RELEASE_REPO}/releases/latest`;
-/** Far above any bundle shipped so far (~20 MB); a cap, so a wrong asset cannot fill the disk. */
+/**
+ * Far above any bundle shipped so far (~20 MB). It caps the size the release DECLARES, checked
+ * before anything is downloaded. The body is read as a stream that stops at the first chunk that
+ * passes that declared size (one network read past it at most), and nothing beyond the declared
+ * size is ever written to disk, so memory stays within roughly twice the cap plus one chunk.
+ */
 export const MAX_BUNDLE_BYTES = 200 * 1024 * 1024;
 const API_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
@@ -44,7 +51,8 @@ export interface UpdateResponse {
   status: number;
   statusText: string;
   json(): Promise<unknown>;
-  arrayBuffer(): Promise<ArrayBuffer>;
+  /** The download is read from this stream (never buffered whole); null reads as no bytes. */
+  body: ReadableStream<Uint8Array> | null;
 }
 
 export type UpdateFetch = (
@@ -94,16 +102,26 @@ export interface UpdateServiceOptions {
   /** The package root this server runs from (where `package.json` sits). */
   packageRoot?: string;
   currentVersion?: string;
-  /** Opens a file with the OS's default handler; `openBrowser` already does exactly that. */
+  /** Opens a file with the OS's default handler (`openFile`: on win32 the path never reaches cmd). */
   open?: (target: string) => Promise<boolean>;
   /** Where the downloaded bundle is written (a fresh directory is made under it). */
   tmpDir?: string;
 }
 
-/** `1.2.3` or `v1.2.3`, numeric parts only; anything else (a pre-release, `unknown`) is null. */
+/**
+ * `1.2.3` or `v1.2.3`, numeric parts of 1–9 digits only; anything else (a pre-release, `unknown`,
+ * surrounding whitespace, a part too long to stay an exact number) is null. The string judged is
+ * the string given — never a trimmed copy — because a release tag is put into URLs and messages as
+ * it came.
+ */
 export function parseVersion(v: string): [number, number, number] | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
+  const m = /^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})$/.exec(v);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** Whether `v` is a version `isNewer` can compare; when it is not, no update claim is made. */
+export function isComparableVersion(v: string): boolean {
+  return parseVersion(v) !== null;
 }
 
 /** Whether `latest` is strictly newer than `current`; false when either cannot be read. */
@@ -163,8 +181,10 @@ export class UpdateService {
     this.fetchImpl = opts.fetch ?? defaultFetch;
     this.packageRoot = opts.packageRoot ?? defaultPackageRoot();
     this.currentVersion = opts.currentVersion ?? getServerVersion();
-    this.open = opts.open ?? openBrowser;
-    this.tmpDir = opts.tmpDir ?? os.tmpdir();
+    this.open = opts.open ?? openFile;
+    // Resolved now: `os.tmpdir()` returns a relative TMPDIR as is, and `openFile` opens only an
+    // absolute path.
+    this.tmpDir = path.resolve(opts.tmpDir ?? os.tmpdir());
   }
 
   installKind(): InstallKind {
@@ -211,12 +231,7 @@ export class UpdateService {
     }
 
     const res = await this.request(asset.url, DOWNLOAD_TIMEOUT_MS, 'application/octet-stream');
-    let bytes: Buffer;
-    try {
-      bytes = Buffer.from(await res.arrayBuffer());
-    } catch (err) {
-      throw new UpdateError(`Downloading ${BUNDLE_ASSET} failed: ${reason(err)}.`);
-    }
+    const bytes = await readCapped(res.body, asset.size);
     if (bytes.length !== asset.size) {
       throw new UpdateError(
         `Downloaded ${bytes.length} bytes, but the release declares ${asset.size} for ` +
@@ -236,9 +251,23 @@ export class UpdateService {
     }
 
     // A fresh, unpredictable directory: nothing else can have planted a file at this name.
-    const dir = await mkdtemp(path.join(this.tmpDir, 'web-latex-mcp-update-'));
+    // The temp dir is named by the environment, so a failure here names it quoted and escaped.
+    const saveFailed = (where: string, err: unknown) =>
+      new UpdateError(
+        `Could not save ${BUNDLE_ASSET} under ${quoteId(toPosix(where))}: ${reason(err)}.`,
+      );
+    let dir: string;
+    try {
+      dir = await mkdtemp(path.join(this.tmpDir, 'web-latex-mcp-update-'));
+    } catch (err) {
+      throw saveFailed(this.tmpDir, err);
+    }
     const file = path.join(dir, `web-latex-mcp-${release.version}.mcpb`);
-    await writeFile(file, bytes, { flag: 'wx', mode: 0o600 });
+    try {
+      await writeFile(file, bytes, { flag: 'wx', mode: 0o600 });
+    } catch (err) {
+      throw saveFailed(dir, err);
+    }
     const opened = await this.open(file);
     return { path: file, bytes: bytes.length, sha256, opened };
   }
@@ -256,7 +285,7 @@ export class UpdateService {
     if (!res.ok) {
       const limited = res.status === 403 || res.status === 429;
       throw new UpdateError(
-        `GitHub answered ${res.status} ${res.statusText} for ${url}.` +
+        `GitHub answered ${res.status} ${escapeInvisibleChars(res.statusText)} for ${url}.` +
           (limited
             ? ' This is usually its hourly rate limit for anonymous requests; retry later.'
             : ''),
@@ -279,6 +308,40 @@ export class UpdateService {
     }
     return parseLatestRelease(body);
   }
+}
+
+/**
+ * Read a download body, keeping no more than `declared` bytes of it: the read is cancelled, and the
+ * download refused, at the first chunk that takes the running total past the size the release
+ * declares, so at most one network read beyond it is buffered before the refusal. On success the
+ * chunks and their joined copy are briefly held together (about twice `declared`). A shorter body
+ * is returned as is, for the caller's size check to refuse. A missing body reads as no bytes. A
+ * read error (the download's timeout firing mid-stream included) is an `UpdateError`.
+ */
+async function readCapped(
+  body: ReadableStream<Uint8Array> | null,
+  declared: number,
+): Promise<Buffer> {
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const step = await reader.read().catch((err: unknown) => {
+      throw new UpdateError(`Downloading ${BUNDLE_ASSET} failed: ${reason(err)}.`);
+    });
+    if (step.done) break;
+    total += step.value.byteLength;
+    if (total > declared) {
+      await reader.cancel().catch(() => undefined);
+      throw new UpdateError(
+        `The download of ${BUNDLE_ASSET} ran past the ${declared} bytes the release declares; ` +
+          'it was cut off there and discarded.',
+      );
+    }
+    chunks.push(step.value);
+  }
+  return Buffer.concat(chunks, total);
 }
 
 /** Read GitHub's `releases/latest` body, refusing anything outside the expected shape. */
@@ -323,9 +386,22 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+/**
+ * A failure as a message names it. Node's `fetch` throws a bare `TypeError('fetch failed')` and
+ * keeps what happened (`ENOTFOUND`, `ECONNREFUSED`, a TLS error) in `cause`, so the cause's code —
+ * or, without one, its message — is appended. Everything is escaped, the error's own message
+ * included: a JSON parse error quotes the response body, which a proxy may have written.
+ */
 function reason(err: unknown): string {
-  if (err instanceof Error) {
-    return err.name === 'TimeoutError' ? 'timed out' : err.message;
+  if (!(err instanceof Error)) return escapeInvisibleChars(String(err));
+  if (err.name === 'TimeoutError') return 'timed out';
+  const cause: unknown = err.cause;
+  let detail: string | undefined;
+  if (cause !== null && typeof cause === 'object') {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === 'string' && code !== '') detail = code;
+    else if (cause instanceof Error && cause.message !== '') detail = cause.message;
   }
-  return String(err);
+  const message = escapeInvisibleChars(err.message);
+  return detail === undefined ? message : `${message} (${escapeInvisibleChars(detail)})`;
 }

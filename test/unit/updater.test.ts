@@ -9,14 +9,21 @@ import { createServer } from '../../src/server.js';
 import type { AppContext } from '../../src/context.js';
 import {
   BUNDLE_ASSET,
+  MAX_BUNDLE_BYTES,
+  UpdateError,
   UpdateService,
   detectInstallKind,
+  isComparableVersion,
   isNewer,
+  manualUpdateAdvice,
   parseLatestRelease,
   parseVersion,
   type UpdateFetch,
   type UpdateResponse,
+  type UpdateServiceOptions,
 } from '../../src/services/updater.js';
+import { quoteId } from '../../src/lib/projectId.js';
+import { climbsOut, toPosix } from '../../src/lib/paths.js';
 import { expectNoUndeclaredKeys } from '../helpers/outputSchema.js';
 
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -55,6 +62,17 @@ function release(tag: string, asset: Record<string, unknown> | null = {}) {
   };
 }
 
+/** A body that yields `chunks` in order, then ends. */
+function streamOf(...chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(c);
+      controller.close();
+    },
+  });
+}
+
+/** A JSON answer, or — for a Buffer — a download whose body streams those bytes. */
 function response(body: unknown, init: { status?: number } = {}): UpdateResponse {
   const status = init.status ?? 200;
   return {
@@ -62,20 +80,24 @@ function response(body: unknown, init: { status?: number } = {}): UpdateResponse
     status,
     statusText: status < 400 ? 'OK' : 'Forbidden',
     json: async () => body,
-    arrayBuffer: async () => {
-      const b = body as Buffer;
-      return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
-    },
+    body: Buffer.isBuffer(body) ? streamOf(body) : null,
   };
 }
 
-/** Answers the release API with `rel` and the asset URL with `bytes`; records every URL asked. */
-function fakeFetch(rel: unknown, bytes: Buffer = ZIP): UpdateFetch & { urls: string[] } {
+/**
+ * Answers the release API with `rel` and the asset URL with `bytes` (or with what `download`
+ * builds); records every URL asked.
+ */
+function fakeFetch(
+  rel: unknown,
+  bytes: Buffer = ZIP,
+  download?: () => UpdateResponse,
+): UpdateFetch & { urls: string[] } {
   const urls: string[] = [];
   const f: UpdateFetch = async (url) => {
     urls.push(url);
     if (url.endsWith('/releases/latest')) return response(rel);
-    if (url.includes('/releases/download/')) return response(bytes);
+    if (url.includes('/releases/download/')) return download ? download() : response(bytes);
     throw new Error(`unexpected URL ${url}`);
   };
   return Object.assign(f, { urls });
@@ -87,12 +109,51 @@ async function extensionRoot(): Promise<string> {
   return root;
 }
 
+/**
+ * Every service a test builds goes through here: an opener that only records (never the real
+ * `xdg-open`/`open`/`start`) and a temp `tmpDir` (never the real temp dir), so a regression that
+ * reaches the open or the write cannot leave this process.
+ */
+async function makeService(
+  opts: Omit<UpdateServiceOptions, 'open' | 'tmpDir'> & { tmpDir?: string; opens?: boolean },
+) {
+  const tmpDir = opts.tmpDir ?? (await tmp('wlm-upd-dl-'));
+  const opened: string[] = [];
+  const { opens = true, ...rest } = opts;
+  const svc = new UpdateService({
+    packageRoot: await extensionRoot(),
+    currentVersion: '0.8.0',
+    ...rest,
+    tmpDir,
+    open: async (p) => {
+      opened.push(p);
+      return opens;
+    },
+  });
+  return { svc, opened, tmpDir };
+}
+
 describe('version comparison', () => {
   it('reads plain and v-prefixed versions, nothing else', () => {
     expect(parseVersion('0.8.0')).toEqual([0, 8, 0]);
     expect(parseVersion('v1.10.2')).toEqual([1, 10, 2]);
     expect(parseVersion('1.0.0-rc.1')).toBeNull();
     expect(parseVersion('unknown')).toBeNull();
+  });
+
+  it('validates the string it is given, never a trimmed copy, and caps each part at 9 digits', () => {
+    expect(parseVersion('v1.2.3 ')).toBeNull();
+    expect(parseVersion(' v1.2.3')).toBeNull();
+    expect(parseVersion('v1.2.3\n')).toBeNull();
+    expect(parseVersion('1234567890.0.0')).toBeNull();
+    expect(parseVersion(`${'9'.repeat(200)}.0.0`)).toBeNull();
+    expect(parseVersion('999999999.0.0')).toEqual([999999999, 0, 0]);
+  });
+
+  it('says whether a running version can be compared at all', () => {
+    expect(isComparableVersion('0.8.0')).toBe(true);
+    expect(isComparableVersion('unknown')).toBe(false);
+    expect(isComparableVersion('0.9.0-rc.1')).toBe(false);
   });
 
   it('compares numerically and never claims an update it cannot read', () => {
@@ -133,6 +194,19 @@ describe('parseLatestRelease', () => {
     expect(() => parseLatestRelease('<html>')).toThrow(/version tag/);
   });
 
+  it('refuses a tag that only parses once trimmed, or whose parts are too long to be numbers', () => {
+    // The tag is put into URLs and messages as is, so the string validated must be that one.
+    expect(() => parseLatestRelease(release('v1.2.3 '))).toThrow(/version tag/);
+    expect(() => parseLatestRelease(release(' v1.2.3'))).toThrow(/version tag/);
+    expect(() => parseLatestRelease(release('v1234567890.2.3'))).toThrow(/version tag/);
+    expect(() => parseLatestRelease(release(`v${'1'.repeat(200)}.0.0`))).toThrow(/version tag/);
+    expect(parseLatestRelease(release('v1.2.3')).version).toBe('1.2.3');
+    expect(parseLatestRelease(release('1.2.3'))).toMatchObject({
+      version: '1.2.3',
+      htmlUrl: 'https://github.com/elias-ramzi/WebLatexMCP/releases/tag/1.2.3',
+    });
+  });
+
   it('reports a missing asset or digest rather than inventing one', () => {
     expect(parseLatestRelease(release('v0.9.0', null)).asset).toBeUndefined();
     expect(parseLatestRelease(release('v0.9.0', { digest: undefined })).asset?.sha256).toBe(
@@ -143,21 +217,11 @@ describe('parseLatestRelease', () => {
 
 describe('UpdateService.downloadBundle', () => {
   async function service(rel: unknown, bytes?: Buffer) {
-    const tmpDir = await tmp('wlm-upd-dl-');
-    const opened: string[] = [];
     const fetch = fakeFetch(rel, bytes);
-    const svc = new UpdateService({
-      fetch,
-      packageRoot: await extensionRoot(),
-      currentVersion: '0.8.0',
-      tmpDir,
-      open: async (p) => {
-        opened.push(p);
-        return true;
-      },
-    });
-    return { svc, fetch, opened, tmpDir };
+    return { fetch, ...(await makeService({ fetch })) };
   }
+
+  const askedForDownload = (urls: string[]) => urls.some((u) => u.includes('/releases/download/'));
 
   it('writes the verified bundle and opens it', async () => {
     const { svc, opened } = await service(release('v0.9.0'));
@@ -186,18 +250,41 @@ describe('UpdateService.downloadBundle', () => {
   });
 
   it('refuses a release without a digest before downloading anything', async () => {
-    const { svc, fetch, opened } = await service(release('v0.9.0', { digest: undefined }));
+    const { svc, fetch, opened, tmpDir } = await service(release('v0.9.0', { digest: undefined }));
     const { release: rel } = await svc.check();
     await expect(svc.downloadBundle(rel)).rejects.toThrow(/cannot be verified/);
-    expect(fetch.urls.some((u) => u.includes('/releases/download/'))).toBe(false);
+    expect(askedForDownload(fetch.urls)).toBe(false);
     expect(opened).toEqual([]);
+    expect(await readdir(tmpDir)).toEqual([]);
   });
 
-  it('refuses a size mismatch and a non-zip', async () => {
+  it('refuses a release without the bundle before downloading anything', async () => {
+    const { svc, fetch, opened, tmpDir } = await service(release('v0.9.0', null));
+    const { release: rel } = await svc.check();
+    await expect(svc.downloadBundle(rel)).rejects.toThrow(/nothing to install/);
+    expect(askedForDownload(fetch.urls)).toBe(false);
+    expect(opened).toEqual([]);
+    expect(await readdir(tmpDir)).toEqual([]);
+  });
+
+  it('refuses a declared size over the cap before downloading anything', async () => {
+    const { svc, fetch, opened, tmpDir } = await service(
+      release('v0.9.0', { size: MAX_BUNDLE_BYTES + 1 }),
+    );
+    const { release: rel } = await svc.check();
+    await expect(svc.downloadBundle(rel)).rejects.toThrow(/byte cap; not downloaded/);
+    expect(askedForDownload(fetch.urls)).toBe(false);
+    expect(opened).toEqual([]);
+    expect(await readdir(tmpDir)).toEqual([]);
+  });
+
+  it('refuses a size mismatch and a non-zip, writing and opening nothing', async () => {
     const short = await service(release('v0.9.0', { size: ZIP.length + 1 }));
     await expect(short.svc.downloadBundle((await short.svc.check()).release)).rejects.toThrow(
-      /declares/,
+      /Downloaded \d+ bytes, but the release declares/,
     );
+    expect(short.opened).toEqual([]);
+    expect(await readdir(short.tmpDir)).toEqual([]);
 
     const notZip = Buffer.from('not a zip archive');
     const plain = await service(
@@ -207,15 +294,211 @@ describe('UpdateService.downloadBundle', () => {
     await expect(plain.svc.downloadBundle((await plain.svc.check()).release)).rejects.toThrow(
       /not a zip/,
     );
+    expect(plain.opened).toEqual([]);
+    expect(await readdir(plain.tmpDir)).toEqual([]);
+  });
+
+  describe('reading the body', () => {
+    async function withBody(download: () => UpdateResponse) {
+      const fetch = fakeFetch(release('v0.9.0'), ZIP, download);
+      const made = await makeService({ fetch });
+      const { release: rel } = await made.svc.check();
+      return { ...made, rel };
+    }
+
+    it('stops reading at the declared size and discards a body that runs past it', async () => {
+      // An endless body, pulled one 4-byte chunk per read. A real Response (which also has
+      // `arrayBuffer`, the whole-body read) so a reader that buffers everything is caught too:
+      // the stream errors once it has been read far past the declared size.
+      const stats = { pulls: 0, cancelled: false };
+      const endless = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            stats.pulls++;
+            if (stats.pulls > 1000) {
+              controller.error(new Error('test stream read far past the declared size'));
+              return;
+            }
+            controller.enqueue(new Uint8Array(4).fill(0x50));
+          },
+          cancel() {
+            stats.cancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const { svc, opened, tmpDir, rel } = await withBody(() => new Response(endless));
+      await expect(svc.downloadBundle(rel)).rejects.toThrow(
+        `ran past the ${ZIP.length} bytes the release declares`,
+      );
+      // ZIP.length is 16: the fifth 4-byte chunk crosses it; one more pull is slack.
+      expect(stats.pulls).toBeLessThanOrEqual(Math.ceil(ZIP.length / 4) + 2);
+      expect(stats.cancelled).toBe(true);
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
+
+    it('accepts a body of exactly the declared size, however it is chunked', async () => {
+      const { svc, opened, rel } = await withBody(() => ({
+        ...response({}),
+        body: streamOf(ZIP.subarray(0, 3), ZIP.subarray(3, 9), ZIP.subarray(9)),
+      }));
+      const got = await svc.downloadBundle(rel);
+      expect(got).toMatchObject({ bytes: ZIP.length, sha256: sha(ZIP), opened: true });
+      expect(await readFile(got.path)).toEqual(ZIP);
+      expect(opened).toEqual([got.path]);
+    });
+
+    it('refuses a body shorter than declared, writing and opening nothing', async () => {
+      const { svc, opened, tmpDir, rel } = await withBody(() => ({
+        ...response({}),
+        body: streamOf(ZIP.subarray(0, 5), ZIP.subarray(5, 10)),
+      }));
+      await expect(svc.downloadBundle(rel)).rejects.toThrow(
+        `Downloaded 10 bytes, but the release declares ${ZIP.length}`,
+      );
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
+
+    it('reads a missing body as no bytes at all, writing and opening nothing', async () => {
+      const { svc, opened, tmpDir, rel } = await withBody(() => ({ ...response({}), body: null }));
+      await expect(svc.downloadBundle(rel)).rejects.toThrow(
+        `Downloaded 0 bytes, but the release declares ${ZIP.length}`,
+      );
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
+
+    it('names a timeout that fires mid-stream', async () => {
+      const stalled = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(ZIP.subarray(0, 4));
+        },
+        pull(controller) {
+          if (controller.desiredSize !== null && controller.desiredSize > 0) {
+            controller.error(new DOMException('The operation timed out.', 'TimeoutError'));
+          }
+        },
+      });
+      const { svc, opened, tmpDir, rel } = await withBody(() => ({
+        ...response({}),
+        body: stalled,
+      }));
+      await expect(svc.downloadBundle(rel)).rejects.toThrow(
+        `Downloading ${BUNDLE_ASSET} failed: timed out.`,
+      );
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
+  });
+
+  it('saves under an absolute path when the temp dir is given relative', async () => {
+    // `os.tmpdir()` returns a relative TMPDIR as is, and `openFile` refuses a relative path.
+    let absolute = await tmp('wlm-upd-rel-');
+    if (path.isAbsolute(path.relative(process.cwd(), absolute))) {
+      // Windows, with the temp dir on another drive than the cwd: no relative path reaches it.
+      const local = await mkdtemp(path.join(process.cwd(), '.wlm-upd-rel-'));
+      cleanups.push(() => rm(local, { recursive: true, force: true }));
+      absolute = local;
+    }
+    const relative = path.relative(process.cwd(), absolute);
+    expect(path.isAbsolute(relative)).toBe(false);
+    const { svc, opened } = await makeService({
+      fetch: fakeFetch(release('v0.9.0')),
+      tmpDir: relative,
+    });
+    const got = await svc.downloadBundle((await svc.check()).release);
+    expect(path.isAbsolute(got.path)).toBe(true);
+    expect(climbsOut(path.relative(absolute, got.path))).toBe(false);
+    expect(opened).toEqual([got.path]);
+    expect(await readFile(got.path)).toEqual(ZIP);
+  });
+
+  it('names an unsavable temp dir quoted, and opens nothing', async () => {
+    // A path under a regular file: mkdtemp fails there on every platform (ENOTDIR or ENOENT).
+    const parent = await tmp('wlm-upd-nosave-');
+    const file = path.join(parent, 'a file‮');
+    await writeFile(file, '');
+    const tmpDir = path.join(file, 'sub');
+    const { svc, opened } = await makeService({ fetch: fakeFetch(release('v0.9.0')), tmpDir });
+    const err: unknown = await svc.downloadBundle((await svc.check()).release).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(UpdateError);
+    const message = (err as Error).message;
+    expect(message).toContain(`Could not save ${BUNDLE_ASSET} under ${quoteId(toPosix(tmpDir))}: `);
+    expect(message).not.toContain('‮');
+    expect(opened).toEqual([]);
+  });
+
+  it('escapes the reason phrase of a refused request', async () => {
+    const { svc } = await makeService({
+      fetch: async () => ({ ...response({}, { status: 502 }), statusText: 'Bad‮Gateway' }),
+    });
+    const err: unknown = await svc.check().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(UpdateError);
+    const message = (err as Error).message;
+    expect(message).toContain('GitHub answered 502 Bad\\u{202E}Gateway for ');
+    expect(message).not.toContain('‮');
   });
 
   it('names the rate limit when GitHub answers 403', async () => {
-    const svc = new UpdateService({
+    const { svc, opened } = await makeService({
       fetch: async () => response({}, { status: 403 }),
-      packageRoot: await extensionRoot(),
-      currentVersion: '0.8.0',
     });
     await expect(svc.check()).rejects.toThrow(/rate limit/);
+    expect(opened).toEqual([]);
+  });
+
+  it("names the cause of Node's opaque `fetch failed`, escaped", async () => {
+    const failing = (cause: unknown): UpdateFetch => {
+      return async () => {
+        throw new TypeError('fetch failed', { cause });
+      };
+    };
+    const coded = Object.assign(new Error('getaddrinfo ENOTFOUND api.github.com'), {
+      code: 'ENOTFOUND',
+    });
+    const a = await makeService({ fetch: failing(coded) });
+    await expect(a.svc.check()).rejects.toThrow(/: fetch failed \(ENOTFOUND\)\.$/);
+
+    const b = await makeService({ fetch: failing(new Error('connect refused\u202E')) });
+    await expect(b.svc.check()).rejects.toThrow('fetch failed (connect refused\\u{202E}).');
+
+    const timedOut = Object.assign(new Error('aborted'), { name: 'TimeoutError' });
+    const c = await makeService({
+      fetch: async () => {
+        throw timedOut;
+      },
+    });
+    await expect(c.svc.check()).rejects.toThrow(/: timed out\.$/);
+  });
+
+  it("escapes the error's own message, which can quote a proxy's response body", async () => {
+    const { svc, opened } = await makeService({
+      fetch: async () => ({
+        ...response({}),
+        json: async () => {
+          throw new SyntaxError('Unexpected token < in JSON: "<p>‮gnp.exe</p>"');
+        },
+      }),
+    });
+    const err: unknown = await svc.check().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).not.toContain('‮');
+    expect(message).toContain(
+      'release listing could not be read: Unexpected token < in JSON: "<p>\\u{202E}gnp.exe</p>".',
+    );
+    expect(opened).toEqual([]);
   });
 });
 
@@ -234,20 +517,15 @@ describe('update_server tool', () => {
     const res = await client.callTool({ name: 'update_server', arguments: args });
     const sc = (res as { structuredContent?: Record<string, unknown> }).structuredContent;
     await expectNoUndeclaredKeys(client, 'update_server', sc);
-    return { res, sc: sc! };
+    const text = (res as { content: Array<{ type: string; text?: string }> }).content
+      .map((c) => c.text ?? '')
+      .join('\n');
+    return { res, sc: sc!, text };
   }
 
   it('only checks unless install is passed', async () => {
-    const opened: string[] = [];
-    const client = await connect(
-      new UpdateService({
-        fetch: fakeFetch(release('v0.9.0')),
-        packageRoot: await extensionRoot(),
-        currentVersion: '0.8.0',
-        tmpDir: await tmp('wlm-upd-tool-'),
-        open: async (p) => (opened.push(p), true),
-      }),
-    );
+    const { svc, opened } = await makeService({ fetch: fakeFetch(release('v0.9.0')) });
+    const client = await connect(svc);
     const checked = await call(client, {});
     expect(checked.sc).toMatchObject({ updateAvailable: true, action: 'none' });
     expect(opened).toEqual([]);
@@ -259,38 +537,113 @@ describe('update_server tool', () => {
 
   it('reports up to date without downloading', async () => {
     const fetch = fakeFetch(release('v0.8.0'));
-    const client = await connect(
-      new UpdateService({ fetch, packageRoot: await extensionRoot(), currentVersion: '0.8.0' }),
-    );
-    const { sc } = await call(client, { install: true });
+    const { svc, opened } = await makeService({ fetch });
+    const { sc } = await call(await connect(svc), { install: true });
     expect(sc).toMatchObject({ updateAvailable: false, action: 'none' });
     expect(fetch.urls).toHaveLength(1);
+    expect(opened).toEqual([]);
   });
 
   it('gives an npm install advice instead of downloading', async () => {
     const fetch = fakeFetch(release('v0.9.0'));
-    const client = await connect(
-      new UpdateService({
-        fetch,
-        packageRoot: await tmp('wlm-upd-npm-'),
-        currentVersion: '0.8.0',
-      }),
-    );
-    const { sc } = await call(client, { install: true });
+    const { svc, opened } = await makeService({ fetch, packageRoot: await tmp('wlm-upd-npm-') });
+    const { sc } = await call(await connect(svc), { install: true });
     expect(sc).toMatchObject({ installKind: 'npm', action: 'manual' });
     expect(String(sc.advice)).toContain('web-latex-mcp@0.9.0');
     expect(fetch.urls).toHaveLength(1);
+    expect(opened).toEqual([]);
   });
 
   it('surfaces a refused download as a tool error', async () => {
-    const client = await connect(
-      new UpdateService({
-        fetch: fakeFetch(release('v0.9.0', { digest: undefined })),
-        packageRoot: await extensionRoot(),
-        currentVersion: '0.8.0',
-      }),
-    );
-    const res = await client.callTool({ name: 'update_server', arguments: { install: true } });
+    const { svc, opened, tmpDir } = await makeService({
+      fetch: fakeFetch(release('v0.9.0', { digest: undefined })),
+    });
+    const res = await (
+      await connect(svc)
+    ).callTool({
+      name: 'update_server',
+      arguments: { install: true },
+    });
     expect((res as { isError?: boolean }).isError).toBe(true);
+    expect(opened).toEqual([]);
+    expect(await readdir(tmpDir)).toEqual([]);
+  });
+
+  describe('a running version that cannot be compared', () => {
+    for (const current of ['unknown', '0.9.0-rc.1']) {
+      for (const install of [false, true]) {
+        it(`says so for ${current}${install ? ' with install' : ''}, and downloads nothing`, async () => {
+          const fetch = fakeFetch(release('v0.9.0'));
+          // The extension install: the one kind that would otherwise download.
+          const { svc, opened, tmpDir } = await makeService({ fetch, currentVersion: current });
+          const { sc, text } = await call(await connect(svc), install ? { install } : {});
+          const advice = manualUpdateAdvice('desktop-extension', '0.9.0');
+          expect(sc).toMatchObject({
+            currentVersion: current,
+            updateAvailable: false,
+            action: install ? 'manual' : 'none',
+            advice,
+          });
+          expect(sc.bundlePath).toBeUndefined();
+          expect(text).toContain(`${quoteId(current)} cannot be compared with v0.9.0`);
+          expect(text).toContain(advice);
+          expect(text).not.toMatch(/not older|up to date/);
+          expect(text).not.toContain(`v${current}`);
+          expect(fetch.urls).toHaveLength(1);
+          expect(opened).toEqual([]);
+          expect(await readdir(tmpDir)).toEqual([]);
+        });
+      }
+    }
+
+    it('gives an npm install its own advice', async () => {
+      const { svc } = await makeService({
+        fetch: fakeFetch(release('v0.9.0')),
+        packageRoot: await tmp('wlm-upd-npm-'),
+        currentVersion: 'unknown',
+      });
+      const { sc } = await call(await connect(svc), { install: true });
+      expect(sc).toMatchObject({
+        action: 'manual',
+        advice: manualUpdateAdvice('npm', '0.9.0'),
+      });
+    });
+  });
+
+  it('tells the user what to do if the opened bundle shows no install prompt', async () => {
+    // The OS can accept the open request without Claude Desktop handling it (no .mcpb handler:
+    // an "Open with" dialog, exit 0), so the opened advice names the by-hand route too.
+    const { svc, opened } = await makeService({ fetch: fakeFetch(release('v0.9.0')) });
+    const { sc, text } = await call(await connect(svc), { install: true });
+    expect(sc.action).toBe('opened');
+    expect(opened).toHaveLength(1);
+    const fallback =
+      `If no install prompt appears, drag ${quoteId(toPosix(opened[0]!))} onto the Claude ` +
+      'Desktop window (or Settings → Extensions → Install Extension).';
+    expect(String(sc.advice)).toContain('Confirm the update in the Claude Desktop prompt.');
+    expect(String(sc.advice)).toContain(fallback);
+    expect(text).toContain(fallback);
+  });
+
+  it('shows the bundle path POSIX and quoted, in the text and the advice', async () => {
+    // A space and an invisible character everywhere; a double quote too where the OS allows one.
+    const name = `wlm upd\u200B${process.platform === 'win32' ? '' : '"q"'}-`;
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), name));
+    cleanups.push(() => rm(tmpDir, { recursive: true, force: true }));
+    const { svc, opened } = await makeService({
+      fetch: fakeFetch(release('v0.9.0')),
+      tmpDir,
+      opens: false,
+    });
+    const { sc, text } = await call(await connect(svc), { install: true });
+    expect(sc.action).toBe('downloaded');
+    expect(opened).toHaveLength(1);
+    const native = opened[0]!;
+    expect(sc.bundlePath).toBe(toPosix(native));
+    const shown = quoteId(toPosix(native));
+    expect(text).toContain(shown);
+    expect(String(sc.advice)).toContain(shown);
+    expect(text).not.toContain(native);
+    expect(String(sc.advice)).not.toContain(native);
   });
 });
