@@ -2513,7 +2513,15 @@ export class GitService {
         return { kind: 'unchanged', previous, pushUrls: [] };
       case 'add':
       case 'repoint': {
-        const verb = decision.kind === 'add' ? 'add' : 'set-url';
+        // git counts a remote as existing while ANY `remote.origin.*` key is set, so `remote add`
+        // fails ("already exists") when the url was removed but a fetch refspec or pushurl stayed;
+        // `set-url` writes the url then. `add` stays for a fully removed remote: it also writes the
+        // fetch refspec. A key name never holds a dot, so `[^.]+$` leaves out a remote named
+        // `origin.foo` (`remote.origin.foo.url`), for which `set-url origin` finds no remote.
+        const leftover =
+          decision.kind === 'add' &&
+          (await this.configRegexp(dir, true, '^remote\\.origin\\.[^.]+$')).length > 0;
+        const verb = decision.kind === 'add' && !leftover ? 'add' : 'set-url';
         // `decision.value`, not `heldUrl`: credential-free (a write is refused for a held token),
         // and a relative local path resolved as `git clone` records it (`originValueToWrite`).
         const res = await execCapture('git', ['remote', verb, '--', 'origin', decision.value], {

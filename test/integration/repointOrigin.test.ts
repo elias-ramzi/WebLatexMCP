@@ -704,6 +704,38 @@ describe('GitService.reconcileOrigin', () => {
     });
   });
 
+  it('adds origin to a repository whose remote.origin.url was removed but whose fetch refspec stayed, where `git remote add` says "already exists"', async () => {
+    const dir = await repo();
+    await simpleGit(dir).raw([
+      'config',
+      '--local',
+      'remote.origin.fetch',
+      '+refs/heads/*:refs/remotes/origin/*',
+    ]);
+    const out = await git.reconcileOrigin(dir, 'https://git.example/a.git');
+    expect(out).toEqual({ kind: 'repointed', previous: undefined, pushUrls: [] });
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.fetch')).toEqual([
+      '+refs/heads/*:refs/remotes/origin/*',
+    ]);
+    expect(await record(dir)).toEqual({
+      heldUrl: 'https://git.example/a.git',
+      originUrl: 'https://git.example/a.git',
+    });
+  });
+
+  it('adds origin beside a remote named `origin.foo`, whose keys are not leftovers of origin', async () => {
+    const dir = await repo();
+    await simpleGit(dir).raw(['remote', 'add', 'origin.foo', 'https://git.example/foo.git']);
+    const out = await git.reconcileOrigin(dir, 'https://git.example/a.git');
+    expect(out).toEqual({ kind: 'repointed', previous: undefined, pushUrls: [] });
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.foo.url')).toEqual(['https://git.example/foo.git']);
+    expect(await configAll(dir, 'remote.origin.foo.fetch')).toEqual([
+      '+refs/heads/*:refs/remotes/origin.foo/*',
+    ]);
+  });
+
   it('never rewrites a hand-set SSH alias; refuses when the registration changed too; adopts once the user points it at the held URL', async () => {
     const a = 'https://git.example/o/r.git';
     const b = 'https://git.example/o/other.git';
