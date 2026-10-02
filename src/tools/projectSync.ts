@@ -7,6 +7,7 @@ import type { SyncResult } from '../services/gitService.js';
 import { enrichPullRefusal } from '../lib/peerRefusal.js';
 import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
 import { planSyncRegistration } from '../lib/syncRegistration.js';
+import { quoteId } from '../lib/projectId.js';
 
 const inputSchema = {
   project: z
@@ -114,7 +115,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           let result: SyncResult;
           if (!cloned) {
             if (mode === 'pull') {
-              throw new Error(`Project "${cfg.id}" is not cloned yet; use mode "clone" or "auto".`);
+              throw new Error(
+                `Project ${quoteId(cfg.id)} is not cloned yet; use mode "clone" or "auto".`,
+              );
             }
             try {
               await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
@@ -125,7 +128,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
           } else {
             if (mode === 'clone') {
-              throw new Error(`Project "${cfg.id}" is already cloned; use mode "pull" or "auto".`);
+              throw new Error(
+                `Project ${quoteId(cfg.id)} is already cloned; use mode "pull" or "auto".`,
+              );
             }
             try {
               result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
