@@ -24,6 +24,21 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The Desktop extension no longer makes you pick a workspace folder before it enables.** The
+  form's **Clone workspace folder** field now comes prefilled with `~/latex-workspace` (`${HOME}`
+  expanded by Claude Desktop), and you can change it from the extension's settings at any time.
+  The server's own fallback when `WEB_LATEX_MCP_WORKSPACE` is unset is unchanged
+  (`~/.web-latex-mcp/projects`), so npm and hand-configured installs are unaffected. An extension
+  install that had left the field blank and picks up the new default starts from an empty project
+  list: point the field back at `~/.web-latex-mcp/projects` to keep the projects registered there.
+  `list_projects` says so when it happens: an empty list now names how many projects are registered
+  in that fallback workspace when the server is using another one, alongside the folder in use.
+- **The tools you meet first say which workspace is in use and how to move it.** `list_projects`'
+  empty state, `register_project`'s result for a git project, and the `credential_portal` page name
+  the workspace folder and where to change it, and `doctor`'s unwritable-workspace hint names the
+  extension's field too (`WEB_LATEX_MCP_WORKSPACE`, which the Desktop
+  extension sets from its settings form). Moving it is still a restart-time setting only; no tool
+  changes it.
 - **The post-release back-merge PR no longer waits for someone to approve its checks.**
   `back-merge.yml` opened the `main` → `dev` PR with the workflow's own `GITHUB_TOKEN`, and GitHub
   holds the `pull_request` runs of such a PR as `action_required`. `dev` requires one of them

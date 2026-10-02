@@ -87,11 +87,12 @@ interface ResolvedWorkspace {
 }
 
 /** The shared home cache used when the launch dir isn't a suitable workspace. */
+function homeWorkspaceRoot(): string {
+  return path.join(os.homedir(), '.web-latex-mcp', 'projects');
+}
+
 function homeWorkspace(): ResolvedWorkspace {
-  return {
-    workspaceRoot: path.join(os.homedir(), '.web-latex-mcp', 'projects'),
-    workspaceIsLocal: false,
-  };
+  return { workspaceRoot: homeWorkspaceRoot(), workspaceIsLocal: false };
 }
 
 /** Whether `dir` (or any ancestor) is a git working tree — walked synchronously via `.git`. */
@@ -610,9 +611,12 @@ export function loadConfig(
     env.WEB_LATEX_MCP_CONTACT_EMAIL,
   );
 
+  const fallbackRoot = homeWorkspaceRoot();
   return {
     workspaceRoot,
     workspaceIsLocal,
+    fallbackWorkspaceRoot:
+      path.resolve(workspaceRoot) === path.resolve(fallbackRoot) ? undefined : fallbackRoot,
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
     envProjectIds: envProjects.map((p) => p.id),

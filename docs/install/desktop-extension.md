@@ -11,15 +11,23 @@ The lowest-friction way onto **Claude Desktop**: a single [MCP Bundle](https://g
 2. Install it, either way:
    - **drag** the file onto the Claude Desktop window, or
    - open **Settings → Extensions → Install Extension** and select it.
-3. Claude Desktop shows a short configuration form — **every field is optional**:
+3. Claude Desktop shows a short configuration form — **every field is optional** (the workspace folder
+   comes prefilled, so you can enable the extension without touching it):
 
    | Field                      | Maps to                   | Notes                                                                                                               |
    | -------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
    | **Overleaf token**         | `OVERLEAF_GIT_TOKEN`      | Masked. Your Overleaf [Git authentication token](https://www.overleaf.com/user/settings). Leave blank to add later. |
    | **GitHub token**           | `GITHUB_TOKEN`            | Masked. A PAT with `repo` scope, for GitHub-hosted projects.                                                        |
-   | **Clone workspace folder** | `WEB_LATEX_MCP_WORKSPACE` | Where local clones live. Blank → `~/.web-latex-mcp/projects`.                                                       |
+   | **Clone workspace folder** | `WEB_LATEX_MCP_WORKSPACE` | Where local clones live. Prefilled with `~/latex-workspace`; change it here at any time.                            |
 
 4. Enable the extension. That's it — the server is registered.
+
+To move the workspace later, change **Clone workspace folder** in **Settings → Extensions →
+WebLatexMCP**. The project list lives in the workspace, so a new folder starts empty and the old one
+is left as it is. `list_projects`, `register_project` and the `credential_portal` page all show the
+folder in use. If an earlier version of the extension ran with the field blank, your projects are
+registered in `~/.web-latex-mcp/projects`; `list_projects` says so, and pointing the field at that
+folder brings them back.
 
 Node.js is bundled with Claude Desktop, so for editing and git the only other thing to install is
 **git 2.25 or newer** on your `PATH` (`doctor` checks the version). Only **`compile`** needs a TeX

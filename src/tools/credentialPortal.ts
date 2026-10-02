@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { openBrowser } from '../lib/openBrowser.js';
+import { toPosix } from '../lib/paths.js';
 import { resolveCredentialTarget } from '../lib/credentialTarget.js';
 import { OVERLEAF_TOKEN_URL } from '../services/auth.js';
 
@@ -65,7 +66,10 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
           };
         }
 
-        const url = await ctx.credentialPortal.open(target, ctx.config.viewerPort);
+        const url = await ctx.credentialPortal.open(
+          { ...target, workspaceRoot: toPosix(ctx.config.workspaceRoot) },
+          ctx.config.viewerPort,
+        );
         if (!url) {
           return {
             content: [

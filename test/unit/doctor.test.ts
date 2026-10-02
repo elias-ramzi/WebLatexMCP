@@ -596,6 +596,8 @@ describe('DoctorService', () => {
     expect(result.ok).toBe(false);
     expect(statusOf(result.checks, 'workspace')).toBe('fail');
     expect(result.hints.join('\n')).toContain('WEB_LATEX_MCP_WORKSPACE');
+    // The Desktop extension sets it through its form, so the hint names that field too.
+    expect(result.hints.join('\n')).toContain('Clone workspace folder');
   });
 
   it('warns when even your own texmf tree cannot be written to', async () => {

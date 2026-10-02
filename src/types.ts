@@ -121,6 +121,15 @@ export interface ServerConfig {
    */
   workspaceExcludePattern?: string;
   /**
+   * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
+   * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one
+   * does — a Desktop extension that now gets `~/latex-workspace` as its default after running on
+   * the fallback, or any server launched with another workspace (workspace-local mode included,
+   * where a separate project list is by design), whose registered projects would otherwise go
+   * unmentioned.
+   */
+  fallbackWorkspaceRoot?: string;
+  /**
    * Identifies this server process among sibling sessions sharing the same workspace, so each
    * one's uncommitted work can be tracked and committed separately. From
    * `WEB_LATEX_MCP_SESSION` when set (give each session a meaningful name — it is what `status`
