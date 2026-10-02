@@ -272,10 +272,15 @@ describe('project_sync: an origin the server owns follows the held URL', () => {
     expect(text).toContain(quoteId(missing));
   });
 
-  it('a mode "clone" refusal after the re-point still says origin moved, once', async () => {
+  it('a mode "clone" refusal on a cloned project writes nothing to .git/config: origin is not re-pointed', async () => {
+    // A call refused on its arguments never touches `.git/config` (as `push` refuses before it
+    // reconciles). The refusal used to come after the reconcile, so a refused call had already
+    // re-pointed origin and rewritten the ownership record.
     const a = await remote();
     const b = await forkWithCommit(a);
     const { client, dir } = await clonedAt(a);
+    const configPath = path.join(dir, '.git', 'config');
+    const before = await readFile(configPath, 'utf8');
 
     const res = await call(client, 'project_sync', {
       project: 'paper',
@@ -285,8 +290,11 @@ describe('project_sync: an origin the server owns follows the held URL', () => {
     expect(res.isError).toBe(true);
     const text = textOf(res);
     expect(text).toMatch(/already cloned/);
-    expect(count(text, REPOINTED)).toBe(1);
-    expect(await originUrl(dir)).toBe(b.url);
+    expect(await originUrl(dir)).toBe(a.url);
+    expect(await record(dir)).toEqual({ heldUrl: a.url, originUrl: a.url });
+    expect(await readFile(configPath, 'utf8')).toBe(before);
+    // Nothing was reconciled, so the refusal says nothing about origin.
+    expect(count(text, REPOINTED)).toBe(0);
   });
 
   it("a token added by hand to an owned origin makes it not the server's: a re-point is refused, redacted, the token left on disk", async () => {
@@ -499,10 +507,12 @@ describe('project_sync: an origin the server did not set is never rewritten', ()
     const ok1 = await ok(s.client, 'project_sync', { project: 'paper' });
     expect(/`git remote set-url origin ([^`]*)`/.exec(textOf(ok1))?.[1]).toBe(quoteId(held));
 
-    const res = await call(s.client, 'project_sync', { project: 'paper', mode: 'clone' });
+    // A failure after the reconcile: the remote origin names is gone, so the fetch fails. (A mode
+    // "clone" refusal no longer serves: it is decided before the reconcile and writes nothing.)
+    await rm(a.bareDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    const res = await call(s.client, 'project_sync', { project: 'paper' });
     expect(res.isError).toBe(true);
     const text = textOf(res);
-    expect(text).toMatch(/already cloned/);
     expect(count(text, UNOWNED)).toBe(1);
     expect(/`git remote set-url origin ([^`]*)`/.exec(text)?.[1]).toBe('<url>');
     expect(text).toContain('list_projects');
@@ -582,6 +592,45 @@ describe('push and reset_to_remote report what they did to origin', () => {
     expect(count(textOf(res), REPOINTED)).toBe(1);
     expect(await originUrl(dir)).toBe(b.url);
     expect(await readFile(path.join(dir, 'extra.tex'), 'utf8')).toBe('only on the fork\n');
+  });
+
+  /**
+   * A hand-set origin (no record) under a held URL carrying a login name: the note names the
+   * remedy. On an error the scrubber turns `https://org@…` into `https://***@…`, so the tool must
+   * put the error variant there (`<url>` placeholder), as project_sync does.
+   */
+  async function unownedUnderLoginUrl() {
+    const a = await remote();
+    const workspaceRoot = await newWorkspace();
+    const dir = path.join(workspaceRoot, 'paper');
+    await simpleGit().clone(a.url, dir);
+    const held = 'https://org@dev.azure.com/org/p/_git/r';
+    const s = await session({ projects: [{ id: 'paper', gitUrl: held }], workspaceRoot });
+    return { a, s };
+  }
+
+  function expectErrorRemedy(res: unknown): void {
+    expect((res as { isError?: boolean }).isError).toBe(true);
+    const text = textOf(res);
+    expect(count(text, UNOWNED)).toBe(1);
+    expect(/`git remote set-url origin ([^`]*)`/.exec(text)?.[1]).toBe('<url>');
+    expect(text).toContain(quoteId('org'));
+    expect(text).not.toMatch(/git remote set-url origin "?https:\/\/\*\*\*@/);
+  }
+
+  it('push: an error after the reconcile carries the remedy the error scrubber cannot turn into a *** command', async () => {
+    const { a, s } = await unownedUnderLoginUrl();
+    await ok(s.client, 'write_file', { project: 'paper', path: 'new.tex', content: 'x\n' });
+    await ok(s.client, 'commit', { project: 'paper', message: 'to push' });
+    // A failure after the reconcile: the remote origin names is gone, so the fetch fails.
+    await rm(a.bareDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    expectErrorRemedy(await call(s.client, 'push', { project: 'paper', confirm: true }));
+  });
+
+  it('reset_to_remote: an error after the reconcile carries the remedy the error scrubber cannot turn into a *** command', async () => {
+    const { a, s } = await unownedUnderLoginUrl();
+    await rm(a.bareDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    expectErrorRemedy(await call(s.client, 'reset_to_remote', { project: 'paper', confirm: true }));
   });
 });
 
@@ -734,6 +783,87 @@ describe('GitService.reconcileOrigin', () => {
     expect(await configAll(dir, 'remote.origin.foo.fetch')).toEqual([
       '+refs/heads/*:refs/remotes/origin.foo/*',
     ]);
+  });
+
+  const DEFAULT_FETCH = '+refs/heads/*:refs/remotes/origin/*';
+
+  it('adds origin where only a pushurl was left, and writes the default fetch refspec `set-url` alone would leave out', async () => {
+    const dir = await repo();
+    await simpleGit(dir).raw(['config', '--local', 'remote.origin.pushurl', 'https://p.example/a']);
+    const out = await git.reconcileOrigin(dir, 'https://git.example/a.git');
+    expect(out).toEqual({
+      kind: 'repointed',
+      previous: undefined,
+      pushUrls: ['https://p.example/a'],
+    });
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.fetch')).toEqual([DEFAULT_FETCH]);
+  });
+
+  it('adds origin beside a custom fetch refspec, keeping it as it is and adding no default', async () => {
+    const dir = await repo();
+    const custom = '+refs/heads/master:refs/remotes/origin/master';
+    await simpleGit(dir).raw(['config', '--local', 'remote.origin.fetch', custom]);
+    expect((await git.reconcileOrigin(dir, 'https://git.example/a.git')).kind).toBe('repointed');
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.fetch')).toEqual([custom]);
+  });
+
+  it('adds origin where the leftover fetch refspec lives in config.worktree, which git counts and --local does not read', async () => {
+    const dir = await repo();
+    await simpleGit(dir).raw(['config', '--local', 'extensions.worktreeConfig', 'true']);
+    await simpleGit(dir).raw(['config', '--worktree', 'remote.origin.fetch', DEFAULT_FETCH]);
+    expect((await git.reconcileOrigin(dir, 'https://git.example/a.git')).kind).toBe('repointed');
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.fetch')).toEqual([DEFAULT_FETCH]);
+  });
+
+  it('adds origin where the leftover key sits in a file .git/config includes, which git counts too', async () => {
+    const dir = await repo();
+    await writeFile(
+      path.join(dir, '.git', 'remotes.inc'),
+      '[remote "origin"]\n\tpushurl = https://p.example/a\n',
+    );
+    await simpleGit(dir).raw(['config', '--local', 'include.path', 'remotes.inc']);
+    expect((await git.reconcileOrigin(dir, 'https://git.example/a.git')).kind).toBe('repointed');
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+    expect(await configAll(dir, 'remote.origin.fetch')).toEqual([DEFAULT_FETCH]);
+  });
+
+  it('adds origin while only the global config holds origin keys: those are no leftover of this clone', async () => {
+    const dir = await repo();
+    const globalConfig = path.join(await tmp('wlm-repoint-global-'), 'gitconfig');
+    await writeFile(
+      globalConfig,
+      '[remote "origin"]\n\tfetch = +refs/heads/*:refs/remotes/elsewhere/*\n\tprune = true\n',
+    );
+    const prev = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      expect((await git.reconcileOrigin(dir, 'https://git.example/a.git')).kind).toBe('repointed');
+      const local = await simpleGit(dir).raw([
+        'config',
+        '--local',
+        '--get-all',
+        'remote.origin.fetch',
+      ]);
+      expect(local.trim()).toBe(DEFAULT_FETCH);
+    } finally {
+      process.env.GIT_CONFIG_GLOBAL = prev;
+    }
+    expect(await originUrl(dir)).toBe('https://git.example/a.git');
+  });
+
+  it("a failed origin write names git's own reason beside the config.lock hint", async () => {
+    const dir = await repo();
+    await writeFile(path.join(dir, '.git', 'config.lock'), '');
+    const err = await git.reconcileOrigin(dir, 'https://org@git.example/a.git').then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err?.message).toMatch(/could not lock config file/);
+    expect(err?.message).toContain('config.lock');
+    expect(await configAll(dir, 'remote.origin.url')).toEqual([]);
   });
 
   it('never rewrites a hand-set SSH alias; refuses when the registration changed too; adopts once the user points it at the held URL', async () => {
@@ -947,7 +1077,9 @@ describe('GitService.reconcileOrigin', () => {
     );
     expect(err?.message).toContain(quoteId('https://git.example/new.git'));
     expect(err?.message).toMatch(/config\.lock/);
-    expect(err?.message).not.toMatch(/fatal|error:/);
+    // git's reason is shown, but only as one quoted line inside the server's own sentence.
+    expect(err?.message).toMatch(/^Could not point the clone's origin at /);
+    expect(err?.message).toMatch(/exited \d+: "error: could not lock config file [^"\n]*"\)/);
     expect(await record(dir)).toEqual({
       heldUrl: 'https://git.example/old.git',
       originUrl: 'https://git.example/old.git',

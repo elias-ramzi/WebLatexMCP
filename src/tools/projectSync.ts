@@ -106,29 +106,55 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             throw new Error('Registering a project with gitUrl also requires a project id.');
           }
           // A re-stated URL keeps the registration's other fields; a re-point replaces it, and
-          // the result text names what that dropped. Judged against the config this replaces —
-          // the one this process holds, env winning over the registry (`planSyncRegistration`).
+          // the result text names what that dropped. Judged against the config this process
+          // holds, env winning over the registry — or, for a restatement of the registry's URL,
+          // against the registry's entry, so a stale snapshot cannot make it pin
+          // (`planSyncRegistration`, `syncRegistrationBase`).
           const plan = planSyncRegistration(
             project,
             gitUrl,
             ctx.projectManager.heldConfig(project),
+            {
+              entry: ctx.projectManager.previousRegistration(project),
+              envConfigured: ctx.config.envProjectIds?.includes(project) ?? false,
+            },
           );
           ctx.projectManager.registerProject(plan.next);
           // Only once the replace happened: a registration that refuses replaced nothing.
           droppedNote = plan.note;
           failedDroppedNote = plan.failedNote;
+        } else {
+          // No URL given: a peer's persisted re-registration first (`refreshedGitConfig`), so the
+          // sync and its credential follow it rather than a stale snapshot's remote. With a URL,
+          // the session-only registration above pins this session's choice instead — unless it
+          // restates the registry's entry, which pins nothing (`ProjectManager.sessionPinned`).
+          ctx.projectManager.refreshedGitConfig(project);
         }
         const cfg = ctx.projectManager.requireGitProject(project, 'sync with');
         const dir = ctx.projectManager.projectPath(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
 
         const result = await ctx.projectManager.runExclusive(cfg.id, async () => {
+          // A re-registration that landed while this call waited for the lock is refused, not
+          // reconciled back to the URL captured above (`assertRegistrationUnchanged`). With a
+          // `gitUrl` too: a registration that restated the registry's entry is not pinned, so a
+          // peer's re-registration in the window reaches it the same way.
+          ctx.projectManager.assertRegistrationUnchanged(cfg);
           const cloned = await ctx.projectManager.hasClone(cfg.id);
+
+          // A call refused on its arguments writes nothing to `.git/config` (as `push` refuses
+          // before it reconciles), so this refusal comes before the reconcile below. The other
+          // refusal (`pull` with no clone) has no clone to reconcile.
+          if (cloned && mode === 'clone') {
+            throw new Error(
+              `Project ${quoteId(cfg.id)} is already cloned; use mode "pull" or "auto".`,
+            );
+          }
 
           // Where the fetch goes (`GitService.reconcileOrigin`, run again inside `syncPull`'s fetch,
           // where it is then a no-op): an origin the server owns follows the held URL; a hand-set
-          // one is kept and named. Called here first, and before the mode refusals, only so this
-          // call can REPORT it — on success and on every failure after it.
+          // one is kept and named. Called here, after the mode refusal and before the pull, only
+          // so this call can REPORT it — on success and on every failure after it.
           if (cloned) {
             const origin = await ctx.git.reconcileOrigin(dir, cfg.gitUrl);
             repointNote = originNote(origin, cfg.gitUrl, dir, 'this sync fetches from it');
@@ -152,11 +178,6 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             const ab = await ctx.git.aheadBehind(dir);
             result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
           } else {
-            if (mode === 'clone') {
-              throw new Error(
-                `Project ${quoteId(cfg.id)} is already cloned; use mode "pull" or "auto".`,
-              );
-            }
             try {
               result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
             } catch (err) {

@@ -7,7 +7,11 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, toPosixOut } from '../lib/paths.js';
 import { gitUrlOf, isLocalProject } from '../lib/projectMode.js';
-import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
+import {
+  pathTokenRefusal,
+  stripGitUrlCredentials,
+  strippedCredentialsNoteFor,
+} from '../lib/gitUrlCredentials.js';
 import { assertValidProjectId, quoteId } from '../lib/projectId.js';
 import { assertRegistrableRootFile } from '../lib/rootFileSpelling.js';
 import { droppedRegistrationFields, registrationDroppedNote } from '../lib/registration.js';
@@ -303,8 +307,13 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
         // exists. In the order the lock used to impose: the id (`runExclusive`'s own first
         // check), then for a local project the target (`resolveLocalTarget` only `stat`s it), then
         // the root — explicit, or inferred from a `.tex` pointed at — which drives every later
-        // call naming none, so it is refused before anything is persisted or cloned.
+        // call naming none, so it is refused before anything is persisted or cloned. A gitUrl
+        // with a token in its path is refused here too, by the text `ProjectManager.registerProject`
+        // still refuses it with behind the lock.
         assertValidProjectId(project);
+        if (gitUrl !== undefined && stripGitUrlCredentials(gitUrl).pathToken) {
+          throw new Error(pathTokenRefusal(gitUrl));
+        }
         const target = localPath !== undefined ? await resolveLocalTarget(localPath) : undefined;
         // An explicit rootFile always wins over the one inferred from the file pointed at.
         const resolvedRoot = rootFile ?? target?.rootFile;
@@ -388,8 +397,9 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             { makeDefault },
           );
           const dropped = droppedRegistrationFields(previous, cfg);
-          // The registered URL is the caller's with any http(s) secret removed
-          // (`ProjectManager.registerProject`); the caller must hear about a removal — the next
+          // The registered URL is the caller's with any userinfo secret or credential query
+          // parameter removed (`ProjectManager.registerProject`, which refuses a token-like path
+          // segment outright); the caller must hear about a removal — the next
           // git operation needs the credential from somewhere else — and only about what was
           // actually removed (a login name stays in the URL).
           const heldUrl = gitUrlOf(cfg) ?? '';

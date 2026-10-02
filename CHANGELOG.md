@@ -61,8 +61,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   records in its own `.git/config` what the server wrote to `origin` (`webLatexMcp.heldUrl`,
   `webLatexMcp.originUrl`, never a token), and before every fetch, pull and push `origin` is
   pointed at the held URL while it is still exactly what the server wrote. So a session-only
-  `project_sync { gitUrl }` moves `origin` for that session, a later session holding the registered
-  or env URL moves it back, and peers holding different URLs each reach their own. A relative local
+  `project_sync { gitUrl }` moves `origin` for that session, and a later session holding the
+  registered or env URL moves it back. Peer sessions no longer flip `origin` between them:
+  `project_sync` (without `gitUrl`), `push` and `reset_to_remote` first adopt the project's current
+  registry entry — URL, branch, credential settings and root together — so a peer that loaded the
+  project before another session re-registered it with `register_project` follows that latest
+  persisted registration instead of pointing `origin` back at the old remote and pushing there; an
+  env-configured project, and one this session re-pointed with a session-only
+  `project_sync { gitUrl }`, keep their own URL — a `project_sync { gitUrl }` that merely restates
+  the registry's URL takes the registry's branch and credential settings (not a stale copy this
+  session loaded earlier), keeps nothing of its own and follows later re-registrations like any
+  peer. A re-registration that lands while one of those
+  three calls waits for the project lock is refused, naming the old and new values, with nothing
+  fetched or pushed, rather than pointing `origin` back at the URL the call started with; a retry
+  follows it. A relative local
   path is written resolved, as `git clone` records it. An `origin` set by hand is never rewritten —
   nor is one carrying a password or token, whoever put it there: set by hand, written by the
   server's own `git clone` of an env-configured or legacy URL that embeds a token, or left by an
@@ -76,7 +88,31 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   redacted, plus any `pushurl` that still decides where a push goes); `register_project` writes
   nothing to the clone and says what the next remote operation will do. An `origin` defined outside
   `.git/config`, several URLs when the registration changed, and a held URL carrying a token are
-  refused in words when a write is needed.
+  refused in words when a write is needed. The `git remote set-url` remedy is the exact command in
+  a successful result, and on an error too unless its URL carries a login name
+  (`https://org@dev.azure.com/…`): an error message has every https userinfo scrubbed to `***@`,
+  so the printed command would set the username to `***`, and the note instead reads
+  `git remote set-url origin <url>` with `<url>` the project's `gitUrl` as `list_projects` shows
+  it, and names the login name. A call refused on its arguments alone never touches `.git/config`:
+  `push` refuses `resolutions` in branch mode, and branch mode without a `branch` or a `message`,
+  before the reconcile, and `project_sync` with `mode: "clone"` on a project already cloned
+  refuses before it too. An `origin` with no url but other `remote.origin.*` keys left in the
+  repository's config (`.git/config`, a file it includes, or `config.worktree`) is restored with
+  `git remote set-url`, writing git's default fetch refspec when none is left, rather than failing
+  on "remote origin already exists"; and a failed write of `origin` now quotes git's first stderr
+  line, credential-scrubbed.
+- **A credential in a git URL's query string, a non-http userinfo or its path is no longer stored
+  or shown.** Registration stripped a secret only from an `http(s)://` userinfo, so
+  `ssh://user:secret@host/…` (any `<scheme>://`), `https://host/repo.git?private_token=…` and
+  `https://host/ghp_…/repo.git` were written to `registry.json` and the clone's `origin`, echoed in
+  results, and left unscrubbed in errors. Now a password in the userinfo of any scheme is removed
+  (the login kept; an ssh login is never taken for a token, and scp-style `git@host:path` has no
+  password to remove), and a query parameter named like a credential (`access_token`,
+  `private_token`, `token`, `sig`, …) or holding a known-prefix token is removed with its `&`, the
+  rest of the URL kept byte for byte. A known-prefix token as a path segment cannot be removed
+  without naming another repository, so registration refuses such a URL, saying nothing was stored.
+  Displayed URLs show each as `***`; error messages mask a non-http password and credential query
+  values too; and an `origin` carrying any of them is never adopted or written by the server.
 - **`compile`, the PDF tools and the viewer now use the `rootFile` a project was registered with.**
   The value was stored in `registry.json` (and accepted in `WEB_LATEX_MCP_PROJECTS`) but read by
   nothing: every call that omitted `rootFile` auto-detected, and detection returned any nested

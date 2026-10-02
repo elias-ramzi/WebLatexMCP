@@ -88,6 +88,23 @@ describe('register_project safety', () => {
     expect(JSON.stringify(listed)).not.toContain('ghp_SECRET123');
   });
 
+  it('refuses a gitUrl with a token in its path before the project lock: no lock directory is left', async () => {
+    const { client, workspace } = await setup();
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', gitUrl: `https://git.example/${token}/paper.git` },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(/access token in its path; nothing was stored/);
+    expect(text).toContain('"https://git.example/***/paper.git"');
+    expect(text).not.toContain(token);
+    expect(existsSync(registryPath(workspace))).toBe(false);
+    // Refused on its arguments alone, so `runExclusive` never created the lock's directory.
+    expect(existsSync(sessionStateDir(workspace, 'paper'))).toBe(false);
+  });
+
   it('list_projects redacts a token in an env-configured gitUrl', async () => {
     const { client } = await setup([
       { id: 'envp', gitUrl: 'https://bob:glpat-SECRET456@gitlab.com/me/envp.git' },

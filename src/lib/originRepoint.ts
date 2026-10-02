@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {
+  carriesCredential,
   redactGitUrlCredentials,
   stripGitUrlCredentials,
   urlLoginName,
@@ -51,7 +52,11 @@ export interface OriginState {
   record: OriginRecord | undefined;
   /** The held URL, credential-stripped. */
   heldStripped: string;
-  /** Whether the held URL carries a password or token (an env-configured or legacy URL). */
+  /**
+   * Whether the held URL carries a credential anywhere (`carriesCredential`: a userinfo password
+   * or token, a credential query parameter, a token-like path segment) — an env-configured or
+   * legacy URL, since registration strips or refuses each.
+   */
   heldCarriesToken: boolean;
   /**
    * The filesystem's realpath of a local path, `undefined` when it cannot be resolved — supplied
@@ -183,7 +188,9 @@ export function decideOrigin(state: OriginState): OriginDecision {
   const { originUrls, record, heldStripped: held } = state;
   const raw = originUrls[0];
   if (raw === undefined) return write(state, 'add');
-  const credentialOnDisk = stripGitUrlCredentials(raw).stripped;
+  // Wherever a credential can sit — userinfo, query, a token-like path segment — as registration
+  // judges it: an origin carrying one is never adopted, re-recorded or rewritten.
+  const credentialOnDisk = carriesCredential(raw);
   const unowned: OriginDecision = credentialOnDisk
     ? { kind: 'unowned', credentialOnDisk: true }
     : { kind: 'unowned' };
@@ -290,7 +297,16 @@ export interface NoteOptions {
  * and the login name itself, which carries no scheme for the scrubber to match.
  */
 function setUrlRemedy(held: string, dir: string, opts: NoteOptions): string {
-  const url = originValueToWrite(stripGitUrlCredentials(held).url);
+  const stripped = stripGitUrlCredentials(held);
+  // A token-like path segment is never stripped (that would name another repository), so no
+  // tokenless URL can be built from the held one: the remedy names the URL without printing it.
+  if (stripped.pathToken) {
+    return (
+      `\`git remote set-url origin <url>\` in ${shownDir(dir)}, with <url> this project's URL ` +
+      'once the token is removed from its path'
+    );
+  }
+  const url = originValueToWrite(stripped.url);
   const login = urlLoginName(url);
   if (opts.forError && login !== undefined) {
     return (
@@ -318,7 +334,7 @@ export function unownedOriginNote(
   credentialOnDisk = false,
   opts: NoteOptions = {},
 ): string {
-  const heldTokenless = stripGitUrlCredentials(held);
+  const heldCarries = carriesCredential(held);
   const remedy = setUrlRemedy(held, dir, opts);
   // Wording only: whether the origin points anywhere but the registered URL, its userinfo (login
   // name included) aside. Nothing is decided by it.
@@ -327,14 +343,14 @@ export function unownedOriginNote(
     ? `The clone's origin in .git/config holds a password or token (${shown(origin)}` +
       (elsewhere ? `, and is not the registered ${shown(held)})` : ')')
     : `The clone's origin is ${shown(origin)}, not the registered ${shown(held)}`;
-  const fromConfiguredUrl = heldTokenless.stripped && credentialOnDisk && !elsewhere;
+  const fromConfiguredUrl = heldCarries && credentialOnDisk && !elsewhere;
   const where = fromConfiguredUrl
     ? ": this project's configured URL embeds a password or token, and a clone made from that " +
       'URL keeps it there. The server never adopts such an origin, so it leaves it as it is and ' +
       'fetch and push go there.'
     : '; the server did not set this origin, or no longer owns it, so it leaves it as it is and ' +
       `fetch and push go there${elsewhere ? ', not to the registered URL' : ''}.`;
-  const how = heldTokenless.stripped
+  const how = heldCarries
     ? (fromConfiguredUrl
         ? ''
         : ` This project's configured URL embeds a password or token${credentialOnDisk ? ' too' : ''}.`) +

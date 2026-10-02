@@ -12,7 +12,11 @@ import { coversPath } from '../lib/commitPaths.js';
 import { REFUSAL_PATH_CAP } from '../lib/peerAttribution.js';
 import { remoteBranchMissingNote } from '../lib/syncState.js';
 import { CONFLICT_MAX_COMMITS } from '../lib/conflictBudget.js';
-import { redactGitUrlCredentials, stripGitUrlCredentials } from '../lib/gitUrlCredentials.js';
+import {
+  carriesCredential,
+  redactGitUrlCredentials,
+  stripGitUrlCredentials,
+} from '../lib/gitUrlCredentials.js';
 import {
   decideOrigin,
   originRefusalMessage,
@@ -22,8 +26,32 @@ import {
   type OriginState,
 } from '../lib/originRepoint.js';
 import { quoteId } from '../lib/projectId.js';
+import { redact } from '../lib/redact.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
+
+/** The fetch refspec `git remote add origin` writes. */
+const DEFAULT_ORIGIN_FETCH = '+refs/heads/*:refs/remotes/origin/*';
+
+/**
+ * The error for a failed write of `origin` (`reconcileOrigin`). git's reason is shown — its first
+ * line only, credential-scrubbed (`redact`) and quoted — so "remote origin already exists" reaches
+ * the user instead of a guess; the `config.lock` hint stays, since that is the usual cause.
+ */
+function originWriteFailure(
+  heldUrl: string,
+  command: string,
+  res: { code: number | null; stderr: string },
+): string {
+  const reason = res.stderr.trim().split(/\r?\n|\r/, 1)[0] ?? '';
+  return (
+    `Could not point the clone's origin at ${quoteId(redactGitUrlCredentials(heldUrl))} ` +
+    `(git ${command} exited ${String(res.code)}` +
+    (reason === '' ? '' : `: ${quoteId(redact(reason))}`) +
+    '); nothing was fetched or pushed. A .git/config.lock left behind by a git process that ' +
+    'crashed is the usual cause: if no git command is running in that clone, delete it and retry.'
+  );
+}
 
 export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged' | 'remote-branch-missing';
 
@@ -2383,7 +2411,9 @@ export class GitService {
         values(local, 'weblatexmcp.originurl'),
       ),
       heldStripped: stripped.url,
-      heldCarriesToken: stripped.stripped,
+      // Every place a credential can sit (userinfo, query, a token-like path segment), judged as
+      // registration judges it — a held URL carrying one is never written into origin.
+      heldCarriesToken: carriesCredential(heldUrl),
       realpath: (p: string) => {
         try {
           return realpathSync.native(p);
@@ -2405,11 +2435,43 @@ export class GitService {
     local: boolean,
     regexp: string,
   ): Promise<Array<[string, string]>> {
-    const res = await execCapture(
+    return this.configRegexpIn(dir, local ? ['--local'] : [], regexp);
+  }
+
+  /**
+   * {@link configRegexp} over the clone's REPOSITORY scope — the scopes git counts when it decides
+   * whether `origin` exists (`git remote add` refuses with "already exists" on any of them):
+   * `.git/config` and, when `extensions.worktreeConfig` is on, `.git/config.worktree`, each with
+   * the files it includes. Global and system keys are left out: git does not count them as this
+   * repository's remote (a global `remote.origin.fetch` does not stop `git remote add origin`).
+   * `--worktree` is read only under the extension, because without it git reads `.git/config`
+   * for `--worktree` too, and every entry would be counted twice.
+   */
+  private async repoConfigRegexp(dir: string, regexp: string): Promise<Array<[string, string]>> {
+    const local = await this.configRegexpIn(dir, ['--local', '--includes'], regexp);
+    const ext = await execCapture(
       'git',
-      ['config', ...(local ? ['--local'] : []), '-z', '--get-regexp', regexp],
+      ['config', '--local', '--bool', '--get', 'extensions.worktreeConfig'],
       { cwd: dir },
     );
+    if (ext.code !== 0 && ext.code !== 1) {
+      throw new Error(
+        `Could not read the clone's git config (git exited ${String(ext.code)}): ` +
+          ext.stderr.trim(),
+      );
+    }
+    if (ext.code === 1 || ext.stdout.trim() !== 'true') return local;
+    return [...local, ...(await this.configRegexpIn(dir, ['--worktree', '--includes'], regexp))];
+  }
+
+  private async configRegexpIn(
+    dir: string,
+    scope: string[],
+    regexp: string,
+  ): Promise<Array<[string, string]>> {
+    const res = await execCapture('git', ['config', ...scope, '-z', '--get-regexp', regexp], {
+      cwd: dir,
+    });
     // Exit 1: nothing matches — an answer, not a failure.
     if (res.code === 1) return [];
     if (res.code !== 0) {
@@ -2478,9 +2540,9 @@ export class GitService {
    * `safePush`, `resolvePush`, `landBranch`, `resetToRemote`) is reached only from those tools,
    * inside `runExclusive`.
    *
-   * A refusal (`originRefusalMessage`) throws before anything is written. A failed write throws a
-   * fixed message — git's output carries the URL raw — and leaves the record as it was, so a retry
-   * tries again. After a write `origin` is read back: anything but one value is refused in words
+   * A refusal (`originRefusalMessage`) throws before anything is written. A failed write throws
+   * (`originWriteFailure`: the first line of git's stderr, credential-scrubbed, never its whole
+   * output) and leaves the record as it was, so a retry tries again. After a write `origin` is read back: anything but one value is refused in words
    * (and is not expected, since a write is refused up front when `origin` is defined outside
    * `.git/config`). The record is written last and best-effort: a failure is logged to stderr,
    * since the re-point itself landed.
@@ -2513,27 +2575,43 @@ export class GitService {
         return { kind: 'unchanged', previous, pushUrls: [] };
       case 'add':
       case 'repoint': {
-        // git counts a remote as existing while ANY `remote.origin.*` key is set, so `remote add`
-        // fails ("already exists") when the url was removed but a fetch refspec or pushurl stayed;
-        // `set-url` writes the url then. `add` stays for a fully removed remote: it also writes the
-        // fetch refspec. A key name never holds a dot, so `[^.]+$` leaves out a remote named
-        // `origin.foo` (`remote.origin.foo.url`), for which `set-url origin` finds no remote.
+        // git counts a remote as existing while ANY `remote.origin.*` key is set in the
+        // repository's config, so `remote add` fails ("already exists") when the url was removed
+        // but a fetch refspec or pushurl stayed; `set-url` writes the url then. `add` stays for a
+        // fully removed remote: it also writes the fetch refspec. A key name never holds a dot, so
+        // `[^.]+$` leaves out a remote named `origin.foo` (`remote.origin.foo.url`), for which
+        // `set-url origin` finds no remote. Read over `.git/config.worktree` too
+        // (`repoConfigRegexp`): git counts a key there, and `--local` does not read it.
         const leftover =
           decision.kind === 'add' &&
-          (await this.configRegexp(dir, true, '^remote\\.origin\\.[^.]+$')).length > 0;
+          (await this.repoConfigRegexp(dir, '^remote\\.origin\\.[^.]+$')).length > 0;
         const verb = decision.kind === 'add' && !leftover ? 'add' : 'set-url';
+        // `set-url` writes no fetch refspec, and an origin without one fetches nothing into
+        // `origin/<branch>`, so the ff-only merge after a fetch would fail far from the cause.
+        // Write the one `git remote add` writes, unless the repository already has a refspec
+        // (a custom one included, kept as it is). Before the url: a failed `set-url` then leaves
+        // the leftover keys in place, so a retry takes this same path and finds the refspec.
+        if (
+          decision.kind === 'add' &&
+          leftover &&
+          (await this.repoConfigRegexp(dir, '^remote\\.origin\\.fetch$')).length === 0
+        ) {
+          const fetch = await execCapture(
+            'git',
+            ['config', '--local', '--add', '--', 'remote.origin.fetch', DEFAULT_ORIGIN_FETCH],
+            { cwd: dir },
+          );
+          if (fetch.code !== 0) {
+            throw new Error(originWriteFailure(heldUrl, 'config --add', fetch));
+          }
+        }
         // `decision.value`, not `heldUrl`: credential-free (a write is refused for a held token),
         // and a relative local path resolved as `git clone` records it (`originValueToWrite`).
         const res = await execCapture('git', ['remote', verb, '--', 'origin', decision.value], {
           cwd: dir,
         });
         if (res.code !== 0) {
-          throw new Error(
-            `Could not point the clone's origin at ${quoteId(redactGitUrlCredentials(heldUrl))} ` +
-              `(git remote ${verb} exited ${String(res.code)}); nothing was fetched or pushed. A ` +
-              '.git/config.lock left behind by a git process that crashed is the usual cause: if ' +
-              'no git command is running in that clone, delete it and retry.',
-          );
+          throw new Error(originWriteFailure(heldUrl, `remote ${verb}`, res));
         }
         const after = (await this.configRegexp(dir, false, '^remote\\.origin\\.url$')).map(
           ([, v]) => v,
@@ -2593,7 +2671,7 @@ export class GitService {
       );
       // An origin carrying a credential (cloned from an env or legacy token URL) is never the
       // server's: no record, so nothing ever rewrites it.
-      if (origin.length === 1 && !stripGitUrlCredentials(origin[0]!).stripped) {
+      if (origin.length === 1 && !carriesCredential(origin[0]!)) {
         await this.writeOriginRecord(targetDir, stripGitUrlCredentials(gitUrl).url, origin[0]!);
       }
     } catch (err) {

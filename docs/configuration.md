@@ -63,8 +63,10 @@ project id and its git URL and it calls the `register_project` tool, which:
 - or, given `path` instead of `gitUrl`, registers a **local** project — a directory already on this
   machine, used in place with no clone at all (see [Local projects](tools.md#local-in-place-projects));
 - stores only the id, git URL, and options (`rootFile` / `branch` / `username` / `tokenEnv`) — **never a
-  token**. Credentials are resolved per host at git time exactly as for env-configured projects (see
-  [Tokens](#tokens--resolved-per-host)).
+  token**: a password or token in the URL's userinfo, or a credential query parameter
+  (`?private_token=…`), is removed first, and a URL with a token as a path segment is refused (see
+  [`register_project`](tools.md#registering-a-project-from-the-chat)). Credentials are resolved per host at git
+  time exactly as for env-configured projects (see [Tokens](#tokens--resolved-per-host)).
 
 A project configured through `WEB_LATEX_MCP_PROJECTS` always wins over a persisted one with the same id,
 so the env stays the source of truth when you use it. `registry.json` is read entry by entry: an entry

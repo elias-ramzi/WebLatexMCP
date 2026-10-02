@@ -124,7 +124,27 @@ mapped through another root's build. `ProjectManager` also supports runtime regi
 registered root is read through `ProjectManager.registeredRootFile`, never `getProjectConfig(id).rootFile`:
 for a project not in `WEB_LATEX_MCP_PROJECTS` (`ServerConfig.envProjectIds`) it reads the registry's
 current entry when that entry names the same location, so a peer session's re-registration takes
-effect without a restart; every other field keeps the in-process snapshot. That is a synchronous
+effect without a restart. Every other field keeps the in-process snapshot, **except at a remote
+operation**: `project_sync` (without `gitUrl`), `push` and `reset_to_remote` first call
+`ProjectManager.refreshedGitConfig`, which adopts the registry's current git entry wholesale into
+`this.projects` (what a fresh process would hold) — never for an env id, never for an id this
+process pinned with a session-only `registerProject` (`project_sync { gitUrl }`; `registerAndPersist`
+un-pins after its upsert), never for an id this process holds as a local project (a mode change is
+not a stale URL), and falling back to the snapshot on no entry, a local entry, an unusable id or a
+read that throws. **A registration pins only when it differs from the registry's entry**
+(`registryHolds`/`sameRegistration`, `src/lib/registrationChange.ts`: the held, credential-stripped
+`gitUrl`, plus `branch`, `tokenEnv`, `username`); a restatement pins nothing and clears an earlier
+pin, and a registry read that throws pins. A `project_sync { gitUrl }` naming the registry's URL is
+planned from the registry's entry, not this process's snapshot (`syncRegistrationBase`,
+`src/lib/syncRegistration.ts`; env ids excepted), so a snapshot stale in `branch`, `tokenEnv` or
+`username` — or pinned elsewhere — cannot make a restatement pin. Pinning every `project_sync { gitUrl }` let a session
+that once restated the URL keep it after a peer re-pointed the project and flip `origin` back.
+**The refresh runs twice**: before the lock (so `requireGitProject` and the credential follow it)
+and again inside `runExclusive`, before `reconcileOrigin`, as
+`ProjectManager.assertRegistrationUnchanged(cfg)` — a `gitUrl` (held form), `tokenEnv` or
+`username` that changed while the call waited for the lock is refused (`registrationChangeMessage`,
+old → new, redacted and quoted; nothing fetched or pushed; retry), never reconciled back to the URL
+the call captured. That is a synchronous
 `registry.json` read per call — including each viewer `/version` poll (every 1.5 s per open page) —
 accepted as small; `upsert` writes by temp-file-plus-rename, so the read needs no lock, and a failed
 read falls back to the in-process root.
@@ -1619,11 +1639,45 @@ read falls back to the in-process root.
   token; an `@` in it (an email) → login; `+`, `=` or `/` (base64) → token; a name the URL already
   carries (`publishesName`: host labels case-insensitively, path segments exactly — Azure DevOps'
   `<org>@dev.azure.com/<org>/…`) → login; an AWS CodeCommit `<user>-at-<12 digits>` → login; 20 or
-  more characters with a digit or mixed case → token. It errs toward removal. An env-configured or
+  more characters with a digit or mixed case → token. It errs toward removal. That token-as-username
+  test is **http(s)-only** (an ssh `git@` is a login, never a token), but a **password** is removed
+  from the userinfo of **any** `<scheme>://` URL (`ssh://`, `git+ssh://`, `ftp(s)://`; an scp-style
+  `git@host:path` has no password syntax and stays untouched) — except `file:`, whose userinfo is
+  never judged, by the strip, `redactGitUrlCredentials`, `carriesCredential` or `redact`
+  (`file://C:\Users\me@corp\repo.git` is a path, not `user:password`). Two more places are judged
+  on every `<scheme>://` URL, `file:` included: a **query parameter** whose percent-decoded, case-folded name is in
+  `CREDENTIAL_PARAMS` (a `Set`: `access_token`, `private_token`, `token`, `sig`, …) or whose decoded
+  value matches `TOKEN_PREFIX` is removed with its `&` (the `?` too when none is left, and the empty
+  parameters of `?&token=…` or `a=1&&token=…` with it, so no bare `?` or stray `&` remains), the other
+  parameters and the `#fragment` byte-identical (`removed: 'query'`, or `queryRemoved: true` beside
+  a userinfo `removed`); and a **path segment** with a token prefix, at least `OPAQUE_MIN_LENGTH`
+  characters and the `opaqueTokenMix` (so `hf_utils`, `ghp_notes` stay repository names) is
+  redacted as `***` but **never stripped** — removing it would name another repository — so
+  `stripGitUrlCredentials` flags it `pathToken` and the registration is refused, storing nothing —
+  by `register_project` before the project lock (so no `.sessions/<id>/` is left behind), and by
+  `ProjectManager.registerProject` again, with the one `pathTokenRefusal` text. Every "does this URL carry a credential" decision goes through
+  `carriesCredential` (strip's `stripped` or `pathToken`) — the origin ownership rule
+  (`decideOrigin`'s `credentialOnDisk`, `readOriginState`'s `heldCarriesToken`, `clone`'s record
+  check) and its notes, whose remedy for a path-token URL names `<url>` rather than print it — so
+  none judges a narrower set than registration. An env-configured or
   legacy URL is **not** stripped (only a registration is), so it is shown with the secret as `***`
   (`redactGitUrlCredentials`: `list_projects`, `push`'s `remote`, `set_credential`'s "no host"
-  error), and `redact` scrubs userinfo to the last `@`, so no part of a password containing a raw
-  `@` survives in an error.
+  error), and `redact` scrubs an https userinfo whole to the last `@`, so no part of a password
+  containing a raw `@` survives in an error; on any other scheme it masks only the password — the
+  login running to the userinfo's first `:`, a raw `@` in it included, and the password to the
+  last `@`, as the strip reads them (`ssh://a@b:***@h`; `ssh://git@host:22/r` is a port) — and
+  inside any URL in free text a credential query value (`name=***`) and a token-like path segment
+  (`***`) through `maskUrlPathAndQuery`, which cuts the URL with the strip's own `urlParts` (so an
+  http(s) path splits on `\` as well as `/`) and judges with the same `maskCredentialParam` and
+  `isPathToken` — so an env-configured URL that carries a token in its path cannot reach an error
+  through git's own message, which quotes the URL whole. A URL glued onto another with no
+  whitespace between (`https://h/r#f,https://h/x?token=…`) is one free-text match, whose first
+  URL's parse holds the rest in its fragment or query, so `maskUrlRun` masks each glued URL as its
+  own, up to the next one's scheme, before masking the whole run as the first URL. The rules that
+  match any scheme, and the search for a glued URL, start a match only at the beginning of a run of
+  scheme characters (`SCHEME_START`): a match that could start
+  anywhere inside a run re-scanned it from each position, quadratic in every `errorResult` (100k
+  characters took seconds). Text outside a URL is left to the `secrets` list.
 - **The server rewrites a clone's `origin` only while it owns it.** Every remote operation runs
   against `origin`, and the held `gitUrl` only keys the injected credential, so re-pointing a cloned
   project used to change the registration while fetch and push kept going to the old remote. Now
@@ -1640,14 +1694,34 @@ read falls back to the in-process root.
   ownership compares the **raw** origin to the tokenless record, so a token added by hand reads as a
   hand edit, and a credential found there is reported, never removed. The remedy a note gives is
   built from the tokenless held URL, resolved as it would be written — never from a redacted one,
-  whose `***` would replace the real token if run. (A round of this fix "cleaned
+  whose `***` would replace the real token if run. **A note is built twice, once per channel**:
+  an error message carries `originNote(..., { forError: true })` and a success text the plain
+  `originNote`, because `errorResult` scrubs every https userinfo — a login name included — so a
+  remedy naming `https://org@dev.azure.com/…` reached the caller as `https://***@…` and would set
+  the username to `***`; the `forError` variant names that URL by where to read it (`list_projects`)
+  plus the login name instead. `project_sync`, `push` and `reset_to_remote` each keep the pair;
+  the unit tests pin `originNote` itself, not which variant a tool attaches where, so a "one note"
+  simplification in a tool brings the bug back unflagged. (A round of this fix "cleaned
   up" tokens older versions left behind and so deleted a user's own PAT; nothing can tell the two
   apart.) A relative held path is written
   as `git clone` would record it, resolved against the server's cwd — never verbatim, since git
   resolves a relative `origin` against the clone. The decision is one pure function, `decideOrigin`
   (`src/lib/originRepoint.ts`). **Do not reintroduce URL comparison**: a "same repository" heuristic
   read git's absolutised relative clone path as another repository (and wrote the relative path back,
-  breaking every later sync) and rewrote SSH host aliases to https.
+  breaking every later sync) and rewrote SSH host aliases to https. **The held URL is refreshed
+  first**: `project_sync` (without `gitUrl`), `push` and `reset_to_remote` adopt the registry's
+  current entry (`ProjectManager.refreshedGitConfig`, above) before `requireGitProject` and the
+  credential, because a peer process still holding its startup snapshot re-pointed the shared
+  `origin` back to the old URL and pushed there — sessions flipped `origin` back and forth. Only a
+  session-only `project_sync { gitUrl }` that differs from the registry's entry still differs from
+  its peers, by design; one that restates it pins nothing. The refresh is repeated under the lock
+  (`assertRegistrationUnchanged`), and a registration that changed while the call waited is
+  refused, never reconciled back — the pre-lock read alone left a window (the credential lookup
+  may spawn `gh auth token`) in which a peer's re-registration and sync were undone. Two write paths
+  in `reconcileOrigin`: an `origin` with no url but other `remote.origin.*` keys in repository
+  scope (`repoConfigRegexp`: local, its includes, and `config.worktree` under
+  `extensions.worktreeConfig`) is written with `set-url`, plus git's default fetch refspec when
+  none is left; and a failed write quotes git's first stderr line, scrubbed (`originWriteFailure`).
 - **Syncing is ff-only, and `push` never force-pushes.** `project_sync` (`GitService.syncPull`) is
   `fetch --prune` + `merge --ff-only origin/<branch>`, not `git pull`: divergence is reported
   (`action: 'diverged'`), never auto-merged. `push` (direct mode) pull-rebases onto the fetched remote

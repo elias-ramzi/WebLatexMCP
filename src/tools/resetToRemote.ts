@@ -60,10 +60,16 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
     },
     async ({ project }) => {
       try {
+        // A peer's persisted re-registration first (`ProjectManager.refreshedGitConfig`), so the
+        // reset and its credential follow it rather than a stale snapshot's remote.
+        ctx.projectManager.refreshedGitConfig(project);
         const cfg = ctx.projectManager.requireGitProject(project, 'reset to');
         const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         return await ctx.projectManager.runExclusive(id, async () => {
+          // A re-registration that landed while this call waited for the lock is refused, not
+          // reconciled back to the URL captured above (`assertRegistrationUnchanged`).
+          ctx.projectManager.assertRegistrationUnchanged(cfg);
           // Where the fetch goes (`GitService.reconcileOrigin`; run again, as a no-op, inside the
           // reset's fetch): reported on success and on a failure after it.
           const origin = await ctx.git.reconcileOrigin(dir, cfg.gitUrl);

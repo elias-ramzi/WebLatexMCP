@@ -428,12 +428,18 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
       conflictDetail = 'auto',
     }) => {
       try {
+        // A peer's persisted re-registration first, so the push (and its credential) goes where
+        // a freshly started process would send it, not back to a stale snapshot's remote.
+        ctx.projectManager.refreshedGitConfig(project);
         const cfg = ctx.projectManager.requireGitProject(project, 'push to');
         const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         const secrets = ctx.credentials.allSecrets();
 
         return await ctx.projectManager.runExclusive(id, async () => {
+          // A re-registration that landed while this call waited for the lock is refused, not
+          // reconciled back to the URL captured above (`assertRegistrationUnchanged`).
+          ctx.projectManager.assertRegistrationUnchanged(cfg);
           await ctx.sessions.touch(id);
           await ctx.shadows.refresh(id, dir);
           await guardPeerWork(
