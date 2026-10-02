@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { originNote, withOriginNote } from '../lib/originRepoint.js';
 
 const inputSchema = {
   project: z.string().optional().describe('Project id. Defaults to the configured default.'),
@@ -63,7 +64,16 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
         const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         return await ctx.projectManager.runExclusive(id, async () => {
-          const res = await ctx.git.resetToRemote(dir, cfg.gitUrl, auth);
+          // Where the fetch goes (`GitService.reconcileOrigin`; run again, as a no-op, inside the
+          // reset's fetch): reported on success and on a failure after it.
+          const origin = await ctx.git.reconcileOrigin(dir, cfg.gitUrl);
+          const note = originNote(origin, cfg.gitUrl, dir, 'this reset fetches from it');
+          let res;
+          try {
+            res = await ctx.git.resetToRemote(dir, cfg.gitUrl, auth);
+          } catch (err) {
+            throw withOriginNote(err, note);
+          }
           // The reset rewrote the working tree to the remote head; drop stale revision baselines so a
           // later edit isn't misread as an out-of-band change (as project_sync/discard do).
           ctx.files.resetBaselines(dir);
@@ -79,13 +89,14 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
             );
           }
           if (res.hadUncommittedChanges) discarded.push('uncommitted working-tree changes');
-          const text = [
-            `Reset ${res.branch} to origin/${res.branch} (${res.remoteHead.slice(0, 8)}).`,
-            discarded.length
-              ? `Discarded ${discarded.join('\n')}`
-              : 'Nothing to discard (already at the remote head).',
-            'Working tree is clean at the remote head — re-apply your edits, then push.',
-          ].join('\n');
+          const text =
+            [
+              `Reset ${res.branch} to origin/${res.branch} (${res.remoteHead.slice(0, 8)}).`,
+              discarded.length
+                ? `Discarded ${discarded.join('\n')}`
+                : 'Nothing to discard (already at the remote head).',
+              'Working tree is clean at the remote head — re-apply your edits, then push.',
+            ].join('\n') + note;
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...res },

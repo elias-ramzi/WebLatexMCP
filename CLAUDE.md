@@ -1624,6 +1624,30 @@ read falls back to the in-process root.
   (`redactGitUrlCredentials`: `list_projects`, `push`'s `remote`, `set_credential`'s "no host"
   error), and `redact` scrubs userinfo to the last `@`, so no part of a password containing a raw
   `@` survives in an error.
+- **The server rewrites a clone's `origin` only while it owns it.** Every remote operation runs
+  against `origin`, and the held `gitUrl` only keys the injected credential, so re-pointing a cloned
+  project used to change the registration while fetch and push kept going to the old remote. Now
+  every fetch, pull and push first runs `GitService.reconcileOrigin` (from `withAuth`, and first of
+  all from `project_sync`, `push` and `reset_to_remote`, so they can report it, under
+  `runExclusive`): `origin` follows the held URL **only while it is still exactly what the server
+  last wrote**, as recorded in the clone's local config (`webLatexMcp.heldUrl`/`webLatexMcp.originUrl`,
+  credential-stripped; written at clone, at every re-point, on adopting a clone with no record whose
+  origin already equals the held URL, and when a hand-set origin already names the held URL). A
+  hand-set `origin` is never rewritten — it is named with the `git remote set-url` remedy, and the
+  remote operation refuses when the registration has also changed. An `origin` that carries a
+  password or token is never the server's: it never sets one by re-pointing (the only way one gets
+  there from the server is a `git clone` of a token-bearing env or legacy URL, which it never adopts),
+  ownership compares the **raw** origin to the tokenless record, so a token added by hand reads as a
+  hand edit, and a credential found there is reported, never removed. The remedy a note gives is
+  built from the tokenless held URL, resolved as it would be written — never from a redacted one,
+  whose `***` would replace the real token if run. (A round of this fix "cleaned
+  up" tokens older versions left behind and so deleted a user's own PAT; nothing can tell the two
+  apart.) A relative held path is written
+  as `git clone` would record it, resolved against the server's cwd — never verbatim, since git
+  resolves a relative `origin` against the clone. The decision is one pure function, `decideOrigin`
+  (`src/lib/originRepoint.ts`). **Do not reintroduce URL comparison**: a "same repository" heuristic
+  read git's absolutised relative clone path as another repository (and wrote the relative path back,
+  breaking every later sync) and rewrote SSH host aliases to https.
 - **Syncing is ff-only, and `push` never force-pushes.** `project_sync` (`GitService.syncPull`) is
   `fetch --prune` + `merge --ff-only origin/<branch>`, not `git pull`: divergence is reported
   (`action: 'diverged'`), never auto-merged. `push` (direct mode) pull-rebases onto the fetched remote

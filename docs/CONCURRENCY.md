@@ -526,6 +526,16 @@ branch-mode landing, whose summary then prescribes the direct-mode push that rec
 The practical rhythm: sessions commit as they finish a piece, and whoever pushes does
 so when the others are between edits.
 
+Where a fetch, pull or push goes is the URL each session holds for the project: before every remote
+operation the server points the shared clone's `origin` at its own held URL — but only while it owns
+`origin`, i.e. `origin` is still exactly what the server last wrote (recorded in the clone's
+`.git/config`). So peers holding different URLs for one project — one ran `project_sync` with a
+session-only `gitUrl`, another reads the registered one — each fetch and push where their own URL
+says, re-pointing `origin` as they go, under the project lock. Each fetch also overwrites and prunes
+the clone's `refs/remotes/origin/*`, which the sessions share too: until a session's next fetch, a
+lock-free `status` there can report ahead/behind against the other session's remote. An `origin`
+set by hand — or carrying a password or token — is never rewritten by any session.
+
 ### What this does not do
 
 - **It is one machine only.** All of it rests on a shared filesystem. Two people on

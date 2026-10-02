@@ -250,3 +250,15 @@ export function strippedCredentialsNoteFor(gitUrl: string | undefined): string {
   const { removed } = stripGitUrlCredentials(gitUrl);
   return removed === undefined ? '' : strippedCredentialsNote(removed);
 }
+
+/**
+ * `gitUrl` with its whole http(s) userinfo removed — login name included — or as written (trimmed)
+ * when it has none. Not for storing (a login name is worth keeping, see the module comment) and
+ * never for deciding anything: it only lets a message say whether an `origin` carrying a token
+ * points anywhere other than the registered URL.
+ */
+export function withoutUserinfo(gitUrl: string): string {
+  const trimmed = gitUrl.trim();
+  const split = splitUserinfo(trimmed);
+  return split === undefined ? trimmed : `${split.scheme}${split.rest}`;
+}

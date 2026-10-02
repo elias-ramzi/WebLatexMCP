@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { AppContext } from '../context.js';
 import type { SafePushResult } from '../services/gitService.js';
+import { originNote, withOriginNote } from '../lib/originRepoint.js';
 import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
 import { redactGitUrlCredentials } from '../lib/gitUrlCredentials.js';
@@ -355,6 +356,15 @@ function safePushToolResult(
   return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
+/** `result` with `note` appended to its (first) text block — `result` itself when there is none. */
+function withTextNote(result: CallToolResult, note: string): CallToolResult {
+  if (note === '') return result;
+  const [first, ...rest] = result.content;
+  if (first?.type !== 'text')
+    return { ...result, content: [{ type: 'text', text: note.trimStart() }, ...result.content] };
+  return { ...result, content: [{ ...first, text: `${first.text}${note}` }, ...rest] };
+}
+
 export function registerPush(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'push',
@@ -432,70 +442,101 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
             dir,
           );
 
-          if (resolutions && resolutions.length > 0) {
-            if (mode === 'branch') {
-              throw new Error('Conflict resolutions are only supported in direct mode.');
+          // Every refusal on the arguments alone comes first, so a call refused on them never
+          // touches the clone's .git/config through the reconcile below.
+          const resolving = resolutions !== undefined && resolutions.length > 0;
+          if (resolving && mode === 'branch') {
+            throw new Error('Conflict resolutions are only supported in direct mode.');
+          }
+          if (mode === 'branch' && !branch) {
+            throw new Error('Branch mode requires a "branch" name.');
+          }
+          if (mode === 'branch' && !approve && !resolving && !message) {
+            throw new Error('Branch mode requires a commit "message" to stage the work.');
+          }
+
+          // Where the push goes (`GitService.reconcileOrigin`; run again, as a no-op, before each
+          // fetch and push inside): an origin the server owns follows the held URL, a hand-set one
+          // is kept and named. Only for the paths that reach the remote — staging a review branch
+          // does not. Reported on the result and on a failure after it.
+          const reachesRemote = resolving || mode !== 'branch' || approve;
+          const note = reachesRemote
+            ? originNote(
+                await ctx.git.reconcileOrigin(dir, cfg.gitUrl),
+                cfg.gitUrl,
+                dir,
+                'this push goes there',
+              )
+            : '';
+          try {
+            return withTextNote(await pushLocked(), note);
+          } catch (err) {
+            throw withOriginNote(err, note);
+          }
+
+          async function pushLocked(): Promise<CallToolResult> {
+            if (resolutions && resolutions.length > 0) {
+              const res = await ctx.git.resolvePush(dir, cfg.gitUrl, auth, {
+                resolutions,
+                commitMessage: message,
+                confirmBibEdit,
+                expectedRemoteHead,
+              });
+              // The resolver rewrote files on disk; drop stale revision baselines so a later edit
+              // isn't misread as an out-of-band change.
+              ctx.files.resetBaselines(dir);
+              await ctx.shadows.refresh(id, dir);
+              return safePushToolResult(res, secrets, conflictDetail);
             }
-            const res = await ctx.git.resolvePush(dir, cfg.gitUrl, auth, {
-              resolutions,
-              commitMessage: message,
-              confirmBibEdit,
-              expectedRemoteHead,
-            });
-            // The resolver rewrote files on disk; drop stale revision baselines so a later edit
-            // isn't misread as an out-of-band change.
-            ctx.files.resetBaselines(dir);
+
+            if (mode === 'branch') {
+              if (!branch) throw new Error('Branch mode requires a "branch" name.'); // narrowing
+              if (approve) {
+                const res = await ctx.git.landBranch(dir, cfg.gitUrl, auth, { branch, base });
+                return safePushToolResult(res, secrets, conflictDetail);
+              }
+              if (!message) {
+                throw new Error('Branch mode requires a commit "message" to stage the work.'); // narrowing
+              }
+              const prep = await ctx.git.prepareBranch(dir, { branch, message, base });
+              // The review payload is budgeted exactly as the conflict branch above is (issue
+              // #160): `prepareBranch` diffs the whole review branch against its base, so this is
+              // the largest patch this tool can produce, and an oversized result is rejected by the
+              // client outright and delivers nothing (#68). ONE plan drives both channels —
+              // `renderPushReviewText` reads the already-cut plan and never `prep.diff`.
+              const review = planPushReviewDiff(prep.diff, prep.files, {
+                summary: prep.summary,
+                base: prep.base,
+                branch: prep.branch,
+              });
+              return {
+                content: [{ type: 'text', text: renderPushReviewText(prep.summary, review) }],
+                structuredContent: {
+                  status: prep.status,
+                  pushed: false,
+                  remote: redact(redactGitUrlCredentials(cfg.gitUrl), secrets),
+                  branch: prep.branch,
+                  base: prep.base,
+                  summary: prep.summary,
+                  committedSha: prep.committedSha,
+                  diff: review.diff,
+                  diffFiles: review.diffFiles,
+                  diffChars: review.diffChars,
+                  diffTruncated: review.diffTruncated,
+                  diffHunksOmitted: review.diffHunksOmitted,
+                  diffPatchFilesOmitted: review.diffPatchFilesOmitted,
+                  diffFilesOmitted: review.diffFilesOmitted,
+                  ...(review.diffNote ? { diffNote: review.diffNote } : {}),
+                },
+              };
+            }
+
+            const res = await ctx.git.safePush(dir, cfg.gitUrl, auth, { commitMessage: message });
+            // The rebase moved HEAD, so carry this session's remaining shadow onto it — and settle
+            // whatever of it just went out.
             await ctx.shadows.refresh(id, dir);
             return safePushToolResult(res, secrets, conflictDetail);
           }
-
-          if (mode === 'branch') {
-            if (!branch) throw new Error('Branch mode requires a "branch" name.');
-            if (approve) {
-              const res = await ctx.git.landBranch(dir, cfg.gitUrl, auth, { branch, base });
-              return safePushToolResult(res, secrets, conflictDetail);
-            }
-            if (!message) {
-              throw new Error('Branch mode requires a commit "message" to stage the work.');
-            }
-            const prep = await ctx.git.prepareBranch(dir, { branch, message, base });
-            // The review payload is budgeted exactly as the conflict branch above is (issue
-            // #160): `prepareBranch` diffs the whole review branch against its base, so this is
-            // the largest patch this tool can produce, and an oversized result is rejected by the
-            // client outright and delivers nothing (#68). ONE plan drives both channels —
-            // `renderPushReviewText` reads the already-cut plan and never `prep.diff`.
-            const review = planPushReviewDiff(prep.diff, prep.files, {
-              summary: prep.summary,
-              base: prep.base,
-              branch: prep.branch,
-            });
-            return {
-              content: [{ type: 'text', text: renderPushReviewText(prep.summary, review) }],
-              structuredContent: {
-                status: prep.status,
-                pushed: false,
-                remote: redact(redactGitUrlCredentials(cfg.gitUrl), secrets),
-                branch: prep.branch,
-                base: prep.base,
-                summary: prep.summary,
-                committedSha: prep.committedSha,
-                diff: review.diff,
-                diffFiles: review.diffFiles,
-                diffChars: review.diffChars,
-                diffTruncated: review.diffTruncated,
-                diffHunksOmitted: review.diffHunksOmitted,
-                diffPatchFilesOmitted: review.diffPatchFilesOmitted,
-                diffFilesOmitted: review.diffFilesOmitted,
-                ...(review.diffNote ? { diffNote: review.diffNote } : {}),
-              },
-            };
-          }
-
-          const res = await ctx.git.safePush(dir, cfg.gitUrl, auth, { commitMessage: message });
-          // The rebase moved HEAD, so carry this session's remaining shadow onto it — and settle
-          // whatever of it just went out.
-          await ctx.shadows.refresh(id, dir);
-          return safePushToolResult(res, secrets, conflictDetail);
         });
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());

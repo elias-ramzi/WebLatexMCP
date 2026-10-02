@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
 import type { AuthConfig, CommitIdentity } from './auth.js';
@@ -11,6 +12,16 @@ import { coversPath } from '../lib/commitPaths.js';
 import { REFUSAL_PATH_CAP } from '../lib/peerAttribution.js';
 import { remoteBranchMissingNote } from '../lib/syncState.js';
 import { CONFLICT_MAX_COMMITS } from '../lib/conflictBudget.js';
+import { redactGitUrlCredentials, stripGitUrlCredentials } from '../lib/gitUrlCredentials.js';
+import {
+  decideOrigin,
+  originRefusalMessage,
+  parseOriginRecord,
+  type OriginDecision,
+  type OriginReconcile,
+  type OriginState,
+} from '../lib/originRepoint.js';
+import { quoteId } from '../lib/projectId.js';
 
 const DEFAULT_IDENTITY: CommitIdentity = { name: 'WebLatexMCP', email: 'web-latex-mcp@localhost' };
 
@@ -2349,6 +2360,209 @@ export class GitService {
   }
 
   /**
+   * The state `decideOrigin` (`src/lib/originRepoint.ts`) judges, read from the clone at `dir`:
+   * every effective `remote.origin.url`, the ones in its own `.git/config`, and the server's
+   * ownership record (`webLatexMcp.heldUrl`/`.originUrl`, local scope only; anything but one
+   * non-empty value of each counts as no record, `parseOriginRecord`). Read-only. Throws when the config cannot be read.
+   */
+  async readOriginState(dir: string, heldUrl: string): Promise<OriginState> {
+    const effective = await this.configRegexp(dir, false, '^remote\\.origin\\.url$');
+    const local = await this.configRegexp(
+      dir,
+      true,
+      '^(remote\\.origin\\.url|weblatexmcp\\.(heldurl|originurl))$',
+    );
+    const values = (entries: Array<[string, string]>, key: string): string[] =>
+      entries.filter(([k]) => k === key).map(([, v]) => v);
+    const stripped = stripGitUrlCredentials(heldUrl);
+    return {
+      originUrls: values(effective, 'remote.origin.url'),
+      localOriginUrls: values(local, 'remote.origin.url'),
+      record: parseOriginRecord(
+        values(local, 'weblatexmcp.heldurl'),
+        values(local, 'weblatexmcp.originurl'),
+      ),
+      heldStripped: stripped.url,
+      heldCarriesToken: stripped.stripped,
+      realpath: (p: string) => {
+        try {
+          return realpathSync.native(p);
+        } catch {
+          return undefined;
+        }
+      },
+    };
+  }
+
+  /**
+   * `[key, value]` pairs of the config entries whose canonical key matches `regexp` — from the
+   * clone's `.git/config` alone when `local`, else every scope with includes. Read with `-z`, so
+   * a value is never split on a newline. No git output reaches the error but its exit code and
+   * stderr, which names a config file and line, never a value.
+   */
+  private async configRegexp(
+    dir: string,
+    local: boolean,
+    regexp: string,
+  ): Promise<Array<[string, string]>> {
+    const res = await execCapture(
+      'git',
+      ['config', ...(local ? ['--local'] : []), '-z', '--get-regexp', regexp],
+      { cwd: dir },
+    );
+    // Exit 1: nothing matches — an answer, not a failure.
+    if (res.code === 1) return [];
+    if (res.code !== 0) {
+      throw new Error(
+        `Could not read the clone's git config (git exited ${String(res.code)}): ` +
+          res.stderr.trim(),
+      );
+    }
+    return res.stdout
+      .split('\0')
+      .filter((entry) => entry !== '')
+      .map((entry): [string, string] => {
+        const nl = entry.indexOf('\n');
+        return nl === -1 ? [entry, ''] : [entry.slice(0, nl), entry.slice(nl + 1)];
+      });
+  }
+
+  /**
+   * What {@link reconcileOrigin} WOULD do for the clone at `dir` — the same decision, read-only.
+   * For `register_project`, which writes nothing to a clone but says where the next remote
+   * operation will go.
+   */
+  async planOrigin(
+    dir: string,
+    heldUrl: string,
+  ): Promise<{ decision: OriginDecision; state: OriginState }> {
+    const state = await this.readOriginState(dir, heldUrl);
+    return { decision: decideOrigin(state), state };
+  }
+
+  /**
+   * Write the ownership record: the held URL `origin` was pointed at and `origin` as git now
+   * reports it, both credential-stripped (`origin` never carries one when this is called —
+   * `decideOrigin` never adopts such an origin — so its strip is defence in depth). `--` ends the options, so a value beginning with `-` is
+   * the value.
+   */
+  private async writeOriginRecord(
+    dir: string,
+    heldStripped: string,
+    origin: string,
+  ): Promise<void> {
+    for (const [key, value] of [
+      ['webLatexMcp.heldUrl', heldStripped],
+      ['webLatexMcp.originUrl', stripGitUrlCredentials(origin).url],
+    ] as const) {
+      const res = await execCapture(
+        'git',
+        ['config', '--local', '--replace-all', '--', key, value],
+        { cwd: dir },
+      );
+      if (res.code !== 0) {
+        throw new Error(`could not record ${key} (git config exited ${String(res.code)})`);
+      }
+    }
+  }
+
+  /**
+   * Keep the clone's `origin` on the URL the session holds — but only an `origin` the server owns
+   * (`decideOrigin`, `src/lib/originRepoint.ts`: rewritten only while it is still exactly what the
+   * server last wrote; a hand-set one is never touched). Called by the tools that run a remote
+   * operation (`project_sync`, `push`, `reset_to_remote`) first, to report what it did, and again
+   * by {@link withAuth} before every fetch, pull and push, where it is then a no-op — so no remote
+   * operation skips it.
+   *
+   * Writes config, so it runs only under the project lock: every remote operation (`syncPull`,
+   * `safePush`, `resolvePush`, `landBranch`, `resetToRemote`) is reached only from those tools,
+   * inside `runExclusive`.
+   *
+   * A refusal (`originRefusalMessage`) throws before anything is written. A failed write throws a
+   * fixed message — git's output carries the URL raw — and leaves the record as it was, so a retry
+   * tries again. After a write `origin` is read back: anything but one value is refused in words
+   * (and is not expected, since a write is refused up front when `origin` is defined outside
+   * `.git/config`). The record is written last and best-effort: a failure is logged to stderr,
+   * since the re-point itself landed.
+   */
+  async reconcileOrigin(dir: string, heldUrl: string): Promise<OriginReconcile> {
+    const state = await this.readOriginState(dir, heldUrl);
+    const decision = decideOrigin(state);
+    const previous = state.originUrls[0];
+    switch (decision.kind) {
+      case 'refuse':
+        throw new Error(
+          originRefusalMessage(decision.reason, {
+            held: heldUrl,
+            origin: previous,
+            dir,
+            count: state.originUrls.length,
+          }),
+        );
+      case 'unowned':
+        return {
+          kind: 'unowned',
+          previous,
+          pushUrls: [],
+          ...(decision.credentialOnDisk ? { credentialOnDisk: true as const } : {}),
+        };
+      case 'unchanged':
+        if (decision.writeRecord && previous !== undefined) {
+          await this.recordBestEffort(dir, state.heldStripped, previous);
+        }
+        return { kind: 'unchanged', previous, pushUrls: [] };
+      case 'add':
+      case 'repoint': {
+        const verb = decision.kind === 'add' ? 'add' : 'set-url';
+        // `decision.value`, not `heldUrl`: credential-free (a write is refused for a held token),
+        // and a relative local path resolved as `git clone` records it (`originValueToWrite`).
+        const res = await execCapture('git', ['remote', verb, '--', 'origin', decision.value], {
+          cwd: dir,
+        });
+        if (res.code !== 0) {
+          throw new Error(
+            `Could not point the clone's origin at ${quoteId(redactGitUrlCredentials(heldUrl))} ` +
+              `(git remote ${verb} exited ${String(res.code)}); nothing was fetched or pushed. A ` +
+              '.git/config.lock left behind by a git process that crashed is the usual cause: if ' +
+              'no git command is running in that clone, delete it and retry.',
+          );
+        }
+        const after = (await this.configRegexp(dir, false, '^remote\\.origin\\.url$')).map(
+          ([, v]) => v,
+        );
+        // Defensive only: a write is refused up front (`external`) when origin is defined outside
+        // `.git/config`, so git reporting other than one value here takes a concurrent edit.
+        if (after.length !== 1) {
+          throw new Error(
+            `The clone's origin was set to ${quoteId(redactGitUrlCredentials(heldUrl))} in its ` +
+              `.git/config, but git now reports ${after.length} origin URLs — another config ` +
+              'file also defines it — so nothing was fetched or pushed. Remove the other ' +
+              `definition, keeping one, in ${quoteId(toPosix(dir))}, then retry.`,
+          );
+        }
+        await this.recordBestEffort(dir, state.heldStripped, after[0]!);
+        return {
+          kind: 'repointed',
+          previous,
+          pushUrls: (await this.configRegexp(dir, false, '^remote\\.origin\\.pushurl$')).map(
+            ([, v]) => v,
+          ),
+        };
+      }
+    }
+  }
+
+  private async recordBestEffort(dir: string, heldStripped: string, origin: string): Promise<void> {
+    try {
+      await this.writeOriginRecord(dir, heldStripped, origin);
+    } catch (err) {
+      console.error(
+        `[web-latex-mcp] ${quoteId(toPosix(dir))}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
    * Clone a project from its tokenless URL, so origin never holds a credential — not even for
    * the length of the clone (it used to clone from the token-bearing URL and reset origin
    * afterwards, so a kill mid-clone left the token in `.git/config`). The credential reaches git
@@ -2362,6 +2576,23 @@ export class GitService {
     const options = ['-c', 'core.autocrlf=false', ...(branch ? ['-b', branch] : [])];
     // `--` ends the options, so a gitUrl can never be read as one.
     await runRemoteGit(undefined, gitUrl, auth, ['clone', ...options, '--', gitUrl, targetDir]);
+    // The ownership record (`src/lib/originRepoint.ts`): this origin is the server's, so a later
+    // change of the held URL may move it. Best-effort — a clone without one is adopted on its
+    // first remote operation, since its origin then still equals the held URL.
+    try {
+      const origin = (await this.configRegexp(targetDir, false, '^remote\\.origin\\.url$')).map(
+        ([, v]) => v,
+      );
+      // An origin carrying a credential (cloned from an env or legacy token URL) is never the
+      // server's: no record, so nothing ever rewrites it.
+      if (origin.length === 1 && !stripGitUrlCredentials(origin[0]!).stripped) {
+        await this.writeOriginRecord(targetDir, stripGitUrlCredentials(gitUrl).url, origin[0]!);
+      }
+    } catch (err) {
+      console.error(
+        `[web-latex-mcp] ${quoteId(toPosix(targetDir))}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** Fetch and fast-forward (ff-only). Surfaces divergence instead of merging. */
@@ -3101,7 +3332,8 @@ export class GitService {
    * This used to point origin at the token-bearing URL (`remote set-url`) for the length of the
    * call and set it back afterwards, which wrote the token into `.git/config` and put it on the
    * `set-url` command line: a process killed inside that window left it on disk in plain text.
-   * Nothing here writes a byte of config now.
+   * Nothing here writes a credential into config now; the one config write left is
+   * {@link reconcileOrigin}'s, of the tokenless held URL.
    */
   private async withAuth(
     dir: string,
@@ -3109,6 +3341,10 @@ export class GitService {
     auth: AuthConfig,
     args: string[],
   ): Promise<void> {
+    // The held URL decides where this goes: `origin` is re-pointed first unless the server does
+    // not own it (`reconcileOrigin`, `decideOrigin`). Idempotent, so a fetch-then-push pays two
+    // `git config` reads per step after the first.
+    await this.reconcileOrigin(dir, gitUrl);
     await runRemoteGit(dir, gitUrl, auth, args);
   }
 

@@ -12,6 +12,7 @@ import { assertValidProjectId, quoteId } from '../lib/projectId.js';
 import { assertRegistrableRootFile } from '../lib/rootFileSpelling.js';
 import { droppedRegistrationFields, registrationDroppedNote } from '../lib/registration.js';
 import { workspaceNote } from '../lib/workspaceNote.js';
+import { pendingOriginNote, unreadableOriginNote } from '../lib/originRepoint.js';
 import type { ProjectConfig } from '../types.js';
 
 // Re-exported for `test/unit/registerProjectFields.test.ts`, which predates its move to the lib.
@@ -396,6 +397,22 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
+          // Registration writes nothing to an existing clone: its `origin` is reconciled at the
+          // next remote operation (`GitService.reconcileOrigin`, under the lock). Previewed here,
+          // read-only, so the caller hears where that operation will go. Only a clone that
+          // pre-existed this call — one cloned below is at the held URL already. The registration
+          // is persisted by now, so a config that cannot be read is a note, never an error that
+          // would lose the notes below.
+          let repointNote = '';
+          if (cloned) {
+            try {
+              const { decision, state } = await ctx.git.planOrigin(dir, heldUrl);
+              repointNote = pendingOriginNote(decision, state, heldUrl, dir);
+            } catch {
+              repointNote = unreadableOriginNote(dir);
+            }
+          }
+
           if (clone && !cloned) {
             const git = ctx.projectManager.requireGitProject(cfg.id, 'clone');
             const auth = await ctx.credentials.resolve(git);
@@ -448,6 +465,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             excludeNote +
             ` ${workspaceNote(ctx.config.workspaceRoot)}` +
             credentialsNote +
+            repointNote +
             defaultRegistrationNote(ctx, makeDefault) +
             registrationDroppedNote(cfg.id, dropped);
           return {

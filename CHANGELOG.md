@@ -53,6 +53,30 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **A cloned project's fetch, pull and push now go to the URL the session holds — while the server
+  owns the clone's `origin`.** `project_sync` and `register_project` with a different `gitUrl`
+  updated the registration but not the clone's `origin`, which is what every remote operation uses:
+  fetch, pull and push kept going to the old remote — a re-point to a repository that does not
+  exist even reported `up-to-date` — and the token was offered only to the new host. A clone now
+  records in its own `.git/config` what the server wrote to `origin` (`webLatexMcp.heldUrl`,
+  `webLatexMcp.originUrl`, never a token), and before every fetch, pull and push `origin` is
+  pointed at the held URL while it is still exactly what the server wrote. So a session-only
+  `project_sync { gitUrl }` moves `origin` for that session, a later session holding the registered
+  or env URL moves it back, and peers holding different URLs each reach their own. A relative local
+  path is written resolved, as `git clone` records it. An `origin` set by hand is never rewritten —
+  nor is one carrying a password or token, whoever put it there: set by hand, written by the
+  server's own `git clone` of an env-configured or legacy URL that embeds a token, or left by an
+  older version after a crash. `project_sync`, `push` and `reset_to_remote` name it (redacted) with
+  the `git remote set-url` remedy — for a configured URL that embeds a token, after moving the
+  token into `tokenEnv` or `set_credential` — and refuse when the registered URL has changed as
+  well. Clones the
+  bug left at the old remote have no record, so they are reported with that remedy, not repaired
+  automatically. An `origin` with several URLs (a push mirror) is never rewritten and keeps working
+  while its first URL is the registered one. A re-point is named in the result (the old URL
+  redacted, plus any `pushurl` that still decides where a push goes); `register_project` writes
+  nothing to the clone and says what the next remote operation will do. An `origin` defined outside
+  `.git/config`, several URLs when the registration changed, and a held URL carrying a token are
+  refused in words when a write is needed.
 - **`compile`, the PDF tools and the viewer now use the `rootFile` a project was registered with.**
   The value was stored in `registry.json` (and accepted in `WEB_LATEX_MCP_PROJECTS`) but read by
   nothing: every call that omitted `rootFile` auto-detected, and detection returned any nested
