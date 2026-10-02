@@ -46,6 +46,15 @@ const outputSchema = {
     .describe('Present only with action "remote-branch-missing": what happened and what it means.'),
 };
 
+/** A clone/pull failure that already carries this call's notes (`withNotes`). */
+class NotedSyncError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+  }
+}
+
+const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 export function registerProjectSync(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'project_sync',
@@ -65,14 +74,18 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
       // fails (a typo'd gitUrl) has still replaced the held config: the error must name the loss
       // too, or a retry with the right URL — judged against the typo config — never would.
       let droppedNote = '';
+      let failedDroppedNote = '';
       try {
         // `registerProject` holds the URL without any http(s) secret; the caller must hear that
         // the token they pasted was not used — on success, and above all on a failed clone/pull,
         // which is then most likely an auth failure — exactly as `register_project` says it.
         const credentialsNote = strippedCredentialsNoteFor(gitUrl || undefined);
-        const withCredentialsNote = (err: unknown): unknown =>
-          credentialsNote && err instanceof Error
-            ? new Error(`${err.message}${credentialsNote}`, { cause: err })
+        // A failed clone/pull carries both notes, in the success text's order (dropped fields
+        // first), its dropped-fields note worded for a URL that may be the reason it failed; the
+        // outer catch adds the plain dropped-fields note alone to any other failure.
+        const withNotes = (err: unknown): unknown =>
+          failedDroppedNote || credentialsNote
+            ? new NotedSyncError(`${messageOf(err)}${failedDroppedNote}${credentialsNote}`, err)
             : err;
         if (gitUrl) {
           if (!project) {
@@ -89,6 +102,7 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           ctx.projectManager.registerProject(plan.next);
           // Only once the replace happened: a registration that refuses replaced nothing.
           droppedNote = plan.note;
+          failedDroppedNote = plan.failedNote;
         }
         const cfg = ctx.projectManager.requireGitProject(project, 'sync with');
         const dir = ctx.projectManager.projectPath(cfg.id);
@@ -105,7 +119,7 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             try {
               await ctx.git.clone(cfg.gitUrl, dir, auth, cfg.branch);
             } catch (err) {
-              throw withCredentialsNote(err);
+              throw withNotes(err);
             }
             const ab = await ctx.git.aheadBehind(dir);
             result = { action: 'cloned', ahead: ab.ahead, behind: ab.behind, diverged: false };
@@ -116,7 +130,7 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
             try {
               result = await ctx.git.syncPull(cfg.gitUrl, dir, auth);
             } catch (err) {
-              throw withCredentialsNote(
+              throw withNotes(
                 await enrichPullRefusal(
                   { sessions: ctx.sessions, shadows: ctx.shadows, git: ctx.git },
                   cfg.id,
@@ -160,11 +174,11 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           structuredContent: { ...payload },
         };
       } catch (err) {
-        // Same shape as `withCredentialsNote`: the note rides on the message, the original error
+        // Same shape as `withNotes`: the note rides on the message, the original error
         // stays the cause, and `errorResult` scrubs the whole text as before.
         const reported =
-          droppedNote && err instanceof Error
-            ? new Error(`${err.message}${droppedNote}`, { cause: err })
+          droppedNote && !(err instanceof NotedSyncError)
+            ? new Error(`${messageOf(err)}${droppedNote}`, { cause: err })
             : err;
         return errorResult(reported, ctx.credentials.allSecrets());
       }

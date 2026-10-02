@@ -341,9 +341,13 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             };
             // Say which directory was registered when they named a file: the project is the whole
             // folder, so that is what is readable and editable — not just the file they pointed at.
+            // The root named is the one registered: an explicit rootFile wins over the inferred one.
+            // Both are file names off the caller's disk, so quoted and escaped: a bidi override or
+            // a newline in one could otherwise forge the rest of this message.
             const inferred = target.pointedAtFile
-              ? `Pointed at "${target.pointedAtFile}", so registered the folder holding it. ` +
-                (target.rootFile ? `LaTeX root: ${target.rootFile}. ` : '')
+              ? `Pointed at ${quoteId(target.pointedAtFile)}, so registered the folder ` +
+                'holding it. ' +
+                (resolvedRoot !== undefined ? `LaTeX root: ${quoteId(resolvedRoot)}. ` : '')
               : '';
             // Say which way the link policy landed: it is the one thing about a local project the
             // caller cannot see from the path, and "refs.bib is not there" is otherwise a puzzle.
@@ -397,9 +401,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
             } catch (err) {
               // A clone that fails right after its token was stripped most likely failed on auth;
-              // say why the token the caller gave was not used.
-              if (!credentialsNote) throw err;
-              throw new Error(`${(err as Error).message}${credentialsNote}`, { cause: err });
+              // say why the token the caller gave was not used. The replacement registration is
+              // already persisted, so what it dropped is named too: a retry with the same
+              // arguments finds nothing left to drop, and the loss would go unreported for good.
+              // Same order as the success text.
+              const droppedNote = registrationDroppedNote(cfg.id, dropped);
+              if (!credentialsNote && !droppedNote) throw err;
+              const message = err instanceof Error ? err.message : String(err);
+              throw new Error(`${message}${credentialsNote}${droppedNote}`, { cause: err });
             }
             ctx.files.resetBaselines(dir);
             cloned = true;

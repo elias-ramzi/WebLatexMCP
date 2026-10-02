@@ -20,7 +20,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `releases/download/<tag>/`. For an npm or git-checkout install, nothing is downloaded and the tool
   says what to run instead. The extension is recognised only because its manifest sets the new
   `WEB_LATEX_MCP_INSTALL_KIND`, never from files on disk; without it a git checkout is `source` and
-  anything else `npm`.
+  anything else `npm`. A bundle that cannot be saved (a full disk) leaves nothing behind in the
+  temp dir, and the error names the file and directory once, with the error code. The npm advice
+  leads with `@latest`, since a release's version reaches npm only once it is published there.
 
 ### Changed
 
@@ -81,6 +83,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   build, and `compile` says when the viewer — running or not yet opened — shows another root,
   nothing at all, or this build only as the surfaced copy (no source locations), and how to make
   it follow the root just built.
+- **A release whose `package.json` was not bumped no longer ships a `.mcpb`.** The bundle workflow
+  now fails when the tag differs from `package.json`'s version, as the npm publish already did. Such
+  a bundle reported the old version, so `update_server` would have offered the same update forever.
+- **`register_project` names the fields it dropped even when the clone fails.** The replacement
+  registration is saved before the clone runs. A failed clone used to lose the "dropping its
+  rootFile=…" note for good, because a retry finds nothing left to drop.
+- **`project_sync { gitUrl }`'s notes, on failure.** The dropped-fields note now comes before the
+  stripped-token note, as it does on success. It no longer tells you to call `register_project`
+  with the URL that may be why the sync failed: it says to do so once the URL is right.
+- **`register_project` quotes and escapes the file name it was pointed at,** and the LaTeX root it
+  inferred from it. A newline or a bidi override in that name could otherwise forge the rest of
+  the message.
 
 ## [0.8.0] - 2026-09-29
 

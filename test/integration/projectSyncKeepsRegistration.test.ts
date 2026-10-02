@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -35,6 +36,8 @@ const HERMETIC_ENV = [
   'GIT_CONFIG_GLOBAL',
   'GIT_CONFIG_NOSYSTEM',
   'GIT_ASKPASS',
+  'NO_PROXY',
+  'no_proxy',
 ];
 const prevEnv = new Map<string, string | undefined>();
 let gitHome = '';
@@ -47,7 +50,18 @@ beforeAll(async () => {
   process.env.GIT_CONFIG_GLOBAL = globalConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
   process.env.GIT_ASKPASS = '';
+  // Every remote here is loopback or file://: a developer's proxy must not answer for one.
+  process.env.NO_PROXY = process.env.no_proxy = '127.0.0.1,localhost';
 });
+
+/** A loopback port nothing listens on: bound by the OS, then released. */
+async function closedPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as net.AddressInfo;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
 afterAll(async () => {
   for (const [key, value] of prevEnv) {
     if (value === undefined) delete process.env[key];
@@ -72,18 +86,20 @@ const noHelpers = async (): Promise<ExecResult> => ({
 });
 
 /**
- * A server over `projects`. With `registry`, a `ProjectRegistry` over the workspace is wired and
+ * A server over `projects` (or what `projectsFor` builds from the workspace root, for a project
+ * whose directory sits inside it). With `registry`, a `ProjectRegistry` over the workspace is wired and
  * seeded with those entries first, and `projects` are treated as env-configured
  * (`envProjectIds`), as `loadConfig` reports a `WEB_LATEX_MCP_PROJECTS` entry.
  */
 async function session(
-  projects: ProjectConfig[],
+  projectsFor: ProjectConfig[] | ((workspaceRoot: string) => ProjectConfig[]),
   env: NodeJS.ProcessEnv = {},
   registry?: ProjectConfig[],
 ): Promise<{ ctx: AppContext; client: Client }> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'wlm-synckeep-'));
   cleanups.push(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const workspaceRoot = path.join(root, 'ws');
+  const projects = typeof projectsFor === 'function' ? projectsFor(workspaceRoot) : projectsFor;
   const config: ServerConfig = {
     workspaceRoot,
     sessionId: 'test',
@@ -239,7 +255,91 @@ describe('project_sync { gitUrl } keeps a registration it only re-states', () =>
     expect(text).toMatch(/differs from the one "paper" was registered with/);
     expect(text).toContain('rootFile="paper.tex"');
     expect(text).toContain('branch="master"');
-    expect(text).toContain('register_project');
+    // The URL may be why the sync failed, so the remedy is conditional on fixing it, never
+    // "call register_project with this gitUrl".
+    expect(text).toContain('once the gitUrl is right, call register_project with it');
+    expect(text).not.toContain('with this gitUrl');
+  });
+
+  it('a re-point refused for a reason other than its URL keeps the plain remedy', async () => {
+    const before = await createFakeRemote({ 'paper.tex': 'alpha\n' });
+    const after = await createFakeRemote({ 'main.tex': 'beta\n' });
+    cleanups.push(before.cleanup, after.cleanup);
+    const { client } = await session([
+      { id: 'paper', gitUrl: before.url, rootFile: 'paper.tex', branch: 'master' },
+    ]);
+    const first = await client.callTool({ name: 'project_sync', arguments: { project: 'paper' } });
+    expect(first.isError, textOf(first)).toBeFalsy();
+
+    // Already cloned: the mode is the problem, never the URL, so nothing hedges on the URL.
+    const res = await client.callTool({
+      name: 'project_sync',
+      arguments: { project: 'paper', gitUrl: after.url, mode: 'clone' },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain('already cloned');
+    expect(text).toContain('rootFile="paper.tex"');
+    expect(text).toContain('call register_project with this gitUrl and those fields');
+    expect(text).not.toContain('once the gitUrl is right');
+  });
+
+  it('a failed re-point names the dropped fields before the stripped-credentials note, as on success', async () => {
+    const before = await createFakeRemote({ 'paper.tex': 'alpha\n' });
+    cleanups.push(before.cleanup);
+    // A pasted token, to a port nothing listens on: the clone fails fast, after both notes apply.
+    const typo = `http://git:${TOKEN}@127.0.0.1:${await closedPort()}/no-such-repo.git`;
+    const { client } = await session([
+      { id: 'paper', gitUrl: before.url, rootFile: 'paper.tex', branch: 'master' },
+    ]);
+
+    const res = await client.callTool({
+      name: 'project_sync',
+      arguments: { project: 'paper', gitUrl: typo },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).not.toContain(TOKEN);
+    const dropped = text.indexOf('rootFile="paper.tex"');
+    const credentials = text.indexOf('it was removed and NOT stored');
+    expect(dropped, text).toBeGreaterThan(-1);
+    expect(credentials, text).toBeGreaterThan(-1);
+    expect(dropped).toBeLessThan(credentials);
+    // Each note once: the outer handler must not append the dropped fields a second time.
+    expect(text.split('rootFile="paper.tex"')).toHaveLength(2);
+  });
+
+  it('a registration refused inside project_sync claims no replacement and keeps the held config', async () => {
+    const before = await createFakeRemote({ 'paper.tex': 'alpha\n' });
+    const after = await createFakeRemote({ 'main.tex': 'beta\n' });
+    cleanups.push(before.cleanup, after.cleanup);
+    const paper: ProjectConfig = {
+      id: 'paper',
+      gitUrl: before.url,
+      rootFile: 'paper.tex',
+      branch: 'master',
+    };
+    // A local project sitting at paper's clone directory: re-registering paper is then refused by
+    // `assertDirUnclaimed`, inside `registerProject`, after the plan computed what it would drop.
+    const { ctx, client } = await session(
+      (ws) => [paper, { id: 'squatter', mode: 'local', path: path.join(ws, 'paper') }],
+      {},
+      [paper],
+    );
+
+    const res = await client.callTool({
+      name: 'project_sync',
+      arguments: { project: 'paper', gitUrl: after.url },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(/Project "squatter" already uses /);
+    // Nothing was replaced, so nothing may be reported dropped.
+    expect(text).not.toMatch(/dropping|replaced|differs|rootFile|branch=/);
+    const cfg = gitConfig(ctx, 'paper');
+    expect(cfg.gitUrl).toBe(before.url);
+    expect(cfg.rootFile).toBe('paper.tex');
+    expect(cfg.branch).toBe('master');
   });
 
   it('a local project synced as a git one says it replaced a local project', async () => {

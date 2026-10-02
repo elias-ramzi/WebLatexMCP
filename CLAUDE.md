@@ -664,8 +664,10 @@ read falls back to the in-process root.
   this. Where the `.bib` guard exists because entry text must never originate from the model, here the
   appended rule originates **only** from the model (a caller-phrased convention), so the gate cannot be
   "re-fetch from a trusted source" the way `add_citation` is; it is the user's acknowledgement instead.
-  This is also the one write in the whole server that lands outside every project sandbox: the target
-  file is loaded into the server's MCP `instructions`, and served over `guide://latex/writing-guide`, at
+  It is not the only write outside every project sandbox — `update_server` saves a digest-verified
+  release bundle in a fresh `mkdtemp` directory under the OS temp dir and hands it to the OS file
+  opener, and `compile` writes under the per-user build root — but it is the only one that persists
+  **model-authored** text into every later session's MCP `instructions`: the target file is loaded into the server's MCP `instructions`, and served over `guide://latex/writing-guide`, at
   **every future startup**, so one unguarded call would persist model-authored text into every later
   session's system prompt. The check is `!== true` in the tool layer (an optional boolean, not a
   schema-level `z.literal(true)`), mirroring `confirmBibEdit`'s shape exactly; `appendWritingConvention`

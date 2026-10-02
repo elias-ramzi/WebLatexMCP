@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,6 +107,10 @@ export interface UpdateServiceOptions {
   open?: (target: string) => Promise<boolean>;
   /** Where the downloaded bundle is written (a fresh directory is made under it). */
   tmpDir?: string;
+  /** How long the bundle download may take, body included (default `DOWNLOAD_TIMEOUT_MS`). */
+  downloadTimeoutMs?: number;
+  /** Writes the verified bundle (default `fs.promises.writeFile`); a seam for its failures. */
+  writeFile?: (file: string, data: Buffer, opts: { flag: string; mode: number }) => Promise<void>;
 }
 
 /**
@@ -166,8 +170,11 @@ export function manualUpdateAdvice(kind: InstallKind, latestVersion: string): st
       );
     case 'npm':
       return (
+        // The version is the latest GitHub release, which npm lists only once publish.yml has
+        // succeeded for that tag — so `@latest` comes first.
         'Launched with `npx -y web-latex-mcp`: npx reuses its cached copy, so change the command ' +
-        `to \`npx -y web-latex-mcp@${latestVersion}\` (or \`@latest\`) and restart the client. ` +
+        `to \`npx -y web-latex-mcp@latest\` (or \`@${latestVersion}\`, if npm lists that ` +
+        'version yet) and restart the client. ' +
         'Installed globally: `npm install -g web-latex-mcp@latest`, then restart the client.'
       );
     case 'source':
@@ -192,6 +199,8 @@ export class UpdateService {
   private readonly currentVersion: string;
   private readonly open: (target: string) => Promise<boolean>;
   private readonly tmpDir: string;
+  private readonly downloadTimeoutMs: number;
+  private readonly writeBundle: NonNullable<UpdateServiceOptions['writeFile']>;
 
   constructor(opts: UpdateServiceOptions = {}) {
     this.fetchImpl = opts.fetch ?? defaultFetch;
@@ -202,6 +211,8 @@ export class UpdateService {
     // Resolved now: `os.tmpdir()` returns a relative TMPDIR as is, and `openFile` opens only an
     // absolute path.
     this.tmpDir = path.resolve(opts.tmpDir ?? os.tmpdir());
+    this.downloadTimeoutMs = opts.downloadTimeoutMs ?? DOWNLOAD_TIMEOUT_MS;
+    this.writeBundle = opts.writeFile ?? writeFile;
   }
 
   installKind(): InstallKind {
@@ -247,7 +258,7 @@ export class UpdateService {
       );
     }
 
-    const res = await this.request(asset.url, DOWNLOAD_TIMEOUT_MS, 'application/octet-stream');
+    const res = await this.request(asset.url, this.downloadTimeoutMs, 'application/octet-stream');
     const bytes = await readCapped(res.body, asset.size);
     if (bytes.length !== asset.size) {
       throw new UpdateError(
@@ -268,10 +279,13 @@ export class UpdateService {
     }
 
     // A fresh, unpredictable directory: nothing else can have planted a file at this name.
-    // The temp dir is named by the environment, so a failure here names it quoted and escaped.
-    const saveFailed = (where: string, err: unknown) =>
+    // The temp dir is named by the environment, so a failure here names it quoted and escaped —
+    // once: an fs error's own message repeats the path (escaped a second time on Windows, with
+    // every backslash doubled), so only its code is appended.
+    const name = `web-latex-mcp-${release.version}.mcpb`;
+    const saveFailed = (where: string, err: unknown, tail = '') =>
       new UpdateError(
-        `Could not save ${BUNDLE_ASSET} under ${quoteId(toPosix(where))}: ${reason(err)}.`,
+        `Could not save ${name} under ${quoteId(toPosix(where))}: ${fsReason(err)}.${tail}`,
       );
     let dir: string;
     try {
@@ -279,11 +293,20 @@ export class UpdateService {
     } catch (err) {
       throw saveFailed(this.tmpDir, err);
     }
-    const file = path.join(dir, `web-latex-mcp-${release.version}.mcpb`);
+    const file = path.join(dir, name);
     try {
-      await writeFile(file, bytes, { flag: 'wx', mode: 0o600 });
+      await this.writeBundle(file, bytes, { flag: 'wx', mode: 0o600 });
     } catch (err) {
-      throw saveFailed(dir, err);
+      // A write that failed partway (ENOSPC) leaves a partial bundle nothing will ever open.
+      const removed = await rm(dir, { recursive: true, force: true }).then(
+        () => true,
+        () => false,
+      );
+      throw saveFailed(
+        dir,
+        err,
+        removed ? ' Nothing was left behind.' : ' That directory could not be removed.',
+      );
     }
     const opened = await this.open(file);
     return { path: file, bytes: bytes.length, sha256, opened };
@@ -401,6 +424,18 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : undefined;
+}
+
+/**
+ * A filesystem failure as a message names it: a system-call error's code alone (`ENOSPC`,
+ * `EACCES`), since its message repeats the path the caller already names; anything else — an
+ * argument error carries a `code` too — as `reason` reads it.
+ */
+function fsReason(err: unknown): string {
+  const errno = err instanceof Error ? (err as NodeJS.ErrnoException) : undefined;
+  return errno && typeof errno.syscall === 'string' && typeof errno.code === 'string'
+    ? escapeInvisibleChars(errno.code)
+    : reason(err);
 }
 
 /**

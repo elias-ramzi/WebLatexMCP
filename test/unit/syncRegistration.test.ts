@@ -82,6 +82,19 @@ describe('syncDroppedNote / planSyncRegistration', () => {
     );
   });
 
+  it('a sync that then failed is not sent back to the URL that may be why it failed', () => {
+    const { failedNote } = planSyncRegistration('paper', 'https://github.com/acme/othr.git', full);
+    expect(failedNote).toMatch(/dropping its rootFile="paper\.tex", branch="master"/);
+    expect(failedNote).toMatch(
+      / — to keep them, once the gitUrl is right, call register_project with it and those fields\.$/,
+    );
+    const local: ProjectConfig = { id: 'paper', mode: 'local', path: '/p', rootFile: 'a.tex' };
+    expect(planSyncRegistration('paper', URL, local).failedNote).toMatch(
+      /To give the git project fields of its own, once the gitUrl is right, call register_project with it and them\.$/,
+    );
+    expect(planSyncRegistration('paper', URL, full).failedNote).toBe('');
+  });
+
   it('a url differing only by a login name is a re-point, worded as a differing gitUrl', () => {
     const { note } = planSyncRegistration('paper', 'https://bob@github.com/acme/paper.git', full);
     expect(note).toMatch(/^\nThis gitUrl differs from the one "paper" was registered with/);
