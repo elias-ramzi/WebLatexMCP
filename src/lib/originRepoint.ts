@@ -2,6 +2,7 @@ import path from 'node:path';
 import {
   redactGitUrlCredentials,
   stripGitUrlCredentials,
+  urlLoginName,
   withoutUserinfo,
 } from './gitUrlCredentials.js';
 import { quoteId } from './projectId.js';
@@ -269,13 +270,42 @@ export interface OriginReconcile {
   credentialOnDisk?: true;
 }
 
+/** How a note is delivered: in a result's text, or appended to an error's message. */
+export interface NoteOptions {
+  /**
+   * The note rides on an error. `errorResult` scrubs every https userinfo there — a login name
+   * included — so a command naming `https://org@…` would reach the caller as `https://***@…` and
+   * set the username to `***`. Such a remedy then names its URL by where to read it instead.
+   */
+  forError?: boolean;
+}
+
+/**
+ * The `git remote set-url` remedy pointing `origin` at the held URL: the URL the server would
+ * write (`originValueToWrite` of the tokenless held URL), quoted with `quoteId` for reading —
+ * never redacted. Quoting is for reading, not for pasting into every shell: `quoteId` escapes `"`
+ * and `\` the way a POSIX double-quoted string undoes them, but not `$` or a backtick, and Windows
+ * shells read `\` literally. On an error path a URL with a login name is not printed (see
+ * `NoteOptions.forError`): the remedy names `list_projects`, which shows it with the login kept,
+ * and the login name itself, which carries no scheme for the scrubber to match.
+ */
+function setUrlRemedy(held: string, dir: string, opts: NoteOptions): string {
+  const url = originValueToWrite(stripGitUrlCredentials(held).url);
+  const login = urlLoginName(url);
+  if (opts.forError && login !== undefined) {
+    return (
+      `\`git remote set-url origin <url>\` in ${shownDir(dir)}, with <url> this project's gitUrl ` +
+      `as list_projects shows it (with the login name ${quoteId(login)})`
+    );
+  }
+  return `\`git remote set-url origin ${quoteId(url)}\` in ${shownDir(dir)}`;
+}
+
 /**
  * The note for an `unowned` origin: where fetch and push go, why, and how to change it — one note
  * in every case. Shown on every result while it lasts: it is a real divergence between what is
  * registered and what is used, or a credential sitting in `.git/config`. `origin` and the held URL
- * are shown redacted; the URL in the `git remote set-url` remedy is the one the server would write
- * (`originValueToWrite` of the tokenless held URL), quoted but never redacted, so the command can
- * be run as shown.
+ * are shown redacted; the remedy is `setUrlRemedy`'s.
  *
  * When the held URL itself embeds a password or token (an env-configured or legacy URL), the
  * clone was most likely made from it — `git clone` writes it into `origin` — so the note says so
@@ -286,11 +316,10 @@ export function unownedOriginNote(
   held: string,
   dir: string,
   credentialOnDisk = false,
+  opts: NoteOptions = {},
 ): string {
   const heldTokenless = stripGitUrlCredentials(held);
-  const remedy =
-    `\`git remote set-url origin ${quoteId(originValueToWrite(heldTokenless.url))}\` in ` +
-    shownDir(dir);
+  const remedy = setUrlRemedy(held, dir, opts);
   // Wording only: whether the origin points anywhere but the registered URL, its userinfo (login
   // name included) aside. Nothing is decided by it.
   const elsewhere = withoutUserinfo(origin) !== withoutUserinfo(held);
@@ -321,13 +350,20 @@ export function unownedOriginNote(
 
 /**
  * The result-text sentence for what a tool's reconcile did — `''` when nothing needs saying.
- * `then` finishes a re-point sentence for the tool ("this sync fetches from it").
+ * `then` finishes a re-point sentence for the tool ("this sync fetches from it"). A tool attaches
+ * the `forError` variant to an error and the plain one to its result.
  */
-export function originNote(r: OriginReconcile, held: string, dir: string, then: string): string {
+export function originNote(
+  r: OriginReconcile,
+  held: string,
+  dir: string,
+  then: string,
+  opts: NoteOptions = {},
+): string {
   if (r.kind === 'unowned') {
     return r.previous === undefined
       ? ''
-      : unownedOriginNote(r.previous, held, dir, r.credentialOnDisk === true);
+      : unownedOriginNote(r.previous, held, dir, r.credentialOnDisk === true, opts);
   }
   if (r.kind === 'unchanged') return '';
   const from =

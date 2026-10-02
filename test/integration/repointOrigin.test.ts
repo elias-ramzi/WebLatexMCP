@@ -488,6 +488,27 @@ describe('project_sync: an origin the server did not set is never rewritten', ()
     expect(await originUrl(s.dir)).toBe(tokened);
   });
 
+  it('an error after the reconcile carries a remedy the error scrubber cannot turn into a *** command; success shows the exact one', async () => {
+    const a = await remote();
+    const workspaceRoot = await newWorkspace();
+    const dir = path.join(workspaceRoot, 'paper');
+    await simpleGit().clone(a.url, dir);
+    const held = 'https://org@dev.azure.com/org/p/_git/r';
+    const s = await session({ projects: [{ id: 'paper', gitUrl: held }], workspaceRoot });
+
+    const ok1 = await ok(s.client, 'project_sync', { project: 'paper' });
+    expect(/`git remote set-url origin ([^`]*)`/.exec(textOf(ok1))?.[1]).toBe(quoteId(held));
+
+    const res = await call(s.client, 'project_sync', { project: 'paper', mode: 'clone' });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(/already cloned/);
+    expect(count(text, UNOWNED)).toBe(1);
+    expect(/`git remote set-url origin ([^`]*)`/.exec(text)?.[1]).toBe('<url>');
+    expect(text).toContain('list_projects');
+    expect(text).toContain(quoteId('org'));
+  });
+
   it('a PAT the user put in origin is left on disk and named redacted, with the remedy, on every sync', async () => {
     const a = await remote();
     const server = await serveWithAuth(a, { username: 'me', password: SECRET });

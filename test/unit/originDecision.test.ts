@@ -13,6 +13,7 @@ import {
   type OriginState,
 } from '../../src/lib/originRepoint.js';
 import { quoteId } from '../../src/lib/projectId.js';
+import { errorResult } from '../../src/lib/errors.js';
 
 /**
  * `decideOrigin` is the ownership rule: `origin` is rewritten only while it is still exactly what
@@ -347,7 +348,11 @@ describe("an origin carrying a password or token is never the server's", () => {
       expect(note).toMatch(/configured URL embeds a password or token/);
       expect(note).toContain('WEB_LATEX_MCP_PROJECTS');
       expect(note).toContain('register_project');
-      expect(note).not.toMatch(/older version|did not set it/);
+      // The clone made from the configured URL is not "an origin the server did not set"; an
+      // unrelated origin still is.
+      if (r.credentialOnDisk) expect(note).not.toMatch(/did not set this origin/);
+      else expect(note).toMatch(/did not set this origin, or no longer owns it/);
+      expect(note).not.toMatch(/older version/);
       expect(/`git remote set-url origin ([^`]*)`/.exec(note)?.[1]).toBe(
         quoteId('https://me@git.example/o/a.git'),
       );
@@ -366,7 +371,6 @@ describe("an origin carrying a password or token is never the server's", () => {
   it('without a token held, the note does not claim the server never set it', () => {
     const note = unownedOriginNote('git@github-work:o/a.git', A, 'ws/paper');
     expect(note).toMatch(/did not set this origin, or no longer owns it/);
-    expect(note).not.toMatch(/the server did not set it[,;.]/);
   });
 
   it('a push mirror whose first URL carries a token is not "unchanged"', () => {
@@ -409,6 +413,77 @@ describe("an origin carrying a password or token is never the server's", () => {
       'ws/paper',
     );
     expect(pending).toBe(same);
+  });
+});
+
+describe('on an error path the remedy survives the error scrubber', () => {
+  // `errorResult` → `redact` rewrites ANY userinfo in an https URL, a login name included, so an
+  // exact command naming `https://org@…` would reach the caller as `https://***@…`.
+  const held = 'https://org@dev.azure.com/org/p/_git/r';
+  const unowned = {
+    kind: 'unowned' as const,
+    previous: 'git@ssh.dev.azure.com:v3/org/p/r',
+    pushUrls: [],
+  };
+  const errorText = (note: string): string => {
+    const res = errorResult(withOriginNote(new Error('boom'), note), []);
+    return (res.content as Array<{ text: string }>).map((c) => c.text).join('');
+  };
+
+  it('a held URL with a login: the error variant names list_projects and the login, never a *** command', () => {
+    const text = errorText(originNote(unowned, held, 'ws/paper', 'x', { forError: true }));
+    expect(text).toContain('git remote set-url origin <url>');
+    expect(text).toContain('list_projects');
+    expect(text).toContain(quoteId('org'));
+    expect(/`git remote set-url origin ([^`]*)`/.exec(text)?.[1]).toBe('<url>');
+  });
+
+  it('the same for a credential-bearing origin and for a held URL whose token was stripped to user@', () => {
+    for (const [origin, h, cred] of [
+      [
+        `https://me:${SECRET}@bitbucket.example/me/r.git`,
+        'https://me@bitbucket.example/me/r.git',
+        true,
+      ],
+      [
+        `https://me:${SECRET}@bitbucket.example/me/r.git`,
+        `https://me:${SECRET}@bitbucket.example/me/r.git`,
+        true,
+      ],
+    ] as const) {
+      const text = errorText(
+        originNote(
+          {
+            kind: 'unowned',
+            previous: origin,
+            pushUrls: [],
+            ...(cred ? { credentialOnDisk: true as const } : {}),
+          },
+          h,
+          'ws/paper',
+          'x',
+          { forError: true },
+        ),
+      );
+      expect(/`git remote set-url origin ([^`]*)`/.exec(text)?.[1]).toBe('<url>');
+      expect(text).toContain('list_projects');
+      expect(text).toContain(quoteId('me'));
+      expect(text).not.toContain(SECRET);
+    }
+  });
+
+  it('the success variant keeps the exact command', () => {
+    const note = originNote(unowned, held, 'ws/paper', 'x');
+    expect(/`git remote set-url origin ([^`]*)`/.exec(note)?.[1]).toBe(quoteId(held));
+  });
+
+  it('without a userinfo, the error variant is the success one', () => {
+    expect(originNote(unowned, A, 'ws/paper', 'x', { forError: true })).toBe(
+      originNote(unowned, A, 'ws/paper', 'x'),
+    );
+    expect(errorText(originNote(unowned, A, 'ws/paper', 'x', { forError: true }))).toContain(
+      `git remote set-url origin ${quoteId(A)}`,
+    );
   });
 });
 

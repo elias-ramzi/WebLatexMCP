@@ -460,18 +460,17 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
           // is kept and named. Only for the paths that reach the remote — staging a review branch
           // does not. Reported on the result and on a failure after it.
           const reachesRemote = resolving || mode !== 'branch' || approve;
-          const note = reachesRemote
-            ? originNote(
-                await ctx.git.reconcileOrigin(dir, cfg.gitUrl),
-                cfg.gitUrl,
-                dir,
-                'this push goes there',
-              )
+          const origin = reachesRemote ? await ctx.git.reconcileOrigin(dir, cfg.gitUrl) : undefined;
+          const then = 'this push goes there';
+          const note = origin ? originNote(origin, cfg.gitUrl, dir, then) : '';
+          // The error variant: an error is scrubbed (`NoteOptions.forError`).
+          const errorNote = origin
+            ? originNote(origin, cfg.gitUrl, dir, then, { forError: true })
             : '';
           try {
             return withTextNote(await pushLocked(), note);
           } catch (err) {
-            throw withOriginNote(err, note);
+            throw withOriginNote(err, errorNote);
           }
 
           async function pushLocked(): Promise<CallToolResult> {

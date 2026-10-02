@@ -83,6 +83,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
       // text: the dropped-fields and credentials notes describe the registration, this one the
       // clone.
       let repointNote = '';
+      // The same note for an error message (`NoteOptions.forError`: a remedy URL with a login name
+      // would come out of `errorResult`'s scrubber as `https://***@…`).
+      let repointErrorNote = '';
       try {
         // `registerProject` holds the URL without any http(s) secret; the caller must hear that
         // the token they pasted was not used — on success, and above all on a failed clone/pull,
@@ -92,9 +95,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
         // first), its dropped-fields note worded for a URL that may be the reason it failed; the
         // outer catch adds the plain dropped-fields note and the re-point note to any other failure.
         const withNotes = (err: unknown): unknown =>
-          failedDroppedNote || credentialsNote || repointNote
+          failedDroppedNote || credentialsNote || repointErrorNote
             ? new NotedSyncError(
-                `${messageOf(err)}${failedDroppedNote}${credentialsNote}${repointNote}`,
+                `${messageOf(err)}${failedDroppedNote}${credentialsNote}${repointErrorNote}`,
                 err,
               )
             : err;
@@ -129,6 +132,9 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
           if (cloned) {
             const origin = await ctx.git.reconcileOrigin(dir, cfg.gitUrl);
             repointNote = originNote(origin, cfg.gitUrl, dir, 'this sync fetches from it');
+            repointErrorNote = originNote(origin, cfg.gitUrl, dir, 'this sync fetches from it', {
+              forError: true,
+            });
           }
 
           let result: SyncResult;
@@ -201,8 +207,8 @@ export function registerProjectSync(server: McpServer, ctx: AppContext): void {
         // Same shape as `withNotes`: the note rides on the message, the original error
         // stays the cause, and `errorResult` scrubs the whole text as before.
         const reported =
-          (droppedNote || repointNote) && !(err instanceof NotedSyncError)
-            ? new Error(`${messageOf(err)}${droppedNote}${repointNote}`, { cause: err })
+          (droppedNote || repointErrorNote) && !(err instanceof NotedSyncError)
+            ? new Error(`${messageOf(err)}${droppedNote}${repointErrorNote}`, { cause: err })
             : err;
         return errorResult(reported, ctx.credentials.allSecrets());
       }

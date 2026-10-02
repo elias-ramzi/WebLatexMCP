@@ -67,12 +67,15 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
           // Where the fetch goes (`GitService.reconcileOrigin`; run again, as a no-op, inside the
           // reset's fetch): reported on success and on a failure after it.
           const origin = await ctx.git.reconcileOrigin(dir, cfg.gitUrl);
-          const note = originNote(origin, cfg.gitUrl, dir, 'this reset fetches from it');
+          const then = 'this reset fetches from it';
+          const note = originNote(origin, cfg.gitUrl, dir, then);
+          // The error variant: an error is scrubbed (`NoteOptions.forError`).
+          const errorNote = originNote(origin, cfg.gitUrl, dir, then, { forError: true });
           let res;
           try {
             res = await ctx.git.resetToRemote(dir, cfg.gitUrl, auth);
           } catch (err) {
-            throw withOriginNote(err, note);
+            throw withOriginNote(err, errorNote);
           }
           // The reset rewrote the working tree to the remote head; drop stale revision baselines so a
           // later edit isn't misread as an out-of-band change (as project_sync/discard do).

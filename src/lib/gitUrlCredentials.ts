@@ -262,3 +262,12 @@ export function withoutUserinfo(gitUrl: string): string {
   const split = splitUserinfo(trimmed);
   return split === undefined ? trimmed : `${split.scheme}${split.rest}`;
 }
+
+/**
+ * The login name in an http(s) URL's userinfo (as written, percent-escapes kept), or `undefined`
+ * when it has none. Read with the same split as everything else here — no other parsing.
+ */
+export function urlLoginName(gitUrl: string): string | undefined {
+  const split = splitUserinfo(gitUrl.trim());
+  return split === undefined || split.user === '' ? undefined : split.user;
+}
