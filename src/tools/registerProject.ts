@@ -165,15 +165,17 @@ async function resolveLocalTarget(
   try {
     info = await stat(target);
   } catch {
+    // The path is the caller's, so it is quoted and escaped in both messages here.
     throw new Error(
-      `No such file or directory: ${toPosix(target)}. A local project must already exist.`,
+      `No such file or directory: ${quoteId(toPosix(target))}. A local project must already ` +
+        'exist.',
     );
   }
   if (info.isDirectory()) return { dir: target };
   if (!info.isFile()) {
     throw new Error(
-      `${toPosix(target)} is neither a file nor a directory. Point "path" at the document, ` +
-        'or at the folder holding it.',
+      `${quoteId(toPosix(target))} is neither a file nor a directory. Point "path" at the ` +
+        'document, or at the folder holding it.',
     );
   }
   const dir = path.dirname(target);
@@ -285,7 +287,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             cloned,
             default: ctx.projectManager.defaultProjectId() === cfg.id,
           };
-          const text = `"${cfg.id}" is already registered.${defaultRegistrationNote(ctx, true)}`;
+          const text = `${quoteId(cfg.id)} is already registered.${defaultRegistrationNote(ctx, true)}`;
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },
@@ -357,7 +359,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               : ' A symlink pointing out of that folder is not followed (re-register with ' +
                 'followSymlinks: true if the links in it are yours).';
             const text =
-              `Registered "${project}" -> ${outPath} (local, persisted to the workspace ` +
+              `Registered ${quoteId(project)} -> ${quoteId(outPath)} (local, persisted to the workspace ` +
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
@@ -432,13 +434,16 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           // redundant .gitignore entry on the user's behalf.
           const excludeNote = ctx.config.workspaceExcludePattern
             ? ` The clone dir is already excluded from the host repo's git ` +
-              `("${ctx.config.workspaceExcludePattern}" in .git/info/exclude) — no .gitignore ` +
+              `(${quoteId(ctx.config.workspaceExcludePattern)} in .git/info/exclude) — no .gitignore ` +
               'entry needed.'
             : '';
           const text =
-            `Registered "${cfg.id}" -> ${heldUrl} (persisted to the workspace registry). ` +
+            // The URL and the directory are the caller's (or under a workspace the environment
+            // named), so both are quoted and escaped, like the id.
+            `Registered ${quoteId(cfg.id)} -> ${quoteId(heldUrl)} (persisted to the workspace ` +
+            'registry). ' +
             (cloned
-              ? `Cloned at ${outPath}.`
+              ? `Cloned at ${quoteId(outPath)}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
             ` ${workspaceNote(ctx.config.workspaceRoot)}` +

@@ -358,7 +358,7 @@ describe('resolveAssetSource', () => {
  * The paths `resolveAssetSource` puts into its refusals are paths the SERVER resolved, and they
  * reach a caller through `errorResult`. "File paths are always POSIX (`/`-separated), on every
  * OS" is the first line of `docs/tools.md`, and `register_project` already holds error text to
- * it (`No such file or directory: ${toPosix(target)}`), so these do too (#138).
+ * it (`No such file or directory: ${quoteId(toPosix(target))}`), so these do too (#138).
  *
  * Non-vacuity, the whole difficulty here: `toPosix` splits on `path.sep`, which is already `/` on
  * a POSIX host, so on Linux and macOS every assertion below would pass against the unconverted

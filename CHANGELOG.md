@@ -92,9 +92,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`project_sync { gitUrl }`'s notes, on failure.** The dropped-fields note now comes before the
   stripped-token note, as it does on success. It no longer tells you to call `register_project`
   with the URL that may be why the sync failed: it says to do so once the URL is right.
-- **`register_project` quotes and escapes the file name it was pointed at,** and the LaTeX root it
-  inferred from it. A newline or a bidi override in that name could otherwise forge the rest of
-  the message.
+- **`register_project` quotes and escapes every path and URL it echoes:** the file it was
+  pointed at and the LaTeX root, the registered directory or git URL, the clone directory, and the
+  path in a "no such file" refusal. A newline or a bidi override in any of them could otherwise
+  forge the rest of the message. The LaTeX root named is the one registered: an explicit `rootFile`
+  over the one inferred from the file.
 
 ## [0.8.0] - 2026-09-29
 

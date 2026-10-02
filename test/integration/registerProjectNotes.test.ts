@@ -10,6 +10,8 @@ import { createContext, type AppContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry } from '../../src/services/projectRegistry.js';
 import type { ServerConfig } from '../../src/types.js';
+import { quoteId } from '../../src/lib/projectId.js';
+import { toPosix } from '../../src/lib/paths.js';
 import { createFakeRemote } from './helpers/bareRepo.js';
 
 /**
@@ -23,10 +25,12 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-async function setup(): Promise<{ ctx: AppContext; client: Client; root: string }> {
+async function setup(
+  workspaceName = 'ws',
+): Promise<{ ctx: AppContext; client: Client; root: string }> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'wlm-regnotes-'));
   cleanups.push(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
-  const workspace = path.join(root, 'ws');
+  const workspace = path.join(root, workspaceName);
   await mkdir(workspace);
   const config: ServerConfig = { workspaceRoot: workspace, sessionId: 'test', projects: [] };
   const ctx = createContext(
@@ -123,4 +127,74 @@ describe('register_project { path } pointed at a file', () => {
       expect(text).not.toMatch(/\nForged line/);
     },
   );
+});
+
+/**
+ * Every path and URL `register_project` echoes is the caller's (or under a workspace the
+ * environment named), so a bidi override or a newline in one is escaped, never written raw.
+ * Windows refuses a newline in a file name, so there only the override is used.
+ */
+const FORGE = process.platform === 'win32' ? '\u202E' : '\u202E\nForged line';
+
+describe('register_project quotes the paths and URLs it echoes', () => {
+  function expectNothingRaw(text: string): void {
+    expect(text).not.toContain('\u202E');
+    expect(text).not.toMatch(/\nForged line/);
+  }
+
+  it('a local directory', async () => {
+    const { client, root } = await setup();
+    const dir = path.join(root, `draft${FORGE}`);
+    await mkdir(dir);
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'draft', path: dir },
+    });
+    expect(res.isError, textOf(res)).toBeFalsy();
+    const text = textOf(res);
+    expectNothingRaw(text);
+    expect(text).toContain(`Registered "draft" -> ${quoteId(toPosix(dir))} (local`);
+  });
+
+  it('a path that does not exist', async () => {
+    const { client, root } = await setup();
+    const missing = path.join(root, `gone${FORGE}`);
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'draft', path: missing },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expectNothingRaw(text);
+    expect(text).toContain(`No such file or directory: ${quoteId(toPosix(missing))}.`);
+  });
+
+  it('a git URL', async () => {
+    const { client } = await setup();
+    const url = `https://example.invalid/pa${FORGE}per.git`;
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', gitUrl: url, clone: false },
+    });
+    expect(res.isError, textOf(res)).toBeFalsy();
+    const text = textOf(res);
+    expectNothingRaw(text);
+    expect(text).toContain(`Registered "paper" -> ${quoteId(url)} (persisted`);
+  });
+
+  it('the clone directory, under a workspace whose name carries them', async () => {
+    const remote = await createFakeRemote({ 'paper.tex': 'alpha\n' });
+    cleanups.push(remote.cleanup);
+    const { ctx, client } = await setup(`ws${FORGE}`);
+    const res = await client.callTool({
+      name: 'register_project',
+      arguments: { project: 'paper', gitUrl: remote.url },
+    });
+    expect(res.isError, textOf(res)).toBeFalsy();
+    const text = textOf(res);
+    expectNothingRaw(text);
+    expect(text).toContain(
+      `Cloned at ${quoteId(toPosix(ctx.projectManager.projectPath('paper')))}.`,
+    );
+  });
 });
