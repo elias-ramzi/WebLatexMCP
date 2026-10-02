@@ -43,7 +43,8 @@ const outputSchema = {
     .enum(['none', 'opened', 'downloaded', 'manual'])
     .describe(
       '"none": no bundle was fetched (check only, already up to date, a running version newer ' +
-        'than the latest release, or one that cannot be compared). "opened": the OS accepted ' +
+        'than the latest release, or — when install was not asked for — one that cannot be ' +
+        'compared). "opened": the OS accepted ' +
         'the request to open the verified bundle ' +
         '(normally in Claude Desktop, which asks the user to confirm) — not proof that Desktop ' +
         'received it: with no handler for .mcpb the OS may show an "Open with" dialog instead. ' +

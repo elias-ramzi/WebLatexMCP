@@ -52,37 +52,50 @@ export function syncRegistration(
  * as different (the safe reading), and it may well name the same repository. The remedy names
  * `register_project`, the tool that takes those fields — `project_sync` takes none. No URL is
  * echoed, so nothing a URL carried can reach the message.
+ *
+ * `failed` words the remedy for a sync that then failed: the URL may be the reason (a typo), so
+ * the note does not send the caller back to it unconditionally.
  */
 export function syncDroppedNote(
   id: string,
   previous: ProjectConfig | undefined,
   dropped: readonly DroppedField[],
+  failed = false,
 ): string {
   if (previous === undefined || dropped.length === 0) return '';
   const fields = droppedFieldList(dropped);
+  const withUrl = failed
+    ? 'once the gitUrl is right, call register_project with it'
+    : 'call register_project with this gitUrl';
   if (isLocalProject(previous)) {
     return (
       `\n${quoteId(id)} was a local project; syncing it as a git project replaced that ` +
       `configuration, dropping its ${fields}. To give the git project fields of its own, ` +
-      'call register_project with this gitUrl and them.'
+      `${withUrl} and them.`
     );
   }
   return (
     `\nThis gitUrl differs from the one ${quoteId(id)} was registered with, so its previous ` +
-    `configuration was replaced, dropping its ${fields} — to keep them, call register_project ` +
-    'with this gitUrl and those fields.'
+    `configuration was replaced, dropping its ${fields} — to keep them, ${withUrl} and those ` +
+    'fields.'
   );
 }
 
 /**
  * What `project_sync { gitUrl }` registers for `id`, and the note naming what that dropped —
- * `previous` being the config it replaces (see `syncRegistration`). Pure.
+ * `previous` being the config it replaces (see `syncRegistration`) — worded for a sync that
+ * succeeds (`note`) and for one that then fails (`failedNote`). Pure.
  */
 export function planSyncRegistration(
   id: string,
   gitUrl: string,
   previous: ProjectConfig | undefined,
-): { next: GitProjectConfig; note: string } {
+): { next: GitProjectConfig; note: string; failedNote: string } {
   const next = syncRegistration(id, gitUrl, previous);
-  return { next, note: syncDroppedNote(id, previous, droppedRegistrationFields(previous, next)) };
+  const dropped = droppedRegistrationFields(previous, next);
+  return {
+    next,
+    note: syncDroppedNote(id, previous, dropped),
+    failedNote: syncDroppedNote(id, previous, dropped, true),
+  };
 }

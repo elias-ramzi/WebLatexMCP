@@ -21,6 +21,18 @@ jobs:
           node-version: 22
           cache: npm
       - run: git config --global core.autocrlf false
+      # The bundle's server reports package.json's version (getServerVersion), not the tag, so a
+      # release whose package.json was not bumped would ship a .mcpb that calls itself the old
+      # version — and update_server would offer that same "update" forever. Same guard as
+      # publish.yml.
+      - name: Verify tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${TAG}) does not match package.json version ${PKG}." >&2
+            exit 1
+          fi
       - run: npm ci
       # Build with dev deps present, then drop them so only runtime deps ship in the bundle.
       - run: npm run build

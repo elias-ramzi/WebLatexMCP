@@ -33,6 +33,8 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 async function tmp(prefix: string): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
   cleanups.push(() => rm(dir, { recursive: true, force: true }));
@@ -498,6 +500,46 @@ describe('UpdateService.downloadBundle', () => {
       expect(opened).toEqual([]);
       expect(await readdir(tmpDir)).toEqual([]);
     });
+
+    it('lets the real download timeout fire on a body that stalls', async () => {
+      // No hand-made TimeoutError: the body is wired to the signal the service passes, as a real
+      // fetch body is, so only `AbortSignal.timeout(downloadTimeoutMs)` can end the stall.
+      let signal: AbortSignal | undefined;
+      const fetch: UpdateFetch = async (url, init) => {
+        if (url.endsWith('/releases/latest')) return response(release('v0.9.0'));
+        signal = init.signal;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(ZIP.subarray(0, 4));
+            init.signal?.addEventListener('abort', () => controller.error(init.signal?.reason));
+          },
+        });
+        return { ...response({}), body };
+      };
+      const { svc, opened, tmpDir } = await makeService({ fetch, downloadTimeoutMs: 50 });
+      const { release: rel } = await svc.check();
+      const started = Date.now();
+      await expect(svc.downloadBundle(rel)).rejects.toThrow(
+        `Downloading ${BUNDLE_ASSET} failed: timed out.`,
+      );
+      expect(signal?.aborted).toBe(true);
+      expect((signal?.reason as Error | undefined)?.name).toBe('TimeoutError');
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
+  });
+
+  it('saves directly inside an absolute temp dir, exactly where it is given', async () => {
+    const tmpDir = await tmp('wlm-upd-abs-');
+    expect(path.resolve(tmpDir)).toBe(tmpDir);
+    const { svc, opened } = await makeService({ fetch: fakeFetch(release('v0.9.0')), tmpDir });
+    const got = await svc.downloadBundle((await svc.check()).release);
+    const dir = path.dirname(got.path);
+    expect(path.dirname(dir)).toBe(tmpDir);
+    expect(path.basename(dir)).toMatch(/^web-latex-mcp-update-/);
+    expect(await readdir(tmpDir)).toEqual([path.basename(dir)]);
+    expect(opened).toEqual([got.path]);
   });
 
   it('saves under an absolute path when the temp dir is given relative', async () => {
@@ -535,9 +577,79 @@ describe('UpdateService.downloadBundle', () => {
     );
     expect(err).toBeInstanceOf(UpdateError);
     const message = (err as Error).message;
-    expect(message).toContain(`Could not save ${BUNDLE_ASSET} under ${quoteId(toPosix(tmpDir))}: `);
+    // The file actually written is named, and the path only once: an fs error's code is appended,
+    // never its message, which repeats the path.
+    expect(message).toMatch(
+      new RegExp(
+        `^Could not save web-latex-mcp-0\\.9\\.0\\.mcpb under ${escapeRegExp(quoteId(toPosix(tmpDir)))}: E[A-Z]+\\.$`,
+      ),
+    );
     expect(message).not.toContain('‮');
     expect(opened).toEqual([]);
+  });
+
+  describe('a write that fails', () => {
+    for (const code of ['ENOSPC', 'EEXIST', 'EACCES']) {
+      it(`names the fresh directory and the code (${code}), removes what it wrote, and opens nothing`, async () => {
+        const tmpDir = await tmp('wlm-upd-wfail-');
+        const written: string[] = [];
+        const { svc, opened } = await makeService({
+          fetch: fakeFetch(release('v0.9.0')),
+          tmpDir,
+          writeFile: async (file, data) => {
+            written.push(file);
+            // A write that fails partway: half the bytes land, then the disk is full.
+            await writeFile(file, data.subarray(0, data.length >> 1));
+            throw Object.assign(new Error(`${code}: failed, write '${file}'`), {
+              code,
+              syscall: 'write',
+            });
+          },
+        });
+        const err: unknown = await svc.downloadBundle((await svc.check()).release).then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(UpdateError);
+        expect(written).toHaveLength(1);
+        const dir = path.dirname(written[0]!);
+        expect(path.dirname(dir)).toBe(tmpDir);
+        expect((err as Error).message).toBe(
+          `Could not save web-latex-mcp-0.9.0.mcpb under ${quoteId(toPosix(dir))}: ${code}. ` +
+            'Nothing was left behind.',
+        );
+        expect(opened).toEqual([]);
+        expect(await readdir(tmpDir)).toEqual([]);
+      });
+    }
+
+    it('names an error that carries a code but no system call by its message', async () => {
+      const { svc } = await makeService({
+        fetch: fakeFetch(release('v0.9.0')),
+        writeFile: async () => {
+          throw Object.assign(new TypeError('The "data" argument must be a Buffer'), {
+            code: 'ERR_INVALID_ARG_TYPE',
+          });
+        },
+      });
+      await expect(svc.downloadBundle((await svc.check()).release)).rejects.toThrow(
+        /: The "data" argument must be a Buffer\. Nothing was left behind\.$/,
+      );
+    });
+
+    it('still names a non-fs failure in full', async () => {
+      const { svc, opened, tmpDir } = await makeService({
+        fetch: fakeFetch(release('v0.9.0')),
+        writeFile: async () => {
+          throw new Error('disk on fire\u202E');
+        },
+      });
+      await expect(svc.downloadBundle((await svc.check()).release)).rejects.toThrow(
+        /: disk on fire\\u\{202E\}\. Nothing was left behind\.$/,
+      );
+      expect(opened).toEqual([]);
+      expect(await readdir(tmpDir)).toEqual([]);
+    });
   });
 
   it('escapes the reason phrase of a refused request', async () => {
@@ -656,7 +768,9 @@ describe('update_server tool', () => {
     const { svc, opened } = await makeService({ fetch, installKind: 'npm' });
     const { sc } = await call(await connect(svc), { install: true });
     expect(sc).toMatchObject({ installKind: 'npm', action: 'manual' });
-    expect(String(sc.advice)).toContain('web-latex-mcp@0.9.0');
+    // `@latest` first: the pinned version exists on npm only if publish.yml succeeded for it.
+    expect(String(sc.advice)).toContain('npx -y web-latex-mcp@latest');
+    expect(String(sc.advice)).toContain('`@0.9.0`, if npm lists that version yet');
     expect(fetch.urls).toHaveLength(1);
     expect(opened).toEqual([]);
   });
