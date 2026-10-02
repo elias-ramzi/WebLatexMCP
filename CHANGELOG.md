@@ -32,7 +32,7 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   install that had left the field blank and picks up the new default starts from an empty project
   list: point the field back at `~/.web-latex-mcp/projects` to keep the projects registered there.
   `list_projects` says so when it happens: an empty list now names how many projects are registered
-  in that fallback workspace when the server is using another one.
+  in that fallback workspace when the server is using another one, alongside the folder in use.
 - **The tools you meet first say which workspace is in use and how to move it.** `list_projects`'
   empty state, `register_project`'s result for a git project, and the `credential_portal` page name
   the workspace folder and where to change it, and `doctor`'s unwritable-workspace hint names the

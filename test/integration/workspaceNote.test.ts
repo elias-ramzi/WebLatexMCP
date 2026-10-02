@@ -76,6 +76,11 @@ describe('list_projects on an empty workspace', () => {
     expect(text).toContain('No projects registered yet');
     expect(text).toContain(`2 projects are registered in "${toPosix(fallback)}"`);
     expect(text).toContain('Settings → Extensions → WebLatexMCP → Clone workspace folder');
+    // The folder actually in use is named too: this is the case where the caller most needs it.
+    expect(text).toContain(`Workspace (clones and the project list): "${toPosix(workspace)}"`);
+    // Neutral wording: in workspace-local mode a separate project list is by design, not a loss.
+    expect(text).toContain('To use them, point');
+    expect(text).not.toContain('get them back');
   });
 
   it('says where the workspace is when the fallback holds nothing', async () => {

@@ -123,8 +123,10 @@ export interface ServerConfig {
   /**
    * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
    * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one
-   * does — the case of a Desktop extension that now gets `~/latex-workspace` as its default
-   * after running on the fallback, whose registered projects would otherwise seem gone.
+   * does — a Desktop extension that now gets `~/latex-workspace` as its default after running on
+   * the fallback, or any server launched with another workspace (workspace-local mode included,
+   * where a separate project list is by design), whose registered projects would otherwise go
+   * unmentioned.
    */
   fallbackWorkspaceRoot?: string;
   /**

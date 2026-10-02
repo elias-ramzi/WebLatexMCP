@@ -25,14 +25,15 @@ export function workspaceNote(workspaceRoot: string): string {
 
 /**
  * For an empty project list: projects are registered in the server's fallback workspace, which
- * this server is not using — most likely a Desktop extension that ran on the fallback before
- * its form got a default folder.
+ * this server is not using. That covers a Desktop extension that ran on the fallback before its
+ * form got a default folder, and any server launched with another workspace — workspace-local
+ * mode (`<repo>/.web_latex_mcp`) included, where a separate project list is by design — so the
+ * wording states where the projects are and how to use them, never that they were lost.
  */
 export function fallbackWorkspaceNote(fallbackRoot: string, count: number): string {
   const projects = count === 1 ? '1 project is' : `${count} projects are`;
   return (
     `${projects} registered in ${quoteId(toPosix(fallbackRoot))}, a workspace this server is ` +
-    `not using. To get them back, point ${WORKSPACE_SETTING} at that folder and restart the ` +
-    'server.'
+    `not using. To use them, point ${WORKSPACE_SETTING} at that folder and restart the server.`
   );
 }

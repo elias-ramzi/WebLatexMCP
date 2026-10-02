@@ -57,15 +57,15 @@ const outputSchema = {
 };
 
 /**
- * The empty state's last line. Projects registered in the server's fallback workspace, which
- * this server is not using, are named first: an empty list is otherwise read as "they are gone".
+ * The empty state's closing lines: the workspace in use, preceded by the projects registered in the
+ * server's fallback workspace when this server is not using it and it holds any — an empty list
+ * is otherwise read as "they are gone", and the folder in use is what tells the two apart.
  */
 function emptyWorkspaceNote(ctx: AppContext): string {
   const fallback = ctx.config.fallbackWorkspaceRoot;
   const count = fallback ? countRegisteredProjects(fallback) : 0;
-  return fallback && count > 0
-    ? fallbackWorkspaceNote(fallback, count)
-    : workspaceNote(ctx.config.workspaceRoot);
+  const inUse = workspaceNote(ctx.config.workspaceRoot);
+  return fallback && count > 0 ? `${fallbackWorkspaceNote(fallback, count)}\n${inUse}` : inUse;
 }
 
 export function registerListProjects(server: McpServer, ctx: AppContext): void {
