@@ -132,8 +132,9 @@ function isHeld(state: OriginState, origin: string): boolean {
   if (localPathKind(held) === undefined || localPathKind(origin) !== 'absolute') return false;
   if (path.resolve(held) === path.resolve(origin)) return true;
   if (state.realpath === undefined) return false;
+  // Both sides resolved the same way first: on Windows a rooted `/r.git` takes the cwd's drive.
   const a = state.realpath(path.resolve(held));
-  const b = state.realpath(origin);
+  const b = state.realpath(path.resolve(origin));
   return a !== undefined && a === b;
 }
 

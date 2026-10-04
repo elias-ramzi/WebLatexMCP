@@ -86,7 +86,8 @@ describe('decideOrigin', () => {
     });
 
     it('judges local paths by realpath when one is supplied (git records $PWD, Node the real cwd)', () => {
-      const realpath = (p: string) => p.replace('/link/', '/real/');
+      // Separator-agnostic: on Windows both sides arrive resolved, as `D:\link\r.git`.
+      const realpath = (p: string) => p.replace(/([\\/])link([\\/])/, '$1real$2');
       expect(
         decideOrigin(state({ originUrls: ['/link/r.git'], heldStripped: '/real/r.git', realpath })),
       ).toEqual({ kind: 'unchanged', writeRecord: true });
