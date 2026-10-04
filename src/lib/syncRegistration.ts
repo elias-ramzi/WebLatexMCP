@@ -128,7 +128,8 @@ export function syncDroppedNote(
  * worded for a sync that succeeds (`note`) and for one that then fails (`failedNote`). `held` is
  * the config this process holds; with `registry`, a restatement of the registry's entry is planned
  * from that entry instead (`syncRegistrationBase`), so it carries the entry's fields and drops
- * nothing. The note is judged against the base the plan was made from. Pure.
+ * nothing. The note is judged against the base the plan was made from — except that a local
+ * `held` is always what the note judges, since that is the configuration this process drops. Pure.
  */
 export function planSyncRegistration(
   id: string,
@@ -138,10 +139,13 @@ export function planSyncRegistration(
 ): { next: GitProjectConfig; note: string; failedNote: string } {
   const previous = registry ? syncRegistrationBase(gitUrl, held, registry) : held;
   const next = syncRegistration(id, gitUrl, previous);
-  const dropped = droppedRegistrationFields(previous, next);
+  // A local `held` is what this call replaces whatever the plan was based on: judged against the
+  // registry's entry instead, the note came back empty while the local config was dropped.
+  const replaced = held !== undefined && isLocalProject(held) ? held : previous;
+  const dropped = droppedRegistrationFields(replaced, next);
   return {
     next,
-    note: syncDroppedNote(id, previous, dropped),
-    failedNote: syncDroppedNote(id, previous, dropped, true),
+    note: syncDroppedNote(id, replaced, dropped),
+    failedNote: syncDroppedNote(id, replaced, dropped, true),
   };
 }

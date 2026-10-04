@@ -199,6 +199,23 @@ describe('planSyncRegistration with the registry entry: a restatement is planned
     expect(plan.next).toEqual({ id: 'paper', gitUrl: U2, branch: 'env-branch' });
   });
 
+  it('a local held project restating the registry URL keeps the entry as base, and the note names what it drops', () => {
+    const held: ProjectConfig = {
+      id: 'paper',
+      mode: 'local',
+      path: '/p',
+      rootFile: 'a.tex',
+      followSymlinks: true,
+    };
+    const entry: ProjectConfig = { id: 'paper', gitUrl: U2, branch: 'main' };
+    const plan = planSyncRegistration('paper', U2, held, { entry, envConfigured: false });
+    expect(plan.next).toEqual({ id: 'paper', gitUrl: U2, branch: 'main' });
+    expect(plan.note).toMatch(
+      /^\n"paper" was a local project; syncing it as a git project replaced/,
+    );
+    expect(plan.failedNote).toMatch(/once the gitUrl is right/);
+  });
+
   it('a local registry entry is never a base for a git registration', () => {
     const entry: ProjectConfig = { id: 'paper', mode: 'local', path: '/p', rootFile: 'a.tex' };
     expect(planSyncRegistration('paper', U1, stale, { entry, envConfigured: false })).toEqual(

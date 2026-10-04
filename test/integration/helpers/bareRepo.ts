@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { rmSync, mkdtempSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, rm, cp } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
+import { inject } from 'vitest';
 
 // Windows keeps transient locks on freshly-used .git files (the OS/AV releases them a
 // beat later), so a plain recursive rm can throw EBUSY/ENOTEMPTY. Retry to ride it out.
@@ -63,7 +64,9 @@ type RootRegistry = { [ROOTS]?: string[] };
 
 function templatesDir(): string {
   if (templateRoot === undefined) {
-    templateRoot = mkdtempSync(path.join(os.tmpdir(), 'ovl-tpl-'));
+    // Under the run's own directory (`test/helpers/templateRunDir.ts`), which the global teardown
+    // removes even when this worker is terminated and its `exit` handler never runs (#247).
+    templateRoot = mkdtempSync(path.join(inject('templateRunDir'), 'ovl-tpl-'));
     const host = globalThis as RootRegistry;
     let roots = host[ROOTS];
     if (roots === undefined) {

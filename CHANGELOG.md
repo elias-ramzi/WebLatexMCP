@@ -53,6 +53,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **Follow-ups from the review of #246 (#247).** `project_sync { gitUrl }` on a project this
+  session held as a local one now names the local fields it drops, even when another session has
+  since registered the same URL. A git URL holding a password with no username before it
+  (`ssh://:pw@host/…`) is no longer described as "an access token (token@)". Error messages now
+  hide the password in `https:/user:pw@host`, `https:\user:pw@host` and `https:user:pw@host`
+  shapes, and the whole of a credential query value that itself contains `<scheme>://`. Test
+  runs no longer leave `ovl-tpl-*` directories in the OS temp dir, and the regex-timing test
+  tolerates a loaded machine.
+
 - **A cloned project's fetch, pull and push now go to the URL the session holds — while the server
   owns the clone's `origin`.** `project_sync` and `register_project` with a different `gitUrl`
   updated the registration but not the clone's `origin`, which is what every remote operation uses:

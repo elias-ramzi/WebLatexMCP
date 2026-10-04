@@ -541,8 +541,7 @@ keeps that URL for itself: between it and its peers one flip remains, each fetch
 where its own URL says and re-pointing `origin` as it goes, under the project lock. That flip is
 inherent to a registration nobody else can see; `register_project` is the way to move every
 session. A `project_sync` whose `gitUrl` merely restates the registered one is not such a
-registration: it takes the registered branch and credential settings — whatever this session last
-loaded — keeps nothing of its own, and follows a later `register_project` like any peer. Each of those three calls reads the registration before it waits
+registration: it takes the registry's current branch and credential settings, keeps nothing of its own, and follows a later `register_project` like any peer. Each of those three calls reads the registration before it waits
 for the project lock and again once it holds it; if a peer re-registered the project in between
 (URL or credential settings), the call is refused — naming the old and new values — with nothing
 fetched or pushed, rather than pointing `origin` back at the URL it started with. Retry it. Each fetch also overwrites and prunes the clone's `refs/remotes/origin/*`, which the

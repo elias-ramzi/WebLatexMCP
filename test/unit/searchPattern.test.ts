@@ -637,8 +637,9 @@ describe('buildSearchMatcher: patterns that must keep working', () => {
    * `x{0,75}x*` followed by four empty-matching repeats, 1.3-1.8s; the converging families,
    * 1.2-1.3s at the largest counts the analyzer accepted before it counted them, and 6.4s for
    * two stages), and the threshold sits in between at 1s. Load only ever slows a run down, so
-   * a line counts as slow only when it is slow on every one of three attempts: a busy CI
-   * runner has to stall the same scan three times running to fail it.
+   * a line counts as slow only when it is slow on every one of three attempts AND more than
+   * `SLOW_RATIO` times the reference scan timed at that moment: a machine slowed across the
+   * board (two suites at once) slows the reference with it.
    */
   it('runs every accepted pattern fast on adversarial 2000-character lines', () => {
     // A run of distinct letters: `x` then `a`s, which overlaps itself nowhere — period `k`.
@@ -783,8 +784,15 @@ describe('buildSearchMatcher: patterns that must keep working', () => {
       }
       for (const line of adversarialLines(pattern, extra)) {
         const ms = timeScan(re, line, SLOW_LINE_MS);
-        if (ms > SLOW_LINE_MS) {
-          slow.push(`${pattern} on ${JSON.stringify(line.slice(0, 12))}…: ${ms.toFixed(0)}ms`);
+        if (ms <= SLOW_LINE_MS) continue;
+        // Slow by the clock; slow by the machine too? The reference is timed right now, so a
+        // load that stalled the scan stalls it as well (#247: two suites at once failed this).
+        const ref = referenceScanMs();
+        if (ms > SLOW_RATIO * ref) {
+          slow.push(
+            `${pattern} on ${JSON.stringify(line.slice(0, 12))}…: ${ms.toFixed(0)}ms ` +
+              `(reference ${ref.toFixed(0)}ms)`,
+          );
           break;
         }
       }
@@ -893,6 +901,29 @@ const LS = String.fromCharCode(0x2028);
 
 /** A line slower than this on every attempt is a misjudged pattern. See the test above. */
 const SLOW_LINE_MS = 1000;
+
+/**
+ * A line over `SLOW_LINE_MS` counts as slow only when it is also more than this many times the
+ * reference scan (`referenceScanMs`) timed at that moment. Load slows both alike, so the ratio
+ * holds where the clock does not. The gap it sits in is the one the test header measures: the
+ * costliest accepted patterns run at 1 to 3 times the reference, a misjudged one at about 9
+ * (1.2s against ~135ms) and up.
+ */
+const SLOW_RATIO = 6;
+
+const REFERENCE_RE = /\w*\w{19}!/;
+const REFERENCE_LINE = 'a'.repeat(2000);
+
+/** The reference the header names, `\w*\w{19}!` on 2000 `a`s: the fastest of three scans. */
+function referenceScanMs(): number {
+  let best = Infinity;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const started = performance.now();
+    REFERENCE_RE.exec(REFERENCE_LINE);
+    best = Math.min(best, performance.now() - started);
+  }
+  return best;
+}
 
 /**
  * Scan the line as `search_files` does — ONE `exec` from the start, which finds the first match

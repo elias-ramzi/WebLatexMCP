@@ -167,11 +167,12 @@ function looksLikeToken(user: string, rest: string): boolean {
 }
 
 /**
- * What a strip removed, judged by the userinfo first: a password (the username kept), a whole
- * userinfo that was a token, or — when the userinfo carried nothing — one or more credential
- * query parameters. A query removed beside a userinfo credential is reported by `queryRemoved`.
+ * What a strip removed, judged by the userinfo first: a password (the username kept), a password
+ * with no username before it (`:pw@`, `bare-password`), a whole userinfo that was a token, or —
+ * when the userinfo carried nothing — one or more credential query parameters. A query removed
+ * beside a userinfo credential is reported by `queryRemoved`.
  */
-export type RemovedCredential = 'password' | 'token' | 'query';
+export type RemovedCredential = 'password' | 'bare-password' | 'token' | 'query';
 
 /** What `stripGitUrlCredentials` returns. Keys are present only when they say something. */
 export interface StrippedGitUrl {
@@ -402,7 +403,13 @@ export function stripGitUrlCredentials(gitUrl: string): StrippedGitUrl {
         : `?${keptParams!.join('&')}`;
   const url = `${userinfoFor(p, verdict, '', '')}${p.authority}${p.path}${query}${p.fragment}`;
   const removed: RemovedCredential =
-    verdict === 'user-only' ? 'password' : verdict === 'remove' ? 'token' : 'query';
+    verdict === 'user-only'
+      ? 'password'
+      : verdict === 'remove'
+        ? p.userinfo?.user === '' && p.userinfo.password !== undefined
+          ? 'bare-password'
+          : 'token'
+        : 'query';
   return {
     url,
     stripped: true,
@@ -489,13 +496,17 @@ export function strippedCredentialsNote(
       ? ' The gitUrl carried a password or token after the username (user:token@); it was ' +
         'removed and NOT stored — neither in the workspace registry nor in the clone’s git ' +
         'config. The username was kept.'
-      : removed === 'token'
-        ? ' The gitUrl’s userinfo was an access token (token@); it was removed and NOT stored — ' +
-          'neither in the workspace registry nor in the clone’s git config.'
-        : ' The gitUrl’s query string carried what looks like an access token (a parameter such ' +
-          'as private_token=… or access_token=…); that parameter was removed and NOT stored — ' +
-          'neither in the workspace registry nor in the clone’s git config. The rest of the URL ' +
-          'was kept as written.';
+      : removed === 'bare-password'
+        ? ' The gitUrl carried a password or token with no username before it (:token@); it ' +
+          'was removed and NOT stored — neither in the workspace registry nor in the clone’s ' +
+          'git config.'
+        : removed === 'token'
+          ? ' The gitUrl’s userinfo was an access token (token@); it was removed and NOT stored — ' +
+            'neither in the workspace registry nor in the clone’s git config.'
+          : ' The gitUrl’s query string carried what looks like an access token (a parameter such ' +
+            'as private_token=… or access_token=…); that parameter was removed and NOT stored — ' +
+            'neither in the workspace registry nor in the clone’s git config. The rest of the URL ' +
+            'was kept as written.';
   const query =
     alsoQuery && removed !== 'query'
       ? ' A credential parameter in its query string (such as private_token=…) was removed too.'

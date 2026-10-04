@@ -24,6 +24,8 @@ export default defineConfig({
     include: ['test/**/*.test.ts'],
     // Creates the build root 0700 before any helper can mkdir it under the process umask.
     setupFiles: ['test/helpers/buildRootSetup.ts'],
+    // One temp directory per run for bareRepo's fixture templates, removed at the end of the run.
+    globalSetup: ['test/helpers/templateRunDir.ts'],
     testTimeout: TEST_TIMEOUT_MS,
     hookTimeout: TEST_TIMEOUT_MS,
     coverage: {
