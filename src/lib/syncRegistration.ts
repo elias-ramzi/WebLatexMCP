@@ -12,9 +12,10 @@ import { droppedFieldList, droppedRegistrationFields, type DroppedField } from '
  * of the process — changing what `compile`, the PDF tools and the viewer build, which branch is
  * synced, and which token authenticates — merely because the caller re-stated its URL.
  *
- * `previous` is the config this registration REPLACES: the one this process holds for `id`
- * (`ProjectManager.heldConfig`) — an env-configured project's env config, never a registry entry
- * the env one outranks. When it is a GIT project for the SAME remote, those four fields are
+ * `previous` is the config the registration is planned FROM (`syncRegistrationBase`): normally the
+ * one this process holds for `id` (`ProjectManager.heldConfig`) — an env-configured project's env
+ * config, never a registry entry the env one outranks — or the registry's current entry when the
+ * call restates its URL. When it is a GIT project for the SAME remote, those four fields are
  * carried forward. "Same" is judged like for like: both URLs go through `stripGitUrlCredentials`,
  * the strip `registerProject` applies before it holds a URL, so a URL differing only by a pasted
  * secret is the same remote, while neither side's secret is ever part of the comparison (an
@@ -31,15 +32,56 @@ export function syncRegistration(
 ): GitProjectConfig {
   const next: GitProjectConfig = { id, gitUrl };
   if (previous === undefined || isLocalProject(previous)) return next;
-  if (stripGitUrlCredentials(previous.gitUrl).url !== stripGitUrlCredentials(gitUrl).url) {
-    return next;
-  }
+  if (!sameRemote(previous.gitUrl, gitUrl)) return next;
   // Only fields that are set, so no explicit-`undefined` key reaches the held config.
   if (previous.rootFile !== undefined) next.rootFile = previous.rootFile;
   if (previous.branch !== undefined) next.branch = previous.branch;
   if (previous.username !== undefined) next.username = previous.username;
   if (previous.tokenEnv !== undefined) next.tokenEnv = previous.tokenEnv;
   return next;
+}
+
+/** Two URLs compared in the form `registerProject` holds them (trimmed, credentials stripped). */
+function sameRemote(a: string, b: string): boolean {
+  return stripGitUrlCredentials(a).url === stripGitUrlCredentials(b).url;
+}
+
+/**
+ * The registry's view of `id` for `planSyncRegistration`: its current entry
+ * (`ProjectManager.previousRegistration`, which prefers the registry's entry) and whether `id` is
+ * configured through `WEB_LATEX_MCP_PROJECTS` (`ServerConfig.envProjectIds`).
+ */
+export interface SyncRegistryView {
+  entry: ProjectConfig | undefined;
+  envConfigured: boolean;
+}
+
+/**
+ * The config `project_sync { gitUrl }` plans its registration from: the registry's current `entry`
+ * when it is a git project whose URL, in held form, is the one given — a restatement of the
+ * registry's registration — and otherwise `held`, the config this process holds.
+ *
+ * Why: `ProjectManager.registerProject` pins a session-only registration against
+ * `refreshedGitConfig` unless it repeats the registry's entry in `gitUrl`, `branch`, `tokenEnv`
+ * and `username` (`sameRegistration`). Planned from a snapshot older than a peer's
+ * re-registration, a restatement carried the snapshot's fields (or, from a snapshot at another
+ * URL, none) — differing from the entry, it pinned, and the session kept that URL after the peer
+ * re-pointed the project again, its next push flipping `origin` back. Planned from the entry, a
+ * restatement repeats it, pins nothing, and clears an earlier pin — even one a session set by
+ * re-pointing elsewhere first, which `refreshedGitConfig` (returning a pinned config as held)
+ * could not undo.
+ *
+ * An env-configured id keeps `held`: env wins over the registry. A URL the registry does not
+ * hold keeps `held` too — a re-point is the session's own choice and still pins. Pure.
+ */
+export function syncRegistrationBase(
+  gitUrl: string,
+  held: ProjectConfig | undefined,
+  registry: SyncRegistryView,
+): ProjectConfig | undefined {
+  const { entry, envConfigured } = registry;
+  if (envConfigured || entry === undefined || isLocalProject(entry)) return held;
+  return sameRemote(entry.gitUrl, gitUrl) ? entry : held;
 }
 
 /**
@@ -83,14 +125,18 @@ export function syncDroppedNote(
 
 /**
  * What `project_sync { gitUrl }` registers for `id`, and the note naming what that dropped —
- * `previous` being the config it replaces (see `syncRegistration`) — worded for a sync that
- * succeeds (`note`) and for one that then fails (`failedNote`). Pure.
+ * worded for a sync that succeeds (`note`) and for one that then fails (`failedNote`). `held` is
+ * the config this process holds; with `registry`, a restatement of the registry's entry is planned
+ * from that entry instead (`syncRegistrationBase`), so it carries the entry's fields and drops
+ * nothing. The note is judged against the base the plan was made from. Pure.
  */
 export function planSyncRegistration(
   id: string,
   gitUrl: string,
-  previous: ProjectConfig | undefined,
+  held: ProjectConfig | undefined,
+  registry?: SyncRegistryView,
 ): { next: GitProjectConfig; note: string; failedNote: string } {
+  const previous = registry ? syncRegistrationBase(gitUrl, held, registry) : held;
   const next = syncRegistration(id, gitUrl, previous);
   const dropped = droppedRegistrationFields(previous, next);
   return {

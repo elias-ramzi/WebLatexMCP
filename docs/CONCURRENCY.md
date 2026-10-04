@@ -526,6 +526,30 @@ branch-mode landing, whose summary then prescribes the direct-mode push that rec
 The practical rhythm: sessions commit as they finish a piece, and whoever pushes does
 so when the others are between edits.
 
+Where a fetch, pull or push goes is the URL each session holds for the project: before every remote
+operation the server points the shared clone's `origin` at its own held URL — but only while it owns
+`origin`, i.e. `origin` is still exactly what the server last wrote (recorded in the clone's
+`.git/config`). Before it does, `project_sync` (without `gitUrl`), `push` and `reset_to_remote`
+re-read the project's entry in the workspace registry and adopt it — URL, branch, credential
+settings and root together, as a freshly started session would hold them. So when one session
+re-registers a project at a new remote with `register_project`, every peer converges on that
+latest **persisted** registration at its next remote operation, instead of pointing `origin` back
+at the URL it loaded at startup and pushing there. Two exceptions keep their own URL. A project
+configured through `WEB_LATEX_MCP_PROJECTS` never follows the registry (env always wins). And a
+session that ran `project_sync` with a `gitUrl` — a session-only registration, never persisted —
+keeps that URL for itself: between it and its peers one flip remains, each fetching and pushing
+where its own URL says and re-pointing `origin` as it goes, under the project lock. That flip is
+inherent to a registration nobody else can see; `register_project` is the way to move every
+session. A `project_sync` whose `gitUrl` merely restates the registered one is not such a
+registration: it takes the registered branch and credential settings — whatever this session last
+loaded — keeps nothing of its own, and follows a later `register_project` like any peer. Each of those three calls reads the registration before it waits
+for the project lock and again once it holds it; if a peer re-registered the project in between
+(URL or credential settings), the call is refused — naming the old and new values — with nothing
+fetched or pushed, rather than pointing `origin` back at the URL it started with. Retry it. Each fetch also overwrites and prunes the clone's `refs/remotes/origin/*`, which the
+sessions share too: until a session's next fetch, a lock-free `status` there can report
+ahead/behind against the other session's remote. An `origin` set by hand — or carrying a password
+or token — is never rewritten by any session.
+
 ### What this does not do
 
 - **It is one machine only.** All of it rests on a shared filesystem. Two people on

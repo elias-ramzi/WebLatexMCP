@@ -145,3 +145,64 @@ describe('the two dropped-fields notes render a held value alike', () => {
     expect(sync).toContain('rootFile="sub\\\\main.tex"');
   });
 });
+
+describe('planSyncRegistration with the registry entry: a restatement is planned from it', () => {
+  const U1 = 'https://github.com/acme/paper.git';
+  const U2 = 'https://github.com/acme/moved.git';
+  const stale: ProjectConfig = { id: 'paper', gitUrl: U1 };
+
+  it("a stale snapshot restating the registry's URL takes the registry's fields, dropping nothing", () => {
+    const entry: ProjectConfig = { id: 'paper', gitUrl: U2, branch: 'main' };
+    const plan = planSyncRegistration('paper', U2, stale, { entry, envConfigured: false });
+    expect(plan.next).toEqual({ id: 'paper', gitUrl: U2, branch: 'main' });
+    expect(plan.note).toBe('');
+    expect(plan.failedNote).toBe('');
+  });
+
+  it("the same URL with a peer's tokenEnv and rootFile carries them, not the snapshot's", () => {
+    const entry: ProjectConfig = { id: 'paper', gitUrl: U1, tokenEnv: 'T', rootFile: 'a.tex' };
+    const plan = planSyncRegistration('paper', U1, stale, { entry, envConfigured: false });
+    expect(plan.next).toEqual({ id: 'paper', gitUrl: U1, tokenEnv: 'T', rootFile: 'a.tex' });
+    expect(plan.note).toBe('');
+  });
+
+  it("the registry's URL is compared in its held form (a legacy token, surrounding whitespace)", () => {
+    const entry: ProjectConfig = {
+      id: 'paper',
+      gitUrl: ' https://alice:s3cretS3cretS3cret99@github.com/acme/moved.git ',
+      branch: 'main',
+    };
+    const plan = planSyncRegistration('paper', 'https://alice@github.com/acme/moved.git', stale, {
+      entry,
+      envConfigured: false,
+    });
+    expect(plan.next).toMatchObject({ branch: 'main' });
+  });
+
+  it("a URL differing from the registry's is planned from the snapshot, as before", () => {
+    const entry: ProjectConfig = { id: 'paper', gitUrl: U2, branch: 'main' };
+    const other = 'https://github.com/acme/other.git';
+    const held: ProjectConfig = { ...stale, rootFile: 'p.tex' };
+    expect(planSyncRegistration('paper', other, held, { entry, envConfigured: false })).toEqual(
+      planSyncRegistration('paper', other, held),
+    );
+    // The snapshot's own URL, restated while the registry moved on: still the snapshot's fields.
+    expect(planSyncRegistration('paper', U1, held, { entry, envConfigured: false })).toEqual(
+      planSyncRegistration('paper', U1, held),
+    );
+  });
+
+  it('an env-configured id is planned from its env config, whatever the registry holds', () => {
+    const env: ProjectConfig = { id: 'paper', gitUrl: U2, branch: 'env-branch' };
+    const entry: ProjectConfig = { id: 'paper', gitUrl: U2, branch: 'main', tokenEnv: 'T' };
+    const plan = planSyncRegistration('paper', U2, env, { entry, envConfigured: true });
+    expect(plan.next).toEqual({ id: 'paper', gitUrl: U2, branch: 'env-branch' });
+  });
+
+  it('a local registry entry is never a base for a git registration', () => {
+    const entry: ProjectConfig = { id: 'paper', mode: 'local', path: '/p', rootFile: 'a.tex' };
+    expect(planSyncRegistration('paper', U1, stale, { entry, envConfigured: false })).toEqual(
+      planSyncRegistration('paper', U1, stale),
+    );
+  });
+});
