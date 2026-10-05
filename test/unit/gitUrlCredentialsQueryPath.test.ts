@@ -424,6 +424,16 @@ describe('redact (free text): a credential value holding <scheme>:// (#247)', ()
     );
   });
 
+  it('stays fast at the glued-URL bound', () => {
+    // Four glued URLs (`MAX_SUFFIX_MASKED_URLS`, the most that take the suffix pass), each masked
+    // to the end of a 1 MB run, then the piecewise pass over the result.
+    const filler = 'a'.repeat(250_000);
+    const text = `https://h/r#${filler},https://h/x?v=${filler},b://c/${filler},d://e/${filler}`;
+    const start = performance.now();
+    redact(text);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
   it('is linear past the glued-URL bound', () => {
     const text = `https://h/r#${',a://b'.repeat(30_000)}`;
     const start = performance.now();
@@ -472,6 +482,15 @@ describe('redact (free text): an https userinfo behind a separator other than //
   ] as const) {
     it(JSON.stringify(text), () => expect(redact(text)).toBe(want));
   }
+
+  it('starts only where a scheme starts, as the strip reads http(s)', () => {
+    expect(redact('see xhttps:a@b and git+https:u:pw@h')).toBe(
+      'see xhttps:a@b and git+https:u:pw@h',
+    );
+    // After a non-scheme character it is still a scheme start, so prose is masked.
+    expect(redact('see http:foo@bar.com')).toBe('see http:***@bar.com');
+    expect(redact('(https:u:pw@h/r.git)')).toBe('(https:***@h/r.git)');
+  });
 
   it('leaves a URL with no userinfo alone', () => {
     expect(redact('see https:/h/r.git and https:h')).toBe('see https:/h/r.git and https:h');

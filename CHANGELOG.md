@@ -63,6 +63,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   or one whose cleanup fails, leaves a single directory, which a later run removes after a
   day), and the regex-timing test tolerates a loaded machine.
 
+- **Follow-ups from the review of #248 (#249).** Error messages no longer hide text like
+  `xhttps:a@b`, where `https:` sits inside a longer word: the lenient userinfo rule now starts
+  only where a scheme starts, as the URL strip already reads one. Prose such as
+  `see http:foo@bar.com` is still masked, since nothing tells it apart from a real credential. A
+  run of URLs glued together with no whitespace is masked whole only up to four URLs, down from
+  16, which bounds how many passes one long run costs; past that each URL is masked up to the next
+  one's scheme, as before.
+
 - **A cloned project's fetch, pull and push now go to the URL the session holds — while the server
   owns the clone's `origin`.** `project_sync` and `register_project` with a different `gitUrl`
   updated the registration but not the clone's `origin`, which is what every remote operation uses:

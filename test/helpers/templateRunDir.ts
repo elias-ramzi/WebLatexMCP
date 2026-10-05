@@ -13,8 +13,8 @@ import type { TestProject } from 'vitest/node';
  * The teardown runs in the main process, whatever happened to the workers. A run killed before it
  * reaches the teardown leaves its one directory; the next run removes any such directory older
  * than a day (never a younger one, which may belong to a run still going). The age is the
- * directory's mtime, which only a new template directory refreshes, so a `vitest --watch` session
- * idle for more than a day can have its live directory swept by another run — restart the watcher
+ * directory's mtime, which changes only when a worker creates or removes its template directory in
+ * it, so a `vitest --watch` session idle for more than a day can have its live directory swept by another run — restart the watcher
  * if so.
  */
 
