@@ -137,7 +137,8 @@ read that throws. **A registration pins only when it differs from the registry's
 pin, and a registry read that throws pins. A `project_sync { gitUrl }` naming the registry's URL is
 planned from the registry's entry, not this process's snapshot (`syncRegistrationBase`,
 `src/lib/syncRegistration.ts`; env ids excepted), so a snapshot stale in `branch`, `tokenEnv` or
-`username` — or pinned elsewhere — cannot make a restatement pin. Pinning every `project_sync { gitUrl }` let a session
+`username` — or pinned elsewhere — cannot make a restatement pin. Its dropped-fields note is
+judged against a local `held` all the same: that is the configuration the call drops. Pinning every `project_sync { gitUrl }` let a session
 that once restated the URL keep it after a peer re-pointed the project and flip `origin` back.
 **The refresh runs twice**: before the lock (so `requireGitProject` and the credential follow it)
 and again inside `runExclusive`, before `reconcileOrigin`, as
@@ -1663,7 +1664,10 @@ read falls back to the in-process root.
   legacy URL is **not** stripped (only a registration is), so it is shown with the secret as `***`
   (`redactGitUrlCredentials`: `list_projects`, `push`'s `remote`, `set_credential`'s "no host"
   error), and `redact` scrubs an https userinfo whole to the last `@`, so no part of a password
-  containing a raw `@` survives in an error; on any other scheme it masks only the password — the
+  containing a raw `@` survives in an error — behind `//` or behind any other separator the strip
+  reads (`https:/u:pw@h`, `https:\u:pw@h`, `https:u:pw@h`; `LENIENT_HTTP_USERINFO`, whose
+  separator is taken atomically and whose userinfo stops at the next `http(s):`, or it was
+  quadratic); on any other scheme it masks only the password — the
   login running to the userinfo's first `:`, a raw `@` in it included, and the password to the
   last `@`, as the strip reads them (`ssh://a@b:***@h`; `ssh://git@host:22/r` is a port) — and
   inside any URL in free text a credential query value (`name=***`) and a token-like path segment
@@ -1673,7 +1677,12 @@ read falls back to the in-process root.
   through git's own message, which quotes the URL whole. A URL glued onto another with no
   whitespace between (`https://h/r#f,https://h/x?token=…`) is one free-text match, whose first
   URL's parse holds the rest in its fragment or query, so `maskUrlRun` masks each glued URL as its
-  own, up to the next one's scheme, before masking the whole run as the first URL. The rules that
+  own — right to left, each to the END of the run, the first URL last — so a credential value that
+  itself contains a scheme (`?token=secret://b`) is masked whole by its own URL's rule rather than
+  cut at that scheme, then each again up to the next one's scheme, so nothing the piecewise pass
+  masked is left showing (a value run to the end can take in a later URL's malformed `%` escape and
+  become undecodable); past `MAX_SUFFIX_MASKED_URLS` (16) glued URLs, which the suffix pass would
+  make quadratic, each is masked only up to the next one's scheme. The rules that
   match any scheme, and the search for a glued URL, start a match only at the beginning of a run of
   scheme characters (`SCHEME_START`): a match that could start
   anywhere inside a run re-scanned it from each position, quadratic in every `errorResult` (100k
@@ -1873,6 +1882,10 @@ read falls back to the in-process root.
   against real LaTeX log snippets).
 - **Integration** (`test/integration/`) runs real git against a **local bare repo** created by
   `helpers/bareRepo.ts` (a `file://` stand-in for the Overleaf remote) — **no network, no secrets**.
+  Its fixture templates live under one directory per run (`test/helpers/templateRunDir.ts`, a
+  vitest `globalSetup` handing the path over by `provide`/`inject`), removed by the global teardown
+  in the main process: a terminated worker never runs its own `exit` handler, and per-worker
+  directories piled up by the thousand in the OS temp dir.
   What `file://` cannot exercise — credential injection — runs against `helpers/authHttpRemote.ts`, a
   local smart-HTTP `git http-backend` remote that demands Basic auth, still on loopback only.
   A test that talks to it should run git hermetically (empty `GIT_CONFIG_GLOBAL`,

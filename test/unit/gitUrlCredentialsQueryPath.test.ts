@@ -391,3 +391,103 @@ describe('an empty "?" is removed with the credential', () => {
     }
   });
 });
+
+describe('a password with no username before it (#247)', () => {
+  // An empty login with a password removes the whole userinfo; the note used to call that
+  // password an access token standing as the userinfo ("token@").
+  for (const url of ['ssh://:pw@h.example/r.git', 'https://:pw@h.example/r.git']) {
+    it(url, () => {
+      expect(stripGitUrlCredentials(url)).toMatchObject({
+        stripped: true,
+        removed: 'bare-password',
+      });
+      const note = strippedCredentialsNoteFor(url);
+      expect(note).toMatch(/no username before it \(:token@\)/);
+      expect(note).not.toMatch(/\(token@\)/);
+    });
+  }
+
+  it('a token standing alone as the userinfo is still worded as one', () => {
+    expect(strippedCredentialsNoteFor(`https://${TOKEN}@h.example/r.git`)).toMatch(/\(token@\)/);
+  });
+});
+
+describe('redact (free text): a credential value holding <scheme>:// (#247)', () => {
+  it('masks the whole value in a URL glued after the first', () => {
+    // The first URL's parse holds the rest in its fragment; the value used to be cut at the
+    // embedded head and its tail left showing (`token=***secret://b`).
+    expect(redact('fatal: https://h/r#f,https://h/x?token=secret://b failed')).toBe(
+      'fatal: https://h/r#f,https://h/x?token=*** failed',
+    );
+    expect(redact('https://h/r#f,https://h/x?token=sec,https://h/y')).toBe(
+      'https://h/r#f,https://h/x?token=***',
+    );
+  });
+
+  it('is linear past the glued-URL bound', () => {
+    const text = `https://h/r#${',a://b'.repeat(30_000)}`;
+    const start = performance.now();
+    redact(text);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it('masks the whole value, not only up to the embedded scheme', () => {
+    expect(redact('fatal: https://h.example/r.git?token=xa://b&a=1 failed')).toBe(
+      'fatal: https://h.example/r.git?token=***&a=1 failed',
+    );
+    // Glued after another URL, the value's URL is not the whole run, so only masking it to the
+    // end of the run (not up to the embedded `xa://`) masks it whole.
+    expect(redact('fatal: https://h/r#f,https://h.example/r.git?token=xa://b&a=1 failed')).toBe(
+      'fatal: https://h/r#f,https://h.example/r.git?token=***&a=1 failed',
+    );
+  });
+
+  it('still masks what the piecewise pass masked when a later URL spoils the value', () => {
+    // Masked to the end of the run, `v` absorbs the glued URL behind it, whose `%zz` makes the
+    // value undecodable, so its percent-escaped token prefix (`%67hp_` = `ghp_`) went unseen.
+    const out = redact(
+      'https://h/r#f,https://h/x?v=%67hp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8,https://h2/y?q=%zz',
+    );
+    expect(out).not.toContain('A1b2C3d4');
+    expect(out).toBe('https://h/r#f,https://h/x?v=***https://h2/y?q=%zz');
+  });
+
+  it('still masks a credential in a URL glued after the first', () => {
+    expect(redact(`https://h/r#f,https://h/x?token=SECRET x https://h/${TOKEN}/r.git`)).toBe(
+      'https://h/r#f,https://h/x?token=*** x https://h/***/r.git',
+    );
+    // A value runs to the end of the run, so a URL glued behind it goes with it.
+    expect(redact(`https://h/r#f,https://h/x?token=SECRET,https://h/${TOKEN}/r.git`)).toBe(
+      'https://h/r#f,https://h/x?token=***',
+    );
+  });
+});
+
+describe('redact (free text): an https userinfo behind a separator other than // (#247)', () => {
+  for (const [text, want] of [
+    ['fatal: https:/u:pw@h/r.git', 'fatal: https:/***@h/r.git'],
+    ['fatal: https:\\u:pw@h/r.git', 'fatal: https:\\***@h/r.git'],
+    ['fatal: https:u:pw@h/r.git', 'fatal: https:***@h/r.git'],
+    ['fatal: HTTP:\\\\/u:p@w@h/r.git', 'fatal: HTTP:\\\\/***@h/r.git'],
+  ] as const) {
+    it(JSON.stringify(text), () => expect(redact(text)).toBe(want));
+  }
+
+  it('leaves a URL with no userinfo alone', () => {
+    expect(redact('see https:/h/r.git and https:h')).toBe('see https:/h/r.git and https:h');
+  });
+
+  // Without the atomic separator and the stop at the next `http(s):`, each of these took about
+  // two seconds at this length.
+  for (const [name, text] of [
+    ['https: repeated', 'https:'.repeat(20_000)],
+    ['https:\\ repeated', 'https:\\'.repeat(20_000)],
+    ['https: then 100k \\', `https:${'\\'.repeat(100_000)}`],
+  ] as const) {
+    it(`is linear: ${name}`, () => {
+      const start = performance.now();
+      redact(text);
+      expect(performance.now() - start).toBeLessThan(1000);
+    });
+  }
+});

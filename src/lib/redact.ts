@@ -27,17 +27,28 @@ const URL_IN_TEXT = new RegExp(`${SCHEME_START}[A-Za-z0-9+.-]+:\\/\\/[^\\s'"<>\`
 const EMBEDDED_URL_HEAD = new RegExp(`${SCHEME_START}[A-Za-z0-9+.-]+:\\/\\/`, 'g');
 
 /**
- * `run` (one `URL_IN_TEXT` match) with every URL in it masked by `maskUrlPathAndQuery`: each URL
- * glued after the first is masked as its own URL, running to the next one's scheme, and then the
- * whole run is masked as the first URL — exactly what a run holding one URL always got. Linear:
- * one regex pass finds the heads, and the pieces between them are disjoint.
+ * How many URLs glued into one run `maskUrlRun` masks each to the end of the run (right to left)
+ * before its piecewise pass; past it, only the piecewise pass runs (each URL masked up to the next
+ * one's scheme). The suffix pass costs the run's length once per URL, so it is bounded; real
+ * messages glue two or three.
  */
-function maskUrlRun(run: string): string {
+const MAX_SUFFIX_MASKED_URLS = 16;
+
+/** The heads of the URLs glued after the first in `run` (one `URL_IN_TEXT` match). */
+function embeddedUrlHeads(run: string): number[] {
   const starts: number[] = [];
   EMBEDDED_URL_HEAD.lastIndex = run.indexOf('://') + 3;
   for (let m = EMBEDDED_URL_HEAD.exec(run); m !== null; m = EMBEDDED_URL_HEAD.exec(run)) {
     starts.push(m.index);
   }
+  return starts;
+}
+
+/**
+ * Each URL glued after the first masked up to the next one's scheme, then the whole run masked
+ * as the first URL. Linear.
+ */
+function maskUrlRunPiecewise(run: string, starts: number[]): string {
   if (starts.length === 0) return maskUrlPathAndQuery(run);
   const pieces = [run.slice(0, starts[0])];
   for (let i = 0; i < starts.length; i++) {
@@ -45,6 +56,47 @@ function maskUrlRun(run: string): string {
   }
   return maskUrlPathAndQuery(pieces.join(''));
 }
+
+/**
+ * `run` (one `URL_IN_TEXT` match) with every URL in it masked by `maskUrlPathAndQuery`. A URL
+ * glued after the first sits, for the first URL's parse, in its fragment or query, where the path
+ * and query rules never look; so each further URL is masked as its own.
+ *
+ * Right to left, each to the END of the run, the first URL last — what a run holding one URL
+ * always got. A URL's credential value may itself contain a scheme (`?token=sec,https://h/y`,
+ * `?token=secret://b`), which reads as a further URL's head: cut at that head, the value's front
+ * was masked and its tail left showing (`token=***secret://b`); masked to the end of the run, the
+ * value is masked whole by its own URL's query rule. Then the piecewise pass runs over that
+ * result (heads found afresh, since masking changed the lengths), so nothing the piecewise pass
+ * masks is left showing: a value masked to the end of the run takes in the later URLs' text, and
+ * a malformed `%` escape there makes it undecodable, which hid a percent-escaped token prefix the
+ * piecewise cut would have seen. Masking only ever replaces text with `***`, so composing the two
+ * only masks more. Past `MAX_SUFFIX_MASKED_URLS` heads only the piecewise pass runs (linear, with
+ * the residual the suffix pass exists to close).
+ */
+function maskUrlRun(run: string): string {
+  const starts = embeddedUrlHeads(run);
+  if (starts.length === 0) return maskUrlPathAndQuery(run);
+  if (starts.length > MAX_SUFFIX_MASKED_URLS) return maskUrlRunPiecewise(run, starts);
+  // Masking a suffix changes nothing before its start, so the earlier heads stay where they are.
+  let out = run;
+  for (const start of [0, ...starts].reverse()) {
+    out = out.slice(0, start) + maskUrlPathAndQuery(out.slice(start));
+  }
+  return maskUrlRunPiecewise(out, embeddedUrlHeads(out));
+}
+
+/**
+ * An http(s) userinfo behind a separator other than `//` — any run of `/` and `\`, or none — as
+ * `stripGitUrlCredentials` reads one (`https:/u:pw@h`, `https:\u:pw@h`, `https:u:pw@h`). The
+ * separator is taken atomically (lookahead + backreference), so a run of `\` cannot be split
+ * between it and the userinfo; and the userinfo never runs across another `http(s):`, so each
+ * start scans only to the next one — without both, `https:` repeated or `https:\\…` was
+ * quadratic. The cost: a password itself containing `http:` keeps its tail in this shape (the
+ * `//` rule above has no such limit).
+ */
+const LENIENT_HTTP_USERINFO =
+  /(https?:(?=([/\\]*))\2)(?:(?!https?:)[^/?#@\s])*(?:@(?:(?!https?:)[^/?#@\s])*)*@/gi;
 
 /**
  * A password in the userinfo of a non-http `<scheme>://` URL: the login runs to the userinfo's
@@ -81,6 +133,9 @@ export function redact(text: string, secrets: Array<string | undefined> = []): s
   // common enough), so match "@"-separated runs greedily — never across "/", "?", "#" or
   // whitespace, which end the authority in a URL and the URL itself in free text.
   out = out.replace(/(https?:\/\/)[^/?#@\s]*(?:@[^/?#@\s]*)*@/gi, '$1***@');
+  // The other separators the strip reads (`LENIENT_HTTP_USERINFO`): `https:/u:pw@h`,
+  // `https:\u:pw@h`, `https:u:pw@h`. A `//` one is already `***@` and is rewritten to itself.
+  out = out.replace(LENIENT_HTTP_USERINFO, '$1***@');
   // Any other scheme: only a password is masked (`OTHER_PASSWORD`). The https rule above has
   // already turned its userinfo into "***@", which holds no ":"; a `file:` URL is left alone.
   out = out.replace(OTHER_PASSWORD, (match, head: string, user: string) =>
