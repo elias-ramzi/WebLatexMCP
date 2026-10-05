@@ -58,9 +58,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   since registered the same URL. A git URL holding a password with no username before it
   (`ssh://:pw@host/…`) is no longer described as "an access token (token@)". Error messages now
   hide the password in `https:/user:pw@host`, `https:\user:pw@host` and `https:user:pw@host`
-  shapes, and the whole of a credential query value that itself contains `<scheme>://`. Test
-  runs no longer leave `ovl-tpl-*` directories in the OS temp dir, and the regex-timing test
-  tolerates a loaded machine.
+  shapes, and the whole of a credential query value that itself contains `<scheme>://`. A
+  finished test run no longer leaves `ovl-tpl-*` directories in the OS temp dir (a killed one,
+  or one whose cleanup fails, leaves a single directory, which a later run removes after a
+  day), and the regex-timing test tolerates a loaded machine.
 
 - **A cloned project's fetch, pull and push now go to the URL the session holds — while the server
   owns the clone's `origin`.** `project_sync` and `register_project` with a different `gitUrl`

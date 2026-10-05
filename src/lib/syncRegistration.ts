@@ -129,7 +129,8 @@ export function syncDroppedNote(
  * the config this process holds; with `registry`, a restatement of the registry's entry is planned
  * from that entry instead (`syncRegistrationBase`), so it carries the entry's fields and drops
  * nothing. The note is judged against the base the plan was made from — except that a local
- * `held` is always what the note judges, since that is the configuration this process drops. Pure.
+ * `held` is always what the note judges, since that is the configuration this process drops, and
+ * its `rootFile` counts as dropped when the entry's differs, not only when the entry sets none. Pure.
  */
 export function planSyncRegistration(
   id: string,
@@ -143,6 +144,19 @@ export function planSyncRegistration(
   // registry's entry instead, the note came back empty while the local config was dropped.
   const replaced = held !== undefined && isLocalProject(held) ? held : previous;
   const dropped = droppedRegistrationFields(replaced, next);
+  // `droppedRegistrationFields` names a rootFile only when `next` sets none — right for
+  // `register_project`, where a new rootFile is the caller's own choice. Here a local `held`'s
+  // rootFile replaced by the registry entry's different one is a loss the caller never asked for.
+  if (
+    replaced !== undefined &&
+    isLocalProject(replaced) &&
+    replaced.rootFile !== undefined &&
+    next.rootFile !== undefined &&
+    next.rootFile !== replaced.rootFile &&
+    !dropped.some((f) => f.name === 'rootFile')
+  ) {
+    dropped.unshift({ name: 'rootFile', value: replaced.rootFile });
+  }
   return {
     next,
     note: syncDroppedNote(id, replaced, dropped),

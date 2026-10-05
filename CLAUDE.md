@@ -1679,8 +1679,10 @@ read falls back to the in-process root.
   URL's parse holds the rest in its fragment or query, so `maskUrlRun` masks each glued URL as its
   own — right to left, each to the END of the run, the first URL last — so a credential value that
   itself contains a scheme (`?token=secret://b`) is masked whole by its own URL's rule rather than
-  cut at that scheme; past `MAX_SUFFIX_MASKED_URLS` (16) glued URLs, which that pass would make
-  quadratic, each is masked only up to the next one's scheme. The rules that
+  cut at that scheme, then each again up to the next one's scheme, so nothing the piecewise pass
+  masked is left showing (a value run to the end can take in a later URL's malformed `%` escape and
+  become undecodable); past `MAX_SUFFIX_MASKED_URLS` (16) glued URLs, which the suffix pass would
+  make quadratic, each is masked only up to the next one's scheme. The rules that
   match any scheme, and the search for a glued URL, start a match only at the beginning of a run of
   scheme characters (`SCHEME_START`): a match that could start
   anywhere inside a run re-scanned it from each position, quadratic in every `errorResult` (100k

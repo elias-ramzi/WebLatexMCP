@@ -435,6 +435,21 @@ describe('redact (free text): a credential value holding <scheme>:// (#247)', ()
     expect(redact('fatal: https://h.example/r.git?token=xa://b&a=1 failed')).toBe(
       'fatal: https://h.example/r.git?token=***&a=1 failed',
     );
+    // Glued after another URL, the value's URL is not the whole run, so only masking it to the
+    // end of the run (not up to the embedded `xa://`) masks it whole.
+    expect(redact('fatal: https://h/r#f,https://h.example/r.git?token=xa://b&a=1 failed')).toBe(
+      'fatal: https://h/r#f,https://h.example/r.git?token=***&a=1 failed',
+    );
+  });
+
+  it('still masks what the piecewise pass masked when a later URL spoils the value', () => {
+    // Masked to the end of the run, `v` absorbs the glued URL behind it, whose `%zz` makes the
+    // value undecodable, so its percent-escaped token prefix (`%67hp_` = `ghp_`) went unseen.
+    const out = redact(
+      'https://h/r#f,https://h/x?v=%67hp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8,https://h2/y?q=%zz',
+    );
+    expect(out).not.toContain('A1b2C3d4');
+    expect(out).toBe('https://h/r#f,https://h/x?v=***https://h2/y?q=%zz');
   });
 
   it('still masks a credential in a URL glued after the first', () => {
