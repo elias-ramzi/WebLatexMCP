@@ -30,9 +30,9 @@ const EMBEDDED_URL_HEAD = new RegExp(`${SCHEME_START}[A-Za-z0-9+.-]+:\\/\\/`, 'g
  * How many URLs glued into one run `maskUrlRun` masks each to the end of the run (right to left)
  * before its piecewise pass; past it, only the piecewise pass runs (each URL masked up to the next
  * one's scheme). The suffix pass costs the run's length once per URL, so it is bounded; real
- * messages glue two or three.
+ * messages glue two or three, so the bound sits just above that.
  */
-const MAX_SUFFIX_MASKED_URLS = 16;
+const MAX_SUFFIX_MASKED_URLS = 4;
 
 /** The heads of the URLs glued after the first in `run` (one `URL_IN_TEXT` match). */
 function embeddedUrlHeads(run: string): number[] {
@@ -94,9 +94,19 @@ function maskUrlRun(run: string): string {
  * start scans only to the next one — without both, `https:` repeated or `https:\\…` was
  * quadratic. The cost: a password itself containing `http:` keeps its tail in this shape (the
  * `//` rule above has no such limit).
+ *
+ * It starts only where a scheme run starts (`SCHEME_START`), as the strip reads `http(s):` only
+ * at the start of a URL: `xhttps:a@b` and `git+https:a@b` are no http(s) URL to it, and are left.
+ * Prose that happens to read as one is still masked (`see http:foo@bar.com` gives
+ * `http:***@bar.com`), and so is the shape inside a `file:` URL's path
+ * (`file:///home/u/https:x@y/r`): nothing tells either apart from a real credential, and a
+ * `file:` run with no whitespace in it can carry a glued http(s) URL, so this errs toward hiding.
+ * What a `file:` URL is never judged on is its own userinfo, which this does not read.
  */
-const LENIENT_HTTP_USERINFO =
-  /(https?:(?=([/\\]*))\2)(?:(?!https?:)[^/?#@\s])*(?:@(?:(?!https?:)[^/?#@\s])*)*@/gi;
+const LENIENT_HTTP_USERINFO = new RegExp(
+  `${SCHEME_START}(https?:(?=([/\\\\]*))\\2)(?:(?!https?:)[^/?#@\\s])*(?:@(?:(?!https?:)[^/?#@\\s])*)*@`,
+  'gi',
+);
 
 /**
  * A password in the userinfo of a non-http `<scheme>://` URL: the login runs to the userinfo's

@@ -1681,7 +1681,7 @@ read falls back to the in-process root.
   itself contains a scheme (`?token=secret://b`) is masked whole by its own URL's rule rather than
   cut at that scheme, then each again up to the next one's scheme, so nothing the piecewise pass
   masked is left showing (a value run to the end can take in a later URL's malformed `%` escape and
-  become undecodable); past `MAX_SUFFIX_MASKED_URLS` (16) glued URLs, which the suffix pass would
+  become undecodable); past `MAX_SUFFIX_MASKED_URLS` (4) glued URLs, which the suffix pass would
   make quadratic, each is masked only up to the next one's scheme. The rules that
   match any scheme, and the search for a glued URL, start a match only at the beginning of a run of
   scheme characters (`SCHEME_START`): a match that could start
