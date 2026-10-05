@@ -9,6 +9,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-05
+
 ### Added
 
 - **`update_server`: update the Claude Desktop extension from the chat.** Ask Claude to check for an
