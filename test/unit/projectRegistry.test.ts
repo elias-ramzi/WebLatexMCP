@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
   ProjectRegistry,
+  countRegisteredProjects,
   readProjectRegistry,
   readProjectRegistryDefault,
   registryPath,
@@ -19,6 +20,28 @@ describe('ProjectRegistry', () => {
 
   afterEach(async () => {
     await rm(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('counts the usable entries of a workspace it is not using, silently', async () => {
+    expect(countRegisteredProjects(workspaceRoot)).toBe(0);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await writeFile(
+        registryPath(workspaceRoot),
+        JSON.stringify({
+          thesis: { gitUrl: 'https://git.example/thesis' },
+          cv: { mode: 'local', path: '/home/me/cv' },
+          '../escape': { gitUrl: 'https://git.example/x' },
+          broken: { nonsense: true },
+        }),
+      );
+      expect(countRegisteredProjects(workspaceRoot)).toBe(2);
+      await writeFile(registryPath(workspaceRoot), '{ not json');
+      expect(countRegisteredProjects(workspaceRoot)).toBe(0);
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it('reads [] when no registry file exists', () => {

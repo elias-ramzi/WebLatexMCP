@@ -32,6 +32,23 @@ describe('CredentialPortal', () => {
     expect((await fetch(`${base}/deadbeef`)).status).toBe(404);
   });
 
+  it('shows the workspace and where to change it, escaped, only when given one', async () => {
+    portal = new CredentialPortal(async () => ({ persisted: true }));
+    const bare = await (
+      await fetch((await portal.open({ host: 'git.overleaf.com', username: 'git' }))!)
+    ).text();
+    expect(bare).not.toContain('Clone workspace folder');
+
+    const url = await portal.open({
+      host: 'git.overleaf.com',
+      username: 'git',
+      workspaceRoot: '/home/me/latex-<b>workspace',
+    });
+    const html = await (await fetch(url!)).text();
+    expect(html).toContain('<code>/home/me/latex-&lt;b&gt;workspace</code>');
+    expect(html).toContain('Settings → Extensions → WebLatexMCP → Clone workspace folder');
+  });
+
   it('stores a submitted token and reports the outcome without echoing it', async () => {
     const stored: Array<{ host: string; username: string; token: string }> = [];
     portal = new CredentialPortal(async (host, username, token) => {

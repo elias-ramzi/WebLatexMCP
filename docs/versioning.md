@@ -67,3 +67,12 @@ This is **automated** by [`back-merge.yml`](../.github/workflows/back-merge.yml)
 opens (and auto-merges, once the checks that already ran on `main` are green) a `main → dev` PR, skipping
 when `dev` is already up to date. Keep the manual step above as the fallback if that workflow is disabled
 or a genuine conflict needs a human.
+
+The workflow opens that PR with the `BACK_MERGE_TOKEN` repository secret: a fine-grained personal access
+token with **Contents** and **Pull requests: read and write** on this repository. `dev` requires the
+`CHANGELOG [Unreleased] updated` check, which runs only on `pull_request`, and GitHub holds the
+`pull_request` runs of a PR opened with the workflow's own `GITHUB_TOKEN` until someone approves them —
+so auto-merge stalled until they were approved, and the held CI run most likely explains the README's CI
+badge reading as failing meanwhile. Without the secret the workflow still opens the PR with
+`GITHUB_TOKEN` and warns: approve the held runs in the Actions tab and auto-merge finishes. When the
+token expires, replace the secret; nothing else needs to change.

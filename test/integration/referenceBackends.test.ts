@@ -32,6 +32,7 @@ import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
+import { UpdateService } from '../../src/services/updater.js';
 import { ReferenceResolver, type ReferenceBackends } from '../../src/services/referenceResolver.js';
 import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
 import type { ReferenceHit } from '../../src/services/referenceBackend.js';
@@ -129,7 +130,7 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       pdfRenderer: new PdfRenderer(),
       viewer: new ViewerService({
         knownIds: () => [],
-        resolvePdfPath: async () => null,
+        locatePdf: async () => ({ pdf: null, root: null }),
         addComment: async () => {
           throw new Error('not used');
         },
@@ -151,6 +152,8 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       ),
       rewriteModes: new RewriteModeStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
+      // Never called here; constructing it reaches nothing.
+      updater: new UpdateService(),
     };
     ctx.files.setMutationRecorder({
       record: (projectDir, relPath, before, after) =>

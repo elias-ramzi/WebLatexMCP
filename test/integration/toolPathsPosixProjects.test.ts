@@ -8,6 +8,7 @@ import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry, readProjectRegistry } from '../../src/services/projectRegistry.js';
+import { quoteId } from '../../src/lib/projectId.js';
 import { createFakeRemote } from './helpers/bareRepo.js';
 import { GitService } from '../../src/services/gitService.js';
 import type { FileService } from '../../src/services/fileService.js';
@@ -183,7 +184,7 @@ describe('register_project: paths at the response boundary', () => {
     expect(pathOf(res)).toBe(posixOf(nativeDir));
     expect(pathOf(res)).not.toContain('\\');
     const text = textOf(res);
-    expect(text).toContain(`Cloned at ${posixOf(nativeDir)}.`);
+    expect(text).toContain(`Cloned at ${quoteId(posixOf(nativeDir))}.`);
     expect(text).not.toContain(nativeDir);
   });
 
@@ -227,7 +228,7 @@ describe('register_project: paths at the response boundary', () => {
     expect(res.isError ?? false).toBe(false);
     expect(pathOf(res)).toBe(posixOf(nativeDir));
     const text = textOf(res);
-    expect(text).toContain(`Registered "draft" -> ${posixOf(nativeDir)} (local`);
+    expect(text).toContain(`Registered "draft" -> ${quoteId(posixOf(nativeDir))} (local`);
     expect(text).not.toContain(nativeDir);
 
     // The `ProjectConfig` guard: the registry entry is read back and handed to `fs` in every

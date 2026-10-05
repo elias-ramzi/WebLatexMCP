@@ -7,9 +7,20 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, toPosixOut } from '../lib/paths.js';
 import { gitUrlOf, isLocalProject } from '../lib/projectMode.js';
-import { strippedCredentialsNoteFor } from '../lib/gitUrlCredentials.js';
-import { quoteId } from '../lib/projectId.js';
+import {
+  pathTokenRefusal,
+  stripGitUrlCredentials,
+  strippedCredentialsNoteFor,
+} from '../lib/gitUrlCredentials.js';
+import { assertValidProjectId, quoteId } from '../lib/projectId.js';
+import { assertRegistrableRootFile } from '../lib/rootFileSpelling.js';
+import { droppedRegistrationFields, registrationDroppedNote } from '../lib/registration.js';
+import { workspaceNote } from '../lib/workspaceNote.js';
+import { pendingOriginNote, unreadableOriginNote } from '../lib/originRepoint.js';
 import type { ProjectConfig } from '../types.js';
+
+// Re-exported for `test/unit/registerProjectFields.test.ts`, which predates its move to the lib.
+export { droppedRegistrationFields } from '../lib/registration.js';
 
 const inputSchema = {
   project: z
@@ -51,7 +62,13 @@ const inputSchema = {
     .string()
     .min(1)
     .optional()
-    .describe('Explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted.'),
+    .describe(
+      'LaTeX root file (e.g. main.tex), as a path relative to the project root without ".." — ' +
+        'an absolute or drive-qualified path is refused. `compile`, `render_pages`, `extract_text`, ' +
+        '`pdf_geometry` and the `viewer` use it whenever a call omits `rootFile`; auto-detected ' +
+        'when omitted. Re-registering with no rootFile (for a local project, with `path` naming the ' +
+        'directory, not a .tex) goes back to auto-detection.',
+    ),
   followSymlinks: z
     .boolean()
     .optional()
@@ -121,86 +138,6 @@ function defaultRegistrationNote(ctx: AppContext, makeDefault: boolean | undefin
   return ' It is now the default project — calls may omit `project`.';
 }
 
-/**
- * Which optional fields a re-registration is about to drop relative to what was already stored,
- * so `register_project` can say so instead of silently losing them. `ProjectRegistry.upsert`
- * replaces the whole stored entry on a re-registration with `gitUrl`/`path` (documented,
- * intentional — docs/configuration.md: "pass every field you want kept") — this helper computes
- * the loss, it never changes what gets persisted.
- *
- * Compares only the fields the STORED (`previous`) entry actually had: a field the new
- * registration also sets is never reported, even when its value changed — this is a loss check,
- * not a diff. `previous` undefined (first-time registration) drops nothing, of course.
- *
- * One rule for every field, kind change or not: it is dropped only when `previous` had it AND
- * `next` does not carry the same value forward. `rootFile` exists on both kinds, so it survives a
- * kind change too, when repeated. `branch`/`username`/`tokenEnv` (git-only) and `followSymlinks`
- * (local-only) cannot be *set* on the other kind at all, so a kind change drops every one of them
- * `previous` had — not because kind changes are special-cased, but because `next` can never carry
- * a git-only field forward onto a local config or vice versa. `followSymlinks: false` is never
- * reported even when omitted next: the effective value is false either way, so nothing was lost.
- *
- * Exported so it is unit-testable without going through the MCP client.
- */
-export function droppedRegistrationFields(
-  previous: ProjectConfig | undefined,
-  next: ProjectConfig,
-): string[] {
-  if (!previous) return [];
-
-  const dropped: string[] = [];
-  const note = (name: string, value: string | boolean): void => {
-    dropped.push(`${name}=${String(value)}`);
-  };
-
-  // Shared by both kinds: dropped whenever `next` doesn't set it too, kind change or not.
-  if (previous.rootFile !== undefined && next.rootFile === undefined) {
-    note('rootFile', previous.rootFile);
-  }
-
-  if (isLocalProject(previous)) {
-    // Local-only. `next` can carry it forward only if it is itself a local config that sets it —
-    // a git `next` never has the field at all, so this is also how a kind change drops it.
-    if (previous.followSymlinks === true && !(isLocalProject(next) && next.followSymlinks)) {
-      note('followSymlinks', previous.followSymlinks);
-    }
-  } else {
-    // Git-only. Same shape: `next` carries a field forward only as a git config that sets it.
-    if (previous.branch !== undefined && !(!isLocalProject(next) && next.branch !== undefined)) {
-      note('branch', previous.branch);
-    }
-    if (
-      previous.username !== undefined &&
-      !(!isLocalProject(next) && next.username !== undefined)
-    ) {
-      note('username', previous.username);
-    }
-    if (
-      previous.tokenEnv !== undefined &&
-      !(!isLocalProject(next) && next.tokenEnv !== undefined)
-    ) {
-      note('tokenEnv', previous.tokenEnv);
-    }
-  }
-  return dropped;
-}
-
-/**
- * The result-text addendum for a re-registration that silently dropped stored fields — empty
- * string when nothing was dropped (a first registration, or one that repeated every field).
- *
- * Worded around "configuration", not "registry entry": `previous` may come from either — a
- * registry entry, or a project this process only ever held in memory (env-configured, or
- * registered in-session via `project_sync { gitUrl }`) — and the loss reads the same either way.
- */
-function droppedFieldsNote(id: string, dropped: string[]): string {
-  if (dropped.length === 0) return '';
-  return (
-    ` Replaced the previous configuration of "${id}", dropping its ${dropped.join(', ')} ` +
-    '— re-register with them to keep them.'
-  );
-}
-
 /** Expand a leading `~`, then resolve against the server's launch dir, so any input form works. */
 function resolveLocalPath(input: string): string {
   const expanded =
@@ -233,15 +170,17 @@ async function resolveLocalTarget(
   try {
     info = await stat(target);
   } catch {
+    // The path is the caller's, so it is quoted and escaped in both messages here.
     throw new Error(
-      `No such file or directory: ${toPosix(target)}. A local project must already exist.`,
+      `No such file or directory: ${quoteId(toPosix(target))}. A local project must already ` +
+        'exist.',
     );
   }
   if (info.isDirectory()) return { dir: target };
   if (!info.isFile()) {
     throw new Error(
-      `${toPosix(target)} is neither a file nor a directory. Point "path" at the document, ` +
-        'or at the folder holding it.',
+      `${quoteId(toPosix(target))} is neither a file nor a directory. Point "path" at the ` +
+        'document, or at the folder holding it.',
     );
   }
   const dir = path.dirname(target);
@@ -353,24 +292,43 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             cloned,
             default: ctx.projectManager.defaultProjectId() === cfg.id,
           };
-          const text = `"${cfg.id}" is already registered.${defaultRegistrationNote(ctx, true)}`;
+          const text = `${quoteId(cfg.id)} is already registered.${defaultRegistrationNote(ctx, true)}`;
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },
           };
         }
 
+        // Everything that can refuse on the arguments alone runs BEFORE `runExclusive`, which
+        // creates `<workspace>/.sessions/<id>/` (the lock's directory) first thing — so a call
+        // refused on its arguments leaves nothing behind, as the default-only branch above
+        // ensures. Refusals that need the lock (`registerAndPersist`'s unclaimed-directory and
+        // unaliased-id checks, an unreadable registry) still run inside it, after that directory
+        // exists. In the order the lock used to impose: the id (`runExclusive`'s own first
+        // check), then for a local project the target (`resolveLocalTarget` only `stat`s it), then
+        // the root — explicit, or inferred from a `.tex` pointed at — which drives every later
+        // call naming none, so it is refused before anything is persisted or cloned. A gitUrl
+        // with a token in its path is refused here too, by the text `ProjectManager.registerProject`
+        // still refuses it with behind the lock.
+        assertValidProjectId(project);
+        if (gitUrl !== undefined && stripGitUrlCredentials(gitUrl).pathToken) {
+          throw new Error(pathTokenRefusal(gitUrl));
+        }
+        const target = localPath !== undefined ? await resolveLocalTarget(localPath) : undefined;
+        // An explicit rootFile always wins over the one inferred from the file pointed at.
+        const resolvedRoot = rootFile ?? target?.rootFile;
+        if (resolvedRoot !== undefined) {
+          assertRegistrableRootFile(resolvedRoot, target ? { projectDir: target.dir } : {});
+        }
+
         return await ctx.projectManager.runExclusive(project, async () => {
-          if (localPath !== undefined) {
+          if (target !== undefined) {
             // Read before persisting: what is already on file, so a silent re-registration can be
             // reported — the registry's own entry when there is one (a peer may have updated it),
             // else this process's in-memory config for an env-configured or session-registered
             // project with no registry entry at all. See `ProjectManager.previousRegistration`.
             const previous = ctx.projectManager.previousRegistration(project);
-            const target = await resolveLocalTarget(localPath);
             const dir = target.dir;
-            // An explicit rootFile always wins over the one inferred from the file pointed at.
-            const resolvedRoot = rootFile ?? target.rootFile;
             const cfg: ProjectConfig = {
               id: project,
               mode: 'local',
@@ -395,9 +353,13 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             };
             // Say which directory was registered when they named a file: the project is the whole
             // folder, so that is what is readable and editable — not just the file they pointed at.
+            // The root named is the one registered: an explicit rootFile wins over the inferred one.
+            // Both are file names off the caller's disk, so quoted and escaped: a bidi override or
+            // a newline in one could otherwise forge the rest of this message.
             const inferred = target.pointedAtFile
-              ? `Pointed at "${target.pointedAtFile}", so registered the folder holding it. ` +
-                (target.rootFile ? `LaTeX root: ${target.rootFile}. ` : '')
+              ? `Pointed at ${quoteId(target.pointedAtFile)}, so registered the folder ` +
+                'holding it. ' +
+                (resolvedRoot !== undefined ? `LaTeX root: ${quoteId(resolvedRoot)}. ` : '')
               : '';
             // Say which way the link policy landed: it is the one thing about a local project the
             // caller cannot see from the path, and "refs.bib is not there" is otherwise a puzzle.
@@ -407,13 +369,13 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               : ' A symlink pointing out of that folder is not followed (re-register with ' +
                 'followSymlinks: true if the links in it are yours).';
             const text =
-              `Registered "${project}" -> ${outPath} (local, persisted to the workspace ` +
+              `Registered ${quoteId(project)} -> ${quoteId(outPath)} (local, persisted to the workspace ` +
               `registry). ${inferred}Every file in that folder is readable and editable; they are ` +
               'read, edited and compiled in place — nothing is cloned or copied, and git tools ' +
               '(status/diff/commit/push/project_sync) do not apply. Compiled PDFs go to the ' +
               `workspace, not into that directory.${links}` +
               defaultRegistrationNote(ctx, makeDefault) +
-              droppedFieldsNote(project, dropped);
+              registrationDroppedNote(project, dropped);
             return {
               content: [{ type: 'text', text }],
               structuredContent: { ...payload },
@@ -435,14 +397,31 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             { makeDefault },
           );
           const dropped = droppedRegistrationFields(previous, cfg);
-          // The registered URL is the caller's with any http(s) secret removed
-          // (`ProjectManager.registerProject`); the caller must hear about a removal — the next
+          // The registered URL is the caller's with any userinfo secret or credential query
+          // parameter removed (`ProjectManager.registerProject`, which refuses a token-like path
+          // segment outright); the caller must hear about a removal — the next
           // git operation needs the credential from somewhere else — and only about what was
           // actually removed (a login name stays in the URL).
           const heldUrl = gitUrlOf(cfg) ?? '';
           const credentialsNote = strippedCredentialsNoteFor(gitUrl);
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
+
+          // Registration writes nothing to an existing clone: its `origin` is reconciled at the
+          // next remote operation (`GitService.reconcileOrigin`, under the lock). Previewed here,
+          // read-only, so the caller hears where that operation will go. Only a clone that
+          // pre-existed this call — one cloned below is at the held URL already. The registration
+          // is persisted by now, so a config that cannot be read is a note, never an error that
+          // would lose the notes below.
+          let repointNote = '';
+          if (cloned) {
+            try {
+              const { decision, state } = await ctx.git.planOrigin(dir, heldUrl);
+              repointNote = pendingOriginNote(decision, state, heldUrl, dir);
+            } catch {
+              repointNote = unreadableOriginNote(dir);
+            }
+          }
 
           if (clone && !cloned) {
             const git = ctx.projectManager.requireGitProject(cfg.id, 'clone');
@@ -451,9 +430,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
               await ctx.git.clone(git.gitUrl, dir, auth, git.branch);
             } catch (err) {
               // A clone that fails right after its token was stripped most likely failed on auth;
-              // say why the token the caller gave was not used.
-              if (!credentialsNote) throw err;
-              throw new Error(`${(err as Error).message}${credentialsNote}`, { cause: err });
+              // say why the token the caller gave was not used. The replacement registration is
+              // already persisted, so what it dropped is named too: a retry with the same
+              // arguments finds nothing left to drop, and the loss would go unreported for good.
+              // Same order as the success text.
+              const droppedNote = registrationDroppedNote(cfg.id, dropped);
+              if (!credentialsNote && !droppedNote) throw err;
+              const message = err instanceof Error ? err.message : String(err);
+              throw new Error(`${message}${credentialsNote}${droppedNote}`, { cause: err });
             }
             ctx.files.resetBaselines(dir);
             cloned = true;
@@ -477,18 +461,23 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           // redundant .gitignore entry on the user's behalf.
           const excludeNote = ctx.config.workspaceExcludePattern
             ? ` The clone dir is already excluded from the host repo's git ` +
-              `("${ctx.config.workspaceExcludePattern}" in .git/info/exclude) — no .gitignore ` +
+              `(${quoteId(ctx.config.workspaceExcludePattern)} in .git/info/exclude) — no .gitignore ` +
               'entry needed.'
             : '';
           const text =
-            `Registered "${cfg.id}" -> ${heldUrl} (persisted to the workspace registry). ` +
+            // The URL and the directory are the caller's (or under a workspace the environment
+            // named), so both are quoted and escaped, like the id.
+            `Registered ${quoteId(cfg.id)} -> ${quoteId(heldUrl)} (persisted to the workspace ` +
+            'registry). ' +
             (cloned
-              ? `Cloned at ${outPath}.`
+              ? `Cloned at ${quoteId(outPath)}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
             excludeNote +
+            ` ${workspaceNote(ctx.config.workspaceRoot)}` +
             credentialsNote +
+            repointNote +
             defaultRegistrationNote(ctx, makeDefault) +
-            droppedFieldsNote(cfg.id, dropped);
+            registrationDroppedNote(cfg.id, dropped);
           return {
             content: [{ type: 'text', text }],
             structuredContent: { ...payload },

@@ -7,6 +7,15 @@
 #
 # It relies on `ci.yml` running `on: push`, so the required checks already exist on `main`'s HEAD SHA
 # and the back-merge PR inherits them — no separate CI run needed for auto-merge to proceed.
+#
+# Why the PR is opened with its own token: `dev` also requires `CHANGELOG [Unreleased] updated`, which
+# runs only on `pull_request` (and skips a back-merge). A PR opened with the workflow's GITHUB_TOKEN
+# gets its `pull_request` runs held as `action_required` until someone approves them, so auto-merge
+# stalled after every release (and the held CI run most likely explains the README's CI badge reading
+# as failing while it waited). BACK_MERGE_TOKEN — a fine-grained personal access token with Contents
+# and Pull requests: read and write on this repository — opens and auto-merges the PR as its owner
+# instead, whose runs start without approval. Without that secret the workflow falls back to
+# GITHUB_TOKEN and warns that the PR's runs need approving (Actions → the held run → Approve and run).
 name: Back-merge main into dev
 
 on:
@@ -22,12 +31,13 @@ jobs:
     name: Open and auto-merge main -> dev
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Open (and auto-merge) the back-merge PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BACK_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_TOKEN: ${{ secrets.BACK_MERGE_TOKEN != '' }}
         run: |
           set -euo pipefail
           git fetch --quiet origin main dev
@@ -52,3 +62,9 @@ jobs:
           # If the repo disallows auto-merge, leave the PR open as a visible reminder.
           gh pr merge "$number" --merge --auto \
             || echo "::warning::Could not enable auto-merge on PR #$number; merge it manually."
+
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::warning::No BACK_MERGE_TOKEN secret, so PR #$number was opened with" \
+                 "GITHUB_TOKEN and its pull_request runs wait for approval before auto-merge can" \
+                 "finish. Approve them in the Actions tab, or add the secret (see docs/versioning.md)."
+          fi

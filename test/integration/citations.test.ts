@@ -23,6 +23,7 @@ import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
+import { UpdateService } from '../../src/services/updater.js';
 import type { AppContext } from '../../src/context.js';
 import type { ServerConfig } from '../../src/types.js';
 
@@ -80,7 +81,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       pdfRenderer: new PdfRenderer(),
       viewer: new ViewerService({
         knownIds: () => [],
-        resolvePdfPath: async () => null,
+        locatePdf: async () => ({ pdf: null, root: null }),
         addComment: async () => {
           throw new Error('not used');
         },
@@ -117,6 +118,8 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       ),
       rewriteModes: new RewriteModeStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
+      // Never called here; constructing it reaches nothing.
+      updater: new UpdateService(),
     };
     ctx.files.setMutationRecorder({
       record: (projectDir, relPath, before, after) =>

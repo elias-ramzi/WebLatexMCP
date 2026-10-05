@@ -18,8 +18,9 @@ import { ShadowStore } from './services/shadowStore.js';
 import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
+import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
-import { detectRootFile } from './lib/rootFile.js';
+import { resolveRootFile } from './lib/rootFile.js';
 import { locateViewerPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
@@ -71,6 +72,8 @@ export interface AppContext {
   rewriteModes: RewriteModeStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
   credentialPortal: CredentialPortal;
+  /** Checks GitHub for a newer release and fetches the Desktop bundle — see `src/services/updater.ts`. */
+  updater: UpdateService;
 }
 
 export function createContext(
@@ -124,22 +127,45 @@ export function createContext(
 
   // The viewer shows a project's PDF and (for comments) resolves a clicked PDF point to source via
   // synctex. Both come from ONE `locateViewerPdf` call, so the page a click lands on and the
-  // synctex that maps it are the same root's build: the detected root's build-dir PDF, where its
+  // synctex that maps it are the same root's build: the project root's build-dir PDF, where its
   // `.synctex.gz` lives, or — when that build is gone — the surfaced copy with no synctex mapping,
   // since that copy holds whichever root compiled last. Constructed here but not listening — it
   // binds a port only when the `viewer` tool is first called.
-  const viewerPdf = async (id: string) => {
+  // The root is the project's registered `rootFile`, else the auto-detected one — the order
+  // `compile` and the PDF tools use too (`resolveRootFile`).
+  const viewerRoot = async (id: string) => {
     const { dir } = await projectManager.requireProjectDir(id);
-    const root = await detectRootFile(files, dir);
-    return { dir, located: await locateViewerPdf(config, id, dir, root) };
+    const root = await resolveRootFile(files, dir, projectManager.registeredRootFile(id));
+    return { dir, root };
+  };
+  const viewerPdf = async (id: string) => {
+    const { dir, root } = await viewerRoot(id);
+    return { dir, located: await locateViewerPdf(config, id, dir, root.rootFile) };
   };
   const viewer = new ViewerService({
     knownIds: () => projectManager.knownIds(),
-    resolvePdfPath: async (id) => {
+    resolveRoot: async (id) => {
       try {
-        return (await viewerPdf(id)).located?.pdf ?? null;
+        return (await viewerRoot(id)).root;
       } catch {
-        return null; // not cloned / no root / no PDF yet — page waits for a compile
+        return null; // not cloned / no .tex yet — the page says only that nothing is compiled
+      }
+    },
+    // One root resolution per request: the page's `/version` poll needs the PDF and, while there
+    // is none, the root it waits for.
+    locatePdf: async (id) => {
+      let resolved: Awaited<ReturnType<typeof viewerRoot>>;
+      try {
+        resolved = await viewerRoot(id);
+      } catch {
+        return { pdf: null, root: null }; // not cloned / no .tex yet — page waits for a compile
+      }
+      const { dir, root } = resolved;
+      try {
+        const located = await locateViewerPdf(config, id, dir, root.rootFile);
+        return { pdf: located?.pdf ?? null, root };
+      } catch {
+        return { pdf: null, root }; // no PDF to be had — the page still names the root it awaits
       }
     },
     addComment: async (id, input) => {
@@ -204,5 +230,8 @@ export function createContext(
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),
+    // The install kind is the launcher's assertion (the Desktop extension's manifest sets
+    // WEB_LATEX_MCP_INSTALL_KIND); unset, the updater never infers the extension.
+    updater: new UpdateService({ installKind: config.installKind }),
   };
 }

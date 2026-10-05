@@ -1,5 +1,6 @@
 import type { RewriteMode } from './lib/rewriteMode.js';
 import type { ReferenceSourceId } from './lib/referenceKey.js';
+import type { InstallKind } from './lib/installKind.js';
 
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
@@ -32,7 +33,10 @@ export interface GitProjectConfig {
   mode?: 'git';
   /** Git remote URL (e.g. https://git.overleaf.com/<id> or https://github.com/<owner>/<repo>). Stored tokenless. */
   gitUrl: string;
-  /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
+  /**
+   * Optional LaTeX root file (e.g. main.tex). `compile`, the PDF tools and the viewer use it when a call
+   * omits `rootFile` (`resolveRootFile`); auto-detected when unset.
+   */
   rootFile?: string;
   /** Optional branch to clone/track. Defaults to the remote's default branch. */
   branch?: string;
@@ -53,7 +57,10 @@ export interface LocalProjectConfig {
   mode: 'local';
   /** Absolute path to the directory holding the document. Files are read and written here. */
   path: string;
-  /** Optional explicit LaTeX root file (e.g. main.tex). Auto-detected when omitted. */
+  /**
+   * Optional LaTeX root file (e.g. main.tex). `compile`, the PDF tools and the viewer use it when a call
+   * omits `rootFile` (`resolveRootFile`); auto-detected when unset.
+   */
   rootFile?: string;
   /**
    * Follow a symlink that leaves this directory — default **false**, like any other project.
@@ -114,6 +121,15 @@ export interface ServerConfig {
    */
   workspaceExcludePattern?: string;
   /**
+   * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
+   * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one
+   * does — a Desktop extension that now gets `~/latex-workspace` as its default after running on
+   * the fallback, or any server launched with another workspace (workspace-local mode included,
+   * where a separate project list is by design), whose registered projects would otherwise go
+   * unmentioned.
+   */
+  fallbackWorkspaceRoot?: string;
+  /**
    * Identifies this server process among sibling sessions sharing the same workspace, so each
    * one's uncommitted work can be tracked and committed separately. From
    * `WEB_LATEX_MCP_SESSION` when set (give each session a meaningful name — it is what `status`
@@ -128,6 +144,14 @@ export interface ServerConfig {
    * the stderr note at startup is invisible to an MCP client. Optional; undefined means none.
    */
   skippedProjects?: SkippedProject[];
+  /**
+   * Ids of `projects` that came from `WEB_LATEX_MCP_PROJECTS` (after id validation), as opposed to
+   * the persisted registry — `loadConfig` merges the two into one list, with env winning. Read by
+   * `ProjectManager.registeredRootFile`: an env-configured project's root always comes from the env,
+   * while a registry-loaded one follows the registry's current entry. Optional so the many test
+   * fixtures constructing `ServerConfig` need no change; undefined means none.
+   */
+  envProjectIds?: string[];
   /** Project id used when a tool call omits `project`. */
   defaultProject?: string;
   /**
@@ -164,6 +188,13 @@ export interface ServerConfig {
    * only way a reporting tool can avoid presenting the default as the user's own configuration.
    */
   rewriteModeExplicit?: boolean;
+  /**
+   * How the launcher says this server was installed, from `WEB_LATEX_MCP_INSTALL_KIND`
+   * (`parseInstallKind` in `src/config.ts`) — set by the Desktop extension's manifest, normally
+   * never by hand. Unset (or an unrecognised value, which is ignored) leaves `update_server` to
+   * tell a git checkout from an npm install; it never infers the extension.
+   */
+  installKind?: InstallKind;
   /**
    * Absolute path to an ADDITIONAL writing guide, appended to (never replacing) the base one.
    * From `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA`, which accepts a path or a `file://` URL.

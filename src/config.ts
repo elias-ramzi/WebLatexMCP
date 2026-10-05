@@ -23,6 +23,8 @@ import {
   quoteId,
 } from './lib/projectId.js';
 import type { RewriteMode } from './lib/rewriteMode.js';
+import { INSTALL_KINDS } from './lib/installKind.js';
+import type { InstallKind } from './lib/installKind.js';
 // One list of ids, shared with the reference-lookup resolver: a private copy here could accept
 // an id the resolver never tries (or reject one it does) — the same reasoning as COMPILER_KINDS.
 import { REFERENCE_SOURCES } from './lib/referenceKey.js';
@@ -85,11 +87,12 @@ interface ResolvedWorkspace {
 }
 
 /** The shared home cache used when the launch dir isn't a suitable workspace. */
+function homeWorkspaceRoot(): string {
+  return path.join(os.homedir(), '.web-latex-mcp', 'projects');
+}
+
 function homeWorkspace(): ResolvedWorkspace {
-  return {
-    workspaceRoot: path.join(os.homedir(), '.web-latex-mcp', 'projects'),
-    workspaceIsLocal: false,
-  };
+  return { workspaceRoot: homeWorkspaceRoot(), workspaceIsLocal: false };
 }
 
 /** Whether `dir` (or any ancestor) is a git working tree — walked synchronously via `.git`. */
@@ -414,6 +417,33 @@ export function parseRewriteMode(raw: string | undefined): {
 }
 
 /**
+ * Read the launcher's assertion of how this server was installed from
+ * `WEB_LATEX_MCP_INSTALL_KIND` (`desktop-extension`, `npm` or `source`). The Desktop extension's
+ * `manifest.json` sets it; nobody normally sets it by hand. It exists because the install kind
+ * must be an assertion, never an inference: `update_server` downloads and opens the `.mcpb` only
+ * for the extension, and a file on disk (`manifest.json` sits at the repo root, so every copy of
+ * the repository has one) cannot tell the extension from a source tree.
+ *
+ * Trimmed and case-insensitive, as `parseRewriteMode`; empty or whitespace-only is unset. An
+ * unrecognised value does not throw — it governs one tool's advice, so a typo must not stop the
+ * server starting — and is NOT taken as any kind: it is ignored (left unset, so a git checkout
+ * still reads as `source` and anything else as `npm`, which downloads nothing) and the rejection
+ * is logged to stderr (never stdout — the JSON-RPC channel), `quoteEnvValue`d.
+ */
+export function parseInstallKind(raw: string | undefined): InstallKind | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  const value = trimmed.toLowerCase();
+  if ((INSTALL_KINDS as readonly string[]).includes(value)) return value as InstallKind;
+  console.error(
+    `WEB_LATEX_MCP_INSTALL_KIND ${quoteEnvValue(trimmed)} is invalid; expected one of: ` +
+      `${INSTALL_KINDS.join(', ')}. Ignoring it: update_server will tell a git checkout from an ` +
+      'npm install by itself.',
+  );
+  return undefined;
+}
+
+/**
  * Resolve `WEB_LATEX_MCP_WRITING_GUIDE_EXTRA` — a path or a `file://` URL to an ADDITIONAL
  * writing guide, appended to (never replacing) the base one.
  *
@@ -567,6 +597,7 @@ export function loadConfig(
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
   );
+  const installKind = parseInstallKind(env.WEB_LATEX_MCP_INSTALL_KIND);
   const { path: extraWritingGuidePath } = parseExtraWritingGuide(
     env.WEB_LATEX_MCP_WRITING_GUIDE_EXTRA,
     cwd,
@@ -580,11 +611,15 @@ export function loadConfig(
     env.WEB_LATEX_MCP_CONTACT_EMAIL,
   );
 
+  const fallbackRoot = homeWorkspaceRoot();
   return {
     workspaceRoot,
     workspaceIsLocal,
+    fallbackWorkspaceRoot:
+      path.resolve(workspaceRoot) === path.resolve(fallbackRoot) ? undefined : fallbackRoot,
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),
     projects,
+    envProjectIds: envProjects.map((p) => p.id),
     ...(skippedProjects.length > 0 ? { skippedProjects } : {}),
     defaultProject,
     defaultProjectExplicit,
@@ -594,6 +629,7 @@ export function loadConfig(
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,
+    installKind,
     extraWritingGuidePath,
     referenceSource,
     referenceSourceExplicit,

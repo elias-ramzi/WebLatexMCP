@@ -15,7 +15,12 @@ import {
   projectIdProblem,
   quoteId,
 } from '../lib/projectId.js';
-import { redactGitUrlCredentials, stripGitUrlCredentials } from '../lib/gitUrlCredentials.js';
+import {
+  pathTokenRefusal,
+  redactGitUrlCredentials,
+  stripGitUrlCredentials,
+} from '../lib/gitUrlCredentials.js';
+import { registrationChangeMessage, sameRegistration } from '../lib/registrationChange.js';
 import type {
   GitProjectConfig,
   ProjectConfig,
@@ -51,6 +56,18 @@ function usableLoadedId(
   record(skipped);
   console.error(`[web-latex-mcp] ${describeSkippedProject(skipped, workspaceRoot)}`);
   return false;
+}
+
+/**
+ * Whether two configs for one id name the same project: the same mode, and the same `gitUrl` (git)
+ * or the same resolved `path` (local) — compared as `registerProject` holds them and
+ * `assertDirUnclaimed` resolves them.
+ */
+function sameLocation(a: ProjectConfig, b: ProjectConfig): boolean {
+  if (isLocalProject(a) || isLocalProject(b)) {
+    return isLocalProject(a) && isLocalProject(b) && path.resolve(a.path) === path.resolve(b.path);
+  }
+  return a.gitUrl === b.gitUrl;
 }
 
 /**
@@ -110,10 +127,31 @@ export class ProjectManager {
    * or a hand edit can change the file at any time.
    */
   private readonly skippedProjects: SkippedProject[];
+  /**
+   * Ids configured through `WEB_LATEX_MCP_PROJECTS` (`ServerConfig.envProjectIds`). Env always wins
+   * over the registry, so neither `registeredRootFile` nor `refreshedGitConfig` lets a registry
+   * entry override one of these.
+   */
+  private readonly envProjectIds: ReadonlySet<string>;
+  /**
+   * Ids whose in-process config this process set by a registration it did NOT persist —
+   * `project_sync { gitUrl }`, which calls `registerProject` directly — and that DIFFERS from the
+   * registry's entry for the id (`sameRegistration`). `refreshedGitConfig` never replaces one of
+   * these with the registry's entry: this session re-pointed the project on purpose, for itself.
+   * A registration that merely restates the registry's entry does not pin, and clears an earlier
+   * pin: there is nothing of this session's own to protect, and pinning it brought back the very
+   * flip `refreshedGitConfig` removes (a session that once restated the URL kept it after a peer
+   * re-pointed the project, and its next push re-pointed `origin` back). `registerAndPersist`
+   * clears the pin once its upsert lands, since the registry then holds what this process holds.
+   * Startup loading never pins (the constructor fills `projects` directly, not through
+   * `registerProject`).
+   */
+  private readonly sessionPinned = new Set<string>();
 
   constructor(config: ServerConfig, registry?: ProjectRegistryStore) {
     this.workspaceRoot = config.workspaceRoot;
     this.skippedProjects = [...(config.skippedProjects ?? [])];
+    this.envProjectIds = new Set(config.envProjectIds ?? []);
     // `loadConfig` already drops (and reports) an id `src/lib/projectId.ts` refuses; this keeps a
     // config built any other way from putting one where `projectPath` would throw on it.
     this.projects = new Map(
@@ -184,25 +222,60 @@ export class ProjectManager {
    * through here, so three rules hold for all of them:
    *
    * - the id must be usable as one directory name (`assertValidProjectId`, `src/lib/projectId.ts`);
-   * - a `gitUrl` is held trimmed, and an http(s) one without any password or token
-   *   (`stripGitUrlCredentials`; a plain login name stays): the config is persisted, listed, and
-   *   handed to `GitService.clone`, which writes it to the clone's `origin` — a token inside it
-   *   would be stored in plain text in both places. A caller that must report the removal asks
-   *   `strippedCredentialsNoteFor` with the URL it passed in, which judges by this same strip;
+   * - a `gitUrl` is held trimmed, without any userinfo password or token and without any
+   *   credential query parameter (`stripGitUrlCredentials`; a plain login name stays): the config
+   *   is persisted, listed, and handed to `GitService.clone`, which writes it to the clone's
+   *   `origin` — a token inside it would be stored in plain text in both places. A caller that
+   *   must report the removal asks `strippedCredentialsNoteFor` with the URL it passed in, which
+   *   judges by this same strip. A URL whose PATH carries a token-like segment is refused
+   *   outright, since removing a segment would name another repository;
    * - the working directory must not already belong to a different id (`assertDirUnclaimed`);
    * - a NEW id must not differ from a known one only in case (`assertIdUnaliased`).
+   *
+   * The registration is session-only — pinned against `refreshedGitConfig` — unless it repeats the
+   * registry's current entry for the id (see `sessionPinned`); `registerAndPersist` un-pins.
    *
    * Returns the config as actually registered (URL stripped), which may differ from `cfg`.
    */
   registerProject(cfg: ProjectConfig): ProjectConfig {
     assertValidProjectId(cfg.id);
-    const held: ProjectConfig = isLocalProject(cfg)
-      ? cfg
-      : { ...cfg, gitUrl: stripGitUrlCredentials(cfg.gitUrl).url };
+    let held: ProjectConfig = cfg;
+    if (!isLocalProject(cfg)) {
+      const stripped = stripGitUrlCredentials(cfg.gitUrl);
+      // A token as a path segment cannot be stripped — removing it would name another
+      // repository — so the registration is refused before anything is held or persisted.
+      // `register_project` refuses it before the project lock too; this is defence in depth.
+      if (stripped.pathToken) throw new Error(pathTokenRefusal(cfg.gitUrl));
+      held = { ...cfg, gitUrl: stripped.url };
+    }
+    // Decided before the checks below only because it reads the registry in its own way (it
+    // must not throw); nothing is held or pinned unless they pass.
+    const restatesRegistry = this.registryHolds(held);
     this.assertDirUnclaimed(held);
     this.assertIdUnaliased(held.id);
     this.projects.set(held.id, held);
+    // Session-only until `registerAndPersist` says otherwise — unless it repeats the registry's
+    // entry, which leaves nothing to protect (see `sessionPinned`).
+    if (restatesRegistry) this.sessionPinned.delete(held.id);
+    else this.sessionPinned.add(held.id);
     return held;
+  }
+
+  /**
+   * Whether the registry's current entry for `cfg.id` is the same registration as `cfg`
+   * (`sameRegistration`: location, `branch`, `tokenEnv`, `username`). False with no registry, no
+   * entry, or a read that throws — a registration that cannot be compared is pinned, failing
+   * toward what the session asked for.
+   */
+  private registryHolds(cfg: ProjectConfig): boolean {
+    if (!this.registry) return false;
+    let current: ProjectConfig | undefined;
+    try {
+      current = this.registry.read().find((p) => p.id === cfg.id);
+    } catch {
+      return false;
+    }
+    return current !== undefined && sameRegistration(current, cfg, sameLocation);
   }
 
   /**
@@ -277,6 +350,9 @@ export class ProjectManager {
   ): Promise<ProjectConfig> {
     const held = this.registerProject(cfg);
     await this.registry?.upsert(held, opts);
+    // The registry now holds exactly this config, so it is no longer session-only. Cleared only
+    // after the upsert landed: a failed write leaves the id pinned to what this process holds.
+    this.sessionPinned.delete(held.id);
     if (opts?.makeDefault === true) this.applyMakeDefault(held.id);
     return held;
   }
@@ -323,7 +399,8 @@ export class ProjectManager {
   /**
    * What a re-registration of `id` is about to replace, so `register_project` can report which
    * stored fields it would silently drop (`upsert` replaces the whole entry — see
-   * `droppedRegistrationFields` in `src/tools/registerProject.ts`).
+   * `droppedRegistrationFields` in `src/lib/registration.ts`). `project_sync { gitUrl }` asks
+   * `heldConfig` instead: it replaces only the in-process config.
    *
    * Prefers the registry's OWN current entry when it has one — a peer session may have
    * re-registered `id` since this process last looked, the same reasoning `setDefaultProject`
@@ -341,6 +418,135 @@ export class ProjectManager {
    */
   previousRegistration(id: string): ProjectConfig | undefined {
     return this.registry?.read().find((p) => p.id === id) ?? this.projects.get(id);
+  }
+
+  /**
+   * The config this process holds for `id` — what `getProjectConfig(id)` returns, including the
+   * registry entry it loads on a miss — or `undefined` where that would throw (an id held nowhere).
+   * An env-configured id answers with its env config even when the registry holds an entry for it:
+   * env wins over the registry, so this is the config a runtime `registerProject(id)` replaces.
+   *
+   * Unlike `previousRegistration`, which prefers the registry's entry because it is about what a
+   * persisting re-registration overwrites on disk; `project_sync { gitUrl }` persists nothing and
+   * replaces only the in-process config, so it asks this.
+   */
+  heldConfig(id: string): ProjectConfig | undefined {
+    if (!this.projects.has(id)) this.reloadFromRegistry();
+    return this.projects.get(id);
+  }
+
+  /**
+   * The `rootFile` registered for `id` — the root `compile`, the PDF tools and the viewer use when
+   * a call names none — read from the registry's CURRENT entry rather than this process's snapshot.
+   *
+   * Why: `this.projects` is a snapshot. When peer session B re-registers `paper` with a new
+   * `rootFile` (persisted to `<workspace>/registry.json`), this session's entry is never refreshed —
+   * `reloadFromRegistry` only fills in MISSING ids — so it kept compiling and serving the old root
+   * until a restart, and the hints' advice to "register the project again with rootFile" did
+   * nothing for a viewer this session owns.
+   *
+   * - An env-configured id (`WEB_LATEX_MCP_PROJECTS`) answers from the in-process config: env always
+   *   wins over the registry, as it does at startup.
+   * - Otherwise, when the registry's current entry for `id` names the SAME project location as the
+   *   in-process config (same mode; same `gitUrl` for git, same resolved `path` for local), its
+   *   `rootFile` is the answer — `undefined` included, when the peer re-registered without one
+   *   (back to auto-detection).
+   * - Otherwise — no registry wired, no entry (a project registered in-session by
+   *   `project_sync { gitUrl }`, which does not persist), an entry pointing elsewhere, or a
+   *   registry that cannot be read — the in-process config's `rootFile`.
+   *
+   * Only the root follows the registry here, and this method never replaces or writes
+   * `this.projects`; a remote operation adopts the whole entry first (`refreshedGitConfig`). Throws the same "Unknown project"
+   * error as `getProjectConfig` for an unknown id. A synchronous read of the registry file, once
+   * per call — callers read it once and pass the value on.
+   */
+  registeredRootFile(id: string): string | undefined {
+    const held = this.getProjectConfig(id);
+    if (this.envProjectIds.has(id) || !this.registry) return held.rootFile;
+    let current: ProjectConfig | undefined;
+    try {
+      current = this.registry.read().find((p) => p.id === id);
+    } catch {
+      // `ProjectRegistry.read()` reads an unparseable file as empty rather than throwing, but a
+      // store that does throw must not fail a compile over a setting it only refines.
+      return held.rootFile;
+    }
+    return current !== undefined && sameLocation(current, held) ? current.rootFile : held.rootFile;
+  }
+
+  /**
+   * The config a REMOTE operation (`project_sync` without `gitUrl`, `push`, `reset_to_remote`)
+   * should use for `id` (or the default project) — the registry's current entry when a peer has
+   * re-registered the project since this process loaded it — adopted into `this.projects`.
+   * Called before `requireGitProject` and before the credential is resolved, so both follow the
+   * adopted URL.
+   *
+   * Why: every fetch, pull and push reconciles the shared clone's `origin` to the held `gitUrl`
+   * while the server owns it (`GitService.reconcileOrigin`). With `this.projects` a snapshot,
+   * a peer process that loaded `paper` before session A re-registered it at a new remote kept the
+   * old URL, and its next push re-pointed the shared `origin` back and pushed there — sessions
+   * flipped `origin` back and forth. Adopting the persisted entry first makes every process
+   * converge on the latest persisted registration at its next remote operation.
+   *
+   * Rules, in order — each but the last answers with the held config, unchanged:
+   * - an env-configured id (`WEB_LATEX_MCP_PROJECTS`): env always wins over the registry;
+   * - an id pinned by a session-only registration in this process (`sessionPinned`:
+   *   `project_sync { gitUrl }` with a registration that differs from the registry's): this
+   *   session re-pointed it on purpose. Between such a session and its peers one flip remains,
+   *   inherent to a registration nobody else can see. A restatement of the registry's entry
+   *   does not pin;
+   * - an id this process holds as a local project: a switch from a directory used in place to a
+   *   clone under the workspace is a mode change, not the stale URL this exists for;
+   * - no registry wired, no registry entry for the id, an entry that is not a git project, an
+   *   entry whose id `usableLoadedId` refuses, or a registry read that throws: fail toward the
+   *   snapshot, never throw over a refinement;
+   * - otherwise the registry's git entry is adopted WHOLESALE — gitUrl, branch, tokenEnv,
+   *   username and rootFile together, since a re-registration replaces the whole entry — which
+   *   is what a freshly started process would hold. No `assertDirUnclaimed`/`assertIdUnaliased`:
+   *   the id is already the registry's, and a git project's directory is `<workspace>/<id>`.
+   *
+   * `undefined` when the id resolves nowhere; the caller's `requireGitProject` then throws its
+   * usual error. Cost: one synchronous `registry.json` read per remote operation, as
+   * `registeredRootFile` pays per compile.
+   */
+  refreshedGitConfig(id?: string): ProjectConfig | undefined {
+    const resolvedId = id ?? this.defaultProjectId();
+    if (resolvedId === undefined) return undefined;
+    const held = this.projects.get(resolvedId);
+    if (this.envProjectIds.has(resolvedId) || this.sessionPinned.has(resolvedId)) return held;
+    if (held !== undefined && isLocalProject(held)) return held;
+    if (!this.registry) return held;
+    let current: ProjectConfig | undefined;
+    try {
+      current = this.registry.read().find((p) => p.id === resolvedId);
+    } catch {
+      // A store that throws must not fail a push over a refinement; the snapshot stands.
+      return held;
+    }
+    if (
+      current === undefined ||
+      isLocalProject(current) ||
+      !usableLoadedId(current.id, 'the registry', this.workspaceRoot, () => undefined)
+    ) {
+      return held;
+    }
+    this.projects.set(resolvedId, current);
+    return current;
+  }
+
+  /**
+   * The in-lock half of `refreshedGitConfig`, for the same remote operations. Each resolves its
+   * config and credential BEFORE taking the project lock, and a peer's re-registration (or a
+   * same-process `project_sync { gitUrl }`) can land while it waits; reconciling `origin` to the
+   * captured URL would then flip it back under the peer. So, inside `runExclusive` and before
+   * `reconcileOrigin`, each re-reads the registration here and is refused when the `gitUrl`,
+   * `tokenEnv` or `username` it resolved for no longer holds (`registrationChangeMessage`): nothing
+   * has been fetched or pushed, and a retry follows the current registration. The re-read adopts
+   * it, exactly as the pre-lock refresh would have.
+   */
+  assertRegistrationUnchanged(cfg: GitProjectConfig): void {
+    const message = registrationChangeMessage(cfg, this.refreshedGitConfig(cfg.id));
+    if (message !== undefined) throw new Error(message);
   }
 
   /**

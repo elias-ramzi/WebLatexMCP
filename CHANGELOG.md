@@ -9,6 +9,175 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-05
+
+### Added
+
+- **`update_server`: update the Claude Desktop extension from the chat.** Ask Claude to check for an
+  update and it compares the running version with the latest GitHub release; with `install: true`
+  it downloads the release's `web-latex-mcp.mcpb`, verifies it against the SHA-256 digest GitHub
+  publishes for the asset (plus its declared size and the zip signature — a release without a
+  digest is refused), and opens it, so Claude Desktop shows its own install prompt. Nothing is
+  installed until you confirm there. The download URL is pinned to this repository's
+  `releases/download/<tag>/`. For an npm or git-checkout install, nothing is downloaded and the tool
+  says what to run instead. The extension is recognised only because its manifest sets the new
+  `WEB_LATEX_MCP_INSTALL_KIND`, never from files on disk; without it a git checkout is `source` and
+  anything else `npm`. A bundle that cannot be saved (a full disk) leaves nothing behind in the
+  temp dir, and the error names the file and directory once, with the error code. The npm advice
+  leads with `@latest`, since a release's version reaches npm only once it is published there.
+
+### Changed
+
+- **The Desktop extension no longer makes you pick a workspace folder before it enables.** The
+  form's **Clone workspace folder** field now comes prefilled with `~/latex-workspace` (`${HOME}`
+  expanded by Claude Desktop), and you can change it from the extension's settings at any time.
+  The server's own fallback when `WEB_LATEX_MCP_WORKSPACE` is unset is unchanged
+  (`~/.web-latex-mcp/projects`), so npm and hand-configured installs are unaffected. An extension
+  install that had left the field blank and picks up the new default starts from an empty project
+  list: point the field back at `~/.web-latex-mcp/projects` to keep the projects registered there.
+  `list_projects` says so when it happens: an empty list now names how many projects are registered
+  in that fallback workspace when the server is using another one, alongside the folder in use.
+- **The tools you meet first say which workspace is in use and how to move it.** `list_projects`'
+  empty state, `register_project`'s result for a git project, and the `credential_portal` page name
+  the workspace folder and where to change it, and `doctor`'s unwritable-workspace hint names the
+  extension's field too (`WEB_LATEX_MCP_WORKSPACE`, which the Desktop
+  extension sets from its settings form). Moving it is still a restart-time setting only; no tool
+  changes it.
+- **The post-release back-merge PR no longer waits for someone to approve its checks.**
+  `back-merge.yml` opened the `main` → `dev` PR with the workflow's own `GITHUB_TOKEN`, and GitHub
+  holds the `pull_request` runs of such a PR as `action_required`. `dev` requires one of them
+  (`CHANGELOG [Unreleased] updated`), so auto-merge stalled after every release until the runs
+  were approved by hand; the held CI run most likely also explains the README's CI badge reading as
+  failing meanwhile. The workflow now opens and auto-merges the PR with a `BACK_MERGE_TOKEN` secret,
+  a fine-grained personal access token, whose runs start without approval. Without the secret it
+  falls back to `GITHUB_TOKEN` and warns that the runs need approving. `docs/versioning.md` says how
+  to set it up.
+
+### Fixed
+
+- **Follow-ups from the review of #246 (#247).** `project_sync { gitUrl }` on a project this
+  session held as a local one now names the local fields it drops, even when another session has
+  since registered the same URL. A git URL holding a password with no username before it
+  (`ssh://:pw@host/…`) is no longer described as "an access token (token@)". Error messages now
+  hide the password in `https:/user:pw@host`, `https:\user:pw@host` and `https:user:pw@host`
+  shapes, and the whole of a credential query value that itself contains `<scheme>://`. A
+  finished test run no longer leaves `ovl-tpl-*` directories in the OS temp dir (a killed one,
+  or one whose cleanup fails, leaves a single directory, which a later run removes after a
+  day), and the regex-timing test tolerates a loaded machine.
+
+- **Follow-ups from the review of #248 (#249).** Error messages no longer hide text like
+  `xhttps:a@b`, where `https:` sits inside a longer word: the lenient userinfo rule now starts
+  only where a scheme starts, as the URL strip already reads one. Prose such as
+  `see http:foo@bar.com` is still masked, since nothing tells it apart from a real credential. A
+  run of URLs glued together with no whitespace is masked whole only up to four URLs, down from
+  16, which bounds how many passes one long run costs; past that each URL is masked up to the next
+  one's scheme, as before.
+
+- **A cloned project's fetch, pull and push now go to the URL the session holds — while the server
+  owns the clone's `origin`.** `project_sync` and `register_project` with a different `gitUrl`
+  updated the registration but not the clone's `origin`, which is what every remote operation uses:
+  fetch, pull and push kept going to the old remote — a re-point to a repository that does not
+  exist even reported `up-to-date` — and the token was offered only to the new host. A clone now
+  records in its own `.git/config` what the server wrote to `origin` (`webLatexMcp.heldUrl`,
+  `webLatexMcp.originUrl`, never a token), and before every fetch, pull and push `origin` is
+  pointed at the held URL while it is still exactly what the server wrote. So a session-only
+  `project_sync { gitUrl }` moves `origin` for that session, and a later session holding the
+  registered or env URL moves it back. Peer sessions no longer flip `origin` between them:
+  `project_sync` (without `gitUrl`), `push` and `reset_to_remote` first adopt the project's current
+  registry entry — URL, branch, credential settings and root together — so a peer that loaded the
+  project before another session re-registered it with `register_project` follows that latest
+  persisted registration instead of pointing `origin` back at the old remote and pushing there; an
+  env-configured project, and one this session re-pointed with a session-only
+  `project_sync { gitUrl }`, keep their own URL — a `project_sync { gitUrl }` that merely restates
+  the registry's URL takes the registry's branch and credential settings (not a stale copy this
+  session loaded earlier), keeps nothing of its own and follows later re-registrations like any
+  peer. A re-registration that lands while one of those
+  three calls waits for the project lock is refused, naming the old and new values, with nothing
+  fetched or pushed, rather than pointing `origin` back at the URL the call started with; a retry
+  follows it. A relative local
+  path is written resolved, as `git clone` records it. An `origin` set by hand is never rewritten —
+  nor is one carrying a password or token, whoever put it there: set by hand, written by the
+  server's own `git clone` of an env-configured or legacy URL that embeds a token, or left by an
+  older version after a crash. `project_sync`, `push` and `reset_to_remote` name it (redacted) with
+  the `git remote set-url` remedy — for a configured URL that embeds a token, after moving the
+  token into `tokenEnv` or `set_credential` — and refuse when the registered URL has changed as
+  well. Clones the
+  bug left at the old remote have no record, so they are reported with that remedy, not repaired
+  automatically. An `origin` with several URLs (a push mirror) is never rewritten and keeps working
+  while its first URL is the registered one. A re-point is named in the result (the old URL
+  redacted, plus any `pushurl` that still decides where a push goes); `register_project` writes
+  nothing to the clone and says what the next remote operation will do. An `origin` defined outside
+  `.git/config`, several URLs when the registration changed, and a held URL carrying a token are
+  refused in words when a write is needed. The `git remote set-url` remedy is the exact command in
+  a successful result, and on an error too unless its URL carries a login name
+  (`https://org@dev.azure.com/…`): an error message has every https userinfo scrubbed to `***@`,
+  so the printed command would set the username to `***`, and the note instead reads
+  `git remote set-url origin <url>` with `<url>` the project's `gitUrl` as `list_projects` shows
+  it, and names the login name. A call refused on its arguments alone never touches `.git/config`:
+  `push` refuses `resolutions` in branch mode, and branch mode without a `branch` or a `message`,
+  before the reconcile, and `project_sync` with `mode: "clone"` on a project already cloned
+  refuses before it too. An `origin` with no url but other `remote.origin.*` keys left in the
+  repository's config (`.git/config`, a file it includes, or `config.worktree`) is restored with
+  `git remote set-url`, writing git's default fetch refspec when none is left, rather than failing
+  on "remote origin already exists"; and a failed write of `origin` now quotes git's first stderr
+  line, credential-scrubbed.
+- **A credential in a git URL's query string, a non-http userinfo or its path is no longer stored
+  or shown.** Registration stripped a secret only from an `http(s)://` userinfo, so
+  `ssh://user:secret@host/…` (any `<scheme>://`), `https://host/repo.git?private_token=…` and
+  `https://host/ghp_…/repo.git` were written to `registry.json` and the clone's `origin`, echoed in
+  results, and left unscrubbed in errors. Now a password in the userinfo of any scheme is removed
+  (the login kept; an ssh login is never taken for a token, and scp-style `git@host:path` has no
+  password to remove), and a query parameter named like a credential (`access_token`,
+  `private_token`, `token`, `sig`, …) or holding a known-prefix token is removed with its `&`, the
+  rest of the URL kept byte for byte. A known-prefix token as a path segment cannot be removed
+  without naming another repository, so registration refuses such a URL, saying nothing was stored.
+  Displayed URLs show each as `***`; error messages mask a non-http password and credential query
+  values too; and an `origin` carrying any of them is never adopted or written by the server.
+- **`compile`, the PDF tools and the viewer now use the `rootFile` a project was registered with.**
+  The value was stored in `registry.json` (and accepted in `WEB_LATEX_MCP_PROJECTS`) but read by
+  nothing: every call that omitted `rootFile` auto-detected, and detection returned any nested
+  `<dir>/main.tex` first. A project whose root is a top-level `root.tex` beside a vendored
+  template's `tpl/main.tex` compiled the template, and the viewer waited forever for the template's
+  build ("No compiled PDF yet") whatever was compiled. A call's own `rootFile` still wins; then the
+  registered one; then detection, which now takes a top-level `main.tex`, else the shallowest `.tex`
+  holding `\documentclass` (a `main.tex` first at each depth), else the shallowest `main.tex`, else
+  the first `.tex`. **On upgrade**, a `rootFile` already stored for a project now takes effect —
+  including the `"rootFile":"main.tex"` the install guides put in `WEB_LATEX_MCP_PROJECTS`, and the
+  one `register_project` infers when `path` names a `.tex` — and a project with no registered root
+  and no top-level `main.tex` may now build another file: depth now comes first and a `main.tex`
+  below the top level must hold `\documentclass` to be preferred, so the shallowest `.tex` holding
+  `\documentclass` wins (a `main.tex` first at its depth), over any deeper `main.tex` and over the
+  first such `.tex` in listing order. A registered root that `compile` and the PDF tools cannot use
+  — missing, not a file, unreadable, an absolute or drive-prefixed path (the relative spelling is
+  offered when it lies in the project), or outside the project (a climbing `..` path, a link out of
+  it) — is refused, naming the registration and the ways out, instead of failing inside latexmk or
+  reporting "Run compile first"; an explicit `rootFile` is not checked. `register_project` now
+  refuses a `rootFile` that is absolute, has a drive prefix or a `..` segment (an entry already in
+  `registry.json` or `WEB_LATEX_MCP_PROJECTS` is never refused at load). A session follows a peer's
+  re-registration of the root without a restart (the root is read from `registry.json` for a project
+  not configured in `WEB_LATEX_MCP_PROJECTS`), and `project_sync` with the gitUrl a project was
+  registered with keeps its `rootFile`, `branch`, `username` and `tokenEnv` instead of dropping them
+  for the rest of the session.
+- **The viewer says which root it shows.** The `viewer` result names it (`rootFile`, `rootSource`:
+  `registered` or `detected`), the page names the root it is waiting for while that root has no
+  build, and `compile` says when the viewer — running or not yet opened — shows another root,
+  nothing at all, or this build only as the surfaced copy (no source locations), and how to make
+  it follow the root just built.
+- **A release whose `package.json` was not bumped no longer ships a `.mcpb`.** The bundle workflow
+  now fails when the tag differs from `package.json`'s version, as the npm publish already did. Such
+  a bundle reported the old version, so `update_server` would have offered the same update forever.
+- **`register_project` names the fields it dropped even when the clone fails.** The replacement
+  registration is saved before the clone runs. A failed clone used to lose the "dropping its
+  rootFile=…" note for good, because a retry finds nothing left to drop.
+- **`project_sync { gitUrl }`'s notes, on failure.** The dropped-fields note now comes before the
+  stripped-token note, as it does on success. It no longer tells you to call `register_project`
+  with the URL that may be why the sync failed: it says to do so once the URL is right.
+- **`register_project` quotes and escapes every path and URL it echoes:** the file it was
+  pointed at and the LaTeX root, the registered directory or git URL, the clone directory, and the
+  path in a "no such file" refusal. A newline or a bidi override in any of them could otherwise
+  forge the rest of the message. The LaTeX root named is the one registered: an explicit `rootFile`
+  over the one inferred from the file.
+
 ## [0.8.0] - 2026-09-29
 
 ### Added

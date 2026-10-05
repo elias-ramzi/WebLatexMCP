@@ -10,6 +10,8 @@ import {
   rewriteModeSourceEnum,
 } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
+import { fallbackWorkspaceNote, workspaceNote } from '../lib/workspaceNote.js';
+import { countRegisteredProjects } from '../services/projectRegistry.js';
 
 const outputSchema = {
   projects: z.array(
@@ -53,6 +55,18 @@ const outputSchema = {
     }),
   ),
 };
+
+/**
+ * The empty state's closing lines: the workspace in use, preceded by the projects registered in the
+ * server's fallback workspace when this server is not using it and it holds any — an empty list
+ * is otherwise read as "they are gone", and the folder in use is what tells the two apart.
+ */
+function emptyWorkspaceNote(ctx: AppContext): string {
+  const fallback = ctx.config.fallbackWorkspaceRoot;
+  const count = fallback ? countRegisteredProjects(fallback) : 0;
+  const inUse = workspaceNote(ctx.config.workspaceRoot);
+  return fallback && count > 0 ? `${fallbackWorkspaceNote(fallback, count)}\n${inUse}` : inUse;
+}
 
 export function registerListProjects(server: McpServer, ctx: AppContext): void {
   server.registerTool(
@@ -114,7 +128,8 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
             ? 'No projects registered yet. Add one with register_project({ project: "<id>", ' +
               'gitUrl: "<git remote>" }) — an Overleaf, GitHub, or any git URL. It is persisted to ' +
               'the workspace, so it survives a restart and is visible to your other sessions, and it ' +
-              'is cloned right away unless you pass clone: false.'
+              'is cloned right away unless you pass clone: false.\n' +
+              emptyWorkspaceNote(ctx)
             : projects
                 .map((p) => {
                   const state =
