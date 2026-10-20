@@ -11,6 +11,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **`npm run format:check` skips the workspace-local `.web_latex_mcp` folder.** Files the server
+  writes there (clones, paper-review reports) are git-excluded but made the local check fail.
+
 - **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
   the function, constant or file that enforces it, grouped under topic headings; the history and
   rationale it repeated now live only in the named files' JSDoc and tests.
