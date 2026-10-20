@@ -9,6 +9,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Changed
+
+- **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
+  the function, constant or file that enforces it, grouped under topic headings; the history and
+  rationale it repeated now live only in the named files' JSDoc and tests.
+
 ## [0.9.0] - 2026-10-05
 
 ### Added
