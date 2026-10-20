@@ -49,6 +49,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the function, constant or file that enforces it, grouped under topic headings; the history and
   rationale it repeated now live only in the named files' JSDoc and tests.
 
+### Fixed
+
+- **`viewer` reports a port it cannot bind as an error.** With `WEB_LATEX_MCP_VIEWER_PORT` naming a
+  port another process held, the tool answered with plain text and no `isError`; since `viewer`
+  declares an output schema, the MCP client rejected that reply (`-32602`, no structured content)
+  and the remedy never reached it. The reply is now a tool error that names the port and says to
+  pick another or unset the variable.
+
 ## [0.9.0] - 2026-10-05
 
 ### Added

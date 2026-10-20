@@ -95,13 +95,22 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         // can be opened first and will fill in once compile runs.
         const { id } = ctx.projectManager.getProjectConfig(project);
 
-        const base = await ctx.viewer.start(ctx.config.viewerPort);
+        const port = ctx.config.viewerPort;
+        const base = await ctx.viewer.start(port);
         if (!base) {
+          // An error, not a plain reply: without `isError` a result carrying no structuredContent
+          // fails the client's outputSchema check (-32602) and this text never reaches it.
           return {
+            isError: true,
             content: [
               {
                 type: 'text',
-                text: 'Could not start the PDF viewer (no free loopback port). Set WEB_LATEX_MCP_VIEWER_PORT to a free port and retry.',
+                text: port
+                  ? `Could not start the viewer on port ${port} (in use, or not bindable on ` +
+                    'loopback; the reason is on stderr). Set WEB_LATEX_MCP_VIEWER_PORT to a free ' +
+                    'port, or unset it to let the OS pick one, and retry.'
+                  : 'Could not start the viewer (no free loopback port). Set ' +
+                    'WEB_LATEX_MCP_VIEWER_PORT to a free port and retry.',
               },
             ],
           };

@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -37,7 +38,7 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-async function harness(opts: { followSymlinks?: boolean } = {}): Promise<{
+async function harness(opts: { followSymlinks?: boolean; viewerPort?: number } = {}): Promise<{
   client: Client;
   ctx: AppContext;
   userDir: string;
@@ -56,7 +57,12 @@ async function harness(opts: { followSymlinks?: boolean } = {}): Promise<{
   await writeFile(path.join(userDir, 'main.tex'), '\\documentclass{article}\n', 'utf8');
   await writeFile(path.join(outside, 'secret.md'), '# not yours\n', 'utf8');
 
-  const config: ServerConfig = { workspaceRoot: workspace, sessionId: 'test', projects: [] };
+  const config: ServerConfig = {
+    workspaceRoot: workspace,
+    sessionId: 'test',
+    projects: [],
+    ...(opts.viewerPort !== undefined ? { viewerPort: opts.viewerPort } : {}),
+  };
   const ctx = createContext(
     config,
     new CredentialResolver({}),
@@ -340,5 +346,22 @@ describe('viewer: markdown document', () => {
     );
     expect(res.status).toBe(404);
     expect(await res.text()).not.toContain('not yours');
+  });
+});
+
+describe('viewer: the port cannot be bound', () => {
+  it('is a tool error naming the port, not an output-validation failure', async () => {
+    // A configured port someone else holds. Without `isError` the reply carried no
+    // structuredContent, and the client's output validator turned it into -32602 with no result.
+    const holder = net.createServer();
+    await new Promise<void>((resolve) => holder.listen(0, '127.0.0.1', resolve));
+    cleanups.push(() => new Promise((resolve) => holder.close(resolve)));
+    const port = (holder.address() as net.AddressInfo).port;
+
+    const { client } = await harness({ viewerPort: port });
+    const opened = await openViewer(client, DOC);
+    expect(opened.isError).toBe(true);
+    expect(opened.text).toContain(`port ${port}`);
+    expect(opened.text).toContain('WEB_LATEX_MCP_VIEWER_PORT');
   });
 });
