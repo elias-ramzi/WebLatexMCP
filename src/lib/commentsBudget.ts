@@ -127,7 +127,8 @@ const COMMENT_SEPARATOR_OVERHEAD = 3;
  *  3. `note` is never dropped, only clipped at {@link COMMENT_NOTE_CAP}. A comment without its note
  *     is not something anyone can act on, and the note is the one field with no copy anywhere else
  *     a tool can reach.
- *  4. The comment's **identity and location** (`id`, `number`, `page`, `file`, `line`, `resolved`)
+ *  4. The comment's **identity and location** (`id`, `number`, `page` or `document`, `file`, `line`,
+ *     `resolved`)
  *     survive last of all, together with the note: they are what makes a comment addressable at
  *     all, and `resolve_comments` takes `ids` that come only from here.
  *
@@ -140,7 +141,10 @@ export const ALLOCATION_ORDER = ['identity+note', 'quote', 'snippet'] as const;
 export interface CommentLike {
   id: string;
   number: number;
-  page: number;
+  /** PDF page; absent for a document comment. */
+  page?: number;
+  /** The markdown document a document comment was made on; absent for a PDF comment. */
+  document?: string;
   note: string;
   quote?: string;
   file?: string;
@@ -222,7 +226,11 @@ export function clipText(s: string, max: number): { text: string; omitted: numbe
  * that appear only where something went, so a result with nothing cut reads exactly as before.
  */
 export function renderCommentText(c: PlannedComment): string {
-  const loc = c.file ? `${c.file}:${c.line}` : `(unresolved — page ${c.page})`;
+  const loc = c.file
+    ? `${c.file}:${c.line}`
+    : c.document !== undefined
+      ? `(unresolved — ${c.document})`
+      : `(unresolved — page ${c.page})`;
   const noteCut = c.noteOmittedChars ? ` (+${c.noteOmittedChars} chars cut)` : '';
   const quote = c.quote
     ? `\n   quote: "${c.quote}"${c.quoteOmittedChars ? ` (+${c.quoteOmittedChars} chars cut)` : ''}`
@@ -249,7 +257,9 @@ export function renderCommentsText(plan: CommentsPlan): string {
  * What one comment costs once this server has rendered it: as a block of the result text AND
  * JSON-encoded into `structuredContent`, plus the separator that joins it to the next one.
  * `JSON.stringify` drops `undefined`-valued keys, which is exactly what the wire form does, so the
- * charge is the wire cost rather than the in-memory object's.
+ * charge is the wire cost rather than the in-memory object's. A document comment's `document` is
+ * rendered in the text only where it is the location (`(unresolved — <document>)`; otherwise the
+ * `file:line` already names it), but it always ships in the JSON, where this charge counts it.
  */
 export function commentRenderCost(c: PlannedComment): number {
   return renderCommentText(c).length + JSON.stringify(c).length + COMMENT_SEPARATOR_OVERHEAD;
@@ -275,6 +285,7 @@ function materialize(f: Frame): PlannedComment {
     id: src.id,
     number: src.number,
     page: src.page,
+    ...(src.document !== undefined ? { document: src.document } : {}),
     note: f.note.text,
     ...(f.note.omitted > 0 ? { noteOmittedChars: f.note.omitted } : {}),
     quote: f.quote?.text,

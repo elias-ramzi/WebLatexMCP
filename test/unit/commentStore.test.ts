@@ -109,4 +109,95 @@ describe('CommentStore', () => {
     expect(s.list('p').map((c) => c.note)).toEqual(['a', 'b', 'c']);
     expect(s.undo('p')).toBeNull(); // nothing left to undo
   });
+
+  describe('surfaces (the PDF and each markdown document)', () => {
+    const doc = (document: string, note: string) => ({ document, note, file: document, line: 3 });
+    const nums = (cs: { note: string; number: number }[]) => cs.map((c) => [c.note, c.number]);
+
+    it('accepts a document comment with no page/x/y', () => {
+      const s = new CommentStore();
+      const c = s.add('p', { document: 'run/a.md', note: 'd', file: 'run/a.md', line: 7 });
+      expect(c).toMatchObject({ document: 'run/a.md', file: 'run/a.md', line: 7, number: 1 });
+      expect(c.page).toBeUndefined();
+    });
+
+    it('numbers open comments per surface, renumbering only the surface that changed', () => {
+      const s = new CommentStore();
+      const p1 = s.add('p', { ...base, note: 'p1' });
+      s.add('p', doc('a.md', 'a1'));
+      s.add('p', { ...base, note: 'p2' });
+      s.add('p', doc('b.md', 'b1'));
+      s.add('p', doc('a.md', 'a2'));
+      expect(nums(s.list('p'))).toEqual([
+        ['p1', 1],
+        ['a1', 1],
+        ['p2', 2],
+        ['b1', 1],
+        ['a2', 2],
+      ]);
+      s.resolve('p', [p1.id]);
+      expect(nums(s.list('p'))).toEqual([
+        ['a1', 1],
+        ['p2', 1],
+        ['b1', 1],
+        ['a2', 2],
+      ]);
+    });
+
+    it('filters list by surface: undefined = all, null = PDF only, string = that document', () => {
+      const s = new CommentStore();
+      s.add('p', { ...base, note: 'pdf' });
+      s.add('p', doc('a.md', 'a'));
+      s.add('p', doc('b.md', 'b'));
+      expect(s.list('p').map((c) => c.note)).toEqual(['pdf', 'a', 'b']);
+      expect(s.list('p', { document: undefined }).map((c) => c.note)).toEqual(['pdf', 'a', 'b']);
+      expect(s.list('p', { document: null }).map((c) => c.note)).toEqual(['pdf']);
+      expect(s.list('p', { document: 'a.md' }).map((c) => c.note)).toEqual(['a']);
+      const a = s.list('p', { document: 'a.md' })[0]!;
+      s.resolve('p', [a.id]);
+      expect(s.list('p', { document: 'a.md' })).toHaveLength(0);
+      expect(s.list('p', { document: 'a.md', includeResolved: true })).toHaveLength(1);
+    });
+
+    it('resolves without ids scoped by surface', () => {
+      const mk = () => {
+        const s = new CommentStore();
+        s.add('p', { ...base, note: 'pdf' });
+        s.add('p', doc('a.md', 'a'));
+        s.add('p', doc('b.md', 'b'));
+        return s;
+      };
+      let s = mk();
+      expect(s.resolve('p', undefined, null)).toBe(1);
+      expect(s.list('p').map((c) => c.note)).toEqual(['a', 'b']);
+      s = mk();
+      expect(s.resolve('p', undefined, 'a.md')).toBe(1);
+      expect(s.list('p').map((c) => c.note)).toEqual(['pdf', 'b']);
+      s = mk();
+      expect(s.resolve('p', undefined, undefined)).toBe(3);
+      expect(s.list('p')).toHaveLength(0);
+    });
+
+    it('undoes per surface, searching the one stack from the top', () => {
+      const mk = () => {
+        const s = new CommentStore();
+        const c1 = s.add('p', { ...base, note: 'pdf' });
+        const c2 = s.add('p', doc('a.md', 'a'));
+        s.remove('p', c1.id);
+        s.remove('p', c2.id);
+        return s;
+      };
+      let s = mk();
+      expect(s.undo('p', null)?.note).toBe('pdf');
+      expect(s.undo('p', null)).toBeNull();
+      expect(s.undo('p', 'a.md')?.note).toBe('a');
+      s = mk();
+      expect(s.undo('p', 'b.md')).toBeNull();
+      expect(s.undo('p', 'a.md')?.note).toBe('a');
+      expect(s.list('p', { document: 'a.md' })[0]?.number).toBe(1);
+      s = mk();
+      expect(s.undo('p')?.note).toBe('a'); // most recent of any surface
+      expect(s.undo('p')?.note).toBe('pdf');
+    });
+  });
 });

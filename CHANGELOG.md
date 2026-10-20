@@ -9,6 +9,25 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **The viewer shows and comments on markdown documents, not only the PDF.** `viewer` takes a
+  `document` (a `.md` file in the project, e.g. a peer-review run's `final-review.md`): the page
+  renders it, the user selects text and leaves comments, and `list_comments` hands each back with
+  the document as `file`, the source `line` the server resolved and a snippet; `resolve_comments`
+  clears them as for PDF comments. Rendering is server-side (markdown-it) with raw HTML off and no
+  images or other fetches, and the document is read through the project sandbox. `list_comments`
+  takes a `document` filter (and `pdfOnly`), and each comment says which `document` it belongs to; `resolve_comments` takes the same two. The peer-review
+  skill now offers to open its final review this way.
+
+### Security
+
+- **The viewer refuses requests that do not come from a loopback address.** A `Host` other than
+  `localhost`, `127.0.0.1` or `[::1]` (any port, so forwarded ports keep working) is refused, and so
+  is a POST whose `Origin` is not the viewer's own (another site, or a page on another local port),
+  so a web page open in the same browser can no longer post comments to the viewer or read what it
+  serves through DNS rebinding.
+
 ### Changed
 
 - **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The
@@ -29,6 +48,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
   the function, constant or file that enforces it, grouped under topic headings; the history and
   rationale it repeated now live only in the named files' JSDoc and tests.
+
+### Fixed
+
+- **`viewer` reports a port it cannot bind as an error.** With `WEB_LATEX_MCP_VIEWER_PORT` naming a
+  port another process held, the tool answered with plain text and no `isError`; since `viewer`
+  declares an output schema, the MCP client rejected that reply (`-32602`, no structured content)
+  and the remedy never reached it. The reply is now a tool error that names the port and says to
+  pick another or unset the variable.
 
 ## [0.9.0] - 2026-10-05
 

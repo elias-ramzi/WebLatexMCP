@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { splitLines } from './lines.js';
+import { isViewableDocument } from './docComments.js';
 
 /** Source lines of context on either side of the reported line — 2 + the line itself + 2 = 5. */
 export const SNIPPET_CONTEXT_LINES = 2;
@@ -208,6 +209,32 @@ export async function readSourceLines(
     return splitLines(content);
   } catch {
     return undefined; // moved, deleted, outside the project, or behind a symlink out of it
+  }
+}
+
+/**
+ * {@link readSourceLines} for a comment made on a markdown document in the viewer. That path came
+ * from no log or synctex record: it is the document the viewer was asked to open, already read
+ * through the sandbox — so the source-extension gate, which exists for paths a *document* names,
+ * gives way to `isViewableDocument`, and the read follows the owner's link policy exactly as the
+ * viewer's own read of it did. Records no baseline, for the same reason {@link readSourceLines}
+ * does not.
+ */
+export async function readDocumentLines(
+  files: SnippetReader,
+  projectDir: string,
+  document: string,
+): Promise<string[] | undefined> {
+  if (!isViewableDocument(document)) return undefined;
+  try {
+    const { content, note } = await files.read(projectDir, {
+      path: document,
+      recordBaseline: false,
+    });
+    if (note) return undefined;
+    return splitLines(content);
+  } catch {
+    return undefined;
   }
 }
 
