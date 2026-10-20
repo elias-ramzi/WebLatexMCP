@@ -9,6 +9,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Changed
+
+- **The CHANGELOG check no longer fails Dependabot's PRs.** It skips them by author and reads a
+  PR's labels live rather than from the event, which raced Dependabot's labelling and left the
+  check red under one name while a second run of it passed.
+
+- **`npm run format:check` skips the workspace-local `.web_latex_mcp` folder.** Files the server
+  writes there (clones, paper-review reports) are git-excluded but made the local check fail.
+
+- **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
+  the function, constant or file that enforces it, grouped under topic headings; the history and
+  rationale it repeated now live only in the named files' JSDoc and tests.
+
 ## [0.9.0] - 2026-10-05
 
 ### Added
