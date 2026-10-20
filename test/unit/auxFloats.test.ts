@@ -42,14 +42,36 @@ describe('parseAuxLabels', () => {
     expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:x', number: '3', page: '7' }]);
   });
 
-  it('parses the hyperref form with five groups, taking only the first two', () => {
+  it("parses the hyperref form with five groups: number, page, and the fourth group's anchor", () => {
     const aux = '\\newlabel{fig:x}{{3}{7}{\\relax }{figure.3}{}}\n';
-    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:x', number: '3', page: '7' }]);
+    expect(parseAuxLabels(aux)).toEqual([
+      { label: 'fig:x', number: '3', page: '7', anchor: 'figure.3' },
+    ]);
   });
 
   it('handles nested braces inside a group', () => {
     const aux = '\\newlabel{sec:intro}{{1}{2}{\\relax {Introduction}}{section.1}{}}\n';
-    expect(parseAuxLabels(aux)).toEqual([{ label: 'sec:intro', number: '1', page: '2' }]);
+    expect(parseAuxLabels(aux)).toEqual([
+      { label: 'sec:intro', number: '1', page: '2', anchor: 'section.1' },
+    ]);
+  });
+
+  it('keeps a label without an anchor when the anchor group is empty, missing or too long', () => {
+    // An anchor only ever adds evidence (labelPages.ts), so a malformed one costs the label
+    // nothing: the entry stays, the anchor is left out.
+    const long = 'a'.repeat(201);
+    const aux = [
+      '\\newlabel{empty}{{1}{2}{Title}{}{}}',
+      '\\newlabel{titleOnly}{{1}{3}{Title}}',
+      `\\newlabel{long}{{1}{4}{Title}{${long}}{}}`,
+      '\\newlabel{fits}{{1}{5}{Title}{figure.caption.9}{}}',
+    ].join('\n');
+    expect(parseAuxLabels(aux)).toEqual([
+      { label: 'empty', number: '1', page: '2' },
+      { label: 'titleOnly', number: '1', page: '3' },
+      { label: 'long', number: '1', page: '4' },
+      { label: 'fits', number: '1', page: '5', anchor: 'figure.caption.9' },
+    ]);
   });
 
   it('parses multiple labels in document order', () => {
@@ -135,7 +157,9 @@ describe('parseAuxLabels', () => {
     // already been consumed. Exact repro from the finding.
     const aux =
       '\\newlabel{fig:real}{{1}{7}{A caption saying \\newlabel{fig:fake}{{9}{999}} here\\relax }{figure.1}{}}';
-    expect(parseAuxLabels(aux)).toEqual([{ label: 'fig:real', number: '1', page: '7' }]);
+    expect(parseAuxLabels(aux)).toEqual([
+      { label: 'fig:real', number: '1', page: '7', anchor: 'figure.1' },
+    ]);
   });
 
   it("does not fabricate a \\newlabel found embedded inside another entry's over-budget outer group", () => {

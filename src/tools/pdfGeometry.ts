@@ -549,7 +549,11 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
             // be returned. Every byte here is document-controlled (`\label` keys straight out of
             // the .aux), and a count cap alone is not a bound on what the client receives — the
             // #68 lesson, applied to the field issue #80 flagged for it. See floatsBudget.ts.
-            const plan = planFloatsPayload(auxResult.floats);
+            // The index's three declared fields only: `anchor` (hyperref's destination name) is
+            // label-lookup evidence, not part of this payload or its schema.
+            const plan = planFloatsPayload(
+              auxResult.floats.map(({ label, number, page }) => ({ label, number, page })),
+            );
             floats = plan.floats;
             floatsOmitted = auxResult.omitted;
             // A THIRD counter rather than folded into floatsOmitted, for the same reason

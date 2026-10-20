@@ -14,6 +14,13 @@ export interface MinimalPdfOptions {
    * merging rather than on one blob.
    */
   text?: (page: number) => string | undefined;
+  /**
+   * Named destinations, written as the catalog's `/Names /Dests` name tree the way pdflatex
+   * writes hyperref's anchors: a number is the 1-based page the destination targets (written as
+   * that page's object reference, `/XYZ`), a string is the destination array written verbatim —
+   * for a target that is not a page of this file (`[3 /XYZ 0 0 null]`, a remote page number).
+   */
+  destinations?: Record<string, number | string>;
 }
 
 /** Escape the three characters that are special inside a PDF literal string. */
@@ -26,9 +33,9 @@ function pdfString(s: string): string {
  * page, so a test can tell rendered pages apart by their bytes. Hand-written rather than compiled,
  * so the render tests need no TeX install.
  *
- * `opts` adds the two things a hand-written PDF needs in order to stand in for a real document in
- * the label-resolution and text-extraction tests: a `/PageLabels` tree and a text layer. Both are
- * off by default, so every pre-existing caller gets byte-for-byte what it got before.
+ * `opts` adds the things a hand-written PDF needs in order to stand in for a real document in
+ * the label-resolution and text-extraction tests: a `/PageLabels` tree, a text layer and named
+ * destinations. All are off by default, so every pre-existing caller gets byte-for-byte what it got before.
  */
 export function minimalPdf(
   pages = 1,
@@ -66,7 +73,21 @@ export function minimalPdf(
       : ` /PageLabels << /Nums [${opts.pageLabels
           .map((label, i) => `${i} << /P (${pdfString(label)}) >>`)
           .join(' ')}] >>`;
-  objs.set(1, `<< /Type /Catalog /Pages 2 0 R${pageLabels} >>`);
+  const names = Object.keys(opts.destinations ?? {}).sort();
+  const dests =
+    names.length === 0
+      ? ''
+      : ` /Names << /Dests << /Names [${names
+          .map((name) => {
+            const target = opts.destinations![name]!;
+            const array =
+              typeof target === 'string'
+                ? target
+                : `[${pageObjs[target - 1]!.pageNum} 0 R /XYZ 0 0 null]`;
+            return `(${pdfString(name)}) ${array}`;
+          })
+          .join(' ')}] >> >>`;
+  objs.set(1, `<< /Type /Catalog /Pages 2 0 R${pageLabels}${dests} >>`);
   objs.set(2, `<< /Type /Pages /Kids [${kids.join(' ')}] /Count ${pages} >>`);
   if (wantsFont) {
     objs.set(fontNum, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
