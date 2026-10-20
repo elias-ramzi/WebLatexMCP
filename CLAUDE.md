@@ -88,6 +88,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 `synctexPdf` is `null` and comments keep no source location.
 
 **Registration freshness.**
+
 - Read the registered root via `ProjectManager.registeredRootFile`, never `getProjectConfig(id).rootFile`:
   for a non-env project (`ServerConfig.envProjectIds`) it reads the registry's current entry when it
   names the same location, so a peer's re-registration applies without restart. One sync
