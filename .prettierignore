@@ -4,3 +4,4 @@ coverage
 test/fixtures
 tmp
 .claude/plans
+.web_latex_mcp
