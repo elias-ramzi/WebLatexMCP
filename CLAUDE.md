@@ -52,8 +52,8 @@ logic lives in services, unit-testable without an MCP client.
 - `src/prompts/skills.ts` — exposes each `.claude/skills/*/SKILL.md` (loaded by `src/lib/skills.ts`) as
   an MCP prompt. Adding a skill directory needs no code.
 - `.claude-plugin/plugin.json` — points at `.claude/skills` whole but lists shipped **commands and
-  agents file by file**, since those dirs also hold dev tooling (`/implement`, `/implement-issue`,
-  `/review`, `implementer`, `plan-verifier`). `test/unit/pluginManifest.test.ts` holds each file to
+  agents file by file**, since those dirs also hold dev tooling (`/pr-review` and its `pr-reviewer`
+  agent). `test/unit/pluginManifest.test.ts` holds each file to
   exactly one of the manifest or its `DEV` list. **Every shipped agent has a `tools:` line** (without
   one it inherits every session tool) and names every server tool in **both** forms,
   `mcp__web-latex-mcp__<tool>` and `mcp__plugin_web-latex-mcp_web-latex-mcp__<tool>` (Claude Code drops
