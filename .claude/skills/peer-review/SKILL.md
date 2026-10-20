@@ -691,3 +691,24 @@ The author should get the review without hunting for it, in every client:
    never skipped.
 
 Then give the predicted outcome and the top of the author action plan.
+
+#### Annotating the review in the viewer
+
+Offer, in one line, to open the final review in the server's viewer so the author can annotate it.
+On a yes, call `viewer` with `document` set to the review's path **inside the project**
+(`paper-review.local/<run>/final-review.md`). For a bare PDF the run directory is not in any project:
+register its parent once as a local project — `register_project` with `project: "<paper-slug>"` and
+`path: "<workspace>/paper-review.local/<paper-slug>"` — then pass `document: "<run>/final-review.md"`;
+once registered, the review files can also be edited with `edit_file` like any project file. The author
+selects text, writes a note, and clicks **Ask Claude** to copy a request. When it arrives:
+
+1. `list_comments` with that `document` — each comment carries the note, the selected `quote`, and
+   the review's `file`:`line` with a snippet.
+2. Treat each note as the author's instruction about the review, not the paper: re-check it
+   against the paper before applying it (a requested claim the paper does not support is answered
+   in the reply, not written in), then edit `final-review.md` — the page reloads by itself.
+3. Record each change in the triage log (comment, request, action, verification), keeping the
+   previous review as `final-review.v<N>.md`.
+4. `resolve_comments` with the ids handled.
+
+The review stays read-only for the paper: comments change the review files only.

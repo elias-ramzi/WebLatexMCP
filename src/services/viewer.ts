@@ -4,8 +4,13 @@ import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Comment, NewComment } from './commentStore.js';
 import type { ResolvedRoot } from '../lib/rootFile.js';
+import { renderMarkdown } from '../lib/markdownRender.js';
+import { isViewableDocument, normalizeDocPath, resolveDocLine } from '../lib/docComments.js';
+import { splitLines } from '../lib/lines.js';
+import { quoteId } from '../lib/projectId.js';
 
 /**
  * A lazily-started localhost web server that shows a project's compiled PDF in the browser and
@@ -61,17 +66,55 @@ export interface ViewerDeps {
   resolveRoot?(id: string): Promise<ResolvedRoot | null>;
   /** Store a viewer comment (resolving its source location via synctex); returns the stored comment. */
   addComment(id: string, input: NewComment): Promise<Comment>;
-  /** Open comments for a project (for the viewer to render markers). */
-  listComments(id: string): Comment[];
+  /**
+   * Open comments for a project (for the viewer to render markers). `document`: `null` the PDF's
+   * only, a string that document's only, `undefined` every surface.
+   */
+  listComments(id: string, document?: string | null): Comment[];
   /** Edit a comment's note; returns the updated comment or null if not found. */
   updateComment(id: string, commentId: string, note: string): Comment | null;
   /** Delete a single comment; returns whether it existed. */
   deleteComment(id: string, commentId: string): boolean;
-  /** Restore the most recently deleted comment; null if there is nothing to undo. */
-  undoDelete(id: string): Comment | null;
-  /** Mark comments resolved (all open ones when `ids` omitted); returns the count. */
-  resolveComments(id: string, ids?: string[]): number;
+  /** Restore the most recently deleted comment of a surface; null if there is nothing to undo. */
+  undoDelete(id: string, document?: string | null): Comment | null;
+  /**
+   * Mark comments resolved (all open ones of the surface when `ids` omitted); returns the count.
+   */
+  resolveComments(id: string, ids?: string[], document?: string | null): number;
+  /**
+   * A markdown document of a project, read through the project sandbox for display. Throws an
+   * Error whose message is safe to show (it already quotes the path). Absent: the document routes
+   * answer 404 "Document viewing is not available.".
+   */
+  readDocument?(id: string, relPath: string): Promise<ViewerDocument>;
+  /** Store a fully-resolved document comment (its `line` computed by the viewer from the file). */
+  addDocComment?(id: string, input: NewComment): Promise<Comment> | Comment;
 }
+
+/** A markdown document of a project, read through the project sandbox for display. */
+export interface ViewerDocument {
+  path: string;
+  text: string;
+}
+
+/** Longest document path the viewer accepts in `?path=`. */
+const MAX_DOC_PATH_CHARS = 1024;
+/** Longest quote stored with a document comment (the page sends no more). */
+const MAX_DOC_QUOTE_CHARS = 2000;
+const DOC_UNAVAILABLE = 'Document viewing is not available.';
+
+/**
+ * The document page's CSP: its one nonce'd inline script, inline styles, same-origin fetches, and
+ * nothing else — no image (the renderer emits none either), no base, no form target.
+ */
+function docPageCsp(nonce: string): string {
+  return (
+    `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; ` +
+    `connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none'`
+  );
+}
+/** The document route's error page runs nothing at all. */
+const DOC_ERROR_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'";
 
 /** Cap on a comment POST body so a bad client can't stream unbounded data into the server. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -131,6 +174,19 @@ function escapeHtml(s: string): string {
   );
 }
 
+/**
+ * `value` as a JavaScript literal safe inside an inline `<script>`: JSON, with `<`, `>` and `&`
+ * written as `\u003c`… so a `</script>` (or `<!--`) in a project id or a file name cannot end the
+ * script, and U+2028/U+2029 escaped for pre-ES2019 parsers. Ids and paths are caller-controlled:
+ * Linux allows `a</script>.md` as a file name.
+ */
+export function jsonForScript(value: unknown): string {
+  return JSON.stringify(value).replace(
+    /[<>&\u2028\u2029]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 function contentType(file: string): string {
   switch (path.extname(file).toLowerCase()) {
     case '.mjs':
@@ -158,19 +214,8 @@ function contentType(file: string): string {
   }
 }
 
-/** The viewer page: pdf.js `PDFViewer` + a poll loop that hot-reloads while preserving position. */
-function viewerHtml(id: string): string {
-  const jid = JSON.stringify(id);
-  const safe = escapeHtml(id);
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${safe} — web-latex-mcp</title>
-<link rel="stylesheet" href="/pdfjs/web/pdf_viewer.css">
-<style>
-  :root { color-scheme: light dark; }
-  html, body { margin: 0; height: 100%; background: #525659; }
-  #bar { position: absolute; top: 0; left: 0; right: 0; height: 22px; z-index: 5;
+/** Top-bar CSS shared by the PDF and document pages (inserted verbatim into each <style>). */
+const BAR_CSS = `  #bar { position: absolute; top: 0; left: 0; right: 0; height: 22px; z-index: 5;
     font: 13px/1.4 -apple-system, system-ui, sans-serif; color: #ddd; background: #111;
     padding: 6px 12px; display: flex; gap: 10px; align-items: center; }
   #bar b { color: #fff; } #msg { color: #9aa; }
@@ -179,13 +224,10 @@ function viewerHtml(id: string): string {
   #bar button { font: 13px system-ui, sans-serif; color: #ddd; background: #2a2a2a; border: 1px solid #444;
     border-radius: 4px; padding: 0 8px; height: 20px; cursor: pointer; line-height: 18px; }
   #bar button:hover { background: #3a3a3a; }
-  #zlvl { color: #9aa; min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; cursor: default; }
-  #viewerContainer { position: absolute; inset: 34px 0 0 0; overflow: auto; }
-  #empty { position: absolute; inset: 34px 0 0 0; color: #ddd; font: 14px/1.5 system-ui, sans-serif;
-    padding: 24px; display: none; }
-  #empty[data-show] { display: block; }
-  code { color: #fff; }
-  #ctoggle.on { background: #2d4a7a; border-color: #3a5f9a; }
+  #zlvl { color: #9aa; min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; cursor: default; }`;
+
+/** Comment UI CSS (button, note popup, panel) shared by the PDF and document pages. */
+const COMMENT_CSS = `  #ctoggle.on { background: #2d4a7a; border-color: #3a5f9a; }
   .wlm-fab { position: fixed; z-index: 20; display: none; font: 12px system-ui, sans-serif;
     background: #2d4a7a; color: #fff; border: 1px solid #3a5f9a; border-radius: 6px;
     padding: 4px 9px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
@@ -230,7 +272,27 @@ function viewerHtml(id: string): string {
     font: 12px system-ui, sans-serif; }
   .wlm-edit .row { display: flex; justify-content: flex-end; gap: 6px; margin-top: 4px; }
   .wlm-edit .row button { font: 11px system-ui, sans-serif; padding: 2px 8px; border-radius: 4px;
-    cursor: pointer; background: #2a2a2a; color: #ddd; border: 1px solid #444; }
+    cursor: pointer; background: #2a2a2a; color: #ddd; border: 1px solid #444; }`;
+
+/** The viewer page: pdf.js `PDFViewer` + a poll loop that hot-reloads while preserving position. */
+function viewerHtml(id: string): string {
+  const jid = jsonForScript(id);
+  const safe = escapeHtml(id);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${safe} — web-latex-mcp</title>
+<link rel="stylesheet" href="/pdfjs/web/pdf_viewer.css">
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; height: 100%; background: #525659; }
+${BAR_CSS}
+  #viewerContainer { position: absolute; inset: 34px 0 0 0; overflow: auto; }
+  #empty { position: absolute; inset: 34px 0 0 0; color: #ddd; font: 14px/1.5 system-ui, sans-serif;
+    padding: 24px; display: none; }
+  #empty[data-show] { display: block; }
+  code { color: #fff; }
+${COMMENT_CSS}
   .wlm-hl-layer { position: absolute; left: 0; top: 0; right: 0; bottom: 0; pointer-events: none; z-index: 2; }
   .wlm-hl { position: absolute; background: rgba(255, 213, 0, 0.35); border-radius: 2px;
     mix-blend-mode: multiply; transition: background .1s; }
@@ -558,8 +620,9 @@ askBtn.addEventListener('click', async () => {
   const n = Number(ccount.textContent) || 0;
   if (!n) { askBtn.textContent = 'No open comments'; setTimeout(() => { askBtn.textContent = label; }, 1400); return; }
   const prompt = 'Please address my ' + n + ' PDF review comment' + (n === 1 ? '' : 's') +
-    ' on "' + ID + '": call list_comments, make each edit at its file:line (use the quoted text ' +
-    'to pin the exact spot), recompile, then call resolve_comments.';
+    ' in project ' + JSON.stringify(ID) + ': call list_comments with pdfOnly: true, make each edit at ' +
+    'its file:line (use the quoted text to pin the exact spot), recompile, then call ' +
+    'resolve_comments with the ids you handled.';
   const ok = await copyText(prompt);
   askBtn.textContent = ok ? '✓ Copied — paste in Claude' : 'Copy failed';
   setTimeout(() => { askBtn.textContent = label; }, 1800);
@@ -714,9 +777,542 @@ refreshComments();
 </body></html>`;
 }
 
+/**
+ * Why a `?path=` cannot name a document the viewer shows, or undefined when it can. Only the shape
+ * is judged here; whether the file exists inside the project (symlinks included) is
+ * `readDocument`'s job.
+ */
+function docPathProblem(p: string | null): string | undefined {
+  if (p === null || p === '') {
+    return 'Expected a "path" query parameter naming a markdown document of the project.';
+  }
+  if (p.length > MAX_DOC_PATH_CHARS) {
+    return `Document path too long: ${p.length} characters (at most ${MAX_DOC_PATH_CHARS}).`;
+  }
+  // A drive-qualified (`C:notes.md`, relative to that drive's cwd) or absolute path never names a
+  // file of the project; refuse it in these words rather than leave it to the sandboxed read.
+  if (/^[A-Za-z]:/.test(p) || path.posix.isAbsolute(p) || path.win32.isAbsolute(p)) {
+    return `Not a project-relative path: ${quoteId(p)}.`;
+  }
+  if (!isViewableDocument(p)) {
+    return `Not a markdown document (.md or .markdown): ${quoteId(p)}.`;
+  }
+  return undefined;
+}
+
+/** The host names a DNS-rebinding page can never make the browser send as `Host`. */
+const LOOPBACK_HOST_NAMES: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * Whether a lowercased `Host` (or the host part of an `Origin`) names this server: a loopback name,
+ * bare or with a port of digits in 1–65535, or exactly one of `exact`. Anything else — a trailing
+ * dot, userinfo, a path, a second colon — is refused.
+ */
+function hostAdmitted(host: string, exact: ReadonlySet<string>): boolean {
+  if (exact.has(host)) return true;
+  const m = /^(localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?$/.exec(host);
+  if (!m) return false;
+  if (m[2] === undefined) return true;
+  const port = Number(m[2]);
+  return port >= 1 && port <= 65535;
+}
+
+/** The version a document page polls: a digest of the text, so any change is seen. */
+function docVersion(text: string): string {
+  return createHash('sha1').update(text).digest('hex');
+}
+
+/** A minimal error page for the document route (a browser opened it, so JSON would be unkind). */
+function docErrorHtml(message: string): string {
+  return `<!doctype html><meta charset="utf-8"><title>web-latex-mcp</title>
+<body style="font:14px system-ui,sans-serif;max-width:40em;margin:3em auto">
+<h1>web-latex-mcp — document viewer</h1>
+<p>${escapeHtml(message)}</p></body>`;
+}
+
+/**
+ * The document page: a project's markdown document rendered server-side (`/doc/render`), polled
+ * for changes (`/doc/version`), with the PDF page's comment UX. Self-contained — its CSP allows
+ * only the one inline script carrying `nonce`, inline styles and same-origin fetches.
+ */
+function documentHtml(id: string, docPath: string, nonce: string): string {
+  const safeId = escapeHtml(id);
+  const safePath = escapeHtml(docPath);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${safePath} — ${safeId} — web-latex-mcp</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; height: 100%; background: #3b3e41; }
+${BAR_CSS}
+  #docpath { color: #c9d1d9; font: 12px ui-monospace, SFMono-Regular, monospace; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #content { position: absolute; inset: 34px 0 0 0; overflow: auto; }
+  #paper { box-sizing: border-box; max-width: 820px; margin: 24px auto 48px; padding: 40px 56px;
+    background: #fdfdfb; color: #1f2328; border-radius: 4px; box-shadow: 0 2px 12px rgba(0,0,0,.35);
+    font: 16px/1.65 -apple-system, system-ui, "Segoe UI", sans-serif; overflow-wrap: break-word;
+    color-scheme: light; }
+  #paper > :first-child { margin-top: 0; }
+  #paper h1, #paper h2, #paper h3, #paper h4, #paper h5, #paper h6 { line-height: 1.25;
+    margin: 1.6em 0 .6em; font-weight: 600; }
+  #paper h1 { font-size: 2em; border-bottom: 1px solid #d8dee4; padding-bottom: .3em; }
+  #paper h2 { font-size: 1.5em; border-bottom: 1px solid #d8dee4; padding-bottom: .3em; }
+  #paper h3 { font-size: 1.25em; }
+  #paper p, #paper ul, #paper ol, #paper blockquote, #paper pre, #paper table { margin: 0 0 1em; }
+  #paper ul, #paper ol { padding-left: 2em; }
+  #paper li + li { margin-top: .25em; }
+  #paper a { color: #0969da; }
+  #paper code { font: .875em ui-monospace, SFMono-Regular, Menlo, monospace; color: inherit;
+    background: #eff1f3; border-radius: 4px; padding: .15em .35em; }
+  #paper pre { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; padding: 12px 16px;
+    overflow: auto; line-height: 1.45; }
+  #paper pre code { background: none; padding: 0; font-size: .85em; }
+  #paper blockquote { border-left: 4px solid #d0d7de; color: #57606a; padding: 0 1em; margin-left: 0; }
+  #paper table { border-collapse: collapse; display: block; overflow: auto; }
+  #paper th, #paper td { border: 1px solid #d0d7de; padding: 6px 13px; }
+  #paper th { background: #f6f8fa; font-weight: 600; }
+  #paper hr { border: 0; border-top: 1px solid #d8dee4; margin: 1.5em 0; }
+  #paper .md-img { color: #57606a; font-style: italic; }
+  #paper .wlm-err { color: #a40e26; }
+${COMMENT_CSS}
+  ::highlight(wlm) { background-color: rgba(255, 213, 0, 0.45); }
+  ::highlight(wlm-hot) { background-color: rgba(255, 145, 0, 0.6); }
+  .wlm-outline { outline: 2px solid rgba(255, 190, 0, .85); outline-offset: 2px; border-radius: 2px; }
+  .wlm-outline.hot { outline-color: rgba(255, 120, 0, 1); }
+  .wlm-num { color: #e0863a; font-weight: 600; }
+</style></head>
+<body>
+<div id="bar"><span id="dot"></span><b>${safeId}</b><span id="docpath">${safePath}</span><span id="msg">live — reloads on change</span>
+  <span id="tools">
+    <button id="ctoggle" title="Comments — select text to add one">💬 <span id="ccount">0</span></button>
+  </span>
+</div>
+<div id="content"><article id="paper"><p>Loading…</p></article></div>
+<button class="wlm-fab" id="fab">💬 Comment</button>
+<div class="wlm-pop" id="pop">
+  <div class="q" id="popq"></div>
+  <textarea id="popnote" placeholder="Describe the change you want… (⇧⏎ to save, Esc to cancel)"></textarea>
+  <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
+</div>
+<div class="wlm-panel" id="panel">
+  <div class="wlm-phead"><span>Comments</span><span class="wlm-phbtns"><button id="undodel" title="Restore the last deleted comment">↶ Undo</button><button id="askclaude" title="Copy a prompt to paste into the Claude chat">📋 Ask Claude</button></span></div>
+  <div id="panellist"></div>
+</div>
+<script nonce="${nonce}">
+(() => {
+'use strict';
+const ID = ${jsonForScript(id)};
+const DOC = ${jsonForScript(docPath)};
+const Q = '?path=' + encodeURIComponent(DOC);
+const DBASE = '/p/' + encodeURIComponent(ID) + '/doc';
+const cbase = () => '/p/' + encodeURIComponent(ID) + '/comments';
+const LIVE = 'live — reloads on change';
+const container = document.getElementById('content');
+const paper = document.getElementById('paper');
+const dot = document.getElementById('dot');
+const msg = document.getElementById('msg');
+
+function setDot(c) { dot.style.background = c; }
+function flash(t) { msg.textContent = t; setTimeout(() => { msg.textContent = LIVE; }, 1500); }
+function showError(text) {
+  paper.textContent = '';
+  const p = document.createElement('p');
+  p.className = 'wlm-err';
+  p.textContent = text;
+  paper.appendChild(p);
+}
+async function errorOf(r) {
+  try { const e = (await r.json()).error; if (typeof e === 'string') return e; } catch {}
+  return 'This document cannot be shown (HTTP ' + r.status + ').';
+}
+
+// --- Live document: render once, then re-render whenever the text's digest changes. ---
+let cur = null;
+async function render() {
+  const r = await fetch(DBASE + '/render' + Q, { cache: 'no-store' });
+  if (!r.ok) { showError(await errorOf(r)); cur = null; return false; }
+  const data = await r.json();
+  const top = container.scrollTop;
+  // markdown-it output with raw HTML disabled; the page's CSP refuses scripts and images anyway.
+  paper.innerHTML = data.html;
+  container.scrollTop = top;
+  cur = data.version;
+  renderHighlights();
+  return true;
+}
+async function tick() {
+  try {
+    const r = await fetch(DBASE + '/version' + Q, { cache: 'no-store' });
+    if (r.ok) {
+      const v = await r.text();
+      if (v !== cur) {
+        const first = cur === null;
+        if ((await render()) && !first) flash('updated');
+      }
+      setDot('#3fb950');
+    } else {
+      showError(await errorOf(r));
+      cur = null;
+      setDot('#d29922');
+    }
+  } catch { setDot('#f85149'); }
+  setTimeout(tick, 1500);
+}
+tick();
+
+// --- Comments: select text -> attach a note -> POST it; the server resolves the source line. ---
+const fab = document.getElementById('fab');
+const pop = document.getElementById('pop');
+const popq = document.getElementById('popq');
+const popnote = document.getElementById('popnote');
+const ctoggle = document.getElementById('ctoggle');
+const ccount = document.getElementById('ccount');
+const panel = document.getElementById('panel');
+const panellist = document.getElementById('panellist');
+const MAX_QUOTE = 2000;
+let pending = null;
+
+// A block's 1-based inclusive source line range, from its data-src attribute.
+function blockRange(el) {
+  const m = /^(\\d+)-(\\d+)$/.exec(el.getAttribute('data-src') || '');
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+function selectionAnchor() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (!paper.contains(range.commonAncestorContainer)) return null;
+  let quote = sel.toString().trim();
+  if (!quote) return null;
+  if (quote.length > MAX_QUOTE) quote = quote.slice(0, MAX_QUOTE);
+  let node = range.startContainer;
+  if (node.nodeType === 3) node = node.parentElement;
+  const block = node && node.closest ? node.closest('[data-src]') : null;
+  if (!block || !paper.contains(block)) return null;
+  const br = blockRange(block);
+  if (!br) return null;
+  const rects = range.getClientRects();
+  const r = rects.length ? rects[0] : range.getBoundingClientRect();
+  return { quote, blockStart: br[0], blockEnd: br[1], cx: r.left, cy: r.top };
+}
+
+document.addEventListener('selectionchange', () => {
+  if (pop.style.display === 'block') return;
+  const a = selectionAnchor();
+  if (a) {
+    fab._anchor = a;
+    fab.style.left = Math.min(window.innerWidth - 110, a.cx) + 'px';
+    fab.style.top = Math.max(40, a.cy - 34) + 'px';
+    fab.style.display = 'block';
+  } else {
+    fab.style.display = 'none';
+  }
+});
+
+fab.addEventListener('mousedown', (e) => e.preventDefault()); // don't drop the selection
+fab.addEventListener('click', () => {
+  const a = fab._anchor;
+  if (!a) return;
+  pending = a;
+  popq.textContent = a.quote.length > 180 ? a.quote.slice(0, 180) + '…' : a.quote;
+  fab.style.display = 'none';
+  pop.style.left = Math.min(window.innerWidth - 280, a.cx) + 'px';
+  pop.style.top = Math.min(window.innerHeight - 170, a.cy + 8) + 'px';
+  pop.style.display = 'block';
+  popnote.value = '';
+  popnote.focus();
+});
+
+document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
+popnote.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); document.getElementById('popsave').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
+});
+document.getElementById('popsave').onclick = async () => {
+  if (!pending) return;
+  const note = popnote.value.trim();
+  if (!note) { popnote.focus(); return; }
+  pop.style.display = 'none';
+  try {
+    const r = await fetch(DBASE + '/comments' + Q, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ quote: pending.quote, blockStart: pending.blockStart, blockEnd: pending.blockEnd, note }),
+    });
+    flash(r.ok ? 'comment added' : 'comment failed');
+    refreshComments();
+  } catch { flash('comment failed'); }
+  pending = null;
+};
+
+let editingId = null; // pause auto-refresh while a note is being edited, so it isn't wiped
+
+function setPanel(open) {
+  panel.classList.toggle('open', open);
+  ctoggle.classList.toggle('on', open);
+}
+ctoggle.addEventListener('click', () => setPanel(!panel.classList.contains('open')));
+
+// As on the PDF page: a primary click on the document dismisses the panel, the chrome the user
+// works with while it is open never does.
+const PANEL_KEEP = '#bar, #panel, #fab, #pop';
+document.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  if (!panel.classList.contains('open')) return;
+  if (editingId) return;
+  const el = e.target;
+  if (el && el.closest && el.closest(PANEL_KEEP)) return;
+  setPanel(false);
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || e.defaultPrevented || editingId) return;
+  if (pop.style.display === 'block') { document.getElementById('popcancel').click(); return; }
+  if (panel.classList.contains('open')) setPanel(false);
+});
+
+document.getElementById('undodel').addEventListener('click', async () => {
+  try {
+    const { restored } = await (await fetch(DBASE + '/comments/undo' + Q, { method: 'POST' })).json();
+    if (restored) refreshComments();
+  } catch {}
+});
+
+async function copyText(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy'); ta.remove();
+      return ok;
+    } catch { return false; }
+  }
+}
+const askBtn = document.getElementById('askclaude');
+askBtn.addEventListener('click', async () => {
+  const label = askBtn.textContent;
+  const n = Number(ccount.textContent) || 0;
+  if (!n) { askBtn.textContent = 'No open comments'; setTimeout(() => { askBtn.textContent = label; }, 1400); return; }
+  const prompt = 'Please address my ' + n + ' review comment' + (n === 1 ? '' : 's') +
+    ' on ' + JSON.stringify(DOC) + ' in project ' + JSON.stringify(ID) +
+    ': call list_comments with document ' + JSON.stringify(DOC) +
+    ', make each change at its file:line (use the quoted text to pin the exact spot), then ' +
+    'call resolve_comments with the ids you handled.';
+  const ok = await copyText(prompt);
+  askBtn.textContent = ok ? '✓ Copied — paste in Claude' : 'Copy failed';
+  setTimeout(() => { askBtn.textContent = label; }, 1800);
+});
+
+// --- Highlights: the quote inside the block holding the comment's line (CSS Custom Highlight
+// API where the browser has it, else an outline on the block). ---
+const HL = typeof CSS !== 'undefined' && !!CSS.highlights && typeof Highlight === 'function';
+let lastComments = [];
+const marks = new Map(); // comment id -> { block, range }
+
+// The block's text with whitespace runs collapsed, and where each kept character came from.
+function textIndex(el) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let text = '';
+  const map = [];
+  let space = true;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const s = n.nodeValue || '';
+    for (let i = 0; i < s.length; i++) {
+      const isSpace = /\\s/.test(s[i]);
+      if (isSpace && space) continue;
+      text += isSpace ? ' ' : s[i];
+      space = isSpace;
+      map.push([n, i]);
+    }
+  }
+  return { text, map };
+}
+function quoteRange(el, quote) {
+  const q = String(quote || '').replace(/\\s+/g, ' ').trim();
+  if (!q) return null;
+  const { text, map } = textIndex(el);
+  const at = text.indexOf(q);
+  if (at < 0) return null;
+  const a = map[at], b = map[at + q.length - 1];
+  const r = document.createRange();
+  r.setStart(a[0], a[1]);
+  r.setEnd(b[0], b[1] + 1);
+  return r;
+}
+// Blocks whose range holds the line, innermost (narrowest range) first.
+function blocksForLine(line) {
+  const out = [];
+  for (const el of paper.querySelectorAll('[data-src]')) {
+    const br = blockRange(el);
+    if (br && br[0] <= line && line <= br[1]) out.push({ el, span: br[1] - br[0] });
+  }
+  out.sort((x, y) => x.span - y.span);
+  return out.map((o) => o.el);
+}
+function locate(c) {
+  if (typeof c.line !== 'number') return null;
+  const blocks = blocksForLine(c.line);
+  if (!blocks.length) return null;
+  if (c.quote) {
+    for (const el of blocks) {
+      const range = quoteRange(el, c.quote);
+      if (range) return { block: el, range };
+    }
+  }
+  return { block: blocks[0], range: null };
+}
+function renderHighlights() {
+  // Best-effort: never let a highlighting error break the panel.
+  try {
+    for (const el of paper.querySelectorAll('.wlm-outline')) el.classList.remove('wlm-outline', 'hot');
+    marks.clear();
+    const ranges = [];
+    for (const c of lastComments) {
+      const m = locate(c);
+      if (!m) continue;
+      marks.set(c.id, m);
+      if (m.range && HL) ranges.push(m.range);
+      else m.block.classList.add('wlm-outline');
+    }
+    if (HL) {
+      CSS.highlights.set('wlm', new Highlight(...ranges));
+      CSS.highlights.delete('wlm-hot');
+    }
+  } catch {
+    /* highlights are cosmetic; ignore */
+  }
+}
+function setHot(cid, on) {
+  const m = marks.get(cid);
+  if (!m) return;
+  try {
+    if (m.range && HL) {
+      if (on) CSS.highlights.set('wlm-hot', new Highlight(m.range));
+      else CSS.highlights.delete('wlm-hot');
+    } else {
+      m.block.classList.toggle('hot', on);
+    }
+  } catch {}
+}
+function jump(c) {
+  const m = marks.get(c.id) || locate(c);
+  if (m) m.block.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+async function refreshComments() {
+  if (editingId) return;
+  let list = [];
+  try {
+    list = await (await fetch(DBASE + '/comments' + Q, { cache: 'no-store' })).json();
+  } catch { return; }
+  if (!Array.isArray(list)) return;
+  ccount.textContent = String(list.length);
+  lastComments = list;
+  panellist.innerHTML = '';
+  if (!list.length) {
+    const d = document.createElement('div');
+    d.className = 'wlm-hint';
+    d.textContent = 'No open comments. Select text in the document, then click “Comment”.';
+    panellist.appendChild(d);
+  } else {
+    for (const c of list) panellist.appendChild(renderComment(c));
+  }
+  renderHighlights();
+}
+
+function renderComment(c) {
+  const item = document.createElement('div');
+  item.className = 'wlm-item';
+  item.onmouseenter = () => setHot(c.id, true);
+  item.onmouseleave = () => setHot(c.id, false);
+
+  const top = document.createElement('div');
+  top.className = 'wlm-itop';
+  const loc = document.createElement('span');
+  loc.className = 'loc';
+  const num = document.createElement('span');
+  num.className = 'wlm-num';
+  num.textContent = '#' + c.number;
+  loc.append(num, document.createTextNode(' ' + c.file + ':' + c.line));
+  loc.title = 'Jump to line ' + c.line;
+  loc.onclick = () => jump(c);
+  const acts = document.createElement('span');
+  acts.className = 'wlm-acts';
+  const editBtn = document.createElement('button');
+  editBtn.textContent = '✎'; editBtn.title = 'Edit note';
+  const delBtn = document.createElement('button');
+  delBtn.className = 'wlm-del'; delBtn.textContent = '🗑'; delBtn.title = 'Delete comment';
+  acts.append(editBtn, delBtn);
+  top.append(loc, acts);
+
+  const note = document.createElement('div');
+  note.className = 'note';
+  note.textContent = c.note;
+  note.title = 'Jump to line ' + c.line;
+  note.onclick = () => jump(c);
+
+  item.append(top, note);
+
+  editBtn.onclick = () => startEdit(item, c);
+  delBtn.onclick = async () => {
+    delBtn.disabled = true;
+    try { await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/delete', { method: 'POST' }); } catch {}
+    refreshComments();
+  };
+  return item;
+}
+
+function startEdit(item, c) {
+  editingId = c.id;
+  item.querySelector('.wlm-acts').style.display = 'none';
+  const note = item.querySelector('.note');
+  const box = document.createElement('div');
+  box.className = 'wlm-edit';
+  const ta = document.createElement('textarea');
+  ta.value = c.note;
+  const row = document.createElement('div');
+  row.className = 'row';
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  const save = document.createElement('button');
+  save.textContent = 'Save';
+  row.append(cancel, save);
+  box.append(ta, row);
+  note.replaceWith(box);
+  ta.focus();
+  const done = () => { editingId = null; refreshComments(); };
+  cancel.onclick = done;
+  save.onclick = async () => {
+    const text = ta.value.trim();
+    if (!text) { ta.focus(); return; }
+    try {
+      await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ note: text }),
+      });
+    } catch {}
+    done();
+  };
+}
+setInterval(refreshComments, 3000);
+refreshComments();
+})();
+</script>
+</body></html>`;
+}
+
 export class ViewerService {
   private server?: http.Server;
   private baseUrl?: string;
+  /**
+   * The exact `Host` values (lowercased) answered beside the loopback names, which `hostAdmitted`
+   * accepts on any port; unset while not listening — refuse all.
+   */
+  private allowedHosts?: ReadonlySet<string>;
 
   constructor(private readonly deps: ViewerDeps) {}
 
@@ -747,6 +1343,27 @@ export class ViewerService {
     return this.baseUrl ? `${this.baseUrl}/p/${encodeURIComponent(id)}` : undefined;
   }
 
+  /** The document page for a project's markdown file, or undefined if the server isn't running. */
+  urlForDocument(id: string, relPath: string): string | undefined {
+    return this.baseUrl
+      ? `${this.baseUrl}/p/${encodeURIComponent(id)}/doc?path=${encodeURIComponent(relPath)}`
+      : undefined;
+  }
+
+  /**
+   * The document the `viewer` tool is asked to open, normalised, after the checks its page's route
+   * makes — the path's shape here, the sandboxed read in `readDocument` — so a bad path is refused
+   * in the tool's result rather than on a page the user opens later. Throws a message safe to show.
+   */
+  async checkDocument(id: string, relPath: string): Promise<string> {
+    const doc = normalizeDocPath(relPath);
+    const problem = docPathProblem(doc);
+    if (problem !== undefined) throw new Error(problem);
+    if (!this.deps.readDocument) throw new Error(DOC_UNAVAILABLE);
+    await this.deps.readDocument(id, doc);
+    return doc;
+  }
+
   /**
    * Start listening (idempotent — a second call returns the existing URL). Binds to loopback.
    * Resolves to the base URL, or undefined if the port could not be bound (viewer stays off, the
@@ -767,6 +1384,10 @@ export class ViewerService {
       server.listen(port, host, () => {
         server.removeListener('error', onError);
         const addr = server.address() as AddressInfo;
+        const bound = host.toLowerCase();
+        const name = bound.includes(':') ? `[${bound}]` : bound;
+        // A loopback name is admitted on any port (see `admits`); another bound host only exactly.
+        this.allowedHosts = new Set(LOOPBACK_HOST_NAMES.has(name) ? [] : [`${name}:${addr.port}`]);
         this.server = server;
         this.baseUrl = `http://${host}:${addr.port}`;
         resolve(this.baseUrl);
@@ -786,10 +1407,48 @@ export class ViewerService {
     }
     this.server = undefined;
     this.baseUrl = undefined;
+    this.allowedHosts = undefined;
+  }
+
+  /**
+   * Whether a request may be answered. Loopback binding is not enough: any web page open in the
+   * user's browser can reach this port — by DNS rebinding (a hostname it controls re-resolved to
+   * 127.0.0.1, which the browser then sends as `Host`) or by a cross-site POST — and the document
+   * routes make project files readable through it. So the `Host` must name this server, and a
+   * POST that carries an `Origin` (every browser POST does) must be `http://` plus a `Host` this
+   * accepts; `Origin: null` is refused. A POST without one is a non-browser client.
+   *
+   * A loopback name (`localhost`, `127.0.0.1`, `[::1]`) is accepted on ANY port, or with none:
+   * rebinding makes the browser send the attacker's own hostname, never a loopback name, so the
+   * name alone defeats it — and the port is no boundary between local processes, while a forwarded
+   * port (VS Code Remote-SSH, Dev Containers) reaches this server under a different local one.
+   * Another host `start()` was given is accepted only as exactly `<host>:<bound port>`. The name
+   * is parsed strictly (`hostAdmitted`): no trailing dot, no userinfo, a port of digits in 1–65535.
+   */
+  private admits(req: http.IncomingMessage): boolean {
+    const hosts = this.allowedHosts;
+    const host = req.headers.host?.toLowerCase();
+    if (!hosts || !host || !hostAdmitted(host, hosts)) return false;
+    const origin = req.headers.origin;
+    // A POST's Origin must be this very page's: the same host:port the browser put in `Host`. Any
+    // loopback name would admit a page served from ANOTHER local port (a dev server, a notebook)
+    // posting here; a forwarded port still works, since the browser writes it into both headers.
+    if (
+      req.method === 'POST' &&
+      origin !== undefined &&
+      origin.toLowerCase() !== `http://${host}`
+    ) {
+      return false;
+    }
+    return true;
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
+      if (!this.admits(req)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' }).end('Forbidden.\n');
+        return;
+      }
       const method = req.method ?? 'GET';
       if (method !== 'GET' && method !== 'HEAD' && method !== 'POST') {
         res.writeHead(405, { Allow: 'GET, HEAD, POST' }).end();
@@ -827,9 +1486,16 @@ export class ViewerService {
           await this.sendVersion(res, id);
           return;
         }
+        // /p/<id>/doc[/render|/version|/comments[/undo]]?path=<document>
+        if (parts[2] === 'doc') {
+          await this.handleDoc(req, res, id, parts.slice(3).join('/'), url);
+          return;
+        }
+        // The PDF page's routes address the PDF surface only (`null`): document comments live on
+        // their own page.
         if (parts.length === 3 && parts[2] === 'comments') {
           if (method === 'POST') await this.addComment(req, res, id);
-          else this.sendJson(res, 200, this.deps.listComments(id));
+          else this.sendJson(res, 200, this.deps.listComments(id, null));
           return;
         }
         if (
@@ -847,7 +1513,7 @@ export class ViewerService {
           parts[3] === 'undo' &&
           method === 'POST'
         ) {
-          this.sendJson(res, 200, { restored: this.deps.undoDelete(id) });
+          this.sendJson(res, 200, { restored: this.deps.undoDelete(id, null) });
           return;
         }
         // /p/<id>/comments/<cid>/update|delete  (cid is never "resolve"/"undo", so no collision)
@@ -923,8 +1589,126 @@ export class ViewerService {
       body && Array.isArray((body as { ids?: unknown }).ids)
         ? ((body as { ids: unknown[] }).ids.filter((x) => typeof x === 'string') as string[])
         : undefined;
-    const resolved = this.deps.resolveComments(id, ids);
+    // With ids the surface is moot (ids are unique across surfaces); without, the PDF's only.
+    const resolved = ids
+      ? this.deps.resolveComments(id, ids)
+      : this.deps.resolveComments(id, undefined, null);
     this.sendJson(res, 200, { resolved });
+  }
+
+  /**
+   * The document routes. `sub` is the path after `/doc` (`''` the page, `render`, `version`,
+   * `comments`, `comments/undo`). The `path` parameter is judged here by shape; whether it names
+   * a file inside the project is `readDocument`'s job, and every error it throws is a 404.
+   */
+  private async handleDoc(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    id: string,
+    sub: string,
+    url: URL,
+  ): Promise<void> {
+    const method = req.method ?? 'GET';
+    const isRead = method === 'GET' || method === 'HEAD';
+    const routed =
+      ((sub === '' || sub === 'render' || sub === 'version') && isRead) ||
+      (sub === 'comments' && (isRead || method === 'POST')) ||
+      (sub === 'comments/undo' && method === 'POST');
+    if (!routed) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end(NOT_FOUND);
+      return;
+    }
+    const page = sub === '';
+    const fail = (status: number, message: string): void => {
+      if (page) this.sendHtml(res, docErrorHtml(message), status, DOC_ERROR_CSP);
+      else this.sendJson(res, status, { error: message });
+    };
+    const rawPath = url.searchParams.get('path');
+    const docPath = rawPath === null ? null : normalizeDocPath(rawPath);
+    const problem = docPathProblem(docPath);
+    if (problem !== undefined) {
+      fail(400, problem);
+      return;
+    }
+    if (docPath === null) return; // unreachable: docPathProblem refuses a missing path
+    const readDocument = this.deps.readDocument;
+    if (!readDocument) {
+      fail(404, DOC_UNAVAILABLE);
+      return;
+    }
+    const read = async (): Promise<ViewerDocument | undefined> => {
+      try {
+        return await readDocument(id, docPath);
+      } catch (err) {
+        fail(404, err instanceof Error ? err.message : String(err));
+        return undefined;
+      }
+    };
+
+    if (sub === 'comments' && method !== 'POST') {
+      this.sendJson(res, 200, this.deps.listComments(id, docPath));
+      return;
+    }
+    if (sub === 'comments/undo') {
+      this.sendJson(res, 200, { restored: this.deps.undoDelete(id, docPath) });
+      return;
+    }
+    if (sub === 'comments') {
+      await this.addDocComment(req, res, id, docPath, read);
+      return;
+    }
+    const doc = await read();
+    if (!doc) return;
+    if (page) {
+      // A fresh nonce per response: the page's one inline script is the only one that may run.
+      const nonce = randomBytes(18).toString('base64');
+      this.sendHtml(res, documentHtml(id, docPath, nonce), 200, docPageCsp(nonce));
+      return;
+    }
+    const version = docVersion(doc.text);
+    if (sub === 'render') {
+      this.sendJson(res, 200, { html: renderMarkdown(doc.text), version });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+    res.end(version);
+  }
+
+  /**
+   * POST /p/<id>/doc/comments?path= — body {note, quote?, blockStart?, blockEnd?}. The stored
+   * line is resolved here from the document as just read; the client's numbers only narrow where
+   * to look and are never stored.
+   */
+  private async addDocComment(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    id: string,
+    docPath: string,
+    read: () => Promise<ViewerDocument | undefined>,
+  ): Promise<void> {
+    const add = this.deps.addDocComment;
+    if (!add) {
+      this.sendJson(res, 404, { error: DOC_UNAVAILABLE });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body || typeof body !== 'object') {
+      this.sendJson(res, 400, { error: 'Invalid JSON body.' });
+      return;
+    }
+    const b = body as Record<string, unknown>;
+    if (typeof b.note !== 'string' || b.note.trim() === '') {
+      this.sendJson(res, 400, {
+        error: 'Expected {note:string (non-empty), quote?:string, blockStart?, blockEnd?}.',
+      });
+      return;
+    }
+    const doc = await read();
+    if (!doc) return;
+    const quote = typeof b.quote === 'string' ? b.quote.slice(0, MAX_DOC_QUOTE_CHARS) : undefined;
+    const line = resolveDocLine(splitLines(doc.text), b.blockStart, b.blockEnd, quote);
+    const comment = await add(id, { document: docPath, file: docPath, line, quote, note: b.note });
+    this.sendJson(res, 201, comment);
   }
 
   /** POST /p/<id>/comments/<cid>/update — body {note}; edits the note. */
@@ -951,8 +1735,12 @@ export class ViewerService {
     this.sendJson(res, 200, comment);
   }
 
-  private sendHtml(res: http.ServerResponse, html: string): void {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  private sendHtml(res: http.ServerResponse, html: string, status = 200, csp?: string): void {
+    res.writeHead(status, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      ...(csp !== undefined ? { 'Content-Security-Policy': csp } : {}),
+    });
     res.end(html);
   }
 

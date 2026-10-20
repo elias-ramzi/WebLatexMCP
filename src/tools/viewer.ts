@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { openBrowser } from '../lib/openBrowser.js';
 import { describeViewerRoot, shouldOpenExternally, viewerHint } from '../lib/viewerHint.js';
+import { quoteId } from '../lib/projectId.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -22,10 +23,30 @@ const inputSchema = {
       'For target "browser": also open the URL in the default browser (default true). Ignored for ' +
         '"vscode".',
     ),
+  document: z
+    .string()
+    .optional()
+    .describe(
+      'Open this markdown document (.md/.markdown, project-relative — e.g. a review report such ' +
+        'as paper-review.local/<run>/final-review.md) instead of the PDF. The user selects text in ' +
+        'it to comment; list_comments with the same `document` reads the comments back with the ' +
+        'source line. Read through the project sandbox; works for local projects too.',
+    ),
 };
 
 const outputSchema = {
-  url: z.string().describe('Localhost viewer URL for the project.'),
+  url: z
+    .string()
+    .describe(
+      'Localhost viewer URL for the project — its PDF, or the `document` when one was given.',
+    ),
+  document: z
+    .string()
+    .optional()
+    .describe(
+      'The markdown document the URL shows, normalised (POSIX, no `./`) — the spelling to pass ' +
+        'to list_comments and resolve_comments. Absent when the URL shows the PDF.',
+    ),
   opened: z.boolean().describe('Whether a browser was launched.'),
   target: z.enum(['browser', 'vscode']),
   rootFile: z
@@ -50,7 +71,7 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'viewer',
     {
-      title: 'Open a live PDF viewer (browser or VSCode tab)',
+      title: 'Open a live PDF or markdown viewer (browser or VSCode tab)',
       description:
         'Start (if needed) a local viewer for the compiled PDF and return its URL. It follows the ' +
         'root file the project was registered with (rootFile), else the auto-detected one (a ' +
@@ -61,12 +82,14 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         'and scroll position. For clients ' +
         'without a PDF surface (e.g. Claude Desktop) it auto-opens your browser; in VSCode pass ' +
         'target:"vscode" (or set WEB_LATEX_MCP_VIEWER_TARGET=vscode) to get the URL to open as a ' +
-        'Simple Browser tab. The server binds to loopback only and starts on demand. Run compile ' +
-        'to populate it.',
+        'Simple Browser tab. Pass `document` to open a markdown document of the project (a review ' +
+        'report, a summary) instead: it is rendered, reloads when the file changes, and takes ' +
+        'comments the same way. The server binds to loopback only, refuses other sites, and ' +
+        'starts on demand. Run compile to populate the PDF view.',
       inputSchema,
       outputSchema,
     },
-    async ({ project, open, target }) => {
+    async ({ project, open, target, document }) => {
       try {
         // Resolve to a concrete id (validates the project) without requiring a clone — the viewer
         // can be opened first and will fill in once compile runs.
@@ -84,9 +107,28 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
           };
         }
 
-        const url = ctx.viewer.urlFor(id)!;
+        // A document is checked before anything is opened, by the same rules its page applies, so
+        // a bad path is refused here rather than on a page the user opens later.
+        const doc =
+          document === undefined ? undefined : await ctx.viewer.checkDocument(id, document);
+        const url =
+          doc === undefined ? ctx.viewer.urlFor(id)! : ctx.viewer.urlForDocument(id, doc)!;
         const resolvedTarget = target ?? ctx.config.viewerTarget ?? 'browser';
         const opened = shouldOpenExternally(resolvedTarget, open) ? await openBrowser(url) : false;
+        if (doc !== undefined) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  viewerHint(url, resolvedTarget, opened) +
+                  `\nIt shows the document ${quoteId(doc)}: select text to comment, then ` +
+                  `list_comments with document ${quoteId(doc)} reads the comments back.`,
+              },
+            ],
+            structuredContent: { url, opened, target: resolvedTarget, document: doc },
+          };
+        }
         const root = await ctx.viewer.rootFor(id);
         // The viewer is never handed a root by a call, so 'argument' cannot come back here.
         const rootSource = root?.source === 'registered' ? 'registered' : 'detected';

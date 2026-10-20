@@ -2,8 +2,45 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, writeFile, rm, utimes, readFile } from 'node:fs/promises';
+import { request } from 'node:http';
+import { connect } from 'node:net';
 import { ViewerService } from '../../src/services/viewer.js';
+import type { ViewerDeps } from '../../src/services/viewer.js';
 import { CommentStore } from '../../src/services/commentStore.js';
+import type { NewComment } from '../../src/services/commentStore.js';
+
+/**
+ * One request with headers fetch cannot set (`Host`), or none at all: `setHost: false` and no
+ * `host` header sends the request without one.
+ */
+function rawRequest(
+  base: string,
+  opts: { method?: string; path: string; headers?: Record<string, string>; body?: string },
+): Promise<{ status: number; body: string }> {
+  const u = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = request(
+      {
+        host: u.hostname,
+        port: Number(u.port),
+        method: opts.method ?? 'GET',
+        path: opts.path,
+        headers: opts.headers ?? {},
+        setHost: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () =>
+          resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }),
+        );
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.end(opts.body);
+  });
+}
 
 describe('ViewerService', () => {
   let dir: string;
@@ -35,11 +72,11 @@ describe('ViewerService', () => {
       },
       // Stand in for the synctex-backed resolver: attach a fixed source location.
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 42 }),
-      listComments: (id) => store.list(id),
+      listComments: (id, document) => store.list(id, { document }),
       updateComment: (id, cid, note) => store.update(id, cid, { note }),
       deleteComment: (id, cid) => store.remove(id, cid),
-      undoDelete: (id) => store.undo(id),
-      resolveComments: (id, ids) => store.resolve(id, ids),
+      undoDelete: (id, document) => store.undo(id, document),
+      resolveComments: (id, ids, document) => store.resolve(id, ids, document),
     });
     const url = await viewer.start(0);
     expect(url).toBeDefined();
@@ -61,6 +98,12 @@ describe('ViewerService', () => {
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toMatch(/text\/html/);
     expect(await r.text()).toContain('demo');
+  });
+
+  it("scopes the PDF page's Ask Claude prompt to PDF comments and the ids handled", async () => {
+    const html = await (await fetch(`${base}/p/demo`)).text();
+    expect(html).toContain('call list_comments with pdfOnly: true');
+    expect(html).toContain('resolve_comments with the ids you handled');
   });
 
   it('serves a viewer module script that parses (guards against JS syntax regressions)', async () => {
@@ -245,11 +288,11 @@ describe('ViewerService', () => {
         throw new Error('boom');
       },
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
-      listComments: (id) => store.list(id),
+      listComments: (id, document) => store.list(id, { document }),
       updateComment: (id, cid, note) => store.update(id, cid, { note }),
       deleteComment: (id, cid) => store.remove(id, cid),
-      undoDelete: (id) => store.undo(id),
-      resolveComments: (id, ids) => store.resolve(id, ids),
+      undoDelete: (id, document) => store.undo(id, document),
+      resolveComments: (id, ids, document) => store.resolve(id, ids, document),
     });
     const url = await other.start(0);
     try {
@@ -437,11 +480,11 @@ describe('ViewerService', () => {
       knownIds: () => ['demo'],
       locatePdf: async () => ({ pdf, root: null }),
       addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
-      listComments: (id) => store.list(id),
+      listComments: (id, document) => store.list(id, { document }),
       updateComment: (id, cid, note) => store.update(id, cid, { note }),
       deleteComment: (id, cid) => store.remove(id, cid),
-      undoDelete: (id) => store.undo(id),
-      resolveComments: (id, ids) => store.resolve(id, ids),
+      undoDelete: (id, document) => store.undo(id, document),
+      resolveComments: (id, ids, document) => store.resolve(id, ids, document),
     });
     const url = await other.start(0);
     expect(url).toBeDefined();
@@ -451,4 +494,420 @@ describe('ViewerService', () => {
     await other.close();
     expect(other.isRunning()).toBe(false);
   }, 5_000);
+
+  // DNS rebinding / cross-site POST: any page in the user's browser can reach the loopback port.
+  describe('Host and Origin guard', () => {
+    const port = () => Number(new URL(base).port);
+
+    it('refuses a foreign Host on every route', async () => {
+      for (const p of ['/', '/p/demo', '/pdfjs/build/pdf.mjs', '/p/demo/doc?path=review.md']) {
+        const r = await rawRequest(base, { path: p, headers: { host: `evil.example:${port()}` } });
+        expect(r.status, p).toBe(403);
+        expect(r.body).toBe('Forbidden.\n');
+      }
+    });
+
+    // A forwarded port (VS Code Remote-SSH, Dev Containers) reaches the server under another
+    // local port; rebinding cannot forge a loopback name, so the port is no boundary.
+    it('accepts a loopback name on any port, or with none', async () => {
+      for (const host of [
+        `127.0.0.1:${port() + 1}`,
+        'localhost',
+        '127.0.0.1',
+        `[::1]:${port() + 7}`,
+        '[::1]',
+        'localhost:1',
+        'localhost:65535',
+      ]) {
+        const r = await rawRequest(base, { path: '/', headers: { host } });
+        expect(r.status, host).toBe(200);
+      }
+    });
+
+    it('refuses names that only look like loopback, and an invalid port', async () => {
+      for (const host of [
+        `localhost.:${port()}`,
+        'localhost.',
+        `127.0.0.1.evil.example:${port()}`,
+        `user@localhost:${port()}`,
+        'localhost:99999',
+        'localhost:0',
+        'localhost:',
+        'localhost:12a',
+        `localhost:${port()}:1`,
+        `::1:${port()}`,
+        `[::1]x:${port()}`,
+        `evil.example:${port()}`,
+      ]) {
+        const r = await rawRequest(base, { path: '/', headers: { host } });
+        expect(r.status, host).toBe(403);
+      }
+    });
+
+    it('refuses a missing Host', async () => {
+      // Node's own parser answers an HTTP/1.1 request without Host with 400 before the handler
+      // runs; HTTP/1.0 allows one, and that is the guard's to refuse.
+      const none = await rawRequest(base, { path: '/' });
+      expect(none.status).toBe(400);
+      const http10 = await new Promise<string>((resolve, reject) => {
+        const sock = connect(port(), '127.0.0.1', () => sock.end('GET / HTTP/1.0\r\n\r\n'));
+        let out = '';
+        sock.on('data', (c: Buffer) => (out += c.toString('utf8')));
+        sock.on('end', () => resolve(out));
+        sock.on('error', reject);
+      });
+      expect(http10).toMatch(/^HTTP\/1\.[01] 403 /);
+    });
+
+    it('accepts localhost and 127.0.0.1 on the bound port', async () => {
+      for (const host of [`localhost:${port()}`, `127.0.0.1:${port()}`, `LOCALHOST:${port()}`]) {
+        const r = await rawRequest(base, { path: '/', headers: { host } });
+        expect(r.status, host).toBe(200);
+      }
+    });
+
+    it('refuses a cross-origin POST, including Origin: null, and stores nothing', async () => {
+      const before = store.list('demo', { includeResolved: true }).length;
+      const body = JSON.stringify({ page: 1, x: 1, y: 1, note: 'csrf' });
+      for (const origin of [
+        'http://evil.example',
+        'null',
+        `http://evil.example:${port()}`,
+        `https://localhost:${port()}`,
+        `http://localhost.:${port()}`,
+        `http://user@localhost:${port()}`,
+        // Another LOCAL page — a dev server or notebook on another port — is still another origin.
+        `http://localhost:${port()}`,
+        `http://127.0.0.1:${port() + 1}`,
+        'http://localhost',
+        `http://[::1]:${port()}`,
+      ]) {
+        const r = await rawRequest(base, {
+          method: 'POST',
+          path: '/p/demo/comments',
+          headers: { host: `127.0.0.1:${port()}`, origin, 'content-type': 'application/json' },
+          body,
+        });
+        expect(r.status, origin).toBe(403);
+      }
+      expect(store.list('demo', { includeResolved: true })).toHaveLength(before);
+    });
+
+    // Same origin means the Origin the browser wrote for this very Host — including a forwarded
+    // port, where both headers carry the forwarded host:port.
+    it('accepts a same-origin POST (forwarded ports included), and one with no Origin', async () => {
+      const body = JSON.stringify({ page: 1, x: 1, y: 1, note: 'same origin' });
+      const variants: Array<{ host: string; origin?: string }> = [
+        { host: `127.0.0.1:${port()}`, origin: `http://127.0.0.1:${port()}` },
+        { host: `localhost:${port()}`, origin: `http://localhost:${port()}` },
+        { host: `localhost:${port() + 1}`, origin: `http://localhost:${port() + 1}` },
+        { host: `LOCALHOST:${port()}`, origin: `http://localhost:${port()}` },
+        { host: `[::1]:${port() + 2}`, origin: `http://[::1]:${port() + 2}` },
+        { host: `127.0.0.1:${port()}` },
+      ];
+      for (const { host, origin } of variants) {
+        const r = await rawRequest(base, {
+          method: 'POST',
+          path: '/p/demo/comments',
+          headers: {
+            host,
+            'content-type': 'application/json',
+            ...(origin === undefined ? {} : { origin }),
+          },
+          body,
+        });
+        expect(r.status, `${host} ${origin ?? '(no origin)'}`).toBe(201);
+      }
+    });
+  });
+});
+
+describe('ViewerService document view', () => {
+  const REVIEW = '# Title\n\nFirst line of para\nsecond line of para\n';
+  let docs: Record<string, string> = {};
+  let store = new CommentStore();
+  let viewer: ViewerService;
+  let base: string;
+  let calls: string[] = [];
+
+  const deps = (withDocs: boolean): ViewerDeps => ({
+    knownIds: () => ['demo'],
+    locatePdf: async () => ({ pdf: null, root: null }),
+    addComment: async (id, input) => store.add(id, { ...input, file: 'main.tex', line: 1 }),
+    listComments: (id, document) => store.list(id, { document }),
+    updateComment: (id, cid, note) => store.update(id, cid, { note }),
+    deleteComment: (id, cid) => store.remove(id, cid),
+    undoDelete: (id, document) => store.undo(id, document),
+    resolveComments: (id, ids, document) => store.resolve(id, ids, document),
+    ...(withDocs
+      ? {
+          readDocument: async (_id: string, relPath: string) => {
+            calls.push(relPath);
+            const text = Object.hasOwn(docs, relPath) ? docs[relPath] : undefined;
+            if (text === undefined) throw new Error(`No such document: ${JSON.stringify(relPath)}`);
+            return { path: relPath, text };
+          },
+          addDocComment: (id: string, input: NewComment) => store.add(id, input),
+        }
+      : {}),
+  });
+
+  beforeAll(async () => {
+    viewer = new ViewerService(deps(true));
+    const url = await viewer.start(0);
+    expect(url).toBeDefined();
+    base = url!;
+  });
+
+  afterAll(async () => {
+    await viewer.close();
+  });
+
+  // Each test gets a fresh store and document set, so numbering is checked from #1.
+  const reset = () => {
+    store = new CommentStore();
+    docs = { 'review.md': REVIEW, 'a</script>.md': '# Odd name\n' };
+    calls = [];
+  };
+
+  const q = (p: string) => `?path=${encodeURIComponent(p)}`;
+
+  async function postDoc(body: unknown, docPath = 'review.md') {
+    return fetch(`${base}/p/demo/doc/comments${q(docPath)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function postPdf(note: string): Promise<{ id: string; number: number }> {
+    const r = await fetch(`${base}/p/demo/comments`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ page: 1, x: 1, y: 1, note }),
+    });
+    return (await r.json()) as { id: string; number: number };
+  }
+
+  function pageScript(html: string): { nonce: string; body: string } {
+    const m = /<script nonce="([^"]+)">([\s\S]*?)<\/script>/.exec(html);
+    expect(m).toBeTruthy();
+    return { nonce: m![1]!, body: m![2]! };
+  }
+
+  it('serves the document page with a nonce CSP whose nonce is the script one', async () => {
+    reset();
+    const r = await fetch(`${base}/p/demo/doc${q('review.md')}`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toMatch(/text\/html/);
+    expect(r.headers.get('cache-control')).toBe('no-store');
+    const csp = r.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("img-src 'none'");
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).toContain("base-uri 'none'");
+    const nonce = /script-src 'nonce-([^']+)'/.exec(csp)?.[1];
+    expect(nonce).toBeTruthy();
+    const html = await r.text();
+    const script = pageScript(html);
+    expect(script.nonce).toBe(nonce);
+    // Compiled, not run: a SyntaxError here blanks the whole page.
+    expect(() => new Function(script.body)).not.toThrow();
+    expect(html).toContain('review.md');
+    // A fresh nonce per response.
+    const again = await fetch(`${base}/p/demo/doc${q('review.md')}`);
+    expect(again.headers.get('content-security-policy')).not.toBe(csp);
+  });
+
+  it('validates the path before reading anything', async () => {
+    reset();
+    for (const p of ['/p/demo/doc', `/p/demo/doc${q('')}`, `/p/demo/doc/render${q('notes.tex')}`]) {
+      expect((await fetch(`${base}${p}`)).status, p).toBe(400);
+    }
+    const dot = await fetch(`${base}/p/demo/doc/render${q('.md')}`);
+    expect(dot.status).toBe(400);
+    expect(((await dot.json()) as { error: string }).error).toContain('".md"');
+    const long = 'a'.repeat(1025 - 3) + '.md';
+    expect(long).toHaveLength(1025);
+    expect((await fetch(`${base}/p/demo/doc/render${q(long)}`)).status).toBe(400);
+    expect(calls).toEqual([]);
+    // Exactly at the cap it reaches readDocument (whose fake 404s it).
+    const max = 'a'.repeat(1024 - 3) + '.md';
+    expect((await fetch(`${base}/p/demo/doc/render${q(max)}`)).status).toBe(404);
+    expect(calls).toEqual([max]);
+  });
+
+  it('escapes invisible characters when it names a refused path', async () => {
+    reset();
+    const r = await fetch(`${base}/p/demo/doc/render${q('x\u202e.tex')}`);
+    expect(r.status).toBe(400);
+    const { error } = (await r.json()) as { error: string };
+    expect(error).toContain('\\u{202E}');
+    expect(error).not.toContain('\u202e');
+  });
+
+  it("404s an unknown document with readDocument's message", async () => {
+    reset();
+    const r = await fetch(`${base}/p/demo/doc/render${q('missing.md')}`);
+    expect(r.status).toBe(404);
+    expect(await r.json()).toEqual({ error: 'No such document: "missing.md"' });
+    const page = await fetch(`${base}/p/demo/doc${q('missing.md')}`);
+    expect(page.status).toBe(404);
+    expect(page.headers.get('content-type')).toMatch(/text\/html/);
+    expect(await page.text()).toContain('No such document: &quot;missing.md&quot;');
+  });
+
+  it('404s every document route when document viewing is not wired', async () => {
+    reset();
+    const other = new ViewerService(deps(false));
+    const url = await other.start(0);
+    try {
+      const r = await fetch(`${url!}/p/demo/doc/render${q('review.md')}`);
+      expect(r.status).toBe(404);
+      expect(((await r.json()) as { error: string }).error).toBe(
+        'Document viewing is not available.',
+      );
+      expect((await fetch(`${url!}/p/demo/doc${q('review.md')}`)).status).toBe(404);
+    } finally {
+      await other.close();
+    }
+  });
+
+  it("scopes the document page's Ask Claude prompt to that document, JSON-quoted", async () => {
+    reset();
+    const html = await (await fetch(`${base}/p/demo/doc${q('review.md')}`)).text();
+    const script = pageScript(html).body;
+    expect(script).toContain('call list_comments with document ');
+    expect(script).toContain('JSON.stringify(DOC)');
+    expect(script).toContain('JSON.stringify(ID)');
+    expect(script).toContain('call resolve_comments with the ids you handled.');
+    // The name is never put between hand-written quotes.
+    expect(script).not.toMatch(/'"' \+ (DOC|ID)/);
+  });
+
+  it('refuses a drive-qualified or absolute document path before reading it', async () => {
+    reset();
+    for (const p of [
+      'C:notes.md',
+      'c:/x/notes.md',
+      '/abs/a.md',
+      '\\\\server\\share\\a.md',
+      '\\a.md',
+    ]) {
+      const r = await fetch(`${base}/p/demo/doc/render${q(p)}`);
+      expect(r.status, p).toBe(400);
+      expect(((await r.json()) as { error: string }).error, p).toContain(
+        'Not a project-relative path',
+      );
+      await expect(viewer.checkDocument('demo', p), p).rejects.toThrow(
+        'Not a project-relative path',
+      );
+    }
+    expect(calls).toEqual([]);
+    docs['notes.md'] = '# n\n';
+    expect((await fetch(`${base}/p/demo/doc/render${q('notes.md')}`)).status).toBe(200);
+    await expect(viewer.checkDocument('demo', 'notes.md')).resolves.toBe('notes.md');
+  });
+
+  it('keeps a </script> in the path out of the page script', async () => {
+    reset();
+    const r = await fetch(`${base}/p/demo/doc${q('a</script>.md')}`);
+    expect(r.status).toBe(200);
+    const html = await r.text();
+    expect(html.match(/<\/script>/g)).toHaveLength(1);
+    const script = pageScript(html);
+    expect(script.body).toContain('\\u003c/script\\u003e.md');
+    expect(() => new Function(script.body)).not.toThrow();
+  });
+
+  it('renders the document with source ranges, and versions it by content', async () => {
+    reset();
+    const r = await fetch(`${base}/p/demo/doc/render${q('review.md')}`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get('cache-control')).toBe('no-store');
+    const { html, version } = (await r.json()) as { html: string; version: string };
+    expect(html).toContain('data-src="3-4"');
+    expect(version).toMatch(/^[0-9a-f]{40}$/);
+    const v1 = await (await fetch(`${base}/p/demo/doc/version${q('review.md')}`)).text();
+    expect(v1).toBe(version);
+    docs['review.md'] = REVIEW + '\nmore\n';
+    const v2 = await (await fetch(`${base}/p/demo/doc/version${q('review.md')}`)).text();
+    expect(v2).not.toBe(v1);
+    expect((await fetch(`${base}/p/demo/doc/version${q('missing.md')}`)).status).toBe(404);
+  });
+
+  it('stores a document comment at the line the server resolves', async () => {
+    reset();
+    const r = await postDoc({ note: 'fix', quote: 'second line', blockStart: 3, blockEnd: 4 });
+    expect(r.status).toBe(201);
+    const c = (await r.json()) as Record<string, unknown>;
+    expect(c).toMatchObject({ document: 'review.md', file: 'review.md', line: 4, note: 'fix' });
+    expect(c.page).toBeUndefined();
+  });
+
+  it('never stores a client line: out-of-file blocks clamp, a line field is ignored', async () => {
+    reset();
+    const far = (await (
+      await postDoc({ note: 'far', quote: 'nowhere', blockStart: 999, blockEnd: 1000 })
+    ).json()) as { line: number };
+    expect(far.line).toBeGreaterThanOrEqual(1);
+    expect(far.line).toBeLessThanOrEqual(4);
+    const lied = (await (
+      await postDoc({ note: 'x', quote: 'second line', blockStart: 3, blockEnd: 4, line: 1 })
+    ).json()) as { line: number };
+    expect(lied.line).toBe(4);
+  });
+
+  it('rejects an empty or missing note', async () => {
+    reset();
+    expect((await postDoc({ note: '' })).status).toBe(400);
+    expect((await postDoc({ note: '   ' })).status).toBe(400);
+    expect((await postDoc({ quote: 'x' })).status).toBe(400);
+    expect(store.list('demo')).toHaveLength(0);
+  });
+
+  it('keeps the PDF surface and each document apart, numbering each from #1', async () => {
+    reset();
+    const docRes = await postDoc({ note: 'doc note', blockStart: 1 });
+    const doc = (await docRes.json()) as { id: string; number: number };
+    expect(doc.number).toBe(1);
+    const pdfC = await postPdf('pdf note');
+    expect(pdfC.number).toBe(1);
+    const pdfList = (await (await fetch(`${base}/p/demo/comments`)).json()) as { id: string }[];
+    expect(pdfList.map((c) => c.id)).toEqual([pdfC.id]);
+    const docListRes = await fetch(`${base}/p/demo/doc/comments${q('review.md')}`);
+    const docList = (await docListRes.json()) as { id: string }[];
+    expect(docList.map((c) => c.id)).toEqual([doc.id]);
+    // Resolving "all" from the PDF page leaves the document's comment open.
+    await fetch(`${base}/p/demo/comments/resolve`, { method: 'POST' });
+    expect(store.list('demo', { document: 'review.md' })).toHaveLength(1);
+    expect(store.list('demo', { document: null })).toHaveLength(0);
+  });
+
+  it('undoes only the surface it is asked on', async () => {
+    reset();
+    const doc = (await (await postDoc({ note: 'doc', blockStart: 1 })).json()) as { id: string };
+    const pdfC = await postPdf('pdf');
+    // The PDF comment deleted first, the document's last: each undo still restores its own.
+    await fetch(`${base}/p/demo/comments/${pdfC.id}/delete`, { method: 'POST' });
+    await fetch(`${base}/p/demo/comments/${doc.id}/delete`, { method: 'POST' });
+    const pdfUndo = await fetch(`${base}/p/demo/comments/undo`, { method: 'POST' });
+    expect(((await pdfUndo.json()) as { restored: { id: string } | null }).restored?.id).toBe(
+      pdfC.id,
+    );
+    const docUndoUrl = `${base}/p/demo/doc/comments/undo${q('review.md')}`;
+    const docUndo = await fetch(docUndoUrl, { method: 'POST' });
+    expect(((await docUndo.json()) as { restored: { id: string } | null }).restored?.id).toBe(
+      doc.id,
+    );
+    const none = await fetch(docUndoUrl, { method: 'POST' });
+    expect(((await none.json()) as { restored: unknown }).restored).toBeNull();
+  });
+
+  it('urlForDocument composes and encodes the path', () => {
+    expect(viewer.urlForDocument('demo', 'notes/a b&c.md')).toBe(
+      `${base}/p/demo/doc?path=notes%2Fa%20b%26c.md`,
+    );
+    expect(new ViewerService(deps(true)).urlForDocument('demo', 'x.md')).toBeUndefined();
+  });
 });
