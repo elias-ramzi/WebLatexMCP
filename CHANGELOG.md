@@ -9,7 +9,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Fixed
+
+- **`labels:` no longer refuses an ordinary hyperref paper's float pages (#223).** hyperref writes
+  no `/PageLabels` tree when every page's label equals its index, so an arabic 1..N paper took the
+  folio route, where a page whose number could not be read from its text (a float page, a table
+  cell above the foot) was refused. `render_pages`/`extract_text` now also accept the candidate
+  page when the label's own hyperref destination (the anchor the `.aux` records) lies on it. This
+  replaces only the page-text check; the restart, roman, last-page and shipout checks still refuse,
+  and a destination elsewhere falls back to the text check and is named in the refusal. The docs no
+  longer claim that loading hyperref always gives an exact lookup.
+
 ### Changed
+
+- **`/review-paper` writes a calibration record after each run (#218).** The record is
+  `paper-review.local/<run>/calibration.md` plus one row in `paper-review.local/calibration-runs.md`.
+  It holds verdict counts, the REJECTED rate, and per seat the findings raised, survived and
+  unique-and-survived, plus each agent's tokens and wall time. It contains counts and model names
+  only, so it can be pasted into #218 without sharing the paper. To make those counts possible, the
+  triage ledger now has lettered source IDs, one verdict word per row, and a `Final ID` column (`—`
+  for a row that did not reach the final review). The triage rules and the panel are unchanged until
+  about five runs exist.
 
 - **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The
   new command runs a multi-round PR review: `pr-reviewer` agents each review through one lens

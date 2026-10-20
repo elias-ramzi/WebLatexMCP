@@ -518,7 +518,9 @@ wrong, and one raised by a single reviewer can be the most important.
    claim list before opening any report, so the reports do not anchor you.
 2. **Ledger.** Extract every strength, weakness, question and typo from every report with a source
    ID (`R1-W3`, `R2-W1`, `R3-Q2`, `DA-C1`, `NOV-W1`, `TYP-12`, `CMP-3` for compile warnings).
-   Under `/review-paper` the three full reviews are blinded: you are not told which model wrote
+   The letter is the report section the item sat in — `S` strength, `W` weakness (a DA MAJOR
+   attack too), `C` DA CRITICAL, `M` minor weakness or DA MINOR, `Q` question, `T` typo — so a
+   seat's findings can be counted from the ledger alone. Under `/review-paper` the three full reviews are blinded: you are not told which model wrote
    `R1`, `R2` or `R3`, and one of them runs on your own model. Do not try to work it out; judge
    every item on the paper alone.
 3. **Cluster** items describing the same underlying problem; split items bundling two.
@@ -600,6 +602,8 @@ _Target venue: <venue> · <YYYY-MM-DD>_
 
 | Final ID | Sources | Verdict | Severity · fix · conf | Section | Verification evidence / reason |
 
+<One row per cluster (a split cluster is one row per part), and every extracted source ID in exactly one row (a split item in each of its parts). Sources: every ID of the cluster, comma-separated, ids only (`triage` for your own). Verdict: one word in capitals — CONFIRMED, PARTIAL, REJECTED, UNVERIFIABLE, or another word you name in the last column (e.g. CORRECTED). Final ID: the item it became, numbered in its section's order (`W2`, `M5`, `Q3`, `T11`, `S1`), or `—` when it reached no section of the final review. Section: the final-review section, `For the authors to check`, `Informational`, or `—` when dropped. /review-paper counts its calibration record from these columns.>
+
 ## Devil's-advocate CRITICAL adjudications
 
 ## Disagreements and how they were resolved
@@ -631,7 +635,8 @@ one model playing every role gives less independent coverage than the `/review-p
 5. **Novelty** — only with the user's go-ahead, since it sends queries to external services.
 6. **Typos** — follow the `proofread-document` skill in report-only mode.
 7. **Triage your own reports** — verify every CRITICAL and MAJOR against the paper once more, then
-   write the final review and the triage log.
+   write the final review and the triage log. One model holds every seat, so there is no
+   calibration record here: that is `/review-paper`'s, which compares seats.
 
 ### Where the reports go
 

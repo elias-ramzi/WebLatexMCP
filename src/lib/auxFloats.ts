@@ -31,6 +31,13 @@ export interface AuxLabel {
   number: string;
   /** The printed page the label resolved to, as it appears in the .aux (may be "iv", "3"). */
   page: string;
+  /**
+   * hyperref's anchor for the label — the fourth group of its five-group form
+   * (`{{1}{3}{caption}{figure.caption.1}{}}`), the name of the PDF destination a `\ref` links
+   * to. Absent without hyperref, and when that group is empty or longer than a field may be:
+   * an anchor only ever adds evidence (`labelPages.ts`), so a missing one costs nothing.
+   */
+  anchor?: string;
 }
 
 const DEFAULT_MAX_LABELS = 2000;
@@ -666,9 +673,10 @@ function* scanAuxEntries(
     }
 
     // The outer group's content starts with two brace groups: {number}{page}[...]. Read them with
-    // the same balanced reader, ignoring anything after (hyperref appends {\relax }{anchor}{}).
+    // the same balanced reader; hyperref appends {title}{anchor}{}, of which only the anchor is
+    // kept (below).
     // This content is already bounded to at most MAX_GROUP_SCAN characters (outerGroup succeeded
-    // under that budget to get here), so these two reads can never themselves hit a scan budget —
+    // under that budget to get here), so these reads can never themselves hit a scan budget —
     // only genuine unbalance is possible, and that stays a silent skip as it always has.
     const inner = outerGroup.content;
     let j = skipWs(inner, 0, work);
@@ -694,7 +702,24 @@ function* scanAuxEntries(
       continue;
     }
 
-    yield { kind: 'entry', entry: { label, number, page } };
+    // hyperref's form carries {title}{anchor}{} after the page. Read past the title to the
+    // anchor; anything malformed there simply leaves the entry without one.
+    let anchor: string | undefined;
+    j = skipWs(inner, pageGroup.end, work);
+    const titleGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN, work);
+    if (titleGroup.kind === 'ok') {
+      j = skipWs(inner, titleGroup.end, work);
+      const anchorGroup = readBraceGroup(inner, j, MAX_GROUP_SCAN, work);
+      if (
+        anchorGroup.kind === 'ok' &&
+        anchorGroup.content.length > 0 &&
+        anchorGroup.content.length <= MAX_FIELD_LENGTH
+      ) {
+        anchor = anchorGroup.content;
+      }
+    }
+
+    yield { kind: 'entry', entry: { label, number, page, ...(anchor ? { anchor } : {}) } };
   }
 }
 
