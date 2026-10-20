@@ -609,7 +609,11 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   header lists residuals). Without `/PageLabels` the `.aux` page is a candidate accepted only when that
   page's folio reads it (`readFolios`: bare last-line number, else `FOOT_FORMS` — which beat the
   running head — else head; two head readings → `ambiguousFolio`), corroborated by a neighbour
-  (`uncorroboratedFolio`; one-page PDFs exempt). A label's own number is never consulted. Refusals:
+  (`uncorroboratedFolio`; one-page PDFs exempt) — **or** when the label's own hyperref destination
+  (`AuxLabel.anchor` → `destinationPages`) lies on that very page (`destinationPageOf`, never for
+  beamer): hyperref writes no `/PageLabels` for a 1..N document (`\HyPL@Useless`), so this is the
+  common hyperref case. It replaces only the text check — a disagreeing destination falls back to it,
+  never refuses — and every other refusal stands. A label's own number is never consulted. Refusals:
   arabic restart (`restarted`), last page decimal ≠ page count (`lastPageMismatch`), label defined twice
   (`multiplyDefined`).
 - **Beamer decks never use the tree** (recognised by `\@writefile{nav}`); folio route, and refused first
@@ -641,7 +645,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 - `\include`d labels: `findBuildDirAux` follows line-anchored `\@input` by `readdir` lookup per
   component, **never as a path** (no links, no `..`; `lstat`/`realpath` at read), bounded (256 count,
   depth 8, bytes); case-mismatched names unread (`caseMismatch`); unread inputs named (`unreadInputs`).
-  For exact lookups: `hyperref` or `pages:`.
+  For exact lookups: `hyperref` (a tree for a renumbered document, link targets otherwise) or `pages:`.
 
 ### Payload budgets
 

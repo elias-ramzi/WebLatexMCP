@@ -215,6 +215,11 @@ export interface PdfRenderService {
    * first, on both of its routes. Two calls would read and parse the whole file twice.
    */
   pageLabelsAndCount(pdfPath: string): Promise<PageLabelsAndCount>;
+  /**
+   * The 1-based page each named destination (`names`) points at, for those that exist and point
+   * at a page of this document. A name missing from the result found no such destination.
+   */
+  destinationPages(pdfPath: string, names: readonly string[]): Promise<Map<string, number>>;
   /** The requested pages' text layer, as merged lines. */
   text(req: TextRequest): Promise<TextResult>;
 }
@@ -838,6 +843,41 @@ export class PdfRenderer implements PdfRenderService {
   }
 
   /**
+   * Named destinations looked up one by one (`getDestination`, the name tree, not the whole
+   * `getDestinations()` map — slow on a large document), each kept only when its target is a page
+   * reference of this document (`getPageIndex`). Anything else — no such name, a malformed or
+   * remote target, a pdf.js without these methods, a lookup that throws — leaves the name out
+   * rather than failing the call: a destination only ever adds evidence to a label lookup
+   * (`labelPages.ts`), and without it the lookup refuses or checks exactly as it would have.
+   */
+  async destinationPages(pdfPath: string, names: readonly string[]): Promise<Map<string, number>> {
+    const pages = new Map<string, number>();
+    if (names.length === 0) return pages;
+    const { doc, destroy } = await this.openDocument(pdfPath);
+    try {
+      if (typeof doc.getDestination !== 'function' || typeof doc.getPageIndex !== 'function') {
+        return pages;
+      }
+      for (const name of new Set(names)) {
+        try {
+          const dest = await doc.getDestination(name);
+          const target: unknown = Array.isArray(dest) ? dest[0] : undefined;
+          if (!isPageRef(target)) continue;
+          const index = await doc.getPageIndex(target);
+          if (Number.isInteger(index) && index >= 0 && index < doc.numPages) {
+            pages.set(name, index + 1);
+          }
+        } catch {
+          // Left out: see above.
+        }
+      }
+      return pages;
+    } finally {
+      await destroy();
+    }
+  }
+
+  /**
    * The requested pages' text layer, as merged lines.
    *
    * Deliberately the SAME walk `geometry`'s "text" kind uses — `getTextContent()` fed through
@@ -1288,6 +1328,26 @@ interface PdfjsDocument {
    * document that does not implement it instead of returning `null`.
    */
   getPageLabels?: () => Promise<string[] | null>;
+  /** Optional, for the same reason; `destinationPages` treats a missing one as "no destinations". */
+  getDestination?: (id: string) => Promise<unknown[] | null>;
+  getPageIndex?: (ref: PageRef) => Promise<number>;
+}
+
+/** pdf.js's `RefProxy`: how an explicit destination names its target page. */
+interface PageRef {
+  num: number;
+  gen: number;
+}
+
+/** A destination's first element is a page reference for a local target, and a bare page number
+ *  only in a remote (`GoToR`) one, which names a page of ANOTHER file. */
+function isPageRef(value: unknown): value is PageRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Number.isInteger((value as PageRef).num) &&
+    Number.isInteger((value as PageRef).gen)
+  );
 }
 
 /** An open document's `/PageLabels` tree, refusing a pdf.js with no `getPageLabels` (see
