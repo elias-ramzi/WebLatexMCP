@@ -66,7 +66,7 @@ The plugin also installs the paper commands and the agents they dispatch: `/revi
 `/hunt-typo`, `/format-latex`, `/review-writing` and `/rewrite-mode`, named
 `/web-latex-mcp:review-paper` and so on under the plugin. A clone gets the same files from
 `.claude/commands` and `.claude/agents`, next to this repository's own development tooling
-(`/implement`, `/review`, and their agents), which the plugin leaves out.
+(`/pr-review` and its agent), which the plugin leaves out.
 
 ### Any MCP client — nothing to install
 

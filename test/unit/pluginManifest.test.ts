@@ -8,8 +8,8 @@ import { describe, expect, it } from 'vitest';
  *
  * Those two directories hold two kinds of file: the paper-facing commands and the agents they
  * dispatch, which the plugin must ship, and this repository's own development tooling, which it
- * must NOT — pointing `plugin.json` at the directories would install `/implement` and
- * `implementer` into every user's Claude Code. So `plugin.json` lists the shipped files one by one,
+ * must NOT — pointing `plugin.json` at the directories would install `/pr-review` and
+ * `pr-reviewer` into every user's Claude Code. So `plugin.json` lists the shipped files one by one,
  * and this test holds every file in the two directories to exactly one of two lists: the
  * manifest's, or the explicit DEV list below. A new file in neither fails here, which is the
  * point: a new paper agent cannot be left out of the plugin by forgetting it, and a new dev agent
@@ -20,8 +20,8 @@ const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
 /** Development tooling: in the repository, never in the plugin. */
 const DEV = {
-  agents: ['implementer.md', 'plan-verifier.md'],
-  commands: ['implement.md', 'implement-issue.md', 'review.md'],
+  agents: ['pr-reviewer.md'],
+  commands: ['pr-review.md'],
 } as const;
 
 type Kind = keyof typeof DEV;

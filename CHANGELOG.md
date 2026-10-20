@@ -11,6 +11,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The
+  new command runs a multi-round PR review: `pr-reviewer` agents each review through one lens
+  (correctness, contracts, integration, design, docs, security; how many depends on the effort
+  level), findings are verified, and with `--fix` they are fixed between rounds and the local gate is
+  re-run, closing with a completeness review. The `implementer` and `plan-verifier` agents, the
+  `review-round` workflow script, its tests and its ESLint block are removed. None of this ships in
+  the plugin.
+
 - **The CHANGELOG check no longer fails Dependabot's PRs.** It skips them by author and reads a
   PR's labels live rather than from the event, which raced Dependabot's labelling and left the
   check red under one name while a second run of it passed.
