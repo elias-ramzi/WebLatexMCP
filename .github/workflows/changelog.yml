@@ -8,6 +8,7 @@
 #   - PRs into `dev` only. A `dev -> main` release PR is the changelog, and the auto-merged
 #     `main -> dev` back-merge PR from back-merge.yml carries no entry by construction — a required
 #     check that blocks a bot's PR is a repo you have to babysit.
+#   - Dependabot's PRs are skipped by author (an action bump changes nothing a user sees).
 #   - A `no-changelog` label opts out, because a PR that genuinely has nothing to log (a CI tweak, a
 #     typo) would otherwise get a junk entry written to satisfy a bot, and junk entries cost the log
 #     more than the missing rule does.
@@ -27,6 +28,9 @@ jobs:
   unreleased-entry:
     name: CHANGELOG [Unreleased] updated
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Skip the back-merge PR
         id: skip
@@ -36,10 +40,19 @@ jobs:
           # `main` is an ordinary contribution and must not skip the check on its name alone.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           THIS_REPO: ${{ github.repository }}
-          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # Labels are read live, never from the event payload: Dependabot opens a PR and labels it
+          # a moment later, so the `opened` run saw no label, failed, and finished after the
+          # `labeled` run that passed — leaving the PR red under one check name (#254).
+          LABELS="$(gh api "repos/$THIS_REPO/issues/$PR_NUMBER/labels" --jq '[.[].name]')"
           if [ "$HEAD_REF" = "main" ] && [ "$HEAD_REPO" = "$THIS_REPO" ]; then
             echo "reason=back-merge from main" >> "$GITHUB_OUTPUT"
+          elif [ "$AUTHOR" = "dependabot[bot]" ] && [ "$HEAD_REPO" = "$THIS_REPO" ]; then
+            # An action bump changes nothing a user of the server sees (see dependabot.yml).
+            echo "reason=Dependabot update" >> "$GITHUB_OUTPUT"
           elif echo "$LABELS" | grep -q '"no-changelog"'; then
             echo "reason=labelled no-changelog" >> "$GITHUB_OUTPUT"
           fi

@@ -11,6 +11,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **The CHANGELOG check no longer fails Dependabot's PRs.** It skips them by author and reads a
+  PR's labels live rather than from the event, which raced Dependabot's labelling and left the
+  check red under one name while a second run of it passed.
+
 - **`npm run format:check` skips the workspace-local `.web_latex_mcp` folder.** Files the server
   writes there (clones, paper-review reports) are git-excluded but made the local check fail.
 
