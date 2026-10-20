@@ -1377,7 +1377,7 @@ export class ViewerService {
     return new Promise((resolve) => {
       const onError = (err: NodeJS.ErrnoException): void => {
         server.removeListener('error', onError);
-        console.error(`[web-latex-mcp] PDF viewer could not start: ${err.message}`);
+        console.error(`[web-latex-mcp] viewer could not start: ${err.message}`);
         resolve(undefined);
       };
       server.once('error', onError);
