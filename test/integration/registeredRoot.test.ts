@@ -61,7 +61,7 @@ function stubCompiler(compiled: string[]) {
   };
 }
 
-async function setup(opts: { workspaceIsLocal: boolean }) {
+async function setup(opts: { surfacePdf: boolean }) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-regroot-ws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-regroot-dir-'));
   cleanups.push(
@@ -76,7 +76,7 @@ async function setup(opts: { workspaceIsLocal: boolean }) {
 
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: opts.workspaceIsLocal,
+    surfacePdf: opts.surfacePdf,
     sessionId: 'test',
     projects: [{ id: 'paper', mode: 'local', path: userDir, rootFile: 'paper.tex' }],
   };
@@ -118,7 +118,7 @@ async function exists(p: string): Promise<boolean> {
 
 describe('a registered rootFile is the root a call without one uses', () => {
   it('compile builds the registered root, and the PDF tools read its build', async () => {
-    const { client, userDir, compiled } = await setup({ workspaceIsLocal: false });
+    const { client, userDir, compiled } = await setup({ surfacePdf: false });
 
     const res = await client.callTool({ name: 'compile', arguments: { project: 'paper' } });
     expect(res.isError ?? false, textOf(res)).toBe(false);
@@ -139,7 +139,7 @@ describe('a registered rootFile is the root a call without one uses', () => {
   });
 
   it('a registered root counts as named: no fallback to the surfaced copy of another root', async () => {
-    const { client, workspace, userDir } = await setup({ workspaceIsLocal: true });
+    const { client, workspace, userDir } = await setup({ surfacePdf: true });
 
     // Compile the OTHER root explicitly: its PDF is surfaced as <workspace>/paper.pdf, and the
     // registered root (paper.tex) has no build at all.
@@ -162,7 +162,7 @@ describe('a registered rootFile is the root a call without one uses', () => {
   });
 
   it('an explicit rootFile still reads that root’s build beside the registered one', async () => {
-    const { client, userDir } = await setup({ workspaceIsLocal: true });
+    const { client, userDir } = await setup({ surfacePdf: true });
     await client.callTool({
       name: 'compile',
       arguments: { project: 'paper', rootFile: 'main.tex' },

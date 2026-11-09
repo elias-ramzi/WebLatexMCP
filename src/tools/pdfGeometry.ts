@@ -33,8 +33,8 @@ const inputSchema = {
         'its .aux), in every workspace mode — pass the same rootFile you compiled with to read ' +
         'a non-default root. When omitted: the rootFile the project was registered with, ' +
         'else auto-detected. Only when neither names a root and no .aux is read does a ' +
-        'missing build PDF fall back to the surfaced <workspace>/<id>.pdf (workspace-local ' +
-        'mode), which holds whichever root compiled last.',
+        'missing build PDF fall back to the surfaced <workspace>/<id>.pdf, which holds ' +
+        'whichever root compiled last.',
     ),
   pages: z
     .array(z.number().int().positive())

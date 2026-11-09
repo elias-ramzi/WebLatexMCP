@@ -43,8 +43,9 @@ Local gate before work is done: `typecheck` + `lint` + `format:check` + `test`.
 **Thin tool layer over a testable service core.** Tools do schema validation + response formatting;
 logic lives in services, unit-testable without an MCP client.
 
-- `src/index.ts` — bootstrap: resolves auth (may hit the Keychain), builds the context, git-excludes a
-  workspace-local clone dir from the host repo; sets `GIT_TERMINAL_PROMPT=0` when unset.
+- `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else resolves
+  auth (may hit the Keychain), builds the context and serves stdio; sets `GIT_TERMINAL_PROMPT=0` when
+  unset.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext` dependency bag (`projectManager`, `git`, `files`, `compiler`,
   `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …).
@@ -72,13 +73,34 @@ local. Git-backed tools call `ctx.projectManager.requireGitProject(id, action)` 
 local project. Helpers: `src/lib/projectMode.ts`.
 
 **Workspace** (`WEB_LATEX_MCP_WORKSPACE`): one dir per git project id, plus `registry.json` and
-`.sessions/`. Unset → `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo and not `$HOME`
-(git-excluded via `.git/info/exclude`, `src/lib/workspaceExclude.ts`), else `~/.web-latex-mcp/projects`.
-`=cwd` forces workspace-local; other values are paths. Detection (`resolveWorkspace`, `src/config.ts`)
-is injectable.
+`.sessions/`. Unset → `~/.web-latex-mcp/projects` wherever the client launched (`resolveWorkspace`,
+`src/config.ts`) — one registry for every project, the precondition for one shared server
+(`docs/design/shared-server.md`). Any value is a path; the retired `cwd` (old workspace-local mode,
+`<launch-dir>/.web_latex_mcp`) throws `cwdSentinelRefusal`. A leftover `<cwd>/.web_latex_mcp` that still
+registers projects is `config.legacyWorkspaceRoot` (injectable `findLegacyWorkspace`), named with its
+`migrateWorkspaceCommand` (`src/lib/workspaceNote.ts`; adds `--to` when the workspace is not the
+default) by `list_projects` (every call), `server_info` (counted per call) and stderr.
 
-**PDF location.** Builds live under a per-user temp build root. In workspace-local mode `compile` also
-copies the PDF to `<workspace>/<id>.pdf` (`src/lib/pdfSurface.ts`) — a user convenience, **never a tool
+**CLI commands** (`src/cli.ts`; no argument, or one starting with `-` other than `--help`, starts the
+server as before):
+
+- `migrate-workspace <from> [--to]` (`src/services/workspaceMigration.ts`): moves clones, `<id>.pdf`,
+  `<id>_arXiv.zip`, `.sessions/<id>/`, and adds registry entries verbatim (`importRegistryEntries`:
+  adds, never replaces). **Every refusal before the first move**: taken name/id, case alias, two local
+  projects on one dir, an unregistered `<to>/<id>` a git entry would adopt, a live session or held
+  `project.lock` in either workspace, unreadable registry, `from`/`to` one folder or nested (by
+  `dev:ino` of each path and ancestors, never spelling), `from` not a workspace or holding foreign
+  entries (OS litter left behind). Re-runnable: `.migration-plan.json` in `from` vouches for entries it
+  moved, a re-run into another folder than the plan's is refused, an entry equal apart from `default`
+  counts as migrated. Rename else (EXDEV) copy to `.migrating-…`, compare mode + streamed SHA-256,
+  rename into place, set the source aside (`.migrated-…`), delete; a killed run's leftovers are
+  cleared. Old registry retired last (`registry.json.migrated`).
+- `import-env-projects [--to]` (`src/services/envProjectImport.ts`): registers `WEB_LATEX_MCP_PROJECTS`
+  via `registerAndPersist` (every registration guard); never overwrites a differing entry, an entry it
+  cannot parse, or its case alias (judged on the raw file).
+
+**PDF location.** Builds live under a per-user temp build root. `compile` also copies the PDF
+(gated on `config.surfacePdf`, always set by `loadConfig`) to `<workspace>/<id>.pdf` (`src/lib/pdfSurface.ts`) — a user convenience, **never a tool
 source**: it holds whichever root compiled last. `render_pages`/`extract_text`/`pdf_geometry` read
 `rootFile`'s own build PDF (`locateRootPdf`, `src/lib/pdfLocate.ts`), falling back to the surfaced copy
 only when no root was named (call or registration) and no `.aux` is read. Root resolution is one

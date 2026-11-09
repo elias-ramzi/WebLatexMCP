@@ -394,9 +394,8 @@ goes depends on the project's mode** (step 1):
 
 ### Git project — the clone root, git-excluded
 
-The report lands at the **root of the clone** (the `path` from step 1). When clones are
-workspace-local this is under `.web_latex_mcp/<id>/`, inside the IDE workspace; when the clone lives
-elsewhere (the home-dir default) it's at that clone root all the same.
+The report lands at the **root of the clone** (the `path` from step 1) — by default under
+`~/.web-latex-mcp/projects/<id>/`, wherever the workspace is.
 
 **Make it git-excluded _before_ writing it**, so it can never be staged:
 
@@ -450,7 +449,7 @@ through the server. Don't claim it's excluded unless the `git` command above act
 
 - When the file is **inside the IDE/Bash working directory**, present a **clickable
   workspace-relative link**, e.g.
-  `[.web_latex_mcp/<id>/citation-report.local.md](.web_latex_mcp/<id>/citation-report.local.md)`.
+  `[<relative path>/citation-report.local.md](<relative path>/citation-report.local.md)`.
 - Otherwise give the **absolute path** and note it lives outside the workspace, so it can't be a
   clickable relative link.
 

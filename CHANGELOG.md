@@ -11,6 +11,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **One workspace for every project.** With `WEB_LATEX_MCP_WORKSPACE` unset, clones and the project
+  list now always live in `~/.web-latex-mcp/projects`, wherever your MCP client starts. A server
+  started inside a git repository no longer keeps its own `<repo>/.web_latex_mcp/` (workspace-local
+  mode), so a project registered from one repository is visible from every other. `compile` now
+  surfaces each project's PDF at `<workspace>/<project>.pdf` in every setup. This is the first step
+  towards one server shared by every session (`docs/design/shared-server.md`).
+- **`WEB_LATEX_MCP_WORKSPACE=cwd` is refused at startup**, with a message naming what to set instead
+  and the command that moves the old clones.
+- `server_info` no longer reports `workspaceLocal` or `workspaceExcludePattern`, and the server no
+  longer adds `.web_latex_mcp/` to the host repository's `.git/info/exclude`.
+
 - **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The
   new command runs a multi-round PR review: `pr-reviewer` agents each review through one lens
   (correctness, contracts, integration, design, docs, security; how many depends on the effort
@@ -29,6 +40,18 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
   the function, constant or file that enforces it, grouped under topic headings; the history and
   rationale it repeated now live only in the named files' JSDoc and tests.
+
+### Added
+
+- **`web-latex-mcp migrate-workspace <folder>`** moves an older version's `.web_latex_mcp/` folder —
+  clones, compiled PDFs, session state and registered projects — into the workspace in use. It checks
+  everything before moving anything and moves nothing when a name is taken, a session is live, or the
+  folder holds something that is not the server's; it can be re-run after an interruption.
+  `list_projects`, `server_info` and the server's startup log name such a folder, with the command,
+  while it still registers projects.
+- **`web-latex-mcp import-env-projects`** registers the projects in `WEB_LATEX_MCP_PROJECTS` in the
+  workspace's project list, applying every check `register_project` applies (a credential in a URL
+  is removed before it is saved) and never overwriting a project registered differently.
 
 ## [0.9.0] - 2026-10-05
 

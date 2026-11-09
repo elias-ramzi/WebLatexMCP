@@ -389,12 +389,7 @@ describe('createServer skill prompts', () => {
 describe('server_info', () => {
   it('advertises the package version and reports runtime config', async () => {
     const ctx = {
-      config: {
-        workspaceRoot: '/tmp/ws',
-        workspaceIsLocal: true,
-        workspaceExcludePattern: '/.web_latex_mcp/',
-        compiler: 'latexmk',
-      },
+      config: { workspaceRoot: '/tmp/ws', surfacePdf: true, compiler: 'latexmk' },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -409,38 +404,66 @@ describe('server_info', () => {
     expect(structured.name).toBe('web-latex-mcp');
     expect(structured.version).toBe(client.getServerVersion()?.version);
     expect(structured.workspaceRoot).toBe('/tmp/ws');
-    expect(structured.workspaceLocal).toBe(true);
     expect(structured.compiler).toBe('latexmk');
-    // The clone dir is already git-excluded; say so, or the caller adds a redundant .gitignore.
-    expect(structured.workspaceExcludePattern).toBe('/.web_latex_mcp/');
+    // Workspace-local mode and its git exclude are gone; nothing reports them any more.
+    expect(structured).not.toHaveProperty('workspaceLocal');
+    expect(structured).not.toHaveProperty('workspaceExcludePattern');
+    expect(structured.legacyWorkspaceRoot).toBeUndefined();
     const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
-    expect(text).toContain('/.web_latex_mcp/');
-    expect(text).toContain('collaborators will not see it');
+    expect(text).toContain('workspace: /tmp/ws\n');
+    expect(text).not.toContain('migrate-workspace');
 
     await client.close();
   });
 
-  it('omits the exclude line when nothing was excluded', async () => {
-    const ctx = {
-      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
-    } as unknown as AppContext;
-    const server = createServer(ctx);
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const client = new Client({ name: 'test', version: '0.0.0' });
-    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  it('names an older workspace-local folder with the command that migrates it', async () => {
+    const legacy = await mkdtemp(path.join(os.tmpdir(), 'wlm-legacy-'));
+    try {
+      await writeFile(
+        path.join(legacy, 'registry.json'),
+        JSON.stringify({ a: { gitUrl: 'https://h/a' }, b: { gitUrl: 'https://h/b' } }),
+      );
+      const ctx = {
+        config: {
+          workspaceRoot: '/tmp/ws',
+          compiler: 'latexmk',
+          legacyWorkspaceRoot: legacy,
+        },
+      } as unknown as AppContext;
+      const server = createServer(ctx);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
-    const res = await client.callTool({ name: 'server_info', arguments: {} });
-    expect(
-      (res.structuredContent as Record<string, unknown>).workspaceExcludePattern,
-    ).toBeUndefined();
-    expect((res.content as Array<{ text: string }>)[0]?.text).not.toContain('.git/info/exclude');
+      const res = await client.callTool({ name: 'server_info', arguments: {} });
+      expect((res.structuredContent as Record<string, unknown>).legacyWorkspaceRoot).toBe(
+        legacy.split(path.sep).join('/'),
+      );
+      const text = (res.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(text).toContain('2 projects are registered in');
+      expect(text).toContain('npx web-latex-mcp migrate-workspace "');
+      // The server's workspace is not the default, so the command says where to move them.
+      expect(text).toContain('--to "/tmp/ws"');
 
-    await client.close();
+      // Once migrated (the folder registers nothing), it is no longer named.
+      await writeFile(path.join(legacy, 'registry.json'), '{}');
+      const after = await client.callTool({ name: 'server_info', arguments: {} });
+      // Undefined, which the JSON wire form drops (InMemoryTransport keeps the key).
+      expect(
+        (after.structuredContent as Record<string, unknown>).legacyWorkspaceRoot,
+      ).toBeUndefined();
+      expect((after.content as Array<{ text: string }>)[0]?.text).not.toContain(
+        'migrate-workspace',
+      );
+      await client.close();
+    } finally {
+      await rm(legacy, { recursive: true, force: true });
+    }
   });
 
   it('omits the extra writing guide fields when not configured', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+      config: { workspaceRoot: '/tmp/ws', surfacePdf: false, compiler: 'latexmk' },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -459,7 +482,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
-        workspaceIsLocal: false,
+        surfacePdf: false,
         compiler: 'latexmk',
         extraWritingGuidePath: '/home/user/paper/conventions.md',
         extraWritingGuideLoaded: true,
@@ -485,7 +508,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
-        workspaceIsLocal: false,
+        surfacePdf: false,
         compiler: 'latexmk',
         extraWritingGuidePath: '/home/user/paper/conventions.md',
         extraWritingGuideLoaded: false,
@@ -512,7 +535,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
-        workspaceIsLocal: false,
+        surfacePdf: false,
         compiler: 'latexmk',
         rewriteMode: 'off',
         rewriteModeExplicit: false,
@@ -535,7 +558,7 @@ describe('server_info', () => {
 
   it('omits writingGuideExtraRuleCount when no guide is configured', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', workspaceIsLocal: false, compiler: 'latexmk' },
+      config: { workspaceRoot: '/tmp/ws', surfacePdf: false, compiler: 'latexmk' },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -553,7 +576,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
-        workspaceIsLocal: false,
+        surfacePdf: false,
         compiler: 'latexmk',
         rewriteMode: 'off',
         rewriteModeExplicit: true,
@@ -585,7 +608,7 @@ describe('server_info', () => {
       const ctx = {
         config: {
           workspaceRoot: '/tmp/ws',
-          workspaceIsLocal: false,
+          surfacePdf: false,
           compiler: 'latexmk',
           extraWritingGuidePath: guidePath,
           extraWritingGuideLoaded: true,
@@ -625,7 +648,7 @@ describe('server_info', () => {
       const ctx = {
         config: {
           workspaceRoot: '/tmp/ws',
-          workspaceIsLocal: false,
+          surfacePdf: false,
           compiler: 'latexmk',
           extraWritingGuidePath: guidePath,
           extraWritingGuideLoaded: false,

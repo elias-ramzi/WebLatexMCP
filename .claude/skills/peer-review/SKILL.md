@@ -666,7 +666,7 @@ temporary directory, so the author and the next session find it beside the paper
   writes nothing.
 - **A bare PDF, not a project** — under the server's workspace, at
   `<workspace>/paper-review.local/<paper-slug>/<YYYYMMDD-HHMM>/`, with `<workspace>` from
-  `server_info`. A workspace-local workspace is already excluded from the host repo's git. Write
+  `server_info`, outside any repository by default. Write
   with the client's file tool or the shell, since `write_file` needs a project.
 - **Never** put the paper or the reviews anywhere else — no upload, no sharing, no issue, no
   gist. The paper is unpublished.
@@ -684,7 +684,7 @@ The author should get the review without hunting for it, in every client:
    only the final review; offer the triage log rather than sending it too.
 2. **As a link.** A clickable workspace-relative link when the run directory is inside the IDE
    working directory — e.g.
-   `[final-review.md](.web_latex_mcp/<id>/paper-review.local/<run>/final-review.md)` — and the
+   `[final-review.md](<relative path>/paper-review.local/<run>/final-review.md)` — and the
    absolute path otherwise.
 3. **Inline.** Show the final review in full in the reply. In a client that can neither send a
    file nor open a link (an MCP prompt in Claude Desktop), this is how the user gets it, so it is

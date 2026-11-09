@@ -9,7 +9,10 @@ import {
   readProjectRegistryDefault,
   readProjectRegistrySkipped,
   registryPath,
+  countRegisteredProjects,
 } from './services/projectRegistry.js';
+import { toPosix } from './lib/paths.js';
+import { homeWorkspaceRoot, migrateWorkspaceCommand } from './lib/workspaceNote.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
 import { COMPILER_KINDS } from './services/compilerResolver.js';
@@ -69,74 +72,58 @@ function expandHome(p: string): string {
 }
 
 /**
- * Sentinel value for `WEB_LATEX_MCP_WORKSPACE` that forces clones into the coding agent's own
- * workspace — under `<launch-dir>/.web_latex_mcp` — so the `.tex`/PDF files sit right beside
- * the code the agent is working on. The launch dir is the server's cwd, which for a stdio
- * server spawned by Claude Code (or another agent) is the workspace root. This is also the
- * automatic default whenever the launch dir is inside a git repo (see `resolveWorkspace`).
+ * The value of `WEB_LATEX_MCP_WORKSPACE` that once put clones under `<launch-dir>/.web_latex_mcp`.
+ * Workspace-local mode is gone (every project now lives in one workspace, so one server can serve
+ * every session), so the value is refused by name rather than read as a folder called `cwd`.
  */
 const WORKSPACE_CWD_SENTINEL = 'cwd';
 
-/** Name of the workspace-local clone directory (the `cwd` sentinel and the in-repo default). */
+/**
+ * Name of the directory older versions created in the launch dir for workspace-local clones. Only
+ * looked for now, so `list_projects` can point at `web-latex-mcp migrate-workspace`.
+ */
 export const LOCAL_WORKSPACE_DIRNAME = '.web_latex_mcp';
 
-interface ResolvedWorkspace {
-  workspaceRoot: string;
-  /** True when clones live inside the agent's workspace (and are git-excluded from it). */
-  workspaceIsLocal: boolean;
-}
+// The default workspace lives in `workspaceNote.ts`, beside the command that names it.
+export { homeWorkspaceRoot };
 
-/** The shared home cache used when the launch dir isn't a suitable workspace. */
-function homeWorkspaceRoot(): string {
-  return path.join(os.homedir(), '.web-latex-mcp', 'projects');
-}
-
-function homeWorkspace(): ResolvedWorkspace {
-  return { workspaceRoot: homeWorkspaceRoot(), workspaceIsLocal: false };
-}
-
-/** Whether `dir` (or any ancestor) is a git working tree — walked synchronously via `.git`. */
-function isInsideGitRepo(dir: string): boolean {
-  let cur = path.resolve(dir);
-  for (;;) {
-    if (existsSync(path.join(cur, '.git'))) return true;
-    const parent = path.dirname(cur);
-    if (parent === cur) return false;
-    cur = parent;
-  }
+/** The refusal for `WEB_LATEX_MCP_WORKSPACE=cwd`, naming the replacement and the migration. */
+export function cwdSentinelRefusal(cwd: string): string {
+  const legacy = path.join(cwd, LOCAL_WORKSPACE_DIRNAME);
+  return (
+    'WEB_LATEX_MCP_WORKSPACE=cwd is no longer supported: every project now lives in one ' +
+    `workspace (default ${quoteId(toPosix(homeWorkspaceRoot()))}). Unset it, or set it to a ` +
+    'folder path. ' +
+    `To move the clones from ${quoteId(toPosix(legacy))} into the default workspace, run ` +
+    `\`${migrateWorkspaceCommand(legacy)}\`.`
+  );
 }
 
 /**
- * Resolve `WEB_LATEX_MCP_WORKSPACE` (raw env value) to an absolute clone root.
- *
- * Precedence: an explicit value always wins (the `cwd` sentinel forces workspace-local; any
- * other value is a path). When unset, the default is workspace-local (`<cwd>/.web_latex_mcp`)
- * *if the launch dir is inside a git repo and isn't the home dir itself* — the case where the
- * agent is clearly working in a project and the clone can be git-excluded from it. Otherwise it
- * falls back to the shared home cache (e.g. Claude Desktop launched from `/` or `~`).
- *
- * `insideRepo` is injectable so the default can be unit-tested without touching the filesystem.
+ * Resolve `WEB_LATEX_MCP_WORKSPACE` (raw env value) to an absolute clone root. Unset means the one
+ * shared workspace, `~/.web-latex-mcp/projects`, wherever the client was launched. A relative path
+ * resolves against the launch dir; `~` expands. The retired `cwd` value throws
+ * {@link cwdSentinelRefusal}: the workspace governs every tool, so there is no partial start.
  */
-function resolveWorkspace(
-  raw: string | undefined,
-  cwd: string,
-  insideRepo: (dir: string) => boolean = isInsideGitRepo,
-): ResolvedWorkspace {
+export function resolveWorkspace(raw: string | undefined, cwd: string): string {
   const value = raw?.trim();
-  if (!value) {
-    const local = path.resolve(cwd) !== path.resolve(os.homedir()) && insideRepo(cwd);
-    return local
-      ? { workspaceRoot: path.join(cwd, LOCAL_WORKSPACE_DIRNAME), workspaceIsLocal: true }
-      : homeWorkspace();
-  }
-  if (value.toLowerCase() === WORKSPACE_CWD_SENTINEL) {
-    return { workspaceRoot: path.join(cwd, LOCAL_WORKSPACE_DIRNAME), workspaceIsLocal: true };
-  }
-  // Relative paths resolve against the launch dir; absolute (and ~-expanded) paths pass through.
-  return { workspaceRoot: path.resolve(cwd, expandHome(value)), workspaceIsLocal: false };
+  if (!value) return homeWorkspaceRoot();
+  if (value.toLowerCase() === WORKSPACE_CWD_SENTINEL) throw new Error(cwdSentinelRefusal(cwd));
+  return path.resolve(cwd, expandHome(value));
 }
 
-function parseProjects(
+/**
+ * The workspace-local folder an older version left in the launch dir, when it still registers
+ * projects and is not the workspace in use: `<cwd>/.web_latex_mcp`. Undefined otherwise.
+ */
+function legacyWorkspaceIn(cwd: string, workspaceRoot: string): string | undefined {
+  const legacy = path.join(cwd, LOCAL_WORKSPACE_DIRNAME);
+  if (path.resolve(legacy) === path.resolve(workspaceRoot)) return undefined;
+  if (!existsSync(registryPath(legacy))) return undefined;
+  return countRegisteredProjects(legacy) > 0 ? legacy : undefined;
+}
+
+export function parseProjects(
   raw: string | undefined,
   cwd: string,
   workspaceRoot: string,
@@ -509,27 +496,26 @@ function warnMalformedWritingGuideExtra(raw: string, reason: string): void {
 
 /**
  * Build the server configuration from environment variables. Reads the filesystem for four
- * things: whether the launch dir is a git repo (for the workspace default), the persisted
- * project registry's project list, the persisted registry's `default: true` flag, and — only
- * when `WEB_LATEX_MCP_DEFAULT_PROJECT` names no loaded project — the registry entries it
- * skipped. All four reads are injectable (`insideRepo`, `readRegistry`, `readRegistryDefault`,
- * `readRegistrySkipped`) so unit tests stay
- * hermetic — a real on-disk registry (e.g. a developer's actual workspace) must never leak into a
+ * things: the persisted project registry's project list, the persisted registry's
+ * `default: true` flag, — only when `WEB_LATEX_MCP_DEFAULT_PROJECT` names no loaded project — the
+ * registry entries it skipped, and whether the launch dir holds an older version's
+ * workspace-local folder still registering projects. All four reads are injectable
+ * (`readRegistry`, `readRegistryDefault`, `readRegistrySkipped`, `findLegacyWorkspace`) so unit
+ * tests stay hermetic — a real on-disk registry (e.g. a developer's actual workspace) must never leak into a
  * test that didn't ask for it.
  */
 export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
-  insideRepo?: (dir: string) => boolean,
   readRegistry: (workspaceRoot: string) => ProjectConfig[] = readProjectRegistry,
   readRegistryDefault: (workspaceRoot: string) => string | undefined = readProjectRegistryDefault,
   readRegistrySkipped: (workspaceRoot: string) => SkippedProject[] = readProjectRegistrySkipped,
+  findLegacyWorkspace: (
+    cwd: string,
+    workspaceRoot: string,
+  ) => string | undefined = legacyWorkspaceIn,
 ): ServerConfig {
-  const { workspaceRoot, workspaceIsLocal } = resolveWorkspace(
-    env.WEB_LATEX_MCP_WORKSPACE,
-    cwd,
-    insideRepo,
-  );
+  const workspaceRoot = resolveWorkspace(env.WEB_LATEX_MCP_WORKSPACE, cwd);
 
   // Env projects are the explicit source of truth and always win; persisted (runtime-registered)
   // projects fill in the rest, so a git URL added from the chat is still here after a restart.
@@ -614,7 +600,10 @@ export function loadConfig(
   const fallbackRoot = homeWorkspaceRoot();
   return {
     workspaceRoot,
-    workspaceIsLocal,
+    // Every build is copied to `<workspace>/<id>.pdf`, so the latest PDF of every project sits in
+    // one folder beside its clone (see `src/lib/pdfSurface.ts`).
+    surfacePdf: true,
+    legacyWorkspaceRoot: findLegacyWorkspace(cwd, workspaceRoot),
     fallbackWorkspaceRoot:
       path.resolve(workspaceRoot) === path.resolve(fallbackRoot) ? undefined : fallbackRoot,
     sessionId: parseSessionId(env.WEB_LATEX_MCP_SESSION),

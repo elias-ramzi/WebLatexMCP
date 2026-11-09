@@ -119,7 +119,7 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [{ id: 'ovl', mode: 'local', path: userDir, rootFile: 'paper/main.tex' }],
       defaultProject: 'ovl',
@@ -283,7 +283,7 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [{ id: 'esc', mode: 'local', path: userDir, rootFile: 'main.tex' }],
       defaultProject: 'esc',
@@ -371,7 +371,7 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [{ id: 'lnk', mode: 'local', path: userDir }],
       defaultProject: 'lnk',
@@ -453,7 +453,7 @@ async function serveLocal(files: Record<string, string>, cleanups: Array<() => P
   }
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: true,
+    surfacePdf: true,
     sessionId: 'test',
     projects: [{ id: 'wb', mode: 'local', path: userDir, rootFile: 'main.tex' }],
     defaultProject: 'wb',

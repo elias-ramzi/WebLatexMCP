@@ -8,7 +8,7 @@ block (see the [install guides](install/) for full `.mcp.json` / `claude_desktop
 | Variable                                                   | Required | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ---------------------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `WEB_LATEX_MCP_PROJECTS`                                   | no\*     | JSON map of project id → either `{ gitUrl, rootFile?, branch?, username?, tokenEnv? }` (a remote to clone) or `{ mode: "local", path, rootFile?, followSymlinks? }` (a directory used in place; `~` and relative paths are resolved; `followSymlinks: true` lets reads, writes and listings follow a symlink out of that directory — off by default, and only ever set it when the links there are yours). \*Not strictly required — you can also register a project at runtime from the chat (`register_project`); set this to have projects present at boot. Each key must be a valid [project id](#project-ids); an entry whose key is not is skipped with a note on stderr, and the rest still load. See [Registering a project without env config](#registering-a-project-without-env-config). |
-| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project. Defaults to `<launch-dir>/.web_latex_mcp` when the launch dir is a git repo, else `~/.web-latex-mcp/projects` — see [Workspace-local clones](#workspace-local-clones). Set to `cwd` to force workspace-local, or to a path to override. The Claude Desktop extension sets it from its **Clone workspace folder** field, prefilled with `~/latex-workspace`; a cleared field leaves it unset.                                                                                                                                                                                                                                                                                                                                                               |
+| `WEB_LATEX_MCP_WORKSPACE`                                  | no       | Directory holding one clone per project and the project list. Defaults to `~/.web-latex-mcp/projects`, wherever the client starts — see [One workspace](#one-workspace). Set it to a path to use another folder. The retired value `cwd` is refused at startup. The Claude Desktop extension sets it from its **Clone workspace folder** field, prefilled with `~/latex-workspace`; a cleared field leaves it unset.                                                                                                                                                                                                                                                                                                                                                                                |
 | `WEB_LATEX_MCP_DEFAULT_PROJECT`                            | no       | Project id used when a tool call omits `project`. **Always wins** over a default persisted via `register_project { default: true }`, even across a restart. See [Setting a default project](#setting-a-default-project).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `WEB_LATEX_MCP_SESSION`                                    | no       | Name for this session when several agent sessions share one clone (e.g. `intro`, `experiments`). It is what peers see in `status`, and it scopes what `commit` commits. Reduced to letters, digits, `.`, `_` and `-` (at most 64 characters); `shelves`, `project.lock` and `rewrite-mode.json` are reserved in any case — they name project-wide state beside the session directories — and the server refuses to start with one. Defaults to a generated id — see [Parallel sessions](#parallel-sessions).                                                                                                                                                                                                                                                                                        |
 | `WEB_LATEX_MCP_COMPILER`                                   | no       | Local compile backend: `latexmk` (default) or `tectonic`. Setting it is an **assertion**: that backend is never substituted, and a missing one is an error. Left unset, a missing `latexmk` falls back to an installed `tectonic`. See [Compile backend](#compile-backend).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -57,7 +57,7 @@ Editing a client's `env` block is fiddly — especially in **Claude Desktop**, w
 a restart. So the server also lets you register a project **at runtime, from the chat**: give Claude the
 project id and its git URL and it calls the `register_project` tool, which:
 
-- **persists** the project to a `registry.json` under the [workspace root](#workspace-local-clones), so
+- **persists** the project to a `registry.json` under the [workspace root](#one-workspace), so
   it survives a restart and is picked up by every other session on the same machine — no env var needed;
 - clones it immediately (pass `clone: false` to defer);
 - or, given `path` instead of `gitUrl`, registers a **local** project — a directory already on this
@@ -166,38 +166,68 @@ persisted `default: true` — the same "a setting is an assertion, an unset one 
 an env default is set (so a later, env-unset session picks it up), but its result text says the env
 default is the one actually in effect this session.
 
-## Workspace-local clones
+## One workspace
 
-When you drive the server from a coding agent (Claude Code, and other agents that spawn it over stdio
-from your project directory), it's handy to have the LaTeX sitting **right beside the code** — so the
-agent can open the `.tex` and the compiled PDF as ordinary workspace files, not only through MCP tools.
+Every project lives in one workspace: one `registry.json` listing the projects, one directory per
+cloned project, and the latest compiled PDF of each project beside its clone as `<project>.pdf`. By
+default that is `~/.web-latex-mcp/projects`, whatever directory your MCP client was started from, so
+a project registered from one repository or chat is visible from every other.
 
-**This is the default whenever the launch dir is a git repo.** With no `WEB_LATEX_MCP_WORKSPACE` set,
-clones land under `<workspace>/.web_latex_mcp/<project-id>/`, where `<workspace>` is the directory the
-server was launched from (the agent's workspace root). On startup the server adds `.web_latex_mcp/` to
-the host repo's **`.git/info/exclude`** (never the tracked `.gitignore`), so the LaTeX clones don't
-show up as untracked files in your own repo.
+`compile` **surfaces the PDF** at `<workspace>/<project>.pdf` (a sibling of the clone, so it never
+dirties the project's git), so the latest build of every paper is in one folder rather than in the
+temp [build directory](#build-directory).
 
-In this mode `compile` also **surfaces the PDF** at `<workspace>/.web_latex_mcp/<project>.pdf` (a
-sibling of the clone, so it never dirties the project's git), so you can open the latest build straight
-from your editor rather than hunting through the temp [build directory](#build-directory).
+To use another folder, set `WEB_LATEX_MCP_WORKSPACE` to its path (absolute, `~`-relative, or relative
+to the launch dir). The project list lives in the workspace, so a new folder starts with none.
 
-When the launch dir is **not** a git repo — or is your home directory — the default instead falls back
-to the shared home cache `~/.web-latex-mcp/projects`. This keeps clients whose launch directory is
-unpredictable (e.g. Claude Desktop, which may start at `/` or `~`) out of surprising locations. The
-Claude Desktop **extension** does not rely on this unless its **Clone workspace folder** field is
-cleared: the field sets the workspace, prefilled with `~/latex-workspace` (see
-[the extension guide](install/desktop-extension.md)).
+### Moving from an older version's workspace-local folder
 
-To override the default:
+Older versions of a server started inside a git repository kept its clones in `<repo>/.web_latex_mcp/`
+(workspace-local mode), and `WEB_LATEX_MCP_WORKSPACE=cwd` forced it. That mode is gone. Projects
+registered there are not lost: `list_projects` and `server_info` name the folder, and one command
+moves them into the workspace in use:
 
-```json
-{ "env": { "WEB_LATEX_MCP_WORKSPACE": "cwd" } }
+```bash
+npx web-latex-mcp migrate-workspace <repo>/.web_latex_mcp
 ```
 
-- `cwd` — force workspace-local even when the auto-detection wouldn't (e.g. a non-repo project dir).
-- any **path** (absolute, `~`-relative, or relative to the launch dir) — use that exact directory as
-  the shared clone root; nothing is git-excluded.
+Stop every session using those projects first. The command:
+
+- moves each clone, each `<project>.pdf` and each project's session state (`.sessions/<project>/`:
+  uncommitted-change records, shelves, rewrite mode) and adds the old registry's entries to the new
+  one;
+- checks everything before moving anything, and moves nothing when a project id is already
+  registered in the new workspace (exactly, or differing only in letter case) or a directory of
+  that name is already there, when a session on either workspace is live or a project lock is held,
+  when either registry cannot be read, when the two folders are one (however spelled) or one holds
+  the other, or when the old folder holds something that is not a clone, a compiled PDF or an
+  arXiv export (`.DS_Store` and similar are left behind);
+- across disks, copies each entry, compares every file's content with the original, and only then
+  deletes the original;
+- can be run again after an interruption, and finishes the job;
+- keeps the new workspace's default project if it has one;
+- carries registry entries over exactly as written, including a URL with a token in it that an older
+  version saved — check `list_projects` afterwards;
+- leaves `registry.json.migrated` and a `MIGRATED.md` note in the old folder, which you can then
+  delete, along with the `.web_latex_mcp/` line in the repository's `.git/info/exclude`.
+
+Each moved project builds from scratch on its first compile. The command moves into
+`WEB_LATEX_MCP_WORKSPACE` as set in the shell you run it from (default `~/.web-latex-mcp/projects`);
+pass `--to <folder>` for another one. The command `list_projects` prints already names the folder
+your server uses.
+
+### Projects configured in `WEB_LATEX_MCP_PROJECTS`
+
+To move projects from a client's environment into the workspace's project list, so every session
+sees them without that variable:
+
+```bash
+WEB_LATEX_MCP_PROJECTS='{"thesis":{"gitUrl":"https://git.overleaf.com/abc"}}' npx web-latex-mcp import-env-projects
+```
+
+Each project is registered as `register_project` would register it: a credential in the URL is
+removed before it is saved (give the token through `tokenEnv`, the environment or
+`credential_portal`), and a project the list already holds differently is left as it is and named.
 
 ## Build directory
 

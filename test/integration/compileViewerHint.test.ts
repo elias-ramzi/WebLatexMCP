@@ -50,7 +50,7 @@ function stubCompiler() {
   };
 }
 
-async function setup(opts: { workspaceIsLocal: boolean }) {
+async function setup(opts: { surfacePdf: boolean }) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-vhint-ws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-vhint-dir-'));
   cleanups.push(
@@ -65,7 +65,7 @@ async function setup(opts: { workspaceIsLocal: boolean }) {
 
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: opts.workspaceIsLocal,
+    surfacePdf: opts.surfacePdf,
     sessionId: 'test',
     projects: [{ id: 'paper', mode: 'local', path: userDir }],
   };
@@ -112,13 +112,13 @@ function viewerLine(res: unknown): string {
 
 describe('compile: the live-viewer line says which build the viewer shows', () => {
   it('says the viewer refreshed when the compiled root is the one it shows', async () => {
-    const { client } = await setup({ workspaceIsLocal: false });
+    const { client } = await setup({ surfacePdf: false });
     const res = await client.callTool({ name: 'compile', arguments: { project: 'paper' } });
     expect(viewerLine(res)).toMatch(/refreshed with this build/);
   });
 
   it('does not claim a refresh after compiling another root, and names the one it shows', async () => {
-    const { client } = await setup({ workspaceIsLocal: false });
+    const { client } = await setup({ surfacePdf: false });
     // main.tex's build exists, so that is what the viewer keeps showing.
     await client.callTool({ name: 'compile', arguments: { project: 'paper' } });
     const res = await client.callTool({
@@ -137,7 +137,7 @@ describe('compile: the live-viewer line says which build the viewer shows', () =
     // Workspace-local: compile surfaces supp's PDF as <workspace>/<id>.pdf, and with no main.tex
     // build the viewer falls back to that copy — so it DOES show this build, but a comment made on
     // it maps to no source line. Neither "refreshed with this build" nor "shows main.tex" is true.
-    const { client } = await setup({ workspaceIsLocal: true });
+    const { client } = await setup({ surfacePdf: true });
     const res = await client.callTool({
       name: 'compile',
       arguments: { project: 'paper', rootFile: 'supp.tex' },
@@ -156,7 +156,7 @@ describe('compile: the live-viewer line says which build the viewer shows', () =
  * nested `<dir>/main.tex` first — so `compile` without `rootFile` built the template and the viewer waited,
  * forever, for the template's build.
  */
-async function setupTemplateLayout(rootFile: string | undefined, workspaceIsLocal = false) {
+async function setupTemplateLayout(rootFile: string | undefined, surfacePdf = false) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), 'ovl-vroot-ws-'));
   const userDir = await mkdtemp(path.join(os.tmpdir(), 'ovl-vroot-dir-'));
   cleanups.push(
@@ -170,7 +170,7 @@ async function setupTemplateLayout(rootFile: string | undefined, workspaceIsLoca
   await writeFile(path.join(userDir, 'root.tex'), doc);
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal,
+    surfacePdf,
     sessionId: 'test',
     projects: [{ id: 'paper', mode: 'local', path: userDir, rootFile }],
   };
@@ -198,7 +198,7 @@ async function setupTemplateLayout(rootFile: string | undefined, workspaceIsLoca
  */
 describe('the viewer resolves its root once per question', () => {
   it('a 404 /version poll detects the root once, and names it', async () => {
-    const { ctx, url } = await setup({ workspaceIsLocal: false });
+    const { ctx, url } = await setup({ surfacePdf: false });
     const detections = countDetections(ctx);
     const res = await fetch(`${url}/p/paper/version`);
     expect(res.status).toBe(404);
@@ -207,7 +207,7 @@ describe('the viewer resolves its root once per question', () => {
   });
 
   it('compile with no rootFile detects the root once, for the build and the viewer line', async () => {
-    const { client, ctx } = await setup({ workspaceIsLocal: false });
+    const { client, ctx } = await setup({ surfacePdf: false });
     const detections = countDetections(ctx);
     const res = await client.callTool({ name: 'compile', arguments: { project: 'paper' } });
     expect(res.isError).toBeFalsy();
@@ -218,7 +218,7 @@ describe('the viewer resolves its root once per question', () => {
   // The call's own root is never the viewer's: with rootFile named, the viewer's root is still
   // resolved on its own (here detected, since nothing is registered).
   it('compile with rootFile still resolves the viewer root separately', async () => {
-    const { client, ctx } = await setup({ workspaceIsLocal: false });
+    const { client, ctx } = await setup({ surfacePdf: false });
     await client.callTool({ name: 'compile', arguments: { project: 'paper' } });
     const detections = countDetections(ctx);
     const res = await client.callTool({

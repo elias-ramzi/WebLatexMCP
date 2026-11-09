@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from './config.js';
+import { runCli } from './cli.js';
 import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createContext } from './context.js';
 import { createServer } from './server.js';
-import { ProjectRegistry } from './services/projectRegistry.js';
+import { ProjectRegistry, countRegisteredProjects } from './services/projectRegistry.js';
+import { legacyWorkspaceNote } from './lib/workspaceNote.js';
 import {
   loadWritingGuide,
   loadExtraWritingGuide,
@@ -12,7 +14,6 @@ import {
 } from './lib/writingGuide.js';
 import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
 import { loadSkills } from './lib/skills.js';
-import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
 import {
   installOutputSchemaCompat,
   isIncompatibleClient,
@@ -25,20 +26,29 @@ import {
 } from './lib/sessionProbe.js';
 
 async function main(): Promise<void> {
+  // A command (`migrate-workspace`, `import-env-projects`, `--help`) runs and exits; no argument
+  // starts the server. Checked first, so a command never touches the stdio JSON-RPC channel.
+  const status = await runCli(process.argv.slice(2), {
+    env: process.env,
+    cwd: process.cwd(),
+    out: (text) => process.stdout.write(text),
+    err: (text) => process.stderr.write(text),
+  });
+  if (status !== undefined) {
+    process.exitCode = status;
+    return;
+  }
   // Fail fast instead of hanging on an interactive credential prompt when no token or
   // credential helper is available. Child git processes inherit these.
   process.env.GIT_TERMINAL_PROMPT ??= '0';
   process.env.GCM_INTERACTIVE ??= 'never';
 
   const config = loadConfig();
-  if (config.workspaceIsLocal) {
-    const pattern = await excludeWorkspaceFromHostGit(config.workspaceRoot);
-    if (pattern) {
-      // Remember it so `server_info` and `register_project` can say the clone dir is already
-      // handled — otherwise the calling agent has no way to know and may add a .gitignore entry.
-      config.workspaceExcludePattern = pattern;
-      console.error(`[web-latex-mcp] excluded ${pattern} from the host repo's git`);
-    }
+  if (config.legacyWorkspaceRoot) {
+    const count = countRegisteredProjects(config.legacyWorkspaceRoot);
+    console.error(
+      `[web-latex-mcp] ${legacyWorkspaceNote(config.legacyWorkspaceRoot, count, config.workspaceRoot)}`,
+    );
   }
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);

@@ -8,21 +8,21 @@ import type { RewriteMode } from '../lib/rewriteMode.js';
 import { countWritingConventions } from '../lib/writingConventions.js';
 import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
 import { errorResult } from '../lib/errors.js';
+import { legacyWorkspaceNote } from '../lib/workspaceNote.js';
+import { countRegisteredProjects } from '../services/projectRegistry.js';
 import { quoteInvalidSource } from '../services/referenceResolver.js';
 
 const outputSchema = {
   name: z.string(),
   version: z.string(),
   workspaceRoot: z.string(),
-  workspaceLocal: z.boolean(),
-  workspaceExcludePattern: z
+  legacyWorkspaceRoot: z
     .string()
     .optional()
     .describe(
-      'When the workspace is local to the launch dir and that dir is a git repo, the pattern the ' +
-        "server added to the host repo's .git/info/exclude so the clones are not committed. Its " +
-        'presence means the directory is already handled — do not add a .gitignore entry for it. ' +
-        'Absent when nothing was excluded.',
+      "An older version's workspace-local folder (<launch dir>/.web_latex_mcp) that still " +
+        'registers projects this server does not see. Move them into the workspace in use with ' +
+        '`web-latex-mcp migrate-workspace <that folder>`. Absent when there is none.',
     ),
   compiler: z
     .string()
@@ -132,8 +132,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       title: 'Server info',
       description:
         'Report the web-latex-mcp server version and runtime configuration (workspace root, ' +
-        'whether the workspace is local to the launch dir, whether the clone dir was git-excluded ' +
-        'from the host repo, the configured compiler — which is not necessarily the backend a ' +
+        'an older workspace-local folder still registering projects, if any, the configured ' +
+        'compiler — which is not necessarily the backend a ' +
         'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
         'there — and the configured rewrite-preservation default, which is not necessarily what ' +
         "a given project uses since a project's own set_rewrite_mode setting wins over it, plus " +
@@ -154,12 +154,19 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
     },
     async () => {
       try {
+        const legacyCount = ctx.config.legacyWorkspaceRoot
+          ? countRegisteredProjects(ctx.config.legacyWorkspaceRoot)
+          : 0;
         const info = {
           name: 'web-latex-mcp',
           version: getServerVersion(),
           workspaceRoot: toPosix(ctx.config.workspaceRoot),
-          workspaceLocal: ctx.config.workspaceIsLocal ?? false,
-          workspaceExcludePattern: ctx.config.workspaceExcludePattern,
+          // Counted per call, like list_projects: after an in-session migration the folder registers
+          // nothing and is no longer named.
+          legacyWorkspaceRoot:
+            legacyCount > 0 && ctx.config.legacyWorkspaceRoot
+              ? toPosix(ctx.config.legacyWorkspaceRoot)
+              : undefined,
           compiler: ctx.config.compiler ?? 'latexmk',
           // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
           // "dblp" here would describe the fallback order's first try as a choice someone made.
@@ -187,12 +194,10 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             ctx.config.extraWritingGuidePath,
           ),
         };
-        // Say it out loud: the exclude is real but lives in .git/info/exclude, which is invisible to
-        // anyone who did not run this server — the user may still want a tracked .gitignore entry.
-        const excludeLine = info.workspaceExcludePattern
-          ? `git: clones are excluded from the host repo as "${info.workspaceExcludePattern}" via ` +
-            '.git/info/exclude (local to this checkout only — collaborators will not see it)\n'
-          : '';
+        const legacyLine =
+          legacyCount > 0 && ctx.config.legacyWorkspaceRoot
+            ? `${legacyWorkspaceNote(ctx.config.legacyWorkspaceRoot, legacyCount, ctx.config.workspaceRoot)}\n`
+            : '';
         // Three states matter here, and only three: not configured (say nothing); configured and
         // loaded (name the path, so a user can tell it took); configured but NOT loaded (name the
         // path AND say plainly that those conventions are not in effect — the state a typo produces
@@ -229,8 +234,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             : '';
         const text =
           `web-latex-mcp v${info.version}\n` +
-          `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
-          excludeLine +
+          `workspace: ${info.workspaceRoot}\n` +
+          legacyLine +
           writingGuideLine +
           `compiler: ${info.compiler}\n` +
           `references: ${referencesDetail}${contactDetail}\n` +

@@ -10,7 +10,7 @@ describe('server_info error handling', () => {
     // the throw into an isError result carrying the raw message — secret included.
     const secret = 'ghp_serverInfoLeakCanary123';
     const config = {
-      workspaceIsLocal: false,
+      surfacePdf: false,
       compiler: 'latexmk',
       get workspaceRoot(): string {
         throw new Error(`cannot read workspace: token ${secret} rejected`);

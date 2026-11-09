@@ -109,24 +109,23 @@ export interface ServerConfig {
   /** Directory that holds one clone per project. */
   workspaceRoot: string;
   /**
-   * True when `workspaceRoot` lives inside the agent's own workspace (the `cwd` sentinel),
-   * so the server excludes it from the host repo's git on startup.
+   * Whether `compile` copies each build to `<workspaceRoot>/<id>.pdf` (`src/lib/pdfSurface.ts`),
+   * and so whether the PDF tools may fall back to that copy. `loadConfig` always sets it; a config
+   * built by hand (a test) leaves it off unless it asks.
    */
-  workspaceIsLocal?: boolean;
+  surfacePdf?: boolean;
   /**
-   * The pattern the server added to the host repo's `.git/info/exclude` at startup, when it did
-   * (see `src/lib/workspaceExclude.ts`). Reported by `server_info`/`register_project` so a caller
-   * knows the clone dir is already handled and does not "helpfully" add a redundant `.gitignore`
-   * entry. Undefined when nothing was excluded (shared workspace, or not inside a git repo).
+   * An older version's workspace-local folder (`<launch-dir>/.web_latex_mcp`) that still registers
+   * projects, when it is not the workspace in use. `list_projects` names it with the
+   * `web-latex-mcp migrate-workspace` command, so projects registered there are not taken for lost.
    */
-  workspaceExcludePattern?: string;
+  legacyWorkspaceRoot?: string;
   /**
    * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
    * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one
    * does — a Desktop extension that now gets `~/latex-workspace` as its default after running on
-   * the fallback, or any server launched with another workspace (workspace-local mode included,
-   * where a separate project list is by design), whose registered projects would otherwise go
-   * unmentioned.
+   * the fallback, or any server launched with another workspace, whose registered projects would
+   * otherwise go unmentioned.
    */
   fallbackWorkspaceRoot?: string;
   /**

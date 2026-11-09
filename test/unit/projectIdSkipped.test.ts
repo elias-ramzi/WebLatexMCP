@@ -174,7 +174,6 @@ describe('a skipped id is explained, not merely unknown', () => {
         }),
       },
       root,
-      () => false,
       () => [],
       () => undefined,
     );
