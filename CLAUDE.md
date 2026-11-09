@@ -43,6 +43,14 @@ Local gate before work is done: `typecheck` + `lint` + `format:check` + `test`.
 **Thin tool layer over a testable service core.** Tools do schema validation + response formatting;
 logic lives in services, unit-testable without an MCP client.
 
+- `src/daemon/*` — `web-latex-mcp serve` (`startDaemon`): Streamable HTTP on `127.0.0.1`, one
+  `SessionScope` + `McpServer` + transport per MCP session over one `createSharedServices`.
+  `guardRequest` (bearer in constant time, exact `Host`, any `Origin` refused) runs on **every**
+  request, `/health` included. `daemon.lock` (via `withFileLock`) held for the daemon's life;
+  `daemon.json` `0600` in a `0700` `.daemon/`, removed only by the daemon that wrote it. A closing
+  session leaves the routing map first, drains running calls, then closes its scope. Per-connection
+  headers are parsed in `sessionHeaders.ts` and refuse rather than rewrite. Guides load per session
+  (`loadSessionGuides`).
 - `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else resolves
   auth (may hit the Keychain), builds the context and serves stdio; sets `GIT_TERMINAL_PROMPT=0` when
   unset.

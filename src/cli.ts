@@ -3,6 +3,7 @@ import { quoteId } from './lib/projectId.js';
 import { toPosix } from './lib/paths.js';
 import { MigrationRefusedError, migrateWorkspace } from './services/workspaceMigration.js';
 import { importEnvProjects } from './services/envProjectImport.js';
+import { SERVE_USAGE, runServe } from './daemon/serveCommand.js';
 
 /**
  * The one-shot commands `web-latex-mcp` runs instead of the MCP server. With no argument the
@@ -13,6 +14,7 @@ import { importEnvProjects } from './services/envProjectImport.js';
 export const USAGE =
   'Usage:\n' +
   '  npx web-latex-mcp                                run the MCP server on stdio\n' +
+  SERVE_USAGE +
   '  npx web-latex-mcp migrate-workspace <from> [--to <workspace>]\n' +
   "      move an older version's workspace-local folder (<repo>/.web_latex_mcp) into the\n" +
   '      workspace in use (WEB_LATEX_MCP_WORKSPACE, default ~/.web-latex-mcp/projects)\n' +
@@ -70,6 +72,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
     );
     return undefined;
   }
+  if (command === 'serve') return runServe(rest, io);
   const parsed = parseArgs(rest);
   try {
     if (command === 'migrate-workspace' && parsed && parsed.positional.length === 1) {

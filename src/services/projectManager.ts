@@ -125,6 +125,14 @@ export class ProjectManager {
    */
   private readonly locks: ProjectLocks;
   /**
+   * This manager's `runExclusive` calls not yet settled, waiting or running. Every write a session
+   * makes runs inside one, so a closing session drains these (`whenIdle`) before its scope closes:
+   * counted from the call itself, it holds for a call the client cancelled or whose transport
+   * closed, which keeps running regardless.
+   */
+  private active = 0;
+  private idleWaiters: Array<() => void> = [];
+  /**
    * Configured ids that were not loaded because `src/lib/projectId.ts` refuses them, with why —
    * from `loadConfig` (`ServerConfig.skippedProjects`) and from the constructor's own check. The
    * registry's skipped entries are not copied here: they are read fresh on a miss, since a peer
@@ -194,6 +202,29 @@ export class ProjectManager {
     // walks out of `.sessions/` would otherwise create a directory wherever it points — and
     // `register_project` takes this lock before the id has been registered anywhere.
     assertValidProjectId(id);
+    this.active++;
+    try {
+      return await this.runExclusiveCounted(id, fn);
+    } finally {
+      if (--this.active === 0) for (const r of this.idleWaiters.splice(0)) r();
+    }
+  }
+
+  /** Whether a `runExclusive` call of this manager is waiting or running. */
+  isBusy(): boolean {
+    return this.active > 0;
+  }
+
+  /** Resolves once no `runExclusive` call of this manager is waiting or running. */
+  whenIdle(): Promise<void> {
+    if (this.active === 0) return Promise.resolve();
+    return new Promise((r) => this.idleWaiters.push(r));
+  }
+
+  private async runExclusiveCounted<T>(
+    id: string,
+    fn: (lock: LockAcquisition) => Promise<T>,
+  ): Promise<T> {
     const entry = this.locks.entry(id);
     // Measured before the mutex is even requested, so `waitedMs` below covers BOTH layers: a
     // same-process peer holding the mutex, and a sibling process holding the file lock.

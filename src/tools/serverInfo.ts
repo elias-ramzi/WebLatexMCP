@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { getServerVersion } from '../lib/version.js';
+import { quoteId } from '../lib/projectId.js';
 import { toPosix } from '../lib/paths.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
@@ -23,6 +24,30 @@ const outputSchema = {
       "An older version's workspace-local folder (<launch dir>/.web_latex_mcp) that still " +
         'registers projects this server does not see. Move them into the workspace in use with ' +
         '`web-latex-mcp migrate-workspace <that folder>`. Absent when there is none.',
+    ),
+  mode: z
+    .enum(['stdio', 'daemon'])
+    .describe(
+      'How this session reaches the server: `stdio` (one server process for this session) or ' +
+        '`daemon` (one shared server, `web-latex-mcp serve`, for every session on the workspace).',
+    ),
+  sessionId: z
+    .string()
+    .describe("This session's id: it names the session to its peers and keys its own changes."),
+  sessionIdRequested: z
+    .string()
+    .optional()
+    .describe(
+      'The session id this client asked for, when another open session already held it and this ' +
+        'one was given `sessionId` instead. Absent otherwise.',
+    ),
+  ignoredClientEnv: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Server-wide settings this client's environment set differently from the shared server's. " +
+        "They do not apply here: set them in the shared server's own environment. Names only, " +
+        'never values. Absent when there are none.',
     ),
   compiler: z
     .string()
@@ -167,6 +192,13 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             legacyCount > 0 && ctx.config.legacyWorkspaceRoot
               ? toPosix(ctx.config.legacyWorkspaceRoot)
               : undefined,
+          mode: ctx.config.serverMode ?? 'stdio',
+          sessionId: ctx.config.sessionId,
+          sessionIdRequested: ctx.config.sessionIdRequested,
+          ignoredClientEnv:
+            ctx.config.ignoredClientEnv && ctx.config.ignoredClientEnv.length > 0
+              ? [...ctx.config.ignoredClientEnv]
+              : undefined,
           compiler: ctx.config.compiler ?? 'latexmk',
           // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
           // "dblp" here would describe the fallback order's first try as a choice someone made.
@@ -235,6 +267,14 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
         const text =
           `web-latex-mcp v${info.version}\n` +
           `workspace: ${info.workspaceRoot}\n` +
+          `session: ${quoteId(info.sessionId)} (${info.mode})` +
+          (info.sessionIdRequested !== undefined
+            ? ` — asked for ${quoteId(info.sessionIdRequested)}, which another open session holds`
+            : '') +
+          '\n' +
+          (info.ignoredClientEnv
+            ? `ignored from this client's environment (server-wide settings): ${info.ignoredClientEnv.map((n) => quoteId(n)).join(', ')}\n`
+            : '') +
           legacyLine +
           writingGuideLine +
           `compiler: ${info.compiler}\n` +

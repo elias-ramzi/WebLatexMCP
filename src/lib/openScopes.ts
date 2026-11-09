@@ -13,7 +13,7 @@ import { realpathSync } from 'node:fs';
  * process, and two sets of shared services in one process (the test suites build one per
  * simulated process) must see each other's open scopes as live, as two real processes do by pid.
  *
- * Keyed by the workspace (`keys`) and the session id. Counted, so two scopes holding one id
+ * Keyed by the workspace (`keys`) and the session id, case-folded. Counted, so two scopes holding one id
  * (refused by the daemon once it assigns ids, §5.2) keep it open until both close.
  */
 const open = new Map<string, number>();
@@ -32,7 +32,10 @@ function keys(workspaceRoot: string, sessionId: string): string[] {
   } catch {
     // Not created yet: the resolved spelling is all there is.
   }
-  return [...forms].map((root) => `${root}\0${sessionId}`);
+  // The id folded too: on a case-insensitive disk `Alice` and `alice` are one session directory,
+  // so an open `Alice` must make an `alice` record read live — erring toward live, never dead.
+  const id = sessionId.toLowerCase();
+  return [...forms].map((root) => `${root}\0${id}`);
 }
 
 /** Mark a scope open; returns the function that marks it closed again (once). */

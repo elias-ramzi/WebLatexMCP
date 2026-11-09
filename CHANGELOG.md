@@ -43,6 +43,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`web-latex-mcp serve`: one shared server for every session** (milestone 4 of
+  `docs/design/shared-server.md`, preview). It serves MCP over Streamable HTTP on `127.0.0.1`,
+  guarded by a bearer token in `<workspace>/.daemon/daemon.json` (`0600`) and by Host and Origin
+  checks, with one session scope per connection: each session keeps its own id, changes and file
+  baselines. A duplicate session id gets a `-2` suffix; a session closes on `DELETE`, or once idle
+  without a client; the daemon exits after 30 minutes with no session unless `--keep-alive`.
+  `WEB_LATEX_MCP_PORT` or `--port` fixes the port. The writing guide and skills are read for each
+  new session. `server_info` now reports `mode` and `sessionId`. Clients still start the stdio
+  server by default.
 - **Liveness by open scope** (milestone 3 of `docs/design/shared-server.md`). A session record
   written by a session scope now carries its process's nonce; another session in the same process
   reads it live exactly while that scope is open, whatever its heartbeat, and dead once it closes.

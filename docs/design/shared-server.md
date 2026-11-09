@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestones 1–3 (§13) are implemented; the rest is not.
+Status: **accepted** (decisions in §14). Milestones 1–4 (§13) are implemented; the rest is not.
 
 ## 1. Why
 
@@ -314,25 +314,36 @@ can be reached by every local process and, through DNS rebinding, by web pages.
   the URL "for this session" in `ProjectManager`, which is per process today. Shared, that pin
   would leak to every scope. Decided (Q4): pins stay per scope; each scope has its own manager.
 
-Left for milestone 4, where several scopes first share a process outside tests (each is a
-daemon-only gap, with no effect on stdio's single scope):
+Milestone 4 (the daemon, `src/daemon/`) settled the milestone-2 and -3 gaps as follows:
 
-- **Duplicate session ids.** `createSessionContext` refuses an unusable id but not one an open
-  scope already holds; §5.2's suffixing belongs to the daemon, which assigns ids.
-- **Calls after close.** `close()` neither waits for nor refuses a running call; the transport
-  must. A write that lands after close re-creates the session record (the heartbeat throttle is
-  reset on release); peers in other processes then read it live by pid, but peers in this process
-  read it dead (§5.3), so its lines are unprotected there until the transport refuses such calls.
-- **Idle close (§5.3 item 5).** Nothing closes a scope for idleness yet; with stdio the scope
-  closes when the process does. `SESSION_IDLE_MS` comes with the daemon, after Q5 is measured.
+- **Duplicate session ids:** suffixed `-2`, `-3`, … against every open session and in-process
+  scope (`uniqueSessionId`), compared **case-folded**, since `Alice` and `alice` are one session
+  directory on macOS and Windows; `server_info` reports `sessionIdRequested`.
+- **Calls after close:** a closing session leaves the routing table first (its id answers 404),
+  then waits for its `ProjectManager`'s `runExclusive` calls (`whenIdle`) — every write runs in one,
+  and it keeps running when the client cancels or the transport aborts the call — for up to
+  `DEFAULT_DRAIN_MS` (10 minutes), cut to `STOP_DRAIN_MS` (10 s) for every session once the daemon
+  stops. A write outliving the cap still lands after close.
+- **Idle close:** `sessionIdleMs` (30 minutes) without a request, an open event stream or a
+  running exclusive call. A connected client holds its event stream open, so in practice a session closes
+  idle when its client vanished without a `DELETE`. Q5 is still to measure; it only matters for
+  clients that keep no stream open.
+
+Still open, for milestone 5 or later:
+
 - **Viewer's view of a shared project.** The viewer resolves an id through the newest open scope
   that knows it, so a session's pin or session-only `rootFile` decides what the viewer shows while
-  that session is open. Prefer the scope that opened the viewer, or the registry, once scopes
-  share a viewer.
-- **Overlay contents.** Every overlay value is scrubbed from the scope's output, so the proxy must
-  forward credential variables only.
-- **Tests from §6 and §12** over HTTP: two scopes racing `compile` and `write_file`, and
-  concurrent `ShadowStore` index writes from several stores in one process.
+  that session is open.
+- **Overlay contents.** Every overlay value is scrubbed from the scope's output; the daemon accepts
+  any variable-shaped name in `X-Web-Latex-Mcp-Credentials`, so the proxy must send credentials
+  only.
+- **The viewer and credential portal listeners** do not yet get the `Host` check (§10).
+- **`~/.web-latex-mcp/config.json`** (§7.1) is not read yet; the daemon reads its own env only.
+- **The ignored-env hint** reaches `server_info` only, not yet the session's first tool result
+  (§7.1).
+- **The session probe** (`WEB_LATEX_MCP_SESSION_PROBE`) is wired for stdio only.
+- **Tests from §6 and §12** that need TeX or the proxy: two sessions racing `compile`, and the
+  proxy relay, auto-start and reconnect tests.
 
 ## 12. Testing
 

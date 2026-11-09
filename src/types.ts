@@ -120,6 +120,18 @@ export interface ServerConfig {
    * `web-latex-mcp migrate-workspace` command, so projects registered there are not taken for lost.
    */
   legacyWorkspaceRoot?: string;
+  /** How this server is reached: one session on stdio (default), or a daemon's session (`serve`). */
+  serverMode?: 'stdio' | 'daemon';
+  /**
+   * The session id the client asked for, when the daemon gave this session another one because a
+   * session holding it was open (`-2`, `-3`, … — docs/design/shared-server.md §5.2).
+   */
+  sessionIdRequested?: string;
+  /**
+   * Names (never values) of daemon-wide variables the client's environment set differently from
+   * the daemon's (`X-Web-Latex-Mcp-Ignored-Env`, §7.1): they do not apply to this session.
+   */
+  ignoredClientEnv?: string[];
   /**
    * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
    * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one

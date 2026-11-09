@@ -332,7 +332,7 @@ function elide(value: string, max = 120): string {
  * cannot forge a second log line nor a bidi control reorder the rest of it, and shortened past
  * `max` characters the way `elide` does, the count outside the quotes.
  */
-function quoteEnvValue(value: string, max = 120): string {
+export function quoteEnvValue(value: string, max = 120): string {
   return value.length <= max
     ? quoteId(value)
     : `${quoteId(value.slice(0, max))}… (${value.length} characters)`;
