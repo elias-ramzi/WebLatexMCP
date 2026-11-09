@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestones 1–4 (§13) are implemented; the rest is not.
+Status: **accepted** (decisions in §14). Milestones 1–5 (§13) are implemented; milestone 6 (docs and packaging) is not.
 
 ## 1. Why
 
@@ -329,7 +329,43 @@ Milestone 4 (the daemon, `src/daemon/`) settled the milestone-2 and -3 gaps as f
   idle when its client vanished without a `DELETE`. Q5 is still to measure; it only matters for
   clients that keep no stream open.
 
-Still open, for milestone 5 or later:
+Milestone 5 (the proxy, `src/proxy/`) follows §9 with these choices:
+
+- **Build rule.** A build id is the version plus the entry file and its mtime (`currentBuildId`).
+  Same version → connect, so two installs of one version (Desktop's bundle, `npx`) share a daemon;
+  the exception is the same entry with another mtime (a launcher rebuilding `main` in place), which
+  counts as newer. A newer version replaces an idle daemon now, a busy one once its sessions end
+  (also when an idle one refuses `/shutdown` because a session just opened); `server_info` then
+  shows `restartPending`. An older proxy connects. A keep-alive daemon is never replaced.
+- **Ignored env (§7.1)** travels as `X-Web-Latex-Mcp-Client-Env`, each daemon-wide variable the
+  client set mapped to a SHA-256 of its value, so the daemon names what differs without seeing a
+  value.
+- **Credentials and environment.** An auto-started daemon gets the client's environment minus the
+  per-connection variables, `WEB_LATEX_MCP_PROJECTS`, every token variable the proxy forwards, and
+  every variable whose name has a secret-like word (`TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, …), so
+  `GH_TOKEN` cannot serve every session through `gh`. It runs in the workspace, not the client's
+  directory; relative guide and skills paths are resolved against the client's directory first,
+  and preloaded modules (`--import tsx` in development) are made absolute.
+- **Relay.** Only a request actually handed to a daemon that is then lost is answered "restarted,
+  retry"; one queued behind the restart goes to the new daemon. A send the live daemon refuses (a 413) is passed back as an error and never triggers a restart. A client `initialize` still
+  unanswered at a restart is re-sent as itself. `/health` answers 503 while a daemon stops.
+  Reconnect restarts at most once per proxy; a second loss ends it.
+- **Ending a session.** The proxy sends `DELETE` on stdin end and on SIGINT, SIGTERM and SIGHUP.
+  For a kill it cannot see (SIGKILL, Windows `TerminateProcess`), the daemon closes a session that
+  held an event stream and lost every one after `DEFAULT_STREAM_LOSS_MS` (60 s) instead of the
+  30-minute idle timeout, freeing its id.
+- **Fallback** is reported as `daemonUnavailable` beside `mode: "stdio"`, not as a `mode` string.
+- **Q5** no longer gates anything for proxied clients: the proxy always ends its session. It still
+  matters only for clients connecting over HTTP directly.
+
+Still open, for milestone 6 or later:
+
+- **`update_server`** does not yet schedule the restart-when-idle (§9.2); after an update the next
+  client's proxy replaces the daemon by the build rule.
+- **Windows job objects.** `detached: true` does not leave a kill-on-close job; a client running its
+  servers in one kills the shared daemon when it quits. Unverified on Windows.
+- **Token variables learned mid-session** (a `tokenEnv` given to `register_project` after the proxy
+  started) are not forwarded until the next session. `gh`'s own login is the daemon's.
 
 - **Viewer's view of a shared project.** The viewer resolves an id through the newest open scope
   that knows it, so a session's pin or session-only `rootFile` decides what the viewer shows while

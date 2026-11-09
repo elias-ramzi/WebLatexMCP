@@ -4,6 +4,7 @@ import { toPosix } from './lib/paths.js';
 import { MigrationRefusedError, migrateWorkspace } from './services/workspaceMigration.js';
 import { importEnvProjects } from './services/envProjectImport.js';
 import { SERVE_USAGE, runServe } from './daemon/serveCommand.js';
+import { DAEMON_USAGE, runDaemonCommand } from './daemon/daemonCommand.js';
 
 /**
  * The one-shot commands `web-latex-mcp` runs instead of the MCP server. With no argument the
@@ -13,8 +14,12 @@ import { SERVE_USAGE, runServe } from './daemon/serveCommand.js';
 
 export const USAGE =
   'Usage:\n' +
-  '  npx web-latex-mcp                                run the MCP server on stdio\n' +
+  '  npx web-latex-mcp                                relay stdio to the shared server,\n' +
+  "      starting it if none answers (or serve in-process when it can't be reached)\n" +
+  '  npx web-latex-mcp --standalone                   serve this one session in-process\n' +
+  '      (also WEB_LATEX_MCP_STANDALONE=1)\n' +
   SERVE_USAGE +
+  DAEMON_USAGE +
   '  npx web-latex-mcp migrate-workspace <from> [--to <workspace>]\n' +
   "      move an older version's workspace-local folder (<repo>/.web_latex_mcp) into the\n" +
   '      workspace in use (WEB_LATEX_MCP_WORKSPACE, default ~/.web-latex-mcp/projects)\n' +
@@ -66,6 +71,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
   }
   // An option the server never took (a wrapper's `"$@"`, a leftover `--stdio`) used to be ignored;
   // it still is, so such a config keeps starting the server. Only a bare word is a command.
+  // `--standalone` is the server's own option (src/index.ts), never ignored.
+  if (command === '--standalone') return undefined;
   if (command !== undefined && command.startsWith('-')) {
     io.err(
       `[web-latex-mcp] ignoring ${argv.map((x) => quoteId(x)).join(' ')}; starting the server\n`,
@@ -73,6 +80,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
     return undefined;
   }
   if (command === 'serve') return runServe(rest, io);
+  if (command === 'daemon') return runDaemonCommand(rest, io);
   const parsed = parseArgs(rest);
   try {
     if (command === 'migrate-workspace' && parsed && parsed.positional.length === 1) {

@@ -6,7 +6,8 @@ import { allowedHosts, guardRequest, sameSecret } from '../../src/daemon/request
 import {
   HEADER_CREDENTIALS,
   HEADER_DEFAULT_PROJECT,
-  HEADER_IGNORED_ENV,
+  HEADER_CLIENT_ENV,
+  HEADER_REPLACE_WHEN_IDLE,
   HEADER_NO_OUTPUT_SCHEMA,
   HEADER_SESSION,
   MAX_CREDENTIALS,
@@ -24,6 +25,7 @@ import {
   type DaemonInfo,
 } from '../../src/daemon/daemonFiles.js';
 import { parseServeArgs } from '../../src/daemon/serveCommand.js';
+import { hashEnvValue } from '../../src/lib/daemonWideEnv.js';
 
 const POSIX = process.platform !== 'win32';
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -90,23 +92,30 @@ describe('parseSessionHeaders', () => {
         [HEADER_DEFAULT_PROJECT]: 'thèse',
         [HEADER_CREDENTIALS]: JSON.stringify({ GITHUB_TOKEN: 'ghp_x', __proto__: 'p' }),
         [HEADER_NO_OUTPUT_SCHEMA]: '1',
-        [HEADER_IGNORED_ENV]:
-          'WEB_LATEX_MCP_COMPILER, WEB_LATEX_MCP_COMPILER,WEB_LATEX_MCP_VIEWER_PORT',
+        [HEADER_CLIENT_ENV]: JSON.stringify({
+          WEB_LATEX_MCP_COMPILER: hashEnvValue('tectonic'),
+          WEB_LATEX_MCP_REWRITE_MODE: hashEnvValue('prose'),
+          NOT_DAEMON_WIDE: hashEnvValue('x'),
+        }),
+        [HEADER_REPLACE_WHEN_IDLE]: '1',
       },
-      {},
+      // The daemon agrees on the rewrite mode, not on the compiler.
+      { WEB_LATEX_MCP_COMPILER: 'latexmk', WEB_LATEX_MCP_REWRITE_MODE: ' prose ' },
     );
     expect(s.requestedSessionId).toBe('agent-1');
     expect(s.defaultProject).toBe('thèse');
     expect(s.credentialOverlay?.GITHUB_TOKEN).toBe('ghp_x');
     expect(Object.getPrototypeOf(s.credentialOverlay)).toBeNull();
     expect(s.outputSchema).toBe('always');
-    expect(s.ignoredEnv).toEqual(['WEB_LATEX_MCP_COMPILER', 'WEB_LATEX_MCP_VIEWER_PORT']);
+    expect(s.ignoredEnv).toEqual(['WEB_LATEX_MCP_COMPILER']);
+    expect(s.replaceWhenIdle).toBe(true);
   });
 
   it("falls back to the daemon's output-schema mode and asks for nothing else", () => {
     expect(parseSessionHeaders({}, { WEB_LATEX_MCP_NO_OUTPUT_SCHEMA: '0' })).toEqual({
       outputSchema: 'never',
       ignoredEnv: [],
+      replaceWhenIdle: false,
     });
   });
 
@@ -148,6 +157,22 @@ describe('parseSessionHeaders', () => {
   });
 });
 
+describe('the client-env header', () => {
+  it('refuses a malformed digest and never needs a value', () => {
+    expect(() =>
+      parseSessionHeaders({ [HEADER_CLIENT_ENV]: '{"WEB_LATEX_MCP_COMPILER":"tectonic"}' }, {}),
+    ).toThrow(/SHA-256/);
+    expect(() => parseSessionHeaders({ [HEADER_CLIENT_ENV]: '[]' }, {})).toThrow(/object/);
+    // Set on the client, unset on the daemon: differs. Unset on both: never sent, never named.
+    expect(
+      parseSessionHeaders(
+        { [HEADER_CLIENT_ENV]: JSON.stringify({ WEB_LATEX_MCP_SKILLS_DIR: hashEnvValue('/s') }) },
+        {},
+      ).ignoredEnv,
+    ).toEqual(['WEB_LATEX_MCP_SKILLS_DIR']);
+  });
+});
+
 describe('uniqueSessionId', () => {
   it('suffixes a taken id, keeping it within 64 characters', () => {
     const taken = new Set(['beta', 'beta-2']);
@@ -168,6 +193,7 @@ describe('daemon files', () => {
     token: 'tok',
     version: '0.0.0',
     buildPath: '/x/dist/index.js',
+    buildId: '0.0.0|/x/dist/index.js|1',
     startedAt: '2026-11-09T00:00:00.000Z',
   };
 

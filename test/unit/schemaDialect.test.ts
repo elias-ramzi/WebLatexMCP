@@ -24,7 +24,7 @@ import type { AppContext } from '../../src/context.js';
 const DRAFT_2020_12 = 'https://json-schema.org/draft/2020-12/schema';
 
 /**
- * `listTools()` through the same hook `src/index.ts` installs. The SDK `Client` compiles an Ajv
+ * `listTools()` through the same hook `src/standalone.ts` and the daemon install. The SDK `Client` compiles an Ajv
  * (draft-07) validator for every `outputSchema` inside `listTools()`, so a resolved call is itself
  * proof that an older SDK client still accepts what is advertised.
  */

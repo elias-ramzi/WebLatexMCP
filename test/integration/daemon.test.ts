@@ -350,7 +350,8 @@ describe('the daemon', () => {
   });
 
   it('keeps a connected session open, and closes one whose client vanished once idle', async () => {
-    const { connect, daemon } = await setup({ sessionIdleMs: 150 });
+    // A long idle timeout: B goes because it dropped its stream, after the short grace.
+    const { connect, daemon } = await setup({ sessionIdleMs: 60_000, streamLossMs: 150 });
     const a = await connect({ 'x-web-latex-mcp-session': 'alpha' });
     const b = await connect({ 'x-web-latex-mcp-session': 'beta' });
     await call(a, 'server_info', {});

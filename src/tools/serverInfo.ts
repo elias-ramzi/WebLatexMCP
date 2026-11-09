@@ -31,6 +31,20 @@ const outputSchema = {
       'How this session reaches the server: `stdio` (one server process for this session) or ' +
         '`daemon` (one shared server, `web-latex-mcp serve`, for every session on the workspace).',
     ),
+  daemonUnavailable: z
+    .string()
+    .optional()
+    .describe(
+      'Why this session runs its own in-process server: the shared server could not be reached or ' +
+        'started. Absent when it is used, or when in-process serving was asked for.',
+    ),
+  restartPending: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when a newer build of the server is waiting: the shared server restarts as that ' +
+        'build once every session on it has ended. Absent otherwise.',
+    ),
   sessionId: z
     .string()
     .describe("This session's id: it names the session to its peers and keys its own changes."),
@@ -193,6 +207,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
               ? toPosix(ctx.config.legacyWorkspaceRoot)
               : undefined,
           mode: ctx.config.serverMode ?? 'stdio',
+          daemonUnavailable: ctx.config.daemonUnavailable,
+          restartPending: ctx.config.restartPending === true ? true : undefined,
           sessionId: ctx.config.sessionId,
           sessionIdRequested: ctx.config.sessionIdRequested,
           ignoredClientEnv:
@@ -268,8 +284,14 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
           `web-latex-mcp v${info.version}\n` +
           `workspace: ${info.workspaceRoot}\n` +
           `session: ${quoteId(info.sessionId)} (${info.mode})` +
+          (info.daemonUnavailable !== undefined
+            ? ` — the shared server is unavailable: ${info.daemonUnavailable}`
+            : '') +
           (info.sessionIdRequested !== undefined
             ? ` — asked for ${quoteId(info.sessionIdRequested)}, which another open session holds`
+            : '') +
+          (info.restartPending
+            ? ' — a newer build replaces this shared server once its sessions end'
             : '') +
           '\n' +
           (info.ignoredClientEnv

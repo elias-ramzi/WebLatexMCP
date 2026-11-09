@@ -11,6 +11,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **One shared server for every session, by default** (milestone 5 of
+  `docs/design/shared-server.md`). `web-latex-mcp` is now a small stdio proxy: it finds the
+  workspace's shared server (`web-latex-mcp serve`), starts it in the background when none answers,
+  and relays the session to it, so several Claude sessions use one process instead of one each.
+  Client configs do not change. Each session keeps its own id, changes and file baselines; git
+  tokens from the client's environment go with that session only and never into the shared
+  server's environment. A different build replaces an idle shared server, or a busy one once its
+  sessions end; if the shared server dies, the proxy restarts it once and keeps the session id.
+  When it cannot run, the session is served in-process as before (`server_info` says why).
+  `--standalone` or `WEB_LATEX_MCP_STANDALONE=1` keeps one in-process server per session.
+  `web-latex-mcp daemon status|stop|restart` manages the shared server.
 - **One workspace for every project.** With `WEB_LATEX_MCP_WORKSPACE` unset, clones and the project
   list now always live in `~/.web-latex-mcp/projects`, wherever your MCP client starts. A server
   started inside a git repository no longer keeps its own `<repo>/.web_latex_mcp/` (workspace-local

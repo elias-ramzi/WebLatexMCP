@@ -1,6 +1,7 @@
 import { parseSessionId } from '../config.js';
 import { projectIdProblem, quoteId } from '../lib/projectId.js';
 import { outputSchemaMode, type OutputSchemaMode } from '../lib/outputSchemaCompat.js';
+import { DAEMON_WIDE_ENV, differingEnv } from '../lib/daemonWideEnv.js';
 
 /**
  * The per-connection settings a client (in practice the stdio proxy, milestone 5) sends on
@@ -11,7 +12,10 @@ export const HEADER_SESSION = 'x-web-latex-mcp-session';
 export const HEADER_DEFAULT_PROJECT = 'x-web-latex-mcp-default-project';
 export const HEADER_CREDENTIALS = 'x-web-latex-mcp-credentials';
 export const HEADER_NO_OUTPUT_SCHEMA = 'x-web-latex-mcp-no-output-schema';
-export const HEADER_IGNORED_ENV = 'x-web-latex-mcp-ignored-env';
+/** JSON: daemon-wide variable name → SHA-256 of the client's value (`clientEnvHashes`). */
+export const HEADER_CLIENT_ENV = 'x-web-latex-mcp-client-env';
+/** `1`: the client runs a newer build; the daemon stops once its last session closes (§9.2). */
+export const HEADER_REPLACE_WHEN_IDLE = 'x-web-latex-mcp-replace-when-idle';
 
 /** Bounds on the credential overlay: a handful of variables, each a token. */
 export const MAX_CREDENTIALS = 32;
@@ -25,8 +29,10 @@ export interface SessionSettings {
   /** Null-prototype: the names are the client's. */
   credentialOverlay?: Record<string, string>;
   outputSchema: OutputSchemaMode;
-  /** Names (never values) of daemon-wide variables the client's env set differently. */
+  /** Daemon-wide variables the client's env set differently from the daemon's, by name. */
   ignoredEnv: string[];
+  /** The client runs a newer build and asks the daemon to stop once nobody uses it. */
+  replaceWhenIdle?: boolean;
 }
 
 export class SessionHeaderError extends Error {
@@ -97,25 +103,38 @@ export function parseSessionHeaders(
     settings.outputSchema = outputSchemaMode({ WEB_LATEX_MCP_NO_OUTPUT_SCHEMA: noOutputSchema });
   }
 
-  const ignored = one(headers, HEADER_IGNORED_ENV);
-  if (ignored !== undefined) {
-    const names = ignored
-      .split(',')
-      .map((n) => n.trim())
-      .filter((n) => n !== '');
-    const bad = names.find((n) => !ENV_NAME.test(n));
-    if (bad !== undefined) {
-      throw new SessionHeaderError(`${HEADER_IGNORED_ENV} names ${quoteId(bad)}, not a variable.`);
-    }
-    const unique = [...new Set(names)];
-    if (unique.length > 64) {
+  const clientEnv = one(headers, HEADER_CLIENT_ENV);
+  if (clientEnv !== undefined) {
+    settings.ignoredEnv = differingEnv(parseClientEnv(clientEnv), daemonEnv);
+  }
+
+  settings.replaceWhenIdle = one(headers, HEADER_REPLACE_WHEN_IDLE) === '1';
+  return settings;
+}
+
+/** The client-env header: names of daemon-wide settings, each with a hex SHA-256. */
+function parseClientEnv(raw: string): Record<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new SessionHeaderError(`${HEADER_CLIENT_ENV} is not JSON.`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new SessionHeaderError(`${HEADER_CLIENT_ENV} must be a JSON object.`);
+  }
+  const out = Object.create(null) as Record<string, string>;
+  for (const [name, hash] of Object.entries(parsed as Record<string, unknown>)) {
+    // A name this daemon does not treat as daemon-wide is no business of this header: dropped.
+    if (!DAEMON_WIDE_ENV.includes(name)) continue;
+    if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
       throw new SessionHeaderError(
-        `${HEADER_IGNORED_ENV} names ${unique.length} variables; at most 64.`,
+        `${HEADER_CLIENT_ENV}: ${name} must map to a SHA-256 hex digest.`,
       );
     }
-    settings.ignoredEnv = unique;
+    out[name] = hash;
   }
-  return settings;
+  return out;
 }
 
 /** The credential header: a JSON object of variable name → value. Never echoes a value. */

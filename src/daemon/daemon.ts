@@ -16,6 +16,7 @@ import { installOutputSchemaCompat } from '../lib/outputSchemaCompat.js';
 import { loadSessionGuides } from '../lib/sessionGuides.js';
 import { quoteId } from '../lib/projectId.js';
 import { getServerVersion } from '../lib/version.js';
+import { currentBuildId } from '../lib/buildId.js';
 import type { CredentialResolver, CommitIdentity } from '../services/auth.js';
 import type { ProjectRegistryStore } from '../services/projectManager.js';
 import type { ServerConfig } from '../types.js';
@@ -47,6 +48,12 @@ import { SessionHeaderError, parseSessionHeaders, uniqueSessionId } from './sess
 export const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
 export const DEFAULT_IDLE_EXIT_MS = 30 * 60 * 1000;
 export const DEFAULT_MAX_SESSIONS = 64;
+/**
+ * How long a session whose client held an event stream open survives losing all of them. The
+ * SDK's client transport re-opens a dropped stream within seconds (1 s, then backoff), so a minute
+ * without one means the client is gone.
+ */
+export const DEFAULT_STREAM_LOSS_MS = 60 * 1000;
 export const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 /** How long a closing session waits for its running calls (a compile) before closing anyway. */
 export const DEFAULT_DRAIN_MS = 10 * 60 * 1000;
@@ -71,6 +78,7 @@ export interface DaemonOptions {
   /** Never exit for idleness (`serve --keep-alive`, for launchd/systemd units). */
   keepAlive?: boolean;
   sessionIdleMs?: number;
+  streamLossMs?: number;
   idleExitMs?: number;
   drainMs?: number;
   maxSessions?: number;
@@ -105,6 +113,8 @@ interface Session {
   transport: StreamableHTTPServerTransport;
   /** Open GET (SSE) streams; a session with one is never idle. */
   openStreams: number;
+  /** Whether the client ever held a stream open: one that drops all of them has likely gone. */
+  hadStream: boolean;
   idleTimer?: NodeJS.Timeout;
   closing?: Promise<void>;
 }
@@ -172,6 +182,7 @@ async function serve(
 ): Promise<RunningDaemon> {
   const { config, env } = opts;
   const sessionIdleMs = opts.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS;
+  const streamLossMs = opts.streamLossMs ?? DEFAULT_STREAM_LOSS_MS;
   const idleExitMs = opts.idleExitMs ?? DEFAULT_IDLE_EXIT_MS;
   const drainMs = opts.drainMs ?? DEFAULT_DRAIN_MS;
   const maxSessions = opts.maxSessions ?? DEFAULT_MAX_SESSIONS;
@@ -192,6 +203,10 @@ async function serve(
   const opening = new Set<Promise<void>>();
   let stopping: Promise<void> | undefined;
   let idleExitTimer: NodeJS.Timeout | undefined;
+  /** A newer build's proxy asked this daemon to make way once nobody uses it (§9.2). */
+  let replaceRequested = false;
+  const buildPath = opts.buildPath ?? process.argv[1] ?? '';
+  const buildId = currentBuildId(buildPath);
   /**
    * Resolves `STOP_DRAIN_MS` after `stop` begins: no session's drain outlasts it, including one
    * whose close (a DELETE) began before the stop with the longer `drainMs` cap.
@@ -210,17 +225,27 @@ async function serve(
   const scheduleIdleExit = (): void => {
     clearTimeout(idleExitTimer);
     idleExitTimer = undefined;
-    if (opts.keepAlive || stopping || sessions.size > 0 || reserved.size > 0) return;
+    if (stopping || sessions.size > 0 || reserved.size > 0) return;
+    if (replaceRequested && !opts.keepAlive) {
+      void stop('a newer build asked to replace this one');
+      return;
+    }
+    if (opts.keepAlive) return;
     idleExitTimer = setTimeout(() => void stop('idle: no open session'), idleExitMs);
     idleExitTimer.unref?.();
   };
 
   const armIdle = (s: Session): void => {
     clearTimeout(s.idleTimer);
+    // A client that kept an event stream open and lost every one has likely gone (a proxy killed
+    // without a DELETE): a short grace, enough for its transport to reconnect, rather than the
+    // whole idle timeout during which the session would read live and hold its id.
+    const wait =
+      s.hadStream && s.openStreams === 0 ? Math.min(streamLossMs, sessionIdleMs) : sessionIdleMs;
     s.idleTimer = setTimeout(() => {
       if (s.openStreams > 0 || s.scope.ctx.projectManager.isBusy()) armIdle(s);
       else void closeSession(s, 'idle');
-    }, sessionIdleMs);
+    }, wait);
     s.idleTimer.unref?.();
   };
 
@@ -272,12 +297,16 @@ async function serve(
 
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     if (url.pathname === '/health' && req.method === 'GET') {
+      // A stopping daemon is not one to connect to: say so, so a proxy starts another.
+      if (stopping) return sendJson(res, 503, { error: 'Stopping', processNonce });
       return sendJson(res, 200, {
         version: getServerVersion(),
         processNonce,
         pid: process.pid,
+        buildId,
         sessions: sessions.size,
         keepAlive: opts.keepAlive === true,
+        replaceRequested,
       });
     }
     if (url.pathname === '/shutdown' && req.method === 'POST') {
@@ -312,6 +341,7 @@ async function serve(
       armIdle(s);
       if (req.method === 'GET') {
         s.openStreams++;
+        s.hadStream = true;
         res.on('close', () => {
           s.openStreams--;
           armIdle(s);
@@ -342,6 +372,11 @@ async function serve(
       throw err;
     }
     const requested = settings.requestedSessionId;
+    if (settings.replaceWhenIdle && !replaceRequested) {
+      replaceRequested = true;
+      log('a newer build asked to replace this daemon; it stops once its last session closes');
+      for (const open of sessions.values()) open.scope.ctx.config.restartPending = true;
+    }
     const sessionId = uniqueSessionId(
       requested ?? `session-${randomBytes(4).toString('hex')}`,
       idTaken,
@@ -367,6 +402,7 @@ async function serve(
           ? { sessionIdRequested: requested }
           : {}),
         ...(settings.ignoredEnv.length > 0 ? { ignoredClientEnv: settings.ignoredEnv } : {}),
+        ...(replaceRequested ? { restartPending: true } : {}),
       });
       const server = createServer(
         scope.ctx,
@@ -382,6 +418,7 @@ async function serve(
         // Assigned below; the transport's callbacks need `s`.
         transport: undefined as unknown as StreamableHTTPServerTransport,
         openStreams: 0,
+        hadStream: false,
       };
       s.transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -458,7 +495,8 @@ async function serve(
     port,
     token,
     version: getServerVersion(),
-    buildPath: opts.buildPath ?? process.argv[1] ?? '',
+    buildPath,
+    buildId,
     startedAt: new Date().toISOString(),
   };
   try {

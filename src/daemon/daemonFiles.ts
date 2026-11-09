@@ -16,8 +16,10 @@ export interface DaemonInfo {
   /** The bearer token; the file is `0600` because of it. */
   token: string;
   version: string;
-  /** The entry script the daemon runs from, so a proxy can tell builds apart (§9.2). */
+  /** The entry script the daemon runs from. */
   buildPath: string;
+  /** Version, entry and its mtime (`currentBuildId`): what a proxy compares (§9.2). */
+  buildId: string;
   startedAt: string;
 }
 
@@ -99,6 +101,7 @@ export async function readDaemonInfo(workspaceRoot: string): Promise<DaemonInfo 
     token: r.token,
     version: typeof r.version === 'string' ? r.version : 'unknown',
     buildPath: typeof r.buildPath === 'string' ? r.buildPath : '',
+    buildId: typeof r.buildId === 'string' ? r.buildId : '',
     startedAt: typeof r.startedAt === 'string' ? r.startedAt : '',
   };
 }

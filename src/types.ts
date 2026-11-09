@@ -129,9 +129,19 @@ export interface ServerConfig {
   sessionIdRequested?: string;
   /**
    * Names (never values) of daemon-wide variables the client's environment set differently from
-   * the daemon's (`X-Web-Latex-Mcp-Ignored-Env`, §7.1): they do not apply to this session.
+   * the daemon's (`X-Web-Latex-Mcp-Client-Env`, §7.1): they do not apply to this session.
    */
   ignoredClientEnv?: string[];
+  /**
+   * Why this stdio session runs in-process: the proxy could not reach or start the shared server
+   * (docs/design/shared-server.md §9.1). Absent when serving in-process was asked for.
+   */
+  daemonUnavailable?: string;
+  /**
+   * A newer build asked the shared server to make way: it restarts as that build once its last
+   * session closes (docs/design/shared-server.md §9.2). Set on every open session's config.
+   */
+  restartPending?: boolean;
   /**
    * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
    * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one

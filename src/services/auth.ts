@@ -44,6 +44,14 @@ const HOST_DEFAULTS: Record<string, HostDefaults> = {
  * named `constructor` or `__proto__` read back `Object`/`Object.prototype` from the literal above —
  * whose `tokenEnv` is undefined, so the resolver looked up the env var literally named "undefined".
  */
+/**
+ * The token variables every resolver consults whatever the project: the generic one and each
+ * host default. A project's own `tokenEnv` comes on top (`src/proxy/clientEnv.ts`).
+ */
+export function standardTokenEnvNames(): string[] {
+  return [GENERIC_TOKEN_ENV, ...Object.values(HOST_DEFAULTS).map((d) => d.tokenEnv)];
+}
+
 function hostDefaults(host: string | undefined): HostDefaults | undefined {
   return host !== undefined && Object.hasOwn(HOST_DEFAULTS, host) ? HOST_DEFAULTS[host] : undefined;
 }
