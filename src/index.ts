@@ -1,18 +1,27 @@
 #!/usr/bin/env node
-import { runCli } from './cli.js';
-import { runStandalone } from './standalone.js';
 import { runProxy, standaloneRequested } from './proxy/proxyCommand.js';
+
+// Loaded only when needed: the proxy, which every client session runs, must not carry the whole
+// server (every tool, pdf.js, the reference backends) — that is what the shared server is for.
+const runCli = async (...args: Parameters<typeof import('./cli.js').runCli>) =>
+  (await import('./cli.js')).runCli(...args);
+const runStandalone = async (...args: Parameters<typeof import('./standalone.js').runStandalone>) =>
+  (await import('./standalone.js')).runStandalone(...args);
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   // A command (`serve`, `daemon …`, `migrate-workspace`, `import-env-projects`, `--help`) runs and
   // exits. Checked first, so a command never touches the stdio JSON-RPC channel.
-  const status = await runCli(argv, {
-    env: process.env,
-    cwd: process.cwd(),
-    out: (text) => process.stdout.write(text),
-    err: (text) => process.stderr.write(text),
-  });
+  // No argument and no option: no command to run, so the CLI module need not even load.
+  const status =
+    argv.length === 0
+      ? undefined
+      : await runCli(argv, {
+          env: process.env,
+          cwd: process.cwd(),
+          out: (text) => process.stdout.write(text),
+          err: (text) => process.stderr.write(text),
+        });
   if (status !== undefined) {
     process.exitCode = status;
     return;
