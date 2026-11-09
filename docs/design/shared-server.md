@@ -9,6 +9,22 @@ holds about 117 MB (measured on macOS with v0.9.0), so ten parallel Claude sessi
 1 GB. Each process also opens its own viewer and credential portal, and coordinates with its
 siblings only through files under `<workspace>/.sessions/`.
 
+Measured after the change (macOS, Node 26, RSS of the server processes only; TeX engines run as
+short-lived children, about 60 MB each, in both setups). Each session compiles the sample
+project, renders a page and extracts text, twice:
+
+| Sessions | One server per session (idle → after work) | Relays + one shared server (idle → after work) |
+| -------- | ------------------------------------------ | ---------------------------------------------- |
+| 1        | 121 → 201 MB                               | 216 → 299 MB                                   |
+| 3        | 359 → 602 MB                               | 411 → 526 MB                                   |
+| 5        | 598 → 1003 MB                              | 612 → 726 MB                                   |
+
+A session's own server keeps pdf.js loaded once it has read a PDF (about 200 MB each); a relay
+stays at about 97 MB and the shared server at about 235 MB, whatever the number of sessions. The
+shared server costs about 100 MB more for one session, breaks even around two, and saves about
+100 MB per session beyond that. Most of a relay's 97 MB is Node and the SDK's HTTP client; a relay
+without the SDK transports could be lighter still.
+
 The default workspace makes things worse for anyone with many papers. It depends on where the
 client was launched: inside a git repository it is `<launch-dir>/.web_latex_mcp`, otherwise
 `~/.web-latex-mcp/projects`. Projects registered from different repositories therefore end up in
