@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestone 1 (§13) is implemented; the rest is not.
+Status: **accepted** (decisions in §14). Milestones 1 and 2 (§13) are implemented; the rest is not.
 
 ## 1. Why
 
@@ -97,7 +97,8 @@ Today `createContext` builds one `AppContext` per process and bakes `config.sess
 
 | Piece                                                                                        | Scope                                                     | Why                                                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ProjectManager` (mutexes, registry)                                                         | shared                                                    | The in-process mutex is what serializes sessions in one process; it must be one instance.                                                                                                                                                                                                                                                                                                  |
+| `ProjectManager`: mutex table (`ProjectLocks`) and registry                                  | shared                                                    | The in-process mutex is what serializes sessions in one process; it must be one table.                                                                                                                                                                                                                                                                                                     |
+| `ProjectManager` itself (session-only registrations, pins, in-process default)               | **per session**, over the shared table                    | Q4: a `project_sync { gitUrl }` registration and its pin are that session's own. One manager per scope keeps them so with no overlay inside the manager. The viewer resolves an id through the open scope that knows it, else through a manager of its own over the configuration and registry.                                                                                            |
 | `GitService`, compiler, `PdfRenderer`, reference backends, `DoctorService`, `SyncTexService` | shared                                                    | Stateless or caching only.                                                                                                                                                                                                                                                                                                                                                                 |
 | `ViewerService`, `CommentStore`                                                              | shared                                                    | One viewer port for everyone. Review comments become visible to every session, which is an improvement: today a comment left in one process's viewer is invisible to the others.                                                                                                                                                                                                           |
 | `CredentialPortal`, `UpdateService`, `RewriteModeStore`                                      | shared                                                    | Project-wide or machine-wide already.                                                                                                                                                                                                                                                                                                                                                      |
@@ -108,7 +109,7 @@ Today `createContext` builds one `AppContext` per process and bakes `config.sess
 
 `AppContext` keeps its shape, so no tool changes. `createContext` becomes
 `createSharedServices(config, …)` plus `createSessionContext(shared, { sessionId, defaultProject,
-credentialOverlay })`, which returns an `AppContext`. `--standalone` builds exactly one session
+credentialOverlay })`, which returns a `SessionScope`: the scope's `AppContext` and its `close()`. `--standalone` builds exactly one session
 context, so it uses the same code path.
 
 `ShadowStore.withIndexLock` is already module-level, keyed by session directory, and
@@ -311,7 +312,24 @@ can be reached by every local process and, through DNS rebinding, by web pages.
   and a soak test.
 - **Session-only registrations.** `project_sync { gitUrl }` that differs from the registry pins
   the URL "for this session" in `ProjectManager`, which is per process today. Shared, that pin
-  would leak to every scope. Decided (Q4): pins become a per-scope overlay.
+  would leak to every scope. Decided (Q4): pins stay per scope; each scope has its own manager.
+
+Left for milestone 4, where several scopes first share a process outside tests (each is a
+daemon-only gap, with no effect on stdio's single scope):
+
+- **Duplicate session ids.** `createSessionContext` refuses an unusable id but not one an open
+  scope already holds; §5.2's suffixing belongs to the daemon, which assigns ids.
+- **Calls after close.** `close()` neither waits for nor refuses a running call; the transport
+  must. A write that lands after close re-creates the session record (the heartbeat throttle is
+  reset on release), so peers still see it.
+- **Viewer's view of a shared project.** The viewer resolves an id through the newest open scope
+  that knows it, so a session's pin or session-only `rootFile` decides what the viewer shows while
+  that session is open. Prefer the scope that opened the viewer, or the registry, once scopes
+  share a viewer.
+- **Overlay contents.** Every overlay value is scrubbed from the scope's output, so the proxy must
+  forward credential variables only.
+- **Tests from §6 and §12** over HTTP: two scopes racing `compile` and `write_file`, and
+  concurrent `ShadowStore` index writes from several stores in one process.
 
 ## 12. Testing
 
@@ -373,8 +391,9 @@ Accepted on 2026-11-09:
   central registry. Env projects configured one process; the shared registry replaces them.
 - **Q3. Daemon lifetime:** an auto-started daemon exits after 30 minutes with no open scope;
   `serve --keep-alive` never idles out (§9.3).
-- **Q4. Session-only `project_sync { gitUrl }` pins:** kept per session, as a per-scope overlay in
-  `ProjectManager`, so a pin never leaks to other scopes.
+- **Q4. Session-only `project_sync { gitUrl }` pins:** kept per session, so a pin never leaks to
+  other scopes. Built (milestone 2) as one `ProjectManager` per scope over a shared mutex table
+  (`ProjectLocks`) rather than an overlay inside one manager.
 - **Q5. Does Claude Code's HTTP client send `DELETE` on exit?** Still to measure, with the session
   probe, before milestone 3 fixes `SESSION_IDLE_MS`. Until then the default stays 30 minutes.
 - **Q6. Desktop extension:** runs the proxy, sharing the central workspace and daemon. Its

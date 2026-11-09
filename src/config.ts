@@ -638,7 +638,7 @@ export function loadConfig(
  *
  * Sanitised to a safe directory name, since it becomes one under the session state dir.
  */
-function parseSessionId(raw: string | undefined): string {
+export function parseSessionId(raw: string | undefined): string {
   const value = raw?.trim();
   if (raw === undefined || !value) return `session-${randomBytes(4).toString('hex')}`;
   const safe = value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');

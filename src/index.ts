@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { loadConfig } from './config.js';
 import { runCli } from './cli.js';
 import { CredentialResolver, loadIdentity } from './services/auth.js';
-import { createContext } from './context.js';
+import { createSessionContext, createSharedServices } from './context.js';
 import { createServer } from './server.js';
 import { ProjectRegistry, countRegisteredProjects } from './services/projectRegistry.js';
 import { legacyWorkspaceNote } from './lib/workspaceNote.js';
@@ -53,10 +53,15 @@ async function main(): Promise<void> {
   const credentials = new CredentialResolver(process.env);
   const identity = loadIdentity(process.env);
   const registry = new ProjectRegistry(config.workspaceRoot);
-  const ctx = createContext(config, credentials, identity, registry);
   const baseWritingGuide = await loadWritingGuide(process.env);
   const extraWritingGuide = await loadExtraWritingGuide(config.extraWritingGuidePath);
+  // Set before the session scope is built: its `config` is a copy, taken then.
   config.extraWritingGuideLoaded = extraWritingGuide !== undefined;
+  // stdio serves one session: the shared services and one scope over them, the same code a
+  // daemon runs once per connection (docs/design/shared-server.md §5.1).
+  const shared = createSharedServices(config, credentials, identity, registry);
+  const scope = createSessionContext(shared);
+  const { ctx } = scope;
   const { text: writingGuide, hasExtra: writingGuideHasExtra } = composeWritingGuide(
     baseWritingGuide,
     extraWritingGuide,
@@ -104,7 +109,7 @@ async function main(): Promise<void> {
   // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
   // session that dies without this is detected as gone by pid instead.
   const release = (): void => {
-    for (const id of ctx.sessions.trackedProjects()) void ctx.sessions.release(id).catch(() => {});
+    void scope.close();
   };
   process.once('SIGINT', release);
   process.once('SIGTERM', release);

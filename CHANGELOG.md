@@ -43,6 +43,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Session scopes over shared services** (milestone 2 of `docs/design/shared-server.md`).
+  `createContext` is now `createSharedServices` (one per process: lock table, registry, git,
+  compiler, viewer, comments, reference backends) plus `createSessionContext` (one per session:
+  project manager, file service with its revision baselines, session registry, shadows, shelves and
+  a memory-only credential overlay). stdio runs one scope, so nothing changes for users; it is the
+  groundwork for one server shared by every session.
 - **`web-latex-mcp migrate-workspace <folder>`** moves an older version's `.web_latex_mcp/` folder —
   clones, compiled PDFs, session state and registered projects — into the workspace in use. It checks
   everything before moving anything and moves nothing when a name is taken, a session is live, or the
@@ -52,6 +58,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`web-latex-mcp import-env-projects`** registers the projects in `WEB_LATEX_MCP_PROJECTS` in the
   workspace's project list, applying every check `register_project` applies (a credential in a URL
   is removed before it is saved) and never overwriting a project registered differently.
+
+### Fixed
+
+- A project registered with `tokenEnv` naming an inherited object key (`toString`, `constructor`)
+  no longer crashes credential lookup.
 
 ## [0.9.0] - 2026-10-05
 

@@ -246,8 +246,13 @@ export class SessionRegistry {
     return dead.map((p) => p.sessionId);
   }
 
-  /** Remove this session's record — best-effort, on clean shutdown. */
+  /**
+   * Remove this session's record — best-effort, on clean shutdown or when a scope closes. The
+   * heartbeat throttle is forgotten with it, so a write that still lands afterwards re-creates the
+   * record at once instead of leaving a session that writes shadows with no record peers can see.
+   */
   async release(projectId: string): Promise<void> {
+    this.lastHeartbeat.delete(projectId);
     await rm(path.join(sessionDir(this.workspaceRoot, projectId, this.sessionId), 'session.json'), {
       force: true,
     });

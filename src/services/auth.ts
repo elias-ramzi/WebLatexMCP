@@ -87,12 +87,51 @@ export function redactionSecrets(auth: AuthConfig): string[] {
 export class CredentialResolver {
   /** Tokens actually resolved, retained so redaction can scrub them from any output. */
   private readonly seenTokens = new Set<string>();
+  /**
+   * A session scope's own credential variables (`withOverlay`), consulted before `env` for every
+   * token name. Memory only: never written anywhere, never handed to a child process, gone with
+   * the resolver. Null-prototype — the names are the client's.
+   */
+  private readonly overlay: Record<string, string>;
+  /** The resolver this one overlays, whose secrets this one's `allSecrets` also scrubs. */
+  private base?: CredentialResolver;
 
   constructor(
     private readonly env: NodeJS.ProcessEnv = process.env,
     /** Injectable for tests; defaults to spawning real subprocesses. */
     private readonly exec: typeof execCapture = execCapture,
-  ) {}
+  ) {
+    this.overlay = Object.create(null) as Record<string, string>;
+  }
+
+  /**
+   * A resolver for one session scope: `overlay`'s values win over this resolver's env for every
+   * token name (per-project `tokenEnv`, host default, generic), and every other source — `gh` and
+   * the git credential helper — is this resolver's, run with this resolver's env; a
+   * `storeCredential` goes to this resolver itself. The overlay must hold credentials only: every
+   * value in it is scrubbed from the scope's output, whatever its name. Its `allSecrets` is this one's plus the overlay's and whatever it
+   * resolved itself, so an error in that scope is scrubbed of its own tokens; nothing it learns
+   * flows back here, so it is dropped with the scope.
+   */
+  withOverlay(overlay: Readonly<Record<string, string>>): CredentialResolver {
+    const scoped = new CredentialResolver(this.env, this.exec);
+    for (const [name, value] of Object.entries(overlay)) {
+      if (typeof value === 'string' && value.trim() !== '') scoped.overlay[name] = value;
+    }
+    scoped.base = this;
+    return scoped;
+  }
+
+  /** A token variable's value: the scope's overlay first, then the env; blank counts as unset. */
+  private tokenVar(name: string): string | undefined {
+    return (
+      (Object.hasOwn(this.overlay, name) ? this.overlay[name]?.trim() : undefined) ||
+      // Own keys only: a registration's `tokenEnv` is the user's text, and `toString` on a plain
+      // env object would otherwise read a function.
+      (Object.hasOwn(this.env, name) ? this.env[name]?.trim() : undefined) ||
+      undefined
+    );
+  }
 
   async resolve(project: CredentialProject): Promise<AuthConfig> {
     const host = hostOf(project.gitUrl);
@@ -118,6 +157,9 @@ export class CredentialResolver {
     username: string,
     token: string,
   ): Promise<{ persisted: boolean }> {
+    // The keychain is the machine's: a scope stores through the process's resolver, so the token
+    // is scrubbed process-wide (and still in this scope, whose `allSecrets` includes the base's).
+    if (this.base) return this.base.storeCredential(host, username, token);
     this.seenTokens.add(token); // ensure it's scrubbed from any output, even on error
     await this.exec('git', ['credential', 'approve'], {
       input: `protocol=https\nhost=${host}\nusername=${username}\npassword=${token}\n\n`,
@@ -130,11 +172,17 @@ export class CredentialResolver {
 
   /** Every token that could appear in output, so error/redaction covers all providers. */
   allSecrets(): string[] {
-    const secrets = new Set<string>(this.seenTokens);
+    const secrets = new Set<string>([...(this.base?.allSecrets() ?? []), ...this.seenTokens]);
     const envNames = [GENERIC_TOKEN_ENV, ...Object.values(HOST_DEFAULTS).map((d) => d.tokenEnv)];
     for (const name of envNames) {
       const value = this.env[name]?.trim();
       if (value) secrets.add(value);
+    }
+    // Every overlay value, whatever its name: a per-project `tokenEnv` the client forwarded is as
+    // secret as a host default.
+    for (const value of Object.values(this.overlay)) {
+      const trimmed = value.trim();
+      if (trimmed) secrets.add(trimmed);
     }
     return [...secrets];
   }
@@ -150,7 +198,7 @@ export class CredentialResolver {
     if (defaults) envNames.push(defaults.tokenEnv);
     envNames.push(GENERIC_TOKEN_ENV);
     for (const name of envNames) {
-      const value = this.env[name]?.trim();
+      const value = this.tokenVar(name);
       if (value) return value;
     }
 

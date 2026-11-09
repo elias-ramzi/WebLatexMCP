@@ -24,6 +24,9 @@ import { resolveRootFile } from './lib/rootFile.js';
 import { locateViewerPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
+import { ProjectLocks } from './lib/projectLocks.js';
+import { parseSessionId } from './config.js';
+import { quoteId } from './lib/projectId.js';
 import type { ServerConfig } from './types.js';
 
 /** Shared dependencies handed to every tool handler. */
@@ -76,54 +79,91 @@ export interface AppContext {
   updater: UpdateService;
 }
 
-export function createContext(
+/**
+ * The services every session scope of one process shares (`docs/design/shared-server.md` §5.1):
+ * the project lock table, the registry, git, the compiler, the PDF and reference services, the
+ * viewer and its comments, the rewrite-mode store, the credential portal and the updater. Each is
+ * stateless, a cache, or project- or machine-wide already.
+ *
+ * What is NOT here is per session, built by `createSessionContext`: the `ProjectManager` (its
+ * session-only registrations, pins and in-process default are that session's own — only its
+ * mutex table is shared), the `FileService` (a revision baseline means "what this session last
+ * saw"; shared, one session's write would move the baseline another relies on and its next write
+ * would overwrite that edit instead of throwing `ExternalChangeError`), the session registry,
+ * shadow store and shelf store (keyed by session id), and the credential overlay.
+ */
+export interface SharedServices {
+  /** The process-wide configuration; a scope's `config` copies it with its own session fields. */
+  config: ServerConfig;
+  /** The process's own credentials (its env, `gh`, the keychain); scopes overlay their own. */
+  credentials: CredentialResolver;
+  registry?: ProjectRegistryStore;
+  locks: ProjectLocks;
+  git: GitService;
+  compiler: CompilerResolver;
+  pdfRenderer: PdfRenderService;
+  viewer: ViewerService;
+  synctex: SyncTexService;
+  comments: CommentStore;
+  references: ReferenceResolver;
+  doctor: DoctorService;
+  rewriteModes: RewriteModeStore;
+  credentialPortal: CredentialPortal;
+  updater: UpdateService;
+}
+
+/** What one session scope brings of its own; anything left out is the process's. */
+export interface SessionOptions {
+  sessionId?: string;
+  /** With `defaultProjectExplicit`, as `WEB_LATEX_MCP_DEFAULT_PROJECT` would set them. */
+  defaultProject?: string;
+  defaultProjectExplicit?: boolean;
+  /** Credential variables for this scope only, consulted before the process env (§7.2). */
+  credentialOverlay?: Readonly<Record<string, string>>;
+}
+
+/** One session's `AppContext`, and how to end it. */
+export interface SessionScope {
+  ctx: AppContext;
+  /**
+   * End the scope: retract its session record from every project it touched (what a clean
+   * process shutdown does) and stop the viewer from consulting its projects. Safe to call again;
+   * never throws. It does not wait for or refuse calls still running in the scope — the daemon's
+   * transport does that (milestone 4); a write landing afterwards re-creates the record.
+   */
+  close: () => Promise<void>;
+}
+
+/** The scopes the shared viewer may consult, newest last (see `createSharedServices`). */
+const openScopes = new WeakMap<SharedServices, Map<ProjectManager, FileService>>();
+
+export function createSharedServices(
   config: ServerConfig,
   credentials: CredentialResolver,
   identity: CommitIdentity,
   registry?: ProjectRegistryStore,
-): AppContext {
-  const projectManager = new ProjectManager(config, registry);
-  const files = new FileService();
+): SharedServices {
+  const locks = new ProjectLocks();
   const synctex = new SyncTexService();
   const comments = new CommentStore();
   const git = new GitService(identity);
-
-  const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
-  const shelves = new ShelfStore(config.workspaceRoot, config.sessionId);
-  const rewriteModes = new RewriteModeStore(config.workspaceRoot);
-  // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
-  // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
-  // `* text=auto` normalising a binary asset's line endings looks like a peer's change and sticks
-  // the entry `conflicted` forever (#63).
-  const shadows = new ShadowStore(
-    config.workspaceRoot,
-    config.sessionId,
-    (dir, rel) => git.readAtRefBytes(dir, 'HEAD', rel),
-    undefined,
-    (dir, rel, bytes) => git.cleanBlobId(dir, rel, bytes),
-    // HEAD's commit sha, once per `refresh`, so a permanently conflicted entry is not re-merged and
-    // re-hashed (two `git hash-object` spawns) on every status/commit/push while HEAD stands still.
-    (dir) => git.headSha(dir),
-    // Two spellings of one name are one file on an ignorecase clone — and must be one shadow
-    // entry, or the second spelling's on-disk shadow file overwrites the first's.
-    (dir) => git.isCaseInsensitive(dir),
-  );
-  // Every mutation this server makes is folded into this session's shadow, so `commit` can later
-  // stage this session's lines alone. FileService is handed the hook rather than the store so it
-  // stays unaware of sessions; the project id comes from the clone directory it was given.
-  // A symlink out of a project is refused unless the project's owner has said the links in it are
-  // theirs (`followSymlinks` on a local project). See setLinkPolicy.
-  files.setLinkPolicy((dir) => projectManager.followsUserLinks(dir));
-
-  files.setMutationRecorder(
-    createSessionRecorder({
-      idForDir: (dir) => projectManager.idForDir(dir),
-      isLocal: (id) => projectManager.isLocal(id),
-      touch: (id) => sessions.touch(id),
-      record: (id, dir, rel, before, after) => shadows.record(id, dir, rel, before, after),
-      markUnrecorded: (id, rel) => shadows.markUnrecorded(id, rel),
-    }),
-  );
+  const scopes = new Map<ProjectManager, FileService>();
+  // The viewer serves every scope from one port. It resolves a project through a manager of its
+  // own (the configuration and the registry) unless a scope that is still open knows the id —
+  // a project only that session registered (`project_sync { gitUrl }`) is then found through
+  // the session that registered it, as it was when every session had its own viewer.
+  // The viewer only reads (root detection, `.tex` lookups) — never a baseline, never a recorded
+  // write — so it reads through the FileService of the scope that knows the project, whose link
+  // policy is that scope's manager's; with no such scope, through one of its own.
+  const viewerManager = new ProjectManager(config, registry, locks);
+  const viewerFiles = new FileService();
+  viewerFiles.setLinkPolicy((dir) => viewerManager.followsUserLinks(dir));
+  const scopeFor = (id: string): { pm: ProjectManager; files: FileService } => {
+    for (const [pm, files] of [...scopes].reverse()) {
+      if (pm.knownIds().includes(id)) return { pm, files };
+    }
+    return { pm: viewerManager, files: viewerFiles };
+  };
 
   // The viewer shows a project's PDF and (for comments) resolves a clicked PDF point to source via
   // synctex. Both come from ONE `locateViewerPdf` call, so the page a click lands on and the
@@ -134,8 +174,9 @@ export function createContext(
   // The root is the project's registered `rootFile`, else the auto-detected one — the order
   // `compile` and the PDF tools use too (`resolveRootFile`).
   const viewerRoot = async (id: string) => {
-    const { dir } = await projectManager.requireProjectDir(id);
-    const root = await resolveRootFile(files, dir, projectManager.registeredRootFile(id));
+    const { pm, files } = scopeFor(id);
+    const { dir } = await pm.requireProjectDir(id);
+    const root = await resolveRootFile(files, dir, pm.registeredRootFile(id));
     return { dir, root };
   };
   const viewerPdf = async (id: string) => {
@@ -143,7 +184,7 @@ export function createContext(
     return { dir, located: await locateViewerPdf(config, id, dir, root.rootFile) };
   };
   const viewer = new ViewerService({
-    knownIds: () => projectManager.knownIds(),
+    knownIds: () => [...new Set([...scopes.keys(), viewerManager].flatMap((pm) => pm.knownIds()))],
     resolveRoot: async (id) => {
       try {
         return (await viewerRoot(id)).root;
@@ -192,11 +233,12 @@ export function createContext(
     resolveComments: (id, ids) => comments.resolve(id, ids),
   });
 
-  return {
+  const shared: SharedServices = {
     config,
-    projectManager,
+    credentials,
+    registry,
+    locks,
     git,
-    files,
     // `compilerExplicit` is the whole licence for a fallback: unset means `compiler` is only a
     // default and may be substituted when it is not installed; set means the user asserted it.
     compiler: new CompilerResolver(config.compiler ?? 'latexmk', config.compilerExplicit ?? false),
@@ -204,7 +246,6 @@ export function createContext(
     viewer,
     synctex,
     comments,
-    credentials,
     // A contact email is sent only when the user set WEB_LATEX_MCP_CONTACT_EMAIL. Crossref and
     // OpenAlex offer a faster "polite pool" to identified clients; we never infer an address.
     references: new ReferenceResolver(
@@ -223,10 +264,9 @@ export function createContext(
       },
     ),
     doctor: new DoctorService(),
-    sessions,
-    shadows,
-    shelves,
-    rewriteModes,
+    rewriteModes: new RewriteModeStore(config.workspaceRoot),
+    // The keychain is the machine's, so a token entered on the portal goes through the process's
+    // own resolver, whichever session opened the page.
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),
@@ -234,4 +274,127 @@ export function createContext(
     // WEB_LATEX_MCP_INSTALL_KIND); unset, the updater never infers the extension.
     updater: new UpdateService({ installKind: config.installKind }),
   };
+  openScopes.set(shared, scopes);
+  return shared;
+}
+
+/**
+ * Build one session's `AppContext` over `shared`. stdio builds exactly one; a daemon builds one
+ * per MCP session. The scope's `config` is a copy of the process's with this session's id and
+ * default project — read the process's settings from `shared.config` before calling this, since
+ * a later write to it does not reach a scope already built.
+ */
+export function createSessionContext(
+  shared: SharedServices,
+  opts: SessionOptions = {},
+): SessionScope {
+  // The id names this session's directories under `.sessions/<project>/`, so it must already be
+  // one `parseSessionId` would produce (and not a reserved name, which it refuses). Two open
+  // scopes with one id would share a shadow index and see no peer in each other; telling them
+  // apart is the daemon's job when it assigns ids (docs/design/shared-server.md §5.2).
+  if (
+    opts.sessionId !== undefined &&
+    (!opts.sessionId.trim() || parseSessionId(opts.sessionId) !== opts.sessionId)
+  ) {
+    throw new Error(
+      `Session id ${quoteId(opts.sessionId)} is not usable; use letters, digits, ".", "_" or "-".`,
+    );
+  }
+  const config: ServerConfig = {
+    ...shared.config,
+    sessionId: opts.sessionId ?? shared.config.sessionId,
+    defaultProject:
+      opts.defaultProject !== undefined ? opts.defaultProject : shared.config.defaultProject,
+    defaultProjectExplicit:
+      opts.defaultProjectExplicit !== undefined
+        ? opts.defaultProjectExplicit
+        : shared.config.defaultProjectExplicit,
+  };
+  const projectManager = new ProjectManager(config, shared.registry, shared.locks);
+  const files = new FileService();
+  const credentials =
+    opts.credentialOverlay !== undefined
+      ? shared.credentials.withOverlay(opts.credentialOverlay)
+      : shared.credentials;
+  const { git } = shared;
+
+  const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
+  const shelves = new ShelfStore(config.workspaceRoot, config.sessionId);
+  // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
+  // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
+  // `* text=auto` normalising a binary asset's line endings looks like a peer's change and sticks
+  // the entry `conflicted` forever (#63).
+  const shadows = new ShadowStore(
+    config.workspaceRoot,
+    config.sessionId,
+    (dir, rel) => git.readAtRefBytes(dir, 'HEAD', rel),
+    undefined,
+    (dir, rel, bytes) => git.cleanBlobId(dir, rel, bytes),
+    // HEAD's commit sha, once per `refresh`, so a permanently conflicted entry is not re-merged and
+    // re-hashed (two `git hash-object` spawns) on every status/commit/push while HEAD stands still.
+    (dir) => git.headSha(dir),
+    // Two spellings of one name are one file on an ignorecase clone — and must be one shadow
+    // entry, or the second spelling's on-disk shadow file overwrites the first's.
+    (dir) => git.isCaseInsensitive(dir),
+  );
+  // Every mutation this session makes is folded into this session's shadow, so `commit` can later
+  // stage this session's lines alone. FileService is handed the hook rather than the store so it
+  // stays unaware of sessions; the project id comes from the clone directory it was given.
+  // A symlink out of a project is refused unless the project's owner has said the links in it are
+  // theirs (`followSymlinks` on a local project). See setLinkPolicy.
+  files.setLinkPolicy((dir) => projectManager.followsUserLinks(dir));
+
+  files.setMutationRecorder(
+    createSessionRecorder({
+      idForDir: (dir) => projectManager.idForDir(dir),
+      isLocal: (id) => projectManager.isLocal(id),
+      touch: (id) => sessions.touch(id),
+      record: (id, dir, rel, before, after) => shadows.record(id, dir, rel, before, after),
+      markUnrecorded: (id, rel) => shadows.markUnrecorded(id, rel),
+    }),
+  );
+
+  const ctx: AppContext = {
+    config,
+    projectManager,
+    git,
+    files,
+    compiler: shared.compiler,
+    pdfRenderer: shared.pdfRenderer,
+    viewer: shared.viewer,
+    synctex: shared.synctex,
+    comments: shared.comments,
+    credentials,
+    references: shared.references,
+    doctor: shared.doctor,
+    sessions,
+    shadows,
+    shelves,
+    rewriteModes: shared.rewriteModes,
+    credentialPortal: shared.credentialPortal,
+    updater: shared.updater,
+  };
+
+  const scopes = openScopes.get(shared);
+  scopes?.set(projectManager, files);
+  // Not memoised: a write that lands after a close re-creates the record (see `release`), and a
+  // second close must retract that one too.
+  const close = async (): Promise<void> => {
+    scopes?.delete(projectManager);
+    await Promise.all(sessions.trackedProjects().map((id) => sessions.release(id).catch(() => {})));
+  };
+  return { ctx, close };
+}
+
+/**
+ * One process, one session: the shared services and a single scope over them. What stdio runs,
+ * and what most tests build.
+ */
+export function createContext(
+  config: ServerConfig,
+  credentials: CredentialResolver,
+  identity: CommitIdentity,
+  registry?: ProjectRegistryStore,
+): AppContext {
+  return createSessionContext(createSharedServices(config, credentials, identity, registry)).ctx;
 }

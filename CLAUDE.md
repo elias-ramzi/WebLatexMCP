@@ -48,7 +48,12 @@ logic lives in services, unit-testable without an MCP client.
   unset.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext` dependency bag (`projectManager`, `git`, `files`, `compiler`,
-  `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …).
+  `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …), built
+  as `createSharedServices` (one per process) + `createSessionContext` (one per session; stdio runs
+  one, `createContext` is both). **Per session, never shared:** `ProjectManager` (over the shared
+  `ProjectLocks` mutex table), `FileService` (baselines are "what this session saw"), session
+  registry, shadows, shelves, and the credential overlay (`CredentialResolver.withOverlay`, memory
+  only, scrubbed by that scope's `allSecrets`). `sharedServices.test.ts` pins it.
 - `src/tools/*` — one file per tool: zod `inputSchema`/`outputSchema` + a handler calling services.
 - `src/prompts/skills.ts` — exposes each `.claude/skills/*/SKILL.md` (loaded by `src/lib/skills.ts`) as
   an MCP prompt. Adding a skill directory needs no code.
