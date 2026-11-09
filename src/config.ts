@@ -12,6 +12,7 @@ import {
   countRegisteredProjects,
 } from './services/projectRegistry.js';
 import { toPosix } from './lib/paths.js';
+import { DEFAULT_MAX_PARALLEL_BUILDS, MAX_PARALLEL_BUILDS_CEILING } from './lib/workGate.js';
 import { homeWorkspaceRoot, migrateWorkspaceCommand } from './lib/workspaceNote.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
@@ -579,6 +580,7 @@ export function loadConfig(
     env.WEB_LATEX_MCP_COMPILER,
   );
   const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
+  const maxParallelBuilds = parseMaxParallelBuilds(env.WEB_LATEX_MCP_MAX_PARALLEL_BUILDS);
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
@@ -615,6 +617,7 @@ export function loadConfig(
     compiler,
     compilerExplicit,
     viewerPort,
+    maxParallelBuilds,
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,
@@ -678,6 +681,24 @@ function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
   throw new Error(
     `WEB_LATEX_MCP_VIEWER_TARGET ${quoteEnvValue(raw ?? '')} is invalid; expected "browser" or "vscode".`,
   );
+}
+
+/**
+ * Parse `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`: how many compiles and PDF loads run at once
+ * (`src/lib/workGate.ts`). Unset → the default; anything but an integer 1–32 is refused, as a bad
+ * viewer port is.
+ */
+export function parseMaxParallelBuilds(raw: string | undefined): number {
+  const value = raw?.trim();
+  if (!value) return DEFAULT_MAX_PARALLEL_BUILDS;
+  const n = Number(value);
+  if (!/^[0-9]+$/.test(value) || !Number.isInteger(n) || n < 1 || n > MAX_PARALLEL_BUILDS_CEILING) {
+    throw new Error(
+      `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS ${quoteEnvValue(raw ?? '')} is invalid; expected a whole ` +
+        `number from 1 to ${MAX_PARALLEL_BUILDS_CEILING}.`,
+    );
+  }
+  return n;
 }
 
 /** Parse an optional fixed viewer port; undefined (the default) means OS-assigned ephemeral. */

@@ -53,7 +53,9 @@ logic lives in services, unit-testable without an MCP client.
 - `src/daemon/*` — `web-latex-mcp serve` (`startDaemon`): Streamable HTTP on `127.0.0.1`, one
   `SessionScope` + `McpServer` + transport per MCP session over one `createSharedServices`.
   `guardRequest` (bearer in constant time, exact `Host`, any `Origin` refused) runs on **every**
-  request, `/health` included. `daemon.lock` (via `withFileLock`) held for the daemon's life;
+  request, `/health` included. The viewer and credential portal run `browserRequestRefusal`
+  (`src/lib/loopbackHost.ts`) first in their handlers: `Host` names the listener, and a non-GET/HEAD
+  `Origin` must be the listener's own. `daemon.lock` (via `withFileLock`) held for the daemon's life;
   `daemon.json` `0600` in a `0700` `.daemon/`, removed only by the daemon that wrote it. A closing
   session leaves the routing map first, drains running calls, then closes its scope. Per-connection
   headers are parsed in `sessionHeaders.ts` and refuse rather than rewrite. Guides load per session
@@ -549,6 +551,10 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### Compile
 
+- **Compiles and PDF loads share one process-wide `WorkGate`** (`src/lib/workGate.ts`,
+  `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`, default 2, FIFO), applied by wrapping the compiler and the
+  renderer in `createSharedServices` (`src/services/gatedWork.ts`); tools never take it. A slot is
+  taken inside `runExclusive`, and no gated call may make another (a limit of 1 would deadlock).
 - **Backend preflight; only an unchosen default is substituted** (`CompilerResolver`,
   `src/services/compilerResolver.ts`, calls `isAvailable()`). `config.compilerExplicit` (from
   `parseCompilerChoice` — derive both answers there) is the licence: unset env → missing `latexmk` may

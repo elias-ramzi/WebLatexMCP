@@ -1,4 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { allowedHosts, hostAllowed } from '../lib/loopbackHost.js';
+
+export { allowedHosts };
 
 /**
  * Who may talk to the daemon (docs/design/shared-server.md §10). Stdio needed none of this: only
@@ -25,14 +28,6 @@ export interface GuardRefusal {
   message: string;
 }
 
-/** The `Host` values the daemon answers to on `port`. */
-export function allowedHosts(port: number): string[] {
-  const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
-  // A client omits the default port from `Host` (RFC 9110 §7.2).
-  if (port === 80) hosts.push('127.0.0.1', 'localhost');
-  return hosts;
-}
-
 /** Constant-time equality of two strings, whatever their lengths. */
 export function sameSecret(given: string, expected: string): boolean {
   // Hashing first gives equal-length inputs, so the comparison leaks neither content nor length.
@@ -49,8 +44,7 @@ export function guardRequest(
   if (req.origin !== undefined) {
     return { status: 403, message: 'Requests from a browser (with an Origin header) are refused.' };
   }
-  const host = req.host?.toLowerCase();
-  if (host === undefined || !allowedHosts(expected.port).includes(host)) {
+  if (!hostAllowed(req.host, expected.port)) {
     return { status: 421, message: 'Unexpected Host header; this listener is loopback only.' };
   }
   const match = /^Bearer ([^\s]+)$/.exec(req.authorization ?? '');

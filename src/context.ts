@@ -3,6 +3,9 @@ import type { ProjectRegistryStore } from './services/projectManager.js';
 import { GitService } from './services/gitService.js';
 import { FileService } from './services/fileService.js';
 import { CompilerResolver } from './services/compilerResolver.js';
+import { createCompiler } from './services/compiler.js';
+import { gatedCompiler, gatedRenderer } from './services/gatedWork.js';
+import { DEFAULT_MAX_PARALLEL_BUILDS, WorkGate } from './lib/workGate.js';
 import { PdfRenderer } from './services/pdfRender.js';
 import { ViewerService } from './services/viewer.js';
 import { SyncTexService } from './services/synctex.js';
@@ -147,6 +150,8 @@ export function createSharedServices(
   registry?: ProjectRegistryStore,
 ): SharedServices {
   const locks = new ProjectLocks();
+  // One limit on compiles and PDF loads for every session this process serves (`workGate.ts`).
+  const gate = new WorkGate(config.maxParallelBuilds ?? DEFAULT_MAX_PARALLEL_BUILDS);
   const synctex = new SyncTexService();
   const comments = new CommentStore();
   const git = new GitService(identity);
@@ -244,8 +249,12 @@ export function createSharedServices(
     git,
     // `compilerExplicit` is the whole licence for a fallback: unset means `compiler` is only a
     // default and may be substituted when it is not installed; set means the user asserted it.
-    compiler: new CompilerResolver(config.compiler ?? 'latexmk', config.compilerExplicit ?? false),
-    pdfRenderer: new PdfRenderer(),
+    compiler: new CompilerResolver(
+      config.compiler ?? 'latexmk',
+      config.compilerExplicit ?? false,
+      (kind) => gatedCompiler(createCompiler(kind), gate),
+    ),
+    pdfRenderer: gatedRenderer(new PdfRenderer(), gate),
     viewer,
     synctex,
     comments,

@@ -25,6 +25,12 @@ shared server costs about 100 MB more for one session, breaks even around two, a
 100 MB per session beyond that. Most of a relay's 97 MB is Node and the SDK's HTTP client; a relay
 without the SDK transports could be lighter still.
 
+Those figures are for sessions taking turns. Sessions compiling at the same moment add one TeX run
+and one pdf.js document each, so the shared server queues them: at most
+`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS` (default 2) compiles and PDF reads run at once, the rest wait in
+arrival order (`src/lib/workGate.ts`). A waiter holds its project lock, never a slot while waiting
+for one.
+
 The default workspace makes things worse for anyone with many papers. It depends on where the
 client was launched: inside a git repository it is `<launch-dir>/.web_latex_mcp`, otherwise
 `~/.web-latex-mcp/projects`. Projects registered from different repositories therefore end up in
@@ -312,8 +318,10 @@ can be reached by every local process and, through DNS rebinding, by web pages.
 - Body size cap (4 MB, above any legitimate `write_file`), and a cap on open scopes (64).
 - On win32 the file mode is not enforced the same way. Say so in the docs, as the build-root
   bullet does, and don't claim more.
-- The viewer and the credential portal keep their own loopback listeners and nonces. They get the
-  same `Host` check while we're at it.
+- The viewer and the credential portal keep their own loopback listeners (the portal also its
+  nonce). They get the same `Host` check; being pages a browser opens, they accept an `Origin`, but
+  only their own on a request that changes something, so another site's form cannot post a comment
+  or a token (`src/lib/loopbackHost.ts`).
 - Nothing about tokens changes on disk: the per-scope overlay (§7.2) is memory only.
 
 ## 11. Risks
@@ -389,7 +397,6 @@ Still open, for milestone 6 or later:
 - **Overlay contents.** Every overlay value is scrubbed from the scope's output; the daemon accepts
   any variable-shaped name in `X-Web-Latex-Mcp-Credentials`, so the proxy must send credentials
   only.
-- **The viewer and credential portal listeners** do not yet get the `Host` check (§10).
 - **`~/.web-latex-mcp/config.json`** (§7.1) is not read yet; the daemon reads its own env only.
 - **The ignored-env hint** reaches `server_info` only, not yet the session's first tool result
   (§7.1).

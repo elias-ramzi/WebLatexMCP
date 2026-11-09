@@ -54,6 +54,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`** (default 2): how many compiles and PDF reads
+  (`render_pages`, `extract_text`, `pdf_geometry`) one server runs at once. The rest wait their
+  turn, so several sessions compiling together on the shared server no longer each add a TeX run
+  and a PDF in memory at the same time.
+
 - **Docs for the shared server** (milestone 6 of `docs/design/shared-server.md`): a new
   [shared server](docs/install/shared-server.md) install page with launchd and systemd units, a
   Windows Task Scheduler entry (unverified) and a direct-HTTP setup for Claude Code
@@ -96,6 +101,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 - A project registered with `tokenEnv` naming an inherited object key (`toString`, `constructor`)
   no longer crashes credential lookup.
+
+### Security
+
+- The PDF viewer and the `credential_portal` page answer only requests that name them in `Host`
+  (`127.0.0.1:<port>` or `localhost:<port>`), which stops a web page from reaching them through
+  DNS rebinding, and refuse a POST from another site, so a page cannot add viewer comments or
+  submit a token.
 
 ## [0.9.0] - 2026-10-05
 

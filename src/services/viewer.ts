@@ -2,6 +2,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
+import { browserRequestRefusal } from '../lib/loopbackHost.js';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { Comment, NewComment } from './commentStore.js';
@@ -717,6 +718,8 @@ refreshComments();
 export class ViewerService {
   private server?: http.Server;
   private baseUrl?: string;
+  /** Where the listener is bound, for the `Host` check (`browserRequestRefusal`). */
+  private listening?: { port: number; bindHost: string };
 
   constructor(private readonly deps: ViewerDeps) {}
 
@@ -768,6 +771,7 @@ export class ViewerService {
         server.removeListener('error', onError);
         const addr = server.address() as AddressInfo;
         this.server = server;
+        this.listening = { port: addr.port, bindHost: host };
         this.baseUrl = `http://${host}:${addr.port}`;
         resolve(this.baseUrl);
       });
@@ -785,11 +789,24 @@ export class ViewerService {
       await closed;
     }
     this.server = undefined;
+    this.listening = undefined;
     this.baseUrl = undefined;
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
+      // Before anything else: a DNS-rebinding page names itself in `Host`, and a cross-site form
+      // POST carries its own `Origin` (docs/design/shared-server.md §10).
+      const refusal = this.listening
+        ? browserRequestRefusal(
+            { method: req.method, host: req.headers.host, origin: req.headers.origin },
+            this.listening,
+          )
+        : { status: 421 as const, message: 'Not listening.' };
+      if (refusal) {
+        res.writeHead(refusal.status, { 'Content-Type': 'text/plain' }).end(`${refusal.message}\n`);
+        return;
+      }
       const method = req.method ?? 'GET';
       if (method !== 'GET' && method !== 'HEAD' && method !== 'POST') {
         res.writeHead(405, { Allow: 'GET, HEAD, POST' }).end();

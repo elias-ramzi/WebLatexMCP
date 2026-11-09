@@ -192,6 +192,11 @@ export interface ServerConfig {
   compilerExplicit?: boolean;
   /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
   viewerPort?: number;
+  /**
+   * How many compiles and PDF loads run at once in this process (`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`,
+   * `src/lib/workGate.ts`); the rest queue. Omit for `DEFAULT_MAX_PARALLEL_BUILDS`.
+   */
+  maxParallelBuilds?: number;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
   /**
