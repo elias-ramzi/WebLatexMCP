@@ -29,6 +29,17 @@ folder in use. If an earlier version of the extension ran with the field blank, 
 registered in `~/.web-latex-mcp/projects`; `list_projects` says so, and pointing the field at that
 folder brings them back.
 
+## One server for Desktop and Claude Code
+
+The extension relays to the workspace's [shared server](shared-server.md), starting it when none is
+running; every Desktop chat is one session on it (Desktop runs one server per extension). The
+workspace folder decides which shared server that is: with the prefilled `~/latex-workspace`,
+Desktop has its own. Set **Clone workspace folder** to `~/.web-latex-mcp/projects`, the Claude Code
+default, to share one project list and one server with your Claude Code sessions — move existing
+projects first with `npx web-latex-mcp migrate-workspace ~/latex-workspace` if you have some. After
+you quit Desktop, the shared server stays up until 30 minutes without a session; `npx web-latex-mcp
+daemon stop` stops it at once.
+
 Node.js is bundled with Claude Desktop, so for editing and git the only other thing to install is
 **git 2.25 or newer** on your `PATH` (`doctor` checks the version). Only **`compile`** needs a TeX
 toolchain (`latexmk` or `tectonic`) on your `PATH` — see the per-OS guides
@@ -51,7 +62,9 @@ Claude calls [`update_server`](../tools.md), which compares the running version 
 [latest release](https://github.com/elias-ramzi/WebLatexMCP/releases/latest). With `install: true` it
 downloads `web-latex-mcp.mcpb`, checks it against the SHA-256 digest GitHub publishes for that file,
 and opens it. Claude Desktop then shows its usual install prompt. **Confirm it there**, and the
-extension restarts on the new version (`server_info` reports which one is running). If the bundle
+extension restarts on the new version (`server_info` reports which one is running). The shared
+server it relays to is replaced by the new version at once when no other session uses it, or as
+soon as the last one ends (`server_info` shows `restartPending` meanwhile). If the bundle
 could not be opened automatically, or no install prompt appears, drag the file whose path the tool
 gives onto the Claude Desktop window.
 
@@ -69,8 +82,9 @@ so it's there next time too.
 
 ## Credentials — three options, none of which put the token in the config file
 
-- **Enter it in the install form** (Overleaf/GitHub token fields). Masked; handed to the server as an env
-  var, not written into a project. Overleaf tokens are created under
+- **Enter it in the install form** (Overleaf/GitHub token fields). Masked; handed to the extension as an
+  env var and sent with its session only, never written into a project or into the shared server's
+  environment. Overleaf tokens are created under
   [Account Settings → Git integration](https://www.overleaf.com/user/settings).
 - **`credential_portal`** — ask Claude to open the credential portal; you type the token into a **local
   `127.0.0.1` page**, so it never passes through the chat, and it lands in your OS keychain.

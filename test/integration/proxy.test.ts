@@ -316,4 +316,20 @@ describe('the stdio proxy', () => {
     await b.end();
     await daemons[0]?.stopped;
   });
+
+  it('serves a client that lists its projects in the environment in-process, saying why', async () => {
+    const { workspace } = await workspaceWithClone();
+    const { toServer, fromServer } = streamPair();
+    const outcome = await runProxy({
+      env: { WEB_LATEX_MCP_WORKSPACE: workspace, WEB_LATEX_MCP_PROJECTS: '{"p":{"gitUrl":"x"}}' },
+      cwd: workspace,
+      stdin: toServer,
+      stdout: fromServer,
+      log: () => {},
+      autostart: () => Promise.reject(new Error('not expected')),
+    });
+    expect(outcome).toMatchObject({ kind: 'unavailable' });
+    expect((outcome as { reason: string }).reason).toMatch(/import-env-projects/);
+    expect(await findDaemon(workspace)).toBeUndefined();
+  });
 });

@@ -225,7 +225,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### Parallel sessions, shadows and commit
 
-- **Sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names the process (`parseSessionId`;
+- **Sessions share a clone; commits don't.** A session is an MCP connection — one scope in the shared server, or one `--standalone` process; `WEB_LATEX_MCP_SESSION` (the proxy's `X-Web-Latex-Mcp-Session`) names it (`parseSessionId`;
   `RESERVED_SESSION_IDS` refuses `shelves`, `project.lock`, `rewrite-mode.json` — add any new
   project-level entry under `.sessions/<id>/` there by hand). State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`). **Guarantee: a commit contains one

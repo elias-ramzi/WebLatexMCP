@@ -44,6 +44,13 @@ claude mcp add web-latex-mcp --scope user -- npx -y web-latex-mcp
 
 💡 Launch Claude Code **from your paper's own repo** so the LaTeX clone lands right beside your code.
 
+## One server for every session
+
+However you install it, the command your client starts relays to **one shared server** per workspace,
+started in the background on first use, so ten Claude sessions run one server rather than ten. Each
+session still keeps its own changes and commits only its own lines. To run that server as a login
+service, connect to it over HTTP, or opt out (`--standalone`), see [The shared server](shared-server.md).
+
 ## TeX is optional
 
 Editing, git, and the PDF viewer all work with no TeX installed — only `compile` needs `latexmk` (the
@@ -62,11 +69,12 @@ Each guide covers both **Claude Code** and **Claude Desktop**:
 - [Windows](windows.md)
 
 All three end at the same place: the server registered over stdio, with a token resolved from an env
-var, the GitHub CLI, or your OS git credential helper.
+var, the GitHub CLI, or your OS git credential helper. Every session on a workspace shares one
+[background server](shared-server.md); nothing to set up for it.
 
 ## Configuration
 
-Prefer env vars — `WEB_LATEX_MCP_PROJECTS`, per-host tokens, the workspace root, the compiler? The
+Prefer env vars — per-host tokens, the workspace root, the compiler? The
 full reference, including per-host token resolution and the cross-platform notes, is in
 [Configuration](../configuration.md).
 

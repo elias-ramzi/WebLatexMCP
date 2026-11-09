@@ -50,6 +50,18 @@ const endpointOf = (found: FoundDaemon): Endpoint => ({
 });
 
 export async function runProxy(io: ProxyIo): Promise<ProxyOutcome> {
+  // A config listing its projects in the environment keeps working exactly as before: the shared
+  // server serves the central registry and ignores that list (Q2), so this client is served
+  // in-process until its projects are imported.
+  if (io.env.WEB_LATEX_MCP_PROJECTS?.trim()) {
+    return {
+      kind: 'unavailable',
+      reason:
+        'WEB_LATEX_MCP_PROJECTS is set, and the shared server does not read it; run ' +
+        '`web-latex-mcp import-env-projects` once and remove it from this config to use the ' +
+        'shared server',
+    };
+  }
   let workspaceRoot: string;
   try {
     workspaceRoot = resolveWorkspace(io.env.WEB_LATEX_MCP_WORKSPACE, io.cwd);

@@ -54,6 +54,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Docs for the shared server** (milestone 6 of `docs/design/shared-server.md`): a new
+  [shared server](docs/install/shared-server.md) install page with launchd and systemd units, a
+  Windows Task Scheduler entry (unverified) and a direct-HTTP setup for Claude Code
+  (`headersHelper`); a per-session vs server-wide settings table in `docs/configuration.md`;
+  `docs/CONCURRENCY.md` on sessions as connections. `web-latex-mcp daemon headers` prints the
+  headers a direct HTTP client needs. A config that still lists `WEB_LATEX_MCP_PROJECTS` is served
+  in-process, as before, instead of losing its projects to the shared server, which does not read
+  that list; `server_info` names `import-env-projects` as the way onto the shared server.
 - **`web-latex-mcp serve`: one shared server for every session** (milestone 4 of
   `docs/design/shared-server.md`, preview). It serves MCP over Streamable HTTP on `127.0.0.1`,
   guarded by a bearer token in `<workspace>/.daemon/daemon.json` (`0600`) and by Host and Origin

@@ -46,6 +46,7 @@ every change, and nothing reaches Overleaf until you say so.
 - 🧑‍⚖️ **Pre-submission peer review** — a multi-model reviewer panel, merged into one verified review ([how it works](https://claude.ai/artifact/Kg5Zuk3wvu9XfprmPgv2rR)).
 - 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 🪶 **One server for all your sessions** — every Claude session on a workspace shares one background server, so ten sessions cost one process, and each still commits only its own lines ([details](docs/install/shared-server.md)).
 
 ## Install
 

@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestones 1–5 (§13) are implemented; milestone 6 (docs and packaging) is not.
+Status: **accepted** (decisions in §14). All six milestones (§13) are implemented; the open items are listed just before §12.
 
 ## 1. Why
 
