@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { mkdir, readdir, readFile, writeFile, rm, rename } from 'node:fs/promises';
 import { sessionDir, sessionStateDir } from '../lib/sessionPaths.js';
-import { renameWithRetry } from '../lib/fileLock.js';
+import { processNonce, renameWithRetry } from '../lib/fileLock.js';
+import { isScopeOpen } from '../lib/openScopes.js';
 import {
   currentBootStamp,
   isSameBoot,
@@ -17,6 +18,13 @@ export interface SessionRecord {
   heartbeatAt: string;
   /** Approximate instant the machine booted, stamped when the record was written. */
   bootedAt?: string;
+  /**
+   * The writing process's `processNonce` (`src/lib/fileLock.ts`), written only by a session scope
+   * (`createSessionContext`). A record carrying this process's nonce and pid is live exactly while
+   * its scope is open here (`src/lib/openScopes.ts`); absent, or another process's, today's pid,
+   * boot and heartbeat rules apply. Older builds never write it.
+   */
+  processNonce?: string;
 }
 
 /** A session as seen by a peer, with liveness resolved. */
@@ -83,6 +91,12 @@ export class SessionRegistry {
   constructor(
     private readonly workspaceRoot: string,
     readonly sessionId: string,
+    /**
+     * `scoped: true` (a session scope's registry) stamps this process's nonce into the records it
+     * writes, so peers in this process judge them by whether the scope is open. A bare registry
+     * writes records judged by pid and heartbeat, as every record was before scopes.
+     */
+    private readonly opts: { scoped?: boolean } = {},
   ) {}
 
   /** Record this session as working on `projectId`, throttled to one write per interval. */
@@ -120,6 +134,7 @@ export class SessionRegistry {
       // this heartbeat still grants it the pid clause via `writtenSinceProcessStart`, and failing
       // that it falls back to the bounded heartbeat-liveness clause below.
       bootedAt: readBootStamp(),
+      ...(this.opts.scoped === true ? { processNonce } : {}),
     };
     await writeAtomic(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
   }
@@ -155,6 +170,16 @@ export class SessionRegistry {
         if (!record) return null;
         const age = Date.now() - Date.parse(record.heartbeatAt);
         const self = record.sessionId === this.sessionId;
+        // A scope of this very process (same pid AND nonce): its pid says nothing — every scope
+        // here shares it — so it is live exactly while its scope is open (§5.3). Pid, boot and
+        // heartbeat are not consulted for it. Every other record keeps the rules below.
+        if (record.pid === process.pid && record.processNonce === processNonce) {
+          return {
+            ...record,
+            self,
+            live: self || isScopeOpen(this.workspaceRoot, record.sessionId),
+          } satisfies PeerSession;
+        }
         return {
           ...record,
           self,
@@ -301,6 +326,8 @@ export class SessionRegistry {
       startedAt: typeof r.startedAt === 'string' ? r.startedAt : r.heartbeatAt,
       heartbeatAt: r.heartbeatAt,
       ...(typeof r.bootedAt === 'string' ? { bootedAt: r.bootedAt } : {}),
+      // Not a string → no nonce: the record is judged by today's rules, never by an open scope.
+      ...(typeof r.processNonce === 'string' ? { processNonce: r.processNonce } : {}),
     };
   }
 }

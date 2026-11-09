@@ -25,6 +25,7 @@ import { locateViewerPdf } from './lib/pdfLocate.js';
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
 import { ProjectLocks } from './lib/projectLocks.js';
+import { openScope } from './lib/openScopes.js';
 import { parseSessionId } from './config.js';
 import { quoteId } from './lib/projectId.js';
 import type { ServerConfig } from './types.js';
@@ -128,14 +129,16 @@ export interface SessionScope {
   /**
    * End the scope: retract its session record from every project it touched (what a clean
    * process shutdown does) and stop the viewer from consulting its projects. Safe to call again;
-   * never throws. It does not wait for or refuse calls still running in the scope — the daemon's
-   * transport does that (milestone 4); a write landing afterwards re-creates the record.
+   * never throws. From here on peers in this process read the session dead (§5.3,
+   * `src/lib/openScopes.ts`). It does not wait for or refuse calls still running in the scope —
+   * the daemon's transport does that (milestone 4); a write landing afterwards re-creates the
+   * record, which this process reads dead and other processes read by pid.
    */
   close: () => Promise<void>;
 }
 
 /** The scopes the shared viewer may consult, newest last (see `createSharedServices`). */
-const openScopes = new WeakMap<SharedServices, Map<ProjectManager, FileService>>();
+const viewerScopes = new WeakMap<SharedServices, Map<ProjectManager, FileService>>();
 
 export function createSharedServices(
   config: ServerConfig,
@@ -274,7 +277,7 @@ export function createSharedServices(
     // WEB_LATEX_MCP_INSTALL_KIND); unset, the updater never infers the extension.
     updater: new UpdateService({ installKind: config.installKind }),
   };
-  openScopes.set(shared, scopes);
+  viewerScopes.set(shared, scopes);
   return shared;
 }
 
@@ -318,7 +321,7 @@ export function createSessionContext(
       : shared.credentials;
   const { git } = shared;
 
-  const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId);
+  const sessions = new SessionRegistry(config.workspaceRoot, config.sessionId, { scoped: true });
   const shelves = new ShelfStore(config.workspaceRoot, config.sessionId);
   // The clean-filter hasher lets ShadowStore judge HEAD/shadow equality the way `commitContents`
   // actually writes blobs (gitattributes-filtered), instead of raw bytes — otherwise a clone-wide
@@ -375,12 +378,16 @@ export function createSessionContext(
     updater: shared.updater,
   };
 
-  const scopes = openScopes.get(shared);
+  const scopes = viewerScopes.get(shared);
   scopes?.set(projectManager, files);
+  // Open from here until `close`: peers in this process read this session live while it is
+  // (`src/lib/openScopes.ts`), however long it stays quiet.
+  const markClosed = openScope(config.workspaceRoot, config.sessionId);
   // Not memoised: a write that lands after a close re-creates the record (see `release`), and a
   // second close must retract that one too.
   const close = async (): Promise<void> => {
     scopes?.delete(projectManager);
+    markClosed();
     await Promise.all(sessions.trackedProjects().map((id) => sessions.release(id).catch(() => {})));
   };
   return { ctx, close };

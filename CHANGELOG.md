@@ -43,6 +43,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Liveness by open scope** (milestone 3 of `docs/design/shared-server.md`). A session record
+  written by a session scope now carries its process's nonce; another session in the same process
+  reads it live exactly while that scope is open, whatever its heartbeat, and dead once it closes.
+  Records from other processes, and from older versions, are judged by pid and heartbeat as
+  before.
 - **Session scopes over shared services** (milestone 2 of `docs/design/shared-server.md`).
   `createContext` is now `createSharedServices` (one per process: lock table, registry, git,
   compiler, viewer, comments, reference backends) plus `createSessionContext` (one per session:

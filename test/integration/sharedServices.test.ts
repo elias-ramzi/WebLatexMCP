@@ -241,4 +241,39 @@ describe('session scopes sharing one set of services', () => {
     await a.scope.close();
     await expect(access(record)).rejects.toThrow();
   });
+
+  it("stops a peer's default commit refusing on a session once its scope closes (§5.3)", async () => {
+    const { session, dir } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    await call(b, 'edit_file', {
+      path: REL,
+      edits: [{ oldString: 'Beta.', newString: 'Beta, by B.' }],
+    });
+
+    // A tracks nothing and B is open: the default scope would widen past a live peer.
+    expect(await callError(a, 'commit', { message: 'take everything' })).toMatch(/beta/);
+
+    await b.scope.close();
+    const done = await call<{ committed: boolean }>(a, 'commit', { message: 'take everything' });
+    expect(done.committed).toBe(true);
+    expect(await simpleGit(dir).show(['HEAD:main.tex'])).toContain('Beta, by B.');
+  });
+
+  it('reads a closed scope dead even when a late write re-created its record', async () => {
+    const { session, workspace } = await setup();
+    const a = await session('alpha');
+    const b = await session('beta');
+    await b.scope.close();
+    await call(b, 'edit_file', {
+      path: REL,
+      edits: [{ oldString: 'Beta.', newString: 'B late.' }],
+    });
+
+    const peers = await a.scope.ctx.sessions.peers('demo');
+    expect(peers.find((p) => p.sessionId === 'beta')).toMatchObject({ live: false });
+    await expect(
+      access(path.join(sessionDir(workspace, 'demo', 'beta'), 'session.json')),
+    ).resolves.toBeUndefined();
+  });
 });

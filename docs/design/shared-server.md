@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestones 1 and 2 (§13) are implemented; the rest is not.
+Status: **accepted** (decisions in §14). Milestones 1–3 (§13) are implemented; the rest is not.
 
 ## 1. Why
 
@@ -321,7 +321,10 @@ daemon-only gap, with no effect on stdio's single scope):
   scope already holds; §5.2's suffixing belongs to the daemon, which assigns ids.
 - **Calls after close.** `close()` neither waits for nor refuses a running call; the transport
   must. A write that lands after close re-creates the session record (the heartbeat throttle is
-  reset on release), so peers still see it.
+  reset on release); peers in other processes then read it live by pid, but peers in this process
+  read it dead (§5.3), so its lines are unprotected there until the transport refuses such calls.
+- **Idle close (§5.3 item 5).** Nothing closes a scope for idleness yet; with stdio the scope
+  closes when the process does. `SESSION_IDLE_MS` comes with the daemon, after Q5 is measured.
 - **Viewer's view of a shared project.** The viewer resolves an id through the newest open scope
   that knows it, so a session's pin or session-only `rootFile` decides what the viewer shows while
   that session is open. Prefer the scope that opened the viewer, or the registry, once scopes

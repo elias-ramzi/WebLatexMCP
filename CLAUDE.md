@@ -308,6 +308,11 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `capUnshelveConflict` (`src/lib/shelf.ts`) with `theirs` charged first, cut last, exempt from the
   per-side cap. Ownership as for `revert` (`before` = shelf base on restore, HEAD on merge;
   `resolveUnshelveFile`). A failed `record` is only logged — a known gap, not a pattern.
+- **A scope's own records are judged by the scope** (`src/lib/openScopes.ts`): a record carrying
+  this process's `processNonce` and pid (written only by a `scoped: true` `SessionRegistry`, i.e.
+  `createSessionContext`) is live exactly while `isScopeOpen(workspace, id)`; pid/boot/heartbeat
+  are not consulted. The table is process-wide, so contexts built per simulated process in tests
+  still see each other. A test faking another process's record must drop `processNonce`.
 - **`status` collapses a dead, change-free peer into `staleSessions: N`** — reporting only, never
   deletion (`isStalePeer`/`splitStalePeers`, `src/lib/peerSummary.ts`). One conjunction: `!live`, index
   read as a readable **empty** array (`null` = unreadable → stays listed with `changes: null`), heartbeat
