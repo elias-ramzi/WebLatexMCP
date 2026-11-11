@@ -46,6 +46,19 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   the error now gives the `register_project` call to repeat here, or the `WEB_LATEX_MCP_WORKSPACE`
   setting to use it.
 
+- **`credential_portal` no longer collects a token git will throw away, and says where it goes.**
+  With no git credential helper configured, `git credential approve` keeps nothing, and the user
+  only learned that after typing the token in. The tool now asks git first and, finding no helper,
+  opens no page: it returns `status: "no-helper"` with the ways to configure one (under WSL, Git for
+  Windows' Credential Manager among them). The page, the result and `set_credential` no longer
+  claim the "OS keychain" whatever the helper is: they name it (a new `storage` field), so a
+  `store` helper is called a plain-text file and a `cache`-only setup is warned that it forgets the
+  token.
+
+- **Under WSL the credential portal and the viewer open in the Windows browser.** `openBrowser`
+  only ran `xdg-open`, usually missing there; it now tries `wslview`, then `cmd.exe /c start` (only
+  for a URL with no shell syntax), then `xdg-open`.
+
 ### Changed
 
 - **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The

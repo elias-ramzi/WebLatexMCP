@@ -66,7 +66,9 @@ describe('CredentialPortal', () => {
     expect(res.status).toBe(200);
     // The secret is never reflected back into the page.
     expect(body).not.toContain('olp_secret');
-    expect(body).toContain('keychain');
+    // With no `storage` given it names the helper generically, never claiming a keychain.
+    expect(body).toContain('your git credential helper');
+    expect(body).not.toContain('keychain');
 
     // It reached the store exactly once, with the right target.
     expect(stored).toEqual([{ host: 'git.overleaf.com', username: 'git', token: 'olp_secret' }]);
@@ -78,6 +80,22 @@ describe('CredentialPortal', () => {
       persisted: true,
     });
     expect(portal.takeOutcome('git.overleaf.com')).toBeUndefined();
+  });
+
+  it('names where the token goes, escaped, on the form, the result page and the outcome', async () => {
+    portal = new CredentialPortal(async () => ({ persisted: true }));
+    const storage = 'a plain-text file <x>';
+    const url = await portal.open({ host: 'git.overleaf.com', username: 'git', storage });
+    const form = await (await fetch(url!)).text();
+    expect(form).toContain('stored in a plain-text file &lt;x&gt;');
+    expect(form).not.toContain('keychain');
+    const res = await fetch(url!, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: 't' }).toString(),
+    });
+    expect(await res.text()).toContain('in a plain-text file &lt;x&gt;');
+    expect(portal.takeOutcome('git.overleaf.com')?.storage).toBe(storage);
   });
 
   it('reports not-persisted when no helper keeps the token', async () => {
