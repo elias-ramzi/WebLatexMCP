@@ -444,9 +444,15 @@ it in place:
 - **Local portal — `credential_portal` (most private).** For when you'd rather the token never appear in
   the chat at all (e.g. a cloud-synced transcript): ask Claude to open the credential portal. It calls
   `credential_portal`, which starts a tiny page on `127.0.0.1`, opens your browser, and lets you type the
-  token into a **local form**. The token is POSTed straight to the server on your machine and stored in
-  the OS keychain — it never reaches Claude, the tool result, or the conversation. After you submit, ask
-  Claude to check and it reports whether it landed. Give a `host` or a `project` to target.
+  token into a **local form**. The token is POSTed straight to the server on your machine and handed to
+  git's credential helper — the OS keychain on most machines; the page and the result name where it
+  really goes (git's `store` helper, for instance, writes a plain-text `~/.git-credentials`) — and it
+  never reaches Claude, the tool result, or the conversation. After you submit, ask Claude to check and
+  it reports whether it landed. Give a `host` or a `project` to target. If git has **no** credential
+  helper (common on a bare Linux box or under WSL), the portal opens nothing and lists the ways to
+  configure one — under WSL, including Git for Windows' Credential Manager — since a token typed in
+  then would be thrown away. Under WSL the page opens in the Windows browser (`wslview`, else
+  `cmd.exe /c start`).
 - **From the chat — `set_credential`.** If you're fine pasting the token to Claude once, this is the
   one-step path: it hands the token to your **OS keychain** via `git credential approve` (with
   `confirm: true`) — it lands there encrypted, not in any config file or our registry, and the server

@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { resolveCredentialTarget } from '../lib/credentialTarget.js';
+import { describeHelpers } from '../lib/credentialHelpers.js';
 import { OVERLEAF_TOKEN_URL } from '../services/auth.js';
 
 const inputSchema = {
@@ -58,7 +59,7 @@ export function registerSetCredential(server: McpServer, ctx: AppContext): void 
       try {
         if (!confirm) {
           throw new Error(
-            'Set confirm: true to store this credential in your OS keychain (it is a real, ' +
+            'Set confirm: true to store this credential in your git credential helper (it is a real, ' +
               'out-of-band side effect).',
           );
         }
@@ -74,8 +75,12 @@ export function registerSetCredential(server: McpServer, ctx: AppContext): void 
           token,
         );
 
+        const helpers = persisted
+          ? await ctx.credentials.credentialHelpers(resolvedHost)
+          : undefined;
+        const storage = helpers?.length ? describeHelpers(helpers) : 'your git credential helper';
         const text = persisted
-          ? `Stored the credential for ${resolvedUsername}@${resolvedHost} in your OS keychain. ` +
+          ? `Stored the credential for ${resolvedUsername}@${resolvedHost} in ${storage}. ` +
             'The server will use it automatically — the token is never written to any config.'
           : `Sent the credential for ${resolvedUsername}@${resolvedHost} to git, but no credential ` +
             'helper kept it (none appears configured). Configure one (e.g. libsecret on Linux) or ' +
