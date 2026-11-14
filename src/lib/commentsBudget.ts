@@ -145,6 +145,8 @@ export interface CommentLike {
   quote?: string;
   file?: string;
   line?: number;
+  /** How `file`/`line` were found — present exactly when they are. */
+  locatedBy?: 'synctex' | 'quote';
   snippet?: string;
   snippetStartLine?: number;
   resolved: boolean;
@@ -222,7 +224,9 @@ export function clipText(s: string, max: number): { text: string; omitted: numbe
  * that appear only where something went, so a result with nothing cut reads exactly as before.
  */
 export function renderCommentText(c: PlannedComment): string {
-  const loc = c.file ? `${c.file}:${c.line}` : `(unresolved — page ${c.page})`;
+  const loc = c.file
+    ? `${c.file}:${c.line}${c.locatedBy === 'quote' ? ' (found by matching the quote)' : ''}`
+    : `(unresolved — page ${c.page})`;
   const noteCut = c.noteOmittedChars ? ` (+${c.noteOmittedChars} chars cut)` : '';
   const quote = c.quote
     ? `\n   quote: "${c.quote}"${c.quoteOmittedChars ? ` (+${c.quoteOmittedChars} chars cut)` : ''}`
@@ -281,6 +285,7 @@ function materialize(f: Frame): PlannedComment {
     ...(quoteCut > 0 ? { quoteOmittedChars: quoteCut } : {}),
     file: src.file,
     line: src.line,
+    ...(src.file && src.locatedBy ? { locatedBy: src.locatedBy } : {}),
     snippet: f.snippetShown ? src.snippet : undefined,
     snippetStartLine: f.snippetShown ? src.snippetStartLine : undefined,
     ...(snippetCut > 0 ? { snippetOmittedChars: snippetCut } : {}),

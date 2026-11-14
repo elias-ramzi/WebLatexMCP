@@ -184,8 +184,9 @@ describe('edit_file rewrite-preservation mode', () => {
       appliedEdits: 1,
       diff: expect.any(String),
       // #153: the confirmation diff is budgeted, so every write tool now also reports whether it
-      // was cut. A local project has no diff at all here, so nothing can have been.
+      // was cut. edit_file's diff is this call's own change, short enough here to be whole.
       diffTruncated: false,
+      diffCondensed: false,
       rewriteMode: 'always',
       preservedEdits: 1,
     });

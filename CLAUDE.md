@@ -205,7 +205,8 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 ### Parallel sessions, shadows and commit
 
 - **Sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names the process (`parseSessionId`;
-  `RESERVED_SESSION_IDS` refuses `shelves`, `project.lock`, `rewrite-mode.json` — add any new
+  `RESERVED_SESSION_IDS` refuses `shelves`, `project.lock`, `rewrite-mode.json`,
+  `compile-defaults.json` — add any new
   project-level entry under `.sessions/<id>/` there by hand). State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`). **Guarantee: a commit contains one
   session's lines and nobody else's.**
@@ -405,7 +406,8 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 - **Local projects never see git.** `status`/`diff`/`commit`/`push`/`discard`/`revert`/`project_sync`/
   `reset_to_remote`/`shelve`/`unshelve`/`list_shelves` and `read_file` with `ref` use
   `requireGitProject`. `changeDiff` (`src/lib/changeDiff.ts`) returns `''` for local projects; the shadow
-  recorder skips them. Compiled PDFs go to the workspace, never beside the user's source.
+  recorder skips them. `edit_file`'s diff needs no git at all: it is this call's before → after
+  (`planEditDiff`, `src/lib/editDiff.ts`, fed by `applyEdits`' `onWritten`), so local projects get one. Compiled PDFs go to the workspace, never beside the user's source.
 
 ### File writes and guards
 
@@ -451,6 +453,19 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   other). `assertBlocksStillComments` refuses the whole call if live text was pulled onto a `%` line or a
   block's bare `\r` now meets a `\n`. `unfuse` turns a bare `\r` before a blank LF line into `\n` (only
   pre-existing bytes or terminators reported via the optional `lastRestoredTerminator`).
+- **A viewer comment is located by SyncTeX, then by its quote, and says which** (`locatedBy`).
+  `SyncTexService.resolve` uses the `synctex` CLI and, only when it cannot run, reads the
+  `.synctex.gz` in-process (`synctexEditQuery`, `src/lib/synctexReader.ts`: smallest hbox under the
+  point, last leaf at or before it; checked against the CLI at ~96% exact line agreement, the rest
+  in margins or within 2 lines). With no SyncTeX answer, `locateQuoteInProject`
+  (`src/lib/quoteLocate.ts`) matches the quote's words against every `.tex` and answers **only on a
+  unique match** — two matches, too many files, an unreadable or oversized one all mean no location,
+  never the first hit. A wrong snippet is worse than none.
+- **`compile: true` on `edit_file`/`write_file` runs `runCompile` (the whole `compile` tool,
+  exported from `src/tools/compile.ts`) after the write's `runExclusive` returns** — the project lock
+  is not re-entrant, so calling it inside deadlocks. Its result is cut to `summarizeCompile`
+  (`src/lib/compileSummary.ts`), never shipped whole. Stored compile defaults (`CompileDefaultsStore`,
+  `applyCompileDefaults`) fill only fields the call left out; a stored `compiler` is an assertion.
 - **`edit_file` is order-independent** within a call: ranges resolved up front (`pendingRanges`), no-op
   judged there. Empty `newString` on a range deletes the lines **with** their terminator (last
   unterminated line: the preceding one, unless inside a preserved block). A range owns the terminator
