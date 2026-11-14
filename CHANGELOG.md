@@ -24,6 +24,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
+- **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when
+  editing one, on the PDF and markdown pages. Shift+Enter still saves; Esc cancels an edit too.
 
 - **A local tool-call log, and `web-latex-mcp call-stats` to read it.** Each tool call adds one
   line to `<workspace>/.logs/tool-calls.jsonl`: tool, session, project, duration, result size and a
