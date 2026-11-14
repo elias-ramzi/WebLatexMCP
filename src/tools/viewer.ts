@@ -13,21 +13,24 @@ const inputSchema = {
     .describe(
       'Where you intend to open the viewer: "browser" (default — auto-opens your OS browser) or ' +
         '"vscode" (returns the URL to open as a Simple Browser editor tab; never auto-opens a ' +
-        'browser). Defaults to WEB_LATEX_MCP_VIEWER_TARGET, else "browser".',
+        'browser). Defaults to WEB_LATEX_MCP_VIEWER_TARGET, else "browser". Leave it unset when ' +
+        'that is "embedded": the client then shows the viewer in a panel of its own.',
     ),
   open: z
     .boolean()
     .optional()
     .describe(
       'For target "browser": also open the URL in the default browser (default true). Ignored for ' +
-        '"vscode".',
+        '"vscode" and "embedded".',
     ),
 };
 
 const outputSchema = {
   url: z.string().describe('Localhost viewer URL for the project.'),
   opened: z.boolean().describe('Whether a browser was launched.'),
-  target: z.enum(['browser', 'vscode']),
+  target: z
+    .enum(['browser', 'vscode', 'embedded'])
+    .describe('"embedded": the client shows the viewer in a panel of its own; no browser opened.'),
   rootFile: z
     .string()
     .optional()
@@ -61,7 +64,9 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         'and scroll position. For clients ' +
         'without a PDF surface (e.g. Claude Desktop) it auto-opens your browser; in VSCode pass ' +
         'target:"vscode" (or set WEB_LATEX_MCP_VIEWER_TARGET=vscode) to get the URL to open as a ' +
-        'Simple Browser tab. The server binds to loopback only and starts on demand. Run compile ' +
+        'Simple Browser tab. A client that shows the viewer itself (e.g. cc-servers) sets ' +
+        'WEB_LATEX_MCP_VIEWER_TARGET=embedded: then no browser opens and the URL is for that ' +
+        'panel. The server binds to loopback only and starts on demand. Run compile ' +
         'to populate it.',
       inputSchema,
       outputSchema,
