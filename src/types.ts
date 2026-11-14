@@ -266,5 +266,9 @@ export interface ServerConfig {
   contactEmailInvalid?: boolean;
 }
 
-/** Where the `viewer` tool expects the PDF viewer to be opened. */
-export type ViewerTarget = 'browser' | 'vscode';
+/**
+ * Where the `viewer` tool expects the PDF viewer to be opened. `embedded`: the host frames the viewer
+ * in a panel of its own (e.g. cc-servers' LaTeX tab) — set by that host through
+ * WEB_LATEX_MCP_VIEWER_TARGET, never offered to the model as a call's `target`.
+ */
+export type ViewerTarget = 'browser' | 'vscode' | 'embedded';

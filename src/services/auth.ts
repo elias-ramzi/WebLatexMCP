@@ -1,3 +1,4 @@
+import { activeHelpers } from '../lib/credentialHelpers.js';
 import { execCapture } from '../lib/exec.js';
 
 /** Resolved git auth for one project: a username + optional token (HTTPS password). */
@@ -144,8 +145,10 @@ export class CredentialResolver {
 
   /**
    * Store a credential in the user's git credential helper (the OS keychain — osxkeychain /
-   * Windows Credential Manager / libsecret). This is how a token reaches the server *without*
-   * being written into our own config: it lands, encrypted, in the OS store, and later resolves
+   * Windows Credential Manager / libsecret — or whatever helper is configured: `store` writes a
+   * plain-text file, `cache` keeps it in memory for a while; `credentialHelpers` says which). This
+   * is how a token reaches the server *without* being written into our own config: it lands in the
+   * helper's store, and later resolves
    * through `git credential fill` like any other helper-backed credential — never persisted by us.
    *
    * `git credential approve` gives no success signal and is a silent no-op when no helper is
@@ -168,6 +171,27 @@ export class CredentialResolver {
     });
     const readBack = await this.tokenFromGitCredential(host);
     return { persisted: readBack === token };
+  }
+
+  /**
+   * The credential helpers git would hand a token for `https://<host>` to, in order — `[]` when
+   * none is configured (so `git credential approve` would keep nothing), `undefined` when git could
+   * not be asked. Read from every config scope git reads (`--get-regexp`, includes followed).
+   */
+  async credentialHelpers(host: string): Promise<string[] | undefined> {
+    try {
+      const res = await this.exec(
+        'git',
+        ['config', '--includes', '-z', '--get-regexp', '^credential\\..*helper$'],
+        { env: { ...this.env, GIT_TERMINAL_PROMPT: '0' }, timeoutMs: 5000 },
+      );
+      // `git config --get-regexp` exits 1 when nothing matches: no helper at all.
+      if (res.code === 1) return [];
+      if (res.code !== 0) return undefined;
+      return activeHelpers(res.stdout, host);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Every token that could appear in output, so error/redaction covers all providers. */

@@ -24,6 +24,26 @@ import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
 import { resolveRootFile } from './lib/rootFile.js';
 import { locateViewerPdf } from './lib/pdfLocate.js';
+
+/**
+ * Why a document could not be read, for a message that already names it (quoted): from the
+ * errno when there is one, else the sandbox's refusals — FileService raises those without a code.
+ */
+function documentRefusal(err: unknown): string {
+  switch ((err as NodeJS.ErrnoException).code) {
+    case 'EACCES':
+    case 'EPERM':
+      return 'permission denied';
+    case 'EISDIR':
+      return 'it is a directory';
+    case 'ELOOP':
+      return 'too many levels of symbolic links';
+    case undefined:
+      return 'it is outside the project, reached through a symlink out of it, or not a regular file';
+    default:
+      return `it could not be read (${(err as NodeJS.ErrnoException).code})`;
+  }
+}
 import type { PdfRenderService } from './services/pdfRender.js';
 import type { CommitIdentity } from './services/auth.js';
 import { ProjectLocks } from './lib/projectLocks.js';
@@ -223,8 +243,11 @@ export function createSharedServices(
         // No synctex source (the surfaced fallback may be another root's): keep the note
         // unlocated rather than map the click through a different document.
         const synctexPdf = located?.synctexPdf;
-        if (synctexPdf) {
-          const loc = await synctex.resolve(synctexPdf, dir, input.page, input.x, input.y);
+        // Only a PDF comment carries the clicked point synctex maps; a document comment never
+        // reaches this path (the viewer stores it through `addDocComment`).
+        const { page, x, y } = input;
+        if (synctexPdf && page !== undefined && x !== undefined && y !== undefined) {
+          const loc = await synctex.resolve(synctexPdf, dir, page, x, y);
           if (loc) {
             ({ file, line } = loc);
             locatedBy = 'synctex';
@@ -245,11 +268,43 @@ export function createSharedServices(
       }
       return comments.add(id, { ...input, file, line, locatedBy });
     },
-    listComments: (id) => comments.list(id),
+    // The viewer names the surface: `null` from the PDF page (PDF comments only), a document's
+    // path from that document's page.
+    listComments: (id, document) => comments.list(id, { document }),
     updateComment: (id, commentId, note) => comments.update(id, commentId, { note }),
     deleteComment: (id, commentId) => comments.remove(id, commentId),
-    undoDelete: (id) => comments.undo(id),
-    resolveComments: (id, ids) => comments.resolve(id, ids),
+    undoDelete: (id, document) => comments.undo(id, document),
+    resolveComments: (id, ids, document) => comments.resolve(id, ids, document),
+    // A markdown document is read the way `read_file` reads one — inside the project, its links
+    // judged by the same policy, a local project as readily as a clone — and records NO baseline:
+    // the user's browser asked for it, not the MCP caller, so nothing here vouches for a write.
+    // Through the scope that knows the project, as the root lookup is.
+    readDocument: async (id, relPath) => {
+      const { pm, files } = scopeFor(id);
+      const { dir } = await pm.requireProjectDir(id);
+      let read: Awaited<ReturnType<typeof files.read>>;
+      try {
+        read = await files.read(dir, { path: relPath });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new Error(`No such document in project ${quoteId(id)}: ${quoteId(relPath)}.`, {
+            cause: err,
+          });
+        }
+        // FileService's own refusals name the path raw; this one reaches a browser page and the
+        // tool's result, so it is quoted (escaped) like every caller-supplied string — with a
+        // reason taken from the error, never a guess that blames the sandbox for an EACCES.
+        throw new Error(`Cannot show document ${quoteId(relPath)}: ${documentRefusal(err)}.`, {
+          cause: err,
+        });
+      }
+      if (read.truncated) {
+        throw new Error(`Document ${quoteId(relPath)} is too large to show.`);
+      }
+      return { path: relPath, text: read.content };
+    },
+    // The viewer resolves the source line itself, from the file it just read; store as given.
+    addDocComment: (id, input) => comments.add(id, input),
   });
 
   const shared: SharedServices = {

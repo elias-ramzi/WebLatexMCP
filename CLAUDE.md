@@ -645,13 +645,30 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `cause`), pins "unavailable" once the stub is in. `render_pages` checks pdf.js before blaming the
   backend (`pdfjsUnavailableError` vs `nativeCanvasError`). `doctor`'s `pdf-render` asks `canReadPdf`
   and `canRasterize` apart (`warn`).
+- **The viewer answers loopback names only** (`ViewerService.admits`): `Host` must be `localhost`,
+  `127.0.0.1` or `[::1]` (any port — a forwarded port is legitimate, DNS rebinding cannot forge
+  the name), and a POST's `Origin`, when present, must be exactly `http://<that Host>` — another
+  local port's page is another origin. It serves project files now, so keep the
+  check ahead of every route.
+- **A markdown document in the viewer is read like `read_file` and claims nothing**: `readDocument`
+  (`context.ts`) goes through `FileService.read` with the owner's link policy and **no**
+  `recordBaseline`; every refusal is re-quoted. Its comments are one surface per document
+  (`CommentStore`: `null` = PDF only); the stored `line` is always `resolveDocLine` over the file
+  just read, never a client number. `list_comments` reads a document comment's snippet with
+  `readDocumentLines` — the one exception to `SOURCE_EXT`, and only when `file === document`.
+  Rendering (`renderMarkdown`) keeps `html: false`, emits no `<img>` and refuses `data:` links, and
+  the page runs under a nonce CSP, so viewing a document fetches nothing and runs none of it.
 - `compile`'s viewer hint (`viewerShowsForCompile`) compares PDF paths with `samePath` (case fold by
   platform — filesystem, not git). Clipped/rescaled renders are `page-<n>-<hash>.png` (`pngName`).
 - **A `labels` lookup is believed only on evidence from the page** (`src/lib/labelPages.ts`; the module
   header lists residuals). Without `/PageLabels` the `.aux` page is a candidate accepted only when that
   page's folio reads it (`readFolios`: bare last-line number, else `FOOT_FORMS` — which beat the
   running head — else head; two head readings → `ambiguousFolio`), corroborated by a neighbour
-  (`uncorroboratedFolio`; one-page PDFs exempt). A label's own number is never consulted. Refusals:
+  (`uncorroboratedFolio`; one-page PDFs exempt) — **or** when the label's own hyperref destination
+  (`AuxLabel.anchor` → `destinationPages`) lies on that very page (`destinationPageOf`, never for
+  beamer): hyperref writes no `/PageLabels` for a 1..N document (`\HyPL@Useless`), so this is the
+  common hyperref case. It replaces only the text check — a disagreeing destination falls back to it,
+  never refuses — and every other refusal stands. A label's own number is never consulted. Refusals:
   arabic restart (`restarted`), last page decimal ≠ page count (`lastPageMismatch`), label defined twice
   (`multiplyDefined`).
 - **Beamer decks never use the tree** (recognised by `\@writefile{nav}`); folio route, and refused first
@@ -683,7 +700,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 - `\include`d labels: `findBuildDirAux` follows line-anchored `\@input` by `readdir` lookup per
   component, **never as a path** (no links, no `..`; `lstat`/`realpath` at read), bounded (256 count,
   depth 8, bytes); case-mismatched names unread (`caseMismatch`); unread inputs named (`unreadInputs`).
-  For exact lookups: `hyperref` or `pages:`.
+  For exact lookups: `hyperref` (a tree for a renumbered document, link targets otherwise) or `pages:`.
 
 ### Payload budgets
 

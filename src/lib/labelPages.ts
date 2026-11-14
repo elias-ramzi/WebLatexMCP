@@ -130,6 +130,13 @@
  *     hatches: load `hyperref` (which writes `/PageLabels`), or find the page with
  *     `extract_text`/`pdf_geometry` and pass `pages:`.
  *
+ *     hyperref does not make that check rarer than it sounds: it writes no `/PageLabels` tree
+ *     when every page's label is its index, so an arabic 1..N paper reaches this route WITH
+ *     hyperref loaded. There a second record answers what the text is asked: the label's own
+ *     named destination, which hyperref writes into the PDF for its anchor. On the candidate page
+ *     it verifies that page in place of the folio and neighbour check, and nothing more
+ *     ({@link destinationPageOf}, #223).
+ *
  *     The label's NUMBER is not what is checked ("the page shows 1.1 somewhere"): that is not
  *     evidence of anything in an `article`, whose figure and table numbers are single digits, and
  *     "[1, 2]", "3 runs" put those on nearly every page, so checked that way a `[titlepage]`
@@ -445,6 +452,10 @@ export interface LabelFailure {
   /** `'uncorroboratedFolio'` only: what each in-range neighbouring page read as, in page order
    *  (one entry on the first or last page of the PDF, two otherwise). */
   neighbours?: NeighbourFolio[];
+  /** `'unverifiedPage'` on the printed-page route, other than `'shipoutMismatch'`: the 1-based
+   *  PDF page the label's own hyperref destination points at, when the PDF has one and it is not
+   *  the candidate page — why the destination did not verify it. Echoed, never used. */
+  destinationPage?: number;
   /** `'unverifiedPage'` with `'pastEndOfPdf'` only: how many pages the PDF on disk has. */
   pageCount?: number;
   /** `'unverifiedPage'` with `'lastPageMismatch'` only: the last PDF page and what it read as
@@ -476,6 +487,12 @@ export interface LabelFailure {
 export interface LabelPageEvidence {
   pageCount: number;
   text: ReadonlyMap<number, readonly string[]>;
+  /**
+   * hyperref anchor (`AuxLabel.anchor`) -> the 1-based PDF page its named destination points at,
+   * for the anchors the PDF has a page destination for ({@link destinationPageOf}). An anchor
+   * absent here is no evidence either way.
+   */
+  destinations?: ReadonlyMap<string, number>;
 }
 
 /** Where a plan's page numbers came from — reported rather than implied, because the two routes
@@ -521,6 +538,10 @@ export interface LabelPagePlan {
    * takes the printed-page route, and the refusal and note must not claim the PDF has no tree.
    */
   pageLabelsIgnored?: 'beamer';
+  /** Printed-page route only: the resolved labels whose candidate page was verified by their
+   *  own hyperref destination lying on it ({@link destinationPageOf}) rather than by the
+   *  page's text, in request order. Absent when none was. */
+  destinationVerified?: string[];
   /** The PDF's page count, when the plan was given it (`evidence.pageCount`) — on either route,
    *  since {@link resolveLabelPages} always reads it. The shipout check needs it, and a refusal
    *  that points at the last page can name it. */
@@ -1056,6 +1077,7 @@ export function planLabelPages(
   const pages: number[] = [];
   const seenLabel = new Set<string>();
   const seenPage = new Set<number>();
+  const destinationVerified: string[] = [];
 
   for (const label of labels) {
     if (seenLabel.has(label)) {
@@ -1204,7 +1226,12 @@ export function planLabelPages(
         failed.push({ label, reason: 'restarted', printedPage: entry.page });
         continue;
       }
-      const check = verifyCandidatePage(page, entry.page, evidence);
+      // The label's own hyperref destination on the candidate page stands in for the page's
+      // text (the folio and its neighbour) — and for nothing else: every refusal above and
+      // below still applies.
+      const destination = destinationPageOf(aux, entry, evidence);
+      const byDestination = destination !== undefined && destination === page;
+      const check = byDestination ? undefined : verifyCandidatePage(page, entry.page, evidence);
       if (check) {
         failed.push({
           label,
@@ -1215,9 +1242,11 @@ export function planLabelPages(
           ...(check.folios ? { folios: check.folios } : {}),
           ...(check.neighbours ? { neighbours: check.neighbours } : {}),
           ...(check.unverified === 'pastEndOfPdf' ? { pageCount: evidence?.pageCount } : {}),
+          ...(destination !== undefined ? { destinationPage: destination } : {}),
         });
         continue;
       }
+      if (byDestination) destinationVerified.push(label);
       if (lastPage) {
         failed.push({
           label,
@@ -1257,7 +1286,13 @@ export function planLabelPages(
   if (failed.length > 0) {
     return { resolved: [], failed, pages: [], ...verdicts };
   }
-  return { resolved, failed, pages, ...verdicts };
+  return {
+    resolved,
+    failed,
+    pages,
+    ...verdicts,
+    ...(destinationVerified.length > 0 ? { destinationVerified } : {}),
+  };
 }
 
 /**
@@ -1377,6 +1412,52 @@ function pagesShippedWith(shipouts: readonly number[], counter: number): number[
     if (c === counter) pages.push(i + 1);
   });
   return pages;
+}
+
+/**
+ * The PDF page the label's own hyperref destination points at, when the build has one — the
+ * evidence that lets the printed-page route verify a candidate without reading the page (#223).
+ *
+ * Why it is needed: hyperref writes no `/PageLabels` tree when every page's label equals its
+ * page index (`\HyPL@Useless` in hyperref.dtx), so the commonest hyperref document — an arabic
+ * paper numbered 1..N — reaches this route like a document without hyperref, and its folios are
+ * read from text that a float page, a table cell or a running head can make unreadable. But
+ * hyperref records an anchor for every `\label` (`AuxLabel.anchor`) and writes a named
+ * destination for it into the PDF, and that destination names a page object — a page INDEX, not
+ * a printed number, so no renumbering can make it agree by accident. When it lies on the
+ * candidate page, two independent records agree: the `.aux`'s printed page, read as an index, and
+ * the place the PDF itself puts the label's target. A shifted document breaks that agreement —
+ * under a title page the figure printed on page 3 sits on PDF page 4, and so does its
+ * destination — so a disagreement falls back to the text check, never to a refusal of its own:
+ * an anchor can legitimately sit on another page than its `\label` (a `\label` far from the
+ * `\refstepcounter` that set it, `Doc-Start` for one before any).
+ *
+ * Not for a beamer deck, which takes this route for reasons a destination cannot answer (its
+ * frame and slide numbering, `usablePageLabelIndex`). What it does not close, said so in
+ * `docs/tools.md`: an anchor shipped exactly as many pages before its label as the document is
+ * shifted agrees with the wrong page, and a document can write a destination of the same name
+ * itself (hyperref keeps the first of two, "duplicate ignored") — on a page, though, that the
+ * shipout record and the checks around this one still judge.
+ */
+function destinationPageOf(
+  aux: AuxFloatsResult,
+  entry: AuxLabel,
+  evidence: LabelPageEvidence | undefined,
+): number | undefined {
+  if (aux.beamerNav || entry.anchor === undefined) return undefined;
+  return evidence?.destinations?.get(entry.anchor);
+}
+
+/** The anchors {@link resolveLabelPages} asks the PDF for: each requested label's, when the
+ *  printed-page route could use it ({@link destinationPageOf}). */
+function anchorsToLookUp(labels: string[], aux: AuxFloatsResult): string[] {
+  if (aux.beamerNav) return [];
+  const wanted = new Set(labels);
+  const anchors = new Set<string>();
+  for (const entry of aux.floats) {
+    if (wanted.has(entry.label) && entry.anchor !== undefined) anchors.add(entry.anchor);
+  }
+  return [...anchors];
 }
 
 /** The PDF pages whose folios can corroborate candidate page `page`: its predecessor and its
@@ -1524,6 +1605,9 @@ export interface LabelPageReader {
   pageCount(): Promise<number>;
   /** The text layer of each requested (in-range) page. */
   pageText(pages: number[]): Promise<ReadonlyMap<number, readonly string[]>>;
+  /** Named destination -> its 1-based page, for the names the PDF has a page destination for.
+   *  Optional: a reader without it supplies no destinations, and the text check decides. */
+  destinationPages?(names: string[]): Promise<ReadonlyMap<string, number>>;
 }
 
 /**
@@ -1559,7 +1643,18 @@ export async function resolveLabelPages(
   }
   const wanted = pagesToVerify(labels, aux, pageCount);
   const text = wanted.length > 0 ? await reader.pageText(wanted) : new Map<number, string[]>();
-  return planLabelPages(labels, aux, pageLabels, { pageCount, text });
+  // Only where pagesToVerify found a candidate to check: when it found none, every label is
+  // refused on a whole-build or heuristic ground a destination does not answer.
+  const anchors = wanted.length > 0 ? anchorsToLookUp(labels, aux) : [];
+  const destinations =
+    anchors.length > 0 && reader.destinationPages
+      ? await reader.destinationPages(anchors)
+      : undefined;
+  return planLabelPages(labels, aux, pageLabels, {
+    pageCount,
+    text,
+    ...(destinations ? { destinations } : {}),
+  });
 }
 
 /**
@@ -1571,9 +1666,13 @@ export async function resolveLabelPages(
  * `'noEvidence'`, a refusal of a label whose page was never looked at.
  */
 export function pdfLabelPageReader(
-  renderer: Pick<PdfRenderService, 'pageLabelsAndCount' | 'text'>,
+  renderer: Pick<PdfRenderService, 'pageLabelsAndCount' | 'text'> &
+    Partial<Pick<PdfRenderService, 'destinationPages'>>,
   pdfPath: string,
 ): LabelPageReader {
+  // Optional: a renderer without it (a test's fake) supplies no destinations, and the text check
+  // decides as it always has.
+  const destinationPages = renderer.destinationPages;
   let info: ReturnType<PdfRenderService['pageLabelsAndCount']> | undefined;
   const load = (): ReturnType<PdfRenderService['pageLabelsAndCount']> =>
     (info ??= renderer.pageLabelsAndCount(pdfPath));
@@ -1594,6 +1693,9 @@ export function pdfLabelPageReader(
       }
       return text;
     },
+    ...(destinationPages
+      ? { destinationPages: (names: string[]) => destinationPages.call(renderer, pdfPath, names) }
+      : {}),
   };
 }
 
@@ -1660,7 +1762,14 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       continue;
     }
     if (failure.reason === 'unverifiedPage') {
-      lines.push(`  - ${quoteLabel(failure.label)}: ${unverifiedText(failure, plan.labelSource)}`);
+      const target =
+        failure.destinationPage === undefined
+          ? ''
+          : ` Its hyperref link target (the destination \\ref jumps to) is on PDF page ` +
+            `${failure.destinationPage}, not on the candidate page, so it could not confirm it.`;
+      lines.push(
+        `  - ${quoteLabel(failure.label)}: ${unverifiedText(failure, plan.labelSource)}${target}`,
+      );
       continue;
     }
     if (failure.reason === 'pgfpagesLayout') {
@@ -1898,14 +2007,17 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       );
     } else {
       lines.push(
-        '  This PDF has no /PageLabels tree, so a printed page is used as the PDF page index only ' +
-          "when that PDF page's own folio (the page number in its footer or running head) reads " +
-          'the same, and a neighbouring page reads as the adjacent number — a title page, a ' +
-          'titlepage environment, \\setcounter{page} or unlabelled roman front matter all shift ' +
-          'it, and a section number or table cell can stand where the folio is looked for. ' +
-          'Loading hyperref writes /PageLabels, which turns this into an exact lookup (though a ' +
-          'title page with no printed number is still labelled like the first numbered page, and ' +
-          "that stays ambiguous); or find the page yourself: search extract_text's output (or " +
+        '  This PDF has no /PageLabels tree (hyperref writes one only when the printed page ' +
+          'numbers differ from the page indices), so a printed page is used as the PDF page ' +
+          "index only when the label's own hyperref link target lies on that page, or when that " +
+          "PDF page's own folio (the page number in its footer or running head) reads the same " +
+          'and a neighbouring page reads as the adjacent number — a title page, a titlepage ' +
+          'environment, \\setcounter{page} or unlabelled roman front matter all shift it, and a ' +
+          'section number or table cell can stand where the folio is looked for. Loading ' +
+          'hyperref adds the link-target check, and writes /PageLabels for a renumbered ' +
+          'document, which turns its lookup into an exact one (though a title page with no ' +
+          'printed number is still labelled like the first numbered page, and that stays ' +
+          "ambiguous); or find the page yourself: search extract_text's output (or " +
           'pdf_geometry kinds: ["text"]) for the label\'s number.',
       );
     }
@@ -2160,11 +2272,22 @@ export function labelResolutionNote(plan: LabelPagePlan): string {
           '— evidence, not proof: a restart whose last page shows no page number goes unseen, ' +
           'and a number standing where the folio is looked for (a table cell, or a line such ' +
           'as "3/9" or "– 3 –", above an empty foot) can read like one, so check the result');
+    const verified = plan.destinationVerified ?? [];
+    const byDestination =
+      verified.length === 0
+        ? ''
+        : `For ${verified.join(', ')} that text check was not needed: the label's own hyperref ` +
+          'link target (the destination \\ref jumps to) lies on that very PDF page, so the ' +
+          ".aux's printed page and the PDF's own placement of the label agree — every other " +
+          'check above still applied. ';
     conversion =
       "which records each label's PRINTED page. " +
       tree +
       checks +
-      (plan.pageLabelsIgnored === 'beamer' ? '' : ', and load hyperref for an exact lookup');
+      (plan.pageLabelsIgnored === 'beamer' || verified.length > 0
+        ? ''
+        : ', and loading hyperref adds a check against its link targets') +
+      (byDestination ? `. ${byDestination.trimEnd()}` : '');
   }
   return (
     `Pages resolved from labels through the build-directory .aux of the LAST COMPILE ` +

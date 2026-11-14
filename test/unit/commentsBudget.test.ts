@@ -306,3 +306,67 @@ describe('commentsBudget: what it must not do', () => {
     expect(clipText('short', 99)).toEqual({ text: 'short', omitted: 0 });
   });
 });
+
+describe('commentsBudget: document comments', () => {
+  const docComment = (over: Partial<CommentLike> = {}): CommentLike => ({
+    id: 'c9',
+    number: 1,
+    document: 'run/final-review.md',
+    note: 'expand this',
+    file: 'run/final-review.md',
+    line: 42,
+    resolved: false,
+    ...over,
+  });
+
+  it('renders a document comment at <doc>:<line> and carries `document` into the plan', () => {
+    const plan = planCommentsPayload([docComment()]);
+    expect(plan.comments[0]).toMatchObject({ document: 'run/final-review.md', line: 42 });
+    expect(plan.comments[0]!.page).toBeUndefined();
+    expect(renderCommentText(plan.comments[0]!)).toBe(
+      '#1 [c9] run/final-review.md:42\n   note: expand this',
+    );
+  });
+
+  it('renders a document comment without a file as (unresolved — <doc>)', () => {
+    const plan = planCommentsPayload([docComment({ file: undefined, line: undefined })]);
+    expect(renderCommentText(plan.comments[0]!)).toBe(
+      '#1 [c9] (unresolved — run/final-review.md)\n   note: expand this',
+    );
+  });
+
+  it('a PDF comment still renders (unresolved — page N) without a file', () => {
+    const c = comment(3, {
+      file: undefined,
+      line: undefined,
+      quote: undefined,
+      snippet: undefined,
+    });
+    expect(renderCommentText(planCommentsPayload([c]).comments[0]!)).toBe(
+      '#3 [c3] (unresolved — page 4)\n   note: tighten paragraph 3',
+    );
+  });
+
+  it('charges the `document` value: a longer document path costs more and cuts earlier', () => {
+    const short = planCommentsPayload([docComment()]).comments[0]!;
+    const long = planCommentsPayload([docComment({ document: `run/${'d'.repeat(500)}.md` })])
+      .comments[0]!;
+    // The text channel names the file, not the document, so the whole difference is the JSON value.
+    expect(commentRenderCost(long) - commentRenderCost(short)).toBe(
+      long.document!.length - short.document!.length,
+    );
+
+    // Same comments, same budget: only the document path differs, and the long one loses more.
+    const list = (document: string) =>
+      many(40, (i) => ({ document, file: 'x.md', line: i, page: undefined }));
+    const budget = 8000;
+    const a = planCommentsPayload(list('a.md'), { budget });
+    const b = planCommentsPayload(list(`${'d'.repeat(400)}.md`), { budget });
+    expect(wireSize(b)).toBeLessThanOrEqual(budget);
+    const kept = (p: CommentsPlan) =>
+      p.comments.length +
+      p.comments.filter((c) => c.quote !== undefined).length +
+      p.comments.filter((c) => c.snippet !== undefined).length;
+    expect(kept(b)).toBeLessThan(kept(a));
+  });
+});
