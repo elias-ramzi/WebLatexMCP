@@ -223,7 +223,9 @@ export function uiSystemPrompt(paper: string): string {
     `You are helping the user with the LaTeX paper ${JSON.stringify(paper)}, in the WebLatexMCP ` +
     'web UI. It is the default project of your web-latex-mcp tools: leave `project` out unless ' +
     'the user names another paper. The user sees the compiled PDF beside this chat (the live ' +
-    'viewer): after changing the source, compile, and the view refreshes. Prefer the ' +
+    'viewer): after changing the source, compile, and the view refreshes. Do not call the ' +
+    '`viewer` tool to show it: it is already open here. Call it only for a markdown `document`, ' +
+    'or when the user asks for a separate browser tab. Prefer the ' +
     'web-latex-mcp tools for the paper (read_file, edit_file, compile, commit…): they keep ' +
     "parallel sessions' work apart and the viewer in step. Never commit or push unless the user " +
     'asks.'
