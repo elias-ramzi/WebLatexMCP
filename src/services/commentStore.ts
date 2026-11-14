@@ -20,9 +20,11 @@ export interface NewComment {
    */
   rects?: number[][];
   note: string;
-  /** Source location, when synctex resolved it. */
+  /** Source location, when synctex resolved it — or, failing that, a unique match of `quote`. */
   file?: string;
   line?: number;
+  /** Which of the two found `file`/`line`; absent when they are. */
+  locatedBy?: 'synctex' | 'quote';
 }
 
 export interface Comment extends NewComment {

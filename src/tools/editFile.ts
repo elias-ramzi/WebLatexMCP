@@ -2,8 +2,17 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { editItemSchema } from '../lib/editItemSchema.js';
+import {
+  assertCompileRequested,
+  compileAfterWriteInput,
+  compileSummarySchema,
+  summarizeCompile,
+} from '../lib/compileSummary.js';
+import { runCompile } from './compile.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
-import { changeDiff, changedPath } from '../lib/changeDiff.js';
+import { changedPath } from '../lib/changeDiff.js';
+import { planEditDiff } from '../lib/editDiff.js';
 import {
   createPreserveTransform,
   matchIsCommented,
@@ -13,61 +22,6 @@ import {
   REWRITE_MODES,
 } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
-
-/**
- * One `edit_file` edit: a string replacement or a line range. Exported so `compile`'s `overlay`
- * takes exactly the same edits, described the same way, rather than a copy that could drift.
- */
-export const editItemSchema = z.union([
-  z
-    .object({
-      oldString: z
-        .string()
-        .describe('Exact text to replace (include enough context to be unique).'),
-      newString: z.string().describe('Replacement text.'),
-      replaceAll: z.boolean().optional().describe('Replace every occurrence (default false).'),
-      excludeComments: z
-        .boolean()
-        .optional()
-        .describe(
-          'Skip matches that sit in a LaTeX comment (default false, so existing callers ' +
-            'are unaffected). A comment runs from an unescaped % to the end of that line: ' +
-            '\\% is a literal percent and is NOT a comment, while \\\\% IS one (the \\\\ ' +
-            'consumes both backslashes). Both a whole commented-out line and the commented ' +
-            'tail of a live line are excluded, and a match that straddles the boundary ' +
-            'counts as commented — it is skipped, never half-replaced. With replaceAll, ' +
-            'only the live occurrences are rewritten; without it, uniqueness is judged over ' +
-            'the live occurrences alone, so a string with one live and 182 commented ' +
-            'occurrences is a unique match. Either way the result reports, per edit, how ' +
-            'many were replaced and how many were skipped (commentMatches), and a request ' +
-            'whose every match is commented is refused rather than silently doing nothing. ' +
-            'Only for a file whose comment character is % (.tex/.sty/.cls/.bbl/.latex/.ltx); ' +
-            'anywhere else the call is refused rather than pretending to filter.',
-        ),
-    })
-    .strict(),
-  z
-    .object({
-      startLine: z
-        .number()
-        .int()
-        .positive()
-        .describe('1-based first line to replace, inclusive — the numbering read_file uses.'),
-      endLine: z.number().int().positive().describe('1-based last line to replace, inclusive.'),
-      newString: z
-        .string()
-        .describe(
-          'Text those lines become. Empty deletes them outright, line terminator included, ' +
-            'so no blank line is left behind (in edit_file only, a rewrite-preservation mode ' +
-            "leaves them %-commented in place instead; compile's overlay never preserves). In a " +
-            'file mixing bare-CR and LF endings, a deletion ' +
-            'that would leave a bare \\r right before a blank LF line turns that \\r (and ' +
-            'any bare \\r run just before it) into \\n, so the blank line is not swallowed ' +
-            'into one CRLF.',
-        ),
-    })
-    .strict(),
-]);
 
 const inputSchema = {
   project: z.string().optional(),
@@ -109,6 +63,7 @@ const inputSchema = {
         'is refused outright, since its live target was already replaced and applying it would ' +
         'rewrite dead commented-out text; the whole call fails and the file is left untouched.',
     ),
+  ...compileAfterWriteInput,
   edits: z
     .array(editItemSchema)
     .min(1)
@@ -137,10 +92,19 @@ const outputSchema = {
   diff: z
     .string()
     .describe(
-      'Confirmation diff against HEAD. Budgeted (#153): a large patch comes back cut at hunk ' +
-        'boundaries with a "... N of M hunk(s) omitted" marker — call diff for the whole one. ' +
-        'Empty for a local project (there is no baseline of ours to diff against) or when ' +
-        'nothing changed; never empty merely because it was cut.',
+      'Confirmation diff of what THIS call changed (the file as the call found it → as it ' +
+        'left it, 2 lines of context), not the file against HEAD — so earlier uncommitted edits ' +
+        'are not repeated, and a local project gets one too. A line longer than 240 characters ' +
+        'is cut around its change, the rest shown as …[N chars]… (see diffCondensed). Budgeted ' +
+        '(#153): a large patch comes back cut at hunk boundaries with a "... N of M hunk(s) ' +
+        'omitted" marker — call diff for the whole one. Empty only when nothing changed; never ' +
+        'empty merely because it was cut.',
+    ),
+  diffCondensed: z
+    .boolean()
+    .describe(
+      'True when a long line in diff was cut around its change, so diff is a confirmation to ' +
+        'read, not a patch to apply.',
     ),
   diffTruncated: z
     .boolean()
@@ -149,6 +113,7 @@ const outputSchema = {
     .enum(REWRITE_MODES as unknown as [RewriteMode, ...RewriteMode[]])
     .describe('The mode that actually applied for this call.'),
   preservedEdits: z.number(),
+  compile: compileSummarySchema.optional(),
   commentMatches: z
     .array(
       z.object({
@@ -186,14 +151,17 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
       overrideExternalChanges,
       confirmBibEdit,
       preserveOriginal,
+      compile,
+      resolveComments,
     }) => {
       try {
+        assertCompileRequested(compile, resolveComments);
         const isBib = isBibFile(relPath);
         if (isBib && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
-        return await ctx.projectManager.runExclusive(id, async () => {
+        const written = await ctx.projectManager.runExclusive(id, async () => {
           // Inside the lock, same reasoning as write_file: closes the peer window at no extra cost
           // since every mutator already takes this lock.
           const target = await ctx.files.linkTarget(dir, relPath);
@@ -239,20 +207,18 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           }
 
           const preserve = createPreserveTransform(effectiveMode);
+          let sides: [string, string] = ['', ''];
           const res = await ctx.files.applyEdits(dir, relPath, edits, {
             overrideExternalChanges,
+            onWritten: (before, after) => {
+              sides = [before, after];
+            },
             preserve,
             excludeMatch: matchIsCommented,
           });
           const preservedEdits = preserve.preservedEdits();
-          // A write through an in-project link changed the target, so that is the path to diff.
-          const diff = await changeDiff(
-            ctx.projectManager,
-            ctx.git,
-            id,
-            dir,
-            changedPath(target, relPath),
-          );
+          // A write through an in-project link changed the target, so that is the path named.
+          const diff = planEditDiff(sides[0], sides[1], changedPath(target, relPath));
           let headline = `applied ${res.appliedEdits} edit(s) to ${res.path}`;
           if (preservedEdits > 0) {
             headline += ` (preserved the original text of ${preservedEdits} edit(s) as comments)`;
@@ -281,7 +247,7 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
           return {
             content: [
               {
-                type: 'text',
+                type: 'text' as const,
                 text: diff.diff ? `${headline}\n\n${diff.diff}` : headline,
               },
             ],
@@ -289,11 +255,22 @@ export function registerEditFile(server: McpServer, ctx: AppContext): void {
               ...res,
               diff: diff.diff,
               diffTruncated: diff.truncated,
+              diffCondensed: diff.condensed,
               rewriteMode: effectiveMode,
               preservedEdits,
             },
           };
         });
+        if (!compile) return written;
+        // After the edit's lock is released (it is not re-entrant): the same build a separate
+        // compile call would make, the project's stored defaults included.
+        const built = summarizeCompile(await runCompile(ctx, { project: id, resolveComments }));
+        return {
+          content: [
+            { type: 'text' as const, text: `${written.content[0]?.text ?? ''}\n\n${built.text}` },
+          ],
+          structuredContent: { ...written.structuredContent, compile: built.summary },
+        };
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());
       }

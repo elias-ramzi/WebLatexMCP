@@ -4,6 +4,7 @@ import { ProjectLocks } from '../lib/projectLocks.js';
 import { withFileLock } from '../lib/fileLock.js';
 import type { LockAcquisition } from '../lib/fileLock.js';
 import { projectLockPath } from '../lib/sessionPaths.js';
+import { otherRegistryHint } from '../lib/otherRegistry.js';
 import { gitUrlOf, isLocalProject, requireGitProject } from '../lib/projectMode.js';
 import {
   assertValidProjectId,
@@ -661,7 +662,10 @@ export class ProjectManager {
             `${describeSkippedProject(skipped, this.workspaceRoot)} Known projects: ${known}.`,
         );
       }
-      throw new Error(`Unknown project ${quoteId(resolvedId)}. Known projects: ${known}.`);
+      throw new Error(
+        `Unknown project ${quoteId(resolvedId)}. Known projects: ${known}.` +
+          otherRegistryHint(resolvedId, this.workspaceRoot),
+      );
     }
     return project;
   }

@@ -668,7 +668,12 @@ export function parseSessionId(raw: string | undefined): string {
  * against the lower-cased id. `test/unit/config.test.ts` reads each name off the real layout, so
  * a renamed entry fails there; a NEW project-level entry must be added here by hand.
  */
-const RESERVED_SESSION_IDS: readonly string[] = ['shelves', 'project.lock', 'rewrite-mode.json'];
+const RESERVED_SESSION_IDS: readonly string[] = [
+  'shelves',
+  'project.lock',
+  'rewrite-mode.json',
+  'compile-defaults.json',
+];
 
 /** Parse the default viewer target from env; undefined (the default) means the OS browser. */
 function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {

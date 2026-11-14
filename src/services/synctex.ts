@@ -1,5 +1,9 @@
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
+import { gunzip } from 'node:zlib';
 import { execCapture } from '../lib/exec.js';
+import { synctexEditQuery } from '../lib/synctexReader.js';
 import type { ExecResult } from '../lib/exec.js';
 import { climbsOut } from '../lib/paths.js';
 
@@ -9,8 +13,44 @@ import { climbsOut } from '../lib/paths.js';
  * selected on a page, and this resolves the LaTeX source that produced it. Requires the PDF to have
  * been compiled with `-synctex=1` (a `<job>.synctex.gz` beside it); the compiler enables that.
  *
+ * When the CLI is not installed (a tectonic-only machine has no TeX Live), the same question is
+ * answered in-process from the `.synctex.gz` beside the PDF (`src/lib/synctexReader.ts`).
+ *
  * The subprocess runner is injectable so parsing/normalization is unit-testable without TeX.
  */
+
+const gunzipAsync = promisify(gunzip);
+
+/** Largest decompressed synctex file read in-process: a book's is tens of megabytes. */
+export const MAX_SYNCTEX_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Answer a `synctex edit` query from the files beside `pdfPath` — `<job>.synctex.gz`, else an
+ * uncompressed `<job>.synctex` — without the CLI. `null` when neither exists, cannot be read or
+ * decompressed within {@link MAX_SYNCTEX_BYTES}, or maps the point nowhere.
+ */
+export async function resolveInProcess(
+  pdfPath: string,
+  projectDir: string,
+  page: number,
+  x: number,
+  y: number,
+): Promise<SyncTexLocation | null> {
+  const base = pdfPath.replace(/\.pdf$/i, '');
+  let text: string | undefined;
+  try {
+    const zipped = await readFile(`${base}.synctex.gz`);
+    text = (await gunzipAsync(zipped, { maxOutputLength: MAX_SYNCTEX_BYTES })).toString('utf8');
+  } catch {
+    try {
+      text = await readFile(`${base}.synctex`, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+  const hit = synctexEditQuery(text, page, x, y);
+  return hit ? { file: normalizeInput(hit.input, projectDir), line: hit.line } : null;
+}
 
 export type Runner = (
   cmd: string,
@@ -94,7 +134,8 @@ export class SyncTexService {
     try {
       res = await this.run('synctex', ['edit', '-o', spec], { timeoutMs: 10_000 });
     } catch {
-      return null;
+      // No CLI to run (or it could not start): read the synctex file ourselves.
+      return resolveInProcess(pdfPath, projectDir, page, x, y);
     }
     return parseSyncTexEdit(res.stdout, projectDir);
   }
