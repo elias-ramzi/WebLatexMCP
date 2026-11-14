@@ -7,6 +7,7 @@ import { getServerVersion } from '../lib/version.js';
 import { ChatError, type ChatManager } from './chatEngine.js';
 import { orderedIds, UiInputError, type PaperMetaStore } from './paperMeta.js';
 import type { ToolAnswer } from './daemonClient.js';
+import { DEV_CHAT } from './devMode.js';
 
 /**
  * The web UI's listener (`web-latex-mcp ui`): the page, its static files, and a JSON API under
@@ -35,6 +36,20 @@ export interface UiServerOptions {
   papers: PaperMetaStore;
   chats: ChatManager;
   workspaceRoot: string;
+  /** Which build the page belongs to: the page reloads itself when it changes (dev mode). */
+  rev?: string;
+  /** Dev mode (`ui --dev`): what the page shows of it. */
+  dev?: UiDevState;
+}
+
+export interface UiDevState {
+  /** The checkout the dev chat works in; absent, the dev chat is off and `problem` says why. */
+  repo?: string;
+  problem?: string;
+  /** Why the build running now is not the newest (the newest did not start). */
+  error?: string;
+  /** A new build waits for the chats to finish their turns. */
+  pending: () => boolean;
 }
 
 const MAX_BODY = 1024 * 1024;
@@ -217,6 +232,12 @@ export class UiServer {
 
   private async requirePaper(value: unknown): Promise<string> {
     if (typeof value !== 'string' || !value) throw new HttpError(400, 'Name a paper.');
+    if (value === DEV_CHAT) {
+      if (!this.opts.dev?.repo) {
+        throw new HttpError(404, this.opts.dev?.problem ?? 'The dev chat runs in dev mode only (ui --dev).');
+      }
+      return value;
+    }
     let rows = await this.projects();
     if (!rows.some((p) => p.project === value)) rows = await this.projects(true);
     if (!rows.some((p) => p.project === value)) {
@@ -290,6 +311,7 @@ export class UiServer {
           return await this.register(body);
         case 'GET /api/viewer': {
           const paper = await this.requirePaper(url.searchParams.get('paper'));
+          if (paper === DEV_CHAT) throw new HttpError(404, 'The dev chat has no paper to show.');
           const r = await this.opts.backend.call('viewer', { project: paper, target: 'vscode' });
           if (r.isError || typeof r.structured?.url !== 'string') {
             throw new HttpError(502, r.text || 'The viewer did not start.');
@@ -331,8 +353,20 @@ export class UiServer {
       };
     });
     const labels = [...new Set(papers.flatMap((p) => p.labels))].sort((a, b) => a.localeCompare(b));
+    const dev = this.opts.dev;
     return {
       version: getServerVersion(),
+      ...(this.opts.rev ? { rev: this.opts.rev } : {}),
+      dev: dev
+        ? {
+            chat: Boolean(dev.repo),
+            ...(dev.repo ? { repo: dev.repo } : {}),
+            ...(dev.problem ? { problem: dev.problem } : {}),
+            ...(dev.error ? { error: dev.error } : {}),
+            pending: dev.pending(),
+            status: dev.repo ? this.opts.chats.status(DEV_CHAT) : 'off',
+          }
+        : null,
       workspace: this.opts.workspaceRoot,
       papers,
       groups: meta.groups,

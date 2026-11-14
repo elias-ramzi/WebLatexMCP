@@ -30,7 +30,8 @@ import {
   type StartArgs,
   type UserInput,
 } from '../../src/ui/chatEngine.js';
-import { UiServer, pageCsp, tokenMatches } from '../../src/ui/uiServer.js';
+import { UiServer, pageCsp, tokenMatches, type UiServerOptions } from '../../src/ui/uiServer.js';
+import { DEV_CHAT } from '../../src/ui/devMode.js';
 import { parseUiArgs } from '../../src/ui/uiCommand.js';
 import { readUiInfo, removeUiInfo, writeUiInfo } from '../../src/ui/uiFiles.js';
 
@@ -430,6 +431,42 @@ describe('ChatManager', () => {
     });
   });
 
+  it('runs the dev chat in the checkout, with its own brief, in Auto mode and no default paper', async () => {
+    const ws = await tmp();
+    const queries: FakeQuery[] = [];
+    const mgr = new ChatManager({
+      workspaceRoot: ws,
+      store: new ChatStore(ws),
+      endpoint: async () => ({ url: 'http://127.0.0.1:1/mcp', token: 't' }),
+      paperDir: async () => ws,
+      dev: { repo: '/the/checkout', prompt: 'You are the developer.' },
+      loadQuery: async () => ({
+        query: (args) => {
+          const q = new FakeQuery(args);
+          queries.push(q);
+          return q;
+        },
+      }),
+      log: () => undefined,
+    });
+    await mgr.send(DEV_CHAT, 'make the button blue');
+    const q = queries[0] as FakeQuery;
+    await until(() => q.sent.length > 0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the SDK's options, untyped here
+    const o = q.args.options as Record<string, any>;
+    expect(o.cwd).toBe('/the/checkout');
+    expect(o.permissionMode).toBe('auto');
+    expect(o.systemPrompt.append).toBe('You are the developer.');
+    const headers = o.mcpServers['web-latex-mcp'].headers;
+    expect(headers['x-web-latex-mcp-default-project']).toBeUndefined();
+    expect(mgr.active()).toBe(true);
+    q.emit({ type: 'result', subtype: 'success', session_id: 'S', modelUsage: {} });
+    await until(() => !mgr.active());
+
+    const plain = await manager();
+    await expect(plain.mgr.send(DEV_CHAT, 'hi')).rejects.toThrow(/dev mode only/);
+  });
+
   it('says why the chat is off when the SDK is missing', async () => {
     const ws = await tmp();
     const mgr = new ChatManager({
@@ -463,7 +500,9 @@ describe('ChatManager', () => {
 });
 
 describe('UiServer', () => {
-  async function server(): Promise<{ srv: UiServer; port: number; ws: string; calls: string[] }> {
+  async function server(
+    extra: Partial<UiServerOptions> = {},
+  ): Promise<{ srv: UiServer; port: number; ws: string; calls: string[] }> {
     const ws = await tmp();
     const staticDir = path.join(ws, 'static');
     await mkdir(path.join(staticDir, 'js'), { recursive: true });
@@ -503,6 +542,7 @@ describe('UiServer', () => {
           return { structured: { project: 'new' }, text: 'Registered', isError: false };
         },
       },
+      ...extra,
     });
     const port = await srv.start(0);
     return { srv, port, ws, calls };
@@ -640,6 +680,39 @@ describe('UiServer', () => {
     }
   });
 
+  it('serves the dev chat and the build id in dev mode only', async () => {
+    const plain = await server();
+    const st = await req(plain.port, { path: '/api/state', headers: auth });
+    expect(st.body.dev).toBeNull();
+    expect(st.body.rev).toBeUndefined();
+    const off = await req(plain.port, { path: `/api/chat?paper=${DEV_CHAT}`, headers: auth });
+    expect(off.status).toBe(404);
+    expect(off.body.error).toMatch(/dev mode only/);
+    await plain.srv.close();
+
+    let pending = false;
+    const dev = await server({ rev: 'build-1', dev: { repo: '/r', pending: () => pending } });
+    pending = true;
+    const st2 = await req(dev.port, { path: '/api/state', headers: auth });
+    expect(st2.body.rev).toBe('build-1');
+    expect(st2.body.dev).toEqual({ chat: true, repo: '/r', pending: true, status: 'off' });
+    const chat = await req(dev.port, { path: `/api/chat?paper=${DEV_CHAT}`, headers: auth });
+    expect(chat.status).toBe(200);
+    expect(chat.body.items).toEqual([]);
+    expect(chat.body.mode).toBe('auto');
+    const viewer = await req(dev.port, { path: `/api/viewer?paper=${DEV_CHAT}`, headers: auth });
+    expect(viewer.status).toBe(404);
+    expect(dev.calls.some((c) => c.startsWith('viewer'))).toBe(false);
+    await dev.srv.close();
+
+    const noRepo = await server({ dev: { problem: 'No checkout here.', pending: () => false } });
+    const st3 = await req(noRepo.port, { path: '/api/state', headers: auth });
+    expect(st3.body.dev).toMatchObject({ chat: false, problem: 'No checkout here.' });
+    const refused = await req(noRepo.port, { path: `/api/chat?paper=${DEV_CHAT}`, headers: auth });
+    expect(refused.body.error).toBe('No checkout here.');
+    await noRepo.srv.close();
+  });
+
   it('compares tokens exactly, and lets frames only on loopback', () => {
     expect(tokenMatches('abc', 'abc')).toBe(true);
     expect(tokenMatches('abd', 'abc')).toBe(false);
@@ -650,12 +723,20 @@ describe('UiServer', () => {
 
 describe('web-latex-mcp ui', () => {
   it('parses its arguments', () => {
-    expect(parseUiArgs([])).toEqual({ port: 0, open: true });
+    expect(parseUiArgs([])).toEqual({ port: 0, open: true, dev: false });
     expect(parseUiArgs(['--no-open', '--port', '7778', '--to', 'ws'])).toEqual({
       port: 7778,
       open: false,
       to: 'ws',
+      dev: false,
     });
+    expect(parseUiArgs(['--dev', '--repo', '../wlm'])).toEqual({
+      port: 0,
+      open: true,
+      dev: true,
+      repo: '../wlm',
+    });
+    expect(parseUiArgs(['--repo', 'x'])).toMatch(/goes with --dev/);
     expect(parseUiArgs(['--port', 'x'])).toMatch(/not a port/);
     expect(parseUiArgs(['--what'])).toMatch(/Unknown argument/);
   });

@@ -22,6 +22,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   The chat uses the Claude Agent SDK, an optional dependency. Groups, labels and conversations stay
   in `<workspace>/.ui/`, out of the registry. See [docs/ui.md](docs/ui.md).
 
+- **A dev mode for the web UI: `web-latex-mcp ui --dev`**, after cc-servers'.
+  - **It restarts on each new build.** The UI starts again, on the same address, whenever the
+    build it runs from changes (a dev update, a rebuild), and the page reloads itself.
+    - It waits until no chat is in a turn.
+    - A build that fails to start is rolled back, with the reason shown.
+  - **"Improve WebLatexMCP"**, at the bottom of the side bar, opens a small chat with a Claude that
+    changes WebLatexMCP itself. It works in its own worktree of your checkout and merges a pull
+    request into `dev` once its checks pass. Then it updates the build, and the page reloads on it.
+
+  See [docs/ui.md](docs/ui.md#dev-mode-improve-the-ui-from-the-ui).
+
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
 - **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when
