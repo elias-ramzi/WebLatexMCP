@@ -255,6 +255,16 @@ describe('output contract: the tools no committed test audited', () => {
     expect(String(out.url)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//);
   });
 
+  it('viewer publishes target "embedded" (set by the host) and opens no browser', async () => {
+    const { client, ctx } = await localHarness();
+    // WEB_LATEX_MCP_VIEWER_TARGET=embedded, as cc-servers sets it: the call names no target.
+    (ctx.config as { viewerTarget?: string }).viewerTarget = 'embedded';
+    const out = await auditCall(client, 'viewer', { project: 'doc' });
+
+    expect(out.target).toBe('embedded');
+    expect(out.opened).toBe(false);
+  });
+
   it('list_comments publishes every key it returns, snippet fields included', async () => {
     const { client, ctx } = await localHarness();
     // Seeded directly: the viewer's own POST path is covered in test/unit/viewerService.test.ts,

@@ -18,6 +18,11 @@ describe('shouldOpenExternally', () => {
     expect(shouldOpenExternally('vscode', undefined)).toBe(false);
   });
 
+  it('never opens the OS browser in embedded mode (the host shows the viewer)', () => {
+    expect(shouldOpenExternally('embedded', true)).toBe(false);
+    expect(shouldOpenExternally('embedded', undefined)).toBe(false);
+  });
+
   it('opens by default in browser mode, honoring an explicit open flag', () => {
     expect(shouldOpenExternally('browser', undefined)).toBe(true);
     expect(shouldOpenExternally('browser', true)).toBe(true);
@@ -214,6 +219,13 @@ describe('viewerHint', () => {
     expect(hint).toContain(url);
     expect(hint).toMatch(/Simple Browser/);
     expect(hint).not.toMatch(/Opened in your browser/);
+  });
+
+  it('says the client shows it in embedded mode, with no browser and no Simple Browser steps', () => {
+    const hint = viewerHint(url, 'embedded', false);
+    expect(hint).toContain(url);
+    expect(hint).toMatch(/viewer panel/);
+    expect(hint).not.toMatch(/Simple Browser|Opened in your browser|Open this URL/);
   });
 
   it('reports whether the browser was opened in browser mode', () => {

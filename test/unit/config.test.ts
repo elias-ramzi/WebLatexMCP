@@ -230,6 +230,7 @@ describe('loadConfig', () => {
     expect(loadConfig({}).viewerTarget).toBeUndefined();
     expect(loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: 'vscode' }).viewerTarget).toBe('vscode');
     expect(loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: '  Browser ' }).viewerTarget).toBe('browser');
+    expect(loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: 'embedded' }).viewerTarget).toBe('embedded');
   });
 
   it('throws on an invalid viewer target', () => {
