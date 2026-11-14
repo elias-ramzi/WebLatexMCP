@@ -171,3 +171,30 @@ describe('CredentialResolver.storeCredential', () => {
     expect(r.allSecrets()).toContain('olp_secret');
   });
 });
+
+describe('CredentialResolver.credentialHelpers', () => {
+  const configExec =
+    (code: number, stdout = '') =>
+    async (cmd: string, args: string[]): Promise<ExecResult> => {
+      expect(cmd).toBe('git');
+      expect(args.slice(0, 4)).toEqual(['config', '--includes', '-z', '--get-regexp']);
+      return { code, stdout, stderr: '', timedOut: false };
+    };
+
+  it('reads the helpers that apply to the host, honouring an empty reset', async () => {
+    const out =
+      'credential.helper\ncache\0' +
+      'credential.https://other.example.com.helper\nlibsecret\0' +
+      'credential.https://git.overleaf.com.helper\n\0' +
+      'credential.https://git.overleaf.com.helper\nstore\0';
+    const r = new CredentialResolver({}, configExec(0, out));
+    expect(await r.credentialHelpers('git.overleaf.com')).toEqual(['store']);
+  });
+
+  it('is [] when nothing is configured and undefined when git fails', async () => {
+    expect(await new CredentialResolver({}, configExec(1)).credentialHelpers('h')).toEqual([]);
+    expect(
+      await new CredentialResolver({}, configExec(128)).credentialHelpers('h'),
+    ).toBeUndefined();
+  });
+});

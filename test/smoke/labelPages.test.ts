@@ -257,6 +257,37 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
     expect(out.pages[0]?.lines).toContain('Figure 1: Cap');
   }, 120_000);
 
+  it('resolves a hyperref article’s figure on a page with no folio by its destination (#223)', async () => {
+    // hyperref writes no /PageLabels for an arabic 1..N document (\HyPL@Useless), so this takes
+    // the printed-page route, where the figure's page — no page number on it — used to be
+    // refused as 'noFolio'. Its anchor's named destination is on that page and verifies it.
+    const tex = [
+      '\\documentclass{article}',
+      '\\usepackage{hyperref}',
+      '\\begin{document}',
+      'First page.',
+      '\\clearpage',
+      '\\thispagestyle{empty}',
+      'Second page.',
+      '\\begin{figure}[h]\\centering FIGURE-BODY\\caption{Cap}\\label{fig:a}\\end{figure}',
+      '\\clearpage',
+      'Third page, Figure~\\ref{fig:a}.',
+      '\\end{document}',
+      '',
+    ].join('\n');
+    const client = await compiled(tex);
+    const aux = await readAuxFloats(lastUserDir, 'main.tex');
+    expect(aux.floats.find((f) => f.label === 'fig:a')?.anchor).toBeTruthy();
+    const res = await client.callTool({
+      name: 'extract_text',
+      arguments: { project: 'doc', labels: ['fig:a'] },
+    });
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    const out = res.structuredContent as unknown as Out;
+    expect(out.resolvedLabels).toEqual([{ label: 'fig:a', printedPage: '2', page: 2 }]);
+    expect(textOf(res)).toContain('link target');
+  }, 120_000);
+
   it('refuses a [titlepage] article whose pages are full of small numbers (no hyperref)', async () => {
     // Checking the label's number instead of the folio accepted this: "[1, 2]" and "3 runs" put
     // the label numbers on every page, so the page BEFORE each figure "showed" its number. Only the folio says which page is which.

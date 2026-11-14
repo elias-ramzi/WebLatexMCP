@@ -137,7 +137,8 @@ general-purpose agent, which has write tools the panel must not hold.
 
    Launch the panel in the background, at most 8 tool uses per message. Say in one line that it is
    running — naming, unless `--no-web`, that the novelty scout is sending search queries out —
-   then wait for the completion notifications; do not poll.
+   then wait for the completion notifications; do not poll. Note the launch time, and keep each
+   notification's token total and duration for the calibration record (step 6).
 
 4. **Collect — once every panel agent has returned**, not as each one does. A reply that starts
    with `failed:`, is empty, or lacks its format's headings is re-dispatched **once** with the
@@ -187,12 +188,51 @@ general-purpose agent, which has write tools the panel must not hold.
 6. **Report.** Surface `final-review.md` as the skill's "Surfacing the final review" says — in
    the Claude desktop app, send it as a file I can download (`SendUserFile`, `display: "attach"`)
    as part of this step, without waiting to be asked; everywhere, show it in full and link it.
-   Now write `panel.md` — which model each of `R1`–`R3` was. Then, from the triage log: the
+   Now write `panel.md` — which model each of `R1`–`R3` was — then the calibration record
+   (below). Then, from the triage log: the
    predicted outcome, the top of the author action plan, and every item marked UNVERIFIABLE that I must check myself.
    Close with the panel that actually ran (which model each of `R1`–`R3` was, and any failed
    agent), the venue and the build (submission or camera-ready) assumed, and links to
-   `final-review.md`, `triage-log.md` and `reports/`, and name the exclude file that gained the `paper-review.local/` line, if one did.
+   `final-review.md`, `triage-log.md`, `reports/`, `calibration.md` and `calibration-runs.md`, and name the exclude file that gained the `paper-review.local/` line, if one did.
    Never upload, publish or share the paper or the reviews anywhere.
+
+   **The calibration record** (#218) measures, run after run, whether triage is too lenient and
+   whether each panel seat earns its tokens. Write `paper-review.local/<run>/calibration.md`,
+   counted from the ledger's columns in `triage-log.md` and from `panel.md`:
+   - **Paper kind** — `clean near-final` or `rough draft` (your judgement, from the final review's
+     weakness count and leftover TODOs; say so); `git project`, `local project` or `bare PDF`;
+     the `Build:` line; the page count, the typo-hunter count, and `--no-web` if passed.
+   - **Verdicts** — ledger rows holding a finding, per verdict word (any word beyond the four
+     under its own name), and the REJECTED rate: REJECTED ÷ those rows. A _finding_ is a source
+     ID lettered `C`, `W`, `M` or `T`, or any `TYP`/`CMP` ID — weaknesses incl. CRITICAL, minor
+     weaknesses and typos; questions and strengths are not counted. Then the final review's
+     weakness, minor-weakness, question and typo counts.
+   - **Per seat** — `R1`–`R3` (with the model from `panel.md`), `DA`, `NOV`, `TYP` (all hunters as
+     one seat), `CMP`: findings raised (split C/W/M/T); _survived_ — its row's Final ID is not
+     `—`, so it is in the final review in any section, downgraded or as a question included
+     (count `For the authors to check` rows apart, as "log only"); _unique and survived_ —
+     survived, and no other seat's ID is in its row. Then tokens and wall time per agent, the
+     triage included (with its `source: triage` items), each hunter summed into `TYP`, a
+     re-dispatch's attempts added: copy each completion notification's token total and
+     duration, write `unknown` where none was reported, and **never estimate**. Close with the
+     total subagent tokens (a lower bound if any is unknown) and the minutes from the panel's
+     launch to the triage's end.
+
+   Then append one row to `paper-review.local/calibration-runs.md`, beside the run directories
+   (read it first and write it back whole; when absent, start it with the header row): run id ·
+   paper kind · verdict counts · REJECTED rate · then, for the sonnet, opus and fable reviewer
+   seats, DA, NOV and TYP, `<unique and survived> · <tokens>` — reviewer columns by model, not by
+   `R` id, since the ids are reshuffled every run. Never rewrite earlier rows.
+
+   Both files are for pasting into #218, so they hold **counts, ids, model names, token and time
+   figures and paper-kind labels only** — no title, project id, file name, quote or finding
+   text. The paper and its reviews stay on this machine (the skill's "never put the paper or the
+   reviews anywhere else"), and you never post either file yourself — I decide what to paste.
+   The decision is due after about **5 runs mixing clean and rough drafts**, and is mine, not
+   this run's: if REJECTED stays near 0 even on clean drafts, triage gains a "strongest reason
+   this weakness might be wrong" step; a seat is kept, replaced or dropped on its
+   unique-and-survived findings weighed against its tokens. Until then, change nothing in the
+   triage, the rubric or the panel.
 
 To review a revision, run the command again: a new run directory, a fresh panel that never sees
 the previous reports, and a fresh blinding. Give only the triage agent the previous

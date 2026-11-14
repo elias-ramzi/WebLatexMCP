@@ -9,9 +9,11 @@ import { OVERLEAF_TOKEN_URL } from './auth.js';
  * `set_credential` works, but it needs the user to paste the secret to Claude — and with a
  * cloud-synced transcript, some users would rather the token never appear there at all. This portal
  * closes that gap: the tool hands back a `http://127.0.0.1:<port>/<nonce>` URL, the user types the
- * token into a local form, and it is POSTed **straight to this process** and stored in the OS
- * keychain (via the injected `store`, i.e. `git credential approve`). The token reaches only the
- * local server and the keychain — never the model, the tool result, or the conversation.
+ * token into a local form, and it is POSTed **straight to this process** and handed to the user's
+ * git credential helper (via the injected `store`, i.e. `git credential approve`) — the OS keychain
+ * for most, but `PortalTarget.storage` names where it really goes, since a `store` helper writes a
+ * plain-text file. The token reaches only the local server and that helper — never the model, the
+ * tool result, or the conversation.
  *
  * Bound to loopback only, behind an unguessable path nonce (so another local process can't blind-POST
  * to it), and one-shot: it stops right after a submission, and auto-closes after a timeout if the
@@ -34,12 +36,19 @@ export interface PortalTarget {
    * page of this server the user sees. Display only: the page cannot change it.
    */
   workspaceRoot?: string;
+  /**
+   * Where the configured credential helper keeps the token, as a phrase (`describeHelpers`), shown
+   * on the page and in the result. Absent when git could not be asked; the page then says only
+   * "your git credential helper".
+   */
+  storage?: string;
 }
 
 export interface PortalOutcome {
   host: string;
   username: string;
   persisted: boolean;
+  storage?: string;
 }
 
 /** Cap on the form POST body — a token is tiny; anything larger is a bad client. */
@@ -213,9 +222,14 @@ export class CredentialPortal {
     } catch {
       persisted = false;
     }
-    this.lastOutcome = { host: target.host, username: target.username, persisted };
+    this.lastOutcome = {
+      host: target.host,
+      username: target.username,
+      persisted,
+      ...(target.storage !== undefined ? { storage: target.storage } : {}),
+    };
     const msg = persisted
-      ? `Stored the credential for ${target.username}@${target.host} in your OS keychain. You can close this tab.`
+      ? `Stored the credential for ${target.username}@${target.host} in ${target.storage ?? 'your git credential helper'}. You can close this tab.`
       : `Sent the credential to git, but no credential helper kept it. Configure one (e.g. libsecret on Linux) or use an env var. You can close this tab.`;
     this.sendHtml(res, 200, this.resultHtml(msg, persisted));
     // One-shot: nothing more to accept. Close after the response flushes.
@@ -233,6 +247,7 @@ export class CredentialPortal {
   private formHtml(target: PortalTarget): string {
     const host = escapeHtml(target.host);
     const username = escapeHtml(target.username);
+    const storage = escapeHtml(target.storage ?? 'your git credential helper');
     const action = `/${this.nonce}`;
     return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -257,13 +272,13 @@ export class CredentialPortal {
 <body>
 <h1>Store your git credential</h1>
 <p>Enter the token for this host. It is sent only to the local web-latex-mcp server on your machine
-and stored in your OS keychain — it never goes through Claude or the chat.</p>
+and stored in ${storage} — it never goes through Claude or the chat.</p>
 <div class="meta">Host: <code>${host}</code><br>Username: <code>${username}</code></div>
 <form method="POST" action="${action}" autocomplete="off">
   <label for="token">Token / password</label>
   <input id="token" name="token" type="password" autocomplete="off" autofocus
     placeholder="e.g. your Overleaf Git authentication token">
-  <button type="submit">Store in keychain</button>
+  <button type="submit">Store token</button>
 </form>
 ${this.workspaceHtml(target)}<p class="note">Overleaf: create one under Account Settings → Git integration →
 <a href="${OVERLEAF_TOKEN_URL}" target="_blank" rel="noopener noreferrer">Git authentication token</a>.

@@ -307,7 +307,13 @@ describe('output contract: the tools no committed test audited', () => {
   });
 
   it('credential_portal publishes every key it returns', async () => {
-    const { client } = await localHarness();
+    // git reports one configured helper, so the portal opens (with no helper it refuses first —
+    // the next test). Nothing reaches a real git config.
+    const { client } = await localHarness(async (cmd, args) =>
+      cmd === 'git' && args[0] === 'config'
+        ? { code: 0, stdout: 'credential.helper\nosxkeychain\0', stderr: '', timedOut: false }
+        : { code: 1, stdout: '', stderr: '', timedOut: false },
+    );
 
     // `open: false` keeps it to a loopback page nobody opens; no token is entered, so the result
     // is the awaiting-entry branch — the one that carries the two optional keys (`url`,
@@ -320,7 +326,25 @@ describe('output contract: the tools no committed test audited', () => {
 
     expect(out.status).toBe('awaiting-entry');
     expect(out.opened).toBe(false);
+    expect(out.storage).toBe('the macOS Keychain');
     expect(String(out.url)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//);
+  });
+
+  it('credential_portal publishes every key of its no-helper refusal', async () => {
+    // `git config --get-regexp` exits 1: no credential helper anywhere, so no page is opened.
+    const { client } = await localHarness(async () => ({
+      code: 1,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+    }));
+    const out = await auditCall(client, 'credential_portal', {
+      host: 'git.example.com',
+      username: 'git',
+      open: false,
+    });
+    expect(out.status).toBe('no-helper');
+    expect(out.url).toBeUndefined();
   });
 
   it('set_credential publishes every key it returns', async () => {

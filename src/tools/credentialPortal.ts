@@ -6,6 +6,8 @@ import { openBrowser } from '../lib/openBrowser.js';
 import { toPosix } from '../lib/paths.js';
 import { resolveCredentialTarget } from '../lib/credentialTarget.js';
 import { OVERLEAF_TOKEN_URL } from '../services/auth.js';
+import { describeHelpers, noHelperAdvice, onlyEphemeral } from '../lib/credentialHelpers.js';
+import { isWsl } from '../lib/wsl.js';
 
 const inputSchema = {
   project: z
@@ -28,7 +30,8 @@ const inputSchema = {
 const outputSchema = {
   host: z.string(),
   username: z.string(),
-  status: z.enum(['awaiting-entry', 'stored', 'not-persisted']),
+  status: z.enum(['awaiting-entry', 'stored', 'not-persisted', 'no-helper']),
+  storage: z.string().optional(),
   url: z.string().optional(),
   opened: z.boolean().optional(),
 };
@@ -40,12 +43,15 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
       title: 'Open a local portal to enter a git token',
       description:
         'Open a small loopback web page where the user types a git token, so the secret is entered ' +
-        'on their machine and stored in the OS keychain **without ever passing through the chat** ' +
+        'on their machine and handed to git’s credential helper (usually the OS keychain) **without ' +
+        'ever passing through the chat** ' +
         '(useful when the transcript is cloud-synced). Returns a 127.0.0.1 URL (and auto-opens the ' +
         'browser). The token is POSTed straight to this local server and never returned to Claude. ' +
         'Give a `host` (e.g. git.overleaf.com) or a `project`. After the user submits, **call this ' +
         'tool again** with the same host/project to read the result: it reports `stored`, ' +
-        '`not-persisted` (no credential helper kept it), or `awaiting-entry` if they haven’t yet.',
+        '`not-persisted` (no credential helper kept it), or `awaiting-entry` if they haven’t yet. ' +
+        'When git has no credential helper at all, no page is opened and the result is `no-helper` ' +
+        'with the ways to configure one — ask the user which they want; do not pick for them.',
       inputSchema,
       outputSchema,
     },
@@ -58,16 +64,48 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
         if (outcome) {
           const status = outcome.persisted ? 'stored' : 'not-persisted';
           const text = outcome.persisted
-            ? `Your credential for ${outcome.username}@${outcome.host} was stored in the OS keychain — the token never went through the chat.`
+            ? `Your credential for ${outcome.username}@${outcome.host} was stored in ${outcome.storage ?? 'your git credential helper'} — the token never went through the chat.`
             : `The token was submitted but no credential helper kept it (none appears configured). Configure one (e.g. libsecret on Linux) or set the token via an env var.`;
           return {
             content: [{ type: 'text', text }],
-            structuredContent: { host: outcome.host, username: outcome.username, status },
+            structuredContent: {
+              host: outcome.host,
+              username: outcome.username,
+              status,
+              ...(outcome.storage !== undefined ? { storage: outcome.storage } : {}),
+            },
           };
         }
 
+        // Ask before collecting a token: with no helper, `git credential approve` keeps nothing, and
+        // the user would only learn that after typing it in. `undefined` (git could not be asked)
+        // opens the page anyway — the follow-up call still reports `not-persisted` then.
+        const helpers = await ctx.credentials.credentialHelpers(target.host);
+        if (helpers !== undefined && helpers.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `No credential page opened for ${target.username}@${target.host}. ` +
+                  noHelperAdvice({ platform: process.platform, wsl: isWsl() }),
+              },
+            ],
+            structuredContent: {
+              host: target.host,
+              username: target.username,
+              status: 'no-helper',
+            },
+          };
+        }
+        const storage = helpers ? describeHelpers(helpers) : undefined;
+
         const url = await ctx.credentialPortal.open(
-          { ...target, workspaceRoot: toPosix(ctx.config.workspaceRoot) },
+          {
+            ...target,
+            workspaceRoot: toPosix(ctx.config.workspaceRoot),
+            ...(storage !== undefined ? { storage } : {}),
+          },
           ctx.config.viewerPort,
         );
         if (!url) {
@@ -85,7 +123,10 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
         const text =
           `Opened a local credential page for ${target.username}@${target.host}: ${url}\n` +
           (opened ? 'It should have opened in your browser. ' : 'Open it in your browser. ') +
-          'Enter your token there — it goes straight to this machine’s keychain and never through the chat. ' +
+          `Enter your token there — it goes straight to ${storage ?? 'git’s credential helper on this machine'} and never through the chat. ` +
+          (helpers && onlyEphemeral(helpers)
+            ? 'Note: git’s only helper is `cache`, so the token will be forgotten after its timeout. '
+            : '') +
           'Once you’ve submitted it, ask me to check and I’ll confirm it landed.' +
           (target.host.includes('overleaf.com')
             ? `\nDon’t have a token yet? Create one under Account Settings → Git integration: ${OVERLEAF_TOKEN_URL}`
@@ -98,6 +139,7 @@ export function registerCredentialPortal(server: McpServer, ctx: AppContext): vo
             status: 'awaiting-entry',
             url,
             opened,
+            ...(storage !== undefined ? { storage } : {}),
           },
         };
       } catch (err) {
