@@ -596,6 +596,14 @@ function closePop() {
   popEdit = null;
 }
 document.getElementById('popcancel').onclick = closePop;
+// A press outside the popup (back on the page, the panel, the toolbar) saves what it holds and
+// closes it. An empty note just closes: no new comment, and an edited one is left as it was.
+document.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || pop.style.display !== 'block') return;
+  if (e.target && e.target.closest && e.target.closest('#pop')) return;
+  if (popnote.value.trim()) document.getElementById('popsave').click();
+  else closePop();
+}, true);
 document.getElementById('popdel').onclick = async () => {
   const c = popEdit;
   if (!c) return;
@@ -691,9 +699,18 @@ function editComment(cid, x, y) {
   if (c) openEditPop(c, x, y);
 }
 // A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
-// themselves take no pointer events, so selecting text under them works as before.
-document.addEventListener('click', (e) => {
-  if (e.button !== 0 || e.target.closest(PANEL_KEEP) || pop.style.display === 'block') return;
+// themselves take no pointer events, so selecting text under them works as before. Judged on
+// pointerdown + pointerup at one spot, not on 'click': once text has been selected, pdf.js moves
+// its text layer's end marker under the pointer on press, and the browser then sends no click.
+let pressAt = null;
+document.addEventListener('pointerdown', (e) => {
+  pressAt = e.button === 0 && !(e.target.closest && e.target.closest(PANEL_KEEP)) ? [e.clientX, e.clientY] : null;
+}, true);
+document.addEventListener('pointerup', (e) => {
+  const at = pressAt;
+  pressAt = null;
+  if (!at || e.button !== 0 || Math.hypot(e.clientX - at[0], e.clientY - at[1]) > 4) return;
+  if (pop.style.display === 'block') return;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return;
   const cid = commentAt(e.clientX, e.clientY);
@@ -1192,6 +1209,14 @@ function closePop() {
   popEdit = null;
 }
 document.getElementById('popcancel').onclick = closePop;
+// A press outside the popup (back on the page, the panel, the toolbar) saves what it holds and
+// closes it. An empty note just closes: no new comment, and an edited one is left as it was.
+document.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || pop.style.display !== 'block') return;
+  if (e.target && e.target.closest && e.target.closest('#pop')) return;
+  if (popnote.value.trim()) document.getElementById('popsave').click();
+  else closePop();
+}, true);
 document.getElementById('popdel').onclick = async () => {
   const c = popEdit;
   if (!c) return;
@@ -1278,9 +1303,18 @@ function editComment(cid, x, y) {
   if (c) openEditPop(c, x, y);
 }
 // A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
-// themselves take no pointer events, so selecting text under them works as before.
-document.addEventListener('click', (e) => {
-  if (e.button !== 0 || e.target.closest(PANEL_KEEP) || pop.style.display === 'block') return;
+// themselves take no pointer events, so selecting text under them works as before. Judged on
+// pointerdown + pointerup at one spot, not on 'click': once text has been selected, pdf.js moves
+// its text layer's end marker under the pointer on press, and the browser then sends no click.
+let pressAt = null;
+document.addEventListener('pointerdown', (e) => {
+  pressAt = e.button === 0 && !(e.target.closest && e.target.closest(PANEL_KEEP)) ? [e.clientX, e.clientY] : null;
+}, true);
+document.addEventListener('pointerup', (e) => {
+  const at = pressAt;
+  pressAt = null;
+  if (!at || e.button !== 0 || Math.hypot(e.clientX - at[0], e.clientY - at[1]) > 4) return;
+  if (pop.style.display === 'block') return;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return;
   const cid = commentAt(e.clientX, e.clientY);

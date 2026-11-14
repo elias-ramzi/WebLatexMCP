@@ -151,9 +151,13 @@ describe('ViewerService', () => {
   it('keeps the comment panel open only for chrome that still exists in the page', async () => {
     const html = await (await fetch(`${base}/p/demo`)).text();
     const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
-    const pointerdown = /document\.addEventListener\('pointerdown',[\s\S]*?\n\}\);/.exec(
-      script,
-    )?.[0];
+    // The panel's own handler, among the page's pointerdown listeners (the note popup has one,
+    // and so does the click-on-a-highlight check): the one that keeps PANEL_KEEP's chrome.
+    const pointerdown = [
+      ...script.matchAll(/document\.addEventListener\('pointerdown',[\s\S]*?\n\}(?:, true)?\);/g),
+    ]
+      .map((m) => m[0])
+      .find((h) => h.includes('el.closest(PANEL_KEEP)'));
     expect(pointerdown).toBeTruthy();
     // Strip the handler's own comments first: a guard named only in the rationale above it is not
     // a guard, and deleting the `if` while leaving that comment behind must still fail here.
@@ -733,6 +737,15 @@ describe('ViewerService document view', () => {
       // a new comment opens the popup out of edit mode
       expect(script).toMatch(
         /pending = a;\s*popEdit = null;\s*pop\.classList\.remove\('editing'\);/,
+      );
+      // a press outside the popup saves it (or just closes an empty one), before anything else
+      expect(script).toMatch(
+        /if \(e\.target && e\.target\.closest && e\.target\.closest\('#pop'\)\) return;\s*if \(popnote\.value\.trim\(\)\) document\.getElementById\('popsave'\)\.click\(\);\s*else closePop\(\);\s*\}, true\);/,
+      );
+      // a highlight opens on press + release at one spot: pdf.js can swallow the 'click'
+      expect(script).toContain("document.addEventListener('pointerup', (e) => {");
+      expect(script).not.toMatch(
+        /document\.addEventListener\('click', \(e\) => \{\s*if \(e\.button !== 0 \|\| e\.target\.closest\(PANEL_KEEP\)/,
       );
     }
   });
