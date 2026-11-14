@@ -65,13 +65,14 @@ when you work inside this repo** — Claude Code loads `.mcp.json` only when lau
       "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
       }
     }
   }
 }
 ```
+
+The project itself is added from the chat ("Add my project https://github.com/me/paper and call it paper"): `register_project` keeps it in the workspace's project list, which every session and the [shared server](shared-server.md) read. Listing projects in `WEB_LATEX_MCP_PROJECTS` still works, but makes that client run its own in-process server instead of the shared one; `npx web-latex-mcp import-env-projects` moves such a list into the project list once.
 
 `${VAR}` expansion is supported in Claude Code, so the token stays in your environment. The repo's
 `.gitignore` already excludes a local `.mcp.json`, so your config never gets committed. Or, to register
@@ -97,7 +98,6 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`
       "command": "node",
       "args": ["C:/Users/you/WebLatexMCP/dist/index.js"],
       "env": {
-        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
       }
     }
@@ -128,7 +128,9 @@ found by Claude Desktop. If `node` isn't found, point `command` at the full path
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```powershell
-$env:WEB_LATEX_MCP_PROJECTS='{}'; node C:/Users/you/WebLatexMCP/dist/index.js
+node C:/Users/you/WebLatexMCP/dist/index.js --standalone
 ```
 
-It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).
+It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit). `--standalone`
+serves in-process, without the [shared server](shared-server.md); without it the same command relays
+to the shared server, starting it if need be — `npx web-latex-mcp daemon status` then shows it.

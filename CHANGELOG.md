@@ -83,9 +83,23 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   is a POST whose `Origin` is not the viewer's own (another site, or a page on another local port),
   so a web page open in the same browser can no longer post comments to the viewer or read what it
   serves through DNS rebinding.
+- **The `credential_portal` page answers only requests that name it in `Host`**
+  (`127.0.0.1:<port>` or `localhost:<port>`), which stops a web page from reaching it through DNS
+  rebinding, and refuses a POST from another site, so a page cannot submit a token.
 
 ### Changed
 
+- **One shared server for every session, by default** (milestone 5 of
+  `docs/design/shared-server.md`). `web-latex-mcp` is now a small stdio proxy: it finds the
+  workspace's shared server (`web-latex-mcp serve`), starts it in the background when none answers,
+  and relays the session to it, so several Claude sessions use one process instead of one each.
+  Client configs do not change. Each session keeps its own id, changes and file baselines; git
+  tokens from the client's environment go with that session only and never into the shared
+  server's environment. A different build replaces an idle shared server, or a busy one once its
+  sessions end; if the shared server dies, the proxy restarts it once and keeps the session id.
+  When it cannot run, the session is served in-process as before (`server_info` says why).
+  `--standalone` or `WEB_LATEX_MCP_STANDALONE=1` keeps one in-process server per session.
+  `web-latex-mcp daemon status|stop|restart` manages the shared server.
 - **One workspace for every project.** With `WEB_LATEX_MCP_WORKSPACE` unset, clones and the project
   list now always live in `~/.web-latex-mcp/projects`, wherever your MCP client starts. A server
   started inside a git repository no longer keeps its own `<repo>/.web_latex_mcp/` (workspace-local
@@ -126,6 +140,39 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`** (default 2): how many compiles and PDF reads
+  (`render_pages`, `extract_text`, `pdf_geometry`) one server runs at once. The rest wait their
+  turn, so several sessions compiling together on the shared server no longer each add a TeX run
+  and a PDF in memory at the same time.
+
+- **Docs for the shared server** (milestone 6 of `docs/design/shared-server.md`): a new
+  [shared server](docs/install/shared-server.md) install page with launchd and systemd units, a
+  Windows Task Scheduler entry (unverified) and a direct-HTTP setup for Claude Code
+  (`headersHelper`); a per-session vs server-wide settings table in `docs/configuration.md`;
+  `docs/CONCURRENCY.md` on sessions as connections. `web-latex-mcp daemon headers` prints the
+  headers a direct HTTP client needs. A config that still lists `WEB_LATEX_MCP_PROJECTS` is served
+  in-process, as before, instead of losing its projects to the shared server, which does not read
+  that list; `server_info` names `import-env-projects` as the way onto the shared server.
+- **`web-latex-mcp serve`: one shared server for every session** (milestone 4 of
+  `docs/design/shared-server.md`, preview). It serves MCP over Streamable HTTP on `127.0.0.1`,
+  guarded by a bearer token in `<workspace>/.daemon/daemon.json` (`0600`) and by Host and Origin
+  checks, with one session scope per connection: each session keeps its own id, changes and file
+  baselines. A duplicate session id gets a `-2` suffix; a session closes on `DELETE`, or once idle
+  without a client; the daemon exits after 30 minutes with no session unless `--keep-alive`.
+  `WEB_LATEX_MCP_PORT` or `--port` fixes the port. The writing guide and skills are read for each
+  new session. `server_info` now reports `mode` and `sessionId`. Clients still start the stdio
+  server by default.
+- **Liveness by open scope** (milestone 3 of `docs/design/shared-server.md`). A session record
+  written by a session scope now carries its process's nonce; another session in the same process
+  reads it live exactly while that scope is open, whatever its heartbeat, and dead once it closes.
+  Records from other processes, and from older versions, are judged by pid and heartbeat as
+  before.
+- **Session scopes over shared services** (milestone 2 of `docs/design/shared-server.md`).
+  `createContext` is now `createSharedServices` (one per process: lock table, registry, git,
+  compiler, viewer, comments, reference backends) plus `createSessionContext` (one per session:
+  project manager, file service with its revision baselines, session registry, shadows, shelves and
+  a memory-only credential overlay). stdio runs one scope, so nothing changes for users; it is the
+  groundwork for one server shared by every session.
 - **`web-latex-mcp migrate-workspace <folder>`** moves an older version's `.web_latex_mcp/` folder —
   clones, compiled PDFs, session state and registered projects — into the workspace in use. It checks
   everything before moving anything and moves nothing when a name is taken, a session is live, or the
@@ -143,6 +190,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   declares an output schema, the MCP client rejected that reply (`-32602`, no structured content)
   and the remedy never reached it. The reply is now a tool error that names the port and says to
   pick another or unset the variable.
+
+- A project registered with `tokenEnv` naming an inherited object key (`toString`, `constructor`)
+  no longer crashes credential lookup.
 
 ## [0.9.0] - 2026-10-05
 

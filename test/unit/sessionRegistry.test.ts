@@ -510,7 +510,7 @@ describe('SessionRegistry', () => {
     });
 
     it('resolves for a project this session never touched, rather than rejecting', async () => {
-      // src/index.ts:72 runs `for (const id of ctx.sessions.trackedProjects()) void
+      // A scope's close (src/context.ts) runs `for (const id of ctx.sessions.trackedProjects()) void
       // ctx.sessions.release(id).catch(() => {})` on shutdown, and `force: true` is what makes a
       // *missing record* a no-op there. This pins the case one layer further out than that: no
       // session directory at all, not merely a directory with the record already gone.
@@ -546,7 +546,7 @@ describe('SessionRegistry', () => {
 
   describe('trackedProjects()', () => {
     it('is empty before any touch(), and gains each project exactly once thereafter', async () => {
-      // Shutdown releases exactly what this returns (src/index.ts:72) — a missing key here leaks a
+      // Shutdown releases exactly what this returns (a scope's close, src/context.ts) — a missing key here leaks a
       // session record forever (a dead session reads live to its peers until STALE_MS), and a
       // duplicate would mean release() is asked to remove the same project's record twice for no
       // reason.

@@ -527,6 +527,9 @@ describe('two sessions sharing one clone', () => {
       JSON.stringify(
         {
           ...record,
+          // Another process wrote it, so it cannot carry this process's nonce: without one it is
+          // judged by pid, boot and heartbeat, not by whether beta's scope is open here.
+          processNonce: undefined,
           pid: process.pid,
           bootedAt: priorBoot,
           heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),

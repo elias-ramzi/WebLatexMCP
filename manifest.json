@@ -46,7 +46,7 @@
     "workspace": {
       "type": "directory",
       "title": "Clone workspace folder",
-      "description": "Folder that keeps one local clone per project, plus the list of projects you registered. Defaults to a latex-workspace folder in your home directory; pick any other folder to change it.",
+      "description": "Folder that keeps one local clone per project, plus the list of projects you registered. Defaults to a latex-workspace folder in your home directory; pick any other folder to change it. Set it to ~/.web-latex-mcp/projects to share projects, and one background server, with Claude Code.",
       "default": "${HOME}/latex-workspace",
       "required": false
     }

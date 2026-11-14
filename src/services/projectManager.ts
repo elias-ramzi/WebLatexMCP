@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { access } from 'node:fs/promises';
-import { Mutex } from 'async-mutex';
+import { ProjectLocks } from '../lib/projectLocks.js';
 import { withFileLock } from '../lib/fileLock.js';
 import type { LockAcquisition } from '../lib/fileLock.js';
 import { projectLockPath } from '../lib/sessionPaths.js';
@@ -119,8 +119,20 @@ export class ProjectManager {
   private readonly sessionId: string;
   private readonly registry?: ProjectRegistryStore;
 
-  /** One mutex per project, so concurrent mutating tool calls can't interleave. */
-  private readonly locks = new Map<string, Mutex>();
+  /**
+   * One mutex per project, so concurrent mutating tool calls can't interleave — shared with every
+   * other session scope in this process (`ProjectLocks`), since two scopes on one project must
+   * queue here rather than meet at the lock file.
+   */
+  private readonly locks: ProjectLocks;
+  /**
+   * This manager's `runExclusive` calls not yet settled, waiting or running. Every write a session
+   * makes runs inside one, so a closing session drains these (`whenIdle`) before its scope closes:
+   * counted from the call itself, it holds for a call the client cancelled or whose transport
+   * closed, which keeps running regardless.
+   */
+  private active = 0;
+  private idleWaiters: Array<() => void> = [];
   /**
    * Configured ids that were not loaded because `src/lib/projectId.ts` refuses them, with why —
    * from `loadConfig` (`ServerConfig.skippedProjects`) and from the constructor's own check. The
@@ -149,7 +161,12 @@ export class ProjectManager {
    */
   private readonly sessionPinned = new Set<string>();
 
-  constructor(config: ServerConfig, registry?: ProjectRegistryStore) {
+  constructor(
+    config: ServerConfig,
+    registry?: ProjectRegistryStore,
+    locks: ProjectLocks = new ProjectLocks(),
+  ) {
+    this.locks = locks;
     this.workspaceRoot = config.workspaceRoot;
     this.skippedProjects = [...(config.skippedProjects ?? [])];
     this.envProjectIds = new Set(config.envProjectIds ?? []);
@@ -178,42 +195,70 @@ export class ProjectManager {
    * Two layers, because sibling agent sessions run separate server processes over the same
    * clone: the mutex serialises this process's own calls, and the lock file serialises us
    * against every other process. Both are needed — git will happily corrupt an index that two
-   * processes rewrite at once.
+   * processes rewrite at once. The mutex table is shared by every session scope of the process
+   * (`ProjectLocks`), so two scopes queue on the mutex and only one ever reaches the file.
    */
   async runExclusive<T>(id: string, fn: (lock: LockAcquisition) => Promise<T>): Promise<T> {
     // Before anything else: `withFileLock` creates the lock's directory first thing, so an id that
     // walks out of `.sessions/` would otherwise create a directory wherever it points — and
     // `register_project` takes this lock before the id has been registered anywhere.
     assertValidProjectId(id);
-    let lock = this.locks.get(id);
-    if (!lock) {
-      lock = new Mutex();
-      this.locks.set(id, lock);
+    this.active++;
+    try {
+      return await this.runExclusiveCounted(id, fn);
+    } finally {
+      if (--this.active === 0) for (const r of this.idleWaiters.splice(0)) r();
     }
+  }
+
+  /** Whether a `runExclusive` call of this manager is waiting or running. */
+  isBusy(): boolean {
+    return this.active > 0;
+  }
+
+  /** Resolves once no `runExclusive` call of this manager is waiting or running. */
+  whenIdle(): Promise<void> {
+    if (this.active === 0) return Promise.resolve();
+    return new Promise((r) => this.idleWaiters.push(r));
+  }
+
+  private async runExclusiveCounted<T>(
+    id: string,
+    fn: (lock: LockAcquisition) => Promise<T>,
+  ): Promise<T> {
+    const entry = this.locks.entry(id);
     // Measured before the mutex is even requested, so `waitedMs` below covers BOTH layers: a
     // same-process peer holding the mutex, and a sibling process holding the file lock.
     // `withFileLock` alone only sees the second — a second concurrent call in this same process
     // would otherwise wait out the whole first call on the mutex and then report `waitedMs: 0`,
     // because `withFileLock`'s own clock only starts once the mutex has already let it in.
     const t0 = Date.now();
-    return lock.runExclusive(() => {
+    // Whether anyone held the mutex when this call asked: only then can a mutex wait name a holder.
+    const contended = entry.mutex.isLocked();
+    return entry.mutex.runExclusive(async () => {
       // How long this call waited on the mutex alone, before withFileLock has even started its
-      // own (file-lock) wait. Read once, right as the mutex admits us.
+      // own (file-lock) wait. Read once, right as the mutex admits us — as is the session that
+      // released it to us, which is the one this call waited on.
       const mutexWaitMs = Date.now() - t0;
-      return withFileLock(
-        projectLockPath(this.workspaceRoot, id),
-        (fileLock) => {
-          const waitedMs = Date.now() - t0;
-          // The file lock saw no contention of its own (the common case: nobody else is touching
-          // this clone), but the mutex wait was real — so the holder it waited on was this very
-          // session, just a still-running call in this same process.
-          const waitedOn =
-            fileLock.waitedOn ?? (mutexWaitMs > MUTEX_WAIT_NOISE_MS ? this.sessionId : undefined);
-          const combined: LockAcquisition = { waitedMs, ...(waitedOn ? { waitedOn } : {}) };
-          return fn(combined);
-        },
-        { owner: this.sessionId },
-      );
+      const mutexHolder = contended ? (entry.lastHolder ?? this.sessionId) : undefined;
+      try {
+        return await withFileLock(
+          projectLockPath(this.workspaceRoot, id),
+          (fileLock) => {
+            const waitedMs = Date.now() - t0;
+            // The file lock saw no contention of its own (the common case: nobody else is touching
+            // this clone), but the mutex wait was real — so the holder it waited on ran in this
+            // same process: this session's own earlier call, or another session scope's.
+            const waitedOn =
+              fileLock.waitedOn ?? (mutexWaitMs > MUTEX_WAIT_NOISE_MS ? mutexHolder : undefined);
+            const combined: LockAcquisition = { waitedMs, ...(waitedOn ? { waitedOn } : {}) };
+            return fn(combined);
+          },
+          { owner: this.sessionId },
+        );
+      } finally {
+        entry.lastHolder = this.sessionId;
+      }
     });
   }
 

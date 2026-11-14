@@ -43,12 +43,35 @@ Local gate before work is done: `typecheck` + `lint` + `format:check` + `test`.
 **Thin tool layer over a testable service core.** Tools do schema validation + response formatting;
 logic lives in services, unit-testable without an MCP client.
 
-- `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else resolves
-  auth (may hit the Keychain), builds the context and serves stdio; sets `GIT_TERMINAL_PROMPT=0` when
-  unset.
+- `src/proxy/*` — the default `web-latex-mcp` (no command): `runProxy` finds the daemon
+  (`findDaemon`: pid + `/health` with token and nonce), applies `decideBuild` (build id = version +
+  entry + mtime), auto-starts one (`autostartDaemon`, detached, env from `daemonSpawnEnv`: **no
+  token or per-connection variable**), and relays stdio ↔ HTTP (`runRelay`, never parses payloads;
+  replays `initialize` once after a loss; watches stdin `end` itself, since the SDK's stdio
+  transport does not). Unreachable daemon → `runStandalone` (`src/standalone.ts`) with
+  `daemonUnavailable`. `--standalone` / `WEB_LATEX_MCP_STANDALONE=1` skip the proxy.
+- `src/daemon/*` — `web-latex-mcp serve` (`startDaemon`): Streamable HTTP on `127.0.0.1`, one
+  `SessionScope` + `McpServer` + transport per MCP session over one `createSharedServices`.
+  `guardRequest` (bearer in constant time, exact `Host`, any `Origin` refused) runs on **every**
+  request, `/health` included. The credential portal runs `browserRequestRefusal`
+  (`src/lib/loopbackHost.ts`) first in its handler: `Host` names the listener, and a non-GET/HEAD
+  `Origin` must be the listener's own. The viewer keeps `ViewerService.admits` (any port, below). `daemon.lock` (via `withFileLock`) held for the daemon's life;
+  `daemon.json` `0600` in a `0700` `.daemon/`, removed only by the daemon that wrote it. A closing
+  session leaves the routing map first, drains running calls, then closes its scope. Per-connection
+  headers are parsed in `sessionHeaders.ts` and refuse rather than rewrite. Guides load per session
+  (`loadSessionGuides`).
+- `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else the
+  proxy, else (daemon unreachable, or `--standalone`) `src/standalone.ts`, the stdio server itself:
+  resolves auth (may hit the Keychain), builds the context and serves stdio. Both the standalone
+  server and `serve` set `GIT_TERMINAL_PROMPT=0` when unset.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext` dependency bag (`projectManager`, `git`, `files`, `compiler`,
-  `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …).
+  `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …), built
+  as `createSharedServices` (one per process) + `createSessionContext` (one per session; stdio runs
+  one, `createContext` is both). **Per session, never shared:** `ProjectManager` (over the shared
+  `ProjectLocks` mutex table), `FileService` (baselines are "what this session saw"), session
+  registry, shadows, shelves, and the credential overlay (`CredentialResolver.withOverlay`, memory
+  only, scrubbed by that scope's `allSecrets`). `sharedServices.test.ts` pins it.
 - `src/tools/*` — one file per tool: zod `inputSchema`/`outputSchema` + a handler calling services.
 - `src/prompts/skills.ts` — exposes each `.claude/skills/*/SKILL.md` (loaded by `src/lib/skills.ts`) as
   an MCP prompt. Adding a skill directory needs no code.
@@ -204,7 +227,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### Parallel sessions, shadows and commit
 
-- **Sessions share a clone; commits don't.** `WEB_LATEX_MCP_SESSION` names the process (`parseSessionId`;
+- **Sessions share a clone; commits don't.** A session is an MCP connection — one scope in the shared server, or one `--standalone` process; `WEB_LATEX_MCP_SESSION` (the proxy's `X-Web-Latex-Mcp-Session`) names it (`parseSessionId`;
   `RESERVED_SESSION_IDS` refuses `shelves`, `project.lock`, `rewrite-mode.json`,
   `compile-defaults.json` — add any new
   project-level entry under `.sessions/<id>/` there by hand). State lives in
@@ -304,6 +327,11 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `capUnshelveConflict` (`src/lib/shelf.ts`) with `theirs` charged first, cut last, exempt from the
   per-side cap. Ownership as for `revert` (`before` = shelf base on restore, HEAD on merge;
   `resolveUnshelveFile`). A failed `record` is only logged — a known gap, not a pattern.
+- **A scope's own records are judged by the scope** (`src/lib/openScopes.ts`): a record carrying
+  this process's `processNonce` and pid (written only by a `scoped: true` `SessionRegistry`, i.e.
+  `createSessionContext`) is live exactly while `isScopeOpen(workspace, id)`; pid/boot/heartbeat
+  are not consulted. The table is process-wide, so contexts built per simulated process in tests
+  still see each other. A test faking another process's record must drop `processNonce`.
 - **`status` collapses a dead, change-free peer into `staleSessions: N`** — reporting only, never
   deletion (`isStalePeer`/`splitStalePeers`, `src/lib/peerSummary.ts`). One conjunction: `!live`, index
   read as a readable **empty** array (`null` = unreadable → stays listed with `changes: null`), heartbeat
@@ -538,6 +566,10 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### Compile
 
+- **Compiles and PDF loads share one process-wide `WorkGate`** (`src/lib/workGate.ts`,
+  `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`, default 2, FIFO), applied by wrapping the compiler and the
+  renderer in `createSharedServices` (`src/services/gatedWork.ts`); tools never take it. A slot is
+  taken inside `runExclusive`, and no gated call may make another (a limit of 1 would deadlock).
 - **Backend preflight; only an unchosen default is substituted** (`CompilerResolver`,
   `src/services/compilerResolver.ts`, calls `isAvailable()`). `config.compilerExplicit` (from
   `parseCompilerChoice` — derive both answers there) is the licence: unset env → missing `latexmk` may

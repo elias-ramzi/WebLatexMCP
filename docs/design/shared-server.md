@@ -1,6 +1,6 @@
 # Design: one shared server per workspace
 
-Status: **accepted** (decisions in §14). Milestone 1 (§13) is implemented; the rest is not.
+Status: **accepted** (decisions in §14). All six milestones (§13) are implemented; the open items are listed just before §12.
 
 ## 1. Why
 
@@ -8,6 +8,28 @@ Today every MCP client session starts its own `web-latex-mcp` process over stdio
 holds about 117 MB (measured on macOS with v0.9.0), so ten parallel Claude sessions cost about
 1 GB. Each process also opens its own viewer and credential portal, and coordinates with its
 siblings only through files under `<workspace>/.sessions/`.
+
+Measured after the change (macOS, Node 26, RSS of the server processes only; TeX engines run as
+short-lived children, about 60 MB each, in both setups). Each session compiles the sample
+project, renders a page and extracts text, twice:
+
+| Sessions | One server per session (idle → after work) | Relays + one shared server (idle → after work) |
+| -------- | ------------------------------------------ | ---------------------------------------------- |
+| 1        | 121 → 201 MB                               | 216 → 299 MB                                   |
+| 3        | 359 → 602 MB                               | 411 → 526 MB                                   |
+| 5        | 598 → 1003 MB                              | 612 → 726 MB                                   |
+
+A session's own server keeps pdf.js loaded once it has read a PDF (about 200 MB each); a relay
+stays at about 97 MB and the shared server at about 235 MB, whatever the number of sessions. The
+shared server costs about 100 MB more for one session, breaks even around two, and saves about
+100 MB per session beyond that. Most of a relay's 97 MB is Node and the SDK's HTTP client; a relay
+without the SDK transports could be lighter still.
+
+Those figures are for sessions taking turns. Sessions compiling at the same moment add one TeX run
+and one pdf.js document each, so the shared server queues them: at most
+`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS` (default 2) compiles and PDF reads run at once, the rest wait in
+arrival order (`src/lib/workGate.ts`). A waiter holds its project lock, never a slot while waiting
+for one.
 
 The default workspace makes things worse for anyone with many papers. It depends on where the
 client was launched: inside a git repository it is `<launch-dir>/.web_latex_mcp`, otherwise
@@ -97,7 +119,8 @@ Today `createContext` builds one `AppContext` per process and bakes `config.sess
 
 | Piece                                                                                        | Scope                                                     | Why                                                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ProjectManager` (mutexes, registry)                                                         | shared                                                    | The in-process mutex is what serializes sessions in one process; it must be one instance.                                                                                                                                                                                                                                                                                                  |
+| `ProjectManager`: mutex table (`ProjectLocks`) and registry                                  | shared                                                    | The in-process mutex is what serializes sessions in one process; it must be one table.                                                                                                                                                                                                                                                                                                     |
+| `ProjectManager` itself (session-only registrations, pins, in-process default)               | **per session**, over the shared table                    | Q4: a `project_sync { gitUrl }` registration and its pin are that session's own. One manager per scope keeps them so with no overlay inside the manager. The viewer resolves an id through the open scope that knows it, else through a manager of its own over the configuration and registry.                                                                                            |
 | `GitService`, compiler, `PdfRenderer`, reference backends, `DoctorService`, `SyncTexService` | shared                                                    | Stateless or caching only.                                                                                                                                                                                                                                                                                                                                                                 |
 | `ViewerService`, `CommentStore`                                                              | shared                                                    | One viewer port for everyone. Review comments become visible to every session, which is an improvement: today a comment left in one process's viewer is invisible to the others.                                                                                                                                                                                                           |
 | `CredentialPortal`, `UpdateService`, `RewriteModeStore`                                      | shared                                                    | Project-wide or machine-wide already.                                                                                                                                                                                                                                                                                                                                                      |
@@ -108,7 +131,7 @@ Today `createContext` builds one `AppContext` per process and bakes `config.sess
 
 `AppContext` keeps its shape, so no tool changes. `createContext` becomes
 `createSharedServices(config, …)` plus `createSessionContext(shared, { sessionId, defaultProject,
-credentialOverlay })`, which returns an `AppContext`. `--standalone` builds exactly one session
+credentialOverlay })`, which returns a `SessionScope`: the scope's `AppContext` and its `close()`. `--standalone` builds exactly one session
 context, so it uses the same code path.
 
 `ShadowStore.withIndexLock` is already module-level, keyed by session directory, and
@@ -295,8 +318,11 @@ can be reached by every local process and, through DNS rebinding, by web pages.
 - Body size cap (4 MB, above any legitimate `write_file`), and a cap on open scopes (64).
 - On win32 the file mode is not enforced the same way. Say so in the docs, as the build-root
   bullet does, and don't claim more.
-- The viewer and the credential portal keep their own loopback listeners and nonces. They get the
-  same `Host` check while we're at it.
+- The viewer and the credential portal keep their own loopback listeners (the portal also its
+  nonce). The portal gets the same exact `Host` check (`src/lib/loopbackHost.ts`); the viewer
+  accepts any loopback name on any port, so a forwarded port (VS Code Remote) still reaches it
+  (`ViewerService.admits`). Being pages a browser opens, both accept an `Origin`, but only their
+  own on a request that changes something, so another site's form cannot post a comment or a token.
 - Nothing about tokens changes on disk: the per-scope overlay (§7.2) is memory only.
 
 ## 11. Risks
@@ -311,7 +337,73 @@ can be reached by every local process and, through DNS rebinding, by web pages.
   and a soak test.
 - **Session-only registrations.** `project_sync { gitUrl }` that differs from the registry pins
   the URL "for this session" in `ProjectManager`, which is per process today. Shared, that pin
-  would leak to every scope. Decided (Q4): pins become a per-scope overlay.
+  would leak to every scope. Decided (Q4): pins stay per scope; each scope has its own manager.
+
+Milestone 4 (the daemon, `src/daemon/`) settled the milestone-2 and -3 gaps as follows:
+
+- **Duplicate session ids:** suffixed `-2`, `-3`, … against every open session and in-process
+  scope (`uniqueSessionId`), compared **case-folded**, since `Alice` and `alice` are one session
+  directory on macOS and Windows; `server_info` reports `sessionIdRequested`.
+- **Calls after close:** a closing session leaves the routing table first (its id answers 404),
+  then waits for its `ProjectManager`'s `runExclusive` calls (`whenIdle`) — every write runs in one,
+  and it keeps running when the client cancels or the transport aborts the call — for up to
+  `DEFAULT_DRAIN_MS` (10 minutes), cut to `STOP_DRAIN_MS` (10 s) for every session once the daemon
+  stops. A write outliving the cap still lands after close.
+- **Idle close:** `sessionIdleMs` (30 minutes) without a request, an open event stream or a
+  running exclusive call. A connected client holds its event stream open, so in practice a session closes
+  idle when its client vanished without a `DELETE`. Q5 is still to measure; it only matters for
+  clients that keep no stream open.
+
+Milestone 5 (the proxy, `src/proxy/`) follows §9 with these choices:
+
+- **Build rule.** A build id is the version plus the entry file and its mtime (`currentBuildId`).
+  Same version → connect, so two installs of one version (Desktop's bundle, `npx`) share a daemon;
+  the exception is the same entry with another mtime (a launcher rebuilding `main` in place), which
+  counts as newer. A newer version replaces an idle daemon now, a busy one once its sessions end
+  (also when an idle one refuses `/shutdown` because a session just opened); `server_info` then
+  shows `restartPending`. An older proxy connects. A keep-alive daemon is never replaced.
+- **Ignored env (§7.1)** travels as `X-Web-Latex-Mcp-Client-Env`, each daemon-wide variable the
+  client set mapped to a SHA-256 of its value, so the daemon names what differs without seeing a
+  value.
+- **Credentials and environment.** An auto-started daemon gets the client's environment minus the
+  per-connection variables, `WEB_LATEX_MCP_PROJECTS`, every token variable the proxy forwards, and
+  every variable whose name has a secret-like word (`TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, …), so
+  `GH_TOKEN` cannot serve every session through `gh`. It runs in the workspace, not the client's
+  directory; relative guide and skills paths are resolved against the client's directory first,
+  and preloaded modules (`--import tsx` in development) are made absolute.
+- **Relay.** Only a request actually handed to a daemon that is then lost is answered "restarted,
+  retry"; one queued behind the restart goes to the new daemon. A send the live daemon refuses (a 413) is passed back as an error and never triggers a restart. A client `initialize` still
+  unanswered at a restart is re-sent as itself. `/health` answers 503 while a daemon stops.
+  Reconnect restarts at most once per proxy; a second loss ends it.
+- **Ending a session.** The proxy sends `DELETE` on stdin end and on SIGINT, SIGTERM and SIGHUP.
+  For a kill it cannot see (SIGKILL, Windows `TerminateProcess`), the daemon closes a session that
+  held an event stream and lost every one after `DEFAULT_STREAM_LOSS_MS` (60 s) instead of the
+  30-minute idle timeout, freeing its id.
+- **Fallback** is reported as `daemonUnavailable` beside `mode: "stdio"`, not as a `mode` string.
+- **Q5** no longer gates anything for proxied clients: the proxy always ends its session. It still
+  matters only for clients connecting over HTTP directly.
+
+Still open, for milestone 6 or later:
+
+- **`update_server`** does not yet schedule the restart-when-idle (§9.2); after an update the next
+  client's proxy replaces the daemon by the build rule.
+- **Windows job objects.** `detached: true` does not leave a kill-on-close job; a client running its
+  servers in one kills the shared daemon when it quits. Unverified on Windows.
+- **Token variables learned mid-session** (a `tokenEnv` given to `register_project` after the proxy
+  started) are not forwarded until the next session. `gh`'s own login is the daemon's.
+
+- **Viewer's view of a shared project.** The viewer resolves an id through the newest open scope
+  that knows it, so a session's pin or session-only `rootFile` decides what the viewer shows while
+  that session is open.
+- **Overlay contents.** Every overlay value is scrubbed from the scope's output; the daemon accepts
+  any variable-shaped name in `X-Web-Latex-Mcp-Credentials`, so the proxy must send credentials
+  only.
+- **`~/.web-latex-mcp/config.json`** (§7.1) is not read yet; the daemon reads its own env only.
+- **The ignored-env hint** reaches `server_info` only, not yet the session's first tool result
+  (§7.1).
+- **The session probe** (`WEB_LATEX_MCP_SESSION_PROBE`) is wired for stdio only.
+- **Tests from §6 and §12** that need TeX or the proxy: two sessions racing `compile`, and the
+  proxy relay, auto-start and reconnect tests.
 
 ## 12. Testing
 
@@ -373,8 +465,9 @@ Accepted on 2026-11-09:
   central registry. Env projects configured one process; the shared registry replaces them.
 - **Q3. Daemon lifetime:** an auto-started daemon exits after 30 minutes with no open scope;
   `serve --keep-alive` never idles out (§9.3).
-- **Q4. Session-only `project_sync { gitUrl }` pins:** kept per session, as a per-scope overlay in
-  `ProjectManager`, so a pin never leaks to other scopes.
+- **Q4. Session-only `project_sync { gitUrl }` pins:** kept per session, so a pin never leaks to
+  other scopes. Built (milestone 2) as one `ProjectManager` per scope over a shared mutex table
+  (`ProjectLocks`) rather than an overlay inside one manager.
 - **Q5. Does Claude Code's HTTP client send `DELETE` on exit?** Still to measure, with the session
   probe, before milestone 3 fixes `SESSION_IDLE_MS`. Until then the default stays 30 minutes.
 - **Q6. Desktop extension:** runs the proxy, sharing the central workspace and daemon. Its

@@ -389,7 +389,12 @@ describe('createServer skill prompts', () => {
 describe('server_info', () => {
   it('advertises the package version and reports runtime config', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', surfacePdf: true, compiler: 'latexmk' },
+      config: {
+        workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
+        surfacePdf: true,
+        compiler: 'latexmk',
+      },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -404,6 +409,10 @@ describe('server_info', () => {
     expect(structured.name).toBe('web-latex-mcp');
     expect(structured.version).toBe(client.getServerVersion()?.version);
     expect(structured.workspaceRoot).toBe('/tmp/ws');
+    // No daemon built this context: a stdio session, named by its own id.
+    expect(structured.mode).toBe('stdio');
+    expect(structured.sessionId).toBe('test-session');
+    expect(structured.sessionIdRequested).toBeUndefined();
     expect(structured.compiler).toBe('latexmk');
     // Workspace-local mode and its git exclude are gone; nothing reports them any more.
     expect(structured).not.toHaveProperty('workspaceLocal');
@@ -426,6 +435,7 @@ describe('server_info', () => {
       const ctx = {
         config: {
           workspaceRoot: '/tmp/ws',
+          sessionId: 'test-session',
           compiler: 'latexmk',
           legacyWorkspaceRoot: legacy,
         },
@@ -463,7 +473,12 @@ describe('server_info', () => {
 
   it('omits the extra writing guide fields when not configured', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', surfacePdf: false, compiler: 'latexmk' },
+      config: {
+        workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
+        surfacePdf: false,
+        compiler: 'latexmk',
+      },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -482,6 +497,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
         surfacePdf: false,
         compiler: 'latexmk',
         extraWritingGuidePath: '/home/user/paper/conventions.md',
@@ -508,6 +524,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
         surfacePdf: false,
         compiler: 'latexmk',
         extraWritingGuidePath: '/home/user/paper/conventions.md',
@@ -535,6 +552,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
         surfacePdf: false,
         compiler: 'latexmk',
         rewriteMode: 'off',
@@ -558,7 +576,12 @@ describe('server_info', () => {
 
   it('omits writingGuideExtraRuleCount when no guide is configured', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', surfacePdf: false, compiler: 'latexmk' },
+      config: {
+        workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
+        surfacePdf: false,
+        compiler: 'latexmk',
+      },
     } as unknown as AppContext;
     const server = createServer(ctx);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -576,6 +599,7 @@ describe('server_info', () => {
     const ctx = {
       config: {
         workspaceRoot: '/tmp/ws',
+        sessionId: 'test-session',
         surfacePdf: false,
         compiler: 'latexmk',
         rewriteMode: 'off',
@@ -608,6 +632,7 @@ describe('server_info', () => {
       const ctx = {
         config: {
           workspaceRoot: '/tmp/ws',
+          sessionId: 'test-session',
           surfacePdf: false,
           compiler: 'latexmk',
           extraWritingGuidePath: guidePath,
@@ -648,6 +673,7 @@ describe('server_info', () => {
       const ctx = {
         config: {
           workspaceRoot: '/tmp/ws',
+          sessionId: 'test-session',
           surfacePdf: false,
           compiler: 'latexmk',
           extraWritingGuidePath: guidePath,
@@ -676,7 +702,7 @@ describe('server_info', () => {
 describe('doctor', () => {
   it('renders the diagnosis, hints included, from an injected toolchain', async () => {
     const ctx = {
-      config: { workspaceRoot: '/tmp/ws', compiler: 'latexmk' },
+      config: { workspaceRoot: '/tmp/ws', sessionId: 'test-session', compiler: 'latexmk' },
       credentials: { allSecrets: () => [] },
       doctor: {
         diagnose: () =>

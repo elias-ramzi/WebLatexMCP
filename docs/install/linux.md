@@ -64,11 +64,12 @@ The server resolves a token per host in this order: per-project `tokenEnv` → h
 
 ```bash
 claude mcp add web-latex-mcp --scope user \
-  -e WEB_LATEX_MCP_PROJECTS='{"paper":{"gitUrl":"https://github.com/me/paper","branch":"main"}}' \
   -e WEB_LATEX_MCP_DEFAULT_PROJECT=paper \
   -e GITHUB_TOKEN=ghp_xxx \
   -- node /path/to/WebLatexMCP/dist/index.js
 ```
+
+The project itself is added from the chat ("Add my project https://github.com/me/paper and call it paper"): `register_project` keeps it in the workspace's project list, which every session and the [shared server](shared-server.md) read. Listing projects in `WEB_LATEX_MCP_PROJECTS` still works, but makes that client run its own in-process server instead of the shared one; `npx web-latex-mcp import-env-projects` moves such a list into the project list once.
 
 (Drop the `GITHUB_TOKEN` line if you use `gh` or a credential helper from step 3.) Check it with `/mcp`.
 Claude Code inherits your shell `PATH`, so `node`/`git`/`gh`/`latexmk` are found as usual.
@@ -85,7 +86,6 @@ To keep it active **only when you work inside the `WebLatexMCP` repo**, drop a p
       "args": ["./dist/index.js"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
       }
     }
@@ -109,7 +109,6 @@ an unofficial/community Electron build, its config typically lives at
       "command": "node",
       "args": ["/path/to/WebLatexMCP/dist/index.js"],
       "env": {
-        "WEB_LATEX_MCP_PROJECTS": "{\"paper\":{\"gitUrl\":\"https://github.com/me/paper\",\"branch\":\"main\"}}",
         "WEB_LATEX_MCP_DEFAULT_PROJECT": "paper"
       }
     }
@@ -126,7 +125,9 @@ to `env`.
 Ask Claude to run `project_sync` then `list_files`. To smoke-test the server directly:
 
 ```bash
-WEB_LATEX_MCP_PROJECTS='{}' node /path/to/WebLatexMCP/dist/index.js
+node /path/to/WebLatexMCP/dist/index.js --standalone
 ```
 
-It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit).
+It logs `server ready on stdio` to stderr and waits for JSON-RPC (Ctrl-C to quit). `--standalone`
+serves in-process, without the [shared server](shared-server.md); without it the same command relays
+to the shared server, starting it if need be — `npx web-latex-mcp daemon status` then shows it.

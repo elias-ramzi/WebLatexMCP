@@ -12,6 +12,7 @@ import {
   countRegisteredProjects,
 } from './services/projectRegistry.js';
 import { toPosix } from './lib/paths.js';
+import { DEFAULT_MAX_PARALLEL_BUILDS, MAX_PARALLEL_BUILDS_CEILING } from './lib/workGate.js';
 import { homeWorkspaceRoot, migrateWorkspaceCommand } from './lib/workspaceNote.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
 // accept a kind the fallback never tries (or reject one it does).
@@ -332,7 +333,7 @@ function elide(value: string, max = 120): string {
  * cannot forge a second log line nor a bidi control reorder the rest of it, and shortened past
  * `max` characters the way `elide` does, the count outside the quotes.
  */
-function quoteEnvValue(value: string, max = 120): string {
+export function quoteEnvValue(value: string, max = 120): string {
   return value.length <= max
     ? quoteId(value)
     : `${quoteId(value.slice(0, max))}… (${value.length} characters)`;
@@ -579,6 +580,7 @@ export function loadConfig(
     env.WEB_LATEX_MCP_COMPILER,
   );
   const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
+  const maxParallelBuilds = parseMaxParallelBuilds(env.WEB_LATEX_MCP_MAX_PARALLEL_BUILDS);
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
@@ -615,6 +617,7 @@ export function loadConfig(
     compiler,
     compilerExplicit,
     viewerPort,
+    maxParallelBuilds,
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,
@@ -638,7 +641,7 @@ export function loadConfig(
  *
  * Sanitised to a safe directory name, since it becomes one under the session state dir.
  */
-function parseSessionId(raw: string | undefined): string {
+export function parseSessionId(raw: string | undefined): string {
   const value = raw?.trim();
   if (raw === undefined || !value) return `session-${randomBytes(4).toString('hex')}`;
   const safe = value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
@@ -684,6 +687,24 @@ function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
     `WEB_LATEX_MCP_VIEWER_TARGET ${quoteEnvValue(raw ?? '')} is invalid; expected "browser", ` +
       '"vscode" or "embedded".',
   );
+}
+
+/**
+ * Parse `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`: how many compiles and PDF loads run at once
+ * (`src/lib/workGate.ts`). Unset → the default; anything but an integer 1–32 is refused, as a bad
+ * viewer port is.
+ */
+export function parseMaxParallelBuilds(raw: string | undefined): number {
+  const value = raw?.trim();
+  if (!value) return DEFAULT_MAX_PARALLEL_BUILDS;
+  const n = Number(value);
+  if (!/^[0-9]+$/.test(value) || !Number.isInteger(n) || n < 1 || n > MAX_PARALLEL_BUILDS_CEILING) {
+    throw new Error(
+      `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS ${quoteEnvValue(raw ?? '')} is invalid; expected a whole ` +
+        `number from 1 to ${MAX_PARALLEL_BUILDS_CEILING}.`,
+    );
+  }
+  return n;
 }
 
 /** Parse an optional fixed viewer port; undefined (the default) means OS-assigned ephemeral. */
