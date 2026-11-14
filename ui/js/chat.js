@@ -710,13 +710,20 @@ export function openChat(paper) {
   pollChat(true);
 }
 
-export async function resetChat() {
-  if (!chat.paper) return;
-  if (!confirm("Start a new conversation on this paper? The current one is set aside (kept on disk).")) return;
-  try { await api("POST", "/api/chat", { paper: chat.paper, reset: true }); } catch (e) {
+/**
+ * Reset a paper's conversation: a new one starts, the old one is set aside on disk. Any paper (the
+ * side bar's ⋯ too), not only the open one; that one is reopened on its new conversation.
+ * @param {string | null} [paper] @param {string} [name]
+ */
+export async function resetChat(paper = chat.paper, name) {
+  if (!paper) return;
+  if (!confirm("Reset the conversation" + (name ? " on " + name : " on this paper") +
+    "? Claude starts afresh; the current conversation is set aside (kept on disk).")) return;
+  try { await api("POST", "/api/chat", { paper, reset: true }); } catch (e) {
     flash(/** @type {Error} */ (e).message, 6000); return;
   }
-  openChat(chat.paper);
+  if (paper === chat.paper) openChat(paper);
+  else flash("Conversation reset.", 2500);
 }
 
 // ---- wiring

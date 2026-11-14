@@ -36,6 +36,7 @@ async function refresh() {
   if (S.paper && S.paper !== DEV && !S.state.papers.some((/** @type {any} */ p) => p.id === S.paper)) route();
 }
 side.refresh = refresh;
+side.resetPaper = resetChat;
 
 function current() {
   return S.state && S.state.papers.find((/** @type {any} */ p) => p.id === S.paper);
@@ -136,7 +137,7 @@ $("#c-title").onclick = () => { const p = current(); if (p) renamePaper(p); };
 $("#c-more").onclick = (/** @type {MouseEvent} */ e) => {
   e.stopPropagation();
   const p = current();
-  if (p) paperMenu(p, /** @type {Element} */ (e.currentTarget), { onReset: resetChat });
+  if (p) paperMenu(p, /** @type {Element} */ (e.currentTarget));
 };
 $("#c-pull").onclick = pullPaper;
 document.addEventListener("keydown", (e) => {

@@ -14,6 +14,7 @@ export const side = {
   justDropped: false,
   /** @type {(id: string) => void} */ onOpen: () => {},
   /** @type {() => Promise<void>} */ refresh: async () => {},
+  /** @type {((id: string, name: string) => void) | null} the ⋯ menu's Reset conversation */ resetPaper: null,
 };
 (() => {
   const c = sideStore("closed");
@@ -159,8 +160,8 @@ export async function papersOp(body, ok) {
 const item = (label, go, cls) => h("button", { type: "button", class: cls || "", role: "menuitem",
   onclick: (/** @type {Event} */ e) => { e.stopPropagation(); go(); } }, label);
 
-/** @param {any} p @param {Element} anchor @param {{ onReset?: () => void, onRename?: () => void }} [more] */
-export function paperMenu(p, anchor, more) {
+/** @param {any} p @param {Element} anchor */
+export function paperMenu(p, anchor) {
   let sub = "";
   openMenu(anchor, (redraw) => {
     const st = S.state;
@@ -209,7 +210,9 @@ export function paperMenu(p, anchor, more) {
       setTimeout(() => input.focus(), 0);
     }
     rows.push(h("hr", {}));
-    if (more && more.onReset) rows.push(item("New conversation", () => { closeMenu(); more.onReset?.(); }));
+    if (side.resetPaper) {
+      rows.push(item("Reset conversation…", () => { closeMenu(); side.resetPaper?.(p.id, paperTitle(p)); }));
+    }
     rows.push(item("Copy its name (" + p.id + ")", () => {
       closeMenu();
       (navigator.clipboard ? navigator.clipboard.writeText(p.id) : Promise.reject(new Error()))

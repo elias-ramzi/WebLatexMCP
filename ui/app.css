@@ -887,6 +887,11 @@ body.dev-on #s-version { display: none; }
   height: min(580px, calc(100vh - 28px)); display: flex; flex-direction: column; background: var(--card);
   border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .35); overflow: hidden; }
 .mini[hidden] { display: none; }
+/* reduced, like a window on a taskbar: only its title bar, still showing whether Claude works */
+.mini.min { height: auto; width: min(300px, calc(100vw - 28px)); }
+.mini.min > :not(.d-head) { display: none !important; }
+.mini.min .d-head { border-bottom: 0; cursor: pointer; }
+.mini.min #dev-full, .mini.min #dev-reset { display: none; }
 .mini .d-head { display: flex; align-items: center; gap: 8px; padding: 9px 10px 9px 14px;
   border-bottom: 1px solid var(--line); }
 .mini .d-head b { font-size: 14px; }
