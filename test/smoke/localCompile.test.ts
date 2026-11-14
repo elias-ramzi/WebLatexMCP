@@ -38,8 +38,8 @@ describe.skipIf(!available)('compiling a local (in-place) project', () => {
       sessionId: 'test',
       projects: [{ id: 'cv', mode: 'local', path: userDir, rootFile: 'main.tex' }],
       defaultProject: 'cv',
-      // Surface the PDF the way a workspace-local install does, to prove where it lands.
-      workspaceIsLocal: true,
+      // Surface the PDF the way every install does, to prove where it lands.
+      surfacePdf: true,
     };
     const ctx = createContext(config, new CredentialResolver({}), {
       name: 'Test',

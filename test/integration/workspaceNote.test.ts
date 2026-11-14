@@ -9,6 +9,7 @@ import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
 import { ProjectRegistry, registryPath } from '../../src/services/projectRegistry.js';
 import { toPosix } from '../../src/lib/paths.js';
+import { expectNoUndeclaredKeys } from '../helpers/outputSchema.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /**
@@ -78,7 +79,7 @@ describe('list_projects on an empty workspace', () => {
     expect(text).toContain('Settings → Extensions → WebLatexMCP → Clone workspace folder');
     // The folder actually in use is named too: this is the case where the caller most needs it.
     expect(text).toContain(`Workspace (clones and the project list): "${toPosix(workspace)}"`);
-    // Neutral wording: in workspace-local mode a separate project list is by design, not a loss.
+    // Neutral wording: a separate project list in another workspace is by design, not a loss.
     expect(text).toContain('To use them, point');
     expect(text).not.toContain('get them back');
   });
@@ -122,5 +123,53 @@ describe('register_project', () => {
     const text = textOf(res);
     expect(text).toContain(`Workspace (clones and the project list): "${toPosix(workspace)}"`);
     expect(text).toContain('WEB_LATEX_MCP_WORKSPACE');
+  });
+});
+
+describe("an older version's workspace-local folder", () => {
+  it('is named, with the migration command, by list_projects and server_info', async () => {
+    const workspace = await tempDir('wln-ws-');
+    const legacy = path.join(await tempDir('wln-launch-'), '.web_latex_mcp');
+    await writeRegistry(workspace, { cv: { gitUrl: 'https://git.example/cv' } });
+    await writeRegistry(legacy, { thesis: { gitUrl: 'https://git.example/thesis' } });
+    const client = await connect({
+      workspaceRoot: workspace,
+      legacyWorkspaceRoot: legacy,
+      sessionId: 'test',
+      projects: [{ id: 'cv', gitUrl: 'https://git.example/cv' }],
+    });
+
+    // Listed even when this workspace is not empty: the old folder's projects are not in it.
+    const listed = await client.callTool({ name: 'list_projects', arguments: {} });
+    expect(listed.isError).toBeFalsy();
+    const text = textOf(listed);
+    expect(text).toContain('- cv [');
+    expect(text).toContain(`1 project is registered in "${toPosix(legacy)}"`);
+    expect(text).toContain(`web-latex-mcp migrate-workspace "${toPosix(legacy)}"`);
+    expect((listed.structuredContent as Record<string, unknown>).legacyWorkspaceRoot).toBe(
+      toPosix(legacy),
+    );
+    await expectNoUndeclaredKeys(client, 'list_projects', listed.structuredContent);
+
+    const info = await client.callTool({ name: 'server_info', arguments: {} });
+    expect(textOf(info)).toContain(`web-latex-mcp migrate-workspace "${toPosix(legacy)}"`);
+    await expectNoUndeclaredKeys(client, 'server_info', info.structuredContent);
+  });
+
+  it('is not named once it registers nothing (after a migration)', async () => {
+    const workspace = await tempDir('wln-ws-');
+    const legacy = path.join(await tempDir('wln-launch-'), '.web_latex_mcp');
+    await mkdir(legacy, { recursive: true });
+    const client = await connect({
+      workspaceRoot: workspace,
+      legacyWorkspaceRoot: legacy,
+      sessionId: 'test',
+      projects: [],
+    });
+    const listed = await client.callTool({ name: 'list_projects', arguments: {} });
+    expect(textOf(listed)).not.toContain('migrate-workspace');
+    expect(listed.structuredContent as Record<string, unknown>).not.toHaveProperty(
+      'legacyWorkspaceRoot',
+    );
   });
 });

@@ -2,27 +2,66 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { getServerVersion } from '../lib/version.js';
+import { quoteId } from '../lib/projectId.js';
 import { toPosix } from '../lib/paths.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
 import { countWritingConventions } from '../lib/writingConventions.js';
 import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
 import { errorResult } from '../lib/errors.js';
+import { legacyWorkspaceNote } from '../lib/workspaceNote.js';
+import { countRegisteredProjects } from '../services/projectRegistry.js';
 import { quoteInvalidSource } from '../services/referenceResolver.js';
 
 const outputSchema = {
   name: z.string(),
   version: z.string(),
   workspaceRoot: z.string(),
-  workspaceLocal: z.boolean(),
-  workspaceExcludePattern: z
+  legacyWorkspaceRoot: z
     .string()
     .optional()
     .describe(
-      'When the workspace is local to the launch dir and that dir is a git repo, the pattern the ' +
-        "server added to the host repo's .git/info/exclude so the clones are not committed. Its " +
-        'presence means the directory is already handled — do not add a .gitignore entry for it. ' +
-        'Absent when nothing was excluded.',
+      "An older version's workspace-local folder (<launch dir>/.web_latex_mcp) that still " +
+        'registers projects this server does not see. Move them into the workspace in use with ' +
+        '`web-latex-mcp migrate-workspace <that folder>`. Absent when there is none.',
+    ),
+  mode: z
+    .enum(['stdio', 'daemon'])
+    .describe(
+      'How this session reaches the server: `stdio` (one server process for this session) or ' +
+        '`daemon` (one shared server, `web-latex-mcp serve`, for every session on the workspace).',
+    ),
+  daemonUnavailable: z
+    .string()
+    .optional()
+    .describe(
+      'Why this session runs its own in-process server: the shared server could not be reached or ' +
+        'started. Absent when it is used, or when in-process serving was asked for.',
+    ),
+  restartPending: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when a newer build of the server is waiting: the shared server restarts as that ' +
+        'build once every session on it has ended. Absent otherwise.',
+    ),
+  sessionId: z
+    .string()
+    .describe("This session's id: it names the session to its peers and keys its own changes."),
+  sessionIdRequested: z
+    .string()
+    .optional()
+    .describe(
+      'The session id this client asked for, when another open session already held it and this ' +
+        'one was given `sessionId` instead. Absent otherwise.',
+    ),
+  ignoredClientEnv: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Server-wide settings this client's environment set differently from the shared server's. " +
+        "They do not apply here: set them in the shared server's own environment. Names only, " +
+        'never values. Absent when there are none.',
     ),
   compiler: z
     .string()
@@ -132,8 +171,8 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
       title: 'Server info',
       description:
         'Report the web-latex-mcp server version and runtime configuration (workspace root, ' +
-        'whether the workspace is local to the launch dir, whether the clone dir was git-excluded ' +
-        'from the host repo, the configured compiler — which is not necessarily the backend a ' +
+        'an older workspace-local folder still registering projects, if any, the configured ' +
+        'compiler — which is not necessarily the backend a ' +
         'compile runs, since an uninstalled default is substituted; doctor reports what is really ' +
         'there — and the configured rewrite-preservation default, which is not necessarily what ' +
         "a given project uses since a project's own set_rewrite_mode setting wins over it, plus " +
@@ -154,12 +193,28 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
     },
     async () => {
       try {
+        const legacyCount = ctx.config.legacyWorkspaceRoot
+          ? countRegisteredProjects(ctx.config.legacyWorkspaceRoot)
+          : 0;
         const info = {
           name: 'web-latex-mcp',
           version: getServerVersion(),
           workspaceRoot: toPosix(ctx.config.workspaceRoot),
-          workspaceLocal: ctx.config.workspaceIsLocal ?? false,
-          workspaceExcludePattern: ctx.config.workspaceExcludePattern,
+          // Counted per call, like list_projects: after an in-session migration the folder registers
+          // nothing and is no longer named.
+          legacyWorkspaceRoot:
+            legacyCount > 0 && ctx.config.legacyWorkspaceRoot
+              ? toPosix(ctx.config.legacyWorkspaceRoot)
+              : undefined,
+          mode: ctx.config.serverMode ?? 'stdio',
+          daemonUnavailable: ctx.config.daemonUnavailable,
+          restartPending: ctx.config.restartPending === true ? true : undefined,
+          sessionId: ctx.config.sessionId,
+          sessionIdRequested: ctx.config.sessionIdRequested,
+          ignoredClientEnv:
+            ctx.config.ignoredClientEnv && ctx.config.ignoredClientEnv.length > 0
+              ? [...ctx.config.ignoredClientEnv]
+              : undefined,
           compiler: ctx.config.compiler ?? 'latexmk',
           // Absent, not a default id: nothing is pinned unless the user pinned it, and reporting
           // "dblp" here would describe the fallback order's first try as a choice someone made.
@@ -187,12 +242,10 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             ctx.config.extraWritingGuidePath,
           ),
         };
-        // Say it out loud: the exclude is real but lives in .git/info/exclude, which is invisible to
-        // anyone who did not run this server — the user may still want a tracked .gitignore entry.
-        const excludeLine = info.workspaceExcludePattern
-          ? `git: clones are excluded from the host repo as "${info.workspaceExcludePattern}" via ` +
-            '.git/info/exclude (local to this checkout only — collaborators will not see it)\n'
-          : '';
+        const legacyLine =
+          legacyCount > 0 && ctx.config.legacyWorkspaceRoot
+            ? `${legacyWorkspaceNote(ctx.config.legacyWorkspaceRoot, legacyCount, ctx.config.workspaceRoot)}\n`
+            : '';
         // Three states matter here, and only three: not configured (say nothing); configured and
         // loaded (name the path, so a user can tell it took); configured but NOT loaded (name the
         // path AND say plainly that those conventions are not in effect — the state a typo produces
@@ -229,8 +282,22 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
             : '';
         const text =
           `web-latex-mcp v${info.version}\n` +
-          `workspace: ${info.workspaceRoot} (${info.workspaceLocal ? 'local' : 'shared'})\n` +
-          excludeLine +
+          `workspace: ${info.workspaceRoot}\n` +
+          `session: ${quoteId(info.sessionId)} (${info.mode})` +
+          (info.daemonUnavailable !== undefined
+            ? ` — the shared server is unavailable: ${info.daemonUnavailable}`
+            : '') +
+          (info.sessionIdRequested !== undefined
+            ? ` — asked for ${quoteId(info.sessionIdRequested)}, which another open session holds`
+            : '') +
+          (info.restartPending
+            ? ' — a newer build replaces this shared server once its sessions end'
+            : '') +
+          '\n' +
+          (info.ignoredClientEnv
+            ? `ignored from this client's environment (server-wide settings): ${info.ignoredClientEnv.map((n) => quoteId(n)).join(', ')}\n`
+            : '') +
+          legacyLine +
           writingGuideLine +
           `compiler: ${info.compiler}\n` +
           `references: ${referencesDetail}${contactDetail}\n` +

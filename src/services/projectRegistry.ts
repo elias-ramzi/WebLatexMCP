@@ -6,6 +6,8 @@ import { isLocalProject } from '../lib/projectMode.js';
 import {
   assertValidProjectId,
   describeSkippedProject,
+  listIds,
+  quoteId,
   projectIdProblem,
 } from '../lib/projectId.js';
 import type { ProjectConfig, SkippedProject } from '../types.js';
@@ -70,9 +72,9 @@ type RegistryFile = Record<string, RegistryEntry>;
  * The file as JSON, every entry kept whatever it holds — what `upsert` rewrites, so an entry this
  * version cannot use is carried through verbatim rather than dropped.
  */
-type RawRegistry = Record<string, unknown>;
+export type RawRegistry = Record<string, unknown>;
 
-type RawRead = { ok: true; raw: RawRegistry } | { ok: false; reason: string };
+export type RawRead = { ok: true; raw: RawRegistry } | { ok: false; reason: string };
 
 /**
  * A fresh object with NO prototype, for every id-keyed record read from or written to the file.
@@ -96,6 +98,11 @@ function reportOnce(message: string): void {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** {@link readRawRegistry}, for `migrate-workspace` and `import-env-projects`. */
+export function readRawRegistryFile(filePath: string): RawRead {
+  return readRawRegistry(filePath);
 }
 
 /**
@@ -322,4 +329,48 @@ function toEntry(cfg: ProjectConfig): RegistryEntry {
   }
   const { gitUrl, rootFile, branch, username, tokenEnv } = cfg;
   return { gitUrl, rootFile, branch, username, tokenEnv };
+}
+
+/**
+ * Add raw entries, verbatim, to the registry in `workspaceRoot` — for `migrate-workspace`, which
+ * moves another workspace's entries (including one this version cannot use, which it must not
+ * drop). Under the registry's lock, like `upsert`, and refusing, writing nothing, when the file
+ * is unreadable or already holds one of the ids: this adds, it never replaces.
+ */
+export async function importRegistryEntries(
+  workspaceRoot: string,
+  entries: RawRegistry,
+): Promise<void> {
+  const filePath = registryPath(workspaceRoot);
+  await withFileLock(
+    `${filePath}.lock`,
+    async () => {
+      const read = readRawRegistry(filePath);
+      if (!read.ok) {
+        throw new Error(
+          `Refusing to update the project registry ${quoteId(filePath)}: it is not valid (${read.reason}).`,
+        );
+      }
+      const map = read.raw;
+      const taken = Object.keys(entries).filter((id) => Object.hasOwn(map, id));
+      if (taken.length > 0) {
+        throw new Error(
+          `Refusing to update the project registry ${quoteId(filePath)}: it already registers ` +
+            `${listIds(taken)}.`,
+        );
+      }
+      for (const [id, entry] of Object.entries(entries)) {
+        Object.defineProperty(map, id, {
+          value: entry,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
+      const tmp = `${filePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, `${JSON.stringify(map, null, 2)}\n`, 'utf8');
+      renameSync(tmp, filePath);
+    },
+    { owner: 'registry' },
+  );
 }

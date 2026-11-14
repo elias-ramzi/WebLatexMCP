@@ -49,7 +49,7 @@ overwrite or move files anywhere — so the client asks for each call; expect th
    (`<workspaceRoot>/<id>`), with a `cloned` flag. Call `list_projects`, take the `path` for your project
    as `<clone>`, and confirm `cloned` is true (if not, `project_sync` first). This is drift-proof — the
    server computes `path` the same way it decides where clones live, so it stays correct no matter how
-   `WEB_LATEX_MCP_WORKSPACE` is set (home default, the `cwd` workspace-local dir, or an explicit path).
+   `WEB_LATEX_MCP_WORKSPACE` is set (the `~/.web-latex-mcp/projects` default, or an explicit path).
    Set `<workspaceRoot>` to the parent of `<clone>` — **step 8 writes the cleaned copy + zip there**, beside
    the clone. Because server and agent share a filesystem (stdio), the clone — figures and all — is already
    on disk; there is nothing to "pull". If `list_projects` shows the project but `path` is not reachable
@@ -116,12 +116,12 @@ Do all MCP edits inside the one project so the per-project mutex serializes them
 
 Give the user a usable pointer to `<workspaceRoot>/<id>_arXiv.zip`:
 
-- When `<workspaceRoot>` is **inside the Bash working directory** — the `cwd` sentinel, the common case
-  here, where the zip lands under the git-excluded `.web_latex_mcp/` — present a **clickable
-  workspace-relative link**, e.g. `[.web_latex_mcp/<id>_arXiv.zip](.web_latex_mcp/<id>_arXiv.zip)`. It is
-  durable across sessions and already untracked, so it never shows in this repo's `git status`.
-- Otherwise (home-dir default, or an explicit path outside the workspace) give the **absolute path** and
-  note it lives outside the IDE workspace, so it can't be a clickable relative link.
+- Usually (the `~/.web-latex-mcp/projects` default, or any path outside the IDE workspace) give the
+  **absolute path** and note it lives outside the IDE workspace, so it can't be a clickable relative
+  link. When the client can hand the user a file (the Claude desktop app's `SendUserFile`), send the
+  zip as an attachment too.
+- When `<workspaceRoot>` is **inside the Bash working directory** (a `WEB_LATEX_MCP_WORKSPACE` pointing
+  there), present a **clickable workspace-relative link** to the zip instead.
 - If `<workspaceRoot>` happens to sit inside some _other_ git repo that does not already exclude it
   (`git -C "<workspaceRoot>" check-ignore "<id>_arXiv.zip"` prints nothing), **ask before touching
   it**: that repo is not the project. On a yes, add `<id>_arXiv/` and `<id>_arXiv.zip` to its
@@ -183,5 +183,5 @@ one PDF per `tikzpicture`.
 
 Report concisely: which draft macros/environments were removed, whether comments were stripped, and the
 page count before/after. For **separate-copy**, surface the `<id>_arXiv.zip` per "Surfacing the zip"
-(clickable relative link when the workspace is local) and confirm the live project was left untouched. For
+(clickable relative link when the workspace is inside the IDE workspace) and confirm the live project was left untouched. For
 **in-place**, confirm it still compiles, point the user at the `diff`, and ask whether to commit and push.

@@ -1,11 +1,10 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { climbsOut, resolveInside } from '../../src/lib/paths.js';
 import { parseSyncTexEdit } from '../../src/services/synctex.js';
 import { parseLog } from '../../src/services/logParser.js';
-import { excludeWorkspaceFromHostGit } from '../../src/lib/workspaceExclude.js';
 import { readAuxFloats } from '../../src/lib/auxFloats.js';
 import { buildAuxPath, buildDir } from '../../src/services/compiler.js';
 
@@ -95,28 +94,6 @@ describe('parseLog rebase (src/services/logParser.ts)', () => {
   it('still leaves a path that climbs out of the project un-rebased', () => {
     const climb = '../../x.tex:3: Undefined control sequence.';
     expect(parseLog(climb, { baseDir: 'paper' }).errors[0]?.file).toBe('../../x.tex');
-  });
-});
-
-describe('excludeWorkspaceFromHostGit (src/lib/workspaceExclude.ts)', () => {
-  it('excludes a workspace dir named `..foo`', async () => {
-    const repo = await tmp('wlm-climb-');
-    await mkdir(path.join(repo, '.git', 'info'), { recursive: true });
-    const pattern = await excludeWorkspaceFromHostGit(path.join(repo, '..foo'));
-    expect(pattern).toBe('/..foo/');
-    expect(await readFile(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).toContain(
-      '/..foo/\n',
-    );
-  });
-
-  it('still writes nothing for a workspace that resolves above the repo', async () => {
-    const repo = await tmp('wlm-climb-');
-    await mkdir(path.join(repo, '.git', 'info'), { recursive: true });
-    // Unnormalized on purpose: its dirname resolves to `repo`, the path itself to repo's parent,
-    // so the relative path is exactly `..`.
-    const above = `${repo}${path.sep}a${path.sep}..${path.sep}..`;
-    expect(await excludeWorkspaceFromHostGit(above)).toBeUndefined();
-    await expect(readFile(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).rejects.toThrow();
   });
 });
 

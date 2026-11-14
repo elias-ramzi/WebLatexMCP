@@ -95,7 +95,6 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       ? loadConfig(
           { WEB_LATEX_MCP_CONTACT_EMAIL: serverOpts.contactEmailEnv },
           workspace,
-          () => false,
           () => [],
           () => undefined,
         )

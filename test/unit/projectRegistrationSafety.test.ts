@@ -107,7 +107,6 @@ describe('project id validation (W1)', () => {
         }),
       },
       root,
-      () => false,
       () => [],
       () => undefined,
     );

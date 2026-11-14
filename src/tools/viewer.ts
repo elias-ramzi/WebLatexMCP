@@ -56,8 +56,8 @@ const outputSchema = {
     .string()
     .optional()
     .describe(
-      "The root .tex the viewer follows. It shows that root's build, or — in workspace-local " +
-        'mode, while that root has no build — the surfaced <workspace>/<id>.pdf, which holds ' +
+      "The root .tex the viewer follows. It shows that root's build, or — while that root has " +
+        'no build — the surfaced <workspace>/<id>.pdf, which holds ' +
         'whichever root compiled last (a comment made on it carries no source location). Absent ' +
         'when it cannot be told yet (the project is not cloned, or holds no .tex).',
     ),
@@ -79,7 +79,7 @@ export function registerViewer(server: McpServer, ctx: AppContext): void {
         'Start (if needed) a local viewer for the compiled PDF and return its URL. It follows the ' +
         'root file the project was registered with (rootFile), else the auto-detected one (a ' +
         'top-level main.tex, else the shallowest .tex with a \\documentclass), named in the ' +
-        "result, and renders that root's build (in workspace-local mode, while it has none, the " +
+        "result, and renders that root's build (while it has none, the " +
         'surfaced copy of whichever root compiled last) with pdf.js (zoom/scroll/search, ' +
         'select-to-comment), hot-reloading whenever it is recompiled and preserving your page ' +
         'and scroll position. For clients ' +

@@ -207,7 +207,7 @@ async function setupCompile(): Promise<CompileHarness> {
     { name: 'Test', email: 'test@example.com' },
     new ProjectRegistry(workspace),
   );
-  // `workspaceIsLocal` is unset, so `compile` reports the backend's own pdfPath verbatim — which
+  // `surfacePdf` is unset, so `compile` reports the backend's own pdfPath verbatim — which
   // makes the staged, backslash-bearing path above exactly what reaches the response boundary.
   ctx.compiler = new CompilerResolver('latexmk', false, () =>
     stubCompiler(nativePdfPath, nativeLogPath),

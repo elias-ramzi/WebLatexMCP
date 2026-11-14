@@ -896,7 +896,8 @@ async function realpathOrSelf(p: string): Promise<string> {
  * answer. A `.git` that is a file (a worktree's gitfile) is recorded like any file; a `.git`
  * anywhere below the root (a nested repository, or one behind a link) is left out whole. A `skip` directory (the workspace) is left
  * out when a directory IS it, by its spelled path or its realpath — never what lies under it,
- * since in the workspace-local layout a local project contains the workspace and the workspace
+ * since a local project can contain the workspace (an older version's workspace-local layout, or a
+ * `WEB_LATEX_MCP_WORKSPACE` inside it) and the workspace
  * holds other clones a project link can reach into, and the build writes through such a link like
  * any other. A `skipTree` directory (the build root, which the build writes by design) is left out
  * with everything under it, so a link to `<buildRoot>/proj` is not walked either — unless it

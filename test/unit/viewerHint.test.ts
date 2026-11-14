@@ -103,7 +103,7 @@ describe('compileViewerHint', () => {
     ).toBe(compileViewerHint(undefined));
   });
 
-  // In workspace-local mode the idle viewer's root may have no build while the surfaced copy is
+  // With the PDF surfaced, the idle viewer's root may have no build while the surfaced copy is
   // the build this compile just made: the viewer WOULD show this build (without synctex), so
   // "not this build" is false.
   it('says an idle viewer would show this build as the surfaced copy', () => {
@@ -254,7 +254,7 @@ describe('viewerShowsForCompile', () => {
     await writeFile(pdf, '%PDF-1.4\n');
     const config: ServerConfig = {
       workspaceRoot: dir,
-      workspaceIsLocal: false,
+      surfacePdf: false,
       sessionId: 'test',
       projects: [],
     };

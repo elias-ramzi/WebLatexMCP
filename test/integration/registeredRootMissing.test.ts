@@ -65,7 +65,7 @@ async function setup(rootFile = 'gone.tex') {
 
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: false,
+    surfacePdf: false,
     sessionId: 'test',
     projects: [{ id: 'paper', mode: 'local', path: userDir, rootFile }],
   };

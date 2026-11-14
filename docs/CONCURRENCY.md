@@ -20,7 +20,7 @@ editing the document are not all using Git:
 - **AI agents** (Claude, through this server) clone the repo, edit files, commit,
   and push over Git.
 - **Several agent sessions at once** — one person running a session per section,
-  say — each a separate server process, all editing the _same_ local clone.
+  say — each its own MCP connection, all editing the _same_ local clone.
 
 So we are bridging concurrency models: OT inside Overleaf, Git against the remote,
 and a shared working tree between sibling sessions. The web side can advance `main`
@@ -135,34 +135,37 @@ We cannot eliminate this, only shrink the window:
 ## Parallel sessions on one clone
 
 Everything above is about the _remote_. This section is about the _local_ clone, when
-one person runs several agent sessions on the same paper — one per section, say — and
-each is a separate server process sharing a single working tree.
+one person runs several agent sessions on the same paper — one per section, say — all
+sharing a single working tree.
 
-Two things break if that is left unmanaged. Git has no tolerance for two processes
-rewriting an index at once, so operations must be serialised across processes, not
-just within one. And `git add` cannot tell whose change is whose, so one session
+Two things break if that is left unmanaged. Git has no tolerance for two writers
+rewriting an index at once, so operations must be serialised — between sessions in one
+server and across processes. And `git add` cannot tell whose change is whose, so one session
 committing would sweep up another's half-written paragraph under its own message.
 
-### One server process per session
+### One session per connection
 
-**A session is a server process.** `WEB_LATEX_MCP_SESSION` is read once at startup, so
-everything on this page assumes each session runs its own stdio server with its own `env`
-block. That is how Claude Code works, and the isolation described here is real there.
+**A session is an MCP connection.** By default every connection on a workspace is relayed
+to one shared server process, which keeps for each session its own id, its own shadow of
+uncommitted changes and its own record of what it last read (so a write over a peer's edit
+is refused, as between two processes). With `--standalone` each connection gets a server
+process of its own; nothing below changes. Claude Code opens one connection per session,
+so the isolation described here is real there.
 
-**Claude Desktop shares one server process across every chat**, and gives one `env` block
-per configured server — so every Desktop chat resolves to the same session id and the
-split is inert: two chats editing one paper commit each other's work exactly as they did
-before per-session shadows existed. Nothing is broken by this and single-session behaviour
-is unchanged, but do not read the rest of this page as describing what a Desktop user gets
-from two chats.
+**Claude Desktop shares one connection across every chat** — one server per configured
+entry — so every Desktop chat resolves to the same session id and the split is inert: two
+chats editing one paper commit each other's work. Nothing is broken by this and
+single-session behaviour is unchanged, but do not read the rest of this page as describing
+what a Desktop user gets from two chats. To split them, give each chat its own server
+entry with its own `WEB_LATEX_MCP_SESSION` (see [configuration.md](configuration.md#parallel-sessions));
+the [session identity probe](configuration.md#session-identity-probe) measures what a
+client shares ([#18](https://github.com/elias-ramzi/WebLatexMCP/issues/18)).
 
-To get the isolation described here today, give each session its own server entry with its
-own `WEB_LATEX_MCP_SESSION`, so each is a separate process — see [configuration.md's interim
-limitation](configuration.md#parallel-sessions). Decoupling session identity from the
-process is tracked in
-[#18](https://github.com/elias-ramzi/WebLatexMCP/issues/18), and which shape that takes turns
-on an empirical question about Desktop the server can answer about itself: the [session
-identity probe](configuration.md#session-identity-probe).
+**When a session ends.** A session is live while its connection is open. It ends when the
+client closes it (the proxy does so when its client exits or it receives a termination
+signal), within a minute of its client vanishing without a word (a killed process), or after
+30 minutes with no activity at all; its record then goes, and its id is free for a new
+session to take over its uncommitted changes.
 
 ### Naming your sessions
 
@@ -170,10 +173,12 @@ Set `WEB_LATEX_MCP_SESSION` per session to something meaningful — `intro`,
 `experiments` — and it becomes what peers see in `status`. Without it a session still
 works and is still isolated, but it shows up to the others under a generated id.
 
-### Serialising across processes
+### Serialising across sessions and processes
 
-Every mutating operation takes a lock file beside the clone for the duration, on top
-of the in-process mutex. A session that crashes cannot release its lock, so a lock is
+Every mutating operation takes the project's in-process mutex — shared by every session
+of one server, so two sessions there queue in order — and then a lock file beside the
+clone for the duration, which serialises against other server processes on the same
+workspace (a `--standalone` server, or an older version). A session that crashes cannot release its lock, so a lock is
 reclaimed once its owning process is gone — or, when the record cannot prove its holder
 alive on this boot (unreadable, or a pid that may be another boot's), once it stops being
 refreshed. A holder whose pid is alive on the boot that recorded it is **not** reclaimed on
@@ -560,10 +565,11 @@ or token — is never rewritten by any session.
   call that omits `project` resolves to the peer's choice, whether or not this session had a
   default before. Only a session that asserted one through `WEB_LATEX_MCP_DEFAULT_PROJECT`
   keeps its own.
-- **A session that dies leaves its edits behind.** They stay in the working tree; once its
-  process is gone — or its recorded pid belongs to a different boot — and its heartbeat is
-  stale, it stops counting as live, and its files show up as changes no live session owns,
-  committable with `scope: "all"` or `scope: "paths"`.
+- **A session that dies leaves its edits behind.** They stay in the working tree; once it
+  stops counting as live — its connection closed or timed out on the shared server, or, for
+  a separate process, that process gone (or its recorded pid another boot's) and its
+  heartbeat stale — its files show up as changes no live session owns, committable with
+  `scope: "all"` or `scope: "paths"`, or reclaimed by a new session taking the same id.
 
 ## Optional review flow for larger edits
 

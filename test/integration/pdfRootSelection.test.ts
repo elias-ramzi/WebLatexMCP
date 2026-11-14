@@ -15,7 +15,7 @@ import { ROUTES_ONLY_LOG } from '../helpers/stagedLog.js';
 import type { ServerConfig } from '../../src/types.js';
 
 /*
- * Which PDF the three read-only PDF tools open in workspace-local mode.
+ * Which PDF the three read-only PDF tools open when the PDF is surfaced (`surfacePdf`).
  *
  * `compile` copies whatever root it just built to `<workspace>/<id>.pdf` — ONE file per project,
  * so it holds whichever root compiled LAST. The build dir, by contrast, keeps one PDF (and one
@@ -85,7 +85,7 @@ async function setup(opts: { stageMain: boolean }): Promise<Harness> {
 
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: true,
+    surfacePdf: true,
     sessionId: 'test',
     projects: [{ id: 'poster', mode: 'local', path: userDir }],
   };

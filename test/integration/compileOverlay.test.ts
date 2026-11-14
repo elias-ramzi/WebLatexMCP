@@ -137,7 +137,7 @@ async function setup(
   const workspace = await tmp('ovl-overlay-ws-');
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: true,
+    surfacePdf: true,
     sessionId: 'test',
     projects: [{ id: 'demo', gitUrl: remote.url }],
     defaultProject: 'demo',
@@ -425,7 +425,7 @@ describe('compile with an overlay', () => {
     await symlink(path.join(workspace, 'shared', 'figs'), path.join(project, 'figs'), 'junction');
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [{ id: 'loc', mode: 'local', path: project }],
       defaultProject: 'loc',

@@ -29,7 +29,7 @@ afterEach(async () => {
 
 let prevPrompt: string | undefined;
 beforeAll(() => {
-  // What `src/index.ts` sets for the server process: fail on a missing credential, never prompt.
+  // What `src/standalone.ts` and `serve` set for the server process: fail on a missing credential, never prompt.
   prevPrompt = process.env.GIT_TERMINAL_PROMPT;
   process.env.GIT_TERMINAL_PROMPT = '0';
 });

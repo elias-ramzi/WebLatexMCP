@@ -456,14 +456,6 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             cloned,
             default: ctx.projectManager.defaultProjectId() === cfg.id,
           };
-          // The clone dir sits inside the user's own repo in workspace-local mode. The server
-          // already excluded it at startup; say so, or the caller cannot tell and adds a
-          // redundant .gitignore entry on the user's behalf.
-          const excludeNote = ctx.config.workspaceExcludePattern
-            ? ` The clone dir is already excluded from the host repo's git ` +
-              `(${quoteId(ctx.config.workspaceExcludePattern)} in .git/info/exclude) — no .gitignore ` +
-              'entry needed.'
-            : '';
           const text =
             // The URL and the directory are the caller's (or under a workspace the environment
             // named), so both are quoted and escaped, like the id.
@@ -472,7 +464,6 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             (cloned
               ? `Cloned at ${quoteId(outPath)}.`
               : 'Not cloned yet — run project_sync to clone when you are ready.') +
-            excludeNote +
             ` ${workspaceNote(ctx.config.workspaceRoot)}` +
             credentialsNote +
             repointNote +
