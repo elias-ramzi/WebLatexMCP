@@ -26,9 +26,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   message that cc-servers sends to the apps it frames.
 - **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when
   editing one, on the PDF and markdown pages. Shift+Enter still saves; Esc cancels an edit too.
-- **A click on a viewer comment edits it**: on its note in the panel, or on its highlight in the
-  PDF or the document (the panel opens on it). The edit box has **Delete** beside Cancel and Save
-  (↶ Undo brings a comment back), and the panel's ✎/🗑 buttons no longer hide until hovered.
+- **A click on a viewer comment edits it**, in the same small popup that writes one: click its
+  highlight in the PDF or the document, or its note in the panel. The popup shows the quoted text
+  and the note, with **Delete** beside Cancel and Save (↶ Undo brings a comment back). The panel's
+  ✎/🗑 buttons no longer hide until hovered.
 - **The UI's Claude knows the PDF is already open beside the chat**, so it no longer calls
   `viewer` to show it (only for a markdown document, or a separate tab the user asks for).
 

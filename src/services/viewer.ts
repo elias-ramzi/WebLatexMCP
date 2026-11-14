@@ -273,6 +273,9 @@ const COMMENT_CSS = `  #ctoggle.on { background: #2d4a7a; border-color: #3a5f9a;
     background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 6px;
     font: 13px system-ui, sans-serif; }
   .wlm-pop .row { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
+  .wlm-pop #popdel { display: none; margin-right: auto; }
+  .wlm-pop.editing #popdel { display: inline-block; }
+  .wlm-pop #popdel:hover { background: #5a2020; border-color: #7a3030; color: #fff; }
   .wlm-panel { position: absolute; top: 34px; right: 0; bottom: 0; width: 280px; z-index: 15;
     background: #181818; border-left: 1px solid #333; overflow: auto; display: none;
     font: 13px/1.4 system-ui, sans-serif; color: #ddd; }
@@ -353,7 +356,7 @@ ${COMMENT_CSS}
 <div class="wlm-pop" id="pop">
   <div class="q" id="popq"></div>
   <textarea id="popnote" placeholder="Describe the change you want… (Ctrl+⏎ or ⇧⏎ to save, Esc to cancel)"></textarea>
-  <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
+  <div class="row"><button id="popdel" class="wlm-del" title="Delete the comment (↶ Undo in the panel brings it back)">Delete</button><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
 </div>
 <div class="wlm-panel" id="panel">
   <div class="wlm-phead"><span>Comments</span><span class="wlm-phbtns"><button id="undodel" title="Restore the last deleted comment">↶ Undo</button><button id="askclaude" title="Copy a prompt to paste into the Claude chat">📋 Ask Claude</button></span></div>
@@ -556,6 +559,8 @@ fab.addEventListener('click', () => {
   const a = fab._anchor;
   if (!a) return;
   pending = a;
+  popEdit = null;
+  pop.classList.remove('editing');
   popq.textContent = a.quote.length > 180 ? a.quote.slice(0, 180) + '…' : a.quote;
   fab.style.display = 'none';
   pop.style.left = Math.min(window.innerWidth - 280, a.cx) + 'px';
@@ -565,7 +570,42 @@ fab.addEventListener('click', () => {
   popnote.focus();
 });
 
-document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
+/** The comment the popup edits, when it was opened on one (else it writes a new one). */
+let popEdit = null;
+/** Open the note popup on comment c, near (x, y): the same box that wrote it, to edit or delete it. */
+function openEditPop(c, x, y) {
+  pending = null;
+  popEdit = c;
+  const quote = c.quote || '';
+  popq.textContent = quote.length > 180 ? quote.slice(0, 180) + '…' : quote;
+  popq.style.display = quote ? '' : 'none';
+  fab.style.display = 'none';
+  pop.classList.add('editing');
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - 280, x)) + 'px';
+  pop.style.top = Math.max(40, Math.min(window.innerHeight - 170, y + 8)) + 'px';
+  pop.style.display = 'block';
+  popnote.value = c.note;
+  popnote.focus();
+  popnote.setSelectionRange(popnote.value.length, popnote.value.length);
+}
+function closePop() {
+  pop.style.display = 'none';
+  pop.classList.remove('editing');
+  popq.style.display = '';
+  pending = null;
+  popEdit = null;
+}
+document.getElementById('popcancel').onclick = closePop;
+document.getElementById('popdel').onclick = async () => {
+  const c = popEdit;
+  if (!c) return;
+  closePop();
+  try {
+    await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/delete', { method: 'POST' });
+    flash('comment deleted — ↶ Undo brings it back');
+  } catch { flash('delete failed'); }
+  refreshComments();
+};
 /** Ctrl+Enter (⌘+Enter on a Mac) or Shift+Enter: save the note. Plain Enter is a newline. */
 function isSaveKey(e) {
   return e.key === 'Enter' && !e.isComposing && (e.ctrlKey || e.metaKey || e.shiftKey);
@@ -575,6 +615,21 @@ popnote.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
 });
 document.getElementById('popsave').onclick = async () => {
+  if (popEdit) {
+    const c = popEdit;
+    const text = popnote.value.trim();
+    if (!text) { popnote.focus(); return; }
+    closePop();
+    try {
+      await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ note: text }),
+      });
+      flash('comment updated');
+    } catch { flash('update failed'); }
+    refreshComments();
+    return;
+  }
   if (!pending) return;
   const note = popnote.value.trim();
   if (!note) { popnote.focus(); return; }
@@ -630,25 +685,19 @@ function commentAt(x, y) {
   return null;
 }
 
-/** Open comment cid for editing, in the panel (opened if it was closed). */
-function editComment(cid) {
-  if (editingId === cid) return;
-  if (editingId) { editingId = null; refreshComments(); }
-  const c = lastComments.find((x) => x.id === cid);
-  const item = panellist.querySelector('.wlm-item[data-cid="' + CSS.escape(cid) + '"]');
-  if (!c || !item) return;
-  setPanel(true);
-  item.scrollIntoView({ block: 'nearest' });
-  startEdit(item, c);
+/** Open comment cid in the note popup, near (x, y). */
+function editComment(cid, x, y) {
+  const c = lastComments.find((v) => v.id === cid);
+  if (c) openEditPop(c, x, y);
 }
 // A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
 // themselves take no pointer events, so selecting text under them works as before.
 document.addEventListener('click', (e) => {
-  if (e.button !== 0 || e.target.closest(PANEL_KEEP)) return;
+  if (e.button !== 0 || e.target.closest(PANEL_KEEP) || pop.style.display === 'block') return;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return;
   const cid = commentAt(e.clientX, e.clientY);
-  if (cid) editComment(cid);
+  if (cid) editComment(cid, e.clientX, e.clientY);
 });
 
 window.addEventListener('keydown', (e) => {
@@ -799,7 +848,7 @@ function renderComment(c) {
   note.className = 'note';
   note.textContent = c.note;
   note.title = 'Click to edit (page ' + c.page + ')';
-  note.onclick = () => { pdfViewer.currentPageNumber = c.page; startEdit(item, c); };
+  note.onclick = (e) => { pdfViewer.currentPageNumber = c.page; openEditPop(c, e.clientX - 280, e.clientY); };
 
   item.append(top, note);
 
@@ -982,7 +1031,7 @@ ${COMMENT_CSS}
 <div class="wlm-pop" id="pop">
   <div class="q" id="popq"></div>
   <textarea id="popnote" placeholder="Describe the change you want… (Ctrl+⏎ or ⇧⏎ to save, Esc to cancel)"></textarea>
-  <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
+  <div class="row"><button id="popdel" class="wlm-del" title="Delete the comment (↶ Undo in the panel brings it back)">Delete</button><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
 </div>
 <div class="wlm-panel" id="panel">
   <div class="wlm-phead"><span>Comments</span><span class="wlm-phbtns"><button id="undodel" title="Restore the last deleted comment">↶ Undo</button><button id="askclaude" title="Copy a prompt to paste into the Claude chat">📋 Ask Claude</button></span></div>
@@ -1106,6 +1155,8 @@ fab.addEventListener('click', () => {
   const a = fab._anchor;
   if (!a) return;
   pending = a;
+  popEdit = null;
+  pop.classList.remove('editing');
   popq.textContent = a.quote.length > 180 ? a.quote.slice(0, 180) + '…' : a.quote;
   fab.style.display = 'none';
   pop.style.left = Math.min(window.innerWidth - 280, a.cx) + 'px';
@@ -1115,7 +1166,42 @@ fab.addEventListener('click', () => {
   popnote.focus();
 });
 
-document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
+/** The comment the popup edits, when it was opened on one (else it writes a new one). */
+let popEdit = null;
+/** Open the note popup on comment c, near (x, y): the same box that wrote it, to edit or delete it. */
+function openEditPop(c, x, y) {
+  pending = null;
+  popEdit = c;
+  const quote = c.quote || '';
+  popq.textContent = quote.length > 180 ? quote.slice(0, 180) + '…' : quote;
+  popq.style.display = quote ? '' : 'none';
+  fab.style.display = 'none';
+  pop.classList.add('editing');
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - 280, x)) + 'px';
+  pop.style.top = Math.max(40, Math.min(window.innerHeight - 170, y + 8)) + 'px';
+  pop.style.display = 'block';
+  popnote.value = c.note;
+  popnote.focus();
+  popnote.setSelectionRange(popnote.value.length, popnote.value.length);
+}
+function closePop() {
+  pop.style.display = 'none';
+  pop.classList.remove('editing');
+  popq.style.display = '';
+  pending = null;
+  popEdit = null;
+}
+document.getElementById('popcancel').onclick = closePop;
+document.getElementById('popdel').onclick = async () => {
+  const c = popEdit;
+  if (!c) return;
+  closePop();
+  try {
+    await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/delete', { method: 'POST' });
+    flash('comment deleted — ↶ Undo brings it back');
+  } catch { flash('delete failed'); }
+  refreshComments();
+};
 /** Ctrl+Enter (⌘+Enter on a Mac) or Shift+Enter: save the note. Plain Enter is a newline. */
 function isSaveKey(e) {
   return e.key === 'Enter' && !e.isComposing && (e.ctrlKey || e.metaKey || e.shiftKey);
@@ -1125,6 +1211,21 @@ popnote.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
 });
 document.getElementById('popsave').onclick = async () => {
+  if (popEdit) {
+    const c = popEdit;
+    const text = popnote.value.trim();
+    if (!text) { popnote.focus(); return; }
+    closePop();
+    try {
+      await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ note: text }),
+      });
+      flash('comment updated');
+    } catch { flash('update failed'); }
+    refreshComments();
+    return;
+  }
   if (!pending) return;
   const note = popnote.value.trim();
   if (!note) { popnote.focus(); return; }
@@ -1171,25 +1272,19 @@ function commentAt(x, y) {
   return null;
 }
 
-/** Open comment cid for editing, in the panel (opened if it was closed). */
-function editComment(cid) {
-  if (editingId === cid) return;
-  if (editingId) { editingId = null; refreshComments(); }
-  const c = lastComments.find((x) => x.id === cid);
-  const item = panellist.querySelector('.wlm-item[data-cid="' + CSS.escape(cid) + '"]');
-  if (!c || !item) return;
-  setPanel(true);
-  item.scrollIntoView({ block: 'nearest' });
-  startEdit(item, c);
+/** Open comment cid in the note popup, near (x, y). */
+function editComment(cid, x, y) {
+  const c = lastComments.find((v) => v.id === cid);
+  if (c) openEditPop(c, x, y);
 }
 // A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
 // themselves take no pointer events, so selecting text under them works as before.
 document.addEventListener('click', (e) => {
-  if (e.button !== 0 || e.target.closest(PANEL_KEEP)) return;
+  if (e.button !== 0 || e.target.closest(PANEL_KEEP) || pop.style.display === 'block') return;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return;
   const cid = commentAt(e.clientX, e.clientY);
-  if (cid) editComment(cid);
+  if (cid) editComment(cid, e.clientX, e.clientY);
 });
 
 window.addEventListener('keydown', (e) => {
@@ -1381,7 +1476,7 @@ function renderComment(c) {
   note.className = 'note';
   note.textContent = c.note;
   note.title = 'Click to edit (line ' + c.line + ')';
-  note.onclick = () => { jump(c); startEdit(item, c); };
+  note.onclick = (e) => { jump(c); openEditPop(c, e.clientX - 280, e.clientY); };
 
   item.append(top, note);
 

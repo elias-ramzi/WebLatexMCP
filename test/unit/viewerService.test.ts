@@ -712,20 +712,28 @@ describe('ViewerService document view', () => {
     return { nonce: m![1]!, body: m![2]! };
   }
 
-  it('edits a comment on a click, on its note or its highlight, and deletes it from the edit box', async () => {
+  it('edits a comment in the note popup on a click, on its note or its highlight', async () => {
     reset();
     for (const page of [`${base}/p/demo`, `${base}/p/demo/doc${q('review.md')}`]) {
       const html = await (await fetch(page)).text();
       const script = /<script[^>]*>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
-      // the panel's note opens the edit box
-      expect(script).toMatch(/note\.onclick = \(\) => \{ [^}]*startEdit\(item, c\); \};/);
-      // a plain click on a highlight edits its comment, and the press does not close the panel
+      // the popup that writes a comment has a Delete, shown only when it edits one
+      expect(html).toMatch(/<button id="popdel" class="wlm-del"[^>]*>Delete<\/button>/);
+      expect(html).toContain('.wlm-pop.editing #popdel { display: inline-block; }');
+      // a note in the panel, and a plain click on a highlight, open it on that comment
+      expect(script).toMatch(/note\.onclick = \(e\) => \{ [^}]*openEditPop\(c, /);
       expect(script).toContain('function commentAt(x, y)');
-      expect(script).toContain('if (cid) editComment(cid);');
+      expect(script).toContain('if (cid) editComment(cid, e.clientX, e.clientY);');
       expect(script).toContain('if (commentAt(e.clientX, e.clientY)) return;');
-      // the edit box has Delete, beside Cancel and Save
-      expect(script).toContain('row.append(del, cancel, save);');
-      expect(script).toMatch(/del\.onclick = async \(\) => \{[\s\S]*?\/delete'/);
+      // Save updates the comment it was opened on; Delete deletes it
+      expect(script).toMatch(/if \(popEdit\) \{[\s\S]*?'\/update'/);
+      expect(script).toMatch(
+        /getElementById\('popdel'\)\.onclick = async \(\) => \{[\s\S]*?'\/delete'/,
+      );
+      // a new comment opens the popup out of edit mode
+      expect(script).toMatch(
+        /pending = a;\s*popEdit = null;\s*pop\.classList\.remove\('editing'\);/,
+      );
     }
   });
 
