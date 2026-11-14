@@ -34,6 +34,7 @@ import { UiServer, pageCsp, tokenMatches, type UiServerOptions } from '../../src
 import { DEV_CHAT } from '../../src/ui/devMode.js';
 import { parseUiArgs } from '../../src/ui/uiCommand.js';
 import { readUiInfo, removeUiInfo, writeUiInfo } from '../../src/ui/uiFiles.js';
+import type { ToolAnswer } from '../../src/ui/daemonClient.js';
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -675,6 +676,79 @@ describe('UiServer', () => {
       expect(reg.body).toMatchObject({ ok: true, project: 'new' });
       expect(calls).toContain('register_project {"project":"new","path":"/x"}');
       expect(await srv.paperDir('p')).toBeTruthy();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('pulls a paper from its remote, and recompiles only when that brought commits', async () => {
+    const calls: string[] = [];
+    const answers: Record<string, ToolAnswer> = {
+      project_sync: {
+        structured: { action: 'pulled', behind: 0 },
+        text: 'p: pulled',
+        isError: false,
+      },
+      compile: { structured: { success: true }, text: 'ok', isError: false },
+    };
+    const { srv, port } = await server({
+      backend: {
+        async call(name, args) {
+          calls.push(`${name} ${JSON.stringify(args ?? {})}`);
+          if (name === 'list_projects') {
+            return {
+              structured: { projects: [{ project: 'p', path: '/x', mode: 'git', cloned: true }] },
+              text: '',
+              isError: false,
+            };
+          }
+          return answers[name] ?? { structured: undefined, text: 'no', isError: true };
+        },
+      },
+    });
+    const pull = () =>
+      req(port, { path: '/api/sync', method: 'POST', headers: auth, body: { paper: 'p' } });
+    try {
+      expect((await pull()).body).toEqual({ action: 'pulled', text: 'p: pulled', compiled: true });
+      expect(calls).toContain('project_sync {"project":"p"}');
+      expect(calls).toContain('compile {"project":"p"}');
+
+      answers.compile = {
+        structured: { success: false },
+        text: 'Undefined control sequence\nmore',
+        isError: false,
+      };
+      expect((await pull()).body).toMatchObject({
+        compiled: false,
+        compileText: 'Undefined control sequence',
+      });
+
+      calls.length = 0;
+      answers.project_sync = {
+        structured: { action: 'up-to-date' },
+        text: 'p: up-to-date',
+        isError: false,
+      };
+      expect((await pull()).body).toMatchObject({ action: 'up-to-date', compiled: null });
+      expect(calls.some((c) => c.startsWith('compile'))).toBe(false);
+
+      answers.project_sync = {
+        structured: undefined,
+        text: 'Not possible to fast-forward',
+        isError: true,
+      };
+      expect(await pull()).toMatchObject({
+        status: 400,
+        body: { error: 'Not possible to fast-forward' },
+      });
+
+      const missing = await req(port, {
+        path: '/api/sync',
+        method: 'POST',
+        headers: auth,
+        body: { paper: 'nope' },
+      });
+      expect(missing.status).toBe(404);
     } finally {
       await srv.close();
     }
