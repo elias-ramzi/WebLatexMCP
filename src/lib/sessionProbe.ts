@@ -234,7 +234,7 @@ type AnyRegisterTool = (
 /**
  * Wrap `server.registerTool` so every tool registered afterwards reports its calls' `_meta`.
  *
- * This is the **single wiring point**: all 36 tools register through `server.registerTool`, so
+ * This is the **single wiring point**: every tool registers through `server.registerTool`, so
  * installing here before `createServer` registers them covers every one of them — and every tool
  * added later — with no per-tool edit and nothing to keep in sync. Install it BEFORE the
  * registrations; tools registered earlier are not wrapped.

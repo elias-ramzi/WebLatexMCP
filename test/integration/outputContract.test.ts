@@ -402,6 +402,54 @@ describe('output contract: the local-project read and write tools', () => {
   });
 });
 
+describe('output contract: compiling from the write tools, and compile defaults', () => {
+  it('publishes every key set_compile_defaults, compile and the write tools return', async () => {
+    const { client, ctx } = await localHarness();
+    const id = ctx.comments.add('doc', { page: 1, x: 1, y: 2, note: 'one' }).id;
+
+    const set = await auditCall(client, 'set_compile_defaults', {
+      project: 'doc',
+      defaults: { timeoutSec: 600, warningsFilter: { excludeRule: ['LaTeX'] } },
+    });
+    expect(set.defaults).toEqual({ timeoutSec: 600, warningsFilter: { excludeRule: ['LaTeX'] } });
+    expect(set.previous).toBeNull();
+    const report = await auditCall(client, 'set_compile_defaults', { project: 'doc' });
+    expect(report.changed).toBe(false);
+
+    const compiled = await auditCall(client, 'compile', { project: 'doc', resolveComments: [id] });
+    expect(compiled.defaultsApplied).toEqual(['timeoutSec', 'warningsFilter']);
+    // The stubbed build succeeds, so the comment is resolved by it.
+    expect(compiled.success).toBe(true);
+    expect(compiled.resolvedComments).toBe(1);
+
+    await auditCall(client, 'write_file', {
+      project: 'doc',
+      path: 'notes.tex',
+      content: 'a line\n',
+      compile: true,
+    });
+    const edited = await auditCall(client, 'edit_file', {
+      project: 'doc',
+      path: 'notes.tex',
+      edits: [{ oldString: 'a line', newString: 'a changed line' }],
+      compile: true,
+      resolveComments: [id],
+    });
+    const summary = edited.compile as Record<string, unknown>;
+    expect(summary.defaultsApplied).toEqual(['timeoutSec', 'warningsFilter']);
+    // Already resolved by the compile above, so this build closes nothing more.
+    expect(summary.resolvedComments).toBe(0);
+    expect(summary.success).toBe(true);
+    expect(edited.diff).toContain('+a changed line');
+
+    const cleared = await auditCall(client, 'set_compile_defaults', {
+      project: 'doc',
+      clear: true,
+    });
+    expect(cleared.defaults).toBeNull();
+  });
+});
+
 describe('output contract: the git-backed tools', () => {
   async function gitHarness(opts: { prime?: boolean } = {}) {
     const remote = await createFakeRemote({ 'main.tex': MAIN_TEX });

@@ -9,6 +9,34 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ## [Unreleased]
 
+### Added
+
+- **`edit_file` and `write_file` can compile in the same call.** `compile: true` runs the same build
+  a separate `compile` call would, after the write, and returns a short report under `compile`
+  (success, backend, counts, the first 5 errors by location); `resolveComments: [ids]` closes those
+  viewer comments when that build succeeds. Editing and checking a fix used to cost two calls per
+  edit.
+- **`set_compile_defaults` stores a project's compile arguments** (`compiler`, `engine`,
+  `timeoutSec`, `warningsFilter`) under `.sessions/<project>/compile-defaults.json`, so callers stop
+  resending them. A call's own argument wins per field; `compile` reports what a default supplied in
+  `defaultsApplied`.
+- **`compile` takes `resolveComments: [ids]`**, marking those comments resolved only when the build
+  succeeds (`resolvedComments`).
+
+### Fixed
+
+- **Viewer comments on a tectonic build now carry their source file and line.** Tectonic was run
+  without `--synctex`, so SyncTeX had nothing to map a comment back through and every one needed a
+  search to locate.
+- **`edit_file`'s confirmation diff shows the edit you made.** It diffed the file against HEAD
+  under a 2000-character budget, so a document written a paragraph per line, or one with earlier
+  uncommitted edits, came back as "1 of 1 hunk(s) omitted" for a one-word change. It now diffs this
+  call's before and after, and cuts a long line around its change (`diffCondensed`).
+- **"Unknown project" names the registry the project is in.** A server whose workspace is local to a
+  checkout does not read `~/.web-latex-mcp/projects/registry.json`; when that registry has the id,
+  the error now gives the `register_project` call to repeat here, or the `WEB_LATEX_MCP_WORKSPACE`
+  setting to use it.
+
 ### Changed
 
 - **Development tooling: `/pr-review` replaces `/implement`, `/implement-issue` and `/review`.** The

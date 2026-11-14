@@ -17,6 +17,7 @@ import { SessionRegistry } from './services/sessionRegistry.js';
 import { ShadowStore } from './services/shadowStore.js';
 import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
+import { CompileDefaultsStore } from './services/compileDefaultsStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
@@ -70,6 +71,8 @@ export interface AppContext {
   shelves: ShelfStore;
   /** Sticky per-project rewrite-preservation mode — see `src/services/rewriteModeStore.ts`. */
   rewriteModes: RewriteModeStore;
+  /** Per-project compile defaults — see `src/services/compileDefaultsStore.ts`. */
+  compileDefaults: CompileDefaultsStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
   credentialPortal: CredentialPortal;
   /** Checks GitHub for a newer release and fetches the Desktop bundle — see `src/services/updater.ts`. */
@@ -227,6 +230,7 @@ export function createContext(
     shadows,
     shelves,
     rewriteModes,
+    compileDefaults: new CompileDefaultsStore(config.workspaceRoot),
     credentialPortal: new CredentialPortal((host, username, token) =>
       credentials.storeCredential(host, username, token),
     ),

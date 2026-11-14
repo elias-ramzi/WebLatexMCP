@@ -55,6 +55,11 @@ export function sessionDir(workspaceRoot: string, projectId: string, sessionId: 
  * Lives beside the clones, never inside them, so it can never be committed or mistaken for
  * project content.
  */
+/** Where `set_compile_defaults` keeps a project's stored compile defaults. */
+export function compileDefaultsPath(workspaceRoot: string, projectId: string): string {
+  return path.join(sessionStateDir(workspaceRoot, projectId), 'compile-defaults.json');
+}
+
 export function rewriteModePath(workspaceRoot: string, projectId: string): string {
   return path.join(sessionStateDir(workspaceRoot, projectId), 'rewrite-mode.json');
 }

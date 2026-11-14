@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import { applyCompileDefaults, warningsFilterSchema } from '../lib/compileDefaults.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { assertRegisteredRootExists, resolveRootFile } from '../lib/rootFile.js';
 import { toFileUrl, toPosix, toPosixOut } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';
@@ -55,7 +57,7 @@ import {
   tikzShellEscapeHint,
 } from '../services/compiler.js';
 import { quoteId } from '../lib/projectId.js';
-import { editItemSchema } from './editFile.js';
+import { editItemSchema } from '../lib/editItemSchema.js';
 import type { CompilerKind } from '../types.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
@@ -173,47 +175,16 @@ const inputSchema = {
         'never trimmed by warningsFilter either — only the default, de-noised logTail is. ' +
         '`warnings[]` is still filtered (and warningsOmitted still counts it) either way.',
     ),
-  warningsFilter: z
-    .object({
-      file: z
-        .array(z.string())
-        .optional()
-        .describe(
-          'Keep only warnings whose file is exactly one of these — project-relative POSIX, ' +
-            'matched EXACTLY as warnings[].file reports it (no globs, no prefixes): the way to ' +
-            'get the spelling right is to read it off a previous compile result. A warning the ' +
-            'log named no file for is dropped when this is set, even though it would otherwise ' +
-            'survive — there is nothing to compare it against, and filtering to one file is not ' +
-            'what you want mixed with warnings of unknown origin.',
-        ),
-      rule: z
-        .array(z.string())
-        .optional()
-        .describe(
-          'Keep only warnings whose rule is exactly one of these — the values warnings[].rule ' +
-            'carries: "Overfull \\hbox", "Underfull \\vbox", "LaTeX", or a package/class name ' +
-            'like "hyperref" — including one carrying a dot or a hyphen, e.g. "pdftex.def" or ' +
-            '"tikz-cd". Matched exactly, never a prefix.',
-        ),
-      excludeRule: z
-        .array(z.string())
-        .optional()
-        .describe(
-          'Drop warnings whose rule is exactly one of these. A warning with no rule is never ' +
-            'excluded by this — only rule and file ever drop a rule-less/file-less warning.',
-        ),
-    })
+  warningsFilter: warningsFilterSchema,
+  resolveComments: z
+    .array(z.string())
+    .min(1)
     .optional()
     .describe(
-      'Trim warnings[] to the ones you actually want, on a document whose warning-heavy log ' +
-        'otherwise dominates the result. Applies to logTail too, in lockstep with warnings[] — ' +
-        'an Overfull \\hbox line otherwise ships twice, once structured and once as raw text — ' +
-        'except when rawLog: true, where logTail stays whole (see rawLog). Never filters errors, ' +
-        'only warnings: a document that fails to compile is not made to look cleaner by a filter ' +
-        'meant for box-warning noise. warningsOmitted reports how many warnings this removed. An ' +
-        'EMPTY array constrains nothing rather than matching nothing — {file: []} returns every ' +
-        'warning, not none — so a list you built programmatically and that came out empty widens ' +
-        'the result instead of narrowing it.',
+      'Viewer comment ids (from list_comments) to mark resolved once this build SUCCEEDS — the ' +
+        'resolve_comments step folded into the compile that checks the fix. A failed build, or ' +
+        'an overlay (variant) build, resolves none, and the result says so. Reported in ' +
+        'resolvedComments.',
     ),
   overlay: z
     .array(
@@ -509,6 +480,21 @@ const outputSchema = {
         'the main one. Evicted once it is no longer among the ' +
         `${MAX_VARIANTS} most recently compiled variants of the project.`,
     ),
+  defaultsApplied: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Arguments this call did not pass that came from the project's stored compile defaults " +
+        '(set_compile_defaults): compiler, engine, timeoutSec, warningsFilter. Absent when none ' +
+        'did.',
+    ),
+  resolvedComments: z
+    .number()
+    .optional()
+    .describe(
+      'How many of the resolveComments ids were marked resolved (0 when the build failed or ' +
+        'was a variant). Absent when resolveComments was not passed.',
+    ),
   hint: z
     .string()
     .optional()
@@ -613,8 +599,28 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({
-      project,
+    (args) => runCompile(ctx, args),
+  );
+}
+
+/** `compile`'s arguments, as `edit_file`/`write_file` pass them when asked to compile too. */
+export type CompileArgs = z.infer<z.ZodObject<typeof inputSchema>>;
+
+/**
+ * The whole `compile` tool, callable from another tool: `edit_file` and `write_file` with
+ * `compile: true` run it after their own lock is released (the project lock is not re-entrant), so
+ * the build is the same one a separate `compile` call would have made, defaults and all.
+ */
+export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<CallToolResult> {
+  try {
+    const { id, dir } = await ctx.projectManager.requireProjectDir(args.project);
+    // The project's stored defaults fill what the call left out, field by field; an argument
+    // the call passes always wins (src/lib/compileDefaults.ts).
+    const { args: merged, applied: defaultsApplied } = applyCompileDefaults(
+      args,
+      await ctx.compileDefaults.get(id),
+    );
+    const {
       rootFile,
       engine,
       clean,
@@ -625,457 +631,474 @@ export function registerCompile(server: McpServer, ctx: AppContext): void {
       compiler,
       warningsFilter,
       overlay,
-    }) => {
-      try {
-        const { id, dir } = await ctx.projectManager.requireProjectDir(project);
-        // Preflight the backend before taking the project lock: choosing one is global, touches no
-        // project file, and throwing here costs nothing. Without it a missing backend surfaced as a
-        // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
-        const backend = await ctx.compiler.select(compiler);
-        return await ctx.projectManager.runExclusive(id, async (lock) => {
-          // The caller's root, else the project's registered one, else auto-detection — the one
-          // order every tool and the viewer use (resolveRootFile). The registered root is read
-          // once (from the registry's current entry, so a peer's re-registration counts) and the
-          // same value feeds the viewer hint below.
-          const registeredRoot = ctx.projectManager.registeredRootFile(id);
-          const resolvedRoot = await resolveRootFile(ctx.files, dir, registeredRoot, rootFile);
-          // A registered root that is not in the project is refused here, before any build: it
-          // otherwise came back as a FAILED compile with 0 errors and the cause in logTail.
-          await assertRegisteredRootExists(ctx.files, dir, id, resolvedRoot);
-          const root = resolvedRoot.rootFile;
-          // An overlay compile builds a variant: the edited text is applied in memory (read
-          // through FileService under the project's link policy, never written back, no baseline)
-          // and compiled in a link farm with its own build dir — see src/lib/variants.ts.
-          let variant:
-            | {
-                handle: string;
-                contents: Map<string, string>;
-                outDir: string;
-                workDir: string;
-                sourceChanges: () => Promise<SourceCheck>;
-              }
-            | undefined;
-          if (overlay) {
-            // The root's spelling and directory path are judged before the overlay is read: a
-            // refusal here must not wait on (or be masked by) an overlay entry's own error.
-            // A registered root is one this call never named: the refusal says where it came from.
-            await refuseLinkedRootDir(dir, root, {
-              registered: resolvedRoot.source === 'registered',
-            });
-            // The build root is created or verified before anything of the overlay runs — the
-            // same fail-closed check every build dir gets (#215). Applying the overlay can already
-            // write under the root (the case probe `applyOverlay` runs for several entries creates
-            // the project's variants dir), and staging certainly does; checking only before
-            // staging let a planted root receive both first.
-            await ensureBuildRoot();
-            const contents = await applyOverlay(ctx.files, dir, overlay);
-            const handle = variantHandle({
-              rootFile: root,
-              engine,
-              compiler: backend.kind,
-              shellEscape,
-              restrictedShellEscape,
-              overlay,
-            });
-            const skip = [ctx.config.workspaceRoot, buildRoot()];
-            // stageVariant judges the root again itself before it creates the variant's
-            // directories: the check is one mkdir + lstat and deliberately never memoised.
-            const paths = await stageVariant({
-              projectDir: dir,
-              handle,
-              rootFile: root,
-              engine: engine ?? 'pdflatex',
-              compiler: backend.kind,
-              contents,
-              skip,
-            });
-            // Snapshot the source AFTER staging (on win32 staging hard-links and unlinks source
-            // files, which moves their change time) and compare right after the build, before
-            // eviction does the same. Some routes from the farm back into the source are not the
-            // server's to close (see `snapshotSource`), so the result reports what the build
-            // actually did to the project rather than asserting "untouched". The workspace is
-            // skipped by equality alone (a local project may contain it, and a project link into
-            // a sibling clone is written through like any other); the build root, which the build
-            // writes by design, with everything under it.
-            const sourceChanges = await watchSource(dir, {
-              skip: [ctx.config.workspaceRoot],
-              skipTree: [buildRoot()],
-            });
-            variant = { handle, contents, outDir: paths.out, workDir: paths.src, sourceChanges };
+      resolveComments,
+    } = merged;
+    // Preflight the backend before taking the project lock: choosing one is global, touches no
+    // project file, and throwing here costs nothing. Without it a missing backend surfaced as a
+    // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
+    const backend = await ctx.compiler.select(compiler);
+    return await ctx.projectManager.runExclusive(id, async (lock) => {
+      // The caller's root, else the project's registered one, else auto-detection — the one
+      // order every tool and the viewer use (resolveRootFile). The registered root is read
+      // once (from the registry's current entry, so a peer's re-registration counts) and the
+      // same value feeds the viewer hint below.
+      const registeredRoot = ctx.projectManager.registeredRootFile(id);
+      const resolvedRoot = await resolveRootFile(ctx.files, dir, registeredRoot, rootFile);
+      // A registered root that is not in the project is refused here, before any build: it
+      // otherwise came back as a FAILED compile with 0 errors and the cause in logTail.
+      await assertRegisteredRootExists(ctx.files, dir, id, resolvedRoot);
+      const root = resolvedRoot.rootFile;
+      // An overlay compile builds a variant: the edited text is applied in memory (read
+      // through FileService under the project's link policy, never written back, no baseline)
+      // and compiled in a link farm with its own build dir — see src/lib/variants.ts.
+      let variant:
+        | {
+            handle: string;
+            contents: Map<string, string>;
+            outDir: string;
+            workDir: string;
+            sourceChanges: () => Promise<SourceCheck>;
           }
-          // Shell escape is off unless the caller opted in — for every compile, not only a
-          // variant (#213): the backend passes latexmk `-no-shell-escape` whenever neither flag is
-          // set, since TeX Live's default (`shell_escape = p`) otherwise runs its allow-list with
-          // no flag at all, writing relative to the project (or, in a variant's farm, through its
-          // links into the source).
-          // "On" as the backend that runs reads the request: tectonic ignores restrictedShellEscape.
-          const shellEscapeOn = shellEscapeRequested(
-            { shellEscape, restrictedShellEscape },
-            backend.kind,
-          );
-          const outcome = await backend.compiler.compile({
-            projectDir: dir,
-            rootFile: root,
-            engine,
-            clean,
-            timeoutSec,
-            shellEscape,
-            restrictedShellEscape,
-            ...(variant ? { workDir: variant.workDir, outDir: variant.outDir } : {}),
-          });
-          const sourceCheck = variant ? await variant.sourceChanges() : undefined;
-          const changedSource = sourceCheck?.changed;
-          // Why it could not be checked, for the variant line: a cause that stays (a committed
-          // link loop) fails every check, so it has to be findable.
-          const uncheckedReason =
-            sourceCheck !== undefined && sourceCheck.changed === undefined
-              ? sourceCheck.reason
-              : undefined;
-          // Retention runs after the compile, under the same lock, and never removes this one. It
-          // is best-effort: an old variant that cannot be removed (a viewer holding its PDF open on
-          // Windows) must not throw away the compile that just finished.
-          let evictionFailure: string | undefined;
-          if (variant) {
-            try {
-              await evictVariants(dir, MAX_VARIANTS, variant.handle);
-            } catch (err) {
-              evictionFailure = evictionFailureHint(err);
-              console.error(
-                `[compile] could not remove an old variant of ${quoteId(id)}: ` +
-                  describeEvictionFailure(err),
-              );
-            }
-          }
-          // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
-          // to the project root — rebase them there so a `file` is one the caller can open.
-          // Captured output (no engine .log found) has no header anything may rest on.
-          const logSource = { capturedOutput: outcome.capturedOutput === true };
-          const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
-            baseDir: outcome.logBaseDir,
-            ...logSource,
-          });
-          // Errors carry their source context; warnings do not — a normal build has hundreds of
-          // them and attaching a snippet to each would bloat every successful compile's result.
-          const { errors: located, omittedLocations: omittedSnippetLocations } =
-            await attachErrorSnippets(
-              // An overlaid file's snippet comes from the text that was compiled, not the disk.
-              variant ? overlaySnippetReader(ctx.files, variant.contents) : ctx.files,
-              dir,
-              parsedErrors,
-            );
-          // A path out of the project through a symlink is not handed back as somewhere to read
-          // next — for warnings as much as errors, since both come off the same document-written
-          // log. Refusing only the snippet read would leave the guard one hop deep.
-          const withheld = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
-          // Note the order: `omittedSnippetLocations` was counted in the pass above, so a snippet
-          // taken away here is not added to it. Only a past-the-cap location can lose one (a path
-          // that escapes is refused the read, so it never had a snippet), and reaching that cap
-          // takes 200+ distinct paths — the count is in the hundreds by then, so the promise that
-          // matters, "0 means every located error has its source context", still holds: 0 is not
-          // reachable in the one case that undercounts.
-          const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
-          const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
-          // One judge, built once and handed to both channels — `warnings[]` here and `logTail`'s
-          // `keepWarning` below — so they can never disagree about a warning. `undefined` means
-          // the filter constrains nothing, and both channels skip the machinery entirely. See
-          // `makeWarningJudge` for why the withholding is applied inside the predicate rather
-          // than by the caller. Never filters errors: a failing document is not made to look
-          // cleaner by a filter meant for warning noise.
-          const judgeWarning = makeWarningJudge(withheld.all, warningsFilter);
-          const shownFilteredWarnings = judgeWarning
-            ? shownWarnings.filter(judgeWarning)
-            : shownWarnings;
-          const warningsOmitted = shownWarnings.length - shownFilteredWarnings.length;
-          const missingPackages = findMissingPackages(outcome.log);
-          // Never silently retry with shell escape — that would turn a compile into arbitrary code
-          // execution without consent. Surface a hint and let the caller opt in explicitly.
-          const hints: string[] = [];
-          // First: it reframes everything below it. A substituted backend means the caller is not
-          // reading the diagnostics they expected — under tectonic, notably, none of them carry a
-          // snippet — so say which engine spoke before explaining what it said.
-          if (backend.note) hints.push(backend.note);
-          // Next: a variant build that wrote the project is the one thing here the caller may
-          // have to undo.
-          if (changedSource !== undefined && changedSource.length > 0) {
-            hints.push(sourceChangedHint(changedSource));
-          }
-          // Then: an engine latexmk could not run explains a failure that otherwise reads as
-          // "FAILED — 0 error(s)" and nothing else. The gate (failed, nothing parsed) and the
-          // wording are the service's; this only places it.
-          const engineHint = engineNotFoundHint(outcome, parsedErrors.length);
-          if (engineHint) hints.push(engineHint);
-          // An overlaid file the build never opened changed nothing, and the variant would read as
-          // the main build without a word — say so, naming it. No .fls (tectonic): nothing claimed.
-          // A FAILED build may simply have stopped before reaching it, so it is not told to
-          // overlay another path.
-          if (variant) {
-            const unread = await overlayFilesNeverRead(variantPaths(dir, variant.handle), root, [
-              ...variant.contents.keys(),
-            ]);
-            if (unread !== undefined && unread.length > 0) {
-              hints.push(overlayNeverReadHint(unread, outcome.success));
-            }
-          }
-          // The service words it: shellEscape: true only, since TeX's restricted allow-list never
-          // holds the engine call externalization makes.
-          const tikzHint = tikzShellEscapeHint(outcome.log, {
-            ...logSource,
-            shellEscapeOn,
-            backend: backend.kind,
-          });
-          if (tikzHint) hints.push(tikzHint);
-          // Shell escape was off (above), so a command the installation's default would have run
-          // — repstopdf for an .eps figure, makeindex — was refused: say which switch brings it
-          // back and what flipping it costs. One hint for every compile; the service words it.
-          const refusedHint = shellEscapeRefusedHint(outcome.log, {
-            ...logSource,
-            shellEscapeOn,
-            overlay: variant !== undefined,
-            backend: backend.kind,
-          });
-          if (refusedHint) hints.push(refusedHint);
-          // The opposite surprise: the caller left shell escape off, and the engine's own banner
-          // says it was on anyway — for every compile, not only a variant's line below.
-          const overriddenHint = shellEscapeOverriddenHint(outcome.log, {
-            ...logSource,
-            shellEscapeOn,
-            backend: backend.kind,
-          });
-          if (overriddenHint) hints.push(overriddenHint);
-          if (missingPackages.length > 0)
-            hints.push(missingPackageHint(missingPackages, backend.kind));
-          // Last: housekeeping, not this compile — an older variant that could not be removed.
-          if (evictionFailure !== undefined) hints.push(evictionFailure);
-          const hint = hints.length > 0 ? hints.join('\n') : undefined;
-          // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
-          // the user can open the latest build from their editor instead of hunting the temp dir.
-          // Never for a variant: the surfaced copy is the project's latest build, which an
-          // overlay compile does not change.
-          let pdfPath = outcome.pdfPath;
-          if (pdfPath && ctx.config.workspaceIsLocal && !variant) {
-            pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
-          }
-          const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
-          // Read the page count off the PDF, not the log's "Output written on … (N pages" line:
-          // that line is absent from a failed run that still produced a PDF, and the PDF is the
-          // thing the caller actually has. Never fatal — a compile that produced a document must
-          // not be reported as failed because a count could not be read (the count needs only
-          // pdf.js, not the optional canvas backend, but a broken install or an unreadable PDF
-          // can still make it fail).
-          let pageCount: number | undefined;
-          if (pdfPath) {
-            try {
-              pageCount = await ctx.pdfRenderer.pageCount(pdfPath);
-            } catch {
-              pageCount = undefined;
-            }
-          }
-          // The response boundary, and it sits below everything above rather than one line
-          // earlier. `ctx.pdfRenderer.pageCount` opens the PDF off the real filesystem, so it needs
-          // the host's own spelling — that half is load-bearing. `toFileUrl` would accept either
-          // (`pathToFileURL` resolves through `path.win32.resolve`, so `C:\a\b` and `C:/a/b` give
-          // the same URL); it stays above the line because it takes a filesystem path rather than a
-          // string chosen for a reader, not because the URL would otherwise break. Past this point
-          // nothing touches a disk, and the paths are converted in one call so the text channel and
-          // structuredContent cannot disagree about a separator.
-          const { pdfPath: outPdfPath, logPath: outLogPath } = toPosixOut({
-            pdfPath,
-            logPath: outcome.logPath,
-          });
-          const lockWaitSec = Math.round(lock.waitedMs / 100) / 10;
-          const lockHeldBy = lock.waitedOn;
-          // ONE plan drives both channels (issue #162) and every document-controlled payload in
-          // them: `errors[]`, `warnings[]`, and the de-noised `logTail`, whose 80-line bound was
-          // never a character bound (each line is an un-wrapped logical line). The plan carries the
-          // text rendering of the errors it KEPT, so the text channel cannot re-render the full
-          // set behind the budget's back (the rule `diff.ts` and `searchFiles.ts` follow), and it
-          // fits `logTail` through the same `judgeWarning` that trimmed `warnings[]` above, so the
-          // two channels still cannot disagree about a warning. `rawLog: true` is not a lane:
-          // raw means raw, so it is neither charged nor cut, and the plan returns no tail for it.
-          const diagnostics = planDiagnosticsPayload(
-            errors,
-            shownFilteredWarnings,
-            rawLog
-              ? {}
-              : {
-                  fitLogTail: (maxChars) =>
-                    fitFilteredLog(outcome.log, {
-                      maxChars,
-                      ...(judgeWarning
-                        ? { baseDir: outcome.logBaseDir, keepWarning: judgeWarning }
-                        : {}),
-                    }),
-                },
-          );
-          const structuredContent = {
-            success: outcome.success,
-            rootFile: root,
-            compiler: backend.kind,
-            pdfPath: outPdfPath,
-            pdfUrl,
-            pageCount,
-            durationSec: outcome.durationSec,
-            rebuilt: outcome.rebuilt,
-            pdfMtime: outcome.pdfMtime,
-            lockWaitSec,
-            lockHeldBy,
-            errors: diagnostics.errors,
-            warnings: diagnostics.warnings,
-            errorsOmittedByCap: diagnostics.errorsOmittedByCap,
-            warningsOmittedByCap: diagnostics.warningsOmittedByCap,
-            warningsOmitted,
-            missingPackages,
-            // The plan fitted a tail exactly when `rawLog` is off; otherwise this is the raw one.
-            logTail: diagnostics.logTail ?? logTail(outcome.log, RAW_TAIL_LINES),
-            logPath: outLogPath,
-            omittedSnippetLocations,
-            ...(diagnostics.note ? { note: diagnostics.note } : {}),
-            ...(variant ? { variant: variant.handle } : {}),
-            hint,
-          };
-          // Name the backend in the text too, not only structuredContent: which engine spoke
-          // decides how to read what follows (tectonic attaches no snippets to anything), and the
-          // client this rendering exists for is the one that cannot read structuredContent at all.
-          let headline = outcome.timedOut
-            ? `compile${variant ? ` of variant ${variant.handle}` : ''} timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
-            : `${outcome.success ? 'compiled' : 'FAILED'} ${variant ? `variant ${variant.handle} of ` : ''}${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
-              `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
-              `${errors.length} error(s), ${shownFilteredWarnings.length} warning(s)` +
-              (warningsOmitted > 0 ? ` (${warningsOmitted} filtered out)` : '');
-          // A fast "success" right after a peer session compiled the same clone is easy to
-          // mistake for a rebuild from this call's own edits — say plainly when it wasn't one.
-          if (outcome.success && !outcome.rebuilt) headline += ' (up to date — not rebuilt)';
-          if (lockWaitSec >= 0.5) {
-            headline +=
-              `; waited ${lockWaitSec.toFixed(1)}s for the lock` +
-              (lockHeldBy ? ` held by "${lockHeldBy}"` : '');
-          }
-          // Render the source context into the text too, not only structuredContent: a client that
-          // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
-          // Errors sharing a location print the snippet once. Which errors the text lists, and
-          // what that costs, is one decision made in `diagnosticsBudget.ts` — rendered here from
-          // the errors the budget KEPT, never from the full array beside it.
-          const errorLines = diagnostics.errorLines;
-          const dropped = [
-            diagnostics.errors.length > diagnostics.errorsInText
-              ? `  … ${diagnostics.errors.length - diagnostics.errorsInText} more error(s) — see structuredContent or ${outLogPath ?? 'the log'}`
-              : '',
-            // Said in the text as well as in structuredContent, and charged there: the client this
-            // rendering exists for is the one that cannot read the counters at all, and a list
-            // silently missing two thirds of a build's warnings is exactly what a budget must not
-            // produce.
-            diagnostics.note ? `  … ${diagnostics.note}` : '',
-            omittedSnippetLocations > 0
-              ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
-                `did not name the file and line outright (every diagnostic, under tectonic), or ` +
-                `they are unreadable, contradicted by the log, or past the 10-location cap`
-              : '',
-            withheld.escaped > 0
-              ? `  … ${withheld.escaped} path(s) the log named leave the project through a symlink; ` +
-                `reported without file/line, since a path the document chose is not one to open`
-              : '',
-            // Kept apart from the line above on purpose: past the cap nothing was resolved, so
-            // nothing is known — calling these escapes sends the caller after a link that is not
-            // there, and blames the document for the server's own bound.
-            withheld.unchecked > 0
-              ? `  … ${withheld.unchecked} path(s) past the ${MAX_REPORTED_PATH_CHECKS}-file limit ` +
-                `on resolving where a log's paths lead; reported without file/line because they ` +
-                `were never checked, not because anything is wrong with them`
-              : '',
-          ]
-            .filter(Boolean)
-            .join('\n');
-          // Surface the live viewer whenever there's something to look at: its URL if it's already
-          // running — saying whether it now shows THIS build, since it follows the project's root
-          // (registered, else auto-detected) and not `rootFile` — else a pointer that the tool
-          // exists, naming the root it would show when that is not this one.
-          // Not for a variant: the viewer shows the project's own build, which this did not touch.
-          // Judged whether or not the viewer runs: an idle one is still worth a line when it
-          // would open on another root than the one just built.
-          const viewerUrl =
-            pdfPath && !variant && ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined;
-          // With no rootFile named, this compile's root IS the viewer's (registered, else
-          // detected): hand it over rather than detect it a second time. A named root is never the
-          // viewer's, so then the viewer's root is resolved on its own.
-          const viewerShows =
-            pdfPath && !variant
-              ? await viewerShowsForCompile(
-                  ctx.files,
-                  ctx.config,
-                  id,
-                  dir,
-                  registeredRoot,
-                  root,
-                  resolvedRoot.source === 'argument' ? undefined : resolvedRoot,
-                )
-              : undefined;
-          const viewerLine = viewerShows
-            ? compileViewerHint(
-                viewerUrl
-                  ? { url: viewerUrl, builtRoot: toPosix(root), shows: viewerShows }
-                  : undefined,
-                { builtRoot: toPosix(root), shows: viewerShows },
-              )
-            : '';
-          // Every claim here is one the build's own record backs: the source's state from the
-          // before/after comparison, shell escape's from the engine's banner — the latexmk flag
-          // alone reaches the engine only through %O, which a project latexmkrc can override.
-          // The banner is read from the log's header only, which the engine writes before the
-          // document: one the document `\typeout`s into the body would blame a latexmkrc that
-          // does not exist. "Off" needs the header READ and holding no banner ('none'); with no
-          // header to read (no engine .log found — latexmk's captured output stood in) neither
-          // "on" nor "off" is claimed, whatever that output opens with. Tectonic reads no
-          // latexmkrc, so there the flag it was given is the whole answer.
-          const headerBanner = engineShellEscapeBanner(outcome.log, logSource);
-          const escapeReenabled =
-            !shellEscapeOn && (headerBanner === 'full' || headerBanner === 'restricted');
-          const escapeOffConfirmed = headerBanner === 'none' || backend.kind === 'tectonic';
-          const variantLine = variant
-            ? `variant ${variant.handle}: pass variant to render_pages / extract_text / ` +
-              'pdf_geometry to inspect it. ' +
-              (changedSource === undefined
-                ? 'The main build, the surfaced PDF and the viewer are untouched; whether the ' +
-                  'build wrote a project file could not be checked this time' +
-                  (uncheckedReason !== undefined ? ` (${uncheckedReason}).` : '.')
-                : changedSource.length > 0
-                  ? `The build CHANGED ${changedSource.length} project file(s) (see hint); ` +
-                    'the main build, the surfaced PDF and the viewer are untouched.'
-                  : 'The source (checked: no project file changed while it built — of a .git ' +
-                    'directory at the project root, if there is one, only what git runs or ' +
-                    'reads its configuration from, such as hooks/ and config, is checked), the ' +
-                    'main build, the surfaced PDF and the viewer are untouched.') +
-              (shellEscapeOn
-                ? " Shell escape was on, so the document's shell commands could write anywhere — " +
-                  "the source included, through the variant's links to it."
-                : escapeReenabled
-                  ? ' Shell escape was requested off, but the log shows it enabled: a ' +
-                    "latexmkrc (the project's own, or a user or system one) overrode the flag, " +
-                    "so the document's shell commands could run."
-                  : escapeOffConfirmed
-                    ? ' Shell escape was off for this build.'
-                    : ' Whether shell escape was off for this build could not be confirmed: no ' +
-                      'engine log with a readable header was found for it (a latexmkrc that ' +
-                      'renames the job leaves the log where the server does not look).')
-            : '';
-          const text = [
-            headline,
-            variantLine,
-            pdfUrl ? `PDF: ${pdfUrl}` : '',
-            errorLines,
-            dropped,
-            hint ? `hint: ${hint}` : '',
-            viewerLine,
-          ]
-            .filter(Boolean)
-            .join('\n');
-          return {
-            content: [{ type: 'text', text }],
-            structuredContent,
-          };
+        | undefined;
+      if (overlay) {
+        // The root's spelling and directory path are judged before the overlay is read: a
+        // refusal here must not wait on (or be masked by) an overlay entry's own error.
+        // A registered root is one this call never named: the refusal says where it came from.
+        await refuseLinkedRootDir(dir, root, {
+          registered: resolvedRoot.source === 'registered',
         });
-      } catch (err) {
-        return errorResult(err, ctx.credentials.allSecrets());
+        // The build root is created or verified before anything of the overlay runs — the
+        // same fail-closed check every build dir gets (#215). Applying the overlay can already
+        // write under the root (the case probe `applyOverlay` runs for several entries creates
+        // the project's variants dir), and staging certainly does; checking only before
+        // staging let a planted root receive both first.
+        await ensureBuildRoot();
+        const contents = await applyOverlay(ctx.files, dir, overlay);
+        const handle = variantHandle({
+          rootFile: root,
+          engine,
+          compiler: backend.kind,
+          shellEscape,
+          restrictedShellEscape,
+          overlay,
+        });
+        const skip = [ctx.config.workspaceRoot, buildRoot()];
+        // stageVariant judges the root again itself before it creates the variant's
+        // directories: the check is one mkdir + lstat and deliberately never memoised.
+        const paths = await stageVariant({
+          projectDir: dir,
+          handle,
+          rootFile: root,
+          engine: engine ?? 'pdflatex',
+          compiler: backend.kind,
+          contents,
+          skip,
+        });
+        // Snapshot the source AFTER staging (on win32 staging hard-links and unlinks source
+        // files, which moves their change time) and compare right after the build, before
+        // eviction does the same. Some routes from the farm back into the source are not the
+        // server's to close (see `snapshotSource`), so the result reports what the build
+        // actually did to the project rather than asserting "untouched". The workspace is
+        // skipped by equality alone (a local project may contain it, and a project link into
+        // a sibling clone is written through like any other); the build root, which the build
+        // writes by design, with everything under it.
+        const sourceChanges = await watchSource(dir, {
+          skip: [ctx.config.workspaceRoot],
+          skipTree: [buildRoot()],
+        });
+        variant = { handle, contents, outDir: paths.out, workDir: paths.src, sourceChanges };
       }
-    },
-  );
+      // Shell escape is off unless the caller opted in — for every compile, not only a
+      // variant (#213): the backend passes latexmk `-no-shell-escape` whenever neither flag is
+      // set, since TeX Live's default (`shell_escape = p`) otherwise runs its allow-list with
+      // no flag at all, writing relative to the project (or, in a variant's farm, through its
+      // links into the source).
+      // "On" as the backend that runs reads the request: tectonic ignores restrictedShellEscape.
+      const shellEscapeOn = shellEscapeRequested(
+        { shellEscape, restrictedShellEscape },
+        backend.kind,
+      );
+      const outcome = await backend.compiler.compile({
+        projectDir: dir,
+        rootFile: root,
+        engine,
+        clean,
+        timeoutSec,
+        shellEscape,
+        restrictedShellEscape,
+        ...(variant ? { workDir: variant.workDir, outDir: variant.outDir } : {}),
+      });
+      const sourceCheck = variant ? await variant.sourceChanges() : undefined;
+      const changedSource = sourceCheck?.changed;
+      // Why it could not be checked, for the variant line: a cause that stays (a committed
+      // link loop) fails every check, so it has to be findable.
+      const uncheckedReason =
+        sourceCheck !== undefined && sourceCheck.changed === undefined
+          ? sourceCheck.reason
+          : undefined;
+      // Retention runs after the compile, under the same lock, and never removes this one. It
+      // is best-effort: an old variant that cannot be removed (a viewer holding its PDF open on
+      // Windows) must not throw away the compile that just finished.
+      let evictionFailure: string | undefined;
+      if (variant) {
+        try {
+          await evictVariants(dir, MAX_VARIANTS, variant.handle);
+        } catch (err) {
+          evictionFailure = evictionFailureHint(err);
+          console.error(
+            `[compile] could not remove an old variant of ${quoteId(id)}: ` +
+              describeEvictionFailure(err),
+          );
+        }
+      }
+      // The log's paths are relative to the directory the engine ran in (latexmk's `-cd`), not
+      // to the project root — rebase them there so a `file` is one the caller can open.
+      // Captured output (no engine .log found) has no header anything may rest on.
+      const logSource = { capturedOutput: outcome.capturedOutput === true };
+      const { errors: parsedErrors, warnings } = parseLog(outcome.log, {
+        baseDir: outcome.logBaseDir,
+        ...logSource,
+      });
+      // Errors carry their source context; warnings do not — a normal build has hundreds of
+      // them and attaching a snippet to each would bloat every successful compile's result.
+      const { errors: located, omittedLocations: omittedSnippetLocations } =
+        await attachErrorSnippets(
+          // An overlaid file's snippet comes from the text that was compiled, not the disk.
+          variant ? overlaySnippetReader(ctx.files, variant.contents) : ctx.files,
+          dir,
+          parsedErrors,
+        );
+      // A path out of the project through a symlink is not handed back as somewhere to read
+      // next — for warnings as much as errors, since both come off the same document-written
+      // log. Refusing only the snippet read would leave the guard one hop deep.
+      const withheld = await unopenablePaths(ctx.files, dir, [...located, ...warnings]);
+      // Note the order: `omittedSnippetLocations` was counted in the pass above, so a snippet
+      // taken away here is not added to it. Only a past-the-cap location can lose one (a path
+      // that escapes is refused the read, so it never had a snippet), and reaching that cap
+      // takes 200+ distinct paths — the count is in the hundreds by then, so the promise that
+      // matters, "0 means every located error has its source context", still holds: 0 is not
+      // reachable in the one case that undercounts.
+      const errors = located.map((e) => withoutUnopenableLocation(e, withheld.all));
+      const shownWarnings = warnings.map((w) => withoutUnopenableLocation(w, withheld.all));
+      // One judge, built once and handed to both channels — `warnings[]` here and `logTail`'s
+      // `keepWarning` below — so they can never disagree about a warning. `undefined` means
+      // the filter constrains nothing, and both channels skip the machinery entirely. See
+      // `makeWarningJudge` for why the withholding is applied inside the predicate rather
+      // than by the caller. Never filters errors: a failing document is not made to look
+      // cleaner by a filter meant for warning noise.
+      const judgeWarning = makeWarningJudge(withheld.all, warningsFilter);
+      const shownFilteredWarnings = judgeWarning
+        ? shownWarnings.filter(judgeWarning)
+        : shownWarnings;
+      const warningsOmitted = shownWarnings.length - shownFilteredWarnings.length;
+      const missingPackages = findMissingPackages(outcome.log);
+      // Never silently retry with shell escape — that would turn a compile into arbitrary code
+      // execution without consent. Surface a hint and let the caller opt in explicitly.
+      const hints: string[] = [];
+      // First: it reframes everything below it. A substituted backend means the caller is not
+      // reading the diagnostics they expected — under tectonic, notably, none of them carry a
+      // snippet — so say which engine spoke before explaining what it said.
+      if (backend.note) hints.push(backend.note);
+      // Next: a variant build that wrote the project is the one thing here the caller may
+      // have to undo.
+      if (changedSource !== undefined && changedSource.length > 0) {
+        hints.push(sourceChangedHint(changedSource));
+      }
+      // Then: an engine latexmk could not run explains a failure that otherwise reads as
+      // "FAILED — 0 error(s)" and nothing else. The gate (failed, nothing parsed) and the
+      // wording are the service's; this only places it.
+      const engineHint = engineNotFoundHint(outcome, parsedErrors.length);
+      if (engineHint) hints.push(engineHint);
+      // An overlaid file the build never opened changed nothing, and the variant would read as
+      // the main build without a word — say so, naming it. No .fls (tectonic): nothing claimed.
+      // A FAILED build may simply have stopped before reaching it, so it is not told to
+      // overlay another path.
+      if (variant) {
+        const unread = await overlayFilesNeverRead(variantPaths(dir, variant.handle), root, [
+          ...variant.contents.keys(),
+        ]);
+        if (unread !== undefined && unread.length > 0) {
+          hints.push(overlayNeverReadHint(unread, outcome.success));
+        }
+      }
+      // The service words it: shellEscape: true only, since TeX's restricted allow-list never
+      // holds the engine call externalization makes.
+      const tikzHint = tikzShellEscapeHint(outcome.log, {
+        ...logSource,
+        shellEscapeOn,
+        backend: backend.kind,
+      });
+      if (tikzHint) hints.push(tikzHint);
+      // Shell escape was off (above), so a command the installation's default would have run
+      // — repstopdf for an .eps figure, makeindex — was refused: say which switch brings it
+      // back and what flipping it costs. One hint for every compile; the service words it.
+      const refusedHint = shellEscapeRefusedHint(outcome.log, {
+        ...logSource,
+        shellEscapeOn,
+        overlay: variant !== undefined,
+        backend: backend.kind,
+      });
+      if (refusedHint) hints.push(refusedHint);
+      // The opposite surprise: the caller left shell escape off, and the engine's own banner
+      // says it was on anyway — for every compile, not only a variant's line below.
+      const overriddenHint = shellEscapeOverriddenHint(outcome.log, {
+        ...logSource,
+        shellEscapeOn,
+        backend: backend.kind,
+      });
+      if (overriddenHint) hints.push(overriddenHint);
+      if (missingPackages.length > 0) hints.push(missingPackageHint(missingPackages, backend.kind));
+      // Last: housekeeping, not this compile — an older variant that could not be removed.
+      if (evictionFailure !== undefined) hints.push(evictionFailure);
+      const hint = hints.length > 0 ? hints.join('\n') : undefined;
+      // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
+      // the user can open the latest build from their editor instead of hunting the temp dir.
+      // Never for a variant: the surfaced copy is the project's latest build, which an
+      // overlay compile does not change.
+      let pdfPath = outcome.pdfPath;
+      if (pdfPath && ctx.config.workspaceIsLocal && !variant) {
+        pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
+      }
+      const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
+      // Read the page count off the PDF, not the log's "Output written on … (N pages" line:
+      // that line is absent from a failed run that still produced a PDF, and the PDF is the
+      // thing the caller actually has. Never fatal — a compile that produced a document must
+      // not be reported as failed because a count could not be read (the count needs only
+      // pdf.js, not the optional canvas backend, but a broken install or an unreadable PDF
+      // can still make it fail).
+      let pageCount: number | undefined;
+      if (pdfPath) {
+        try {
+          pageCount = await ctx.pdfRenderer.pageCount(pdfPath);
+        } catch {
+          pageCount = undefined;
+        }
+      }
+      // The response boundary, and it sits below everything above rather than one line
+      // earlier. `ctx.pdfRenderer.pageCount` opens the PDF off the real filesystem, so it needs
+      // the host's own spelling — that half is load-bearing. `toFileUrl` would accept either
+      // (`pathToFileURL` resolves through `path.win32.resolve`, so `C:\a\b` and `C:/a/b` give
+      // the same URL); it stays above the line because it takes a filesystem path rather than a
+      // string chosen for a reader, not because the URL would otherwise break. Past this point
+      // nothing touches a disk, and the paths are converted in one call so the text channel and
+      // structuredContent cannot disagree about a separator.
+      const { pdfPath: outPdfPath, logPath: outLogPath } = toPosixOut({
+        pdfPath,
+        logPath: outcome.logPath,
+      });
+      const lockWaitSec = Math.round(lock.waitedMs / 100) / 10;
+      const lockHeldBy = lock.waitedOn;
+      // ONE plan drives both channels (issue #162) and every document-controlled payload in
+      // them: `errors[]`, `warnings[]`, and the de-noised `logTail`, whose 80-line bound was
+      // never a character bound (each line is an un-wrapped logical line). The plan carries the
+      // text rendering of the errors it KEPT, so the text channel cannot re-render the full
+      // set behind the budget's back (the rule `diff.ts` and `searchFiles.ts` follow), and it
+      // fits `logTail` through the same `judgeWarning` that trimmed `warnings[]` above, so the
+      // two channels still cannot disagree about a warning. `rawLog: true` is not a lane:
+      // raw means raw, so it is neither charged nor cut, and the plan returns no tail for it.
+      const diagnostics = planDiagnosticsPayload(
+        errors,
+        shownFilteredWarnings,
+        rawLog
+          ? {}
+          : {
+              fitLogTail: (maxChars) =>
+                fitFilteredLog(outcome.log, {
+                  maxChars,
+                  ...(judgeWarning
+                    ? { baseDir: outcome.logBaseDir, keepWarning: judgeWarning }
+                    : {}),
+                }),
+            },
+      );
+      // Comments are closed only by a build that shows the fix: a successful build of the
+      // project itself. A variant is a what-if, not the project's text.
+      let resolvedComments: number | undefined;
+      let commentsLine = '';
+      if (resolveComments !== undefined) {
+        if (outcome.success && !variant) {
+          resolvedComments = ctx.comments.resolve(id, resolveComments);
+          commentsLine = `resolved ${resolvedComments} of ${resolveComments.length} comment(s)`;
+        } else {
+          resolvedComments = 0;
+          commentsLine =
+            `resolved none of ${resolveComments.length} comment(s): ` +
+            (variant ? 'a variant build does not change the project' : 'the build failed');
+        }
+      }
+      const structuredContent = {
+        ...(defaultsApplied.length > 0 ? { defaultsApplied } : {}),
+        ...(resolvedComments !== undefined ? { resolvedComments } : {}),
+        success: outcome.success,
+        rootFile: root,
+        compiler: backend.kind,
+        pdfPath: outPdfPath,
+        pdfUrl,
+        pageCount,
+        durationSec: outcome.durationSec,
+        rebuilt: outcome.rebuilt,
+        pdfMtime: outcome.pdfMtime,
+        lockWaitSec,
+        lockHeldBy,
+        errors: diagnostics.errors,
+        warnings: diagnostics.warnings,
+        errorsOmittedByCap: diagnostics.errorsOmittedByCap,
+        warningsOmittedByCap: diagnostics.warningsOmittedByCap,
+        warningsOmitted,
+        missingPackages,
+        // The plan fitted a tail exactly when `rawLog` is off; otherwise this is the raw one.
+        logTail: diagnostics.logTail ?? logTail(outcome.log, RAW_TAIL_LINES),
+        logPath: outLogPath,
+        omittedSnippetLocations,
+        ...(diagnostics.note ? { note: diagnostics.note } : {}),
+        ...(variant ? { variant: variant.handle } : {}),
+        hint,
+      };
+      // Name the backend in the text too, not only structuredContent: which engine spoke
+      // decides how to read what follows (tectonic attaches no snippets to anything), and the
+      // client this rendering exists for is the one that cannot read structuredContent at all.
+      let headline = outcome.timedOut
+        ? `compile${variant ? ` of variant ${variant.handle}` : ''} timed out after ${outcome.durationSec.toFixed(1)}s (${backend.kind})`
+        : `${outcome.success ? 'compiled' : 'FAILED'} ${variant ? `variant ${variant.handle} of ` : ''}${root} with ${backend.kind} in ${outcome.durationSec.toFixed(1)}s — ` +
+          `${pageCount !== undefined ? `${pageCount} page(s), ` : ''}` +
+          `${errors.length} error(s), ${shownFilteredWarnings.length} warning(s)` +
+          (warningsOmitted > 0 ? ` (${warningsOmitted} filtered out)` : '');
+      // A fast "success" right after a peer session compiled the same clone is easy to
+      // mistake for a rebuild from this call's own edits — say plainly when it wasn't one.
+      if (outcome.success && !outcome.rebuilt) headline += ' (up to date — not rebuilt)';
+      if (lockWaitSec >= 0.5) {
+        headline +=
+          `; waited ${lockWaitSec.toFixed(1)}s for the lock` +
+          (lockHeldBy ? ` held by "${lockHeldBy}"` : '');
+      }
+      // Render the source context into the text too, not only structuredContent: a client that
+      // strips structured output (see lib/outputSchemaCompat) would otherwise never see it.
+      // Errors sharing a location print the snippet once. Which errors the text lists, and
+      // what that costs, is one decision made in `diagnosticsBudget.ts` — rendered here from
+      // the errors the budget KEPT, never from the full array beside it.
+      const errorLines = diagnostics.errorLines;
+      const dropped = [
+        diagnostics.errors.length > diagnostics.errorsInText
+          ? `  … ${diagnostics.errors.length - diagnostics.errorsInText} more error(s) — see structuredContent or ${outLogPath ?? 'the log'}`
+          : '',
+        // Said in the text as well as in structuredContent, and charged there: the client this
+        // rendering exists for is the one that cannot read the counters at all, and a list
+        // silently missing two thirds of a build's warnings is exactly what a budget must not
+        // produce.
+        diagnostics.note ? `  … ${diagnostics.note}` : '',
+        omittedSnippetLocations > 0
+          ? `  … no source context for ${omittedSnippetLocations} error location(s) — the log ` +
+            `did not name the file and line outright (every diagnostic, under tectonic), or ` +
+            `they are unreadable, contradicted by the log, or past the 10-location cap`
+          : '',
+        withheld.escaped > 0
+          ? `  … ${withheld.escaped} path(s) the log named leave the project through a symlink; ` +
+            `reported without file/line, since a path the document chose is not one to open`
+          : '',
+        // Kept apart from the line above on purpose: past the cap nothing was resolved, so
+        // nothing is known — calling these escapes sends the caller after a link that is not
+        // there, and blames the document for the server's own bound.
+        withheld.unchecked > 0
+          ? `  … ${withheld.unchecked} path(s) past the ${MAX_REPORTED_PATH_CHECKS}-file limit ` +
+            `on resolving where a log's paths lead; reported without file/line because they ` +
+            `were never checked, not because anything is wrong with them`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+      // Surface the live viewer whenever there's something to look at: its URL if it's already
+      // running — saying whether it now shows THIS build, since it follows the project's root
+      // (registered, else auto-detected) and not `rootFile` — else a pointer that the tool
+      // exists, naming the root it would show when that is not this one.
+      // Not for a variant: the viewer shows the project's own build, which this did not touch.
+      // Judged whether or not the viewer runs: an idle one is still worth a line when it
+      // would open on another root than the one just built.
+      const viewerUrl =
+        pdfPath && !variant && ctx.viewer.isRunning() ? ctx.viewer.urlFor(id) : undefined;
+      // With no rootFile named, this compile's root IS the viewer's (registered, else
+      // detected): hand it over rather than detect it a second time. A named root is never the
+      // viewer's, so then the viewer's root is resolved on its own.
+      const viewerShows =
+        pdfPath && !variant
+          ? await viewerShowsForCompile(
+              ctx.files,
+              ctx.config,
+              id,
+              dir,
+              registeredRoot,
+              root,
+              resolvedRoot.source === 'argument' ? undefined : resolvedRoot,
+            )
+          : undefined;
+      const viewerLine = viewerShows
+        ? compileViewerHint(
+            viewerUrl
+              ? { url: viewerUrl, builtRoot: toPosix(root), shows: viewerShows }
+              : undefined,
+            { builtRoot: toPosix(root), shows: viewerShows },
+          )
+        : '';
+      // Every claim here is one the build's own record backs: the source's state from the
+      // before/after comparison, shell escape's from the engine's banner — the latexmk flag
+      // alone reaches the engine only through %O, which a project latexmkrc can override.
+      // The banner is read from the log's header only, which the engine writes before the
+      // document: one the document `\typeout`s into the body would blame a latexmkrc that
+      // does not exist. "Off" needs the header READ and holding no banner ('none'); with no
+      // header to read (no engine .log found — latexmk's captured output stood in) neither
+      // "on" nor "off" is claimed, whatever that output opens with. Tectonic reads no
+      // latexmkrc, so there the flag it was given is the whole answer.
+      const headerBanner = engineShellEscapeBanner(outcome.log, logSource);
+      const escapeReenabled =
+        !shellEscapeOn && (headerBanner === 'full' || headerBanner === 'restricted');
+      const escapeOffConfirmed = headerBanner === 'none' || backend.kind === 'tectonic';
+      const variantLine = variant
+        ? `variant ${variant.handle}: pass variant to render_pages / extract_text / ` +
+          'pdf_geometry to inspect it. ' +
+          (changedSource === undefined
+            ? 'The main build, the surfaced PDF and the viewer are untouched; whether the ' +
+              'build wrote a project file could not be checked this time' +
+              (uncheckedReason !== undefined ? ` (${uncheckedReason}).` : '.')
+            : changedSource.length > 0
+              ? `The build CHANGED ${changedSource.length} project file(s) (see hint); ` +
+                'the main build, the surfaced PDF and the viewer are untouched.'
+              : 'The source (checked: no project file changed while it built — of a .git ' +
+                'directory at the project root, if there is one, only what git runs or ' +
+                'reads its configuration from, such as hooks/ and config, is checked), the ' +
+                'main build, the surfaced PDF and the viewer are untouched.') +
+          (shellEscapeOn
+            ? " Shell escape was on, so the document's shell commands could write anywhere — " +
+              "the source included, through the variant's links to it."
+            : escapeReenabled
+              ? ' Shell escape was requested off, but the log shows it enabled: a ' +
+                "latexmkrc (the project's own, or a user or system one) overrode the flag, " +
+                "so the document's shell commands could run."
+              : escapeOffConfirmed
+                ? ' Shell escape was off for this build.'
+                : ' Whether shell escape was off for this build could not be confirmed: no ' +
+                  'engine log with a readable header was found for it (a latexmkrc that ' +
+                  'renames the job leaves the log where the server does not look).')
+        : '';
+      const text = [
+        headline,
+        defaultsApplied.length > 0
+          ? `project compile defaults applied: ${defaultsApplied.join(', ')}`
+          : '',
+        commentsLine,
+        variantLine,
+        pdfUrl ? `PDF: ${pdfUrl}` : '',
+        errorLines,
+        dropped,
+        hint ? `hint: ${hint}` : '',
+        viewerLine,
+      ]
+        .filter(Boolean)
+        .join('\n');
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent,
+      };
+    });
+  } catch (err) {
+    return errorResult(err, ctx.credentials.allSecrets());
+  }
 }
