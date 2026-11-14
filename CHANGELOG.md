@@ -24,6 +24,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
+- **The UI's Claude knows the PDF is already open beside the chat**, so it no longer calls
+  `viewer` to show it (only for a markdown document, or a separate tab the user asks for).
 
 - **A local tool-call log, and `web-latex-mcp call-stats` to read it.** Each tool call adds one
   line to `<workspace>/.logs/tool-calls.jsonl`: tool, session, project, duration, result size and a

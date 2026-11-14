@@ -25,6 +25,7 @@ import {
   ChatManager,
   TOKEN_VAR,
   suggestionRules,
+  uiSystemPrompt,
   type QueryLike,
   type StartArgs,
   type UserInput,
@@ -442,6 +443,12 @@ describe('ChatManager', () => {
     await expect(mgr.send('p', 'hi')).rejects.toThrow('not installed');
     await expect(mgr.setMode('p', 'yolo')).rejects.toThrow(/mode must be/);
     await expect(mgr.settings('p', { effort: 'huge' })).rejects.toThrow(/effort must be/);
+  });
+
+  it('tells Claude the PDF is already shown, so it does not open the viewer again', () => {
+    const p = uiSystemPrompt('thesis');
+    expect(p).toContain('"thesis"');
+    expect(p).toMatch(/Do not call the `viewer` tool/);
   });
 
   it('words a suggestion as rules', () => {
