@@ -29,7 +29,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **A click on a viewer comment edits it**, in the same small popup that writes one: click its
   highlight in the PDF or the document, or its note in the panel. The popup shows the quoted text
   and the note, with **Delete** beside Cancel and Save (↶ Undo brings a comment back). The panel's
-  ✎/🗑 buttons no longer hide until hovered.
+  ✎/🗑 buttons no longer hide until hovered. A click outside the popup saves it and closes it (an
+  empty one just closes).
 - **The UI's Claude knows the PDF is already open beside the chat**, so it no longer calls
   `viewer` to show it (only for a markdown document, or a separate tab the user asks for).
 
