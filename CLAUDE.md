@@ -431,6 +431,14 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   other). `assertBlocksStillComments` refuses the whole call if live text was pulled onto a `%` line or a
   block's bare `\r` now meets a `\n`. `unfuse` turns a bare `\r` before a blank LF line into `\n` (only
   pre-existing bytes or terminators reported via the optional `lastRestoredTerminator`).
+- **A viewer comment is located by SyncTeX, then by its quote, and says which** (`locatedBy`).
+  `SyncTexService.resolve` uses the `synctex` CLI and, only when it cannot run, reads the
+  `.synctex.gz` in-process (`synctexEditQuery`, `src/lib/synctexReader.ts`: smallest hbox under the
+  point, last leaf at or before it; checked against the CLI at ~96% exact line agreement, the rest
+  in margins or within 2 lines). With no SyncTeX answer, `locateQuoteInProject`
+  (`src/lib/quoteLocate.ts`) matches the quote's words against every `.tex` and answers **only on a
+  unique match** — two matches, too many files, an unreadable or oversized one all mean no location,
+  never the first hit. A wrong snippet is worse than none.
 - **`compile: true` on `edit_file`/`write_file` runs `runCompile` (the whole `compile` tool,
   exported from `src/tools/compile.ts`) after the write's `runExclusive` returns** — the project lock
   is not re-entrant, so calling it inside deadlocks. Its result is cut to `summarizeCompile`

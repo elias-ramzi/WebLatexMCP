@@ -269,6 +269,7 @@ describe('output contract: the tools no committed test audited', () => {
       quote: 'The opening line',
       file: 'main.tex',
       line: 4,
+      locatedBy: 'quote',
     });
 
     const out = await auditCall(client, 'list_comments', { project: 'doc' });
@@ -281,6 +282,7 @@ describe('output contract: the tools no committed test audited', () => {
     // declaredness check above would catch.
     expect(comments[0]!.snippet).toBeTypeOf('string');
     expect(comments[0]!.snippetStartLine).toBe(2);
+    expect(comments[0]!.locatedBy).toBe('quote');
     expect(Object.keys(comments[0]!)).not.toContain('project');
   });
 

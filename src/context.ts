@@ -6,6 +6,7 @@ import { CompilerResolver } from './services/compilerResolver.js';
 import { PdfRenderer } from './services/pdfRender.js';
 import { ViewerService } from './services/viewer.js';
 import { SyncTexService } from './services/synctex.js';
+import { locateQuoteInProject } from './lib/quoteLocate.js';
 import { CommentStore } from './services/commentStore.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
@@ -174,6 +175,7 @@ export function createContext(
     addComment: async (id, input) => {
       let file: string | undefined;
       let line: number | undefined;
+      let locatedBy: 'synctex' | 'quote' | undefined;
       try {
         const { dir, located } = await viewerPdf(id);
         // No synctex source (the surfaced fallback may be another root's): keep the note
@@ -181,12 +183,24 @@ export function createContext(
         const synctexPdf = located?.synctexPdf;
         if (synctexPdf) {
           const loc = await synctex.resolve(synctexPdf, dir, input.page, input.x, input.y);
-          if (loc) ({ file, line } = loc);
+          if (loc) {
+            ({ file, line } = loc);
+            locatedBy = 'synctex';
+          }
+        }
+        // SyncTeX placed nothing: the selected text, if it occurs in exactly one place in the
+        // project's .tex files (src/lib/quoteLocate.ts). Text evidence, reported as such.
+        if (!file && input.quote) {
+          const hit = await locateQuoteInProject(files, dir, input.quote);
+          if (hit) {
+            ({ file, line } = hit);
+            locatedBy = 'quote';
+          }
         }
       } catch {
         // Leave the location unresolved — the note is still kept (Claude can use the quote/page).
       }
-      return comments.add(id, { ...input, file, line });
+      return comments.add(id, { ...input, file, line, locatedBy });
     },
     listComments: (id) => comments.list(id),
     updateComment: (id, commentId, note) => comments.update(id, commentId, { note }),

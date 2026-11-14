@@ -32,6 +32,10 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   under a 2000-character budget, so a document written a paragraph per line, or one with earlier
   uncommitted edits, came back as "1 of 1 hunk(s) omitted" for a one-word change. It now diffs this
   call's before and after, and cuts a long line around its change (`diffCondensed`).
+- **Viewer comments get a source location without TeX Live.** When the `synctex` command is not
+  installed, the server reads the build's `.synctex.gz` itself. When SyncTeX places nothing, the
+  comment's quote is matched against the project's `.tex` files and located only if exactly one
+  place matches; `list_comments` reports which way each was found in `locatedBy`.
 - **"Unknown project" names the registry the project is in.** A server whose workspace is local to a
   checkout does not read `~/.web-latex-mcp/projects/registry.json`; when that registry has the id,
   the error now gives the `register_project` call to repeat here, or the `WEB_LATEX_MCP_WORKSPACE`
