@@ -13,7 +13,7 @@ import type { ServerConfig } from '../../src/types.js';
  * The viewer shows one PDF and maps a click on it back to source through synctex. Both halves
  * must name the SAME root's build.
  *
- * In workspace-local mode `compile` copies whatever root it just built to `<workspace>/<id>.pdf`
+ * With `surfacePdf` on, `compile` copies whatever root it just built to `<workspace>/<id>.pdf`
  * — one file per project, holding whichever root compiled LAST — while a comment's click was
  * resolved through the DETECTED root's build-dir synctex. After compiling a non-default root
  * (a supplement), the user clicked on the supplement's page and the comment was filed against
@@ -67,7 +67,7 @@ async function setup(opts: { stageMainBuild: boolean }): Promise<Harness> {
 
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: true,
+    surfacePdf: true,
     sessionId: 'test',
     projects: [{ id: 'poster', mode: 'local', path: userDir }],
   };

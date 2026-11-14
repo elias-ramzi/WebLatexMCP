@@ -107,7 +107,6 @@ describe('an id that names an Object.prototype member is refused (1)', () => {
           '{"__proto__":{"gitUrl":"https://git.example/p.git"},"ok":{"gitUrl":"https://git.example/o.git"}}',
       },
       root,
-      () => false,
       () => [],
       () => undefined,
     );
@@ -169,7 +168,6 @@ describe('a default project that names a skipped id never stops startup (3)', ()
         WEB_LATEX_MCP_PROJECTS: '{"thesis.pdf":{"gitUrl":"https://git.example/p.git"}}',
       },
       root,
-      () => false,
       () => [],
       () => undefined,
     );
@@ -189,7 +187,6 @@ describe('a default project that names a skipped id never stops startup (3)', ()
     const cfg = loadConfig(
       { WEB_LATEX_MCP_WORKSPACE: workspaceRoot, WEB_LATEX_MCP_DEFAULT_PROJECT: 'con' },
       root,
-      () => false,
     );
     expect(cfg.defaultProject).toBe('con');
     const pm = new ProjectManager(cfg, new ProjectRegistry(workspaceRoot));

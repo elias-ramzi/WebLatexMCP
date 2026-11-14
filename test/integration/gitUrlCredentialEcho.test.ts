@@ -53,7 +53,7 @@ beforeAll(async () => {
   gitHome = await mkdtemp(path.join(os.tmpdir(), 'ovl-urlcred-git-'));
   const globalConfig = path.join(gitHome, 'gitconfig');
   await writeFile(globalConfig, '');
-  // What `src/index.ts` sets for the server process: fail on a missing credential, never prompt.
+  // What `src/standalone.ts` and `serve` set for the server process: fail on a missing credential, never prompt.
   process.env.GIT_TERMINAL_PROMPT = '0';
   process.env.GIT_CONFIG_GLOBAL = globalConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';

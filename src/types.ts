@@ -109,24 +109,45 @@ export interface ServerConfig {
   /** Directory that holds one clone per project. */
   workspaceRoot: string;
   /**
-   * True when `workspaceRoot` lives inside the agent's own workspace (the `cwd` sentinel),
-   * so the server excludes it from the host repo's git on startup.
+   * Whether `compile` copies each build to `<workspaceRoot>/<id>.pdf` (`src/lib/pdfSurface.ts`),
+   * and so whether the PDF tools may fall back to that copy. `loadConfig` always sets it; a config
+   * built by hand (a test) leaves it off unless it asks.
    */
-  workspaceIsLocal?: boolean;
+  surfacePdf?: boolean;
   /**
-   * The pattern the server added to the host repo's `.git/info/exclude` at startup, when it did
-   * (see `src/lib/workspaceExclude.ts`). Reported by `server_info`/`register_project` so a caller
-   * knows the clone dir is already handled and does not "helpfully" add a redundant `.gitignore`
-   * entry. Undefined when nothing was excluded (shared workspace, or not inside a git repo).
+   * An older version's workspace-local folder (`<launch-dir>/.web_latex_mcp`) that still registers
+   * projects, when it is not the workspace in use. `list_projects` names it with the
+   * `web-latex-mcp migrate-workspace` command, so projects registered there are not taken for lost.
    */
-  workspaceExcludePattern?: string;
+  legacyWorkspaceRoot?: string;
+  /** How this server is reached: one session on stdio (default), or a daemon's session (`serve`). */
+  serverMode?: 'stdio' | 'daemon';
+  /**
+   * The session id the client asked for, when the daemon gave this session another one because a
+   * session holding it was open (`-2`, `-3`, … — docs/design/shared-server.md §5.2).
+   */
+  sessionIdRequested?: string;
+  /**
+   * Names (never values) of daemon-wide variables the client's environment set differently from
+   * the daemon's (`X-Web-Latex-Mcp-Client-Env`, §7.1): they do not apply to this session.
+   */
+  ignoredClientEnv?: string[];
+  /**
+   * Why this stdio session runs in-process: the proxy could not reach or start the shared server
+   * (docs/design/shared-server.md §9.1). Absent when serving in-process was asked for.
+   */
+  daemonUnavailable?: string;
+  /**
+   * A newer build asked the shared server to make way: it restarts as that build once its last
+   * session closes (docs/design/shared-server.md §9.2). Set on every open session's config.
+   */
+  restartPending?: boolean;
   /**
    * The server's own fallback workspace (`~/.web-latex-mcp/projects`), set only when it is not
    * `workspaceRoot`. `list_projects` names it when this workspace holds no project and that one
    * does — a Desktop extension that now gets `~/latex-workspace` as its default after running on
-   * the fallback, or any server launched with another workspace (workspace-local mode included,
-   * where a separate project list is by design), whose registered projects would otherwise go
-   * unmentioned.
+   * the fallback, or any server launched with another workspace, whose registered projects would
+   * otherwise go unmentioned.
    */
   fallbackWorkspaceRoot?: string;
   /**
@@ -171,6 +192,17 @@ export interface ServerConfig {
   compilerExplicit?: boolean;
   /** Fixed port for the on-demand PDF viewer; omit for an OS-assigned ephemeral port. */
   viewerPort?: number;
+  /**
+   * How many compiles and PDF loads run at once in this process (`WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`,
+   * `src/lib/workGate.ts`); the rest queue. Omit for `DEFAULT_MAX_PARALLEL_BUILDS`.
+   */
+  maxParallelBuilds?: number;
+  /**
+   * Whether tool calls are logged to `<workspace>/.logs/tool-calls.jsonl`
+   * (`WEB_LATEX_MCP_CALL_LOG`, `src/lib/callLog.ts`). `loadConfig` sets it — `true` unless the
+   * variable says off; a config built by hand (tests) leaves it unset, which is off.
+   */
+  callLog?: boolean;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
   /**

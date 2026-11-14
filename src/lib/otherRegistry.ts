@@ -1,13 +1,10 @@
-import os from 'node:os';
 import path from 'node:path';
 import { readProjectRegistry, registryPath } from '../services/projectRegistry.js';
 import { redactGitUrlCredentials } from './gitUrlCredentials.js';
 import { escapeInvisibleChars, quoteId } from './projectId.js';
+import { homeWorkspaceRoot } from './workspaceNote.js';
 
-/** The shared home workspace, `~/.web-latex-mcp/projects` (as `src/config.ts` defaults to). */
-export function homeWorkspaceRoot(): string {
-  return path.join(os.homedir(), '.web-latex-mcp', 'projects');
-}
+export { homeWorkspaceRoot };
 
 function quotePath(p: string): string {
   return escapeInvisibleChars(JSON.stringify(p));
@@ -17,10 +14,9 @@ function quotePath(p: string): string {
  * The sentence an "Unknown project" error adds when the id IS registered — only in the other
  * registry this server does not read.
  *
- * A server launched inside a git checkout keeps its projects in a workspace-local registry
- * (`<launch-dir>/.web_latex_mcp/registry.json`), while one launched elsewhere uses the shared
- * `~/.web-latex-mcp/projects/registry.json`. A project registered under one is unknown to the
- * other, and the bare "Unknown project" sent the caller hunting. This reads the home registry
+ * A server whose `WEB_LATEX_MCP_WORKSPACE` names another folder keeps its projects there, while
+ * one without it uses the shared `~/.web-latex-mcp/projects/registry.json`. A project registered
+ * under one is unknown to the other, and the bare "Unknown project" sent the caller hunting. This reads the home registry
  * **to suggest**, never to load: adopting its entry here would give one id two workspaces, two
  * clones and two lock files, which the per-project lock exists to prevent. The suggestion is the
  * registration to repeat here, or the setting that points this server at the other registry.

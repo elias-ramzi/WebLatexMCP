@@ -59,7 +59,6 @@ async function startSession(workspace: string, sessionId: string) {
   const config = loadConfig(
     { WEB_LATEX_MCP_WORKSPACE: workspace, WEB_LATEX_MCP_SESSION: sessionId },
     workspace,
-    () => false,
   );
   const ctx = createContext(
     config,

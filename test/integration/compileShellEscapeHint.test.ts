@@ -78,7 +78,7 @@ async function setup(files: Record<string, string>, backend: CompilerKind = 'lat
   cleanups.push(() => rm(workspace, { recursive: true, force: true }));
   const config: ServerConfig = {
     workspaceRoot: workspace,
-    workspaceIsLocal: true,
+    surfacePdf: true,
     sessionId: 'test',
     projects: [{ id: 'demo', gitUrl: remote.url }],
     defaultProject: 'demo',

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { timedPhase } from '../lib/callLog.js';
 import { realpathSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit, type SimpleGit, type StatusResult as GitStatusSummary } from 'simple-git';
@@ -4182,13 +4183,11 @@ async function runRemoteGit(
   args: string[],
 ): Promise<void> {
   const injected = gitCredentialConfig(gitUrl, auth);
-  const res = await execCapture(
-    'git',
-    [...(injected?.config.flatMap((c) => ['-c', c]) ?? []), ...args],
-    {
+  const res = await timedPhase('git-remote', () =>
+    execCapture('git', [...(injected?.config.flatMap((c) => ['-c', c]) ?? []), ...args], {
       ...(cwd !== undefined ? { cwd } : {}),
       ...(injected ? { env: { ...process.env, ...injected.env } } : {}),
-    },
+    }),
   );
   if (res.code !== 0) {
     const output = res.stdout + res.stderr;

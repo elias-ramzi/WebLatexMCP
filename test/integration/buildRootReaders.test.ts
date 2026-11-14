@@ -67,7 +67,7 @@ describe.skipIf(process.platform === 'win32')('PDF readers: planted build root (
 
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [],
     };

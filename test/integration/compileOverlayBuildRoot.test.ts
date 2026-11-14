@@ -45,7 +45,7 @@ describe.skipIf(process.platform === 'win32')('compile overlay: planted build ro
     const workspace = await mkdtemp(path.join(tmp, 'ws-'));
     const config: ServerConfig = {
       workspaceRoot: workspace,
-      workspaceIsLocal: true,
+      surfacePdf: true,
       sessionId: 'test',
       projects: [{ id: 'demo', gitUrl: remote.url }],
       defaultProject: 'demo',

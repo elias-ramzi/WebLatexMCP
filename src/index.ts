@@ -1,113 +1,59 @@
 #!/usr/bin/env node
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { loadConfig } from './config.js';
-import { CredentialResolver, loadIdentity } from './services/auth.js';
-import { createContext } from './context.js';
-import { createServer } from './server.js';
-import { ProjectRegistry } from './services/projectRegistry.js';
-import {
-  loadWritingGuide,
-  loadExtraWritingGuide,
-  composeWritingGuide,
-} from './lib/writingGuide.js';
-import { loadConcurrencyGuide } from './lib/concurrencyGuide.js';
-import { loadSkills } from './lib/skills.js';
-import { excludeWorkspaceFromHostGit } from './lib/workspaceExclude.js';
-import {
-  installOutputSchemaCompat,
-  isIncompatibleClient,
-  outputSchemaMode,
-} from './lib/outputSchemaCompat.js';
-import {
-  createSessionProbe,
-  installConnectionProbe,
-  sessionProbeEnabled,
-} from './lib/sessionProbe.js';
+import { runProxy, standaloneRequested } from './proxy/proxyCommand.js';
+
+// Loaded only when needed: the proxy, which every client session runs, must not carry the whole
+// server (every tool, pdf.js, the reference backends) — that is what the shared server is for.
+const runCli = async (...args: Parameters<typeof import('./cli.js').runCli>) =>
+  (await import('./cli.js')).runCli(...args);
+const runStandalone = async (...args: Parameters<typeof import('./standalone.js').runStandalone>) =>
+  (await import('./standalone.js')).runStandalone(...args);
 
 async function main(): Promise<void> {
-  // Fail fast instead of hanging on an interactive credential prompt when no token or
-  // credential helper is available. Child git processes inherit these.
-  process.env.GIT_TERMINAL_PROMPT ??= '0';
-  process.env.GCM_INTERACTIVE ??= 'never';
-
-  const config = loadConfig();
-  if (config.workspaceIsLocal) {
-    const pattern = await excludeWorkspaceFromHostGit(config.workspaceRoot);
-    if (pattern) {
-      // Remember it so `server_info` and `register_project` can say the clone dir is already
-      // handled — otherwise the calling agent has no way to know and may add a .gitignore entry.
-      config.workspaceExcludePattern = pattern;
-      console.error(`[web-latex-mcp] excluded ${pattern} from the host repo's git`);
-    }
+  const argv = process.argv.slice(2);
+  // A command (`serve`, `daemon …`, `migrate-workspace`, `import-env-projects`, `--help`) runs and
+  // exits. Checked first, so a command never touches the stdio JSON-RPC channel.
+  // No argument and no option: no command to run, so the CLI module need not even load.
+  const status =
+    argv.length === 0
+      ? undefined
+      : await runCli(argv, {
+          env: process.env,
+          cwd: process.cwd(),
+          out: (text) => process.stdout.write(text),
+          err: (text) => process.stderr.write(text),
+        });
+  if (status !== undefined) {
+    process.exitCode = status;
+    return;
   }
-  const credentials = new CredentialResolver(process.env);
-  const identity = loadIdentity(process.env);
-  const registry = new ProjectRegistry(config.workspaceRoot);
-  const ctx = createContext(config, credentials, identity, registry);
-  const baseWritingGuide = await loadWritingGuide(process.env);
-  const extraWritingGuide = await loadExtraWritingGuide(config.extraWritingGuidePath);
-  config.extraWritingGuideLoaded = extraWritingGuide !== undefined;
-  const { text: writingGuide, hasExtra: writingGuideHasExtra } = composeWritingGuide(
-    baseWritingGuide,
-    extraWritingGuide,
-  );
-  const concurrencyGuide = await loadConcurrencyGuide(process.env);
-  const skills = await loadSkills(process.env);
-  // Opt-in session-identity instrumentation for #18's spike. Unset (the default) leaves `probe`
-  // undefined, so nothing is installed anywhere and no line is written: see src/lib/sessionProbe.ts.
-  const probe = sessionProbeEnabled(process.env)
-    ? // Read lazily: the resolver learns a project's token when that project is first touched, so
-      // a list snapshotted here would scrub almost nothing.
-      createSessionProbe({ secrets: () => credentials.allSecrets() })
-    : undefined;
-  probe?.startup(config.sessionId);
-  const server = createServer(
-    ctx,
-    writingGuide,
-    concurrencyGuide,
-    skills,
-    writingGuideHasExtra,
-    probe,
-  );
-
-  // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
-  const transport = new StdioServerTransport();
-  // Shape outgoing tool schemas: always drop the SDK's draft-07 `$schema` marker (a 2020-12-only
-  // client refuses it), and omit `outputSchema` for clients that can't handle it (e.g. Claude
-  // Desktop); see src/lib/outputSchemaCompat.ts. The default `auto` mode omits it only for
-  // known-incompatible clients. Every mode installs the hook.
-  const schemaMode = outputSchemaMode();
-  installOutputSchemaCompat(server, transport, schemaMode);
-  const prevOnInitialized = server.server.oninitialized;
-  server.server.oninitialized = () => {
-    prevOnInitialized?.();
-    const client = server.server.getClientVersion();
-    const stripping = schemaMode === 'always' || isIncompatibleClient(client?.name);
-    console.error(
-      `[web-latex-mcp] client ${client?.name ?? 'unknown'} v${client?.version ?? '?'}` +
-        `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
+  if (standaloneRequested(argv, process.env)) {
+    await runStandalone();
+    return;
+  }
+  // The default: relay this client's stdio to the workspace's shared server, starting it if
+  // need be; when that cannot be done, serve this session in-process, as before
+  // (docs/design/shared-server.md §9.1).
+  const relayed = await runProxy({
+    env: process.env,
+    cwd: process.cwd(),
+    stdin: process.stdin,
+    stdout: process.stdout,
+    log: (line) => process.stderr.write(`[web-latex-mcp] ${line}\n`),
+    // Killed rather than closed: still end the session on the shared server, so it does not read
+    // live for its idle timeout and the session id can be taken over at once.
+    onStop: (stop) => {
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(signal, stop);
+    },
+  });
+  if (relayed.kind === 'unavailable') {
+    process.stderr.write(
+      `[web-latex-mcp] shared server unavailable (${relayed.reason}); serving this session ` +
+        'in-process instead\n',
     );
-  };
-  // Chained after the handler above, and deliberately so: the probe runs first inside that chain
-  // (see installConnectionProbe), so a firing is counted even if the compatibility logger throws.
-  if (probe) installConnectionProbe(server.server, probe);
-  // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
-  // session that dies without this is detected as gone by pid instead.
-  const release = (): void => {
-    for (const id of ctx.sessions.trackedProjects()) void ctx.sessions.release(id).catch(() => {});
-  };
-  process.once('SIGINT', release);
-  process.once('SIGTERM', release);
-  process.once('beforeExit', release);
-
-  await server.connect(transport);
-  console.error(
-    `[web-latex-mcp] server ready on stdio as session "${config.sessionId}"` +
-      `${writingGuide ? ' (writing guide loaded)' : ''}` +
-      `${config.extraWritingGuideLoaded ? ' (extra writing guide loaded)' : ''}` +
-      `${concurrencyGuide ? ' (concurrency guide loaded)' : ''}` +
-      `${skills.length > 0 ? ` (${skills.length} skills as prompts)` : ''}`,
-  );
+    await runStandalone({ daemonUnavailable: relayed.reason });
+    return;
+  }
+  if (relayed.kind === 'failed') process.exitCode = 1;
 }
 
 main().catch((err: unknown) => {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
@@ -25,55 +25,97 @@ import {
 import { ShelfStore } from '../../src/services/shelfStore.js';
 
 describe('loadConfig', () => {
-  const notInRepo = () => false;
-  const inRepo = () => true;
+  const home = path.join(os.homedir(), '.web-latex-mcp', 'projects');
 
-  it('falls back to the home cache when unset and not in a git repo', () => {
-    const cfg = loadConfig({}, '/some/dir', notInRepo);
-    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
-    expect(cfg.workspaceIsLocal).toBe(false);
+  it('defaults to the one shared workspace, wherever it is launched', () => {
+    // The registry reads are stubbed: the default IS the developer's real workspace.
+    const cfg = loadConfig(
+      {},
+      '/some/dir',
+      () => [],
+      () => undefined,
+      () => [],
+      () => undefined,
+    );
+    expect(cfg.workspaceRoot).toBe(home);
+    expect(cfg.surfacePdf).toBe(true);
     expect(cfg.projects).toEqual([]);
     expect(cfg.defaultProject).toBeUndefined();
   });
 
-  it('defaults to workspace-local when unset and inside a git repo', () => {
-    const cfg = loadConfig({}, '/work/paper', inRepo);
-    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', '.web_latex_mcp'));
-    expect(cfg.workspaceIsLocal).toBe(true);
-  });
-
-  it('does not default to workspace-local in the home dir even inside a repo', () => {
-    const cfg = loadConfig({}, os.homedir(), inRepo);
-    expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), '.web-latex-mcp', 'projects'));
-    expect(cfg.workspaceIsLocal).toBe(false);
+  it('no longer defaults to a workspace-local folder inside a git repo', async () => {
+    // A real git repository as the launch dir: the old default put clones in <repo>/.web_latex_mcp.
+    const repo = await mkdtemp(path.join(os.tmpdir(), 'wlm-cfg-repo-'));
+    try {
+      await mkdir(path.join(repo, '.git'));
+      expect(loadConfig({}, repo).workspaceRoot).toBe(home);
+      expect(loadConfig({}, os.homedir()).workspaceRoot).toBe(home);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
   });
 
   it('names the fallback workspace only when it is not the one in use', () => {
-    const fallback = path.join(os.homedir(), '.web-latex-mcp', 'projects');
-    expect(loadConfig({}, '/some/dir', notInRepo).fallbackWorkspaceRoot).toBeUndefined();
+    expect(loadConfig({}, '/some/dir').fallbackWorkspaceRoot).toBeUndefined();
     expect(
-      loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/latex-workspace' }, '/some/dir', notInRepo)
+      loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/latex-workspace' }, '/some/dir')
         .fallbackWorkspaceRoot,
-    ).toBe(fallback);
-    expect(loadConfig({}, '/work/paper', inRepo).fallbackWorkspaceRoot).toBe(fallback);
+    ).toBe(home);
   });
 
   it('expands a leading ~ in the workspace root', () => {
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '~/tex-projects' });
     expect(cfg.workspaceRoot).toBe(path.join(os.homedir(), 'tex-projects'));
-    expect(cfg.workspaceIsLocal).toBe(false);
+    expect(cfg.surfacePdf).toBe(true);
   });
 
-  it('clones into the launch dir on the "cwd" sentinel', () => {
-    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: '  CWD ' }, '/work/paper');
-    expect(cfg.workspaceRoot).toBe(path.join('/work/paper', '.web_latex_mcp'));
-    expect(cfg.workspaceIsLocal).toBe(true);
+  it('refuses the retired "cwd" value, naming the replacement and the migration', () => {
+    for (const value of ['cwd', '  CWD ']) {
+      expect(() => loadConfig({ WEB_LATEX_MCP_WORKSPACE: value }, '/work/paper')).toThrow(
+        /WEB_LATEX_MCP_WORKSPACE=cwd is no longer supported/,
+      );
+    }
+    let message = '';
+    try {
+      loadConfig({ WEB_LATEX_MCP_WORKSPACE: 'cwd' }, '/work/paper');
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('web-latex-mcp migrate-workspace "/work/paper/.web_latex_mcp"');
+    // A folder merely named like the sentinel is still a folder.
+    expect(loadConfig({ WEB_LATEX_MCP_WORKSPACE: './cwd' }, '/work/paper').workspaceRoot).toBe(
+      path.resolve('/work/paper', 'cwd'),
+    );
   });
 
   it('resolves a relative workspace against the launch dir', () => {
     const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: 'clones' }, '/work/paper');
     expect(cfg.workspaceRoot).toBe(path.resolve('/work/paper', 'clones'));
-    expect(cfg.workspaceIsLocal).toBe(false);
+  });
+
+  it('detects an older workspace-local folder only while it still registers projects', async () => {
+    const launch = await mkdtemp(path.join(os.tmpdir(), 'wlm-cfg-legacy-'));
+    const workspace = path.join(launch, 'central');
+    const legacy = path.join(launch, '.web_latex_mcp');
+    const env = { WEB_LATEX_MCP_WORKSPACE: workspace };
+    try {
+      expect(loadConfig(env, launch).legacyWorkspaceRoot).toBeUndefined();
+      await mkdir(legacy);
+      await writeFile(path.join(legacy, 'registry.json'), '{}\n');
+      // An empty registry registers nothing, so there is nothing to migrate.
+      expect(loadConfig(env, launch).legacyWorkspaceRoot).toBeUndefined();
+      await writeFile(
+        path.join(legacy, 'registry.json'),
+        JSON.stringify({ paper: { gitUrl: 'https://h/p' } }),
+      );
+      expect(loadConfig(env, launch).legacyWorkspaceRoot).toBe(legacy);
+      // The folder in use is never its own leftover.
+      expect(
+        loadConfig({ WEB_LATEX_MCP_WORKSPACE: legacy }, launch).legacyWorkspaceRoot,
+      ).toBeUndefined();
+    } finally {
+      await rm(launch, { recursive: true, force: true });
+    }
   });
 
   it('parses the projects registry and default project', () => {
@@ -125,7 +167,6 @@ describe('loadConfig', () => {
         }),
       },
       '/some/dir',
-      () => false,
       persisted,
     );
     const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, gitUrlOf(p)]));
@@ -150,7 +191,6 @@ describe('loadConfig', () => {
         }),
       },
       '/some/dir',
-      () => false,
       persisted,
     );
     expect([...(cfg.envProjectIds ?? [])].sort()).toEqual(['talk', 'thesis']);
@@ -162,12 +202,7 @@ describe('loadConfig', () => {
     // before the fix too (loadConfig already validated against the env+registry merge), so it's
     // kept here as a regression guard rather than reported as new coverage.
     const persisted = () => [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/persisted' }];
-    const cfg = loadConfig(
-      { WEB_LATEX_MCP_DEFAULT_PROJECT: 'thesis' },
-      '/some/dir',
-      () => false,
-      persisted,
-    );
+    const cfg = loadConfig({ WEB_LATEX_MCP_DEFAULT_PROJECT: 'thesis' }, '/some/dir', persisted);
     expect(cfg.defaultProject).toBe('thesis');
   });
 
@@ -249,7 +284,6 @@ describe('loadConfig', () => {
         }),
       },
       '/work',
-      notInRepo,
     );
 
     const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p]));
@@ -274,7 +308,6 @@ describe('loadConfig', () => {
         }),
       },
       '/work',
-      notInRepo,
     );
 
     const byId = Object.fromEntries(cfg.projects.map((p) => [p.id, p]));
@@ -302,7 +335,6 @@ describe('loadConfig defaultProject via an injected readRegistryDefault (hermeti
     const cfg = loadConfig(
       {},
       '/some/dir',
-      () => false,
       () => [{ id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' }],
       () => 'thesis',
     );
@@ -314,7 +346,6 @@ describe('loadConfig defaultProject via an injected readRegistryDefault (hermeti
     const cfg = loadConfig(
       { WEB_LATEX_MCP_DEFAULT_PROJECT: 'paper' },
       '/some/dir',
-      () => false,
       () => [
         { id: 'thesis', gitUrl: 'https://git.overleaf.com/abc' },
         { id: 'paper', gitUrl: 'https://git.overleaf.com/def' },
@@ -330,7 +361,6 @@ describe('loadConfig defaultProject via an injected readRegistryDefault (hermeti
     const cfg = loadConfig(
       {},
       '/some/dir',
-      () => false,
       () => [], // merged project list does not include "ghost"
       () => 'ghost',
     );
@@ -344,7 +374,7 @@ describe('loadConfig defaultProject via an injected readRegistryDefault (hermeti
 
 describe('loadConfig defaultProject from a persisted registry.json on disk', () => {
   // Unlike the hermetic block above, this one (real file) goes through the REAL
-  // readProjectRegistry/readProjectRegistryDefault (only `insideRepo` is stubbed) against a temp
+  // readProjectRegistry/readProjectRegistryDefault (nothing is stubbed) against a temp
   // workspace root — proving the on-disk `"default": true` flag `register_project` writes is
   // actually read end to end. Kept to exactly one test so the default (real) readers are only
   // exercised where a test explicitly asks for the real filesystem, never incidentally.
@@ -364,15 +394,13 @@ describe('loadConfig defaultProject from a persisted registry.json on disk', () 
 
   it('(real file) a registry-persisted default is used when WEB_LATEX_MCP_DEFAULT_PROJECT is unset', async () => {
     await writeRegistry({ thesis: { gitUrl: 'https://git.overleaf.com/abc', default: true } });
-    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: workspaceRoot }, '/some/dir', () => false);
+    const cfg = loadConfig({ WEB_LATEX_MCP_WORKSPACE: workspaceRoot }, '/some/dir');
     expect(cfg.defaultProject).toBe('thesis');
     expect(cfg.defaultProjectExplicit).toBe(false);
   });
 });
 
 describe('parseRewriteMode', () => {
-  const notInRepo = () => false;
-
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -404,15 +432,15 @@ describe('parseRewriteMode', () => {
   });
 
   it('wires the env default into loadConfig as rewriteMode', () => {
-    expect(loadConfig({}, '/some/dir', notInRepo).rewriteMode).toBe(DEFAULT_REWRITE_MODE);
-    expect(
-      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo).rewriteMode,
-    ).toBe('always');
+    expect(loadConfig({}, '/some/dir').rewriteMode).toBe(DEFAULT_REWRITE_MODE);
+    expect(loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir').rewriteMode).toBe(
+      'always',
+    );
 
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(
-      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir', notInRepo).rewriteMode,
-    ).toBe(DEFAULT_REWRITE_MODE);
+    expect(loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir').rewriteMode).toBe(
+      DEFAULT_REWRITE_MODE,
+    );
     expect(spy).toHaveBeenCalledTimes(1);
     const message = spy.mock.calls[0]?.[0] as string;
     expect(message).toContain('bogus');
@@ -422,28 +450,24 @@ describe('parseRewriteMode', () => {
     // rewriteMode is populated the same way whether or not the user set anything — only
     // rewriteModeExplicit tells `list_projects` (envConfigured) apart from a plain default
     // install, so it has to be asserted on its own, not inferred from rewriteMode alone.
-    expect(loadConfig({}, '/some/dir', notInRepo).rewriteModeExplicit).toBe(false);
+    expect(loadConfig({}, '/some/dir').rewriteModeExplicit).toBe(false);
 
     // A rejected value is not a choice: even though the invalid input falls back to the same
     // mode as unset, it must NOT be reported as explicit — this is the case a hardcoded
     // `rewriteModeExplicit: true` in loadConfig would sail through undetected.
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(
-      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir', notInRepo)
-        .rewriteModeExplicit,
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'bogus' }, '/some/dir').rewriteModeExplicit,
     ).toBe(false);
     spy.mockRestore();
 
     expect(
-      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir', notInRepo)
-        .rewriteModeExplicit,
+      loadConfig({ WEB_LATEX_MCP_REWRITE_MODE: 'always' }, '/some/dir').rewriteModeExplicit,
     ).toBe(true);
   });
 });
 
 describe('parseInstallKind', () => {
-  const notInRepo = () => false;
-
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -488,14 +512,13 @@ describe('parseInstallKind', () => {
   });
 
   it('wires the value into loadConfig as installKind, and leaves it unset otherwise', () => {
-    expect(loadConfig({}, '/some/dir', notInRepo).installKind).toBeUndefined();
+    expect(loadConfig({}, '/some/dir').installKind).toBeUndefined();
     expect(
-      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'desktop-extension' }, '/some/dir', notInRepo)
-        .installKind,
+      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'desktop-extension' }, '/some/dir').installKind,
     ).toBe('desktop-extension');
     vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(
-      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'mcpb' }, '/some/dir', notInRepo).installKind,
+      loadConfig({ WEB_LATEX_MCP_INSTALL_KIND: 'mcpb' }, '/some/dir').installKind,
     ).toBeUndefined();
   });
 });
@@ -841,16 +864,11 @@ describe('parseContactEmail', () => {
         WEB_LATEX_MCP_AUTHOR_NAME: 'Elias',
       },
       '/some/dir',
-      () => true,
     );
     expect(withAuthor.contactEmail).toBeUndefined();
 
     // And it IS populated when — and only when — its own variable is set.
-    const withContact = loadConfig(
-      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
-      '/some/dir',
-      () => true,
-    );
+    const withContact = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' }, '/some/dir');
     expect(withContact.contactEmail).toBe('me@example.com');
   });
 });
@@ -868,7 +886,7 @@ describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused w
 
   it('sets contactEmailInvalid when the value is set but not a usable address', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir');
 
     expect(cfg.contactEmailInvalid).toBe(true);
     // The flag REPORTS that the polite pool is off; it must never switch it back on.
@@ -881,7 +899,7 @@ describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused w
     // Deliberately unlike `referenceSourceInvalid`, which keeps the user's own typo of a
     // backend id. An address identifies a person, and config is copied into server_info.
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir', () => true);
+    const cfg = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: rejected }, '/some/dir');
 
     expect(cfg.contactEmailInvalid).toBe(true);
     expect(JSON.stringify(cfg)).not.toContain(rejected);
@@ -893,15 +911,11 @@ describe('a rejected WEB_LATEX_MCP_CONTACT_EMAIL is remembered, never confused w
     // CONTROL: passes before and after this change. It pins the shape — the flag is set only
     // when a value was actually rejected, so an implementation reporting `false` for every
     // healthy install (which would make the field meaningless in `server_info`) fails here.
-    const ok = loadConfig(
-      { WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' },
-      '/some/dir',
-      () => true,
-    );
+    const ok = loadConfig({ WEB_LATEX_MCP_CONTACT_EMAIL: 'me@example.com' }, '/some/dir');
     expect(ok.contactEmail).toBe('me@example.com');
     expect(ok.contactEmailInvalid).toBeUndefined();
 
-    const none = loadConfig({}, '/some/dir', () => true);
+    const none = loadConfig({}, '/some/dir');
     expect(none.contactEmail).toBeUndefined();
     expect(none.contactEmailInvalid).toBeUndefined();
   });

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
+import { browserRequestRefusal } from '../lib/loopbackHost.js';
 import { OVERLEAF_TOKEN_URL } from './auth.js';
 
 /**
@@ -89,6 +90,8 @@ function readBody(req: http.IncomingMessage): Promise<string | null> {
 export class CredentialPortal {
   private server?: http.Server;
   private baseUrl?: string;
+  /** Where the listener is bound, for the `Host` check (`browserRequestRefusal`). */
+  private listening?: { port: number; bindHost: string };
   private nonce?: string;
   private target?: PortalTarget;
   private lastOutcome?: PortalOutcome;
@@ -143,6 +146,7 @@ export class CredentialPortal {
         server.removeListener('error', onError);
         const addr = server.address() as AddressInfo;
         this.server = server;
+        this.listening = { port: addr.port, bindHost: host };
         this.baseUrl = `http://${host}:${addr.port}`;
         resolve(this.formUrl());
       });
@@ -161,6 +165,7 @@ export class CredentialPortal {
       await closed;
     }
     this.server = undefined;
+    this.listening = undefined;
     this.baseUrl = undefined;
     this.nonce = undefined;
     this.target = undefined;
@@ -178,6 +183,18 @@ export class CredentialPortal {
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
+      // Before anything else: a DNS-rebinding page names itself in `Host`, and a cross-site form
+      // POST carries its own `Origin` (docs/design/shared-server.md §10).
+      const refusal = this.listening
+        ? browserRequestRefusal(
+            { method: req.method, host: req.headers.host, origin: req.headers.origin },
+            this.listening,
+          )
+        : { status: 421 as const, message: 'Not listening.' };
+      if (refusal) {
+        res.writeHead(refusal.status, { 'Content-Type': 'text/plain' }).end(`${refusal.message}\n`);
+        return;
+      }
       const url = new URL(req.url ?? '/', 'http://localhost');
       const path = url.pathname.replace(/^\/+/, '');
       // Everything is gated behind the nonce path; a process that doesn't know it gets nothing.

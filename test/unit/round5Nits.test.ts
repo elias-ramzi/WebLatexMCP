@@ -7,7 +7,6 @@ const NL = String.fromCharCode(0x0a);
 const RLO = String.fromCharCode(0x202e);
 /** A value that, interpolated raw, forges a second stderr line and flips the rest of it. */
 const FORGED = `bad${NL}[web-latex-mcp] forged line${RLO}`;
-const notInRepo = (): boolean => false;
 
 function captureStderr(): { lines: string[] } {
   const out = { lines: [] as string[] };
@@ -39,21 +38,15 @@ afterEach(() => {
 
 describe('config — a rejected env value is escaped in the message that names it', () => {
   it('WEB_LATEX_MCP_COMPILER', () => {
-    expectEscaped(
-      thrownMessage(() => loadConfig({ WEB_LATEX_MCP_COMPILER: FORGED }, '/w', notInRepo)),
-    );
+    expectEscaped(thrownMessage(() => loadConfig({ WEB_LATEX_MCP_COMPILER: FORGED }, '/w')));
   });
 
   it('WEB_LATEX_MCP_VIEWER_TARGET', () => {
-    expectEscaped(
-      thrownMessage(() => loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: FORGED }, '/w', notInRepo)),
-    );
+    expectEscaped(thrownMessage(() => loadConfig({ WEB_LATEX_MCP_VIEWER_TARGET: FORGED }, '/w')));
   });
 
   it('WEB_LATEX_MCP_VIEWER_PORT', () => {
-    expectEscaped(
-      thrownMessage(() => loadConfig({ WEB_LATEX_MCP_VIEWER_PORT: FORGED }, '/w', notInRepo)),
-    );
+    expectEscaped(thrownMessage(() => loadConfig({ WEB_LATEX_MCP_VIEWER_PORT: FORGED }, '/w')));
   });
 
   it('WEB_LATEX_MCP_WRITING_GUIDE_EXTRA', () => {
@@ -69,7 +62,7 @@ describe('config — a rejected env value is escaped in the message that names i
     ['WEB_LATEX_MCP_CONTACT_EMAIL'],
   ])('%s (already elided, now escaped too)', (name) => {
     const err = captureStderr();
-    loadConfig({ [name]: FORGED }, '/w', notInRepo);
+    loadConfig({ [name]: FORGED }, '/w');
     const line = err.lines.find((l) => l.includes(name));
     expect(line).toBeDefined();
     expectEscaped(line!);
@@ -77,7 +70,7 @@ describe('config — a rejected env value is escaped in the message that names i
 
   it('bounds an over-long value while escaping it', () => {
     const msg = thrownMessage(() =>
-      loadConfig({ WEB_LATEX_MCP_COMPILER: `${NL}${'x'.repeat(5000)}` }, '/w', notInRepo),
+      loadConfig({ WEB_LATEX_MCP_COMPILER: `${NL}${'x'.repeat(5000)}` }, '/w'),
     );
     expect(msg).not.toContain(NL);
     expect(msg.length).toBeLessThan(400);

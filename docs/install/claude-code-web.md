@@ -75,11 +75,9 @@ To have a project present the moment the server boots, add the usual `env` block
 environment's variables, which are not part of the repo.
 
 > [!TIP]
-> The session's working directory is the clone, which is a git repo, so the
-> [workspace-local default](../configuration.md#workspace-local-clones) applies unchanged: LaTeX clones
-> land under `.web_latex_mcp/` and the server adds that to the host repo's `.git/info/exclude` at
-> startup, so they never show up in your diff. `compile` surfaces the PDF at
-> `.web_latex_mcp/<project>.pdf` beside the clone.
+> LaTeX clones land in the [one workspace](../configuration.md#one-workspace),
+> `~/.web-latex-mcp/projects`, outside the session's repository, so they never show up in your diff.
+> `compile` surfaces the PDF at `~/.web-latex-mcp/projects/<project>.pdf` beside the clone.
 
 ## 3. Configure the cloud environment
 

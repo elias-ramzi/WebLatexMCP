@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
-import { toPosixOut } from '../lib/paths.js';
+import { toPosix, toPosixOut } from '../lib/paths.js';
 import {
   REWRITE_MODES,
   resolveRewriteMode,
@@ -10,10 +10,18 @@ import {
   rewriteModeSourceEnum,
 } from '../lib/rewriteMode.js';
 import type { RewriteMode } from '../lib/rewriteMode.js';
-import { fallbackWorkspaceNote, workspaceNote } from '../lib/workspaceNote.js';
+import { fallbackWorkspaceNote, legacyWorkspaceNote, workspaceNote } from '../lib/workspaceNote.js';
 import { countRegisteredProjects } from '../services/projectRegistry.js';
 
 const outputSchema = {
+  legacyWorkspaceRoot: z
+    .string()
+    .optional()
+    .describe(
+      "An older version's workspace-local folder (<launch dir>/.web_latex_mcp) that still " +
+        'registers projects not in this list. Move them here with `web-latex-mcp ' +
+        'migrate-workspace <that folder>`. Absent when there is none.',
+    ),
   projects: z.array(
     z.object({
       project: z.string(),
@@ -149,9 +157,21 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
                   return `- ${p.project} [${state}${rewrite}] -> ${p.path}`;
                 })
                 .join('\n');
+        // An older version's workspace-local folder that still registers projects, listed on every
+        // call (not only when this list is empty): after the upgrade the projects there are no
+        // longer seen, and without this line the caller can only conclude they are gone.
+        const legacy = ctx.config.legacyWorkspaceRoot;
+        const legacyCount = legacy ? countRegisteredProjects(legacy) : 0;
+        const legacyText =
+          legacy && legacyCount > 0
+            ? `\n${legacyWorkspaceNote(legacy, legacyCount, ctx.config.workspaceRoot)}`
+            : '';
         return {
-          content: [{ type: 'text', text }],
-          structuredContent: { projects },
+          content: [{ type: 'text', text: text + legacyText }],
+          structuredContent: {
+            projects,
+            ...(legacy && legacyCount > 0 ? { legacyWorkspaceRoot: toPosix(legacy) } : {}),
+          },
         };
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());

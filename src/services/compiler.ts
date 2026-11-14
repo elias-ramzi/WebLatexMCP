@@ -1097,7 +1097,7 @@ export function latexmkArgs(req: CompileRequest, buildDir: string): string[] {
 /**
  * The path a compile would write its `.pdf` to (the build-dir `<jobname>.pdf`). Lets the read-only
  * `viewer` tool locate the last build without re-compiling. This is only the temp build
- * copy; a workspace-local compile also surfaces the same PDF beside the clone (`pdfSurface`).
+ * copy; `compile` also surfaces the same PDF beside the clone (`pdfSurface`).
  */
 export function buildPdfPath(projectDir: string, rootFile: string): string {
   return buildPdfPathIn(buildDir(projectDir), rootFile);

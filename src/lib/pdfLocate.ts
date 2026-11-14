@@ -77,8 +77,7 @@ export interface RootPdfRequest {
  * per root. A call that resolves `labels`/`floats` through the requested root's `.aux` and then
  * opens the surfaced copy pairs one root's page numbers with another root's pages — a label on
  * `main.tex`'s page 3 read back as the supplement's page 3, with no refusal. Reading the build
- * PDF also makes the answer independent of `workspaceIsLocal`, which it always was outside that
- * mode.
+ * PDF also makes the answer independent of `surfacePdf`.
  *
  * The surfaced copy is still a fallback, but only when nothing ties the call to one root: no
  * `rootFile` named and no `.aux` read. There it is honestly "the last compiled PDF" the tools
@@ -105,7 +104,7 @@ export async function locateRootPdf(
   await ensureBuildRoot();
   const built = buildPdfPath(dir, rootFile);
   if (await exists(built)) return built;
-  if (config.workspaceIsLocal && !request.rootNamed && !request.readsAux) {
+  if (config.surfacePdf && !request.rootNamed && !request.readsAux) {
     const surfaced = path.join(config.workspaceRoot, `${id}.pdf`);
     if (await exists(surfaced)) return surfaced;
   }

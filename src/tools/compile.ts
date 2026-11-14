@@ -301,8 +301,8 @@ const outputSchema = {
     .string()
     .optional()
     .describe(
-      'Path to the compiled PDF. For workspace-local clones this is <workspace>/.web_latex_mcp/' +
-        '<project>.pdf, surfaced beside the clone for easy opening; otherwise the temp build path. ' +
+      'Path to the compiled PDF: <workspace>/<project>.pdf, surfaced beside the clone for easy ' +
+        'opening. ' +
         "For an overlay compile it is always the variant's own PDF, in its temp build dir " +
         '(variants/<handle>/out/) — a variant is never surfaced. POSIX (`/`-separated) on every OS.',
     ),
@@ -851,12 +851,12 @@ export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<Ca
       // Last: housekeeping, not this compile — an older variant that could not be removed.
       if (evictionFailure !== undefined) hints.push(evictionFailure);
       const hint = hints.length > 0 ? hints.join('\n') : undefined;
-      // For workspace-local clones, copy the PDF beside the clone (<workspace>/<id>.pdf) so
-      // the user can open the latest build from their editor instead of hunting the temp dir.
+      // Copy the PDF beside the clone (<workspace>/<id>.pdf) so the user can open the latest
+      // build of every project from one folder instead of hunting the temp dir.
       // Never for a variant: the surfaced copy is the project's latest build, which an
       // overlay compile does not change.
       let pdfPath = outcome.pdfPath;
-      if (pdfPath && ctx.config.workspaceIsLocal && !variant) {
+      if (pdfPath && ctx.config.surfacePdf && !variant) {
         pdfPath = await surfaceCompiledPdf(ctx.config.workspaceRoot, id, pdfPath);
       }
       const pdfUrl = pdfPath ? toFileUrl(pdfPath) : undefined;
