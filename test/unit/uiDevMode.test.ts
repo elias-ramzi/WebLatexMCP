@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import type { ChildProcess } from 'node:child_process';
 import {
   CHILD_ENV,
@@ -23,7 +23,8 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
 });
 async function tmp(): Promise<string> {
-  const d = await mkdtemp(path.join(os.tmpdir(), 'wlm-dev-'));
+  // resolved: macOS's temp dir is under a link (/var -> /private/var), and repos are found resolved
+  const d = await realpath(await mkdtemp(path.join(os.tmpdir(), 'wlm-dev-')));
   dirs.push(d);
   return d;
 }

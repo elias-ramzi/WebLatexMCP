@@ -153,7 +153,13 @@ export function liveStep(repo: string, root: string, env: NodeJS.ProcessEnv): st
   } catch {
     // as given
   }
-  const rel = path.relative(repo, realRoot);
+  let realRepo = repo;
+  try {
+    realRepo = realpathSync(repo);
+  } catch {
+    // as given
+  }
+  const rel = path.relative(realRepo, realRoot);
   if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
     return (
       `The UI runs from ${repo} itself: bring it to the merged dev (\`git -C ${repo} pull ` +
