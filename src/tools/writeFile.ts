@@ -2,11 +2,19 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
+import {
+  assertCompileRequested,
+  compileAfterWriteInput,
+  compileSummarySchema,
+  summarizeCompile,
+} from '../lib/compileSummary.js';
+import { runCompile } from './compile.js';
 import { bibEditBlockedMessage, isBibFile } from '../lib/bib.js';
 import { changeDiff, changedPath } from '../lib/changeDiff.js';
 
 const inputSchema = {
   project: z.string().optional(),
+  ...compileAfterWriteInput,
   path: z.string().describe('Path relative to the project root.'),
   content: z.string().describe('Full file content to write.'),
   createDirs: z.boolean().optional().describe('Create missing parent directories (default false).'),
@@ -42,6 +50,7 @@ const outputSchema = {
   diffTruncated: z
     .boolean()
     .describe('True iff the confirmation diff above was cut to fit its budget.'),
+  compile: compileSummarySchema.optional(),
 };
 
 export function registerWriteFile(server: McpServer, ctx: AppContext): void {
@@ -62,13 +71,16 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
       createDirs,
       overrideExternalChanges,
       confirmBibEdit,
+      compile,
+      resolveComments,
     }) => {
       try {
+        assertCompileRequested(compile, resolveComments);
         if (isBibFile(relPath) && !confirmBibEdit) {
           throw new Error(bibEditBlockedMessage(relPath));
         }
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);
-        return await ctx.projectManager.runExclusive(id, async () => {
+        const written = await ctx.projectManager.runExclusive(id, async () => {
           // Inside the lock: a peer session's own mutations take this same per-project lock, so
           // checking here (rather than before runExclusive) closes the window where a peer could
           // land a symlink onto refs.bib between the check and the write.
@@ -93,10 +105,24 @@ export function registerWriteFile(server: McpServer, ctx: AppContext): void {
           const headline = `${res.created ? 'created' : 'wrote'} ${res.path} (${res.bytesWritten} bytes)`;
           // Both channels render from the same budgeted plan, never from the full patch.
           return {
-            content: [{ type: 'text', text: diff.diff ? `${headline}\n\n${diff.diff}` : headline }],
+            content: [
+              {
+                type: 'text' as const,
+                text: diff.diff ? `${headline}\n\n${diff.diff}` : headline,
+              },
+            ],
             structuredContent: { ...res, diff: diff.diff, diffTruncated: diff.truncated },
           };
         });
+        if (!compile) return written;
+        // After the write's lock is released (it is not re-entrant), as edit_file does.
+        const built = summarizeCompile(await runCompile(ctx, { project: id, resolveComments }));
+        return {
+          content: [
+            { type: 'text' as const, text: `${written.content[0]?.text ?? ''}\n\n${built.text}` },
+          ],
+          structuredContent: { ...written.structuredContent, compile: built.summary },
+        };
       } catch (err) {
         return errorResult(err, ctx.credentials.allSecrets());
       }

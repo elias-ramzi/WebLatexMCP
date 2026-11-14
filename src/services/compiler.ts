@@ -1257,10 +1257,11 @@ export class LatexmkCompiler implements LatexCompiler {
 
 /**
  * The root job's records in a build dir that a tectonic compile does not write: tectonic puts only
- * `<job>.pdf` and `<job>.log` into `--outdir` (with `--keep-logs`; checked with tectonic 0.17 — no
- * `.aux` or `.fls` without `--keep-intermediates`, no `.synctex.gz` without `--synctex`), and
- * leaves whatever else is there. The `.log` is listed because tectonic writes it only when it gets
- * that far, and an earlier latexmk run's would otherwise be read back as this run's.
+ * `<job>.pdf`, `<job>.log` and `<job>.synctex.gz` into `--outdir` (with `--keep-logs` and
+ * `--synctex`; checked with tectonic 0.17 — no `.aux` or `.fls` without `--keep-intermediates`),
+ * and leaves whatever else is there. The `.log` and `.synctex.gz` are listed because tectonic
+ * writes them only when it gets that far, and an earlier run's would otherwise be read back as
+ * this run's.
  */
 const TECTONIC_UNWRITTEN_RECORDS = ['.aux', '.fls', '.log', '.synctex.gz', '.fdb_latexmk'];
 
@@ -1328,7 +1329,19 @@ export class TectonicCompiler implements LatexCompiler {
     // Before anything runs: a failed run must not leave an earlier latexmk build's records either.
     await removeRecordsTectonicDoesNotWrite(buildDir, req.rootFile);
 
-    const args = [req.rootFile, '--outdir', buildDir, '--keep-logs', '--chatter', 'minimal'];
+    // `--synctex` writes `<job>.synctex.gz` beside the PDF, as latexmk's `-synctex=1` does, so a
+    // viewer comment on a tectonic build maps back to its source file and line. Tectonic records
+    // absolute input paths, which `normalizeInput` (src/services/synctex.ts) rebases onto the
+    // project. The stale one was removed above, so a run that fails before writing leaves none.
+    const args = [
+      req.rootFile,
+      '--outdir',
+      buildDir,
+      '--keep-logs',
+      '--synctex',
+      '--chatter',
+      'minimal',
+    ];
     // Tectonic has no restricted mode, so `restrictedShellEscape` alone does not widen to full
     // shell escape here; only an explicit `shellEscape` enables system calls. Without it tectonic
     // runs none at all, so it needs no counterpart of latexmk's `-no-shell-escape`.

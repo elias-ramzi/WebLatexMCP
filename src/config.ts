@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { homeWorkspaceRoot } from './lib/otherRegistry.js';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -84,11 +85,6 @@ interface ResolvedWorkspace {
   workspaceRoot: string;
   /** True when clones live inside the agent's workspace (and are git-excluded from it). */
   workspaceIsLocal: boolean;
-}
-
-/** The shared home cache used when the launch dir isn't a suitable workspace. */
-function homeWorkspaceRoot(): string {
-  return path.join(os.homedir(), '.web-latex-mcp', 'projects');
 }
 
 function homeWorkspace(): ResolvedWorkspace {
@@ -679,7 +675,12 @@ function parseSessionId(raw: string | undefined): string {
  * against the lower-cased id. `test/unit/config.test.ts` reads each name off the real layout, so
  * a renamed entry fails there; a NEW project-level entry must be added here by hand.
  */
-const RESERVED_SESSION_IDS: readonly string[] = ['shelves', 'project.lock', 'rewrite-mode.json'];
+const RESERVED_SESSION_IDS: readonly string[] = [
+  'shelves',
+  'project.lock',
+  'rewrite-mode.json',
+  'compile-defaults.json',
+];
 
 /** Parse the default viewer target from env; undefined (the default) means the OS browser. */
 function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {

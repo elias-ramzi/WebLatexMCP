@@ -67,6 +67,15 @@ const commentShape = z.object({
         'pointing out through a symlink is not handed back as somewhere to read.',
     ),
   line: z.number().optional().describe('Source line, when synctex resolved it.'),
+  locatedBy: z
+    .enum(['synctex', 'quote'])
+    .optional()
+    .describe(
+      'How file/line were found: "synctex" maps the clicked point through the build\'s SyncTeX ' +
+        'data; "quote" means SyncTeX gave nothing and the selected text matched exactly one ' +
+        "place in the project's .tex files (whitespace, case, accents and markup ignored) — " +
+        'text evidence, so check the snippet. Absent when there is no location.',
+    ),
   snippet: z
     .string()
     .optional()
@@ -176,6 +185,7 @@ export function registerListComments(server: McpServer, ctx: AppContext): void {
               quote: c.quote,
               file: c.file,
               line: c.line,
+              locatedBy: c.file ? c.locatedBy : undefined,
               snippet,
               snippetStartLine,
               resolved: c.resolved,

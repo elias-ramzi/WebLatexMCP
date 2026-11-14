@@ -1710,6 +1710,12 @@ export class FileService {
       overrideExternalChanges?: boolean;
       strictLinks?: boolean;
       /**
+       * Called once the edited content is on disk, with the file as the call found it and as it
+       * left it — what `edit_file` diffs for its confirmation (`src/lib/editDiff.ts`). Kept out of
+       * the return value, which the tool spreads into `structuredContent`.
+       */
+      onWritten?: (before: string, after: string) => void;
+      /**
        * Consulted for every candidate match of an edit that set `excludeComments`: `true` means
        * "this match is inside a comment — skip it". Same ignorance boundary as `preserve`: this
        * method sees a predicate over integer offsets and never learns what a comment is
@@ -1777,6 +1783,7 @@ export class FileService {
       original,
       content,
     );
+    opts.onWritten?.(original, content);
     return {
       path: relPath,
       appliedEdits: edits.length,
