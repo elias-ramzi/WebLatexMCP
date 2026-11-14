@@ -24,6 +24,8 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
+- **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when
+  editing one, on the PDF and markdown pages. Shift+Enter still saves; Esc cancels an edit too.
 - **The UI's Claude knows the PDF is already open beside the chat**, so it no longer calls
   `viewer` to show it (only for a markdown document, or a separate tab the user asks for).
 

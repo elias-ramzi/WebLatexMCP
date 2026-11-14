@@ -712,6 +712,28 @@ describe('ViewerService document view', () => {
     return { nonce: m![1]!, body: m![2]! };
   }
 
+  it('saves a comment on Ctrl/⌘+Enter (and Shift+Enter), new or edited, on both pages', async () => {
+    reset();
+    for (const page of [`${base}/p/demo`, `${base}/p/demo/doc${q('review.md')}`]) {
+      const html = await (await fetch(page)).text();
+      const script = /<script[^>]*>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
+      const isSaveKey = new Function(
+        `${/function isSaveKey\(e\) \{[\s\S]*?\n\}/.exec(script)?.[0]}; return isSaveKey;`,
+      )() as (e: Record<string, unknown>) => boolean;
+      expect(isSaveKey({ key: 'Enter', ctrlKey: true })).toBe(true);
+      expect(isSaveKey({ key: 'Enter', metaKey: true })).toBe(true);
+      expect(isSaveKey({ key: 'Enter', shiftKey: true })).toBe(true);
+      expect(isSaveKey({ key: 'Enter' })).toBeFalsy();
+      expect(isSaveKey({ key: 'Enter', ctrlKey: true, isComposing: true })).toBeFalsy();
+      // the new-comment box and the edit box both use it
+      expect(script).toContain(
+        "if (isSaveKey(e)) { e.preventDefault(); document.getElementById('popsave').click(); }",
+      );
+      expect(script).toContain('if (isSaveKey(e)) { e.preventDefault(); save.click(); }');
+      expect(html).toContain('Ctrl+⏎ or ⇧⏎ to save');
+    }
+  });
+
   it('serves the document page with a nonce CSP whose nonce is the script one', async () => {
     reset();
     const r = await fetch(`${base}/p/demo/doc${q('review.md')}`);

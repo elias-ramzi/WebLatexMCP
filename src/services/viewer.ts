@@ -348,7 +348,7 @@ ${COMMENT_CSS}
 <button class="wlm-fab" id="fab">💬 Comment</button>
 <div class="wlm-pop" id="pop">
   <div class="q" id="popq"></div>
-  <textarea id="popnote" placeholder="Describe the change you want… (⇧⏎ to save, Esc to cancel)"></textarea>
+  <textarea id="popnote" placeholder="Describe the change you want… (Ctrl+⏎ or ⇧⏎ to save, Esc to cancel)"></textarea>
   <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
 </div>
 <div class="wlm-panel" id="panel">
@@ -562,10 +562,12 @@ fab.addEventListener('click', () => {
 });
 
 document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
-// Shift+Enter saves without reaching for the mouse; Escape cancels. Plain Enter still adds a
-// newline in the note.
+/** Ctrl+Enter (⌘+Enter on a Mac) or Shift+Enter: save the note. Plain Enter is a newline. */
+function isSaveKey(e) {
+  return e.key === 'Enter' && !e.isComposing && (e.ctrlKey || e.metaKey || e.shiftKey);
+}
 popnote.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); document.getElementById('popsave').click(); }
+  if (isSaveKey(e)) { e.preventDefault(); document.getElementById('popsave').click(); }
   else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
 });
 document.getElementById('popsave').onclick = async () => {
@@ -793,6 +795,11 @@ function startEdit(item, c) {
   note.replaceWith(box);
   ta.focus();
   const done = () => { editingId = null; refreshComments(); };
+  // As in the new-comment box: Ctrl/⌘+Enter (or Shift+Enter) saves, Escape cancels.
+  ta.addEventListener('keydown', (e) => {
+    if (isSaveKey(e)) { e.preventDefault(); save.click(); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); }
+  });
   cancel.onclick = done;
   save.onclick = async () => {
     const text = ta.value.trim();
@@ -928,7 +935,7 @@ ${COMMENT_CSS}
 <button class="wlm-fab" id="fab">💬 Comment</button>
 <div class="wlm-pop" id="pop">
   <div class="q" id="popq"></div>
-  <textarea id="popnote" placeholder="Describe the change you want… (⇧⏎ to save, Esc to cancel)"></textarea>
+  <textarea id="popnote" placeholder="Describe the change you want… (Ctrl+⏎ or ⇧⏎ to save, Esc to cancel)"></textarea>
   <div class="row"><button id="popcancel">Cancel</button><button id="popsave">Save</button></div>
 </div>
 <div class="wlm-panel" id="panel">
@@ -1063,8 +1070,12 @@ fab.addEventListener('click', () => {
 });
 
 document.getElementById('popcancel').onclick = () => { pop.style.display = 'none'; pending = null; };
+/** Ctrl+Enter (⌘+Enter on a Mac) or Shift+Enter: save the note. Plain Enter is a newline. */
+function isSaveKey(e) {
+  return e.key === 'Enter' && !e.isComposing && (e.ctrlKey || e.metaKey || e.shiftKey);
+}
 popnote.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); document.getElementById('popsave').click(); }
+  if (isSaveKey(e)) { e.preventDefault(); document.getElementById('popsave').click(); }
   else if (e.key === 'Escape') { e.preventDefault(); document.getElementById('popcancel').click(); }
 });
 document.getElementById('popsave').onclick = async () => {
@@ -1322,6 +1333,11 @@ function startEdit(item, c) {
   note.replaceWith(box);
   ta.focus();
   const done = () => { editingId = null; refreshComments(); };
+  // As in the new-comment box: Ctrl/⌘+Enter (or Shift+Enter) saves, Escape cancels.
+  ta.addEventListener('keydown', (e) => {
+    if (isSaveKey(e)) { e.preventDefault(); save.click(); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); }
+  });
   cancel.onclick = done;
   save.onclick = async () => {
     const text = ta.value.trim();
