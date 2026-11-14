@@ -13,10 +13,11 @@ import { samePath } from './paths.js';
 
 /**
  * Whether the `viewer` tool should launch the OS browser. In VSCode mode we never do — the URL is
- * meant to be opened as a Simple Browser tab inside the editor instead.
+ * meant to be opened as a Simple Browser tab inside the editor instead — nor in embedded mode, where
+ * the host already shows the viewer in a panel of its own (a browser tab would be a second copy).
  */
 export function shouldOpenExternally(target: ViewerTarget, open: boolean | undefined): boolean {
-  if (target === 'vscode') return false;
+  if (target === 'vscode' || target === 'embedded') return false;
   return open ?? true;
 }
 
@@ -224,6 +225,13 @@ export function compileViewerHint(
 
 /** The human-facing hint the `viewer` tool returns, tailored to where the viewer opens. */
 export function viewerHint(url: string, target: ViewerTarget, opened: boolean): string {
+  if (target === 'embedded') {
+    return (
+      `PDF viewer: ${url}\n` +
+      "Shown in your client's own viewer panel (no browser was opened) — it refreshes " +
+      'automatically each time you compile.'
+    );
+  }
   if (target === 'vscode') {
     return (
       `PDF viewer: ${url}\n` +

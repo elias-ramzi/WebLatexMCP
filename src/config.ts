@@ -686,9 +686,10 @@ const RESERVED_SESSION_IDS: readonly string[] = [
 function parseViewerTarget(raw: string | undefined): ViewerTarget | undefined {
   const v = raw?.trim().toLowerCase();
   if (!v) return undefined;
-  if (v === 'browser' || v === 'vscode') return v;
+  if (v === 'browser' || v === 'vscode' || v === 'embedded') return v;
   throw new Error(
-    `WEB_LATEX_MCP_VIEWER_TARGET ${quoteEnvValue(raw ?? '')} is invalid; expected "browser" or "vscode".`,
+    `WEB_LATEX_MCP_VIEWER_TARGET ${quoteEnvValue(raw ?? '')} is invalid; expected "browser", ` +
+      '"vscode" or "embedded".',
   );
 }
 

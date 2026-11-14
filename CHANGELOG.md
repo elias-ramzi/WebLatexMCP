@@ -22,6 +22,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   `defaultsApplied`.
 - **`compile` takes `resolveComments: [ids]`**, marking those comments resolved only when the build
   succeeds (`resolvedComments`).
+- **`WEB_LATEX_MCP_VIEWER_TARGET=embedded`, for a client that shows the viewer itself.** A host
+  that frames the viewer in a panel of its own (cc-servers' LaTeX tab) sets it: `viewer` then opens
+  no browser tab (which would be a second copy), its hint says the client's panel shows it, and its
+  result's `target` is `embedded`. It is the env default only; a call's `target` stays `browser` or
+  `vscode`.
 
 ### Fixed
 
