@@ -5,6 +5,7 @@ import { MigrationRefusedError, migrateWorkspace } from './services/workspaceMig
 import { importEnvProjects } from './services/envProjectImport.js';
 import { SERVE_USAGE, runServe } from './daemon/serveCommand.js';
 import { DAEMON_USAGE, runDaemonCommand } from './daemon/daemonCommand.js';
+import { readCallLog, renderCallStats, summarizeCalls } from './lib/callStats.js';
 
 /**
  * The one-shot commands `web-latex-mcp` runs instead of the MCP server. With no argument the
@@ -24,7 +25,10 @@ export const USAGE =
   "      move an older version's workspace-local folder (<repo>/.web_latex_mcp) into the\n" +
   '      workspace in use (WEB_LATEX_MCP_WORKSPACE, default ~/.web-latex-mcp/projects)\n' +
   '  npx web-latex-mcp import-env-projects [--to <workspace>]\n' +
-  '      register the projects in WEB_LATEX_MCP_PROJECTS in the workspace registry\n';
+  '      register the projects in WEB_LATEX_MCP_PROJECTS in the workspace registry\n' +
+  '  npx web-latex-mcp call-stats [--days <n>] [--json] [--to <workspace>]\n' +
+  '      summarise the tool-call log (<workspace>/.logs/tool-calls.jsonl): tokens and time\n' +
+  '      per tool, waits, repeated calls and back-to-back pairs\n';
 
 export interface CliIo {
   env: NodeJS.ProcessEnv;
@@ -81,6 +85,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
   }
   if (command === 'serve') return runServe(rest, io);
   if (command === 'daemon') return runDaemonCommand(rest, io);
+  if (command === 'call-stats') return runCallStats(rest, io);
   const parsed = parseArgs(rest);
   try {
     if (command === 'migrate-workspace' && parsed && parsed.positional.length === 1) {
@@ -131,4 +136,36 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
   }
   io.err(`Unknown command or arguments: ${argv.map((a) => quoteId(a)).join(' ')}\n\n${USAGE}`);
   return 2;
+}
+
+/** `call-stats [--days <n>] [--json] [--to <workspace>]`. */
+async function runCallStats(args: string[], io: CliIo): Promise<number> {
+  let days: number | undefined;
+  let json = false;
+  let to: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const value = args[i + 1];
+    if (arg === '--json') json = true;
+    else if (arg === '--days' && value !== undefined && /^[0-9]+(\.[0-9]+)?$/.test(value)) {
+      days = Number(value);
+      i++;
+    } else if (arg === '--to' && value !== undefined) {
+      to = value;
+      i++;
+    } else {
+      io.err(`Unknown call-stats argument: ${quoteId(String(arg))}\n\n${USAGE}`);
+      return 2;
+    }
+  }
+  const workspace = to ?? resolveWorkspace(io.env.WEB_LATEX_MCP_WORKSPACE, io.cwd);
+  const since = days === undefined ? 0 : Date.now() - days * 86_400_000;
+  try {
+    const stats = summarizeCalls(await readCallLog(workspace, since));
+    io.out(json ? `${JSON.stringify(stats, null, 2)}\n` : renderCallStats(stats));
+    return 0;
+  } catch (err) {
+    io.err(`web-latex-mcp: ${(err as Error).message}\n`);
+    return 1;
+  }
 }

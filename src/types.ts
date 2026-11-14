@@ -197,6 +197,12 @@ export interface ServerConfig {
    * `src/lib/workGate.ts`); the rest queue. Omit for `DEFAULT_MAX_PARALLEL_BUILDS`.
    */
   maxParallelBuilds?: number;
+  /**
+   * Whether tool calls are logged to `<workspace>/.logs/tool-calls.jsonl`
+   * (`WEB_LATEX_MCP_CALL_LOG`, `src/lib/callLog.ts`). `loadConfig` sets it — `true` unless the
+   * variable says off; a config built by hand (tests) leaves it unset, which is off.
+   */
+  callLog?: boolean;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
   /**

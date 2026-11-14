@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { parseCallLog } from './lib/callLog.js';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -581,6 +582,13 @@ export function loadConfig(
   );
   const viewerPort = parseViewerPort(env.WEB_LATEX_MCP_VIEWER_PORT);
   const maxParallelBuilds = parseMaxParallelBuilds(env.WEB_LATEX_MCP_MAX_PARALLEL_BUILDS);
+  const callLog = parseCallLog(env.WEB_LATEX_MCP_CALL_LOG);
+  if (callLog.invalid !== undefined) {
+    console.error(
+      `[web-latex-mcp] WEB_LATEX_MCP_CALL_LOG ${quoteEnvValue(callLog.invalid)} is not on/off; ` +
+        'keeping the tool-call log on.',
+    );
+  }
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
@@ -618,6 +626,7 @@ export function loadConfig(
     compilerExplicit,
     viewerPort,
     maxParallelBuilds,
+    callLog: callLog.enabled,
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,

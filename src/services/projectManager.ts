@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { noteLockWait } from '../lib/callLog.js';
 import { access } from 'node:fs/promises';
 import { ProjectLocks } from '../lib/projectLocks.js';
 import { withFileLock } from '../lib/fileLock.js';
@@ -246,6 +247,7 @@ export class ProjectManager {
           projectLockPath(this.workspaceRoot, id),
           (fileLock) => {
             const waitedMs = Date.now() - t0;
+            noteLockWait(waitedMs);
             // The file lock saw no contention of its own (the common case: nobody else is touching
             // this clone), but the mutex wait was real — so the holder it waited on ran in this
             // same process: this session's own earlier call, or another session scope's.

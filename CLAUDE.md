@@ -163,7 +163,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   (`src/lib/projectId.ts`, `escapeInvisibleChars` → `\u{…}`); rejected env values via `quoteEnvValue`
   (`src/config.ts`, cut at 120 chars with true length) for `WEB_LATEX_MCP_COMPILER`, `_VIEWER_TARGET`,
   `_VIEWER_PORT`, `_WRITING_GUIDE_EXTRA`, `_REFERENCE_SOURCE`, `_REWRITE_MODE`, `_CONTACT_EMAIL`,
-  `_INSTALL_KIND`; the session recorder's stderr paths likewise. Never a bare template literal.
+  `_INSTALL_KIND`, `_CALL_LOG`; the session recorder's stderr paths likewise. Never a bare template literal.
 - **Tool return shape.** `structuredContent` must be a fresh object literal (`{ ...result }`). Every
   catch uses `errorResult(err, ctx.credentials.allSecrets())` (`src/lib/errors.ts`).
 - **Every key in `structuredContent` must be declared in `outputSchema`.** The server strips/ignores
@@ -728,6 +728,16 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   component, **never as a path** (no links, no `..`; `lstat`/`realpath` at read), bounded (256 count,
   depth 8, bytes); case-mismatched names unread (`caseMismatch`); unread inputs named (`unreadInputs`).
   For exact lookups: `hyperref` (a tree for a renumbered document, link targets otherwise) or `pages:`.
+
+### Tool-call log
+
+- **`createServer` wraps `registerTool` once to log every call** (`installCallLog`,
+  `src/lib/callLog.ts`) into `<workspace>/.logs/tool-calls.jsonl` — only when `loadConfig` set
+  `callLog: true` (a hand-built test config logs nothing). **Never log argument or result content**:
+  `argShape` keeps booleans, numbers, lengths, and only `ENUM_ARGS` string values. Waits and heavy
+  steps reach the record through `AsyncLocalStorage`: `noteLockWait` (`runExclusive`), the gate
+  wait and `compile`/`pdf` phases (`gatedWork.ts`), `git-remote` (`runRemoteGit`). A new slow step
+  gets `timedPhase`. Logging never fails or delays a call. `call-stats` is `src/lib/callStats.ts`.
 
 ### Payload budgets
 

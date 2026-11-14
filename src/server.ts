@@ -44,6 +44,7 @@ import { registerSkillPrompts } from './prompts/skills.js';
 import { buildInstructions } from './lib/writingGuide.js';
 import { getServerVersion } from './lib/version.js';
 import { installToolCallProbe } from './lib/sessionProbe.js';
+import { callLogSink, installCallLog } from './lib/callLog.js';
 import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
 
@@ -84,6 +85,15 @@ export function createServer(
 
   // Before the registrations below: the wrapper only covers tools registered after it.
   if (probe) installToolCallProbe(server, probe);
+  // Likewise before the registrations: one line per tool call (src/lib/callLog.ts).
+  if (ctx.config?.callLog === true) {
+    installCallLog(server, {
+      sink: callLogSink(ctx.config.workspaceRoot),
+      session: ctx.config.sessionId,
+      mode: ctx.config.serverMode ?? 'stdio',
+      defaultProject: () => ctx.config.defaultProject,
+    });
+  }
 
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);

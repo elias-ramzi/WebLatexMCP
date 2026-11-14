@@ -11,6 +11,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **A local tool-call log, and `web-latex-mcp call-stats` to read it.** Each tool call adds one
+  line to `<workspace>/.logs/tool-calls.jsonl`: tool, session, project, duration, result size and a
+  rough token count, and the time spent waiting for the project lock or the compile queue and in
+  TeX, pdf.js or the git remote. No file content, text, path or URL is logged. `call-stats` lists
+  tokens and latency per tool, the slowest calls, runs of one tool and back-to-back pairs (where a
+  batched or combined tool would save calls). `WEB_LATEX_MCP_CALL_LOG=off` turns it off.
 - **`edit_file` and `write_file` can compile in the same call.** `compile: true` runs the same build
   a separate `compile` call would, after the write, and returns a short report under `compile`
   (success, backend, counts, the first 5 errors by location); `resolveComments: [ids]` closes those
