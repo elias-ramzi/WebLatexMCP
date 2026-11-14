@@ -6,6 +6,7 @@ import { importEnvProjects } from './services/envProjectImport.js';
 import { SERVE_USAGE, runServe } from './daemon/serveCommand.js';
 import { DAEMON_USAGE, runDaemonCommand } from './daemon/daemonCommand.js';
 import { readCallLog, renderCallStats, summarizeCalls } from './lib/callStats.js';
+import { UI_USAGE, runUi } from './ui/uiCommand.js';
 
 /**
  * The one-shot commands `web-latex-mcp` runs instead of the MCP server. With no argument the
@@ -21,6 +22,7 @@ export const USAGE =
   '      (also WEB_LATEX_MCP_STANDALONE=1)\n' +
   SERVE_USAGE +
   DAEMON_USAGE +
+  UI_USAGE +
   '  npx web-latex-mcp migrate-workspace <from> [--to <workspace>]\n' +
   "      move an older version's workspace-local folder (<repo>/.web_latex_mcp) into the\n" +
   '      workspace in use (WEB_LATEX_MCP_WORKSPACE, default ~/.web-latex-mcp/projects)\n' +
@@ -86,6 +88,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number | undefi
   if (command === 'serve') return runServe(rest, io);
   if (command === 'daemon') return runDaemonCommand(rest, io);
   if (command === 'call-stats') return runCallStats(rest, io);
+  if (command === 'ui') return runUi(rest, io);
   const parsed = parseArgs(rest);
   try {
     if (command === 'migrate-workspace' && parsed && parsed.positional.length === 1) {

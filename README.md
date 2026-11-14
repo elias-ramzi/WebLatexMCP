@@ -46,6 +46,7 @@ every change, and nothing reaches Overleaf until you say so.
 - 🧑‍⚖️ **Pre-submission peer review** — a multi-model reviewer panel, merged into one verified review ([how it works](https://claude.ai/artifact/Kg5Zuk3wvu9XfprmPgv2rR)).
 - 🧩 **Bundled Claude Code skills** — project cleanup, typo hunting, writing-guide review, citation audits, bibliography normalization.
 - 🔐 **Tokens stay in memory** — never written to `.git/config`, and scrubbed from all output.
+- 🖥️ **A web UI** — `npx web-latex-mcp ui`: your papers in groups and labels, a Claude chat beside each one's live PDF ([details](docs/ui.md)).
 - 🪶 **One server for all your sessions** — every Claude session on a workspace shares one background server, so ten sessions cost one process, and each still commits only its own lines ([details](docs/install/shared-server.md)).
 
 ## Install
@@ -103,7 +104,7 @@ and [the two ways a skill runs](docs/skills.md#two-ways-a-skill-runs).
 
 ## Documentation
 
-Everything above in depth: [Configuration](docs/configuration.md), [Tools](docs/tools.md), [Skills](docs/skills.md), [Concurrency](docs/CONCURRENCY.md), [Writing guide](docs/writing-guide.md)
+Everything above in depth: [Configuration](docs/configuration.md), [Tools](docs/tools.md), [Web UI](docs/ui.md), [Skills](docs/skills.md), [Concurrency](docs/CONCURRENCY.md), [Writing guide](docs/writing-guide.md)
 
 ## Contributing
 

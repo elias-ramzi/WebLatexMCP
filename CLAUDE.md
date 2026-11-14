@@ -739,6 +739,27 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   wait and `compile`/`pdf` phases (`gatedWork.ts`), `git-remote` (`runRemoteGit`). A new slow step
   gets `timedPhase`. Logging never fails or delays a call. `call-stats` is `src/lib/callStats.ts`.
 
+### Web UI
+
+- **`web-latex-mcp ui` (`src/ui/*`, page in `ui/`) is a separate process with its own loopback
+  listener** (`UiServer`): the page needs `?token=`, `/api/*` needs `X-WLM-Token` (constant time),
+  `browserRequestRefusal` on every request, nonce CSP, JSON bodies only (`415` otherwise). Never
+  serve it from the daemon's listener (`guardRequest` refuses any `Origin`).
+- **It reaches projects only through the daemon's tools** (`DaemonClient`: `list_projects`,
+  `register_project`, `viewer`), so their guards apply. Its MCP session ends with
+  `terminateSession()`; a plain `close()` leaves it open on the daemon.
+- **The Agent SDK is optional and never imported at load**: `loadSdkQuery` imports it through a
+  variable specifier, only when the chat is used. A paper's Claude is a full Claude Code
+  (`settingSources` user/project/local, cwd = the paper's folder). `allowedTools` lets
+  `mcp__web-latex-mcp__*` through; everything else goes to `canUseTool`, then a card in the page.
+  **The daemon token goes in the child's env (`TOKEN_VAR`), referenced as `${VAR}` in the MCP
+  header**: the SDK passes `--mcp-config` on the command line, which any local user can read.
+- **Sidebar metadata (`.ui/papers.json`, `PaperMetaStore`) stays out of `registry.json`.** Its maps
+  are null-prototype; names are judged by `cleanName` (no control or bidi characters).
+- **`ui/` keeps cc-servers' formatting and names** (prettier-ignored, `ui/**` lint rules relaxed):
+  its CSS tokens, ids and classes, and the chat item shape (`chatItems.ts`) are cc-servers', so the
+  two can merge. Port code from there rather than restyling it.
+
 ### Payload budgets
 
 Every document-controlled payload is budgeted (`src/lib/*Budget.ts`: conflict, floats, search, inline,

@@ -226,6 +226,39 @@ const BAR_CSS = `  #bar { position: absolute; top: 0; left: 0; right: 0; height:
   #bar button:hover { background: #3a3a3a; }
   #zlvl { color: #9aa; min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; cursor: default; }`;
 
+/**
+ * Framed with `?embed=1` (the WebLatexMCP UI, cc-servers' LaTeX tab), a page takes its frame's
+ * colours: the parent sends `{type: "cc-theme", vars, scheme}` (cc-servers' message to the apps it
+ * frames) once the page posts `wlm-ready`. Only the bar and the background change, and only values
+ * that look like colours are taken; a page not framed, or framed without `embed=1`, looks as before.
+ */
+// The pages sit on the frame's line colour, not its background: a white page on a white
+// background would lose its edges in a light theme.
+const EMBED_CSS = `  :root[data-embed] html, :root[data-embed] body { background: var(--wlm-line); }
+  :root[data-embed] #bar { background: var(--wlm-panel); color: var(--wlm-text);
+    box-shadow: inset 0 -1px 0 var(--wlm-line); }
+  :root[data-embed] #bar b { color: var(--wlm-text); }
+  :root[data-embed] #msg, :root[data-embed] #zlvl, :root[data-embed] #empty { color: var(--wlm-muted); }
+  :root[data-embed] #bar button { background: var(--wlm-bg); color: var(--wlm-text); border-color: var(--wlm-line); }`;
+
+/** The script half of `EMBED_CSS`, inlined in each page's own script. */
+const EMBED_JS = `
+if (new URLSearchParams(location.search).get('embed') === '1' && window.parent !== window) {
+  const COLOUR = /^(#[0-9a-fA-F]{3,8}|(rgb|rgba|hsl|hsla)\\([0-9.,%\\s]{1,60}\\))$/;
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent || !e.data || e.data.type !== 'cc-theme') return;
+    const v = e.data.vars || {};
+    const root = document.documentElement;
+    for (const k of ['bg', 'panel', 'text', 'muted', 'line', 'accent']) {
+      if (typeof v[k] === 'string' && COLOUR.test(v[k].trim())) root.style.setProperty('--wlm-' + k, v[k].trim());
+    }
+    root.dataset.embed = e.data.scheme === 'light' ? 'light' : 'dark';
+    root.style.colorScheme = root.dataset.embed;
+  });
+  window.parent.postMessage({ type: 'wlm-ready' }, '*');
+}
+`;
+
 /** Comment UI CSS (button, note popup, panel) shared by the PDF and document pages. */
 const COMMENT_CSS = `  #ctoggle.on { background: #2d4a7a; border-color: #3a5f9a; }
   .wlm-fab { position: fixed; z-index: 20; display: none; font: 12px system-ui, sans-serif;
@@ -287,6 +320,7 @@ function viewerHtml(id: string): string {
   :root { color-scheme: light dark; }
   html, body { margin: 0; height: 100%; background: #525659; }
 ${BAR_CSS}
+${EMBED_CSS}
   #viewerContainer { position: absolute; inset: 34px 0 0 0; overflow: auto; }
   #empty { position: absolute; inset: 34px 0 0 0; color: #ddd; font: 14px/1.5 system-ui, sans-serif;
     padding: 24px; display: none; }
@@ -322,6 +356,7 @@ ${COMMENT_CSS}
   <div id="panellist"></div>
 </div>
 <script type="module">
+${EMBED_JS}
 import * as pdfjsLib from '/pdfjs/build/pdf.mjs';
 import * as pdfjsViewer from '/pdfjs/web/pdf_viewer.mjs';
 globalThis.pdfjsLib = pdfjsLib;
@@ -845,6 +880,7 @@ function documentHtml(id: string, docPath: string, nonce: string): string {
 <style>
   :root { color-scheme: light dark; }
   html, body { margin: 0; height: 100%; background: #3b3e41; }
+${EMBED_CSS}
 ${BAR_CSS}
   #docpath { color: #c9d1d9; font: 12px ui-monospace, SFMono-Regular, monospace; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -900,6 +936,7 @@ ${COMMENT_CSS}
   <div id="panellist"></div>
 </div>
 <script nonce="${nonce}">
+${EMBED_JS}
 (() => {
 'use strict';
 const ID = ${jsonForScript(id)};

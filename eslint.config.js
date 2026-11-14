@@ -24,6 +24,22 @@ export default tseslint.config(
     },
   },
   {
+    // The web UI's page scripts (`web-latex-mcp ui`) run in the browser, with no build step:
+    // their globals are the DOM's, which ESLint's node-oriented setup does not know.
+    // Much of them is ported from cc-servers as is (to keep the two mergeable), in its style:
+    // `catch (e)` left unused, NUL as a placeholder in md()'s regexes.
+    files: ['ui/**/*.js'],
+    rules: {
+      'no-undef': 'off',
+      'no-control-regex': 'off',
+      'no-useless-assignment': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { caughtErrors: 'none', argsIgnorePattern: '^_' },
+      ],
+    },
+  },
+  {
     // The reference backends each used to declare their own `REQUEST_TIMEOUT_MS = 15_000`
     // while `transportReason` quoted the shared one in "timed out after 15s" — so a drift in
     // any copy made the error message lie, and nothing in the suite could see it (a test would

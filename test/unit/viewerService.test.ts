@@ -100,6 +100,23 @@ describe('ViewerService', () => {
     expect(await r.text()).toContain('demo');
   });
 
+  it('takes its frame’s colours when embedded, only from its parent and only colour values', async () => {
+    const html = await (await fetch(`${base}/p/demo`)).text();
+    expect(html).toContain(':root[data-embed] #bar');
+    const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
+    expect(script).toContain("get('embed') === '1' && window.parent !== window");
+    expect(script).toContain("e.source !== window.parent || !e.data || e.data.type !== 'cc-theme'");
+    expect(script).toContain("window.parent.postMessage({ type: 'wlm-ready' }, '*')");
+    const colour = /const COLOUR = (\/.*\/);/.exec(script)?.[1] as string;
+    const re = new Function(`return ${colour}`)() as RegExp;
+    expect(['#fff', '#1f1e1d', 'rgb(1, 2, 3)', 'hsl(10, 50%, 50%)'].every((c) => re.test(c))).toBe(
+      true,
+    );
+    expect(['url(x)', 'red;background:url(x)', 'expression(1)', ''].some((c) => re.test(c))).toBe(
+      false,
+    );
+  });
+
   it("scopes the PDF page's Ask Claude prompt to PDF comments and the ids handled", async () => {
     const html = await (await fetch(`${base}/p/demo`)).text();
     expect(html).toContain('call list_comments with pdfOnly: true');

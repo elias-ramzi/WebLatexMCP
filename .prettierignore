@@ -5,3 +5,5 @@ test/fixtures
 tmp
 .claude/plans
 .web_latex_mcp
+# the web UI keeps cc-servers' own formatting (double quotes, 120 columns): code moves between the two
+ui
