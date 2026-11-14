@@ -712,6 +712,23 @@ describe('ViewerService document view', () => {
     return { nonce: m![1]!, body: m![2]! };
   }
 
+  it('edits a comment on a click, on its note or its highlight, and deletes it from the edit box', async () => {
+    reset();
+    for (const page of [`${base}/p/demo`, `${base}/p/demo/doc${q('review.md')}`]) {
+      const html = await (await fetch(page)).text();
+      const script = /<script[^>]*>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? '';
+      // the panel's note opens the edit box
+      expect(script).toMatch(/note\.onclick = \(\) => \{ [^}]*startEdit\(item, c\); \};/);
+      // a plain click on a highlight edits its comment, and the press does not close the panel
+      expect(script).toContain('function commentAt(x, y)');
+      expect(script).toContain('if (cid) editComment(cid);');
+      expect(script).toContain('if (commentAt(e.clientX, e.clientY)) return;');
+      // the edit box has Delete, beside Cancel and Save
+      expect(script).toContain('row.append(del, cancel, save);');
+      expect(script).toMatch(/del\.onclick = async \(\) => \{[\s\S]*?\/delete'/);
+    }
+  });
+
   it('saves a comment on Ctrl/⌘+Enter (and Shift+Enter), new or edited, on both pages', async () => {
     reset();
     for (const page of [`${base}/p/demo`, `${base}/p/demo/doc${q('review.md')}`]) {

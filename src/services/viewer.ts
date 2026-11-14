@@ -294,8 +294,12 @@ const COMMENT_CSS = `  #ctoggle.on { background: #2d4a7a; border-color: #3a5f9a;
   .wlm-item .loc { color: #6ea8fe; font: 11px ui-monospace, SFMono-Regular, monospace;
     cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wlm-item .note { margin-top: 2px; cursor: pointer; white-space: pre-wrap; }
-  .wlm-acts { display: flex; gap: 4px; opacity: 0; transition: opacity .1s; flex: none; }
+  .wlm-acts { display: flex; gap: 4px; opacity: .6; transition: opacity .1s; flex: none; }
   .wlm-item:hover .wlm-acts { opacity: 1; }
+  .wlm-item .note { cursor: text; }
+  .wlm-item .note:hover { background: rgba(255, 255, 255, .05); border-radius: 3px; }
+  .wlm-edit .row .wlm-del { margin-right: auto; }
+  .wlm-edit .row .wlm-del:hover { background: #5a2020; border-color: #7a3030; color: #fff; }
   .wlm-acts button { background: #262626; color: #ccc; border: 1px solid #3a3a3a; border-radius: 4px;
     font-size: 11px; padding: 1px 6px; cursor: pointer; line-height: 16px; }
   .wlm-acts button:hover { background: #333; }
@@ -614,8 +618,39 @@ document.addEventListener('pointerdown', (e) => {
   if (editingId) return;
   const el = e.target;
   if (el && el.closest && el.closest(PANEL_KEEP)) return;
+  if (commentAt(e.clientX, e.clientY)) return;
   setPanel(false);
 });
+/** The comment whose highlight is under the point, if any. */
+function commentAt(x, y) {
+  for (const hl of document.querySelectorAll('.wlm-hl')) {
+    const r = hl.getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return hl.parentElement.dataset.cid;
+  }
+  return null;
+}
+
+/** Open comment cid for editing, in the panel (opened if it was closed). */
+function editComment(cid) {
+  if (editingId === cid) return;
+  if (editingId) { editingId = null; refreshComments(); }
+  const c = lastComments.find((x) => x.id === cid);
+  const item = panellist.querySelector('.wlm-item[data-cid="' + CSS.escape(cid) + '"]');
+  if (!c || !item) return;
+  setPanel(true);
+  item.scrollIntoView({ block: 'nearest' });
+  startEdit(item, c);
+}
+// A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
+// themselves take no pointer events, so selecting text under them works as before.
+document.addEventListener('click', (e) => {
+  if (e.button !== 0 || e.target.closest(PANEL_KEEP)) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  const cid = commentAt(e.clientX, e.clientY);
+  if (cid) editComment(cid);
+});
+
 window.addEventListener('keydown', (e) => {
   // defaultPrevented: the note popup's own Escape handled it first. editingId: an in-progress
   // note edit lives inside the panel, and closing it would move it out from under the user.
@@ -736,6 +771,7 @@ function setHot(cid, on) {
 function renderComment(c) {
   const item = document.createElement('div');
   item.className = 'wlm-item';
+  item.dataset.cid = c.id;
   // Hovering a row emphasizes its highlight so you can spot where it is on the page.
   item.onmouseenter = () => setHot(c.id, true);
   item.onmouseleave = () => setHot(c.id, false);
@@ -762,8 +798,8 @@ function renderComment(c) {
   const note = document.createElement('div');
   note.className = 'note';
   note.textContent = c.note;
-  note.title = 'Jump to page ' + c.page;
-  note.onclick = () => { pdfViewer.currentPageNumber = c.page; };
+  note.title = 'Click to edit (page ' + c.page + ')';
+  note.onclick = () => { pdfViewer.currentPageNumber = c.page; startEdit(item, c); };
 
   item.append(top, note);
 
@@ -790,10 +826,15 @@ function startEdit(item, c) {
   cancel.textContent = 'Cancel';
   const save = document.createElement('button');
   save.textContent = 'Save';
-  row.append(cancel, save);
+  const del = document.createElement('button');
+  del.className = 'wlm-del';
+  del.textContent = 'Delete';
+  del.title = 'Delete the comment (↶ Undo in the panel brings it back)';
+  row.append(del, cancel, save);
   box.append(ta, row);
   note.replaceWith(box);
   ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
   const done = () => { editingId = null; refreshComments(); };
   // As in the new-comment box: Ctrl/⌘+Enter (or Shift+Enter) saves, Escape cancels.
   ta.addEventListener('keydown', (e) => {
@@ -801,6 +842,11 @@ function startEdit(item, c) {
     else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); }
   });
   cancel.onclick = done;
+  del.onclick = async () => {
+    del.disabled = true;
+    try { await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/delete', { method: 'POST' }); } catch {}
+    done();
+  };
   save.onclick = async () => {
     const text = ta.value.trim();
     if (!text) { ta.focus(); return; }
@@ -1111,8 +1157,41 @@ document.addEventListener('pointerdown', (e) => {
   if (editingId) return;
   const el = e.target;
   if (el && el.closest && el.closest(PANEL_KEEP)) return;
+  if (commentAt(e.clientX, e.clientY)) return;
   setPanel(false);
 });
+/** The comment whose marked text is under the point, if any. */
+function commentAt(x, y) {
+  for (const [cid, m] of marks) {
+    if (!m.range) continue;
+    for (const r of m.range.getClientRects()) {
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return cid;
+    }
+  }
+  return null;
+}
+
+/** Open comment cid for editing, in the panel (opened if it was closed). */
+function editComment(cid) {
+  if (editingId === cid) return;
+  if (editingId) { editingId = null; refreshComments(); }
+  const c = lastComments.find((x) => x.id === cid);
+  const item = panellist.querySelector('.wlm-item[data-cid="' + CSS.escape(cid) + '"]');
+  if (!c || !item) return;
+  setPanel(true);
+  item.scrollIntoView({ block: 'nearest' });
+  startEdit(item, c);
+}
+// A plain click (nothing selected) on a comment's highlight edits that comment. The highlights
+// themselves take no pointer events, so selecting text under them works as before.
+document.addEventListener('click', (e) => {
+  if (e.button !== 0 || e.target.closest(PANEL_KEEP)) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  const cid = commentAt(e.clientX, e.clientY);
+  if (cid) editComment(cid);
+});
+
 window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || e.defaultPrevented || editingId) return;
   if (pop.style.display === 'block') { document.getElementById('popcancel').click(); return; }
@@ -1275,6 +1354,7 @@ async function refreshComments() {
 function renderComment(c) {
   const item = document.createElement('div');
   item.className = 'wlm-item';
+  item.dataset.cid = c.id;
   item.onmouseenter = () => setHot(c.id, true);
   item.onmouseleave = () => setHot(c.id, false);
 
@@ -1300,8 +1380,8 @@ function renderComment(c) {
   const note = document.createElement('div');
   note.className = 'note';
   note.textContent = c.note;
-  note.title = 'Jump to line ' + c.line;
-  note.onclick = () => jump(c);
+  note.title = 'Click to edit (line ' + c.line + ')';
+  note.onclick = () => { jump(c); startEdit(item, c); };
 
   item.append(top, note);
 
@@ -1328,10 +1408,15 @@ function startEdit(item, c) {
   cancel.textContent = 'Cancel';
   const save = document.createElement('button');
   save.textContent = 'Save';
-  row.append(cancel, save);
+  const del = document.createElement('button');
+  del.className = 'wlm-del';
+  del.textContent = 'Delete';
+  del.title = 'Delete the comment (↶ Undo in the panel brings it back)';
+  row.append(del, cancel, save);
   box.append(ta, row);
   note.replaceWith(box);
   ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
   const done = () => { editingId = null; refreshComments(); };
   // As in the new-comment box: Ctrl/⌘+Enter (or Shift+Enter) saves, Escape cancels.
   ta.addEventListener('keydown', (e) => {
@@ -1339,6 +1424,11 @@ function startEdit(item, c) {
     else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); }
   });
   cancel.onclick = done;
+  del.onclick = async () => {
+    del.disabled = true;
+    try { await fetch(cbase() + '/' + encodeURIComponent(c.id) + '/delete', { method: 'POST' }); } catch {}
+    done();
+  };
   save.onclick = async () => {
     const text = ta.value.trim();
     if (!text) { ta.focus(); return; }
