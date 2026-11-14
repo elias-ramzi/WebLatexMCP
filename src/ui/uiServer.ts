@@ -21,7 +21,7 @@ import { DEV_CHAT } from './devMode.js';
  * - the page runs under a nonce CSP; it may frame the viewer (a loopback page) and nothing else.
  *
  * Everything about projects goes through the daemon's own tools (`list_projects`,
- * `register_project`, `viewer`), so their guards apply here as for any client.
+ * `register_project`, `viewer`, `project_sync`, `compile`), so their guards apply here as for any client.
  */
 
 export interface UiBackend {
@@ -309,6 +309,8 @@ export class UiServer {
           return await this.papersOp(body);
         case 'POST /api/register':
           return await this.register(body);
+        case 'POST /api/sync':
+          return await this.sync(await this.requirePaper(body.paper));
         case 'GET /api/viewer': {
           const paper = await this.requirePaper(url.searchParams.get('paper'));
           if (paper === DEV_CHAT) throw new HttpError(404, 'The dev chat has no paper to show.');
@@ -403,6 +405,38 @@ export class UiServer {
       default:
         throw new HttpError(400, 'Unknown op.');
     }
+  }
+
+  /**
+   * The paper's "Pull" button: `project_sync` (ff-only, so it never merges over local work), then,
+   * when it brought new commits, a `compile`, so the PDF beside the chat shows them. The compile's
+   * failure does not make the pull fail: it is reported apart.
+   */
+  private async sync(paper: string): Promise<unknown> {
+    if (paper === DEV_CHAT) throw new HttpError(404, 'The dev chat has no paper to pull.');
+    const r = await this.opts.backend.call('project_sync', { project: paper });
+    this.projectsCache = undefined;
+    if (r.isError) throw new HttpError(400, r.text || 'project_sync failed.');
+    const action = typeof r.structured?.action === 'string' ? r.structured.action : null;
+    let compiled: boolean | null = null;
+    let compileText: string | undefined;
+    if (action === 'pulled' || action === 'cloned') {
+      const c = await this.opts.backend
+        .call('compile', { project: paper })
+        .catch((err: unknown) => ({
+          structured: undefined,
+          text: err instanceof Error ? err.message : String(err),
+          isError: true,
+        }));
+      compiled = !c.isError && c.structured?.success === true;
+      if (!compiled) compileText = c.text.split('\n')[0]?.slice(0, 300) || 'The compile failed.';
+    }
+    return {
+      action,
+      text: r.text,
+      compiled,
+      ...(compileText ? { compileText } : {}),
+    };
   }
 
   private async register(body: Record<string, unknown>): Promise<unknown> {

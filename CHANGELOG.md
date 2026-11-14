@@ -33,6 +33,9 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
   See [docs/ui.md](docs/ui.md#dev-mode-improve-the-ui-from-the-ui).
 
+- **A Pull button in the web UI.** A git paper's header has **⤓ Pull**: it fetches the latest
+  version from the remote (Overleaf, GitHub…) through `project_sync`, fast-forward only, then
+  recompiles so the PDF shows it. See [docs/ui.md](docs/ui.md#the-side-bar).
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
 - **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when

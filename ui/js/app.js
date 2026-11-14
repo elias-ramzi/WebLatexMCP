@@ -41,14 +41,41 @@ function current() {
   return S.state && S.state.papers.find((/** @type {any} */ p) => p.id === S.paper);
 }
 
+/** The header's Pull: the paper's remote (Overleaf…) into its clone, then a compile for the PDF. */
+async function pullPaper() {
+  const p = current(), btn = $("#c-pull");
+  if (!p || btn.disabled) return;
+  btn.disabled = true;
+  const label = btn.lastChild.textContent;
+  btn.lastChild.textContent = " Pulling…";
+  try {
+    const r = await api("POST", "/api/sync", { paper: p.id });
+    if (r.action === "up-to-date") flash(paperTitle(p) + " is up to date.", 3000);
+    else if (r.action === "pulled" || r.action === "cloned") {
+      const what = r.action === "cloned" ? "Cloned " + paperTitle(p) : "Pulled the latest version";
+      flash(what + (r.compiled ? "; the PDF is recompiled." : r.compiled === false
+        ? ". The compile failed: " + (r.compileText || "ask Claude to look.") : "."), r.compiled === false ? 9000 : 4000);
+    } else flash(r.text || r.action, 12000);
+    await refresh();
+  } catch (e) {
+    flash("Pull failed: " + /** @type {Error} */ (e).message, 12000);
+  } finally {
+    btn.disabled = false;
+    btn.lastChild.textContent = label;
+  }
+}
+
 function updateHead() {
   if (S.paper === DEV) {
     $("#c-title").textContent = "Improve WebLatexMCP";
     $("#c-meta").textContent = (S.state && S.state.dev && S.state.dev.repo) || "";
     document.title = "Improve WebLatexMCP";
+    $("#c-pull").hidden = true;
     return;
   }
   const p = current();
+  // a local folder has no remote to pull from
+  $("#c-pull").hidden = !p || p.mode === "local";
   $("#c-title").textContent = p ? paperTitle(p) : "WebLatexMCP";
   $("#c-meta").textContent = p ? p.id : "";
   document.title = p ? paperTitle(p) + " · WebLatexMCP" : "WebLatexMCP";
@@ -111,6 +138,7 @@ $("#c-more").onclick = (/** @type {MouseEvent} */ e) => {
   const p = current();
   if (p) paperMenu(p, /** @type {Element} */ (e.currentTarget), { onReset: resetChat });
 };
+$("#c-pull").onclick = pullPaper;
 document.addEventListener("keydown", (e) => {
   if (e.altKey && (e.key === "s" || e.key === "S")) { e.preventDefault(); toggleSide(); }
 });

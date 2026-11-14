@@ -77,6 +77,12 @@ it. **⌄ → New conversation** starts afresh; the old conversation is set asid
   its id; the id itself does not change.
 - A paper's dot shows its Claude's state: working, waiting for you, idle, or off.
 
+**⤓ Pull**, in a git paper's header, fetches the latest version from its remote (Overleaf,
+GitHub…) through `project_sync`, then recompiles so the PDF shows it. The pull is fast-forward only:
+when the clone has commits the remote lacks, or local edits the pull would overwrite, nothing is
+merged and the page says why (ask Claude to commit, push, or sort it out). A local folder has no
+Pull button.
+
 Settings (the ⚙ at the bottom): the theme (the same nine as cc-servers), the font and the text size.
 They are kept in the browser. **Alt+S** hides the side bar, and **Alt+A** hides the PDF. **⇄** moves
 the PDF to the other side, and dragging a bar's edge resizes it.
