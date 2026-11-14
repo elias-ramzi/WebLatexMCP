@@ -81,6 +81,34 @@ Settings (the ⚙ at the bottom): the theme (the same nine as cc-servers), the f
 They are kept in the browser. **Alt+S** hides the side bar, and **Alt+A** hides the PDF. **⇄** moves
 the PDF to the other side, and dragging a bar's edge resizes it.
 
+## Dev mode: improve the UI from the UI
+
+`web-latex-mcp ui --dev [--repo <checkout>]` is for working on WebLatexMCP itself, as cc-servers'
+dev mode is for cc-servers. It adds two things:
+
+- **The UI restarts on each new build.** `ui --dev` runs the UI under a small supervisor. The UI
+  watches the build it was started from: the CLI's path as started, links unresolved, so the dev
+  build's `current` link moving counts, and so do `ui/` and `dist/ui/` changing in a checkout you
+  rebuild. A new build is started on the same port with the same token, and open pages reload
+  themselves.
+  - **It waits for the chats.** A restart ends every Claude, so it happens only once none is in a
+    turn. Meanwhile the `dev` chip in the header says a new build waits.
+  - **A failed start is rolled back.** A build that exits before it listens is not kept: the build
+    that ran before starts again, and the `dev` chip says why.
+- **"Improve WebLatexMCP"**, at the bottom of the side bar, opens a small chat at the bottom left.
+  - **Where it works:** a Claude run in your WebLatexMCP checkout, in Auto mode, told how to work on
+    it. The checkout is `--repo`, else `$WEB_LATEX_MCP_DEV_REPO`, else the checkout the UI runs
+    from, else the one it was started in.
+  - **For each request:** Claude makes the change in its own worktree, branched off `origin/dev`,
+    runs the gate, opens a pull request into `dev` and merges it once its checks pass. Then it makes
+    it live: `web-latex-mcp-dev-update` when that script is on your `PATH`, or `npm run build` when
+    the UI runs from the checkout itself. The UI restarts when Claude's turn ends.
+  - **Answering it:** a permission request or a question shows as a link to the full view (`#dev`),
+    the main chat showing this conversation.
+
+The supervisor itself does not reload: after a change to `src/ui/devMode.ts`'s `superviseUi`, stop
+the UI and start it again.
+
 ## Where things are kept
 
 Everything stays in `<workspace>/.ui/`, owner-only (`0700` folders, `0600` files):
@@ -90,7 +118,7 @@ Everything stays in `<workspace>/.ui/`, owner-only (`0700` folders, `0600` files
 | `papers.json`        | Groups, labels, titles and the order of the side bar. Not in `registry.json`, so a label never changes a registration. |
 | `chats/<hash>.jsonl` | Each paper's conversation, as the page shows it.                                                                       |
 | `chats/<hash>.json`  | The Claude Code session it resumes, and the model, effort and mode chosen.                                             |
-| `ui.json`            | The running UI's port and token. Removed when it stops.                                                                |
+| `ui.json`            | The running UI's port and token (in dev mode, the supervisor's pid). Removed when it stops.                            |
 
 Claude Code also keeps its own transcript of each session, under `~/.claude/projects/`.
 

@@ -6,21 +6,34 @@ import { side, renderSide, toggleSide, openAdd, newGroup, paperMenu, renamePaper
 import { chat, openChat, wireChat, resetChat } from "./chat.js";
 import { showViewer, wireViewer } from "./viewer.js";
 import { wireSettings } from "./settings.js";
+import { DEV, openDev, restoreDev, updateDev, wireDev } from "./dev.js";
 
 if (document.documentElement.classList.contains("side-off-early")) document.body.classList.add("side-off");
 fillIcons();
 
+/** @type {string | null} */
+let rev0 = null;
 async function refresh() {
+  const wasDev = !!(S.state && S.state.dev);
   try {
     S.state = await api("GET", "/api/state");
   } catch (e) {
-    flash("The UI server does not answer: " + /** @type {Error} */ (e).message, 6000);
+    // dev mode: the UI is starting again on a new build (it keeps its port and token)
+    flash(wasDev ? "The UI is restarting on a new build…"
+      : "The UI server does not answer: " + /** @type {Error} */ (e).message, 6000);
     return;
   }
+  // a new build answers (dev mode restarted the UI): load the page that goes with it
+  if (S.state.rev) {
+    if (rev0 === null) rev0 = S.state.rev;
+    else if (S.state.rev !== rev0) { location.reload(); return; }
+  }
   $("#s-version").textContent = "web-latex-mcp " + S.state.version;
+  updateDev(S.state);
+  if (!wasDev && S.state.dev) restoreDev();
   renderSide();
   updateHead();
-  if (S.paper && !S.state.papers.some((/** @type {any} */ p) => p.id === S.paper)) route();
+  if (S.paper && S.paper !== DEV && !S.state.papers.some((/** @type {any} */ p) => p.id === S.paper)) route();
 }
 side.refresh = refresh;
 
@@ -29,13 +42,36 @@ function current() {
 }
 
 function updateHead() {
+  if (S.paper === DEV) {
+    $("#c-title").textContent = "Improve WebLatexMCP";
+    $("#c-meta").textContent = (S.state && S.state.dev && S.state.dev.repo) || "";
+    document.title = "Improve WebLatexMCP";
+    return;
+  }
   const p = current();
   $("#c-title").textContent = p ? paperTitle(p) : "WebLatexMCP";
   $("#c-meta").textContent = p ? p.id : "";
   document.title = p ? paperTitle(p) + " · WebLatexMCP" : "WebLatexMCP";
 }
 
+/** The dev chat in the main view (#dev): its permission cards and questions are answered here. */
+function routeDev() {
+  if (S.paper === DEV) return;
+  S.paper = DEV;
+  document.body.classList.remove("homing");
+  side.key = "";
+  renderSide();
+  updateHead();
+  openDev(false);
+  openChat(DEV);
+  showViewer(null);
+  $("#tx-what").textContent = "";
+  $("#tx-none").hidden = false;
+  $("#tx-none").textContent = "The dev chat has no PDF: pick a paper at the left to see one.";
+}
+
 function route() {
+  if (location.hash === "#dev" && S.state && S.state.dev && S.state.dev.chat) { routeDev(); return; }
   const m = location.hash.match(/^#paper\/(.+)$/);
   let id = m ? decodeURIComponent(m[1]) : sideStore("last");
   if (S.state && id && !S.state.papers.some((/** @type {any} */ p) => p.id === id)) id = null;
@@ -62,6 +98,7 @@ function route() {
 wireSettings();
 wireViewer();
 wireChat();
+wireDev();
 $("#s-fold").onclick = toggleSide;
 $("#c-side-btn").onclick = toggleSide;
 $("#s-backdrop").onclick = () => document.body.classList.remove("side-open");

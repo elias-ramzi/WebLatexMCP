@@ -756,6 +756,13 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   header**: the SDK passes `--mcp-config` on the command line, which any local user can read.
 - **Sidebar metadata (`.ui/papers.json`, `PaperMetaStore`) stays out of `registry.json`.** Its maps
   are null-prototype; names are judged by `cleanName` (no control or bidi characters).
+- **Dev mode (`ui --dev`, `src/ui/devMode.ts`)**: `superviseUi` runs the UI as a child and restarts it
+  on exit status `RELOAD_EXIT`, with the same port and token (the token travels in the child's env
+  and is deleted from `process.env` before any Claude starts). The child's `DevReloader` exits only
+  when `ChatManager.active()` is false: a restart ends every Claude. A child that never reported
+  `ready` is replaced by the last good build, and `ERROR_ENV` goes to that fallback only. The dev
+  chat is the chat key `DEV_CHAT` (`.dev`: no project id starts with a dot), run in the checkout
+  with `devSystemPrompt`, and it has no default project.
 - **`ui/` keeps cc-servers' formatting and names** (prettier-ignored, `ui/**` lint rules relaxed):
   its CSS tokens, ids and classes, and the chat item shape (`chatItems.ts`) are cc-servers', so the
   two can merge. Port code from there rather than restyling it.

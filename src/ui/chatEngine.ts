@@ -20,6 +20,7 @@ import {
 } from './chatItems.js';
 import { chatKey, type ChatStore } from './chatStore.js';
 import { uiDir } from './uiFiles.js';
+import { DEV_CHAT } from './devMode.js';
 
 /**
  * The UI's conversations: one Claude per paper, run through the Agent SDK
@@ -259,6 +260,11 @@ export interface ChatManagerOptions {
   endpoint: () => Promise<DaemonEndpoint>;
   /** The paper's folder (its clone, or a local project's directory), where Claude works. */
   paperDir?: (paper: string) => Promise<string | undefined>;
+  /**
+   * Dev mode (`ui --dev`): the dev chat (`DEV_CHAT`) runs in this WebLatexMCP checkout, with these
+   * instructions, in Auto mode unless the user picks another.
+   */
+  dev?: { repo: string; prompt: string };
   /** Test seam: the SDK's `query`, or why there is none. */
   loadQuery?: () => Promise<{ query?: StartQuery; error?: string }>;
   log?: (line: string) => void;
@@ -344,7 +350,10 @@ class PaperChat {
 
   private async start(query: StartQuery, endpoint: DaemonEndpoint): Promise<void> {
     let meta = await this.mgr.store.meta(this.paper);
-    let cwd = await this.mgr.paperDir(this.paper);
+    const dev = this.paper === DEV_CHAT ? this.mgr.dev : undefined;
+    if (this.paper === DEV_CHAT && !dev) throw new ChatError('The dev chat runs in dev mode only.');
+    let cwd = dev ? dev.repo : await this.mgr.paperDir(this.paper);
+    if (dev && !meta.mode) meta = await this.mgr.store.setMeta(this.paper, { mode: 'auto' });
     if (!cwd) {
       cwd = path.join(uiDir(this.mgr.workspaceRoot), 'claude');
       await mkdir(cwd, { recursive: true, mode: 0o700 });
@@ -380,7 +389,7 @@ class PaperChat {
             // command line, which any local user can read; the environment is the owner's alone.
             authorization: `Bearer \${${TOKEN_VAR}}`,
             [HEADER_SESSION]: uiSessionId(this.paper),
-            [HEADER_DEFAULT_PROJECT]: this.paper,
+            ...(dev ? {} : { [HEADER_DEFAULT_PROJECT]: this.paper }),
           },
           alwaysLoad: true,
         },
@@ -393,7 +402,11 @@ class PaperChat {
       ...(meta.sessionId ? { resume: meta.sessionId } : {}),
       ...(meta.model ? { model: meta.model } : {}),
       ...(meta.effort ? { effort: meta.effort } : {}),
-      systemPrompt: { type: 'preset', preset: 'claude_code', append: uiSystemPrompt(this.paper) },
+      systemPrompt: {
+        type: 'preset',
+        preset: 'claude_code',
+        append: dev ? dev.prompt : uiSystemPrompt(this.paper),
+      },
       env: {
         ...process.env,
         [TOKEN_VAR]: endpoint.token,
@@ -727,19 +740,34 @@ export class ChatManager {
     return this.chats.get(paper)?.status ?? 'off';
   }
 
+  get dev(): { repo: string; prompt: string } | undefined {
+    return this.opts.dev;
+  }
+
+  /** Whether any Claude is in a turn (starting, working, or waiting on the user). */
+  active(): boolean {
+    for (const c of this.chats.values()) {
+      if (c.status === 'starting' || c.status === 'working' || c.status === 'waiting') return true;
+    }
+    return false;
+  }
+
   async snapshot(paper: string): Promise<ChatSnapshot> {
     const meta = await this.store.meta(paper);
     const model = meta.model ?? this.models.get(paper);
     return this.chat(paper).snapshot({
       ...(model ? { model } : {}),
       ...(meta.effort ? { effort: meta.effort } : {}),
-      ...(meta.mode ? { mode: meta.mode } : {}),
+      ...(meta.mode ? { mode: meta.mode } : paper === DEV_CHAT ? { mode: 'auto' } : {}),
     });
   }
 
   async send(paper: string, text: string): Promise<void> {
     if (!text.trim()) throw new ChatError('The message is empty.');
     if (text.length > 100_000) throw new ChatError('The message is longer than 100000 characters.');
+    if (paper === DEV_CHAT && !this.opts.dev) {
+      throw new ChatError('The dev chat runs in dev mode only.');
+    }
     await this.chat(paper).send(text);
   }
 

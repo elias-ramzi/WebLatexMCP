@@ -37,6 +37,9 @@ try {
     <div id="s-list"></div>
     <div class="rs" id="side-rs" title="Drag to resize (double-click: back to the default)"></div>
     <div class="s-foot">
+      <button type="button" id="dev-btn" hidden
+        title="Ask Claude to change WebLatexMCP: a PR into dev, merged when green; the page reloads"
+        ><span data-icon="wrench"></span><span>Improve WebLatexMCP</span><span class="dot"></span></button>
       <span class="small" id="s-version" style="flex: 1"></span>
       <button type="button" id="set-btn" title="Settings" aria-label="Settings"><span data-icon="gear"></span></button>
     </div>
@@ -53,6 +56,7 @@ try {
           aria-label="Paper menu"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg></button></div>
         <div id="c-meta"></div></div>
+      <span id="dev" class="chip" hidden>dev</span>
       <span id="c-badge" class="badge idle"></span>
       <button type="button" id="c-arts-btn" class="ghost" title="Show or hide the PDF (Alt+A)">PDF</button>
     </div>
@@ -137,6 +141,19 @@ try {
   <div class="dlg-buttons"><button type="button" id="add-cancel">Cancel</button>
     <button type="button" class="primary" id="add-go">Add</button></div>
 </dialog>
+<div id="dev-chat" class="mini" hidden role="dialog" aria-label="WebLatexMCP dev chat">
+  <div class="d-head"><b>Improve WebLatexMCP</b><span class="sub" id="dev-sub"></span>
+    <button type="button" id="dev-full" title="Open this conversation in the full view">Full view</button>
+    <button type="button" id="dev-reset" title="Start over in a new conversation (this one is kept on disk)"
+      >New</button>
+    <button type="button" id="dev-close" title="Close (Esc)" aria-label="Close">✕</button></div>
+  <div id="dev-log" class="m-log"></div>
+  <div id="dev-work" class="m-work" hidden></div>
+  <form id="dev-form" class="m-form"><textarea id="dev-input" rows="1" spellcheck="true"
+      placeholder="What should change in WebLatexMCP?"></textarea>
+    <button type="submit" id="dev-send" class="primary" title="Send (Enter)" aria-label="Send"
+      ><span data-icon="enter"></span></button></form>
+</div>
 <div id="flash" hidden></div>
 <script type="module" src="/static/js/app.js"></script>
 </body>
