@@ -797,8 +797,15 @@ export class ProjectManager {
     return { id: cfg.id, dir };
   }
 
-  /** All known projects with their current status. */
+  /**
+   * All known projects with their current status — including those a peer registered since this
+   * session started: the registry is re-read first (adding only, as for an unknown id). On the
+   * shared server every session is built from the daemon's startup snapshot, so without this a
+   * session opened after a peer's `register_project` could use the project by name but never saw
+   * it listed.
+   */
   async listProjects(): Promise<ProjectStatus[]> {
+    this.reloadFromRegistry();
     return Promise.all(
       [...this.projects.values()].map(async (p) => {
         // Redacted, not dropped: an env-configured or legacy registry URL may still embed a token

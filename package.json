@@ -19,7 +19,8 @@
     "dist",
     "docs/writing-guide.md",
     "docs/CONCURRENCY.md",
-    ".claude/skills"
+    ".claude/skills",
+    "ui"
   ],
   "engines": {
     "node": ">=20"
@@ -72,6 +73,7 @@
     "vitest": "^4.1.9"
   },
   "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.325",
     "@napi-rs/canvas": "^1.0.0"
   }
 }

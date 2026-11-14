@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebLatexMCP</title>
+<link rel="stylesheet" href="/static/app.css">
+<script nonce="__NONCE__">
+// the theme, the font and the conversation's size (Settings), before the page shows: no jump
+try {
+  const get = (k) => JSON.parse(localStorage.getItem("wlm-side-" + k));
+  const t = get("theme"), f = get("font"), z = get("size");
+  if (t) document.documentElement.dataset.theme = t;
+  if (f) document.documentElement.dataset.font = f;
+  if (z) document.documentElement.style.setProperty("--chat-size", z + "px");
+  if (get("off") === true) document.documentElement.classList.add("side-off-early");
+} catch (e) { /* no storage: the defaults */ }
+</script>
+</head>
+<body class="homing arts-on">
+<section id="chat">
+  <aside id="c-side" aria-label="Papers">
+    <div class="s-head">
+      <button type="button" id="s-fold" class="ghost ico" title="Hide the side bar (Alt+S)"
+        aria-label="Hide the side bar"><span data-icon="sidebar"></span></button>
+      <span class="s-title">Papers</span>
+    </div>
+    <button type="button" id="s-add-paper" title="Register a paper: a git URL (Overleaf, GitHub…) or a local folder">
+      <span class="plus">+</span> Add paper</button>
+    <button type="button" id="s-add-group" title="A group to put papers in (drag them onto it)">
+      <span class="ico" data-icon="folder"></span> New group</button>
+    <div class="s-top">
+      <input type="search" id="s-filter" placeholder="Filter papers" spellcheck="false" autocomplete="off"
+        aria-label="Filter papers by name, title or label">
+    </div>
+    <div class="s-labels" id="s-labels" aria-label="Labels"></div>
+    <div id="s-list"></div>
+    <div class="rs" id="side-rs" title="Drag to resize (double-click: back to the default)"></div>
+    <div class="s-foot">
+      <span class="small" id="s-version" style="flex: 1"></span>
+      <button type="button" id="set-btn" title="Settings" aria-label="Settings"><span data-icon="gear"></span></button>
+    </div>
+  </aside>
+  <div id="s-backdrop"></div>
+  <div id="c-main">
+    <div class="c-head">
+      <span class="c-headnav">
+        <button id="c-side-btn" class="ghost ico" title="Show the side bar (Alt+S)" aria-label="Show the side bar">
+          <span data-icon="sidebar"></span></button>
+      </span>
+      <div class="titles"><div class="tline"><div id="c-title" title="Click to rename it"></div>
+        <button type="button" id="c-more" class="ghost chev" title="Group, labels, new conversation…"
+          aria-label="Paper menu"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg></button></div>
+        <div id="c-meta"></div></div>
+      <span id="c-badge" class="badge idle"></span>
+      <button type="button" id="c-arts-btn" class="ghost" title="Show or hide the PDF (Alt+A)">PDF</button>
+    </div>
+    <div id="c-scroll"><div id="c-log"></div>
+      <div id="c-status" hidden><span class="spin dots4" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span id="c-status-txt"></span></div>
+    </div>
+    <div class="c-bottom"><div>
+      <div id="c-ask" hidden aria-live="polite"></div>
+      <ul id="c-picker" hidden></ul>
+      <ul id="c-queue" hidden></ul>
+      <form id="c-box">
+        <button type="button" id="c-add" title="Slash commands: skills and commands (or type /)"
+          aria-label="Commands" aria-haspopup="menu"><span data-icon="slash"></span></button>
+        <textarea id="c-input" rows="1" spellcheck="true" placeholder="Ask Claude about this paper"></textarea>
+        <div class="sendcol">
+          <div class="sendrow">
+            <button type="submit" class="primary" id="c-send" title="Send (Enter)" aria-label="Send">
+              <span data-icon="enter"></span></button>
+          </div>
+        </div>
+      </form>
+      <div class="c-tools">
+        <span id="c-working" hidden>working…</span>
+        <span class="pills">
+          <button type="button" id="c-ctx-btn" class="pill" title="Context used" hidden>
+            <span class="gauge"><span id="c-ctx-fill"></span></span><span id="c-ctx-pct"></span></button>
+          <button type="button" id="c-model-btn" class="pill" title="Model and effort, for this paper">Model</button>
+          <button type="button" id="c-mode-btn" class="pill" title="Permission mode">Mode</button>
+        </span>
+        <div id="c-pop" hidden role="menu"></div>
+        <div id="c-pop2" hidden role="menu"></div>
+      </div>
+    </div></div>
+  </div>
+  <aside id="c-arts" class="tex" aria-label="The live PDF">
+    <div class="rs" id="arts-rs" title="Drag to resize (double-click: back to the default)"></div>
+    <div class="a-top"><nav class="rtabs" aria-label="Right bar">
+        <button type="button" id="rt-tex" class="on" title="The live viewer: it reloads on each compile">PDF</button>
+      </nav>
+      <button type="button" class="ghost" id="tx-swap" title="Put the PDF on the other side">⇄</button>
+      <button type="button" class="ghost" id="a-close" title="Hide (Alt+A)">✕</button></div>
+    <div id="texv">
+      <div class="tx-top"><span id="tx-what"></span>
+        <button type="button" class="ghost" id="tx-reload" title="Reload the viewer">↻</button>
+        <a class="ghost" id="tx-open" target="_blank" rel="noopener noreferrer" title="Open in a new tab">↗</a></div>
+      <iframe id="tx-frame" title="The live PDF" hidden
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"></iframe>
+      <div id="tx-none" hidden></div>
+    </div>
+  </aside>
+</section>
+<div id="set-pop" hidden role="dialog" aria-label="Settings">
+  <h4>Settings</h4>
+  <button type="button" class="set-sec" id="set-theme-head" aria-expanded="false" aria-controls="set-theme">
+    <span class="lbl">Theme</span><span class="cur" id="set-theme-cur"></span><span class="chev">›</span></button>
+  <div class="menu-list" id="set-theme" role="menu" hidden></div>
+  <button type="button" class="set-sec" id="set-font-head" aria-expanded="false" aria-controls="set-font">
+    <span class="lbl">Font</span><span class="cur" id="set-font-cur"></span><span class="chev">›</span></button>
+  <div class="menu-list" id="set-font" role="menu" hidden></div>
+  <button type="button" class="set-sec" id="set-size-head" aria-expanded="false" aria-controls="set-size">
+    <span class="lbl">Text size</span><span class="cur" id="set-size-cur"></span><span class="chev">›</span></button>
+  <div class="menu-list" id="set-size" role="menu" hidden></div>
+</div>
+<div id="row-menu" hidden role="menu"></div>
+<dialog id="add-dlg">
+  <h3>Add a paper</h3>
+  <div class="row"><span class="seg" role="tablist"><button type="button" class="on" data-kind="git">Git URL</button
+    ><button type="button" data-kind="local">Local folder</button></span></div>
+  <div class="row" id="add-git-row"><label for="add-git">Git URL</label>
+    <input type="text" id="add-git" placeholder="https://git.overleaf.com/… or https://github.com/…" spellcheck="false"></div>
+  <div class="row" id="add-path-row" hidden><label for="add-path">Folder</label>
+    <input type="text" id="add-path" placeholder="/home/you/papers/thesis" spellcheck="false"></div>
+  <div class="row"><label for="add-id">Name</label>
+    <input type="text" id="add-id" placeholder="thesis (optional: from the URL or folder)" spellcheck="false"></div>
+  <div class="row"><label for="add-root">Root file</label>
+    <input type="text" id="add-root" placeholder="main.tex (optional: detected)" spellcheck="false"></div>
+  <div class="info" id="add-info">A git project is cloned into the workspace; a local folder is used in place.
+    A token never goes in the URL: the server finds it in your environment or with gh, or asks for it
+    (credential_portal).</div>
+  <div class="dlg-err" id="add-err"></div>
+  <div class="dlg-buttons"><button type="button" id="add-cancel">Cancel</button>
+    <button type="button" class="primary" id="add-go">Add</button></div>
+</dialog>
+<div id="flash" hidden></div>
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

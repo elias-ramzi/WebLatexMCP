@@ -96,6 +96,15 @@ describe('ProjectManager', () => {
     expect(() => noDefault.getProjectConfig()).toThrow(/register_project/);
   });
 
+  it('lists a project a peer registered after this session started', async () => {
+    // The shared server builds every session from its startup snapshot: a project another
+    // session registered later must still be listed, not only usable by name.
+    const registry = makeFakeRegistry();
+    const pm = new ProjectManager(makeConfig(), registry);
+    registry.entries = [{ id: 'late', gitUrl: 'https://git.example/late' }];
+    expect((await pm.listProjects()).map((p) => p.project)).toEqual(['thesis', 'paper', 'late']);
+  });
+
   it('reports clone status based on the presence of a .git directory', async () => {
     const pm = new ProjectManager(makeConfig());
     await mkdir(path.join(workspaceRoot, 'thesis', '.git'), { recursive: true });

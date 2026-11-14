@@ -11,6 +11,20 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **A web UI: `web-latex-mcp ui`.** A page in the browser in three parts, built like cc-servers' UI:
+  - at the left, your papers, in groups and with labels you set (drag to reorder or to move one
+    into a group);
+  - in the middle, a Claude conversation per paper: Claude Code's whole toolset, run in the paper's
+    folder with your settings, plus the web-latex-mcp tools. Permission requests, questions and
+    plans come as cards; the model, effort and permission mode are pills;
+  - at the right, the live PDF.
+
+  The chat uses the Claude Agent SDK, an optional dependency. Groups, labels and conversations stay
+  in `<workspace>/.ui/`, out of the registry. See [docs/ui.md](docs/ui.md).
+
+- **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
+  message that cc-servers sends to the apps it frames.
+
 - **A local tool-call log, and `web-latex-mcp call-stats` to read it.** Each tool call adds one
   line to `<workspace>/.logs/tool-calls.jsonl`: tool, session, project, duration, result size and a
   rough token count, and the time spent waiting for the project lock or the compile queue and in
@@ -43,6 +57,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   skill now offers to open its final review this way.
 
 ### Fixed
+
+- **A project another session registered now shows in `list_projects`.** Each session of the shared
+  server starts from the server's own snapshot of the registry. A project registered later by
+  another session could be used by name but was never listed. `list_projects` now re-reads the
+  registry first.
 
 - **Viewer comments on a tectonic build now carry their source file and line.** Tectonic was run
   without `--synctex`, so SyncTeX had nothing to map a comment back through and every one needed a
