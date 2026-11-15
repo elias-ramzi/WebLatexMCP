@@ -82,6 +82,13 @@ export interface ProjectRegistryStore {
   /** Id of the persisted default project, or `undefined`. */
   readDefault(): string | undefined;
   upsert(cfg: ProjectConfig, opts?: { makeDefault?: boolean }): Promise<void>;
+  /** Remove an entry; whether the store held it. Optional for test stores. */
+  remove?(id: string): Promise<boolean>;
+  /**
+   * Every id the store holds, or `undefined` when it cannot tell — so a session drops a project a
+   * peer unregistered. Optional for test stores (which then never drop one).
+   */
+  heldIds?(): ReadonlySet<string> | undefined;
   /**
    * Entries the store holds but did not load, with why — read when a call names an unknown id, so
    * it can say "skipped because …" instead of "Unknown project". Optional for test stores.
@@ -161,6 +168,13 @@ export class ProjectManager {
    * `registerProject`).
    */
   private readonly sessionPinned = new Set<string>();
+  /**
+   * Ids this session holds BECAUSE the registry holds them — the only ones `dropUnregistered` may
+   * forget when the registry no longer does. Startup ids count only when the config says which
+   * came from the environment (`envProjectIds`, always set by `loadConfig`): a config built by
+   * hand names projects that may never have been in the registry.
+   */
+  private readonly fromRegistry = new Set<string>();
 
   constructor(
     config: ServerConfig,
@@ -186,6 +200,11 @@ export class ProjectManager {
     this.defaultProjectExplicit = config.defaultProjectExplicit === true;
     this.sessionId = config.sessionId;
     this.registry = registry;
+    if (config.envProjectIds !== undefined) {
+      for (const id of this.projects.keys()) {
+        if (!this.envProjectIds.has(id)) this.fromRegistry.add(id);
+      }
+    }
   }
 
   /**
@@ -398,6 +417,7 @@ export class ProjectManager {
   ): Promise<ProjectConfig> {
     const held = this.registerProject(cfg);
     await this.registry?.upsert(held, opts);
+    if (this.registry) this.fromRegistry.add(held.id);
     // The registry now holds exactly this config, so it is no longer session-only. Cleared only
     // after the upsert landed: a failed write leaves the id pinned to what this process holds.
     this.sessionPinned.delete(held.id);
@@ -610,6 +630,54 @@ export class ProjectManager {
   }
 
   /**
+   * Forget a registered project — `unregister_project`. Removes the registry entry and this
+   * session's in-process config; never touches a file: the clone (or local folder), its PDF and
+   * `.sessions/<id>/` stay where they are, and registering the same id again adopts them. Refuses
+   * an id configured through `WEB_LATEX_MCP_PROJECTS` (env wins over the registry: it would be back
+   * on the next start) and an id held nowhere. Other sessions drop it at their next
+   * `list_projects` (`dropUnregistered`). Call under `runExclusive(id)`.
+   */
+  async unregister(
+    id: string,
+  ): Promise<{ config: ProjectConfig; dir: string; wasDefault: boolean }> {
+    if (this.envProjectIds.has(id)) {
+      throw new Error(
+        `Project ${quoteId(id)} is configured through WEB_LATEX_MCP_PROJECTS, not registered: ` +
+          'remove it from that variable instead.',
+      );
+    }
+    const config = this.getProjectConfig(id);
+    const dir = this.projectPath(id);
+    const wasDefault = this.defaultProjectId() === id;
+    await this.registry?.remove?.(id);
+    this.projects.delete(id);
+    this.sessionPinned.delete(id);
+    this.fromRegistry.delete(id);
+    if (!this.defaultProjectExplicit && this.defaultProject === id) this.defaultProject = undefined;
+    return { config, dir, wasDefault };
+  }
+
+  /**
+   * Drop the ids this session holds from the registry (`fromRegistry`) that it no longer holds — a peer
+   * ran `unregister_project`. On the shared server a session starts from the daemon's startup
+   * snapshot, so without this a removed project came back in every new session's list. Never an
+   * env-configured id or one this session registered for itself (`sessionPinned`), and nothing at
+   * all when the store cannot say what it holds.
+   */
+  private dropUnregistered(): void {
+    const held = this.registry?.heldIds?.();
+    if (!held) return;
+    for (const id of [...this.fromRegistry]) {
+      if (this.envProjectIds.has(id) || this.sessionPinned.has(id) || held.has(id)) continue;
+      this.projects.delete(id);
+      this.fromRegistry.delete(id);
+      if (!this.defaultProjectExplicit && this.defaultProject === id) {
+        this.defaultProject = undefined;
+      }
+    }
+  }
+
+  /**
    * Pull in any runtime registrations a peer session persisted since we last looked, without
    * clobbering our own (env-configured or newer) entries. Cheap enough to run on an unknown-id
    * miss, which is where a not-yet-seen registration would surface.
@@ -624,6 +692,7 @@ export class ProjectManager {
         usableLoadedId(p.id, 'the registry', this.workspaceRoot, () => undefined)
       ) {
         this.projects.set(p.id, p);
+        this.fromRegistry.add(p.id);
       }
     }
   }
@@ -805,6 +874,7 @@ export class ProjectManager {
    * it listed.
    */
   async listProjects(): Promise<ProjectStatus[]> {
+    this.dropUnregistered();
     this.reloadFromRegistry();
     return Promise.all(
       [...this.projects.values()].map(async (p) => {

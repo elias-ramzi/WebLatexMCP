@@ -91,7 +91,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   takes a `document` filter (and `pdfOnly`), and each comment says which `document` it belongs to; `resolve_comments` takes the same two. The peer-review
   skill now offers to open its final review this way.
 
+- **`unregister_project`: forget a registered project.** Its registry entry goes; no file is
+  deleted (clone or local folder, PDF, session state), and registering the same id again picks
+  them up. Other sessions of the shared server drop it at their next `list_projects`. A project
+  from `WEB_LATEX_MCP_PROJECTS` is refused. The web UI's paper menu has **Remove paper…** for it.
+
 ### Fixed
+
+- **The web UI's Add paper dialog works with what Overleaf shows.** A pasted `git clone <url>`
+  line is reduced to its URL (its `-b` becomes the branch) instead of being registered whole and
+  failing to clone, and an empty Name is filled from the URL or folder as the dialog says, instead
+  of failing with an input-validation error.
 
 - **A project another session registered now shows in `list_projects`.** Each session of the shared
   server starts from the server's own snapshot of the registry. A project registered later by

@@ -218,8 +218,25 @@ export function paperMenu(p, anchor) {
       (navigator.clipboard ? navigator.clipboard.writeText(p.id) : Promise.reject(new Error()))
         .then(() => flash("Copied", 1500)).catch(() => prompt("The paper's name:", p.id));
     }));
+    rows.push(item("Remove paper…", () => { closeMenu(); removePaper(p); }, "danger"));
     return rows;
   });
+}
+
+/** The ⋯ menu's Remove: unregister_project forgets the paper; no file is deleted. @param {any} p */
+async function removePaper(p) {
+  const msg = "Remove " + JSON.stringify(paperTitle(p)) + " from the list?\n\nNothing is deleted: its files" +
+    (p.path ? " (" + p.path + ")" : "") + " stay on disk, and adding it again under the name " +
+    JSON.stringify(p.id) + " picks them up.";
+  if (!confirm(msg)) return;
+  try {
+    await api("POST", "/api/unregister", { paper: p.id });
+    flash("Removed: " + p.id, 3000);
+    if (location.hash === "#paper/" + encodeURIComponent(p.id)) location.hash = "";
+    await side.refresh();
+  } catch (e) {
+    flash(/** @type {Error} */ (e).message, 6000);
+  }
 }
 
 /** @param {any} p */

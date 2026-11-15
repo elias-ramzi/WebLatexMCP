@@ -73,6 +73,8 @@ bar), starts afresh; the old conversation is set aside on disk, not deleted.
   in your environment or with `gh`, or asks for it.
 - **New group** makes a folder. Move a paper into one by dragging it onto the group's name, or with
   the paper's **⋯ → Move to group**.
+- **⋯ → Remove paper…** takes a paper off the list (`unregister_project`). Nothing is deleted: its
+  files stay on disk, and adding it again under the same name picks them up.
 - **⋯ → Labels** tags a paper. The label chips under the search box filter the list.
 - Drag a paper, or a group's name, to reorder. **⋯ → Rename** gives a paper a title shown instead of
   its id; the id itself does not change.

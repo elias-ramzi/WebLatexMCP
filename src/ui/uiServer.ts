@@ -22,7 +22,8 @@ import type { LiveStatus } from './liveMode.js';
  * - the page runs under a nonce CSP; it may frame the viewer (a loopback page) and nothing else.
  *
  * Everything about projects goes through the daemon's own tools (`list_projects`,
- * `register_project`, `viewer`, `project_sync`, `compile`), so their guards apply here as for any client.
+ * `register_project`, `unregister_project`, `viewer`, `project_sync`, `compile`), so their guards
+ * apply here as for any client.
  */
 
 export interface UiBackend {
@@ -312,6 +313,8 @@ export class UiServer {
           return await this.papersOp(body);
         case 'POST /api/register':
           return await this.register(body);
+        case 'POST /api/unregister':
+          return await this.unregister(await this.requirePaper(body.paper));
         case 'POST /api/sync':
           return await this.sync(await this.requirePaper(body.paper));
         case 'GET /api/viewer': {
@@ -450,12 +453,77 @@ export class UiServer {
         args[k] = (body[k] as string).trim();
       }
     }
+    if (typeof args.gitUrl === 'string') {
+      const cmd = parseCloneCommand(args.gitUrl);
+      args.gitUrl = cmd.url;
+      if (cmd.branch && !args.branch) args.branch = cmd.branch;
+      if (/\s/.test(cmd.url)) {
+        throw new HttpError(400, 'A git URL has no spaces: paste the URL alone.');
+      }
+    }
     if (!args.gitUrl && !args.path) throw new HttpError(400, 'Give a git URL or a local folder.');
+    if (!args.project) {
+      const name = defaultPaperName(
+        args.gitUrl as string | undefined,
+        args.path as string | undefined,
+      );
+      if (!name) throw new HttpError(400, 'Give the paper a name.');
+      args.project = name;
+    }
     const r = await this.opts.backend.call('register_project', args);
     this.projectsCache = undefined;
     if (r.isError) throw new HttpError(400, r.text || 'register_project failed.');
     return { ok: true, text: r.text, project: r.structured?.project ?? args.project ?? null };
   }
+
+  /** The ⋯ menu's Remove: unregister_project, which forgets the paper and deletes no file. */
+  private async unregister(paper: string): Promise<unknown> {
+    const r = await this.opts.backend.call('unregister_project', { project: paper });
+    this.projectsCache = undefined;
+    if (r.isError) throw new HttpError(400, r.text || 'unregister_project failed.');
+    return { ok: true, text: r.text };
+  }
+}
+
+/**
+ * Overleaf's Git dialog shows `git clone https://git.overleaf.com/<id>`, and that whole line is what
+ * gets pasted. Take the URL out of a `git clone [options] <url> [<dir>]` line (and its `-b`/`--branch`);
+ * leave anything else as it was: register_project judges the URL itself.
+ */
+export function parseCloneCommand(text: string): { url: string; branch?: string } {
+  const words = text.trim().split(/\s+/);
+  if (words.length < 3 || words[0] !== 'git' || words[1] !== 'clone') return { url: text.trim() };
+  let branch: string | undefined;
+  let url: string | undefined;
+  for (let i = 2; i < words.length; i++) {
+    const w = words[i] as string;
+    if (w === '-b' || w === '--branch') branch = words[++i];
+    else if (w.startsWith('--branch=')) branch = w.slice('--branch='.length);
+    // An option's value (`--depth 1`) is a word too: the URL is the first that reads as one.
+    else if (!url && !w.startsWith('-') && /:\/\/|^[^\s@/]+@[^\s:/]+:/.test(w)) url = w;
+  }
+  return url ? { url, ...(branch ? { branch } : {}) } : { url: text.trim() };
+}
+
+/**
+ * The name the dialog promises when its Name field is left empty: the URL's last path segment
+ * (without `.git`), else the folder's name (a `.tex` named in place of the folder counts as its
+ * folder). register_project still judges it as an id; `''` when nothing usable is there.
+ */
+export function defaultPaperName(gitUrl?: string, localPath?: string): string {
+  if (gitUrl) {
+    const noQuery = gitUrl.replace(/[?#].*$/, '');
+    const segs = noQuery.split(/[/\\:]+/).filter(Boolean);
+    const last = segs.length > 1 ? (segs[segs.length - 1] as string) : '';
+    return last.replace(/\.git$/i, '');
+  }
+  if (localPath) {
+    const segs = localPath.split(/[/\\]+/).filter(Boolean);
+    let last = segs[segs.length - 1] ?? '';
+    if (/\.(tex|md|markdown)$/i.test(last)) last = segs[segs.length - 2] ?? '';
+    return last === '~' ? '' : last;
+  }
+  return '';
 }
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {

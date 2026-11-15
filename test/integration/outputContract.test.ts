@@ -420,6 +420,8 @@ describe('output contract: the local-project read and write tools', () => {
       rule: "Always write 'lidar', never 'LiDAR'.",
       confirmGuideEdit: true,
     });
+    // Last: forgets `doc` (deleting nothing), so every call above still had it.
+    await auditCall(client, 'unregister_project', { project: 'doc' });
   });
 
   it('publishes every key the PDF-reading tools return', async () => {
