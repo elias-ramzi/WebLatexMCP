@@ -32,7 +32,7 @@ import {
 } from '../../src/ui/chatEngine.js';
 import { UiServer, pageCsp, tokenMatches, type UiServerOptions } from '../../src/ui/uiServer.js';
 import { DEV_CHAT } from '../../src/ui/devMode.js';
-import { parseUiArgs } from '../../src/ui/uiCommand.js';
+import { liveChildArgs, parseUiArgs } from '../../src/ui/uiCommand.js';
 import { readUiInfo, removeUiInfo, writeUiInfo } from '../../src/ui/uiFiles.js';
 import type { ToolAnswer } from '../../src/ui/daemonClient.js';
 
@@ -785,6 +785,14 @@ describe('UiServer', () => {
     const refused = await req(noRepo.port, { path: `/api/chat?paper=${DEV_CHAT}`, headers: auth });
     expect(refused.body.error).toBe('No checkout here.');
     await noRepo.srv.close();
+
+    const live = { dir: '/r/wt', branch: 'ui-live', ahead: 2, changed: 1 };
+    const liveUi = await server({
+      dev: { repo: '/r/wt', pending: () => false, live: async () => live },
+    });
+    const st4 = await req(liveUi.port, { path: '/api/state', headers: auth });
+    expect(st4.body.dev).toMatchObject({ chat: true, repo: '/r/wt', live });
+    await liveUi.srv.close();
   });
 
   it('compares tokens exactly, and lets frames only on loopback', () => {
@@ -811,6 +819,24 @@ describe('web-latex-mcp ui', () => {
       repo: '../wlm',
     });
     expect(parseUiArgs(['--repo', 'x'])).toMatch(/goes with --dev/);
+    expect(parseUiArgs(['--dev', '--live'])).toMatchObject({ dev: true, live: '' });
+    expect(parseUiArgs(['--dev', '--live', '--no-open'])).toMatchObject({ live: '', open: false });
+    expect(parseUiArgs(['--dev', '--live', 'wt'])).toMatchObject({ live: 'wt' });
+    expect(parseUiArgs(['--live'])).toMatch(/--live goes with --dev/);
+    expect(
+      liveChildArgs(
+        ['--dev', '--live', '--repo', 'r', '--port', '9', '--open'],
+        '/repo',
+        '/repo/wt',
+      ),
+    ).toEqual(['--dev', '--port', '9', '--repo', '/repo', '--live', '/repo/wt']);
+    expect(liveChildArgs(['--live', 'x', '--dev'], '/r', '/w')).toEqual([
+      '--dev',
+      '--repo',
+      '/r',
+      '--live',
+      '/w',
+    ]);
     expect(parseUiArgs(['--port', 'x'])).toMatch(/not a port/);
     expect(parseUiArgs(['--what'])).toMatch(/Unknown argument/);
   });

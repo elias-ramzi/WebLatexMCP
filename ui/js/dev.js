@@ -3,10 +3,14 @@
 // changes WebLatexMCP itself (in its own worktree of the checkout, PR into dev, merged when green, then the
 // dev build), and the page reloads itself once the UI runs the new build. Ported from cc-servers'
 // miniChat; permission cards and questions are answered in the full view (#dev), which is the main chat.
+// Live mode (`--dev --live`): the UI runs from a worktree Claude edits in place; Ship sends it as one PR.
 import { $, h, api, flash, S } from "./dom.js";
 import { md } from "./md.js";
 
 export const DEV = ".dev";
+
+const SHIP = "Ship the live changes: one pull request into dev with their tests, docs and CHANGELOG " +
+  "entries, merged once its checks pass, then bring the live worktree back to dev.";
 
 const m = { offset: 0, epoch: /** @type {string | null} */ (null), timer: /** @type {any} */ (null),
   loading: false, /** @type {{ el: HTMLElement, names: string[] } | null} */ steps: null, gen: 0 };
@@ -55,6 +59,12 @@ function tick(/** @type {number} */ ms) { clearTimeout(m.timer); if (shown()) m.
 
 function intro() {
   const d = (S.state && S.state.dev) || {};
+  if (d.live) {
+    note("Live mode: the UI runs from " + d.live.dir + ", and Claude edits it in place. A change shows " +
+      "when its turn ends, with no pull request. Press Ship when you are happy: Claude then opens one pull " +
+      "request into dev for all of it and merges it once its checks pass.");
+    return;
+  }
   note("Tell Claude what to change in this page, the viewer or the server. It works in its own worktree of " +
     (d.repo || "the checkout") + ", opens a pull request into dev and merges it once its checks pass, then " +
     "updates the build: the UI restarts on it when no chat is working, and this page reloads.");
@@ -123,11 +133,10 @@ function reduce(/** @type {boolean} */ on) {
   }
 }
 
-async function send() {
-  const text = $("#dev-input").value.trim();
+async function send(/** @type {string} */ given = "") {
+  const text = given || $("#dev-input").value.trim();
   if (!text) return;
-  $("#dev-input").value = "";
-  store("draft", "");
+  if (!given) { $("#dev-input").value = ""; store("draft", ""); }
   const log = $("#dev-log");
   log.querySelectorAll(".note.intro").forEach((/** @type {Element} */ x) => x.remove());
   log.append(h("div", { class: "u pending" }, text));
@@ -137,7 +146,7 @@ async function send() {
     setTimeout(poll, 400);
   } catch (e) {
     log.querySelectorAll(".u.pending").forEach((/** @type {Element} */ x) => x.remove());
-    $("#dev-input").value = text;
+    if (!given) $("#dev-input").value = text;
     note(/** @type {Error} */ (e).message, "note bad");
   }
 }
@@ -149,15 +158,32 @@ export function updateDev(st) {
   $("#dev-btn").hidden = !d;
   $("#dev").hidden = !d;
   if (!d) { $("#dev-chat").hidden = true; return; }
-  $("#dev").textContent = d.pending ? "dev · new build waits" : "dev";
+  const live = d.live, waiting = live ? live.ahead + live.changed : 0;
+  $("#dev").textContent = (live ? "dev · live" : "dev") + (d.pending ? " · new build waits" : "");
   $("#dev").title = d.error ? "Running the build before: " + d.error
     : d.pending ? "A new build is ready: the UI restarts on it once no chat is working"
-      : "Dev mode: the UI restarts on each new build";
+      : live ? "Live mode: the UI runs from " + live.dir + " (" + live.branch + ")" +
+        (live.problem ? ": " + live.problem : ", " + liveCount(live) + " not shipped")
+        : "Dev mode: the UI restarts on each new build";
+  const busy = d.status === "working" || d.status === "starting" || d.status === "waiting";
+  $("#dev-ship").hidden = !live;
+  $("#dev-ship").textContent = waiting ? "Ship (" + waiting + ")" : "Ship";
+  $("#dev-ship").disabled = !waiting || busy;
+  $("#dev-ship").title = !live ? "" : busy ? "Wait for Claude's turn to end"
+    : waiting ? "Ship " + liveCount(live) + ": one pull request into dev, merged when its checks pass"
+      : "Nothing to ship: the live worktree is at dev";
   $("#dev").classList.toggle("attn", !!d.error || !!d.pending);
   $("#dev-btn").disabled = !d.chat;
   $("#dev-btn").title = d.chat ? "Ask Claude to change WebLatexMCP: a PR into dev, merged when green; the page reloads"
     : "The dev chat is off: " + (d.problem || "");
-  $("#dev-btn").classList.toggle("busy", d.status === "working" || d.status === "starting" || d.status === "waiting");
+  $("#dev-btn").classList.toggle("busy", busy);
+}
+
+/** "2 commits and 1 changed file". @param {{ ahead: number, changed: number }} l */
+function liveCount(l) {
+  const n = (/** @type {number} */ k, /** @type {string} */ w) => k + " " + w + (k === 1 ? "" : "s");
+  return [l.ahead ? n(l.ahead, "commit") : "", l.changed ? n(l.changed, "changed file") : ""]
+    .filter(Boolean).join(" and ") || "nothing";
 }
 
 export function wireDev() {
@@ -172,6 +198,10 @@ export function wireDev() {
   if (store("min") === true) reduce(true);
   $("#dev-close").onclick = () => openDev(false);
   $("#dev-full").onclick = () => { location.hash = "#dev"; };
+  $("#dev-ship").onclick = () => {
+    if (!confirm("Ship the live changes? Claude opens one pull request into dev and merges it once its checks pass.")) return;
+    send(SHIP);
+  };
   $("#dev-reset").onclick = () => {
     if (!confirm("Start over in a new conversation? This one is set aside (kept on disk).")) return;
     api("POST", "/api/chat", { paper: DEV, reset: true }).then(() => {

@@ -17,6 +17,18 @@ import {
   TOKEN_ENV,
   WATCH_ENV,
 } from '../../src/ui/devMode.js';
+import {
+  buildEntry,
+  defaultLiveDir,
+  keepBuild,
+  LIVE_BRANCH,
+  liveStatus,
+  liveSystemPrompt,
+  prepareLive,
+  type LiveRun,
+} from '../../src/ui/liveMode.js';
+import { execCapture } from '../../src/lib/exec.js';
+import { existsSync } from 'node:fs';
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -295,5 +307,180 @@ describe('superviseUi', () => {
       (children[i] as FakeChild).exit(9);
     }
     expect(await crashing).toBe(9);
+  });
+});
+
+describe('live mode', () => {
+  it('briefs the dev chat to edit the live worktree in place and ship on demand', () => {
+    const brief = liveSystemPrompt('/repo', '/repo/.claude/worktrees/live');
+    expect(brief).toContain('Edit /repo/.claude/worktrees/live directly');
+    expect(brief).toContain(`branch ${LIVE_BRANCH}`);
+    expect(brief).toMatch(/no pull request per change/);
+    expect(brief).toMatch(/npm --prefix \/repo\/\.claude\/worktrees\/live run build/);
+    expect(brief).toMatch(/Shipping[\s\S]*one pull request into dev/);
+    expect(brief).toMatch(/never force-push/i);
+    expect(defaultLiveDir('/repo')).toBe(path.join('/repo', '.claude', 'worktrees', 'live'));
+  });
+
+  it('adds a missing worktree, installs and builds it; leaves a ready one alone', async () => {
+    const repo = await checkout(await tmp());
+    const dir = path.join(repo, '.claude', 'worktrees', 'live');
+    const calls: string[] = [];
+    const run: LiveRun = async (cmd, args, cwd) => {
+      calls.push(`${path.relative(repo, cwd) || '.'}: ${cmd} ${args.join(' ')}`);
+      if (args[0] === 'worktree') await checkout(dir);
+      else if (args[0] === 'ci') await mkdir(path.join(dir, 'node_modules'));
+      else if (args[0] === 'run') await build(dir);
+      // no `ui-live` branch yet
+      return { code: args[0] === 'rev-parse' ? 1 : 0, stdout: '', stderr: '' };
+    };
+    const entry = await prepareLive({ repo, dir, run, log: () => undefined });
+    expect(entry).toBe(buildEntry(dir));
+    const wt = path.join('.claude', 'worktrees', 'live');
+    expect(calls).toEqual([
+      '.: git fetch origin dev',
+      `.: git rev-parse --verify --quiet refs/heads/${LIVE_BRANCH}`,
+      `.: git worktree add -b ${LIVE_BRANCH} ${dir} origin/dev`,
+      `${wt}: npm ci --no-audit --no-fund --loglevel=error`,
+      `${wt}: npm run build --silent`,
+    ]);
+    calls.length = 0;
+    expect(await prepareLive({ repo, dir, run, log: () => undefined })).toBe(entry);
+    expect(calls).toEqual([]);
+
+    const other = await tmp();
+    await expect(prepareLive({ repo, dir: other, run, log: () => undefined })).rejects.toThrow(
+      /not a git checkout of WebLatexMCP/,
+    );
+    const failing: LiveRun = async () => ({ code: 128, stdout: '', stderr: 'fatal: no remote\n' });
+    await expect(
+      prepareLive({ repo, dir: path.join(repo, 'elsewhere'), run: failing, log: () => undefined }),
+    ).rejects.toThrow(/git fetch origin dev.*exit status 128.*no remote/s);
+  });
+
+  it('keeps an existing ui-live branch, with its commits, when it adds the worktree', async () => {
+    const repo = await checkout(await tmp());
+    const dir = path.join(repo, 'wt');
+    const calls: string[] = [];
+    const run: LiveRun = async (_cmd, args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'worktree') {
+        await checkout(dir);
+        await mkdir(path.join(dir, 'node_modules'));
+        await build(dir);
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    await prepareLive({ repo, dir, run, log: () => undefined });
+    expect(calls).toContain(`worktree add ${dir} ${LIVE_BRANCH}`);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'keeps a whole copy of a build that started, without the checkout’s worktrees',
+    async () => {
+      const dir = await checkout(await tmp());
+      await build(dir);
+      await mkdir(path.join(dir, 'node_modules', 'pkg'), { recursive: true });
+      await mkdir(path.join(dir, '.claude', 'skills', 's'), { recursive: true });
+      await writeFile(path.join(dir, '.claude', 'skills', 's', 'SKILL.md'), 'skill');
+      await mkdir(path.join(dir, '.claude', 'worktrees', 'other'), { recursive: true });
+      await mkdir(path.join(dir, 'src'));
+      const good = path.join(await tmp(), '.ui', 'live-good');
+      const entry = keepBuild(dir, good);
+      expect(entry).toBe(buildEntry(good));
+      expect(existsSync(path.join(good, 'ui', 'js', 'app.js'))).toBe(true);
+      expect(existsSync(path.join(good, 'package.json'))).toBe(true);
+      expect(existsSync(path.join(good, '.claude', 'skills', 's', 'SKILL.md'))).toBe(true);
+      expect(existsSync(path.join(good, '.claude', 'worktrees'))).toBe(false);
+      expect(existsSync(path.join(good, 'src'))).toBe(false);
+      expect(await realpath(path.join(good, 'node_modules'))).toBe(path.join(dir, 'node_modules'));
+      // a later build replaces it whole
+      await writeFile(path.join(dir, 'ui', 'js', 'new.js'), '');
+      await rm(path.join(dir, 'ui', 'js', 'app.js'));
+      keepBuild(dir, good);
+      expect(existsSync(path.join(good, 'ui', 'js', 'new.js'))).toBe(true);
+      expect(existsSync(path.join(good, 'ui', 'js', 'app.js'))).toBe(false);
+      expect(existsSync(`${good}.next`)).toBe(false);
+      expect(existsSync(`${good}.old`)).toBe(false);
+    },
+  );
+
+  it('counts the commits not on origin/dev and the files changed', async () => {
+    const dir = await tmp();
+    const git = async (...args: string[]): Promise<void> => {
+      const r = await execCapture(
+        'git',
+        ['-c', 'user.name=t', '-c', 'user.email=t@e', '-c', 'commit.gpgsign=false', ...args],
+        { cwd: dir },
+      );
+      if (r.code !== 0) throw new Error(r.stderr);
+    };
+    await git('init', '-q', '-b', LIVE_BRANCH);
+    await writeFile(path.join(dir, 'a.txt'), 'a');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'base');
+    await git('update-ref', 'refs/remotes/origin/dev', 'HEAD');
+    expect(await liveStatus(dir)).toEqual({ dir, branch: LIVE_BRANCH, ahead: 0, changed: 0 });
+    await writeFile(path.join(dir, 'a.txt'), 'b');
+    await git('commit', '-qam', 'live change');
+    await writeFile(path.join(dir, 'a.txt'), 'c');
+    await writeFile(path.join(dir, 'new.txt'), 'n');
+    expect(await liveStatus(dir)).toEqual({ dir, branch: LIVE_BRANCH, ahead: 1, changed: 2 });
+    await git('update-ref', '-d', 'refs/remotes/origin/dev');
+    expect((await liveStatus(dir)).problem).toBeTruthy();
+  });
+
+  it('falls back to the kept copy when a build rebuilt in place does not start', async () => {
+    const children: FakeChild[] = [];
+    const kept: string[] = [];
+    let stop = (): void => undefined;
+    const done = superviseUi(
+      {
+        entry: '/live/dist/index.js',
+        args: [],
+        open: false,
+        keep: (started) => {
+          kept.push(started);
+          return '/good/dist/index.js';
+        },
+        lastGood: '/older/dist/index.js',
+        spawnChild: (script, args, env) => {
+          const c = new FakeChild(script, args, env);
+          children.push(c);
+          return c as unknown as ChildProcess;
+        },
+        onStop: (s) => (stop = s),
+      },
+      { env: {}, out: () => undefined, err: () => undefined },
+    );
+    // a first start that fails goes back to the copy kept last time
+    await until(() => children.length === 1);
+    (children[0] as FakeChild).exit(1);
+    await until(() => children.length === 2);
+    expect((children[1] as FakeChild).script).toBe('/older/dist/index.js');
+    (children[1] as FakeChild).ready(7000);
+    expect(kept).toEqual([]);
+    (children[1] as FakeChild).exit(RELOAD_EXIT);
+    // the live build starts: it is kept
+    await until(() => children.length === 3);
+    expect((children[2] as FakeChild).script).toBe('/live/dist/index.js');
+    (children[2] as FakeChild).ready(7000);
+    expect(kept).toEqual(['/live/dist/index.js']);
+    (children[2] as FakeChild).exit(RELOAD_EXIT);
+    // rebuilt in place and broken: the kept copy runs, saying why
+    await until(() => children.length === 4);
+    const broken = children[3] as FakeChild;
+    expect(broken.script).toBe('/live/dist/index.js');
+    broken.stderr.emit('data', Buffer.from('TypeError: x is not a function\n'));
+    broken.exit(1);
+    await until(() => children.length === 5);
+    const back = children[4] as FakeChild;
+    expect(back.script).toBe('/good/dist/index.js');
+    expect(back.env[ERROR_ENV]).toMatch(/TypeError/);
+    expect(back.env[WATCH_ENV]).toBe('/live/dist/index.js');
+    back.ready(7000);
+    expect(kept).toHaveLength(1);
+    stop();
+    expect(await done).toBe(0);
   });
 });

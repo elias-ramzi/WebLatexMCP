@@ -8,6 +8,7 @@ import { ChatError, type ChatManager } from './chatEngine.js';
 import { orderedIds, UiInputError, type PaperMetaStore } from './paperMeta.js';
 import type { ToolAnswer } from './daemonClient.js';
 import { DEV_CHAT } from './devMode.js';
+import type { LiveStatus } from './liveMode.js';
 
 /**
  * The web UI's listener (`web-latex-mcp ui`): the page, its static files, and a JSON API under
@@ -50,6 +51,8 @@ export interface UiDevState {
   error?: string;
   /** A new build waits for the chats to finish their turns. */
   pending: () => boolean;
+  /** Live mode (`--live`): what the worktree the UI runs from holds that is not shipped. */
+  live?: () => Promise<LiveStatus>;
 }
 
 const MAX_BODY = 1024 * 1024;
@@ -367,6 +370,7 @@ export class UiServer {
             ...(dev.error ? { error: dev.error } : {}),
             pending: dev.pending(),
             status: dev.repo ? this.opts.chats.status(DEV_CHAT) : 'off',
+            ...(dev.live ? { live: await dev.live() } : {}),
           }
         : null,
       workspace: this.opts.workspaceRoot,

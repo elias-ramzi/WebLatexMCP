@@ -90,7 +90,7 @@ the PDF to the other side, and dragging a bar's edge resizes it.
 
 ## Dev mode: improve the UI from the UI
 
-`web-latex-mcp ui --dev [--repo <checkout>]` is for working on WebLatexMCP itself, as cc-servers'
+`web-latex-mcp ui --dev [--repo <checkout>] [--live [<worktree>]]` is for working on WebLatexMCP itself, as cc-servers'
 dev mode is for cc-servers. It adds two things:
 
 - **The UI restarts on each new build.** `ui --dev` runs the UI under a small supervisor. The UI
@@ -115,6 +115,30 @@ dev mode is for cc-servers. It adds two things:
   - **Answering it:** a permission request or a question shows as a link to the full view (`#dev`),
     the main chat showing this conversation.
 
+### Live mode: see each change at once, ship them together
+
+`web-latex-mcp ui --dev --live [<worktree>]` skips the pull request and the dev update between a
+request and seeing it. The UI runs from a worktree of your checkout, and the dev chat edits that
+worktree in place.
+
+- **The worktree** is `<checkout>/.claude/worktrees/live` unless you name one, on branch `ui-live`.
+  When it is missing, the UI adds it off `origin/dev` (or on `ui-live` as it is, when that branch
+  already exists), then installs and builds it before it starts. That first start takes a minute.
+- **A change shows when Claude's turn ends.** A change to the page (`ui/`) needs nothing more. For a
+  change to `src/`, Claude typechecks and builds the worktree. Either way the UI restarts on it
+  once no chat is working, and the page reloads. Claude commits each change on `ui-live` and pushes
+  nothing.
+- **A build that does not start falls back.** The worktree is rebuilt in place, so there is no
+  build before it to go back to. Each live build that starts is therefore copied to
+  `<workspace>/.ui/live-good/`, and a broken one runs that copy instead, with the `dev · live` chip
+  saying why. The next build Claude makes is tried again.
+- **Ship** (in the chat's title bar) says how much is not on `dev` yet: commits on `ui-live` plus
+  changed files. Pressing it asks Claude to ship: rebase onto `origin/dev`, add tests, docs and
+  `CHANGELOG.md` entries, run the gate, open one pull request into `dev` and merge it once its
+  checks pass. Then it brings the worktree back to `dev` and updates the dev build.
+- **Only the UI is live.** A change to the shared server (anything outside `src/ui/` and `ui/`)
+  reaches your papers' sessions once it is shipped.
+
 The supervisor itself does not reload: after a change to `src/ui/devMode.ts`'s `superviseUi`, stop
 the UI and start it again.
 
@@ -128,6 +152,7 @@ Everything stays in `<workspace>/.ui/`, owner-only (`0700` folders, `0600` files
 | `chats/<hash>.jsonl` | Each paper's conversation, as the page shows it.                                                                       |
 | `chats/<hash>.json`  | The Claude Code session it resumes, and the model, effort and mode chosen.                                             |
 | `ui.json`            | The running UI's port and token (in dev mode, the supervisor's pid). Removed when it stops.                            |
+| `live-good/`         | Live mode: a copy of the last live build that started, for a broken one to fall back to.                               |
 
 Claude Code also keeps its own transcript of each session, under `~/.claude/projects/`.
 

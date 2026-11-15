@@ -41,6 +41,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **Reset conversation…** is in every paper's menu in the web UI, the side bar's **⋯** included, so a
   paper's chat can be reset without opening it first (it was **New conversation**, in the header
   menu only).
+- **Live mode for the web UI's dev chat: `web-latex-mcp ui --dev --live [<worktree>]`.** The UI
+  runs from a worktree of the checkout (`.claude/worktrees/live`, branch `ui-live`, made and built
+  when missing), and the dev chat edits it in place: a change shows when Claude's turn ends, with
+  no pull request and no dev update in between. **Ship**, in the chat's title bar, counts what is
+  not on `dev` yet, and asks Claude for one pull request with the lot, merged once its checks pass.
+  A live build that does not start falls back to a copy of the last one that did
+  (`<workspace>/.ui/live-good/`). See [docs/ui.md](docs/ui.md#live-mode-see-each-change-at-once-ship-them-together).
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
 - **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when
