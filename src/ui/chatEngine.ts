@@ -363,7 +363,9 @@ class PaperChat {
       await this.mgr.store.append(this.paper, [
         {
           k: 'note',
-          text: "The paper's folder moved: Claude starts a new conversation (this one stays above).",
+          text: dev
+            ? 'The dev chat works in another folder now: Claude starts a new conversation (this one stays above).'
+            : "The paper's folder moved: Claude starts a new conversation (this one stays above).",
           t: new Date().toISOString(),
         },
       ]);

@@ -261,6 +261,13 @@ export interface SuperviseOptions {
   /** The `ui` arguments, `--open` and `--no-open` taken out. */
   args: string[];
   open: boolean;
+  /**
+   * Live mode: a build that started is copied, and the copy is what a failed start goes back to
+   * (a build rebuilt in place has no build before it). Returns the copy's CLI file.
+   */
+  keep?: (started: string) => string;
+  /** The build to go back to before any has started (live mode: the copy kept last time). */
+  lastGood?: string;
   /** Test seam: how a child is started. */
   spawnChild?: (script: string, args: string[], env: NodeJS.ProcessEnv) => ChildProcess;
   /** Test seam: signals that stop the supervisor (and its child). */
@@ -303,13 +310,22 @@ export async function superviseUi(opts: SuperviseOptions, io: SuperviseIo): Prom
   const token = randomBytes(24).toString('base64url');
   const spawnChild = opts.spawnChild ?? defaultSpawn;
   let port: number | undefined;
-  let lastGood: string | undefined;
+  let lastGood: string | undefined = opts.lastGood ? realOr(opts.lastGood) : undefined;
   let fallback = false;
   let error: string | undefined;
   let first = true;
   let stopping = false;
   let child: ChildProcess | undefined;
   const crashes: number[] = [];
+  const keepGood = (started: string): string | undefined => {
+    if (!opts.keep) return started;
+    try {
+      return realOr(opts.keep(started));
+    } catch (err) {
+      io.err(`web-latex-mcp ui: could not keep a copy of this build: ${(err as Error).message}\n`);
+      return undefined;
+    }
+  };
 
   const stop = (): void => {
     stopping = true;
@@ -354,7 +370,7 @@ export async function superviseUi(opts: SuperviseOptions, io: SuperviseIo): Prom
         port = m.ready;
         first = false;
         if (!fallback) {
-          lastGood = started;
+          lastGood = keepGood(started) ?? lastGood;
           error = undefined;
         }
       }

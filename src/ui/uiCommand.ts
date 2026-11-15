@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { resolveWorkspace, quoteEnvValue } from '../config.js';
@@ -23,20 +24,35 @@ import {
   TOKEN_ENV,
   WATCH_ENV,
 } from './devMode.js';
+import {
+  buildEntry,
+  defaultLiveDir,
+  goodDir,
+  keepBuild,
+  LIVE_BRANCH,
+  liveStatus,
+  liveSystemPrompt,
+  prepareLive,
+  type LiveStatus,
+} from './liveMode.js';
 
 /**
- * `web-latex-mcp ui [--port <n>] [--no-open] [--to <workspace>] [--dev [--repo <dir>]]`: the web
+ * `web-latex-mcp ui [--port <n>] [--no-open] [--to <workspace>] [--dev [--repo <dir>] [--live
+ * [<dir>]]]`: the web
  * UI — papers in a sidebar, a Claude chat and the live viewer side by side (docs/ui.md). Runs in
  * the foreground until Ctrl+C. A second launch on the same workspace opens the running one's page
  * instead. `--dev` runs it under a supervisor that restarts it on each new build, with a chat
- * that changes WebLatexMCP itself (`devMode.ts`).
+ * that changes WebLatexMCP itself (`devMode.ts`); with `--live`, the UI runs from a worktree that chat
+ * edits in place, shipped as one pull request when the user says so (`liveMode.ts`).
  */
 
 export const UI_USAGE =
-  '  npx web-latex-mcp ui [--port <n>] [--no-open] [--to <workspace>] [--dev [--repo <dir>]]\n' +
+  '  npx web-latex-mcp ui [--port <n>] [--no-open] [--to <workspace>]\n' +
+  '                     [--dev [--repo <dir>] [--live [<dir>]]]\n' +
   '      the web UI: your papers, a Claude chat beside the live PDF (needs\n' +
   '      @anthropic-ai/claude-agent-sdk for the chat); Ctrl+C stops it. --dev: it\n' +
-  '      restarts on each new build, and "Improve WebLatexMCP" changes it\n';
+  '      restarts on each new build, and "Improve WebLatexMCP" changes it.\n' +
+  '      --live: it runs from a worktree that chat edits in place, shipped on demand\n';
 
 export interface UiIo {
   env: NodeJS.ProcessEnv;
@@ -53,6 +69,8 @@ interface UiArgs {
   to?: string;
   dev: boolean;
   repo?: string;
+  /** `--live [<dir>]`: `''` when no folder is named (the default one). */
+  live?: string;
 }
 
 export function parseUiArgs(args: string[]): UiArgs | string {
@@ -62,6 +80,10 @@ export function parseUiArgs(args: string[]): UiArgs | string {
     if (arg === '--no-open') out.open = false;
     else if (arg === '--open') out.open = true;
     else if (arg === '--dev') out.dev = true;
+    else if (arg === '--live') {
+      const v = args[i + 1];
+      out.live = v !== undefined && !v.startsWith('-') ? (i++, v) : '';
+    }
     else if (arg === '--port' || arg === '--to' || arg === '--repo') {
       const v = args[++i];
       if (v === undefined) return `${arg} needs a value.`;
@@ -77,7 +99,81 @@ export function parseUiArgs(args: string[]): UiArgs | string {
     } else return `Unknown argument to ui: ${quoteEnvValue(arg ?? '')}.`;
   }
   if (out.repo !== undefined && !out.dev) return '--repo goes with --dev.';
+  if (out.live !== undefined && !out.dev) return '--live goes with --dev.';
   return out;
+}
+
+/** The arguments a live-mode child gets: the checkout and the worktree, as found by its supervisor. */
+export function liveChildArgs(args: string[], repo: string, dir: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === '--repo') i++;
+    else if (arg === '--live') {
+      const v = args[i + 1];
+      if (v !== undefined && !v.startsWith('-')) i++;
+    } else if (arg !== '--open' && arg !== '--no-open') out.push(arg);
+  }
+  return [...out, '--repo', repo, '--live', dir];
+}
+
+/** `liveStatus` at most every few seconds: the page asks for the state often. */
+function cachedLiveStatus(dir: string, everyMs = 3000): () => Promise<LiveStatus> {
+  let last: { at: number; status: Promise<LiveStatus> } | undefined;
+  return () => {
+    if (!last || Date.now() - last.at > everyMs) {
+      last = {
+        at: Date.now(),
+        status: liveStatus(dir).catch((err: unknown) => ({
+          dir,
+          branch: '',
+          ahead: 0,
+          changed: 0,
+          problem: (err as Error).message,
+        })),
+      };
+    }
+    return last.status;
+  };
+}
+
+/**
+ * `ui --dev --live`: make the live worktree ready, then supervise the UI run from it, keeping a
+ * copy of each build that starts for a broken one to fall back to.
+ */
+async function superviseLive(
+  parsed: UiArgs,
+  workspaceRoot: string,
+  args: string[],
+  io: UiIo,
+): Promise<number> {
+  const found = findDevRepo({ given: parsed.repo, env: io.env, cwd: io.cwd, root: packageRoot() });
+  if (!found.repo) {
+    io.err(`web-latex-mcp ui: --live needs the WebLatexMCP checkout: ${found.problem ?? ''}\n`);
+    return 1;
+  }
+  const repo = found.repo;
+  const dir = parsed.live ? path.resolve(io.cwd, parsed.live) : defaultLiveDir(repo);
+  let entry: string;
+  try {
+    entry = await prepareLive({ repo, dir, log: io.err });
+  } catch (err) {
+    io.err(`web-latex-mcp ui: the live worktree is not ready: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const good = goodDir(workspaceRoot);
+  const kept = buildEntry(good);
+  io.out(`Live mode: the UI runs from ${dir} (branch ${LIVE_BRANCH}).\n`);
+  return superviseUi(
+    {
+      entry,
+      args: liveChildArgs(args, repo, dir),
+      open: parsed.open,
+      keep: () => keepBuild(dir, good),
+      ...(existsSync(kept) ? { lastGood: kept } : {}),
+    },
+    io,
+  );
 }
 
 export function pageUrl(port: number, token: string): string {
@@ -131,6 +227,7 @@ export async function runUi(args: string[], io: UiIo): Promise<number> {
       );
       return 1;
     }
+    if (parsed.live !== undefined) return superviseLive(parsed, workspaceRoot, args, io);
     const entry = io.entry ?? process.argv[1];
     if (!entry) {
       io.err('web-latex-mcp ui: --dev cannot tell which file started it.\n');
@@ -171,6 +268,11 @@ export async function runUi(args: string[], io: UiIo): Promise<number> {
   const found = child
     ? findDevRepo({ given: parsed.repo, env: io.env, cwd: io.cwd, root: packageRoot() })
     : {};
+  // live mode: the dev chat works in the worktree the UI runs from
+  const liveDir =
+    found.repo && parsed.live !== undefined && parsed.live !== ''
+      ? path.resolve(io.cwd, parsed.live)
+      : undefined;
   const holder: { server?: UiServer; reloader?: DevReloader } = {};
   const chats = new ChatManager({
     workspaceRoot,
@@ -179,10 +281,12 @@ export async function runUi(args: string[], io: UiIo): Promise<number> {
     paperDir: (paper) => holder.server?.paperDir(paper) ?? Promise.resolve(undefined),
     ...(found.repo
       ? {
-          dev: {
-            repo: found.repo,
-            prompt: devSystemPrompt(found.repo, liveStep(found.repo, packageRoot(), io.env)),
-          },
+          dev: liveDir
+            ? { repo: liveDir, prompt: liveSystemPrompt(found.repo, liveDir) }
+            : {
+                repo: found.repo,
+                prompt: devSystemPrompt(found.repo, liveStep(found.repo, packageRoot(), io.env)),
+              },
         }
       : {}),
   });
@@ -192,6 +296,7 @@ export async function runUi(args: string[], io: UiIo): Promise<number> {
         ...(found.problem ? { problem: found.problem } : {}),
         ...(io.env[ERROR_ENV] ? { error: io.env[ERROR_ENV] } : {}),
         pending: () => holder.reloader?.pending ?? false,
+        ...(liveDir ? { live: cachedLiveStatus(liveDir) } : {}),
       }
     : undefined;
   const server = new UiServer({
