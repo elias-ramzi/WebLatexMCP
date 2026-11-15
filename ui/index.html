@@ -52,7 +52,7 @@ try {
           <span data-icon="sidebar"></span></button>
       </span>
       <div class="titles"><div class="tline"><div id="c-title" title="Click to rename it"></div>
-        <button type="button" id="c-more" class="ghost chev" title="Group, labels, new conversation…"
+        <button type="button" id="c-more" class="ghost chev" title="Group, labels, reset the conversation…"
           aria-label="Paper menu"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg></button></div>
         <div id="c-meta"></div></div>
@@ -147,6 +147,8 @@ try {
 <div id="dev-chat" class="mini" hidden role="dialog" aria-label="WebLatexMCP dev chat">
   <div class="d-head"><b>Improve WebLatexMCP</b><span class="sub" id="dev-sub"></span>
     <button type="button" id="dev-full" title="Open this conversation in the full view">Full view</button>
+    <button type="button" id="dev-min" title="Reduce to its title bar (click the bar to bring it back)"
+      aria-label="Reduce" aria-expanded="true">–</button>
     <button type="button" id="dev-reset" title="Start over in a new conversation (this one is kept on disk)"
       >New</button>
     <button type="button" id="dev-close" title="Close (Esc)" aria-label="Close">✕</button></div>

@@ -63,7 +63,8 @@ The **mode** pill sets the permission mode for the paper, and it applies at once
 The **model** pill picks the model and the effort, and takes effect from the next turn.
 
 A message sent while Claude works reaches it at its next step. **Esc**, or the ■ button, interrupts
-it. **⌄ → New conversation** starts afresh; the old conversation is set aside on disk, not deleted.
+it. **Reset conversation…**, in the paper's menu (the **⌄** by its title, or its **⋯** in the side
+bar), starts afresh; the old conversation is set aside on disk, not deleted.
 
 ## The side bar
 
@@ -109,6 +110,8 @@ dev mode is for cc-servers. It adds two things:
     runs the gate, opens a pull request into `dev` and merges it once its checks pass. Then it makes
     it live: `web-latex-mcp-dev-update` when that script is on your `PATH`, or `npm run build` when
     the UI runs from the checkout itself. The UI restarts when Claude's turn ends.
+  - **Reducing it:** **–** shrinks it to its title bar, like a window, which still says when Claude is
+    working or waiting for you. A click on the bar (or on **Improve WebLatexMCP**) brings it back.
   - **Answering it:** a permission request or a question shows as a link to the full view (`#dev`),
     the main chat showing this conversation.
 

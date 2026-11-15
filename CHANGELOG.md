@@ -36,6 +36,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **A Pull button in the web UI.** A git paper's header has **⤓ Pull**: it fetches the latest
   version from the remote (Overleaf, GitHub…) through `project_sync`, fast-forward only, then
   recompiles so the PDF shows it. See [docs/ui.md](docs/ui.md#the-side-bar).
+- **The web UI's dev chat can be reduced** to its title bar (**–**), like a window, and brought back
+  with a click; the bar still says when Claude works or waits for you.
+- **Reset conversation…** is in every paper's menu in the web UI, the side bar's **⋯** included, so a
+  paper's chat can be reset without opening it first (it was **New conversation**, in the header
+  menu only).
 - **The viewer takes its frame's colours when embedded** (`?embed=1`): it reads the `cc-theme`
   message that cc-servers sends to the apps it frames.
 - **Ctrl+Enter (⌘+Enter on a Mac) saves a viewer comment**, in the new-comment box and when

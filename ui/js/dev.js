@@ -103,7 +103,24 @@ async function poll() {
 export function openDev(on) {
   $("#dev-chat").hidden = !on;
   store("open", on);
-  if (on) { poll(); $("#dev-input").focus(); } else clearTimeout(m.timer);
+  if (on) { poll(); if (!reduced()) $("#dev-input").focus(); } else clearTimeout(m.timer);
+}
+
+const reduced = () => $("#dev-chat").classList.contains("min");
+
+/** Reduce the chat to its title bar, or bring it back (it keeps polling: the bar says when Claude works). */
+function reduce(/** @type {boolean} */ on) {
+  $("#dev-chat").classList.toggle("min", on);
+  $("#dev-min").textContent = on ? "□" : "–";
+  $("#dev-min").title = on ? "Bring it back" : "Reduce to its title bar (click the bar to bring it back)";
+  $("#dev-min").setAttribute("aria-label", on ? "Restore" : "Reduce");
+  $("#dev-min").setAttribute("aria-expanded", String(!on));
+  store("min", on);
+  if (!on && shown()) {
+    const log = $("#dev-log");
+    log.scrollTop = log.scrollHeight;
+    $("#dev-input").focus();
+  }
 }
 
 async function send() {
@@ -144,7 +161,15 @@ export function updateDev(st) {
 }
 
 export function wireDev() {
-  $("#dev-btn").onclick = () => openDev($("#dev-chat").hidden);
+  $("#dev-btn").onclick = () => {
+    if (!$("#dev-chat").hidden && reduced()) reduce(false);
+    else openDev($("#dev-chat").hidden);
+  };
+  $("#dev-min").onclick = (/** @type {Event} */ e) => { e.stopPropagation(); reduce(!reduced()); };
+  $(".mini .d-head").addEventListener("click", (/** @type {MouseEvent} */ e) => {
+    if (reduced() && !(/** @type {Element} */ (e.target)).closest("button")) reduce(false);
+  });
+  if (store("min") === true) reduce(true);
   $("#dev-close").onclick = () => openDev(false);
   $("#dev-full").onclick = () => { location.hash = "#dev"; };
   $("#dev-reset").onclick = () => {
