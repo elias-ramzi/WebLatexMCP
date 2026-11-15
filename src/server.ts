@@ -3,6 +3,7 @@ import type { AppContext } from './context.js';
 import { registerListProjects } from './tools/listProjects.js';
 import { registerProjectSync } from './tools/projectSync.js';
 import { registerRegisterProject } from './tools/registerProject.js';
+import { registerUnregisterProject } from './tools/unregisterProject.js';
 import { registerSetCredential } from './tools/setCredential.js';
 import { registerCredentialPortal } from './tools/credentialPortal.js';
 import { registerListFiles } from './tools/listFiles.js';
@@ -98,6 +99,7 @@ export function createServer(
   registerListProjects(server, ctx);
   registerProjectSync(server, ctx);
   registerRegisterProject(server, ctx);
+  registerUnregisterProject(server, ctx);
   registerSetCredential(server, ctx);
   registerCredentialPortal(server, ctx);
   registerListFiles(server, ctx);

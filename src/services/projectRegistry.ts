@@ -314,6 +314,42 @@ export class ProjectRegistry {
     );
   }
 
+  /**
+   * Remove `id`'s entry — `unregister_project`. Under the registry's lock like `upsert`, every other
+   * entry written back exactly as read; refuses, writing nothing, when the file is not valid (the
+   * same reason `upsert` does). Returns whether the file held the entry.
+   */
+  async remove(id: string): Promise<boolean> {
+    assertValidProjectId(id);
+    return withFileLock(
+      this.lockPath,
+      async () => {
+        const read = readRawRegistry(this.filePath);
+        if (!read.ok) {
+          throw new Error(
+            `Refusing to update the project registry ${this.filePath}: it is not valid (` +
+              `${read.reason}), and rewriting it would drop every registration in it. Fix or ` +
+              'move the file, then try again.',
+          );
+        }
+        if (!Object.hasOwn(read.raw, id)) return false;
+        delete read.raw[id];
+        this.writeAtomic(read.raw);
+        return true;
+      },
+      { owner: 'registry' },
+    );
+  }
+
+  /**
+   * Every id the file holds — usable or not — or `undefined` when it cannot be read: an unreadable
+   * file is not known to have dropped anything, so `ProjectManager` forgets nothing on it.
+   */
+  heldIds(): ReadonlySet<string> | undefined {
+    const read = readRawRegistry(this.filePath);
+    return read.ok ? new Set(Object.keys(read.raw)) : undefined;
+  }
+
   private writeAtomic(map: RawRegistry): void {
     const tmp = `${this.filePath}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(map, null, 2)}\n`, 'utf8');

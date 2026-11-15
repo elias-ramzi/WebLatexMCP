@@ -30,7 +30,14 @@ import {
   type StartArgs,
   type UserInput,
 } from '../../src/ui/chatEngine.js';
-import { UiServer, pageCsp, tokenMatches, type UiServerOptions } from '../../src/ui/uiServer.js';
+import {
+  UiServer,
+  defaultPaperName,
+  pageCsp,
+  parseCloneCommand,
+  tokenMatches,
+  type UiServerOptions,
+} from '../../src/ui/uiServer.js';
 import { DEV_CHAT } from '../../src/ui/devMode.js';
 import { liveChildArgs, parseUiArgs } from '../../src/ui/uiCommand.js';
 import { readUiInfo, removeUiInfo, writeUiInfo } from '../../src/ui/uiFiles.js';
@@ -675,6 +682,14 @@ describe('UiServer', () => {
       });
       expect(reg.body).toMatchObject({ ok: true, project: 'new' });
       expect(calls).toContain('register_project {"project":"new","path":"/x"}');
+      const unreg = await req(port, {
+        path: '/api/unregister',
+        method: 'POST',
+        headers: auth,
+        body: { paper: 'p' },
+      });
+      expect(unreg.body).toMatchObject({ ok: true });
+      expect(calls).toContain('unregister_project {"project":"p"}');
       expect(await srv.paperDir('p')).toBeTruthy();
     } finally {
       await srv.close();
@@ -855,5 +870,31 @@ describe('web-latex-mcp ui', () => {
     expect(await readUiInfo(ws)).toBeUndefined();
     await writeUiInfo(ws, { pid: 2 ** 22 + 12345, port: 1, token: 't', startedAt: '' });
     expect(await readUiInfo(ws)).toBeUndefined();
+  });
+});
+
+describe('Add paper: what the dialog sends', () => {
+  it('takes the URL out of a pasted git clone line, with its branch', () => {
+    expect(parseCloneCommand('git clone https://git.overleaf.com/abc')).toEqual({
+      url: 'https://git.overleaf.com/abc',
+    });
+    expect(parseCloneCommand('git clone -b dev --depth 1 https://h/x.git mydir')).toEqual({
+      url: 'https://h/x.git',
+      branch: 'dev',
+    });
+    expect(parseCloneCommand('git clone --branch=main https://h/x')).toEqual({
+      url: 'https://h/x',
+      branch: 'main',
+    });
+    expect(parseCloneCommand(' https://h/x ')).toEqual({ url: 'https://h/x' });
+  });
+
+  it('names a paper from its URL or folder when Name is left empty', () => {
+    expect(defaultPaperName('https://git@git.overleaf.com/6ac8dba0')).toBe('6ac8dba0');
+    expect(defaultPaperName('git@github.com:me/thesis.git')).toBe('thesis');
+    expect(defaultPaperName('https://github.com/me/thesis.git?x=1')).toBe('thesis');
+    expect(defaultPaperName(undefined, '/home/me/papers/vador/')).toBe('vador');
+    expect(defaultPaperName(undefined, '~/papers/vador/main.tex')).toBe('vador');
+    expect(defaultPaperName('https://')).toBe('');
   });
 });
