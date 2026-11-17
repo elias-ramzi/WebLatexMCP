@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import {
   cloneLineNote,
   isGitCloneLine,
@@ -9,7 +9,11 @@ import {
   storedCloneLineRefusal,
 } from '../../src/lib/gitCloneLine.js';
 import { ProjectManager } from '../../src/services/projectManager.js';
-import { ProjectRegistry, registryPath } from '../../src/services/projectRegistry.js';
+import {
+  ProjectRegistry,
+  readProjectRegistry,
+  registryPath,
+} from '../../src/services/projectRegistry.js';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 
 /**
@@ -51,10 +55,26 @@ describe('parseGitCloneLine', () => {
     expect(cloneLineNote(parsed)).toContain('"my-paper" was ignored');
   });
 
-  it('refuses options, a missing URL and extra arguments, asking for the URL alone', () => {
+  it('reads -b / --branch / --branch= as the branch', () => {
     for (const line of [
       'git clone -b main https://git.overleaf.com/abc',
+      'git clone --branch main https://git.overleaf.com/abc',
+      'git clone --branch=main https://git.overleaf.com/abc paper',
+      "git clone https://git.overleaf.com/abc -b 'main'",
+    ]) {
+      const parsed = parseGitCloneLine(line);
+      expect(parsed.url, line).toBe('https://git.overleaf.com/abc');
+      expect(parsed.branch, line).toBe('main');
+      expect(cloneLineNote(parsed), line).toContain('with its branch "main"');
+    }
+  });
+
+  it('refuses other options, a missing URL and extra arguments, asking for the URL alone', () => {
+    for (const line of [
       'git clone https://git.overleaf.com/abc --depth 1',
+      'git clone -b https://git.overleaf.com/abc',
+      'git clone -b main -b dev https://git.overleaf.com/abc',
+      'git clone --branch= https://git.overleaf.com/abc',
       'git clone',
       'git clone https://h/x dir extra',
     ]) {
@@ -100,7 +120,7 @@ describe('parseGitCloneLine', () => {
   it('never echoes a credential in the refusal', () => {
     let message = '';
     try {
-      parseGitCloneLine(`git clone -b main https://${TOKEN}@git.overleaf.com/abc`);
+      parseGitCloneLine(`git clone --depth 1 https://${TOKEN}@git.overleaf.com/abc`);
     } catch (err) {
       message = err instanceof Error ? err.message : String(err);
     }
@@ -159,9 +179,37 @@ describe('a `git clone` line through ProjectManager.registerProject', () => {
       const registry = new ProjectRegistry(workspaceRoot);
       const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, registry);
       await expect(
-        pm.registerAndPersist({ id: 'paper', gitUrl: 'git clone -b main https://h/x.git' }),
+        pm.registerAndPersist({ id: 'paper', gitUrl: 'git clone --depth 1 https://h/x.git' }),
       ).rejects.toThrow(/Pass just the repository URL/);
       await expect(readFile(registryPath(workspaceRoot), 'utf8')).rejects.toThrow();
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("registers a line's -b as the branch, and refuses one that disagrees with branch", async () => {
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'ovl-cloneline-'));
+    try {
+      const registry = new ProjectRegistry(workspaceRoot);
+      const pm = new ProjectManager({ workspaceRoot, sessionId: 'test', projects: [] }, registry);
+      await expect(
+        pm.registerAndPersist({
+          id: 'other',
+          gitUrl: 'git clone -b dev https://h/y.git',
+          branch: 'main',
+        }),
+      ).rejects.toThrow(/names branch "dev" but branch is "main"/);
+      const held = await pm.registerAndPersist({
+        id: 'paper',
+        gitUrl: 'git clone -b dev https://h/x.git',
+      });
+      expect(held).toMatchObject({ gitUrl: 'https://h/x.git', branch: 'dev' });
+      const onDisk = JSON.parse(await readFile(registryPath(workspaceRoot), 'utf8')) as Record<
+        string,
+        { gitUrl: string; branch?: string }
+      >;
+      expect(onDisk['paper']).toMatchObject({ gitUrl: 'https://h/x.git', branch: 'dev' });
+      expect(onDisk['other']).toBeUndefined();
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
     }
@@ -169,10 +217,48 @@ describe('a `git clone` line through ProjectManager.registerProject', () => {
 });
 
 describe('a stored `git clone` line', () => {
-  it('fails fast at a remote operation, naming the fix, without rewriting the entry', async () => {
+  it('is read as its URL (and -b as its branch) wherever it was stored', async () => {
     const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'ovl-cloneline-'));
     try {
-      const line = `git clone https://git:${TOKEN}@git.overleaf.com/abc`;
+      // Exactly what Overleaf's Git menu shows, stored by hand or by an older version.
+      const line = 'git clone https://git@git.overleaf.com/6ac8dba0a9e29a8745293d90';
+      const pm = new ProjectManager({
+        workspaceRoot,
+        sessionId: 'test',
+        projects: [
+          { id: 'paper', gitUrl: line },
+          { id: 'branchy', gitUrl: 'git clone -b dev https://h/x.git' },
+        ],
+        envProjectIds: [],
+      });
+      expect(gitUrlOf(pm.requireRemoteGitProject('paper', 'sync with'))).toBe(
+        'https://git@git.overleaf.com/6ac8dba0a9e29a8745293d90',
+      );
+      expect(pm.requireRemoteGitProject('branchy', 'sync with')).toMatchObject({
+        gitUrl: 'https://h/x.git',
+        branch: 'dev',
+      });
+
+      // A registry entry is read the same way, its token stripped as registration strips it,
+      // and the file left as written.
+      await writeFile(
+        registryPath(workspaceRoot),
+        JSON.stringify({
+          stored: { gitUrl: `git clone https://git:${TOKEN}@git.overleaf.com/abc` },
+        }),
+      );
+      const fromRegistry = readProjectRegistry(workspaceRoot).find((p) => p.id === 'stored');
+      expect(fromRegistry && gitUrlOf(fromRegistry)).toBe('https://git@git.overleaf.com/abc');
+      expect(await readFile(registryPath(workspaceRoot), 'utf8')).toContain('git clone');
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails fast at a remote operation when it cannot be read, naming the fix', async () => {
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), 'ovl-cloneline-'));
+    try {
+      const line = `git clone --depth 1 https://git:${TOKEN}@git.overleaf.com/abc`;
       const pm = new ProjectManager({
         workspaceRoot,
         sessionId: 'test',
@@ -186,9 +272,7 @@ describe('a stored `git clone` line', () => {
         message = err instanceof Error ? err.message : String(err);
       }
       expect(message).toMatch(/is a `git clone` command line/);
-      expect(message).toContain(
-        'register_project { project: "paper", gitUrl: "https://git.overleaf.com/abc" }',
-      );
+      expect(message).toContain('register_project { project: "paper"');
       expect(message).toContain('project_sync { project: "paper"');
       expect(message).not.toContain(TOKEN);
       // Left as it is; and a local-only git tool is not refused for it.

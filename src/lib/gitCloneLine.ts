@@ -6,9 +6,10 @@ import { redactGitUrlCredentials, urlLoginName, withoutUserinfo } from './gitUrl
  * A `gitUrl` pasted as a whole `git clone` command line — what Overleaf's "Git" menu shows
  * (`git clone https://git@git.overleaf.com/<id>`). Held as written, it registered fine and then
  * every sync failed with `fatal: protocol 'git clone https' is not supported`. A registration
- * now takes the URL out of the line (`parseGitCloneLine`), and a registry or env entry that
- * already holds such a line fails fast at clone/sync/push (`storedCloneLineRefusal`) rather than
- * being rewritten behind the user's back.
+ * now takes the URL (and a `-b` branch) out of the line (`parseGitCloneLine`), and a registry or
+ * env entry that already holds one is read the same way when loaded (`readStoredGitUrl`), the
+ * file left as written. Only a stored line that cannot be read fails fast at clone/sync/push
+ * (`storedCloneLineRefusal`).
  *
  * Pure: no I/O. Every message that quotes the input runs it through `redact` (or the URL through
  * `redactGitUrlCredentials`) first, so a token pasted inside the line is never echoed.
@@ -32,6 +33,8 @@ export interface CloneLineUrl {
   fromCloneLine: boolean;
   /** The directory argument the line named, which is ignored (the project id names the clone). */
   ignoredDir?: string;
+  /** The branch a `-b <b>` / `--branch <b>` / `--branch=<b>` option named. */
+  branch?: string;
 }
 
 /**
@@ -57,18 +60,41 @@ export function parseGitCloneLine(gitUrl: string): CloneLineUrl {
     close !== undefined && trimmed.length >= 2 && trimmed.endsWith(close)
       ? trimmed.slice(1, -1).trim()
       : trimmed;
-  const args = whole.split(/\s+/).slice(2);
-  if (args.length === 0 || args.length > 2 || args.some((a) => a.startsWith('-'))) {
+  const words = whole.split(/\s+/).slice(2);
+  // `-b <b>` / `--branch <b>` / `--branch=<b>` is the one option read: it is what a host shows
+  // for a non-default branch, and it names exactly one thing. Every other option still refuses.
+  let branch: string | undefined;
+  const args: string[] = [];
+  let badOption = false;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]!;
+    if ((w === '-b' || w === '--branch') && i + 1 < words.length && branch === undefined) {
+      branch = unwrapQuoted(words[++i]!, gitUrl);
+    } else if (w.startsWith('--branch=') && branch === undefined) {
+      branch = unwrapQuoted(w.slice('--branch='.length), gitUrl);
+    } else if (w.startsWith('-')) {
+      badOption = true;
+    } else {
+      args.push(w);
+    }
+  }
+  if (branch === '' || branch?.startsWith('-')) badOption = true;
+  if (args.length === 0 || args.length > 2 || badOption) {
     throw new Error(
       `The gitUrl ${quoteId(redact(gitUrl.trim()))} is a \`git clone\` command line, not a URL, ` +
-        'and only `git clone <url>` or `git clone <url> <dir>` can be read as one — options ' +
-        'such as -b or --depth are not. Nothing was stored. Pass just the repository URL as ' +
+        'and only `git clone [-b <branch>] <url> [<dir>]` can be read as one — other options, ' +
+        'such as --depth, are not. Nothing was stored. Pass just the repository URL as ' +
         'gitUrl (and a branch as `branch`, on register_project).',
     );
   }
   const url = unwrapQuoted(args[0]!, gitUrl);
   const dir = args[1] !== undefined ? unwrapQuoted(args[1], gitUrl) : undefined;
-  return { url, fromCloneLine: true, ...(dir !== undefined ? { ignoredDir: dir } : {}) };
+  return {
+    url,
+    fromCloneLine: true,
+    ...(dir !== undefined ? { ignoredDir: dir } : {}),
+    ...(branch !== undefined ? { branch } : {}),
+  };
 }
 
 const OPENERS = new Map([
@@ -107,11 +133,37 @@ export function cloneLineNote(parsed: CloneLineUrl): string {
   return (
     ' The gitUrl was a `git clone` command line: the `git clone` prefix was removed and only ' +
     'the URL was registered' +
+    (parsed.branch !== undefined ? `, with its branch ${quoteId(parsed.branch)}` : '') +
     (parsed.ignoredDir !== undefined
       ? ` (the directory argument ${quoteId(parsed.ignoredDir)} was ignored: the project id ` +
         'names the clone directory).'
       : '.')
   );
+}
+
+/**
+ * A git entry as read from the registry or `WEB_LATEX_MCP_PROJECTS`, with a `git clone` line in
+ * its gitUrl read as that line's URL (and its `-b` as the branch, unless the entry names one) —
+ * the line Overleaf's Git menu shows is what people paste, and it should simply work wherever it
+ * was stored. The stored text is not rewritten. A line that cannot be read (other options) is
+ * returned as is, and `ProjectManager.requireRemoteGitProject` refuses it with the fix.
+ * `strip` (registry entries) also removes a URL secret, as registration would have: a token
+ * inside a stored clone line never reached `stripGitUrlCredentials`. Env entries are not
+ * stripped, like every env URL.
+ */
+export function readStoredGitUrl<T extends { gitUrl: string; branch?: string }>(
+  entry: T,
+  strip: (url: string) => string = (u) => u,
+): T {
+  if (!isGitCloneLine(entry.gitUrl)) return entry;
+  let parsed: CloneLineUrl;
+  try {
+    parsed = parseGitCloneLine(entry.gitUrl);
+  } catch {
+    return entry;
+  }
+  const branch = entry.branch ?? parsed.branch;
+  return { ...entry, gitUrl: strip(parsed.url), ...(branch !== undefined ? { branch } : {}) };
 }
 
 /**

@@ -71,24 +71,37 @@ describe('project_sync with a `git clone` command line as gitUrl', () => {
     const { client, workspace } = await connect([]);
     const res = await client.callTool({
       name: 'project_sync',
-      arguments: { project: 'paper', gitUrl: `git clone -b master ${remote.url}` },
+      arguments: { project: 'paper', gitUrl: `git clone --depth 1 ${remote.url}` },
     });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/Pass just the repository URL/);
     await expect(stat(path.join(workspace, 'paper'))).rejects.toThrow();
   });
 
-  it('fails fast on an entry that already holds a `git clone` line', async () => {
+  it('clones and syncs an entry that already holds a `git clone` line (the Overleaf paste)', async () => {
     const remote = await createFakeRemote();
     cleanups.push(remote.cleanup);
     const { client, workspace } = await connect([
       { id: 'paper', gitUrl: `git clone ${remote.url}` },
     ]);
     const res = await client.callTool({ name: 'project_sync', arguments: { project: 'paper' } });
+    expect(res.isError, textOf(res)).toBeFalsy();
+    expect((res.structuredContent as { action: string }).action).toBe('cloned');
+    expect(await readFile(path.join(workspace, 'paper', 'main.tex'), 'utf8')).toContain('Hello');
+    const again = await client.callTool({ name: 'project_sync', arguments: { project: 'paper' } });
+    expect((again.structuredContent as { action: string }).action).toBe('up-to-date');
+  });
+
+  it('still fails fast on a stored line it cannot read, naming the fix', async () => {
+    const remote = await createFakeRemote();
+    cleanups.push(remote.cleanup);
+    const { client, workspace } = await connect([
+      { id: 'paper', gitUrl: `git clone --depth 1 ${remote.url}` },
+    ]);
+    const res = await client.callTool({ name: 'project_sync', arguments: { project: 'paper' } });
     expect(res.isError).toBe(true);
     const text = textOf(res);
     expect(text).toMatch(/is a `git clone` command line/);
-    expect(text).toContain(`gitUrl: ${JSON.stringify(remote.url)}`);
     expect(text).not.toMatch(/protocol .* is not supported/);
     await expect(stat(path.join(workspace, 'paper'))).rejects.toThrow();
 

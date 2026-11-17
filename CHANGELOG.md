@@ -126,10 +126,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   (`https://doi.org/10.48550/arxiv…`); the format-bibliography skill rekeys them.
 - **A push that races a collaborator on Overleaf is retried** instead of failing with
   `[remote rejected] main -> main (invalid old id sent)`, like any other remote-moved rejection.
-- **A `git clone <url>` line is accepted as a `gitUrl`** by `register_project` and
-  `project_sync`, reduced to its URL (a token in it is still stripped, never stored). A project
-  already registered with such a line is refused at its next sync, push or reset with the command
-  that fixes it, instead of failing with `protocol 'git clone https' is not supported`.
+- **The `git clone <url>` line Overleaf shows can be pasted as a `gitUrl`**, in `register_project`
+  and `project_sync`, quoted or not: it is reduced to its URL (a token in it is still stripped,
+  never stored), and a `-b <branch>` becomes the branch. A project already registered with such a
+  line now just works — the line is read as its URL wherever it is loaded — instead of failing
+  every sync with `protocol 'git clone https' is not supported`.
 - **`edit_file`'s "matches N times" refusal says when the extra matches are commented out**, and
   that `excludeComments: true` matches the live one only — a paper that keeps old versions as `%`
   comments made edits fail as non-unique, and sessions fell back to editing files from the shell.

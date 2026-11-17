@@ -357,8 +357,12 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   outside `CREDENTIAL_HOST_RE` and usernames/tokens with CR/LF/NUL are refused.
 - **A `gitUrl` that is a whole `git clone <url> [<dir>]` line is read as its URL** (`parseGitCloneLine`,
   `src/lib/gitCloneLine.ts`) before `stripGitUrlCredentials`, in `ProjectManager.registerProject` and in
-  the tools before their notes and pathToken check; options or extra words are refused, echoing the
-  input only through `redact`. A stored clone line is never rewritten: remote operations go through
+  the tools before their notes and pathToken check; `-b`/`--branch` is read as the branch (a
+  different `branch` argument refuses), other options or extra words are refused, echoing the input
+  only through `redact`. **A stored clone line just works**: `readStoredGitUrl` reads it as its URL
+  (and `-b` as the branch) wherever an entry is loaded — `readRegistryFile` (stripped, as
+  registration strips), `loadConfig`'s env entries (not stripped, as no env URL is) and the
+  `ProjectManager` constructor — and the file is left as written. Only an unreadable one reaches
   `ProjectManager.requireRemoteGitProject`, which refuses it (`storedCloneLineRefusal`) naming the
   `register_project` fix.
 - **URL secrets are stripped before persist/echo/clone** (`stripGitUrlCredentials`,
