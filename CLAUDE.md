@@ -34,9 +34,13 @@ Local gate before work is done: `typecheck` + `lint` + `format:check` + `test`.
 
 - Before committing: `git fetch origin && git rebase origin/dev` (or merge), resolve conflicts, re-run
   the gate. Commit/push only when the user asks.
-- `dev` is the integration branch (work branches off it, PRs target it). `main` is release; a guard
-  workflow rejects PRs into `main` from anything but `dev` (`.github/workflows/only-dev-into-main.yml`).
-- A PR into `dev` must change `CHANGELOG.md`'s `[Unreleased]` section (`.github/workflows/changelog.yml`).
+- `dev` is the integration branch, and work may be **committed and pushed straight to `dev`** (no PR
+  needed; the local dev build the sessions run follows it). Keep `CHANGELOG.md`'s `[Unreleased]`
+  section updated in the same commit, and run the full gate before pushing: CI runs on every push to
+  `dev` but no longer blocks it. Never force-push `dev`. A PR into `dev` is still fine for larger work,
+  and its CHANGELOG check (`.github/workflows/changelog.yml`) still applies.
+- `main` is release; a guard workflow rejects PRs into `main` from anything but `dev`
+  (`.github/workflows/only-dev-into-main.yml`).
 
 ## Architecture
 
