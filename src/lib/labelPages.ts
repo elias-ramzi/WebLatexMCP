@@ -40,7 +40,9 @@
  *     found, its page just is not printed anywhere in this document any more. And a printed page
  *     that `/PageLabels` maps to **more than one** page (`'ambiguousPrintedPage'`) is legitimate —
  *     a restarted `\pagenumbering`, or an unnumbered front page — so taking the first match would
- *     re-create the wrong-page failure by another route; both candidates are named instead.
+ *     re-create the wrong-page failure by another route; both candidates are named instead —
+ *     unless the label's own hyperref destination picks one (the destination route, below fact
+ *     3), which here needs the tree to label the destination's page with the printed page.
  *
  *     One tree is never looked anything up in: a **beamer** deck's (`pageLabelsIgnored`,
  *     {@link usablePageLabelIndex}). The lookup is exact only because hyperref labels each page
@@ -136,6 +138,45 @@
  *     named destination, which hyperref writes into the PDF for its anchor. On the candidate page
  *     it verifies that page in place of the folio and neighbour check, and nothing more
  *     ({@link destinationPageOf}, #223).
+ *
+ *     **The destination route.** The same destination is the one record that can say which copy
+ *     of a repeated printed page a label is on — a CVPR paper with its supplement in one PDF
+ *     restarts at 1, and every printed page of the supplement names two PDF pages. So where a
+ *     route has refused a label for exactly that ambiguity — `'ambiguousPrintedPage'` on the
+ *     `/PageLabels` route; `'renumbered'`, `'restarted'` or `'lastPageMismatch'` on the
+ *     printed-page route — and the label has a destination ({@link tryDestination}), its page is
+ *     taken instead, but only when what the route reads for that page agrees
+ *     ({@link destinationVerdict}): its `/PageLabels` entry is the printed page, or (without a
+ *     tree) every folio its text shows reads it, and whenever the shipout record is usable its
+ *     mark is the printed page's counter — at least one of those positively, none against.
+ *     Otherwise the route's own refusal stands, naming the destination's page and what
+ *     contradicted it. It runs inside the routes, so every build-level refusal (fact 2:
+ *     `'multiplyDefined'`, pgfpages, `'nothingShipped'`, `'stalePdf'`) and a deck's
+ *     `'slideMismatch'` come first, and it is never used for a deck. A label with no anchor (no
+ *     hyperref) or no destination of that name keeps the route's refusal unchanged, and a label
+ *     a route resolves on its own is never moved by it. The resolved label carries
+ *     `via: 'destination'`.
+ *
+ *     Corroboration only proves the destination's page is ONE of the copies of the number; which
+ *     copy rests on the destination alone, so its anchor must name this label and nothing else
+ *     ({@link anchorCollision}). hyperref names anchors after `\theH<counter>`, so a supplement
+ *     that resets a counter (`\setcounter{figure}{0}`, whatever `\thefigure` it then prints)
+ *     reuses the main paper's anchors — `figure.1` twice — and the PDF keeps the FIRST
+ *     destination of the name: verified with real pdflatex, the supplement figure's destination
+ *     is the main figure's page, whose tree label, folio and shipout mark all read the same
+ *     printed page. So the route (and the #223 shortcut above, which then falls back to the text
+ *     check) refuses when another `\newlabel` read carries the same anchor (`'sharedAnchor'`),
+ *     when the label set read is incomplete so that cannot be ruled out (`'anchorUnchecked'`), or
+ *     when the build's `.log` reports a duplicate destination of that name (`'duplicateDestination'`
+ *     — pdfTeX's "destination with the same identifier", LuaTeX's "ignoring duplicate
+ *     destination"; XeTeX's driver writes none into the `.log`, so there the `.aux` check is the
+ *     whole guard). What it still trusts, stated: the destination is written by the document,
+ *     so a hand-made `\hypertarget` of the anchor's name on the other copy of the number placed
+ *     BEFORE the label's own (hyperref keeps the first of two; the engine's duplicate warning
+ *     refuses that too under pdfTeX and LuaTeX) resolves to that copy — it only gets past here
+ *     when that page also prints the number and was shipped with its counter. The shipout record's competing-page
+ *     rule is not applied on this route: the other page shipped with the same counter is the
+ *     ambiguity the destination settles.
  *
  *     The label's NUMBER is not what is checked ("the page shows 1.1 somewhere"): that is not
  *     evidence of anything in an `article`, whose figure and table numbers are single digits, and
@@ -315,10 +356,48 @@ export interface ResolvedLabel {
    * `printedPage` on, or — when the document carries no usable tree — the printed page read as a
    * decimal integer, accepted only because that page's own folio reads `printedPage` and a
    * neighbouring page's reads the adjacent number.
-   * {@link LabelPagePlan.labelSource} says which of the two it was.
+   * {@link LabelPagePlan.labelSource} says which of the two it was — unless `via` is set.
    */
   page: number;
+  /**
+   * `'destination'` when the printed page named more than one PDF page (a restarted or renumbered
+   * numbering) and the page was taken from the label's own hyperref named destination instead,
+   * accepted only because that page's own `/PageLabels` entry, folio or shipout mark agrees with
+   * `printedPage` ({@link destinationVerdict}). Absent on every other resolution.
+   */
+  via?: 'destination';
 }
+
+/**
+ * What contradicted — or failed to corroborate — the page a label's hyperref destination points
+ * at, when the destination route ({@link destinationVerdict}) was tried and refused. Echoed in the
+ * refusal text, never used to pick anything:
+ *  - `'sharedAnchor'` — another `\newlabel` in the `.aux` (`labels`) carries the same hyperref
+ *    anchor, so the PDF's one destination of that name may be the other label's
+ *    ({@link anchorCollision});
+ *  - `'anchorUnchecked'` — not every `\newlabel` could be read (past the lookup cap, unparseable,
+ *    or in an `\@input` that was not read), so a shared anchor cannot be ruled out;
+ *  - `'duplicateDestination'` — the build's `.log` reports a second destination of that name,
+ *    which the engine dropped;
+ *  - `'pageLabel'` — the PDF's `/PageLabels` tree labels that page `pageLabel` (`null`: no label),
+ *    not the printed page;
+ *  - `'folio'` — that page reads as page number `folios`, not the printed page;
+ *  - `'shipout'` — the build's `.log` records that page as shipped out with counter `shipout`
+ *    (absent: no entry for it), not the printed page;
+ *  - `'uncorroborated'` — nothing contradicts it, but nothing confirms it either: the page shows
+ *    no page number and the shipout record was not usable, and a destination is written by the
+ *    document, so it is never taken on its own;
+ *  - `'noEvidence'` — that page's text could not be read to check it.
+ */
+export type DestinationContradiction =
+  | { kind: 'sharedAnchor'; anchor: string; labels: string[] }
+  | { kind: 'anchorUnchecked'; anchor: string }
+  | { kind: 'duplicateDestination'; anchor: string }
+  | { kind: 'pageLabel'; pageLabel: string | null }
+  | { kind: 'folio'; folios: string[] }
+  | { kind: 'shipout'; shipout?: number }
+  | { kind: 'uncorroborated' }
+  | { kind: 'noEvidence' };
 
 /**
  * Why one label could not be turned into a page. Counted apart rather than collapsed into one
@@ -452,10 +531,15 @@ export interface LabelFailure {
   /** `'uncorroboratedFolio'` only: what each in-range neighbouring page read as, in page order
    *  (one entry on the first or last page of the PDF, two otherwise). */
   neighbours?: NeighbourFolio[];
-  /** `'unverifiedPage'` on the printed-page route, other than `'shipoutMismatch'`: the 1-based
-   *  PDF page the label's own hyperref destination points at, when the PDF has one and it is not
-   *  the candidate page — why the destination did not verify it. Echoed, never used. */
+  /** The 1-based PDF page the label's own hyperref destination points at, echoed (never used)
+   *  to say why it did not settle the label: on `'unverifiedPage'` on the printed-page route,
+   *  other than `'shipoutMismatch'`, when it is not the candidate page; and on
+   *  `'ambiguousPrintedPage'`, `'restarted'`, `'renumbered'` and `'lastPageMismatch'` together
+   *  with `destinationContradiction`, when the destination route was tried and refused. */
   destinationPage?: number;
+  /** Set exactly when the destination route ({@link destinationVerdict}) was tried for this
+   *  label and refused: what contradicted, or failed to corroborate, `destinationPage`. */
+  destinationContradiction?: DestinationContradiction;
   /** `'unverifiedPage'` with `'pastEndOfPdf'` only: how many pages the PDF on disk has. */
   pageCount?: number;
   /** `'unverifiedPage'` with `'lastPageMismatch'` only: the last PDF page and what it read as
@@ -1078,6 +1162,13 @@ export function planLabelPages(
   const seenLabel = new Set<string>();
   const seenPage = new Set<number>();
   const destinationVerified: string[] = [];
+  const accept = (label: string, printedPage: string, page: number, byDest: boolean): void => {
+    resolved.push({ label, printedPage, page, ...(byDest ? { via: 'destination' as const } : {}) });
+    if (!seenPage.has(page)) {
+      seenPage.add(page);
+      pages.push(page);
+    }
+  };
 
   for (const label of labels) {
     if (seenLabel.has(label)) {
@@ -1181,13 +1272,21 @@ export function planLabelPages(
       if (only === undefined) {
         // Never the first match. A document that restarts \pagenumbering prints "1" twice, and
         // taking the lower index renders the front matter when the caller meant the body — the
-        // exact silently-wrong page this whole feature exists to refuse.
+        // exact silently-wrong page this whole feature exists to refuse. The label's own
+        // hyperref destination may pick between them, but only when the tree (and the shipout
+        // record, when usable) agrees with the page it points at — never on its own.
+        const tried = tryDestination(aux, entry, evidence, pageLabels, 'pageLabels');
+        if (tried && 'page' in tried) {
+          accept(label, entry.page, tried.page, true);
+          continue;
+        }
         failed.push({
           label,
           reason: 'ambiguousPrintedPage',
           printedPage: entry.page,
           candidatePages: candidates.slice(0, MAX_AMBIGUOUS_CANDIDATES),
           candidatePagesOmitted: Math.max(0, candidates.length - MAX_AMBIGUOUS_CANDIDATES),
+          ...(tried ?? {}),
         });
         continue;
       }
@@ -1215,22 +1314,36 @@ export function planLabelPages(
         failed.push({ label, reason: 'notAPageNumber', printedPage: entry.page });
         continue;
       }
-      if (renumberedBy) {
-        failed.push({ label, reason: 'renumbered', printedPage: entry.page });
-        continue;
-      }
-      if (restartedAt) {
+      if (renumberedBy || restartedAt) {
         // Every label, not only those on a repeated number: once one arabic number stands for
         // two pages, the folio check below can confirm the wrong one of them — the main paper's
-        // page 1 reads "1" and its page 2 reads "2", exactly as the supplement's would.
-        failed.push({ label, reason: 'restarted', printedPage: entry.page });
+        // page 1 reads "1" and its page 2 reads "2", exactly as the supplement's would. Only the
+        // label's own hyperref destination can say which copy it is on, and it is taken only
+        // when that page's folio or shipout mark agrees with the printed page and neither
+        // contradicts it (destinationVerdict).
+        const tried = tryDestination(aux, entry, evidence, pageLabels, 'printedPage');
+        if (tried && 'page' in tried) {
+          accept(label, entry.page, tried.page, true);
+          continue;
+        }
+        failed.push({
+          label,
+          reason: renumberedBy ? 'renumbered' : 'restarted',
+          printedPage: entry.page,
+          ...(tried ?? {}),
+        });
         continue;
       }
       // The label's own hyperref destination on the candidate page stands in for the page's
       // text (the folio and its neighbour) — and for nothing else: every refusal above and
       // below still applies.
+      // A destination whose anchor another label shares (a supplement that resets a counter
+      // reuses its anchors, and the PDF keeps only the first destination of a name) may be the
+      // other label's, so it verifies nothing: the text check decides, as it does for a
+      // destination on another page.
       const destination = destinationPageOf(aux, entry, evidence);
-      const byDestination = destination !== undefined && destination === page;
+      const collision = destination !== undefined ? anchorCollision(aux, entry) : undefined;
+      const byDestination = destination !== undefined && destination === page && !collision;
       const check = byDestination ? undefined : verifyCandidatePage(page, entry.page, evidence);
       if (check) {
         failed.push({
@@ -1243,11 +1356,19 @@ export function planLabelPages(
           ...(check.neighbours ? { neighbours: check.neighbours } : {}),
           ...(check.unverified === 'pastEndOfPdf' ? { pageCount: evidence?.pageCount } : {}),
           ...(destination !== undefined ? { destinationPage: destination } : {}),
+          ...(collision ? { destinationContradiction: collision } : {}),
         });
         continue;
       }
-      if (byDestination) destinationVerified.push(label);
       if (lastPage) {
+        // The last page says the numbering does not reach the end in step — usually a restart
+        // the .aux shows no decrease for — so the candidate may be the other copy of its
+        // number. The destination route decides it as it does a visible restart, or refuses.
+        const tried = tryDestination(aux, entry, evidence, pageLabels, 'printedPage');
+        if (tried && 'page' in tried) {
+          accept(label, entry.page, tried.page, true);
+          continue;
+        }
         failed.push({
           label,
           reason: 'unverifiedPage',
@@ -1255,9 +1376,11 @@ export function planLabelPages(
           number: entry.number,
           unverified: 'lastPageMismatch',
           lastPage,
+          ...(tried ?? {}),
         });
         continue;
       }
+      if (byDestination) destinationVerified.push(label);
     }
 
     // After either route has settled on a page, and only ever against it: the shipout record may
@@ -1276,11 +1399,7 @@ export function planLabelPages(
       continue;
     }
 
-    resolved.push({ label, printedPage: entry.page, page });
-    if (!seenPage.has(page)) {
-      seenPage.add(page);
-      pages.push(page);
-    }
+    accept(label, entry.page, page, false);
   }
 
   if (failed.length > 0) {
@@ -1448,14 +1567,153 @@ function destinationPageOf(
   return evidence?.destinations?.get(entry.anchor);
 }
 
-/** The anchors {@link resolveLabelPages} asks the PDF for: each requested label's, when the
- *  printed-page route could use it ({@link destinationPageOf}). */
-function anchorsToLookUp(labels: string[], aux: AuxFloatsResult): string[] {
+/**
+ * The destination route, tried only where a route has already refused a label because its
+ * printed page stands for more than one PDF page: `'ambiguousPrintedPage'` on the `/PageLabels`
+ * route, `'renumbered'`, `'restarted'` and `'lastPageMismatch'` on the printed-page route — and
+ * only after every build-level refusal (`'multiplyDefined'`, the two pgfpages reasons,
+ * `'nothingShipped'`, `'stalePdf'`) and, for a deck, `'slideMismatch'` has passed, since it is
+ * reached from inside the routes. `undefined` when the label has no destination to try (no
+ * anchor — no hyperref — no destination of that name in the PDF, or a beamer deck): the route's
+ * own refusal then stands unchanged. Otherwise the page, or the fields that say why the
+ * destination did not settle it ({@link destinationVerdict}).
+ */
+function tryDestination(
+  aux: AuxFloatsResult,
+  entry: AuxLabel,
+  evidence: LabelPageEvidence | undefined,
+  pageLabels: readonly string[] | null | undefined,
+  route: LabelSource,
+):
+  | { page: number }
+  | { destinationPage: number; destinationContradiction: DestinationContradiction }
+  | undefined {
+  const destination = destinationPageOf(aux, entry, evidence);
+  if (destination === undefined) return undefined;
+  const contradiction =
+    anchorCollision(aux, entry) ??
+    destinationVerdict(aux, entry, evidence, pageLabels, route, destination);
+  return contradiction
+    ? { destinationPage: destination, destinationContradiction: contradiction }
+    : { page: destination };
+}
+
+/**
+ * Why the label's anchor cannot identify its destination, or `undefined` when nothing says so.
+ *
+ * Corroboration ({@link destinationVerdict}) only shows that the destination's page is ONE of the
+ * copies of the printed page; which copy rests on the destination alone. And hyperref names an
+ * anchor after `\theH<counter>`, so a supplement that resets its counters (`\setcounter{figure}{0}`,
+ * whatever `\thefigure` it prints) gives its first figure the main paper's anchor `figure.1` —
+ * the PDF keeps the FIRST destination of that name ("duplicate ignored"), so the supplement label's
+ * destination is the main figure's page, which prints the same number and was shipped with the
+ * same counter, and every check passes on the wrong page (verified with real pdflatex). So the
+ * anchor must be the label's alone:
+ *  - `'sharedAnchor'`: another `\newlabel` in the label set the lookup read carries it (this
+ *    covers every engine — XeTeX's PDF driver reports duplicates nowhere the server reads);
+ *  - `'anchorUnchecked'`: that set is incomplete (`omitted`, `dropped`, `unreadInputs`), so a
+ *    sharing label cannot be ruled out;
+ *  - `'duplicateDestination'`: the build's `.log` reports a duplicate destination of that name
+ *    (`AuxFloatsResult.duplicateDestinations`: a `\hypertarget` or a label in an unread file).
+ * Every one only refuses — the destination route, or the #223 shortcut, which then falls back to
+ * the text check. The log is document-writable, which is acceptable for exactly that reason.
+ */
+function anchorCollision(
+  aux: AuxFloatsResult,
+  entry: AuxLabel,
+): DestinationContradiction | undefined {
+  const anchor = entry.anchor;
+  if (anchor === undefined) return undefined;
+  const labels: string[] = [];
+  for (const other of aux.floats) {
+    if (other !== entry && other.anchor === anchor && other.label !== entry.label) {
+      if (!labels.includes(other.label)) labels.push(other.label);
+    }
+  }
+  if (labels.length > 0) {
+    return { kind: 'sharedAnchor', anchor, labels: labels.slice(0, MAX_AMBIGUOUS_CANDIDATES) };
+  }
+  if (aux.omitted > 0 || aux.dropped > 0 || (aux.unreadInputs ?? 0) > 0) {
+    return { kind: 'anchorUnchecked', anchor };
+  }
+  if (aux.duplicateDestinations?.has(anchor)) return { kind: 'duplicateDestination', anchor };
+  return undefined;
+}
+
+/**
+ * `undefined` when PDF page `destination` — where the label's own hyperref destination points —
+ * is corroborated as the label's page by the evidence the routes already read, otherwise what
+ * contradicted it or failed to confirm it.
+ *
+ * Why a destination may pick a page here when it only ever VERIFIES one elsewhere
+ * ({@link destinationPageOf}): these labels are refused because their printed page names two or
+ * more PDF pages, so the `.aux` alone cannot say which, and the destination is the one record
+ * that names a page INDEX. But it is written by the document too — a `\label` far from its
+ * `\refstepcounter`, a hand-written `\hypertarget` of the same name — so it is never believed on
+ * its own. The page it points at must agree with what the route reads for that page:
+ *  - on the `/PageLabels` route, its tree label must be the printed page exactly — and that
+ *    corroborates it;
+ *  - on the printed-page route, every folio its text shows must read the printed page exactly
+ *    (an empty reading contradicts nothing, but corroborates nothing either; a page whose text was
+ *    not read refuses);
+ *  - on both, when the build's shipout record is usable ({@link usableShipouts}) and the printed
+ *    page is decimal, the page must have been shipped with that counter — which corroborates it.
+ *    The printed-page route's competing-page rule ({@link shipoutVerdict}) is NOT applied: another
+ *    page shipped with the same counter is exactly the ambiguity the destination resolves.
+ * And at least one of those must positively agree — on the printed-page route a page with no folio
+ * and no usable shipout record is `'uncorroborated'`. Every refusal here only keeps the route's
+ * own refusal; nothing here can move a page a route resolved on its own.
+ */
+function destinationVerdict(
+  aux: AuxFloatsResult,
+  entry: AuxLabel,
+  evidence: LabelPageEvidence | undefined,
+  pageLabels: readonly string[] | null | undefined,
+  route: LabelSource,
+  destination: number,
+): DestinationContradiction | undefined {
+  let corroborated: boolean;
+  if (route === 'pageLabels') {
+    const pageLabel = pageLabels?.[destination - 1];
+    if (pageLabel !== entry.page) {
+      return { kind: 'pageLabel', pageLabel: typeof pageLabel === 'string' ? pageLabel : null };
+    }
+    corroborated = true;
+  } else {
+    const lines = evidence?.text.get(destination);
+    if (!lines) return { kind: 'noEvidence' };
+    const folios = readFolios(lines);
+    if (folios.some((f) => f !== entry.page)) return { kind: 'folio', folios };
+    corroborated = folios.length > 0;
+  }
+  const shipouts = usableShipouts(aux, evidence?.pageCount);
+  const printed = parsePrintedPage(entry.page);
+  if (shipouts && printed !== undefined) {
+    const shipout = shipouts[destination - 1];
+    if (shipout !== printed) {
+      return { kind: 'shipout', ...(shipout === undefined ? {} : { shipout }) };
+    }
+    corroborated = true;
+  }
+  return corroborated ? undefined : { kind: 'uncorroborated' };
+}
+
+/** The anchors {@link resolveLabelPages} asks the PDF for: each requested label's, when a route
+ *  could use it ({@link destinationPageOf}) — all of them on the printed-page route, and on the
+ *  `/PageLabels` route (`ambiguousIn`) only those whose printed page the tree puts on more than
+ *  one page, the only ones that route ever tries a destination for. */
+function anchorsToLookUp(
+  labels: string[],
+  aux: AuxFloatsResult,
+  ambiguousIn?: ReadonlyMap<string, number[]>,
+): string[] {
   if (aux.beamerNav) return [];
   const wanted = new Set(labels);
   const anchors = new Set<string>();
   for (const entry of aux.floats) {
-    if (wanted.has(entry.label) && entry.anchor !== undefined) anchors.add(entry.anchor);
+    if (!wanted.has(entry.label) || entry.anchor === undefined) continue;
+    if (ambiguousIn && (ambiguousIn.get(entry.page)?.length ?? 0) < 2) continue;
+    anchors.add(entry.anchor);
   }
   return [...anchors];
 }
@@ -1638,18 +1896,37 @@ export async function resolveLabelPages(
   }
   const pageLabels = await reader.pageLabels();
   const pageCount = await reader.pageCount();
-  if (usablePageLabelIndex(aux, pageLabels).index) {
-    return planLabelPages(labels, aux, pageLabels, { pageCount, text: new Map() });
-  }
-  const wanted = pagesToVerify(labels, aux, pageCount);
-  const text = wanted.length > 0 ? await reader.pageText(wanted) : new Map<number, string[]>();
-  // Only where pagesToVerify found a candidate to check: when it found none, every label is
-  // refused on a whole-build or heuristic ground a destination does not answer.
-  const anchors = wanted.length > 0 ? anchorsToLookUp(labels, aux) : [];
-  const destinations =
-    anchors.length > 0 && reader.destinationPages
+  // A build every label of which is refused before either route runs (pgfpages named or
+  // unknown, a .log that shipped nothing, a stale PDF) has no use for a destination: the
+  // destination route only ever runs behind those refusals.
+  const buildRefused =
+    aux.pgfpages !== false ||
+    shippedNothing(aux, pageCount >= 1) ||
+    staleBuildEvidence(aux, { pageCount, hasPages: pageCount >= 1 }) !== undefined;
+  const lookUp = async (anchors: string[]): Promise<ReadonlyMap<string, number> | undefined> =>
+    !buildRefused && anchors.length > 0 && reader.destinationPages
       ? await reader.destinationPages(anchors)
       : undefined;
+  const tree = usablePageLabelIndex(aux, pageLabels).index;
+  if (tree) {
+    // Destinations only for labels whose printed page the tree puts on several pages — the
+    // only labels this route tries one for. No page text: the tree corroborates the page.
+    const destinations = await lookUp(anchorsToLookUp(labels, aux, tree));
+    return planLabelPages(labels, aux, pageLabels, {
+      pageCount,
+      text: new Map(),
+      ...(destinations ? { destinations } : {}),
+    });
+  }
+  const wanted = pagesToVerify(labels, aux, pageCount);
+  const destinations = await lookUp(anchorsToLookUp(labels, aux));
+  // The destination route checks the folio of the page each destination points at, so those
+  // pages are read too — in the same pass, each page once.
+  const toRead = [...wanted];
+  for (const page of destinations?.values() ?? []) {
+    if (page >= 1 && page <= pageCount && !toRead.includes(page)) toRead.push(page);
+  }
+  const text = toRead.length > 0 ? await reader.pageText(toRead) : new Map<number, string[]>();
   return planLabelPages(labels, aux, pageLabels, {
     pageCount,
     text,
@@ -1744,7 +2021,8 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
           `${quoteLabel(failure.printedPage ?? '')}, and the PDF prints that on ` +
           `${candidates.length + omitted} different pages (PDF pages ${candidates.join(', ')}` +
           `${more}) — a document that restarts \\pagenumbering legitimately prints one number ` +
-          'twice, so there is no single page to render and picking one would be a coin flip.',
+          'twice, so there is no single page to render and picking one would be a coin flip.' +
+          destinationText(failure, plan.labelSource),
       );
       continue;
     }
@@ -1763,10 +2041,12 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
     }
     if (failure.reason === 'unverifiedPage') {
       const target =
-        failure.destinationPage === undefined
-          ? ''
-          : ` Its hyperref link target (the destination \\ref jumps to) is on PDF page ` +
-            `${failure.destinationPage}, not on the candidate page, so it could not confirm it.`;
+        failure.destinationContradiction !== undefined
+          ? destinationText(failure, plan.labelSource)
+          : failure.destinationPage === undefined
+            ? ''
+            : ` Its hyperref link target (the destination \\ref jumps to) is on PDF page ` +
+              `${failure.destinationPage}, not on the candidate page, so it could not confirm it.`;
       lines.push(
         `  - ${quoteLabel(failure.label)}: ${unverifiedText(failure, plan.labelSource)}${target}`,
       );
@@ -1863,7 +2143,8 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
           `${quoteLabel(after?.page ?? '')} (labels are written as their pages ship, so a page ` +
           'number that goes DOWN is a restart) — so one printed number stands for more than one ' +
           'PDF page here, and which one this label is on cannot be told from the .aux or the ' +
-          'folios.',
+          'folios.' +
+          destinationText(failure, plan.labelSource),
       );
       continue;
     }
@@ -1871,7 +2152,8 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
       `  - ${quoteLabel(failure.label)}: prints on page ${quoteLabel(failure.printedPage ?? '')}, ` +
         `but this document renumbers its pages — ${quoteLabel(plan.renumberedBy?.label ?? '')} ` +
         `prints on ${quoteLabel(plan.renumberedBy?.page ?? '')} — so a printed page is not the ` +
-        'PDF page index here and the offset cannot be computed from the .aux.',
+        'PDF page index here and the offset cannot be computed from the .aux.' +
+        destinationText(failure, plan.labelSource),
     );
   }
 
@@ -1913,7 +2195,10 @@ export function labelRefusalMessage(plan: LabelPagePlan, aux: AuxFloatsResult): 
     lines.push(
       (restarted ? '  A' : '  If the numbering does restart: a') +
         ' restarted arabic numbering is ambiguous on either route: /PageLabels (hyperref) ' +
-        'prints the repeated numbers too. Numbering the restarted part distinctly (e.g. ' +
+        "prints the repeated numbers too. A label's hyperref link target picks between the " +
+        "copies only when that page's own /PageLabels entry, page number or .log shipout " +
+        'record agrees with the printed page and none contradicts it. Numbering the restarted ' +
+        'part distinctly (e.g. ' +
         '\\renewcommand{\\thepage}{S\\arabic{page}} for a supplement) and loading hyperref ' +
         "makes it an exact lookup; or find the page yourself: search extract_text's output (or " +
         'pdf_geometry kinds: ["text"]) for the label\'s number.',
@@ -2223,6 +2508,77 @@ function shipoutText(failure: LabelFailure, route: LabelSource): string {
   );
 }
 
+/**
+ * The sentence a refusal gains when the destination route was tried for the label and refused
+ * ({@link destinationVerdict}): where the label's hyperref destination points, and what about that
+ * page did not let it settle the label. `''` when the route was not tried.
+ */
+function destinationText(failure: LabelFailure, route: LabelSource): string {
+  const contradiction = failure.destinationContradiction;
+  const page = failure.destinationPage;
+  if (contradiction === undefined || page === undefined) return '';
+  const printed = quoteLabel(failure.printedPage ?? '');
+  let why: string;
+  switch (contradiction.kind) {
+    case 'sharedAnchor':
+    case 'anchorUnchecked':
+    case 'duplicateDestination': {
+      const anchor = quoteLabel(contradiction.anchor);
+      const cause =
+        contradiction.kind === 'sharedAnchor'
+          ? `its hyperref anchor ${anchor} is also the anchor of ` +
+            `${contradiction.labels.map(quoteLabel).join(', ')} in the .aux`
+          : contradiction.kind === 'duplicateDestination'
+            ? `the build's .log reports a duplicate destination named ${anchor}, its hyperref ` +
+              'anchor'
+            : `not every \\newlabel in the .aux could be read, so whether another label shares ` +
+              `its hyperref anchor ${anchor} cannot be ruled out`;
+      return (
+        ` Its hyperref link target (the destination \\ref jumps to) is on PDF page ${page}, but ` +
+        `${cause} — a counter reset (\\setcounter{figure}{0} before a supplement) makes hyperref ` +
+        'reuse an anchor, and the PDF keeps only the first destination of that name — so the ' +
+        "link target may be another label's and was not used. Find the page yourself " +
+        '(extract_text, or pdf_geometry kinds: ["text"], for the label\'s number) and pass ' +
+        'pages: explicitly.'
+      );
+    }
+    case 'pageLabel':
+      why =
+        contradiction.pageLabel === null
+          ? "the PDF's /PageLabels tree gives that page no label"
+          : `the PDF's /PageLabels tree labels that page ${quoteLabel(contradiction.pageLabel)}, ` +
+            `not ${printed}`;
+      break;
+    case 'folio':
+      why =
+        `that page reads as page number ${contradiction.folios.map(quoteLabel).join(' or ')}, ` +
+        `not ${printed}`;
+      break;
+    case 'shipout':
+      why =
+        contradiction.shipout === undefined
+          ? "the build's .log shipout record has no entry for that page"
+          : "the build's .log records that page as shipped out with page counter " +
+            `${contradiction.shipout}, not ${printed}`;
+      break;
+    case 'noEvidence':
+      why = "that page's text could not be read to check it";
+      break;
+    case 'uncorroborated':
+      why =
+        (route === 'pageLabels'
+          ? 'nothing confirms that page'
+          : "that page shows no page number and the build's .log shipout record could not be " +
+            'used, so nothing confirms it') +
+        ' — and a link target, which the document writes too, is never taken on its own';
+      break;
+  }
+  return (
+    ` Its hyperref link target (the destination \\ref jumps to) is on PDF page ${page}, but ` +
+    `${why}, so the link target does not settle which page the label is on either.`
+  );
+}
+
 /** `label -> page` pairs, for a one-line summary in a result's text channel and note. */
 export function describeResolvedLabels(resolved: ResolvedLabel[]): string {
   return resolved.map((r) => `${r.label} -> page ${r.page}`).join(', ');
@@ -2280,19 +2636,37 @@ export function labelResolutionNote(plan: LabelPagePlan): string {
           'link target (the destination \\ref jumps to) lies on that very PDF page, so the ' +
           ".aux's printed page and the PDF's own placement of the label agree — every other " +
           'check above still applied. ';
-    conversion =
-      "which records each label's PRINTED page. " +
-      tree +
-      checks +
-      (plan.pageLabelsIgnored === 'beamer' || verified.length > 0
-        ? ''
-        : ', and loading hyperref adds a check against its link targets') +
-      (byDestination ? `. ${byDestination.trimEnd()}` : '');
+    conversion = plan.resolved.every((r) => r.via === 'destination')
+      ? "which records each label's PRINTED page; this PDF carries no /PageLabels tree"
+      : "which records each label's PRINTED page. " +
+        tree +
+        checks +
+        (plan.pageLabelsIgnored === 'beamer' || verified.length > 0
+          ? ''
+          : ', and loading hyperref adds a check against its link targets') +
+        (byDestination ? `. ${byDestination.trimEnd()}` : '');
   }
+  const viaDestination = plan.resolved.filter((r) => r.via === 'destination').map((r) => r.label);
+  const destinationNote =
+    viaDestination.length === 0
+      ? ''
+      : ` For ${viaDestination.join(', ')} the printed page stands for more than one PDF page ` +
+        '(a restarted or renumbered numbering), so it could not be turned into a page index ' +
+        "directly: the page was taken from the label's own hyperref link target (the PDF's named destination " +
+        'for its anchor, where \\ref jumps to), and accepted only because ' +
+        (plan.labelSource === 'pageLabels'
+          ? "that page's /PageLabels entry is the printed page"
+          : "that page's own page number, read from its text, or the build's .log shipout " +
+            'record agrees with the printed page and neither contradicts it') +
+        (plan.shipoutsChecked === true && plan.labelSource === 'pageLabels'
+          ? " and the build's .log recorded it as shipped out with that page counter"
+          : '') +
+        ' — evidence, not proof: the document writes the link target too.';
   return (
     `Pages resolved from labels through the build-directory .aux of the LAST COMPILE ` +
-    `(${describeResolvedLabels(plan.resolved)}), ${conversion}. Edits since that compile, and ` +
-    'references that have not converged, are not reflected: recompile if the page looks wrong.'
+    `(${describeResolvedLabels(plan.resolved)}), ${conversion}.${destinationNote} Edits since ` +
+    'that compile, and references that have not converged, are not reflected: recompile if the ' +
+    'page looks wrong.'
   );
 }
 

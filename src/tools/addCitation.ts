@@ -34,10 +34,17 @@ const outputSchema = {
   /** The bibliography the key belongs to. */
   source: z.string(),
   /**
-   * The service that actually issued the BibTeX, when it is not `source`. Only OpenAlex sets
-   * this: it publishes no BibTeX, so its records are fetched from Crossref by DOI.
+   * The service that actually issued the BibTeX, when it is not `source`: the DOI's
+   * registration agency, Crossref or DataCite.
    */
-  via: z.string().optional(),
+  via: z
+    .string()
+    .optional()
+    .describe(
+      'The service that actually issued the BibTeX, when it is not source: "crossref" or ' +
+        '"datacite" for an openalex: key (fetched by its DOI), "datacite" for a crossref: key ' +
+        'whose DOI DataCite registered (arXiv preprints, 10.48550/...).',
+    ),
   bibtex: z.string(),
   diff: z
     .string()
@@ -114,8 +121,13 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
         'the bibliography. This is the only sanctioned way to add to a .bib file: the BibTeX is ' +
         'fetched from the service server-side, never hand-written, so entries are verifiable. ' +
         'The key decides which service is asked. OpenAlex publishes no BibTeX of its own, so an ' +
-        'openalex: key is resolved to its DOI and the entry fetched from Crossref — a record ' +
-        'with no DOI is refused rather than assembled by hand. Find the key with ' +
+        'openalex: key is resolved to its DOI and the entry fetched by DOI — a record ' +
+        "with no DOI is refused rather than assembled by hand. A DOI's entry comes from the " +
+        'agency that registered it: arXiv DOIs (10.48550/...) from DataCite, any other from ' +
+        'Crossref, and from DataCite when Crossref has no record of it (reported as via). ' +
+        "DataCite's cite keys are URLs (e.g. https://doi.org/10.48550/arxiv.1706.03762); the " +
+        'entry is written verbatim, so the returned key is that URL — the format-bibliography ' +
+        'skill rekeys entries later. Find the key with ' +
         'search_references first. No-op (alreadyPresent) if the cite key is already in the file.',
       inputSchema,
       outputSchema,
@@ -132,8 +144,9 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
         // long as a peer's own lock wait (fileLock's DEFAULT_TIMEOUT_MS), so a peer's
         // write/commit could fail with LockTimeoutError behind a citation lookup.
         // Re-fetched from the issuing service so the appended text always originates from the
-        // API, never from the model. An OpenAlex key is bridged to Crossref by its DOI, and
-        // refused outright when it has none — we never assemble an entry ourselves.
+        // API, never from the model. An OpenAlex key is bridged to its DOI's registrar (Crossref
+        // or DataCite), and refused outright when it has none — we never assemble an entry
+        // ourselves.
         const fetched = await ctx.references.fetchBibtex(key);
         const bibtex = fetched.bibtex;
         return await ctx.projectManager.runExclusive(id, async () => {

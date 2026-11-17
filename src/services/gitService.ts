@@ -54,7 +54,14 @@ function originWriteFailure(
   );
 }
 
-export type SyncAction = 'cloned' | 'pulled' | 'up-to-date' | 'diverged' | 'remote-branch-missing';
+export type SyncAction =
+  | 'cloned'
+  | 'pulled'
+  | 'up-to-date'
+  | 'diverged'
+  | 'remote-branch-missing'
+  | 'rebased'
+  | 'conflict';
 
 export interface SyncResult {
   action: SyncAction;
@@ -62,11 +69,41 @@ export interface SyncResult {
   behind: number;
   diverged: boolean;
   /**
-   * Present only with `action: 'remote-branch-missing'`: what happened to the branch and what it
-   * means for the unpushed work (see `remoteBranchMissingNote`).
+   * With `action: 'remote-branch-missing'`: what happened to the branch and what it means for the
+   * unpushed work (see `remoteBranchMissingNote`). With `action: 'rebased'`: set only when the
+   * rebase dropped local commits an identical upstream change already carried.
    */
   note?: string;
+  /** `action: 'rebased'` only: local commits now replayed on top of the remote tip. */
+  replayedCommits?: number;
+  /** `action: 'rebased'` only: remote commits the local ones were rebased over. */
+  incomingCommits?: number;
+  /** `action: 'conflict'` only: the aborted rebase's report — the same one `push` returns. */
+  conflict?: ConflictReport;
 }
+
+/** `syncPull`'s opt-in to replay a diverged clone's local commits (`project_sync` mode "rebase"). */
+export interface SyncRebaseOptions {
+  rebase?: boolean;
+  /** Runs once a rebase is certain, before anything is touched; a throw refuses the sync. */
+  beforeRebase?: () => Promise<void>;
+}
+
+/**
+ * The conflict guidance for a `project_sync` mode "rebase" conflict. Same report as `push`'s; only
+ * the route out differs in what it must say plainly: resolving goes through `push`, which publishes.
+ */
+export const SYNC_REBASE_CONFLICT_GUIDANCE =
+  'The local commits and a remote commit touched the same lines. The rebase was aborted: the ' +
+  'clone is exactly as it was before this sync (same HEAD, same working tree, nothing ' +
+  'half-merged), and nothing was pushed. For each file, `ours` is the local version, `theirs` ' +
+  'the version that landed upstream, and `base` the common ancestor — compute a merged file that ' +
+  'also keeps their non-conflicting edits. To land it, retry `push` with a `resolutions` array ' +
+  "carrying each conflicted file's full merged content and `expectedRemoteHead` set to the " +
+  'remoteHead below. Note that this PUSHES the merged result to the remote — there is no ' +
+  'resolve-without-pushing route. Never force-push, and never rebase by hand in a shell. ' +
+  'Alternatively, `reset_to_remote` (confirm: true) rewinds the clone to the remote head so the ' +
+  'edits can be re-applied — it discards the local commits.';
 
 export interface StatusResult {
   branch: string;
@@ -419,15 +456,31 @@ export class LocalChangesOverwriteError extends Error {
 }
 
 /**
- * True when a `git push` failure is a plain non-fast-forward rejection — the remote gained a
- * commit we don't have (a collaborator's Overleaf edit landing between our last fetch and the
- * push) — as opposed to an auth failure, a network error, or a server-side hook refusal
- * (`[remote rejected] ... (pre-receive hook declined)`, which is a different bracket phrase
- * entirely and must never be retried). Matched case-insensitively against git/simple-git's raw
- * stderr, which is not a stable API but is the only signal available.
+ * Overleaf's compare-and-swap failure, on one line of git's OWN push report:
+ * ` ! [remote rejected] main -> main (invalid old id sent)`. Anchored to that line's start (the
+ * `!` status flag), so a hook cannot get a refusal retried by printing the phrase itself — the
+ * server's output reaches stderr prefixed `remote: ` — and same line only, so one ref's hook
+ * refusal cannot borrow the phrase from another line.
+ */
+const OVERLEAF_STALE_OLD_ID_RE = /^\s*!\s*\[remote rejected\][^\n]*\(invalid old id sent\)/im;
+
+/**
+ * True when a `git push` failure means the remote moved under us — it gained a commit we don't
+ * have (a collaborator's Overleaf edit landing between our last fetch and the push) — as opposed
+ * to an auth failure, a network error, or a server-side refusal. Matched case-insensitively
+ * against git/simple-git's raw stderr, which is not a stable API but is the only signal available.
+ *
+ * Two shapes qualify. git's own client-side `[rejected] ... (fetch first)` /
+ * `(non-fast-forward)`; and exactly one server-side `[remote rejected]` reason,
+ * `(invalid old id sent)`, which is Overleaf's compare-and-swap failure: the old id our push named
+ * is no longer the branch tip because a collaborator's push landed between our fetch and our push.
+ * That is a lost race, not a policy refusal, so it earns the same refetch-rebase-retry rounds.
+ * Every OTHER `[remote rejected]` reason — `(pre-receive hook declined)`, a protected branch, a
+ * quota — is a hard refusal and must never be retried.
  */
 export function isNonFastForwardRejection(message: string): boolean {
   if (!message) return false;
+  if (OVERLEAF_STALE_OLD_ID_RE.test(message)) return true;
   const lower = message.toLowerCase();
   return (
     lower.includes('[rejected]') &&
@@ -1896,19 +1949,14 @@ export class GitService {
         committedSha = (await this.commit(dir, { message: opts.commitMessage, paths: opts.paths }))
           .sha;
       } else {
-        const modified = trackedModifiedPaths(preStatus);
-        if (modified.length > 0) {
-          throw new Error(uncommittedModificationsMessage(modified, preStatus.not_added));
-        }
+        assertNoTrackedModifications(preStatus, 'push');
       }
     }
 
     // Fetch first so we can record what our change will rebase over (surfaced on success).
     await this.fetchOrigin(dir, gitUrl, auth);
     const rebasedOver = await this.logCommits(git, `HEAD..origin/${branch}`);
-    const first = await this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-      this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
-    );
+    const first = await this.pullRebase(dir, git, gitUrl, auth, branch);
     if (!first.ok) return this.conflictResult(gitUrl, first.report);
 
     if ((await this.aheadBehindOf(git)).ahead === 0) {
@@ -1923,9 +1971,7 @@ export class GitService {
     if (ab.ahead === 0) return this.nothingToPush(gitUrl, branch, committedSha);
 
     const retryRebase = (): Promise<RebaseOutcome> =>
-      this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-        this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
-      );
+      this.pullRebase(dir, git, gitUrl, auth, branch);
     const pushResult = await this.pushWithRetry(
       dir,
       git,
@@ -2047,10 +2093,7 @@ export class GitService {
       if (opts.commitMessage) {
         committedSha = (await this.commit(dir, { message: opts.commitMessage })).sha;
       } else {
-        const modified = trackedModifiedPaths(preStatus);
-        if (modified.length > 0) {
-          throw new Error(uncommittedModificationsMessage(modified, preStatus.not_added));
-        }
+        assertNoTrackedModifications(preStatus, 'push');
       }
     }
 
@@ -2237,9 +2280,7 @@ export class GitService {
     // (against a commit that landed after the one we just resolved), unrelated to `resolutions`,
     // and is reported — never silently retried again with stale content.
     const retryRebase = (): Promise<RebaseOutcome> =>
-      this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
-        this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
-      );
+      this.pullRebase(dir, git, gitUrl, auth, branch);
     // When the caller pinned `expectedRemoteHead`, they asked to be refused rather than have their
     // merge silently rebased over a second remote move — one round only, so a lost race here is
     // reported as `remote-moved` (nothing pushed, clone intact) instead of retried.
@@ -2682,8 +2723,18 @@ export class GitService {
     }
   }
 
-  /** Fetch and fast-forward (ff-only). Surfaces divergence instead of merging. */
-  async syncPull(gitUrl: string, dir: string, auth: AuthConfig): Promise<SyncResult> {
+  /**
+   * Fetch and fast-forward (ff-only). Surfaces divergence instead of merging — unless `rebase` is
+   * set (`project_sync` mode "rebase"), when a diverged clone has its local commits replayed onto
+   * the fetched remote by {@link syncRebase}. Up-to-date, ahead-only and fast-forwardable clones
+   * take the same path either way: a rebase is only ever run when there is something on both sides.
+   */
+  async syncPull(
+    gitUrl: string,
+    dir: string,
+    auth: AuthConfig,
+    opts: SyncRebaseOptions = {},
+  ): Promise<SyncResult> {
     const git = simpleGit(dir);
     await this.fetchOrigin(dir, gitUrl, auth);
     // The fetch prunes, so a branch renamed or deleted upstream leaves no `origin/<branch>` to
@@ -2709,6 +2760,7 @@ export class GitService {
       return { action: 'up-to-date', ahead: ab.ahead, behind: 0, diverged: false };
     }
     if (ab.ahead > 0) {
+      if (opts.rebase) return this.syncRebase(git, dir, gitUrl, auth, branch, ab, opts);
       return { action: 'diverged', ahead: ab.ahead, behind: ab.behind, diverged: true };
     }
     try {
@@ -2718,6 +2770,77 @@ export class GitService {
     }
     const after = await this.aheadBehindOf(git, branch);
     return { action: 'pulled', ahead: after.ahead, behind: after.behind, diverged: false };
+  }
+
+  /**
+   * `project_sync` mode "rebase" on a diverged clone: exactly the rebase `push` runs before it
+   * pushes ({@link pullRebase}, behind the same dirty-tree refusal), minus the push. Never pushes.
+   *
+   * `beforeRebase` runs first — the tool's live-peer refusal (`guardPeerWork`), so a rebase that
+   * would rewrite the tree under a live peer's uncommitted lines is refused as `push` refuses it;
+   * it runs only here, once a rebase is certain, so an ff or a no-op sync is not refused for it.
+   *
+   * A conflict aborts the rebase — HEAD, branch and working tree back exactly as before — and
+   * comes back as `action: 'conflict'` carrying `push`'s own {@link ConflictReport}, its guidance
+   * reworded: the only resolution route is `push` with `resolutions`, which PUSHES. An untracked
+   * file an incoming commit would overwrite is reported in pull wording (nothing changed).
+   */
+  private async syncRebase(
+    git: SimpleGit,
+    dir: string,
+    gitUrl: string,
+    auth: AuthConfig,
+    branch: string,
+    before: { ahead: number; behind: number },
+    opts: SyncRebaseOptions,
+  ): Promise<SyncResult> {
+    await opts.beforeRebase?.();
+    assertNoTrackedModifications(await git.status(), 'sync');
+    const preHead = (await git.revparse(['HEAD'])).trim();
+    let outcome: RebaseOutcome;
+    try {
+      outcome = await this.pullRebase(dir, git, gitUrl, auth, branch);
+    } catch (err) {
+      if (err instanceof UntrackedOverwriteError) {
+        throw new UntrackedOverwriteError(err.paths, 'pull');
+      }
+      throw err;
+    }
+    if (!outcome.ok) {
+      return {
+        action: 'conflict',
+        ahead: before.ahead,
+        behind: before.behind,
+        diverged: true,
+        conflict: { ...outcome.report, guidance: SYNC_REBASE_CONFLICT_GUIDANCE },
+      };
+    }
+    const after = await this.aheadBehindOf(git, branch);
+    let incoming = before.behind;
+    try {
+      // `pull --rebase` fetches again, so count against the tip it actually rebased onto.
+      incoming =
+        Number((await git.raw(['rev-list', '--count', `${preHead}..origin/${branch}`])).trim()) ||
+        0;
+    } catch {
+      // Keep the pre-rebase count: it is what the fetch above saw land.
+    }
+    const dropped = before.ahead - after.ahead;
+    return {
+      action: 'rebased',
+      ahead: after.ahead,
+      behind: after.behind,
+      diverged: false,
+      replayedCommits: after.ahead,
+      incomingCommits: incoming,
+      ...(dropped > 0
+        ? {
+            note:
+              `${dropped} local commit(s) were dropped by the rebase: an identical change had ` +
+              'already landed upstream.',
+          }
+        : {}),
+    };
   }
 
   /** Ahead/behind counts vs the upstream for a clone directory. */
@@ -2939,6 +3062,25 @@ export class GitService {
     branch: string,
   ): Promise<RebaseOutcome> {
     await this.fetchOrigin(dir, gitUrl, auth);
+    return this.pullRebase(dir, git, gitUrl, auth, branch);
+  }
+
+  /**
+   * THE pull-rebase: `pull --rebase origin <branch>` under {@link tryRebase}, so a conflict is
+   * reported in full and aborted (clone back to its pre-rebase state) and any other failure clears a
+   * dangling rebase before propagating. Every caller that replays local commits onto the remote
+   * goes through here — `safePush` (both rebases and every retry round), `resolvePush`'s retry
+   * rounds, and `project_sync`'s mode "rebase" ({@link syncRebase}) — so the sync rebase and the
+   * push rebase cannot drift apart. The caller refuses a tree with tracked modifications first
+   * ({@link assertNoTrackedModifications}).
+   */
+  private async pullRebase(
+    dir: string,
+    git: SimpleGit,
+    gitUrl: string,
+    auth: AuthConfig,
+    branch: string,
+  ): Promise<RebaseOutcome> {
     return this.tryRebase(dir, git, branch, `origin/${branch}`, () =>
       this.withAuth(dir, gitUrl, auth, ['pull', '--rebase', 'origin', branch]),
     );
@@ -4010,6 +4152,19 @@ function trackedModifiedPaths(status: GitStatusSummary): string[] {
 }
 
 /**
+ * The dirty-tree refusal every pull-rebase shares (`safePush`, `resolvePush`, `syncRebase`): a
+ * rebase tolerates untracked dirt in place but cannot replay over uncommitted modifications to
+ * files git already tracks, so refuse — in the caller's own words — before anything is fetched
+ * into the working tree.
+ */
+function assertNoTrackedModifications(status: GitStatusSummary, operation: 'push' | 'sync'): void {
+  const modified = trackedModifiedPaths(status);
+  if (modified.length > 0) {
+    throw new Error(uncommittedModificationsMessage(modified, status.not_added, operation));
+  }
+}
+
+/**
  * How many characters of PATHSPEC arguments a single git invocation may carry.
  *
  * Derived from the smallest command-line limit of the three platforms this server runs on:
@@ -4266,7 +4421,22 @@ function untrackedCollisionNote(untrackedPaths: string[], capped: string[]): str
  * `localChangesOverwriteFromError` already expose — so the wording can be asserted without
  * standing up a remote and driving a real push. Both call sites are unchanged.
  */
-export function uncommittedModificationsMessage(modified: string[], untracked: string[]): string {
+export function uncommittedModificationsMessage(
+  modified: string[],
+  untracked: string[],
+  operation: 'push' | 'sync' = 'push',
+): string {
+  if (operation === 'sync') {
+    // `project_sync` mode "rebase": same block, same exits, minus the push-only `message` route.
+    return (
+      `Uncommitted changes to tracked file(s): ${capList(modified, 20)}. Nothing was changed. A ` +
+      'rebase sync replays the local commits onto the latest remote, and git cannot rebase over ' +
+      'uncommitted modifications to files it already tracks. Commit them first (`commit` takes ' +
+      "this session's edits by default), `shelve` them (`shelve { paths: [...] }`) to set them " +
+      'aside outside the clone and bring them back with `unshelve` after the sync, or `discard` ' +
+      'them. Untracked files never block the rebase.'
+    );
+  }
   const untrackedNote =
     untracked.length > 0
       ? `Untracked file(s) never block a push — ${capList(untracked, 10)} will ride along untouched.`

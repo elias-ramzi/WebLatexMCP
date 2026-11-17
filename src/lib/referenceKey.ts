@@ -190,6 +190,16 @@ function normalizeDoi(raw: string, original: string): string {
   return id;
 }
 
+/**
+ * Validate a bare DOI (no prefix, no URL) by the same strict rule a `crossref:` key's id is held
+ * to, returning it verbatim. For a backend that is handed a DOI rather than a record key —
+ * DataCite's BibTeX fetch, reached with a DOI the resolver already holds — so it interpolates
+ * nothing this boundary has not judged.
+ */
+export function parseDoi(raw: string): string {
+  return normalizeDoi(raw, raw);
+}
+
 /** Validate an OpenAlex work id, normalising only the leading `W` to uppercase. */
 function normalizeOpenAlex(raw: string, original: string): string {
   const id = raw.trim();

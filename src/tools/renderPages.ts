@@ -10,6 +10,7 @@ import {
   resolveRootFile,
 } from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
+import { normalizePages, pagesInputSchema } from '../lib/pageSelection.js';
 import { toPosixOut } from '../lib/paths.js';
 import { buildDir, ensureBuildRoot } from '../services/compiler.js';
 import { HARD_MAX_EDGE_PX, MAX_PAGES_PER_CALL, PdfRenderError } from '../services/pdfRender.js';
@@ -47,12 +48,11 @@ const inputSchema = {
         'missing build PDF fall back to the surfaced <workspace>/<id>.pdf, which holds ' +
         'whichever root compiled last.',
     ),
-  pages: z
-    .array(z.number().int().positive())
-    .min(1, 'Omit pages for every page — an empty array selects zero pages, not "all".')
+  pages: pagesInputSchema()
     .optional()
     .describe(
-      '1-based page numbers, in the order given. Defaults to every page, capped at ' +
+      '1-based page numbers, in the order given, or one page number on its own (2 is [2]). ' +
+        'Defaults to every page, capped at ' +
         `${MAX_PAGES_PER_CALL} (MAX_PAGES_PER_CALL) per call. Omit the field for every page; an ` +
         'empty array is rejected rather than silently rendering nothing. Cannot be combined with ' +
         '`labels`.',
@@ -75,8 +75,13 @@ const inputSchema = {
         'tree when it has one, so a renumbered document (roman front matter, \\frontmatter, an ' +
         'appendix scheme) resolves EXACTLY. A printed page that tree prints on no page is ' +
         'reported as a stale .aux, and one it prints on several pages (a restarted ' +
-        '\\pagenumbering) is refused with both candidates named rather than resolved to the ' +
-        'first. A PDF with no /PageLabels — the usual `article` without hyperref — falls back to ' +
+        '\\pagenumbering, a supplement numbered from 1 again) is resolved through the ' +
+        "label's own hyperref link target (its named destination in the PDF) when that page's " +
+        '/PageLabels entry — and its [n] shipout mark, when the .log numbers every page — agree ' +
+        'with the printed page (`via: "destination"`), and otherwise refused with the ' +
+        'candidates named rather than resolved to the first; without /PageLabels a restarted ' +
+        'or renumbered document is resolved the same way, checked against the page number the ' +
+        'destination page prints. A PDF with no /PageLabels — the usual `article` without hyperref — falls back to ' +
         "the printed page as the index, but only once that PDF page's own folio (the page " +
         'number in its footer or running head) reads that printed page AND a neighbouring ' +
         "page's folio reads the adjacent number (a section number or a table cell can pass for " +
@@ -211,7 +216,20 @@ const outputSchema = {
               "printed page read as a decimal integer, once that page's text showed the label's " +
               'number. It differs from printedPage exactly when ' +
               'the document renumbers and says so in /PageLabels; without that tree a document ' +
-              'where they could differ is refused rather than reported here.',
+              'where they could differ is refused rather than reported here — unless `via` says ' +
+              'the page came from the link target.',
+          ),
+        via: z
+          .literal('destination')
+          .optional()
+          .describe(
+            'Present only when the printed page names more than one PDF page (a restarted or ' +
+              'renumbered numbering, e.g. a supplement numbered from 1 again) and the page was ' +
+              "taken from the label's own hyperref link target (the PDF's named destination for " +
+              "its anchor) instead — accepted only because that page's /PageLabels entry (or, " +
+              "with no such tree, its own page number or the build's .log shipout record) " +
+              'agrees with printedPage and nothing read contradicts it, never on the link target ' +
+              'alone. Absent on every other resolution.',
           ),
       }),
     )
@@ -269,8 +287,19 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, labels, dpi, maxEdgePx, clip, inline, variant }) => {
+    async ({
+      project,
+      rootFile,
+      pages: pagesInput,
+      labels,
+      dpi,
+      maxEdgePx,
+      clip,
+      inline,
+      variant,
+    }) => {
       try {
+        const pages = normalizePages(pagesInput);
         // Rejected, never silently resolved — the house rule `diff` already applies to
         // `ref` + `staged`. Either one could be made to win, and whichever were chosen would
         // silently render something the caller did not ask for half the time they hit it.

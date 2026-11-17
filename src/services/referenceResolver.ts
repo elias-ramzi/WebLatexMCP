@@ -29,9 +29,19 @@
  *    search result and carries its own provenance (`crossref:10.1109/…`), so it must go to the
  *    backend that issued it even when the config names another. Nothing is substituted here
  *    either: a key identifies one record in one backend, so there is nothing to substitute *to*.
+ *
+ * 4. **A DOI's BibTeX comes from the agency that registered the DOI.** A `crossref:` key and an
+ *    OpenAlex record's DOI name one record, but Crossref is only one registration agency:
+ *    DataCite registers every arXiv DOI (`10.48550/…`), which Crossref answers with a 404. Asking
+ *    DataCite for that same DOI is fetching the same record from its registrar — NOT a
+ *    substitution — so `fetchDoiBibtex` does it, and reports it as `via: "datacite"`. The order
+ *    is decided by the DOI alone (`doiRegistrarOrder`): arXiv's prefix goes to DataCite first,
+ *    any other DOI to Crossref first; the second agency is asked ONLY on the first one's
+ *    definite 404 (`RecordNotFoundError`). An unreachable first agency is an error, never a
+ *    reason to ask the other.
  */
 
-import { BackendUnavailableError } from './referenceBackend.js';
+import { BackendUnavailableError, RecordNotFoundError } from './referenceBackend.js';
 import type { ReferenceHit } from './referenceBackend.js';
 import { parseRecordKey, REFERENCE_SOURCES } from '../lib/referenceKey.js';
 import { quoteId } from '../lib/projectId.js';
@@ -57,17 +67,38 @@ export interface ResolvedSearch {
   note?: string;
 }
 
+/**
+ * Who can serve a DOI's BibTeX: Crossref, or DataCite (the registration agency of arXiv's DOIs,
+ * among others). DataCite is not a search backend, so it is not a `ReferenceSourceId`.
+ */
+export type DoiRegistrar = 'crossref' | 'datacite';
+
 export interface ResolvedBibtex {
   /** The BibTeX, verbatim from whichever service issued it. */
   bibtex: string;
   /** The backend the key belongs to. */
   source: ReferenceSourceId;
   /**
-   * The backend that actually served the BibTeX, when it is not `source`. Only OpenAlex sets
-   * this: it publishes no BibTeX, so its records are fetched from Crossref by DOI.
+   * The service that actually served the BibTeX, when it is not `source`: `crossref` or
+   * `datacite` for an OpenAlex key (OpenAlex publishes no BibTeX, so its records are fetched by
+   * DOI), `datacite` for a `crossref:` key whose DOI DataCite registered.
    */
-  via?: ReferenceSourceId;
+  via?: DoiRegistrar;
 }
+
+/** arXiv's DOI prefix. Its DOIs are registered with DataCite, never with Crossref. */
+export const ARXIV_DOI_PREFIX = '10.48550/';
+
+/**
+ * Which registration agency to ask first for a DOI's BibTeX, and which second. Decided by the
+ * DOI alone: arXiv's DOIs go to DataCite first; every other DOI to Crossref, which registers most
+ * of them. The second is asked only after the first answered a definite 404.
+ */
+export function doiRegistrarOrder(doi: string): readonly [DoiRegistrar, DoiRegistrar] {
+  return doi.startsWith(ARXIV_DOI_PREFIX) ? ['datacite', 'crossref'] : ['crossref', 'datacite'];
+}
+
+const REGISTRAR_NAME: Record<DoiRegistrar, string> = { crossref: 'Crossref', datacite: 'DataCite' };
 
 /** Thrown when the caller pinned a backend and that backend could not answer. */
 export class ReferenceSourceUnavailableError extends Error {
@@ -135,6 +166,11 @@ interface BibtexBackend extends SearchBackend {
   fetchBibtex(keyOrUrl: string): Promise<string>;
 }
 
+/** DataCite: BibTeX by DOI, and nothing else — it is not a search backend. */
+interface DoiBibtexBackend {
+  fetchBibtexByDoi(doi: string): Promise<string>;
+}
+
 interface DoiBackend extends SearchBackend {
   /** The record's DOI, or `null` when it has none — an answer, never an exception. */
   resolveDoi(keyOrId: string): Promise<string | null>;
@@ -144,6 +180,7 @@ export interface ReferenceBackends {
   dblp: BibtexBackend;
   crossref: BibtexBackend;
   openalex: DoiBackend;
+  datacite: DoiBibtexBackend;
 }
 
 /** The two ways a caller can pin a backend, and the wording each one needs in a refusal. */
@@ -291,7 +328,9 @@ export class ReferenceResolver {
       return { bibtex: await this.backends.dblp.fetchBibtex(id), source };
     }
     if (source === 'crossref') {
-      return { bibtex: await this.backends.crossref.fetchBibtex(id), source };
+      // A `crossref:` key's id is a DOI, and DataCite may be the agency that registered it.
+      const { bibtex, from } = await this.fetchDoiBibtex(id);
+      return from === 'crossref' ? { bibtex, source } : { bibtex, source, via: from };
     }
 
     // OpenAlex publishes no BibTeX at all, so the record's DOI is the only route to a canonical
@@ -314,7 +353,56 @@ export class ReferenceResolver {
           'then write it with confirmBibEdit: true.',
       );
     }
-    return { bibtex: await this.backends.crossref.fetchBibtex(doi), source, via: 'crossref' };
+    const { bibtex, from } = await this.fetchDoiBibtex(doi);
+    return { bibtex, source, via: from };
+  }
+
+  /**
+   * A DOI's BibTeX from the agency that registered it, in `doiRegistrarOrder`.
+   *
+   * Only a definite 404 (`RecordNotFoundError`) moves on to the other agency: that is the first
+   * agency saying the DOI is not one of its own. Anything else — the first agency unreachable, a
+   * body that is not BibTeX, a caller error — is thrown as it is, because it says nothing about
+   * which agency holds the DOI. Both agencies answering 404 is reported as one error naming
+   * both; the second being unreachable after the first's 404 is unavailability that says so.
+   */
+  private async fetchDoiBibtex(doi: string): Promise<{ bibtex: string; from: DoiRegistrar }> {
+    const [first, second] = doiRegistrarOrder(doi);
+    let miss: RecordNotFoundError;
+    try {
+      return { bibtex: await this.fromRegistrar(first, doi), from: first };
+    } catch (err) {
+      if (!(err instanceof RecordNotFoundError)) throw err;
+      miss = err;
+    }
+    try {
+      return { bibtex: await this.fromRegistrar(second, doi), from: second };
+    } catch (err) {
+      if (err instanceof BackendUnavailableError) {
+        throw new BackendUnavailableError(
+          err.backend,
+          `${REGISTRAR_NAME[first]} has no record for DOI "${doi}", and ` +
+            `${REGISTRAR_NAME[second]}, the other agency that registers DOIs for scholarly works, ` +
+            `could not be reached to look it up there. ${miss.message} ${err.message} ` +
+            'Retry later.',
+        );
+      }
+      if (err instanceof RecordNotFoundError) {
+        throw new RecordNotFoundError(
+          `${REGISTRAR_NAME[first]}, ${REGISTRAR_NAME[second]}`,
+          `Neither Crossref nor DataCite has a record for DOI "${doi}": both answered that no ` +
+            `such DOI is registered with them. ${miss.message} ${err.message} Check the DOI, or ` +
+            'search for the paper again with search_references and add it from another result.',
+        );
+      }
+      throw err;
+    }
+  }
+
+  private fromRegistrar(registrar: DoiRegistrar, doi: string): Promise<string> {
+    return registrar === 'crossref'
+      ? this.backends.crossref.fetchBibtex(doi)
+      : this.backends.datacite.fetchBibtexByDoi(doi);
   }
 }
 

@@ -1,4 +1,13 @@
-import { planChangeDiff } from './diffBudget.js';
+import {
+  CHANGE_DIFF_BUDGET,
+  CHANGE_DIFF_HINT,
+  DIFF_CONTENT_BUDGET,
+  planChangeDiff,
+  renderCost,
+  renderFileOmissionMarker,
+  renderHunkOmissionMarker,
+  splitPatch,
+} from './diffBudget.js';
 import type { ChangeDiffPlan } from './diffBudget.js';
 
 /**
@@ -192,7 +201,18 @@ function condenseLongLines(ops: Op[]): { ops: Op[]; condensed: boolean } {
  * budgeted like every confirmation diff.
  */
 export function planEditDiff(before: string, after: string, relPath: string): EditDiffPlan {
-  if (before === after) return { diff: '', truncated: false, condensed: false };
+  const { patch, condensed } = buildEditPatch(before, after, relPath);
+  if (patch === '') return { diff: '', truncated: false, condensed: false };
+  return { ...planChangeDiff(patch), condensed };
+}
+
+/** The unbudgeted confirmation patch of `before` → `after`, and whether a long line was cut. */
+function buildEditPatch(
+  before: string,
+  after: string,
+  relPath: string,
+): { patch: string; condensed: boolean } {
+  if (before === after) return { patch: '', condensed: false };
   const a = splitLines(before);
   const b = splitLines(after);
   const ops = lineOps(a, b);
@@ -223,5 +243,61 @@ export function planEditDiff(before: string, after: string, relPath: string): Ed
     patch += `@@ -${aStart},${aCount} +${bStart},${bCount} @@\n`;
     for (const o of c.ops) patch += render(o.kind, o.text);
   }
-  return { ...planChangeDiff(patch), condensed };
+  return { patch, condensed };
+}
+
+/** One file of a multi-file `edit_file` call, as {@link planEditDiffs} takes it. */
+export interface EditDiffInput {
+  before: string;
+  after: string;
+  relPath: string;
+}
+
+/**
+ * The confirmation diffs of a multi-file `edit_file` call, from ONE pool: `files` exists so a
+ * caller can batch many small edits, and N per-file budgets would grow the echo with N while a
+ * pool keeps it bounded. The pool is {@link CHANGE_DIFF_BUDGET} per file — what N single-file
+ * calls would each have had — capped at the house content budget {@link DIFF_CONTENT_BUDGET},
+ * so 20 files can no more return 40000 characters than one `diff` call can.
+ *
+ * Every file first gets its mandatory charge — what `planChangeDiff` would itself reserve for it:
+ * its header, the marker for losing every hunk, and the file-omission marker — so a later file is
+ * never starved to an empty diff by an earlier big one (an empty `diff` must keep meaning "nothing
+ * changed"). The rest of the pool is then spent in file order, each file getting its mandatory
+ * charge plus whatever is left, and returning what it did not use. Charges are `renderCost`, both
+ * channels, as for every confirmation diff. Only when the mandatory charges alone exceed the pool
+ * (twenty very long paths) does the total pass it — by headers, never by content.
+ */
+export function planEditDiffs(inputs: EditDiffInput[]): EditDiffPlan[] {
+  const built = inputs.map((i) => buildEditPatch(i.before, i.after, i.relPath));
+  const hint = CHANGE_DIFF_HINT;
+  const mandatory = built.map(({ patch }) => {
+    if (patch === '') return 0;
+    const [section] = splitPatch(patch);
+    if (!section) return 0;
+    return (
+      renderCost(renderFileOmissionMarker(1, hint)) +
+      renderCost(section.header) +
+      (section.hunks.length > 0
+        ? renderCost(
+            renderHunkOmissionMarker(
+              section,
+              section.hunks.length,
+              section.hunks.length,
+              section.hunks.reduce((n, h) => n + h.length, 0),
+              hint,
+            ),
+          )
+        : 0)
+    );
+  });
+  const pool = Math.min(inputs.length * CHANGE_DIFF_BUDGET, DIFF_CONTENT_BUDGET);
+  let spare = Math.max(0, pool - mandatory.reduce((a, b) => a + b, 0));
+  return built.map(({ patch, condensed }, i) => {
+    if (patch === '') return { diff: '', truncated: false, condensed: false };
+    const budget = (mandatory[i] ?? 0) + spare;
+    const plan = planChangeDiff(patch, budget);
+    spare = Math.max(0, budget - renderCost(plan.diff));
+    return { ...plan, condensed };
+  });
 }

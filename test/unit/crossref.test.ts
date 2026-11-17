@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { CrossrefService, type FetchResponse } from '../../src/services/crossref.js';
 import {
   BackendUnavailableError,
+  RecordNotFoundError,
   REQUEST_TIMEOUT_MS,
 } from '../../src/services/referenceBackend.js';
 import { getServerVersion } from '../../src/lib/version.js';
@@ -650,6 +651,11 @@ describe('a 404 addressing a RECORD is Crossref answering, not Crossref being do
     // Beside the type, so a refactor cannot satisfy the type check while losing the wording.
     await expect(missing.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toThrow(
       /no record exists under this key/,
+    );
+    // Typed, so the resolver can tell THIS answer (which licenses asking DataCite for the same
+    // DOI) apart from any other plain Error, such as a body that is not BibTeX.
+    await expect(missing.fetchBibtex('10.1109/CVPR.2016.90')).rejects.toBeInstanceOf(
+      RecordNotFoundError,
     );
   });
 

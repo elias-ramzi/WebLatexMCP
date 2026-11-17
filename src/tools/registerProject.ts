@@ -12,6 +12,7 @@ import {
   stripGitUrlCredentials,
   strippedCredentialsNoteFor,
 } from '../lib/gitUrlCredentials.js';
+import { cloneLineNote, parseGitCloneLine } from '../lib/gitCloneLine.js';
 import { assertValidProjectId, quoteId } from '../lib/projectId.js';
 import { assertRegistrableRootFile } from '../lib/rootFileSpelling.js';
 import { droppedRegistrationFields, registrationDroppedNote } from '../lib/registration.js';
@@ -40,8 +41,10 @@ const inputSchema = {
     .describe(
       'Git remote URL (Overleaf, GitHub, or any git host). Stored tokenless: a password or ' +
         'token embedded in an https URL (user:token@, token@) is removed, never stored — supply ' +
-        'it with set_credential or `tokenEnv` instead; a plain login name (org@) is kept. Give ' +
-        'this OR `path`.',
+        'it with set_credential or `tokenEnv` instead; a plain login name (org@) is kept. A ' +
+        'pasted `git clone <url>` (or `git clone <url> <dir>`) line is accepted: the URL is ' +
+        'taken out of it and the directory ignored; a line with options (-b, --depth) is ' +
+        'refused. Give this OR `path`.',
     ),
   path: z
     .string()
@@ -311,8 +314,14 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
         // with a token in its path is refused here too, by the text `ProjectManager.registerProject`
         // still refuses it with behind the lock.
         assertValidProjectId(project);
-        if (gitUrl !== undefined && stripGitUrlCredentials(gitUrl).pathToken) {
-          throw new Error(pathTokenRefusal(gitUrl));
+        // A pasted `git clone <url> [<dir>]` line is read as its URL first, so the path-token
+        // check, the registration and the credentials note all judge the URL itself (a line with
+        // options is refused here, before the lock). `ProjectManager.registerProject` parses it
+        // again behind the lock; on a plain URL both are the identity.
+        const cloneLine = gitUrl !== undefined ? parseGitCloneLine(gitUrl) : undefined;
+        const urlIn = cloneLine?.url ?? gitUrl;
+        if (urlIn !== undefined && stripGitUrlCredentials(urlIn).pathToken) {
+          throw new Error(pathTokenRefusal(urlIn));
         }
         const target = localPath !== undefined ? await resolveLocalTarget(localPath) : undefined;
         // An explicit rootFile always wins over the one inferred from the file pointed at.
@@ -388,7 +397,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
             {
               id: project,
               // Narrowed by the guards above; `localPath` is undefined here.
-              gitUrl: gitUrl as string,
+              gitUrl: urlIn as string,
               rootFile,
               branch,
               username,
@@ -403,7 +412,9 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           // git operation needs the credential from somewhere else — and only about what was
           // actually removed (a login name stays in the URL).
           const heldUrl = gitUrlOf(cfg) ?? '';
-          const credentialsNote = strippedCredentialsNoteFor(gitUrl);
+          // The `git clone` note rides with it, in both the success text and a failed clone's.
+          const credentialsNote =
+            (cloneLine ? cloneLineNote(cloneLine) : '') + strippedCredentialsNoteFor(urlIn);
           const dir = ctx.projectManager.projectPath(cfg.id);
           let cloned = await ctx.projectManager.hasClone(cfg.id);
 
@@ -424,7 +435,7 @@ export function registerRegisterProject(server: McpServer, ctx: AppContext): voi
           }
 
           if (clone && !cloned) {
-            const git = ctx.projectManager.requireGitProject(cfg.id, 'clone');
+            const git = ctx.projectManager.requireRemoteGitProject(cfg.id, 'clone');
             const auth = await ctx.credentials.resolve(git);
             try {
               await ctx.git.clone(git.gitUrl, dir, auth, git.branch);

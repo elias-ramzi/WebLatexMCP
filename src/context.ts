@@ -14,6 +14,7 @@ import { CommentStore } from './services/commentStore.js';
 import { CredentialResolver } from './services/auth.js';
 import { DblpService } from './services/dblp.js';
 import { CrossrefService } from './services/crossref.js';
+import { DataCiteService } from './services/datacite.js';
 import { OpenAlexService } from './services/openalex.js';
 import { ReferenceResolver } from './services/referenceResolver.js';
 import { DoctorService } from './services/doctor.js';
@@ -337,6 +338,8 @@ export function createSharedServices(
         dblp: new DblpService(),
         crossref: new CrossrefService(undefined, { contactEmail: config.contactEmail }),
         openalex: new OpenAlexService(undefined, { contactEmail: config.contactEmail }),
+        // BibTeX by DOI for what DataCite registered (every arXiv DOI), which Crossref 404s.
+        datacite: new DataCiteService(undefined, { contactEmail: config.contactEmail }),
       },
       {
         source: config.referenceSource,

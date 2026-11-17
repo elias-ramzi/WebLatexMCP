@@ -118,6 +118,51 @@ export interface CommentMatchReport {
   skippedInComments: number;
 }
 
+/**
+ * A file's edits, planned by {@link FileService.planEdits} and not yet written: every guard has
+ * run, and `content` is what {@link FileService.writeEditPlan} will put on disk.
+ */
+export interface EditPlan {
+  projectDir: string;
+  relPath: string;
+  /** The `resolveInside` path — the file's identity for the revision tracker. */
+  abs: string;
+  /** The bytes the plan was computed from, re-checked before a `verifyUnchanged` write. */
+  originalBytes: Buffer;
+  /** `originalBytes`, decoded exactly (the plan refuses a file that is not valid UTF-8). */
+  original: string;
+  content: string;
+  appliedEdits: number;
+  commentMatches: CommentMatchReport[];
+}
+
+/**
+ * A multi-file edit that failed part-way through writing. Names the file that failed and, of
+ * those already written, which were put back to their previous bytes and which could not be.
+ */
+export class EditPlansWriteError extends Error {
+  constructor(
+    readonly failedPath: string,
+    override readonly cause: unknown,
+    readonly restored: string[],
+    readonly unrestored: string[],
+  ) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    let msg = `Writing ${quoteId(failedPath)} failed: ${reason}`;
+    if (restored.length > 0) {
+      msg += ` Restored to their previous content: ${restored.map(quoteId).join(', ')}.`;
+    }
+    if (unrestored.length > 0) {
+      msg += ` Could NOT restore: ${unrestored.join('; ')} — check these by hand.`;
+    }
+    if (restored.length === 0 && unrestored.length === 0) {
+      msg += ' Nothing had been written; no file changed.';
+    }
+    super(msg);
+    this.name = 'EditPlansWriteError';
+  }
+}
+
 export interface ApplyEditsResult {
   path: string;
   appliedEdits: number;
@@ -405,6 +450,26 @@ async function translateMissingParentError(
 }
 
 /**
+ * How many of `needle`'s occurrences in `content` the `commented` predicate calls commented,
+ * enumerated as `countOccurrences` counts them (non-overlapping, left to right) — so the split it
+ * reports adds up to the count in the same message.
+ */
+function countCommentedOccurrences(
+  content: string,
+  needle: string,
+  commented: (content: string, start: number, end: number) => boolean,
+): number {
+  let n = 0;
+  let idx = content.indexOf(needle);
+  while (idx !== -1) {
+    const end = idx + needle.length;
+    if (commented(content, idx, end)) n++;
+    idx = content.indexOf(needle, end);
+  }
+  return n;
+}
+
+/**
  * The pure half of {@link FileService.applyEdits}: turn `original` plus `edits` into the edited
  * content, with no I/O at all — no read, no write, no baseline, no mutation record. `applyEdits`
  * wraps it with exactly those; `compile`'s `overlay` calls it directly, because an overlay applies
@@ -421,6 +486,8 @@ export function applyEditsToContent(
     excludeMatch?: (content: string, start: number, end: number) => boolean;
     /** As `applyEdits`' option of the same name. */
     preserve?: EditTransform;
+    /** As `applyEdits`' option of the same name. */
+    commentHint?: (content: string, start: number, end: number) => boolean;
   } = {},
 ): { content: string; commentMatches: CommentMatchReport[] } {
   if (edits.length === 0) {
@@ -965,10 +1032,37 @@ export function applyEditsToContent(
           idx = content.indexOf(edit.oldString, idx + edit.oldString.length);
         }
       }
+      if (occursInPreserved) {
+        throw new Error(
+          `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, at least once inside text preserved (commented out) by an earlier edit in this same call; add more surrounding context so it matches only the live text, if any live occurrence remains.`,
+        );
+      }
+      // A file that keeps old versions of its prose as %-commented lines makes a live sentence
+      // match twice or more. The caller usually means the live one, and `excludeComments` is
+      // exactly that request — so say how the matches split, judged with the same predicate the
+      // flag uses, rather than leave the caller to give up on the edit. Advice only: nothing is
+      // applied on this path, the edit is still refused.
+      const inComments = opts.commentHint
+        ? countCommentedOccurrences(content, edit.oldString, opts.commentHint)
+        : 0;
+      const live = count - inComments;
+      if (inComments > 0 && live === 1) {
+        throw new Error(
+          `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, so it is not unique — but only once outside comments: the other ${inComments} match(es) are inside %-comments (e.g. commented-out old versions). Set excludeComments: true on this edit to replace the live occurrence only, or add more surrounding context.`,
+        );
+      }
+      if (inComments > 0 && live === 0) {
+        throw new Error(
+          `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, so it is not unique — and all ${count} are inside %-comments: there is no live occurrence. Add more surrounding context to pick one commented match, or check that oldString names the live text.`,
+        );
+      }
+      if (inComments > 0) {
+        throw new Error(
+          `Edit ${i + 1}: oldString matches ${count} times in ${relPath} (${live} outside comments, ${inComments} inside %-comments); add more surrounding context for a unique match, or set replaceAll (with excludeComments: true to leave the commented ones alone).`,
+        );
+      }
       throw new Error(
-        occursInPreserved
-          ? `Edit ${i + 1}: oldString matches ${count} times in ${relPath}, at least once inside text preserved (commented out) by an earlier edit in this same call; add more surrounding context so it matches only the live text, if any live occurrence remains.`
-          : `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
+        `Edit ${i + 1}: oldString matches ${count} times in ${relPath}; add more surrounding context for a unique match, or set replaceAll.`,
       );
     }
     if (edit.replaceAll) {
@@ -1702,6 +1796,209 @@ export class FileService {
    * inclusive — see `RangeEditOp`). All edits are applied in memory and only written if every
    * edit succeeds (atomic) — so a failure leaves the file untouched.
    */
+  /**
+   * The planning half of {@link applyEdits}: every guard a single-file edit runs — the link
+   * check, the external-change check, UTF-8 exactness, and every edit-level refusal of
+   * {@link applyEditsToContent} — with the edited content computed in memory and NOTHING written,
+   * recorded or notified. {@link writeEditPlan} is the other half. Split so `edit_file` with
+   * `files` can plan every file (and refuse the whole call if any one fails) before the first
+   * write; `applyEdits` is exactly the two halves back to back.
+   */
+  async planEdits(
+    projectDir: string,
+    relPath: string,
+    edits: AnyEditOp[],
+    opts: {
+      overrideExternalChanges?: boolean;
+      strictLinks?: boolean;
+      /**
+       * Consulted for every candidate match of an edit that set `excludeComments`: `true` means
+       * "this match is inside a comment — skip it". Same ignorance boundary as `preserve`: this
+       * method sees a predicate over integer offsets and never learns what a comment is
+       * (`src/lib/rewriteMode.ts`'s `matchIsCommented` is what `edit_file` passes). It is
+       * re-asked against the *current* content for every occurrence, not once per edit, because
+       * a replacement can change its own line's comment state.
+       *
+       * An edit setting `excludeComments` with no filter supplied here is a wiring error and is
+       * refused, never silently applied as if the flag were absent.
+       */
+      excludeMatch?: (content: string, start: number, end: number) => boolean;
+      /**
+       * Optional hook letting a caller rewrite the replacement text for each edit, given the
+       * position of the (unique, non-`replaceAll`) match in the file's *current* content. Used by
+       * `edit_file`'s rewrite-preservation feature to decide, with the actual match position in
+       * hand, whether commenting out the original text is safe (see `src/lib/rewriteMode.ts`) — a
+       * decision `FileService` deliberately stays ignorant of, since it knows nothing about
+       * comment syntax; it only reads back the reported `commentedLength` as an integer offset.
+       * The ledger of already-preserved ranges lives entirely in this method (see the `preserved`
+       * array below), not in the hook — `applyEdits` is the only code that knows every splice
+       * offset a call produces, `replaceAll` included.
+       *
+       * Not consulted for a `replaceAll` edit: there is no single match position, so preservation
+       * is skipped for those unconditionally, and matching inside an earlier preserved comment
+       * under `replaceAll` is documented, intended behaviour (see `edit_file`'s
+       * `preserveOriginal` description) — a `replaceAll` edit still shifts the ledger as it
+       * splices, it just never adds to it.
+       */
+      preserve?: EditTransform;
+      /**
+       * Advice only, never a filter: consulted when an edit WITHOUT `excludeComments` is refused
+       * as non-unique, to say how many of its matches sit in comments and point at
+       * `excludeComments`. Pass it only for a file that has comment syntax (`edit_file` passes
+       * `matchIsCommented` for a `%`-comment file); absent, the refusal reads as it always did.
+       */
+      commentHint?: (content: string, start: number, end: number) => boolean;
+    } = {},
+  ): Promise<EditPlan> {
+    if (edits.length === 0) {
+      throw new Error('No edits provided.');
+    }
+    const abs = resolveInside(projectDir, relPath);
+    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
+    const originalBytes = await readFile(abs);
+    const original = decodeUtf8Exact(originalBytes);
+    if (!opts.overrideExternalChanges && this.isChangedOnDisk(abs, originalBytes)) {
+      throw new ExternalChangeError(relPath);
+    }
+    // Every edit here is a read-decode-modify-write of the WHOLE file, and the decode is UTF-8:
+    // a byte sequence that is not valid UTF-8 (a Latin-1 `é` is the one byte 0xE9) decodes to
+    // U+FFFD and is written back as ef bf bd. So a one-line edit to a Latin-1 `.tex` rewrote every
+    // accented character in the file, far from the edit and absent from its diff's intent.
+    // Refused before anything is spliced; `write`, whose content is the caller's whole file, is
+    // deliberately not held to this — replacing such a file outright is a choice, not a side effect.
+    if (original === null) {
+      throw new Error(
+        `"${relPath}" is not valid UTF-8 (likely Latin-1 or another legacy encoding), and ` +
+          'edit_file rewrites the whole file as UTF-8, which would replace every character it ' +
+          'cannot decode — not just the edited text — with U+FFFD. Convert the file to UTF-8 ' +
+          'first, or replace it deliberately with write_file and its full content.',
+      );
+    }
+    const { content, commentMatches } = applyEditsToContent(original, relPath, edits, {
+      excludeMatch: opts.excludeMatch,
+      preserve: opts.preserve,
+      commentHint: opts.commentHint,
+    });
+    return {
+      projectDir,
+      relPath,
+      abs,
+      originalBytes,
+      original,
+      content,
+      appliedEdits: edits.length,
+      commentMatches,
+    };
+  }
+
+  /**
+   * The writing half of {@link applyEdits}: put a {@link planEdits} result on disk, record its
+   * baseline and tell the mutation recorder (attributed through any in-project link, as every
+   * write is). With `verifyUnchanged`, the file is re-read first and the write refused
+   * ({@link ExternalChangeError}) when its bytes are no longer the ones the plan was computed
+   * from — `edit_file` with `files` plans every file before writing any, so a hand edit landing
+   * in between would otherwise be overwritten by content computed from the old bytes.
+   */
+  async writeEditPlan(
+    plan: EditPlan,
+    opts: { verifyUnchanged?: boolean } = {},
+  ): Promise<ApplyEditsResult> {
+    const { projectDir, relPath, abs, original, content, commentMatches } = plan;
+    if (opts.verifyUnchanged) {
+      const now = await readFile(abs);
+      if (!now.equals(plan.originalBytes)) throw new ExternalChangeError(relPath);
+    }
+    await writeFile(abs, content, 'utf8');
+    this.revisions.record(abs, content);
+    await this.notify(
+      projectDir,
+      await this.attributedPath(projectDir, abs, relPath),
+      original,
+      content,
+    );
+    return {
+      path: relPath,
+      appliedEdits: plan.appliedEdits,
+      ...(commentMatches.length > 0 ? { commentMatches } : {}),
+    };
+  }
+
+  /**
+   * Write several {@link planEdits} results, all or nothing as far as the disk allows. Plans are
+   * written in order, each re-verified against the bytes it was planned from; when one fails,
+   * every plan already written is put back to its previous bytes **through this service** —
+   * baseline re-recorded, the reverse change told to the mutation recorder, so the session's
+   * shadow does not keep an edit that is no longer on disk — but only while the file still holds
+   * exactly what this call wrote (anything else is someone's newer edit, never clobbered). The
+   * caller must hold the project lock across the whole call.
+   */
+  async writeEditPlans(plans: EditPlan[]): Promise<ApplyEditsResult[]> {
+    const written: EditPlan[] = [];
+    const results: ApplyEditsResult[] = [];
+    for (const plan of plans) {
+      try {
+        results.push(await this.writeEditPlan(plan, { verifyUnchanged: true }));
+        written.push(plan);
+      } catch (err) {
+        const restored: string[] = [];
+        const unrestored: string[] = [];
+        // The failing file itself: a write that failed after opening (ENOSPC) can leave it
+        // truncated. Put its planned-from bytes back — unless the failure WAS a newer edit
+        // landing on it (ExternalChangeError), which is someone else's and stays.
+        if (!(err instanceof ExternalChangeError)) {
+          try {
+            const now = await readFile(plan.abs);
+            if (!now.equals(plan.originalBytes)) {
+              await writeFile(plan.abs, plan.originalBytes);
+              restored.push(plan.relPath);
+            }
+          } catch (restoreErr) {
+            // Gone since it was planned: this call never wrote it (the write's own re-read is
+            // what failed), so there is nothing of ours to put back.
+            if ((restoreErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+              unrestored.push(
+                `${quoteId(plan.relPath)} (${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)})`,
+              );
+            }
+          }
+        }
+        for (const done of written.reverse()) {
+          try {
+            const now = await readFile(done.abs);
+            if (!now.equals(Buffer.from(done.content, 'utf8'))) {
+              unrestored.push(
+                `${quoteId(done.relPath)} (it changed again after this call wrote it)`,
+              );
+              continue;
+            }
+            await writeFile(done.abs, done.original, 'utf8');
+            this.revisions.record(done.abs, done.original);
+            await this.notify(
+              done.projectDir,
+              await this.attributedPath(done.projectDir, done.abs, done.relPath),
+              done.content,
+              done.original,
+            );
+            restored.push(done.relPath);
+          } catch (restoreErr) {
+            unrestored.push(
+              `${quoteId(done.relPath)} (${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)})`,
+            );
+          }
+        }
+        throw new EditPlansWriteError(plan.relPath, err, restored.reverse(), unrestored.reverse());
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Apply surgical edits. Each is either a string replacement (whose `oldString` must match
+   * uniquely unless `replaceAll` is set) or a line range (`startLine`/`endLine`, 1-based and
+   * inclusive — see `RangeEditOp`). All edits are applied in memory and only written if every
+   * edit succeeds (atomic) — so a failure leaves the file untouched. {@link planEdits} then
+   * {@link writeEditPlan}, back to back.
+   */
   async applyEdits(
     projectDir: string,
     relPath: string,
@@ -1745,50 +2042,19 @@ export class FileService {
        * splices, it just never adds to it.
        */
       preserve?: EditTransform;
+      /**
+       * Advice only, never a filter: consulted when an edit WITHOUT `excludeComments` is refused
+       * as non-unique, to say how many of its matches sit in comments and point at
+       * `excludeComments`. Pass it only for a file that has comment syntax (`edit_file` passes
+       * `matchIsCommented` for a `%`-comment file); absent, the refusal reads as it always did.
+       */
+      commentHint?: (content: string, start: number, end: number) => boolean;
     } = {},
   ): Promise<ApplyEditsResult> {
-    if (edits.length === 0) {
-      throw new Error('No edits provided.');
-    }
-    const abs = resolveInside(projectDir, relPath);
-    await this.guardLinks(projectDir, abs, relPath, opts.strictLinks);
-    const originalBytes = await readFile(abs);
-    const original = decodeUtf8Exact(originalBytes);
-    if (!opts.overrideExternalChanges && this.isChangedOnDisk(abs, originalBytes)) {
-      throw new ExternalChangeError(relPath);
-    }
-    // Every edit here is a read-decode-modify-write of the WHOLE file, and the decode is UTF-8:
-    // a byte sequence that is not valid UTF-8 (a Latin-1 `é` is the one byte 0xE9) decodes to
-    // U+FFFD and is written back as ef bf bd. So a one-line edit to a Latin-1 `.tex` rewrote every
-    // accented character in the file, far from the edit and absent from its diff's intent.
-    // Refused before anything is spliced; `write`, whose content is the caller's whole file, is
-    // deliberately not held to this — replacing such a file outright is a choice, not a side effect.
-    if (original === null) {
-      throw new Error(
-        `"${relPath}" is not valid UTF-8 (likely Latin-1 or another legacy encoding), and ` +
-          'edit_file rewrites the whole file as UTF-8, which would replace every character it ' +
-          'cannot decode — not just the edited text — with U+FFFD. Convert the file to UTF-8 ' +
-          'first, or replace it deliberately with write_file and its full content.',
-      );
-    }
-    const { content, commentMatches } = applyEditsToContent(original, relPath, edits, {
-      excludeMatch: opts.excludeMatch,
-      preserve: opts.preserve,
-    });
-    await writeFile(abs, content, 'utf8');
-    this.revisions.record(abs, content);
-    await this.notify(
-      projectDir,
-      await this.attributedPath(projectDir, abs, relPath),
-      original,
-      content,
-    );
-    opts.onWritten?.(original, content);
-    return {
-      path: relPath,
-      appliedEdits: edits.length,
-      ...(commentMatches.length > 0 ? { commentMatches } : {}),
-    };
+    const plan = await this.planEdits(projectDir, relPath, edits, opts);
+    const res = await this.writeEditPlan(plan);
+    opts.onWritten?.(plan.original, plan.content);
+    return res;
   }
 
   /** Delete a file (not a directory) from the project. */

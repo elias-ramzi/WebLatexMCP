@@ -8,6 +8,7 @@ import { registerSetCredential } from './tools/setCredential.js';
 import { registerCredentialPortal } from './tools/credentialPortal.js';
 import { registerListFiles } from './tools/listFiles.js';
 import { registerSearchFiles } from './tools/searchFiles.js';
+import { registerLocateText } from './tools/locateText.js';
 import { registerReadFile } from './tools/readFile.js';
 import { registerWriteFile } from './tools/writeFile.js';
 import { registerAddAsset } from './tools/addAsset.js';
@@ -104,6 +105,7 @@ export function createServer(
   registerCredentialPortal(server, ctx);
   registerListFiles(server, ctx);
   registerSearchFiles(server, ctx);
+  registerLocateText(server, ctx);
   registerReadFile(server, ctx);
   registerWriteFile(server, ctx);
   registerAddAsset(server, ctx);
