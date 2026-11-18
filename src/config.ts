@@ -13,6 +13,7 @@ import {
   countRegisteredProjects,
 } from './services/projectRegistry.js';
 import { toPosix } from './lib/paths.js';
+import { readStoredGitUrl } from './lib/gitCloneLine.js';
 import { DEFAULT_MAX_PARALLEL_BUILDS, MAX_PARALLEL_BUILDS_CEILING } from './lib/workGate.js';
 import { homeWorkspaceRoot, migrateWorkspaceCommand } from './lib/workspaceNote.js';
 // One list of backends, shared with the resolver's fallback loop: a private copy here could
@@ -179,7 +180,8 @@ export function parseProjects(
       ? // A path from the environment may be `~`-prefixed or relative to the launch dir, the same
         // as WEB_LATEX_MCP_WORKSPACE. Resolve it once here so everything downstream sees absolute.
         { id, ...cfg, path: path.resolve(cwd, expandHome(cfg.path)) }
-      : { id, ...cfg },
+      : // A `git clone` line pasted as the gitUrl is read as its URL (env URLs are not stripped).
+        { id, ...readStoredGitUrl(cfg) },
   );
   return { projects, skipped };
 }

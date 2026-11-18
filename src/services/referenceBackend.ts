@@ -1,5 +1,5 @@
 /**
- * Shared plumbing for reference-lookup backends (DBLP, Crossref, OpenAlex).
+ * Shared plumbing for reference-lookup backends (DBLP, Crossref, OpenAlex, DataCite).
  *
  * Each backend fronts its API with the same failure shapes: a transport error, a non-OK
  * HTTP status, or — worse — a 200 that is actually a bot-challenge/interstitial HTML page
@@ -77,6 +77,27 @@ export class BackendUnavailableError extends Error {
   constructor(backend: string, message: string) {
     super(message);
     this.name = 'BackendUnavailableError';
+    this.backend = backend;
+  }
+}
+
+/**
+ * Thrown when a request that **names a record** got a definite 404: the backend answered, and it
+ * holds no record under that identifier. A plain `Error` subclass, never a
+ * `BackendUnavailableError` — see that class for why a missing record is an answer.
+ *
+ * It exists as its own type for one decision only: a DOI names one record, registered with one
+ * agency (Crossref or DataCite), so a definite "Crossref has no such DOI" is what licenses asking
+ * DataCite for the SAME DOI — the same record from its own registrar, not a substitute. Anything
+ * else that is not unavailability (a body that is not BibTeX, a caller error) must not be read as
+ * that answer, which is why the resolver tests for this type and not for "any plain Error".
+ */
+export class RecordNotFoundError extends Error {
+  readonly backend: string;
+
+  constructor(backend: string, message: string) {
+    super(message);
+    this.name = 'RecordNotFoundError';
     this.backend = backend;
   }
 }

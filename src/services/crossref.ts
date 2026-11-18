@@ -23,6 +23,7 @@ import {
   BODY_EXCERPT,
   REQUEST_TIMEOUT_MS,
   BackendUnavailableError,
+  RecordNotFoundError,
   assertApiBody,
   fetchOrUnavailable,
   readBodyOrUnavailable,
@@ -279,7 +280,12 @@ export class CrossrefService implements ReferenceBackend {
       // through on a missing record would be wrong even if there were a fallback to fall to:
       // a DOI names one record, so there is nothing to substitute to.
       const message = `Crossref returned ${res.status} ${res.statusText} for DOI "${doi}".${httpHint(SERVICE, res.status, 'record')}`;
-      throw res.status === 404 ? new Error(message) : new BackendUnavailableError(SERVICE, message);
+      // `RecordNotFoundError` (a plain Error subclass) so the resolver can tell this definite
+      // answer apart from every other non-unavailable failure: it is what licenses asking DataCite,
+      // the other DOI registration agency, for the same DOI.
+      throw res.status === 404
+        ? new RecordNotFoundError(SERVICE, message)
+        : new BackendUnavailableError(SERVICE, message);
     }
     const text = (await readBodyOrUnavailable(SERVICE, res, `BibTeX for DOI "${doi}"`)).trim();
     assertApiBody(SERVICE, text, `a BibTeX request for DOI "${doi}"`);

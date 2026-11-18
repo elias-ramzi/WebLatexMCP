@@ -5,13 +5,18 @@ import {
   ReferenceSourceInvalidError,
   NoCanonicalBibtexError,
   DEFAULT_SOURCE_ORDER,
+  doiRegistrarOrder,
   type ReferenceBackends,
 } from '../../src/services/referenceResolver.js';
-import { BackendUnavailableError } from '../../src/services/referenceBackend.js';
-import type { ReferenceHit } from '../../src/services/referenceBackend.js';
+import {
+  BackendUnavailableError,
+  RecordNotFoundError,
+} from '../../src/services/referenceBackend.js';
+import type { FetchResponse, ReferenceHit } from '../../src/services/referenceBackend.js';
 import { DblpService } from '../../src/services/dblp.js';
 import { CrossrefService } from '../../src/services/crossref.js';
 import { OpenAlexService } from '../../src/services/openalex.js';
+import { DataCiteService } from '../../src/services/datacite.js';
 import { parseReferenceSource } from '../../src/config.js';
 
 function hit(source: string, key: string): ReferenceHit {
@@ -31,7 +36,7 @@ interface Behaviour {
   doi?: string | null | Error;
 }
 
-function spy(plan: Partial<Record<'dblp' | 'crossref' | 'openalex', Behaviour>>): Spy {
+function spy(plan: Partial<Record<'dblp' | 'crossref' | 'openalex' | 'datacite', Behaviour>>): Spy {
   const calls: string[] = [];
   const give = <T>(what: T | Error): Promise<T> =>
     what instanceof Error ? Promise.reject(what) : Promise.resolve(what);
@@ -56,6 +61,12 @@ function spy(plan: Partial<Record<'dblp' | 'crossref' | 'openalex', Behaviour>>)
           calls.push('openalex.resolveDoi');
           const d = plan.openalex?.doi;
           return d instanceof Error ? Promise.reject(d) : Promise.resolve(d ?? null);
+        },
+      },
+      datacite: {
+        fetchBibtexByDoi: (_d: string) => {
+          calls.push('datacite.fetchBibtexByDoi');
+          return give(plan.datacite?.bibtex ?? '@misc{https://doi.org/10.48550/x,}');
         },
       },
     },
@@ -215,6 +226,7 @@ describe('ReferenceResolver.search — with REAL backends over a rejecting fetch
       dblp: new DblpService(dead),
       crossref: new CrossrefService(alive),
       openalex: new OpenAlexService(dead),
+      datacite: new DataCiteService(dead),
     }).search('resnet');
 
     expect(out.source).toBe('crossref');
@@ -494,6 +506,155 @@ describe('ReferenceResolver.fetchBibtex — routed by the key, never by config',
       BackendUnavailableError,
     );
     expect(s.calls).toEqual(['dblp.fetchBibtex']);
+  });
+});
+
+describe('ReferenceResolver.fetchBibtex — a DOI is fetched from the agency that registered it', () => {
+  const notFound = (b: string) =>
+    new RecordNotFoundError(b, `${b} returned 404 Not Found for DOI "x".`);
+  const ARXIV_ENTRY = '@misc{https://doi.org/10.48550/arxiv.2609.26618,\n  title = {T}\n}';
+
+  it('sends an arXiv DOI straight to DataCite — Crossref is never asked', async () => {
+    const s = spy({ datacite: { bibtex: ARXIV_ENTRY } });
+    const out = await new ReferenceResolver(s.backends).fetchBibtex(
+      'crossref:10.48550/arXiv.2609.26618',
+    );
+    expect(out).toEqual({ bibtex: ARXIV_ENTRY, source: 'crossref', via: 'datacite' });
+    expect(s.calls).toEqual(['datacite.fetchBibtexByDoi']);
+  });
+
+  it('routes an OpenAlex record whose DOI is arXiv to DataCite (the CVPR-session failure)', async () => {
+    const s = spy({
+      openalex: { doi: '10.48550/arxiv.2609.26618' },
+      datacite: { bibtex: ARXIV_ENTRY },
+    });
+    const out = await new ReferenceResolver(s.backends).fetchBibtex('openalex:W7214111511');
+    expect(out).toEqual({ bibtex: ARXIV_ENTRY, source: 'openalex', via: 'datacite' });
+    expect(s.calls).toEqual(['openalex.resolveDoi', 'datacite.fetchBibtexByDoi']);
+  });
+
+  it('asks DataCite for a non-arXiv DOI only after Crossref answered a definite 404', async () => {
+    const s = spy({
+      crossref: { bibtex: notFound('Crossref') },
+      datacite: { bibtex: '@misc{https://doi.org/10.5281/zenodo.1,\n}' },
+    });
+    const out = await new ReferenceResolver(s.backends).fetchBibtex('crossref:10.5281/zenodo.1');
+    expect(out).toEqual({
+      bibtex: '@misc{https://doi.org/10.5281/zenodo.1,\n}',
+      source: 'crossref',
+      via: 'datacite',
+    });
+    expect(s.calls).toEqual(['crossref.fetchBibtex', 'datacite.fetchBibtexByDoi']);
+  });
+
+  it('CONTROL: a Crossref hit for a non-arXiv DOI reports no via and never asks DataCite', async () => {
+    const s = spy({ crossref: { bibtex: '@article{c,}' } });
+    const out = await new ReferenceResolver(s.backends).fetchBibtex(
+      'crossref:10.1109/CVPR.2016.90',
+    );
+    expect(out).toEqual({ bibtex: '@article{c,}', source: 'crossref' });
+    expect(s.calls).toEqual(['crossref.fetchBibtex']);
+  });
+
+  it('names BOTH agencies when neither has the DOI, and is not substitutable', async () => {
+    const s = spy({
+      crossref: { bibtex: notFound('Crossref') },
+      datacite: { bibtex: notFound('DataCite') },
+    });
+    const err = await new ReferenceResolver(s.backends)
+      .fetchBibtex('crossref:10.1234/nowhere')
+      .then(
+        () => {
+          throw new Error('expected a refusal');
+        },
+        (e: unknown) => e as Error,
+      );
+    expect(err).toBeInstanceOf(RecordNotFoundError);
+    expect(err).not.toBeInstanceOf(BackendUnavailableError);
+    expect(err.message).toMatch(
+      /Neither Crossref nor DataCite has a record for DOI "10\.1234\/nowhere"/,
+    );
+  });
+
+  it('a 404 from Crossref then an unreachable DataCite is unavailability that says both', async () => {
+    const s = spy({
+      crossref: { bibtex: notFound('Crossref') },
+      datacite: { bibtex: down('DataCite') },
+    });
+    const err = await new ReferenceResolver(s.backends).fetchBibtex('crossref:10.1234/x').then(
+      () => {
+        throw new Error('expected a refusal');
+      },
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(BackendUnavailableError);
+    expect(err.message).toMatch(/Crossref has no record for DOI "10\.1234\/x"/);
+    expect(err.message).toMatch(/DataCite[\s\S]*could not be reached/);
+  });
+
+  it('CONTROL: an UNREACHABLE Crossref is never a reason to ask DataCite', async () => {
+    const s = spy({ crossref: { bibtex: down('Crossref') } });
+    await expect(
+      new ReferenceResolver(s.backends).fetchBibtex('crossref:10.1234/x'),
+    ).rejects.toBeInstanceOf(BackendUnavailableError);
+    expect(s.calls).toEqual(['crossref.fetchBibtex']);
+  });
+
+  it('CONTROL: a non-404 plain error from Crossref (a body that is not BibTeX) is not a 404', async () => {
+    const s = spy({ crossref: { bibtex: new Error('No BibTeX entry found on Crossref') } });
+    await expect(
+      new ReferenceResolver(s.backends).fetchBibtex('crossref:10.1234/x'),
+    ).rejects.toThrow(/No BibTeX entry found/);
+    expect(s.calls).toEqual(['crossref.fetchBibtex']);
+  });
+
+  it('end to end over the REAL services: an arXiv OpenAlex record is fetched from DataCite', async () => {
+    const urls: string[] = [];
+    const answer =
+      (status: number, body: string) =>
+      (url: string): Promise<FetchResponse> => {
+        urls.push(url);
+        return Promise.resolve({
+          ok: status === 200,
+          status,
+          statusText: status === 200 ? 'OK' : 'Not Found',
+          text: async () => body,
+          json: async () => JSON.parse(body) as unknown,
+        });
+      };
+    const crossrefCalls: string[] = [];
+    const out = await new ReferenceResolver({
+      dblp: new DblpService(() => Promise.reject(new Error('dblp must not be consulted'))),
+      crossref: new CrossrefService((url) => {
+        crossrefCalls.push(url);
+        return Promise.reject(new Error('crossref must not be consulted'));
+      }),
+      openalex: new OpenAlexService(
+        answer(
+          200,
+          JSON.stringify({
+            id: 'https://openalex.org/W7214111511',
+            doi: 'https://doi.org/10.48550/arxiv.2609.26618',
+          }),
+        ),
+      ),
+      datacite: new DataCiteService(answer(200, `${ARXIV_ENTRY}\n`)),
+    }).fetchBibtex('openalex:W7214111511');
+
+    expect(out).toEqual({ bibtex: ARXIV_ENTRY, source: 'openalex', via: 'datacite' });
+    expect(crossrefCalls).toEqual([]);
+    expect(urls.at(-1)).toBe(
+      'https://api.datacite.org/dois/application/x-bibtex/10.48550/arxiv.2609.26618',
+    );
+  });
+});
+
+describe('doiRegistrarOrder', () => {
+  it('puts DataCite first for arXiv DOIs only', () => {
+    expect(doiRegistrarOrder('10.48550/arXiv.1706.03762')).toEqual(['datacite', 'crossref']);
+    expect(doiRegistrarOrder('10.1109/CVPR.2016.90')).toEqual(['crossref', 'datacite']);
+    // A prefix that merely starts with the same digits is another registrant.
+    expect(doiRegistrarOrder('10.485501/x')).toEqual(['crossref', 'datacite']);
   });
 });
 

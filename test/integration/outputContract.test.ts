@@ -67,6 +67,7 @@ import { ReferenceResolver } from '../../src/services/referenceResolver.js';
 import { DblpService } from '../../src/services/dblp.js';
 import { CrossrefService } from '../../src/services/crossref.js';
 import { OpenAlexService } from '../../src/services/openalex.js';
+import { DataCiteService } from '../../src/services/datacite.js';
 import { UpdateService } from '../../src/services/updater.js';
 import { buildPdfPath, logBaseDir } from '../../src/services/compiler.js';
 import { minimalPdf } from '../helpers/minimalPdf.js';
@@ -393,6 +394,10 @@ describe('output contract: the local-project read and write tools', () => {
     await auditCall(client, 'set_rewrite_mode', { project: 'doc', mode: 'prose' });
     await auditCall(client, 'read_file', { project: 'doc', path: 'main.tex' });
     await auditCall(client, 'search_files', { project: 'doc', pattern: 'opening' });
+    await auditCall(client, 'locate_text', {
+      project: 'doc',
+      text: 'The opening line mentions [1]. --> fix',
+    });
     await auditCall(client, 'write_file', {
       project: 'doc',
       path: 'notes.tex',
@@ -790,6 +795,16 @@ const CROSSREF_BIBTEX = [
   '',
 ].join('\n');
 
+/** DataCite's BibTeX for an arXiv DOI, as the live API served it (cite key is a URL). */
+const DATACITE_BIBTEX = [
+  '@misc{https://doi.org/10.48550/arxiv.1706.03762,',
+  '  doi = {10.48550/ARXIV.1706.03762},',
+  '  title = {Attention Is All You Need},',
+  '  publisher = {arXiv},',
+  '  year = {2017}',
+  '}',
+].join('\n');
+
 const OPENALEX_WORK_JSON = JSON.stringify({
   id: 'https://openalex.org/W2194775991',
   doi: 'https://doi.org/10.1109/cvpr.2016.90',
@@ -857,6 +872,9 @@ function stubbedReferences(opts: { dblpDown?: boolean } = {}): ReferenceResolver
         ['/works?search=', '{"results":[]}'],
         ['/works/W', OPENALEX_WORK_JSON],
       ]),
+    ),
+    datacite: new DataCiteService(
+      route('DataCite', [['/dois/application/x-bibtex/10.48550/', DATACITE_BIBTEX]]),
     ),
   });
 }
@@ -1039,6 +1057,18 @@ describe('output contract: the bibliography tools', () => {
       key: 'openalex:W2194775991',
     });
     expect(bridged).toMatchObject({ added: true, source: 'openalex', via: 'crossref' });
+
+    // An arXiv DOI is fetched from DataCite, its registrar; its URL-shaped cite key is reported.
+    const arxiv = await auditCall(client, 'add_citation', {
+      project: 'demo',
+      key: 'crossref:10.48550/arXiv.1706.03762',
+    });
+    expect(arxiv).toMatchObject({
+      added: true,
+      source: 'crossref',
+      via: 'datacite',
+      key: 'https://doi.org/10.48550/arxiv.1706.03762',
+    });
   });
 });
 

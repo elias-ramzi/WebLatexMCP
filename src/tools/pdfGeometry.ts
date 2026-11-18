@@ -9,6 +9,7 @@ import {
   resolveRootFile,
 } from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
+import { normalizePages, pagesInputSchema } from '../lib/pageSelection.js';
 import { toPosixOut } from '../lib/paths.js';
 import {
   MAX_GEOMETRY_PAGES,
@@ -36,12 +37,11 @@ const inputSchema = {
         'missing build PDF fall back to the surfaced <workspace>/<id>.pdf, which holds ' +
         'whichever root compiled last.',
     ),
-  pages: z
-    .array(z.number().int().positive())
-    .min(1, 'Omit pages for every page — an empty array selects zero pages, not "all".')
+  pages: pagesInputSchema()
     .optional()
     .describe(
-      '1-based page numbers, in the order given. Defaults to every page, capped at ' +
+      '1-based page numbers, in the order given, or one page number on its own (2 is [2]). ' +
+        'Defaults to every page, capped at ' +
         `${MAX_GEOMETRY_PAGES} (MAX_GEOMETRY_PAGES) per call — lower than render_pages' cap, ` +
         'because a page of text-line boxes is a lot more structured output than one PNG. Omit ' +
         'the field for every page (up to the cap); an empty array is rejected rather than ' +
@@ -441,8 +441,9 @@ export function registerPdfGeometry(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, kinds, variant }) => {
+    async ({ project, rootFile, pages: pagesInput, kinds, variant }) => {
       try {
+        const pages = normalizePages(pagesInput);
         // Invariant: requireProjectDir, NEVER requireGitProject — this tool must work for a
         // mode:'local' project exactly like compile and render_pages. Git-gating it would be wrong.
         const { id, dir } = await ctx.projectManager.requireProjectDir(project);

@@ -3,6 +3,8 @@ import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { z } from 'zod';
 import { withFileLock } from '../lib/fileLock.js';
 import { isLocalProject } from '../lib/projectMode.js';
+import { readStoredGitUrl } from '../lib/gitCloneLine.js';
+import { stripGitUrlCredentials } from '../lib/gitUrlCredentials.js';
 import {
   assertValidProjectId,
   describeSkippedProject,
@@ -186,7 +188,12 @@ function readRegistryFile(workspaceRoot: string): {
       skip({ id, source: filePath, kind: 'entry', problem });
       continue;
     }
-    entries[id] = parsed.data;
+    // A `git clone` line pasted as the gitUrl (what Overleaf's Git menu shows) is read as its URL,
+    // stripped as registration strips it; the file itself is left as written.
+    entries[id] =
+      parsed.data.mode === 'local'
+        ? parsed.data
+        : readStoredGitUrl(parsed.data, (u) => stripGitUrlCredentials(u).url);
   }
   return { entries, skipped };
 }

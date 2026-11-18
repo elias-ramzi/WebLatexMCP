@@ -9,6 +9,7 @@ import {
   resolveRootFile,
 } from '../lib/rootFile.js';
 import { locateRootPdf } from '../lib/pdfLocate.js';
+import { normalizePages, pagesInputSchema } from '../lib/pageSelection.js';
 import { toPosixOut } from '../lib/paths.js';
 import { MAX_TEXT_PAGES, PdfRenderError } from '../services/pdfRender.js';
 import type { TextResult } from '../services/pdfRender.js';
@@ -49,12 +50,11 @@ const inputSchema = {
         'missing build PDF fall back to the surfaced <workspace>/<id>.pdf, which holds ' +
         'whichever root compiled last.',
     ),
-  pages: z
-    .array(z.number().int().positive())
-    .min(1, 'Omit pages for every page — an empty array selects zero pages, not "all".')
+  pages: pagesInputSchema()
     .optional()
     .describe(
-      '1-based page numbers, in the order given. Defaults to every page, capped at ' +
+      '1-based page numbers, in the order given, or one page number on its own (2 is [2]). ' +
+        'Defaults to every page, capped at ' +
         `${MAX_TEXT_PAGES} (MAX_TEXT_PAGES) per call — the rest come back in skippedPages. Omit ` +
         'the field for every page; an empty array is rejected rather than silently extracting ' +
         'nothing. Cannot be combined with `labels`.',
@@ -126,6 +126,15 @@ const outputSchema = {
             'The printed page the .aux records for it, verbatim — what \\pageref would print.',
           ),
         page: z.number().describe('The 1-based PDF page index its text was read from.'),
+        via: z
+          .literal('destination')
+          .optional()
+          .describe(
+            'Present only when the printed page names more than one PDF page (a restarted or ' +
+              "renumbered numbering) and the page was taken from the label's own hyperref link " +
+              "target (the PDF's named destination), accepted because that page's /PageLabels " +
+              'entry, page number or .log shipout record agrees with printedPage — see render_pages.',
+          ),
       }),
     )
     .optional()
@@ -180,8 +189,9 @@ export function registerExtractText(server: McpServer, ctx: AppContext): void {
       inputSchema,
       outputSchema,
     },
-    async ({ project, rootFile, pages, labels, variant }) => {
+    async ({ project, rootFile, pages: pagesInput, labels, variant }) => {
       try {
+        const pages = normalizePages(pagesInput);
         // Rejected, never silently resolved — the same house rule render_pages and `diff` apply.
         if (labels && pages) {
           throw new Error(

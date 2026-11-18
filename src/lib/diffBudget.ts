@@ -556,6 +556,10 @@ export interface ChangeDiffPlan {
   truncated: boolean;
 }
 
+/** The route out a confirmation diff's omission markers name. Exported so a caller that reserves
+ * a marker's cost up front (`planEditDiffs`) charges the very text the marker will carry. */
+export const CHANGE_DIFF_HINT = 'call diff for the full patch';
+
 /**
  * Plan a write/edit confirmation diff against {@link CHANGE_DIFF_BUDGET}.
  *
@@ -568,7 +572,7 @@ export function planChangeDiff(patch: string, budget = CHANGE_DIFF_BUDGET): Chan
   const plan = planPatch(splitPatch(patch), {
     budget,
     maxFiles: DIFF_MAX_FILES,
-    hint: 'call diff for the full patch',
+    hint: CHANGE_DIFF_HINT,
   });
   return {
     diff: plan.patch,

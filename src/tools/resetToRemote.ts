@@ -63,7 +63,7 @@ export function registerResetToRemote(server: McpServer, ctx: AppContext): void 
         // A peer's persisted re-registration first (`ProjectManager.refreshedGitConfig`), so the
         // reset and its credential follow it rather than a stale snapshot's remote.
         ctx.projectManager.refreshedGitConfig(project);
-        const cfg = ctx.projectManager.requireGitProject(project, 'reset to');
+        const cfg = ctx.projectManager.requireRemoteGitProject(project, 'reset to');
         const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         return await ctx.projectManager.runExclusive(id, async () => {

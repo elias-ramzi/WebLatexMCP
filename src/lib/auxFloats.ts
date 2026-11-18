@@ -906,6 +906,14 @@ export interface AuxFloatsResult {
    *  beside it says that PDF is not this run's output. Never spread into a tool's
    *  `structuredContent`. */
   engineOutput?: EngineOutput;
+  /** The named destinations the engine reported as DUPLICATES in the build's `.log`
+   *  ({@link parseDuplicateDestinations}) — names a second `\hypertarget`/anchor tried to define
+   *  after the first, which the PDF kept. Read in the same pass as `shipouts`, so present only
+   *  when the caller asked for those and the log was read (an empty set when it reports none);
+   *  absent otherwise. `labelPages.ts` uses it only to REFUSE: a label whose anchor is a
+   *  duplicate cannot be located by its destination, which may be another label's. Never spread
+   *  into a tool's `structuredContent`. */
+  duplicateDestinations?: ReadonlySet<string>;
   /** When the caller named the PDF it will pair with this `.aux` (`readAuxFloats(…, { pdfPath })`)
    *  and both could be stat'd: each file's modification time, in milliseconds. A compile that
    *  finishes writes its `.aux` BEFORE its PDF, so an `.aux` newer than the PDF is one a later run
@@ -1543,7 +1551,13 @@ async function readWholeBuildLog(auxPath: string): Promise<string | undefined> {
 }
 
 /** What {@link readLogRecords} gives for a log it was not asked to read. */
-const NO_LOG_RECORDS: { shipouts?: number[]; engineOutput?: EngineOutput } = {};
+const NO_LOG_RECORDS: LogRecords = {};
+
+interface LogRecords {
+  shipouts?: number[];
+  engineOutput?: EngineOutput;
+  duplicateDestinations?: ReadonlySet<string>;
+}
 
 /**
  * Both records a label lookup reads off the build's `.log`, from ONE read of it
@@ -1551,13 +1565,17 @@ const NO_LOG_RECORDS: { shipouts?: number[]; engineOutput?: EngineOutput } = {};
  * closing output record ({@link parseEngineOutput}). Each is absent when it could not be had —
  * every failure is "no record", since either one can only add a refusal.
  */
-async function readLogRecords(
-  auxPath: string,
-): Promise<{ shipouts?: number[]; engineOutput?: EngineOutput }> {
+async function readLogRecords(auxPath: string): Promise<LogRecords> {
   const log = await readWholeBuildLog(auxPath);
   if (log === undefined) return {};
   let shipouts: number[] | undefined;
   let engineOutput: EngineOutput | undefined;
+  let duplicateDestinations: ReadonlySet<string> | undefined;
+  try {
+    duplicateDestinations = parseDuplicateDestinations(log);
+  } catch {
+    duplicateDestinations = undefined;
+  }
   try {
     shipouts = parseShipoutMarks(log);
   } catch {
@@ -1571,7 +1589,43 @@ async function readLogRecords(
   return {
     ...(shipouts === undefined ? {} : { shipouts }),
     ...(engineOutput === undefined ? {} : { engineOutput }),
+    ...(duplicateDestinations === undefined ? {} : { duplicateDestinations }),
   };
+}
+
+/** pdfTeX: `pdfTeX warning (ext4): destination with the same identifier (name{figure.1}) has been
+ *  already used, duplicate ignored`. LuaTeX: `warning  (pdf backend): ignoring duplicate
+ *  destination with the name 'figure.1'`. Both checked against TeX Live 2026 builds of a document
+ *  whose supplement resets the figure counter. The name is bounded so a marker with no closing
+ *  delimiter cannot make the lazy match scan the rest of a large log. */
+const DUPLICATE_DESTINATION = [
+  /destination with the same identifier \(name\{(.{1,512}?)\}\) has been already used/g,
+  /ignoring duplicate destination with the name '(.{1,512}?)'/g,
+];
+
+/**
+ * The destination names the engine reports in `log` as defined twice — the second definition
+ * dropped, so the PDF's destination of that name is the FIRST one's. Searched with every line
+ * break removed, as {@link parseEngineOutput} searches: the engine wraps its log at 79 columns,
+ * and a warning that long is nearly always cut inside the name or the text around it.
+ *
+ * XeTeX writes no such line into its `.log`: xdvipdfmx turns the `.xdv` into the PDF after the
+ * engine closed its log, and reports to its own output. A XeTeX build is judged by the `.aux`
+ * alone (a second `\newlabel` with the same anchor), which `labelPages.ts` checks for every
+ * engine. The log is document-writable (`\message`, `\typeout`), so a name read here may only
+ * ever add a refusal; joining lines can also glue two lines into a match nobody wrote, which can
+ * likewise only refuse.
+ */
+export function parseDuplicateDestinations(log: string): Set<string> {
+  const text = log.replace(/[\r\n]/g, '');
+  const names = new Set<string>();
+  for (const re of DUPLICATE_DESTINATION) {
+    re.lastIndex = 0;
+    for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+      if (m[1] !== undefined) names.add(m[1]);
+    }
+  }
+  return names;
 }
 
 /** `Output written on <file> (<n> page[s], <b> bytes).`, as the engine closes a run that shipped
@@ -1776,7 +1830,7 @@ export async function readAuxFloats(
 
   const note = unreadInputsNote(inputWalk);
   const pgfpages = await readPgfpagesEvidence(auxPath);
-  const { shipouts, engineOutput } =
+  const { shipouts, engineOutput, duplicateDestinations } =
     opts?.shipouts === true ? await readLogRecords(auxPath) : NO_LOG_RECORDS;
   const buildTimes =
     opts?.pdfPath !== undefined ? await readBuildTimes(auxPath, opts.pdfPath) : undefined;
@@ -1793,6 +1847,7 @@ export async function readAuxFloats(
     ...(pgfpages === undefined ? {} : { pgfpages }),
     ...(shipouts === undefined ? {} : { shipouts }),
     ...(engineOutput === undefined ? {} : { engineOutput }),
+    ...(duplicateDestinations === undefined ? {} : { duplicateDestinations }),
     ...(buildTimes === undefined ? {} : { buildTimes }),
     ...paired,
     ...(note === undefined ? {} : { note }),

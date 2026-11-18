@@ -81,6 +81,9 @@ async function setup(bib: Buffer): Promise<{ client: Client; bibPath: string }> 
       search: () => Promise.reject(new Error('openalex must not be consulted')),
       resolveDoi: () => Promise.reject(new Error('openalex must not be consulted')),
     },
+    datacite: {
+      fetchBibtexByDoi: () => Promise.reject(new Error('datacite must not be consulted')),
+    },
   });
   const server = createServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

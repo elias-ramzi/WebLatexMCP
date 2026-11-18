@@ -110,6 +110,10 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
           resolveDoi: () =>
             Promise.reject(new Error('openalex must not be consulted in this suite')),
         },
+        datacite: {
+          fetchBibtexByDoi: () =>
+            Promise.reject(new Error('datacite must not be consulted in this suite')),
+        },
       }),
       doctor: new DoctorService(),
       sessions: new SessionRegistry(workspace, config.sessionId),

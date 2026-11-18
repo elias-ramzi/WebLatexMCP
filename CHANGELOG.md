@@ -96,7 +96,44 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   them up. Other sessions of the shared server drop it at their next `list_projects`. A project
   from `WEB_LATEX_MCP_PROJECTS` is refused. The web UI's paper menu has **Remove paper…** for it.
 
+- **`locate_text`: find where text copied from the PDF lives in the source.** Paste a passage as
+  it comes out of the PDF — hyphenated across lines, with a review copy's margin line numbers
+  glued on, even with your `--> fix` note still attached — and get the source `file:line` of each
+  live match with a snippet. Commented-out text is never a match. No compile, no git, no lock.
+- **`edit_file` edits several files in one call, all or nothing** (`files: [{path, edits}]`, up
+  to 20). Every file is checked by every guard first (the `.bib` gate, external changes, UTF-8,
+  each edit's match), and nothing is written unless all pass; a write that fails part-way puts the
+  files already written back as they were. One shared diff budget, one compile with
+  `compile: true`. A single edit can also be given inline (`{path, oldString, newString}` or
+  `{path, startLine, endLine, newString}`) without wrapping it in `edits`.
+- **`project_sync mode: "rebase"`** replays local commits onto the remote when the clone has
+  diverged — what `push` does before pushing, with the same peer and dirty-tree guards, and
+  without pushing. A conflict aborts with the clone exactly as before and returns `push`'s conflict
+  payload.
+- **`render_pages` and `extract_text` resolve a label whose printed page repeats** (a main paper
+  and its supplement in one PDF, each numbered from 1) through hyperref's link target for that
+  label, when the page it lands on agrees — by its page label, its printed folio or its shipout
+  record. A link target alone is never enough. `resolvedLabels[].via` says `"destination"`.
+- **`pages` takes a single number** (`pages: 2`) as well as an array in `render_pages`,
+  `extract_text` and `pdf_geometry`.
+
 ### Fixed
+
+- **`add_citation` works for arXiv preprints.** Their DOIs (`10.48550/…`) are registered with
+  DataCite, not Crossref, so every one failed with "Crossref returned 404". A DOI's BibTeX now comes
+  from the agency that registered it: arXiv DOIs from DataCite, others from Crossref, then DataCite
+  for the same DOI on a definite 404. `via` says which served it. DataCite's cite keys are URLs
+  (`https://doi.org/10.48550/arxiv…`); the format-bibliography skill rekeys them.
+- **A push that races a collaborator on Overleaf is retried** instead of failing with
+  `[remote rejected] main -> main (invalid old id sent)`, like any other remote-moved rejection.
+- **The `git clone <url>` line Overleaf shows can be pasted as a `gitUrl`**, in `register_project`
+  and `project_sync`, quoted or not: it is reduced to its URL (a token in it is still stripped,
+  never stored), and a `-b <branch>` becomes the branch. A project already registered with such a
+  line now just works — the line is read as its URL wherever it is loaded — instead of failing
+  every sync with `protocol 'git clone https' is not supported`.
+- **`edit_file`'s "matches N times" refusal says when the extra matches are commented out**, and
+  that `excludeComments: true` matches the live one only — a paper that keeps old versions as `%`
+  comments made edits fail as non-unique, and sessions fell back to editing files from the shell.
 
 - **The web UI's Add paper dialog works with what Overleaf shows.** A pasted `git clone <url>`
   line is reduced to its URL (its `-b` becomes the branch) instead of being registered whole and

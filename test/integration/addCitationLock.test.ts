@@ -95,6 +95,9 @@ function resolverWith(dblp: DblpService): ReferenceResolver {
       search: () => Promise.reject(new Error('openalex must not be consulted')),
       resolveDoi: () => Promise.reject(new Error('openalex must not be consulted')),
     },
+    datacite: {
+      fetchBibtexByDoi: () => Promise.reject(new Error('datacite must not be consulted')),
+    },
   });
 }
 

@@ -29,7 +29,7 @@ export interface QuoteLocation {
   line: number;
 }
 
-interface Word {
+export interface Word {
   text: string;
   /** 1-based source line the word starts on. */
   line: number;
@@ -147,6 +147,116 @@ export function locateQuote(
   if (l && (tail.length === 0 || (t && t.file === l.file && t.line >= l.line))) return l;
   if (t && lead.length === 0) return t;
   return null;
+}
+
+/** How a {@link QuoteMatch} was found: the whole word sequence, or one of its two ends. */
+export type QuoteMatchedBy = 'full' | 'leading-window' | 'trailing-window';
+
+/** One place the words sit, for {@link fullMatches}/{@link windowMatches}. */
+export interface QuoteMatch {
+  file: string;
+  /** 1-based line the first matched word starts on. */
+  line: number;
+  /** 1-based line the last matched word starts on. */
+  endLine: number;
+  matchedBy: QuoteMatchedBy;
+}
+
+interface Span {
+  file: string;
+  /** Index of the first matched word in its file's word list. */
+  start: number;
+  /** Index one past the last matched word. */
+  end: number;
+}
+
+/** Every place `needle` occurs, in file order then word order. Unlike `occurrences`, unbounded. */
+function spans(needle: string[], files: ReadonlyArray<{ file: string; words: Word[] }>): Span[] {
+  const out: Span[] = [];
+  const first = needle[0];
+  if (first === undefined) return out;
+  for (const { file, words } of files) {
+    for (let i = 0; i + needle.length <= words.length; i++) {
+      if (words[i]?.text !== first) continue;
+      let ok = true;
+      for (let k = 1; k < needle.length; k++) {
+        if (words[i + k]?.text !== needle[k]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) out.push({ file, start: i, end: i + needle.length });
+    }
+  }
+  return out;
+}
+
+function toMatch(
+  span: Span,
+  endIndex: number,
+  words: Word[],
+  matchedBy: QuoteMatchedBy,
+): QuoteMatch {
+  const line = words[span.start]?.line ?? 1;
+  return { file: span.file, line, endLine: words[endIndex - 1]?.line ?? line, matchedBy };
+}
+
+/**
+ * EVERY place the whole of `needle` occurs in `files`, not only a unique one — the `locate_text`
+ * reading, where the caller judges between candidates. `[]` below {@link MIN_WORDS} words: three
+ * common words match everywhere.
+ */
+export function fullMatches(
+  needle: string[],
+  files: ReadonlyArray<{ file: string; words: Word[] }>,
+): QuoteMatch[] {
+  if (needle.length < MIN_WORDS) return [];
+  const byFile = new Map(files.map((f) => [f.file, f.words]));
+  return spans(needle, files).map((s) => toMatch(s, s.end, byFile.get(s.file) ?? [], 'full'));
+}
+
+/**
+ * The fallback when the whole sequence is found nowhere (something the PDF shows is not spelled
+ * in the source): every place its leading {@link WINDOW_WORDS} words occur, and every place its
+ * trailing ones do. A trailing hit that closes a leading one — same file, after it, within a span
+ * the quote could plausibly stretch to — is folded into that leading match (its `endLine`
+ * extended to the tail's), so one passage is not reported twice. `[]` for a needle of at most
+ * {@link WINDOW_WORDS} words, whose window would be the whole needle.
+ */
+export function windowMatches(
+  needle: string[],
+  files: ReadonlyArray<{ file: string; words: Word[] }>,
+): QuoteMatch[] {
+  if (needle.length < MIN_WORDS || needle.length <= WINDOW_WORDS) return [];
+  const byFile = new Map(files.map((f) => [f.file, f.words]));
+  const lead = spans(needle.slice(0, WINDOW_WORDS), files);
+  const tail = spans(needle.slice(needle.length - WINDOW_WORDS), files);
+  // How far past the lead's start its tail may end: the quote's own length, doubled for what the
+  // source spells and the PDF does not (citation keys, macro arguments), plus slack.
+  const reach = needle.length * 2 + 20;
+  const used = new Set<Span>();
+  const out: QuoteMatch[] = [];
+  // Both lists are in file order, then position order (spans() walks the files in turn), so the
+  // first unused tail hit after a lead hit is found by a cursor that only moves forward: a
+  // `find` from the start for every lead hit was quadratic in the hit count on a repetitive file.
+  const fileRank = new Map(files.map((f, i) => [f.file, i]));
+  const before = (c: Span, l: Span): boolean => {
+    const rc = fileRank.get(c.file) ?? 0;
+    const rl = fileRank.get(l.file) ?? 0;
+    return rc < rl || (rc === rl && c.start <= l.start);
+  };
+  let cursor = 0;
+  for (const l of lead) {
+    while (cursor < tail.length && (used.has(tail[cursor]!) || before(tail[cursor]!, l))) cursor++;
+    const c = tail[cursor];
+    const t = c && c.file === l.file && c.end - l.start <= reach ? c : undefined;
+    if (t) used.add(t);
+    out.push(toMatch(l, t ? t.end : l.end, byFile.get(l.file) ?? [], 'leading-window'));
+  }
+  for (const t of tail) {
+    if (!used.has(t)) out.push(toMatch(t, t.end, byFile.get(t.file) ?? [], 'trailing-window'));
+  }
+  return out;
 }
 
 /** At most this many `.tex` files are searched, each up to {@link QUOTE_MAX_FILE_BYTES}. */

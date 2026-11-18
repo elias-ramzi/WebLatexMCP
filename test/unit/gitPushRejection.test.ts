@@ -24,6 +24,46 @@ describe('isNonFastForwardRejection', () => {
     ).toBe(false);
   });
 
+  it("recognizes Overleaf's invalid-old-id compare-and-swap failure as a lost race", () => {
+    expect(
+      isNonFastForwardRejection(
+        'To https://git.overleaf.com/<p>\n' +
+          ' ! [remote rejected] main -> main (invalid old id sent)\n' +
+          "error: failed to push some refs to 'https://git.overleaf.com/<p>'",
+      ),
+    ).toBe(true);
+    expect(
+      isNonFastForwardRejection(' ! [Remote Rejected] main -> main (Invalid Old Id Sent)'),
+    ).toBe(true);
+  });
+
+  it('does not match a remote-rejected main -> main hook refusal', () => {
+    expect(
+      isNonFastForwardRejection('! [remote rejected] main -> main (pre-receive hook declined)'),
+    ).toBe(false);
+  });
+
+  it('does not borrow the invalid-old-id phrase from another line', () => {
+    expect(
+      isNonFastForwardRejection(
+        ' ! [remote rejected] main -> main (pre-receive hook declined)\n' +
+          'remote: (invalid old id sent)',
+      ),
+    ).toBe(false);
+  });
+
+  it('does not retry a hook that prints the invalid-old-id phrase itself', () => {
+    expect(
+      isNonFastForwardRejection(
+        'remote: ! [remote rejected] main -> main (invalid old id sent)\n' +
+          ' ! [remote rejected] main -> main (pre-receive hook declined)',
+      ),
+    ).toBe(false);
+    expect(isNonFastForwardRejection('remote: [remote rejected] x (invalid old id sent)')).toBe(
+      false,
+    );
+  });
+
   it('does not match an authentication failure', () => {
     expect(isNonFastForwardRejection("fatal: Authentication failed for 'https://…'")).toBe(false);
   });

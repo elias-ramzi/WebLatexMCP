@@ -142,7 +142,9 @@ describe('the printed-page route verifies a candidate by its hyperref destinatio
     expect(plan.failed.map((f) => f.unverified)).toEqual(['lastPageMismatch']);
   });
 
-  it('stands in for the page text only: a restart is still refused', () => {
+  it('a restart is still refused when the destination page reads another number', () => {
+    // A destination resolves a restart only through the destination route, which checks the
+    // page it points at: PDF page 2 reads "2", not the printed "1".
     const index = aux([
       ['fig:main', '1', '3', 'figure.caption.1'],
       ['fig:supp', 'S1', '1', 'figure.caption.5'],
@@ -151,9 +153,15 @@ describe('the printed-page route verifies a candidate by its hyperref destinatio
       ['fig:supp'],
       index,
       null,
-      evidence(FLOAT_PAGE, { 'figure.caption.5': 1 }),
+      evidence(FLOAT_PAGE, { 'figure.caption.5': 2 }),
     );
-    expect(plan.failed.map((f) => f.reason)).toEqual(['restarted']);
+    expect(plan.failed).toEqual([
+      expect.objectContaining({
+        reason: 'restarted',
+        destinationPage: 2,
+        destinationContradiction: { kind: 'folio', folios: ['2'] },
+      }),
+    ]);
   });
 
   it('is never used for a beamer deck', () => {

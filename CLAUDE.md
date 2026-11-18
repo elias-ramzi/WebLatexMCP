@@ -34,9 +34,13 @@ Local gate before work is done: `typecheck` + `lint` + `format:check` + `test`.
 
 - Before committing: `git fetch origin && git rebase origin/dev` (or merge), resolve conflicts, re-run
   the gate. Commit/push only when the user asks.
-- `dev` is the integration branch (work branches off it, PRs target it). `main` is release; a guard
-  workflow rejects PRs into `main` from anything but `dev` (`.github/workflows/only-dev-into-main.yml`).
-- A PR into `dev` must change `CHANGELOG.md`'s `[Unreleased]` section (`.github/workflows/changelog.yml`).
+- `dev` is the integration branch, and work may be **committed and pushed straight to `dev`** (no PR
+  needed; the local dev build the sessions run follows it). Keep `CHANGELOG.md`'s `[Unreleased]`
+  section updated in the same commit, and run the full gate before pushing: CI runs on every push to
+  `dev` but no longer blocks it. Never force-push `dev`. A PR into `dev` is still fine for larger work,
+  and its CHANGELOG check (`.github/workflows/changelog.yml`) still applies.
+- `main` is release; a guard workflow rejects PRs into `main` from anything but `dev`
+  (`.github/workflows/only-dev-into-main.yml`).
 
 ## Architecture
 
@@ -355,6 +359,16 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `gitCredentialConfig` sets `credential.<scheme>://<host>.helper` to empty then the inline helper, so
   the user's helpers are bypassed for that host only. `clone` clones from the tokenless URL. Hosts
   outside `CREDENTIAL_HOST_RE` and usernames/tokens with CR/LF/NUL are refused.
+- **A `gitUrl` that is a whole `git clone <url> [<dir>]` line is read as its URL** (`parseGitCloneLine`,
+  `src/lib/gitCloneLine.ts`) before `stripGitUrlCredentials`, in `ProjectManager.registerProject` and in
+  the tools before their notes and pathToken check; `-b`/`--branch` is read as the branch (a
+  different `branch` argument refuses), other options or extra words are refused, echoing the input
+  only through `redact`. **A stored clone line just works**: `readStoredGitUrl` reads it as its URL
+  (and `-b` as the branch) wherever an entry is loaded — `readRegistryFile` (stripped, as
+  registration strips), `loadConfig`'s env entries (not stripped, as no env URL is) and the
+  `ProjectManager` constructor — and the file is left as written. Only an unreadable one reaches
+  `ProjectManager.requireRemoteGitProject`, which refuses it (`storedCloneLineRefusal`) naming the
+  `register_project` fix.
 - **URL secrets are stripped before persist/echo/clone** (`stripGitUrlCredentials`,
   `src/lib/gitUrlCredentials.ts`, in `ProjectManager.registerProject`). Trim first; any run of `/`/`\` (or
   none) after the scheme; userinfo runs to the **last** `@`. `user:token@` keeps `user@` unless
@@ -393,6 +407,19 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `project_sync` → `remote-branch-missing` + `note`, `status` → `remoteBranchMissing`/`remoteBranchNote`,
   local commits count as unpushed. `status` lists commits only with `withCommits: true`; without
   `origin/<branch>` `aheadCommits` caps at 20 (`aheadCommitsOmitted`).
+- **`project_sync mode: "rebase"` is the one sync that rewrites local history**, and never pushes.
+  A diverged clone's local commits are replayed through `GitService.pullRebase` — the same function
+  `safePush`/`fetchAndRebase`/`resolvePush`'s retry rounds use; never add a second replay. Up-to-date,
+  ahead-only and ff-able clones take the ff-only path. Before rebasing: `guardPeerWork` (via
+  `syncPull`'s `beforeRebase`, only once a rebase is certain), then
+  `assertNoTrackedModifications(…, 'sync')`. A conflict aborts (clone exactly as before) and returns push's budgeted payload
+  (`conflictPayload`, `src/lib/conflictPayload.ts`; both tools spread `conflictOutputFields`), whose
+  guidance names the only resolution route, `push` with `resolutions` + `expectedRemoteHead`, and says
+  it pushes. After `"rebased"`: `resetBaselines` + `shadows.refresh`.
+- **`isNonFastForwardRejection` retries exactly two shapes**, matched on one line: git's
+  `[rejected] … (fetch first|non-fast-forward)` and Overleaf's compare-and-swap failure
+  `[remote rejected] … (invalid old id sent)` (a collaborator pushed at the same moment). Every other
+  `[remote rejected]` reason (a hook) is a hard error, never retried.
 - **Conflicts fail safe; resolve through the tool, never auto-merge.** On a rebase conflict `push`
   aborts and returns `status: 'conflict'` with per-file `base`/`ours`/`theirs` + `hunks`,
   `conflictPaths`, `remoteHead`, `remoteCommits`, rendered into the **text** too
@@ -500,6 +527,23 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   after `endLine`; a string edit touching it is an overlap. **`applyEdits` and `add_citation` refuse
   non-UTF-8 files** (`decodeUtf8Exact`, `src/lib/utf8.ts`; `FileService.readTextExact`); `write_file` is
   the way to replace one.
+- **`edit_file` with `files` is all-or-nothing across files**, and a single file is the same code path:
+  `applyEdits` = `planEdits` (every guard, writes and records nothing) → `writeEditPlan` (write, baseline,
+  recorder). The per-file tool logic is `planFileEdit` (`src/lib/editFilePlan.ts`: both `.bib` gates,
+  rewrite mode, `excludeComments` eligibility), so a guard added there covers both shapes. Multi-file:
+  `assertDistinctFiles` (by resolved path and `dev:ino`), plan every file, then `writeEditPlans` inside
+  one `runExclusive` — each write re-verifies the planned bytes, and a failure restores already-written
+  files through FileService (so the recorder sees the reverse) only where they still hold what this
+  call wrote (`EditPlansWriteError`: `restored`/`unrestored`). Diffs share one budget (`planEditDiffs`).
+  A non-unique refusal of an edit without `excludeComments` counts the commented matches
+  (`commentHint`) and names `excludeComments: true` when exactly one is live — papers that keep old
+  versions as `%` comments otherwise drove sessions to edit from the shell.
+- **`locate_text` finds pasted PDF text in the sources** (`src/lib/locateText.ts` over
+  `quoteLocate.ts`'s `fullMatches`/`windowMatches`): it tries the text as pasted first and only then
+  with margin line numbers stripped (`stripMarginNumbers`), so a removed number never makes a match;
+  it returns every live match (never commented text), reads like `list_comments` (`strictLinks`, no
+  baseline, no lock) and is budgeted (`locateTextBudget.ts`). `locateQuote` stays unique-only for
+  `list_comments`.
 - **`applyEdits` splices by index — never `String.prototype.replace`** (`$` patterns in `newString`
   corrupt LaTeX). `replaceAll` splices each occurrence in turn (never `split`/`join`). Pinned in
   `test/unit/editFile.test.ts`; test helpers standing in for `applyEdits` must obey it too.
@@ -540,8 +584,16 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `BackendUnavailableError` in the backend (`assertApiBody`, `assertApiShape`, `fetchOrUnavailable`,
   `readBodyOrUnavailable`, `src/services/referenceBackend.ts`).
 - **OpenAlex publishes no BibTeX**: `OpenAlexService` has no `fetchBibtex` (pinned at runtime in
-  `test/unit/openalex.test.ts` — keep it); records are fetched from Crossref by DOI; no DOI → refused,
-  never assembled from metadata.
+  `test/unit/openalex.test.ts` — keep it); records are fetched by DOI from the DOI's registrar; no DOI →
+  refused, never assembled from metadata.
+- **A DOI's BibTeX comes from the agency that registered it — not a substitution** (same DOI, same
+  record). `doiRegistrarOrder` (`src/services/referenceResolver.ts`): arXiv's `10.48550/` → DataCite
+  first (`DataCiteService`, `src/services/datacite.ts`, `GET api.datacite.org/dois/application/x-bibtex/<doi>`),
+  every other DOI → Crossref first. The other agency is asked only on the first one's definite 404, the
+  typed `RecordNotFoundError` (never `BackendUnavailableError`); unavailability, a non-BibTeX body or a
+  caller error never moves on. Both 404 → one `RecordNotFoundError` naming both. `via` names the agency
+  that served the entry. DataCite cite keys are URLs (`https://doi.org/10.48550/arxiv…`), kept verbatim.
+  `parseDoi` (`src/lib/referenceKey.ts`) validates a bare DOI before any backend interpolates it.
 - A fetched entry is cut to its own bytes only (`bibtexEntrySpan`): choosing a cut is allowed;
   inserting, reordering, reformatting or completing is not. Closer believed at depth 0 alone on its
   line, or ending the header's own line with no unmatched closer after; otherwise **fail open** (run to
@@ -698,6 +750,22 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   never refuses — and every other refusal stands. A label's own number is never consulted. Refusals:
   arabic restart (`restarted`), last page decimal ≠ page count (`lastPageMismatch`), label defined twice
   (`multiplyDefined`).
+- **A printed page that names several PDF pages may be resolved through the label's destination**
+  (`tryDestination`/`destinationVerdict`, `resolvedLabels[].via: 'destination'`) — only inside the
+  routes, after a refusal for that ambiguity (`ambiguousPrintedPage` on the `/PageLabels` route;
+  `renumbered`, `restarted`, `lastPageMismatch` on the printed-page route), so behind every build-level
+  refusal and `slideMismatch`, never for a deck. The destination page must be **positively** confirmed
+  (its `/PageLabels` entry, or every folio on it, reads the printed page; or a usable shipout mark is
+  the printed page's counter) and contradicted by nothing, or the route's own refusal stands with
+  `destinationPage`/`destinationContradiction`. A link target alone is never enough: the document writes
+  it too. **Corroboration only proves the page is one of the copies; the anchor alone picks the copy**,
+  so the anchor must be this label's alone (`anchorCollision`): refused when another `\newlabel` in the
+  set read carries it (`sharedAnchor` — a supplement's `\setcounter{figure}{0}` gives `figure.1` twice,
+  and pdfTeX keeps the first destination), when that set is incomplete (`anchorUnchecked`), or when the
+  `.log` reports a duplicate destination of that name (`duplicateDestination`,
+  `parseDuplicateDestinations`, pdfTeX and LuaTeX wordings, line breaks removed; xdvipdfmx logs none, so
+  under XeTeX the `.aux` check is the only guard). The #223 shortcut obeys the same check. `pages` in `render_pages`/`extract_text`/`pdf_geometry` is a `z.union` of one integer or an
+  array (`src/lib/pageSelection.ts`), never a `z.preprocess`, so the advertised schema shows both.
 - **Beamer decks never use the tree** (recognised by `\@writefile{nav}`); folio route, and refused first
   on any disagreeing `\beamer@slide` record (`slideMismatch`, `AuxFloatsResult.beamerSlides`,
   `SLIDE_FIELD` one brace level). Do not reinstate an identity-tree rule (`pgfpages` defeats it).

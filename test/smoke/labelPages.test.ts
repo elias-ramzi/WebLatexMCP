@@ -234,15 +234,20 @@ describe.skipIf(!available)('label -> page against a real compile', () => {
 
   it('with hyperref, still never the title page: /PageLabels prints "1" on it too', async () => {
     // A real finding, pinned: hyperref's /PageLabels labels the unnumbered title page "1" as
-    // well, so the exact lookup sees two candidates and refuses as ambiguous. The point is the
-    // same as above — PDF page 1 is never returned for fig:a.
+    // well, so the exact lookup sees two candidates. That used to be refused as ambiguous; the
+    // figure's own hyperref destination now picks PDF page 2, which the tree labels "1" too.
+    // The point is the same as above — PDF page 1 is never returned for fig:a.
     const client = await compiled(reportTex(true));
     const res = await client.callTool({
       name: 'extract_text',
       arguments: { project: 'doc', labels: ['fig:a'] },
     });
-    expect(res.isError, textOf(res)).toBe(true);
-    expect(textOf(res)).toContain('PDF pages 1, 2');
+    expect(res.isError ?? false, textOf(res)).toBe(false);
+    const out = res.structuredContent as unknown as Out;
+    expect(out.resolvedLabels).toEqual([
+      { label: 'fig:a', printedPage: '1', page: 2, via: 'destination' },
+    ]);
+    expect(out.pages[0]?.lines?.join('\n')).toContain('FIGURE-BODY');
   }, 120_000);
 
   it('still resolves a plain article without hyperref, whose page shows the figure number', async () => {

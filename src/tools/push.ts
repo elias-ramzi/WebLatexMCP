@@ -7,20 +7,18 @@ import { originNote, withOriginNote } from '../lib/originRepoint.js';
 import { errorResult } from '../lib/errors.js';
 import { redact } from '../lib/redact.js';
 import { redactGitUrlCredentials } from '../lib/gitUrlCredentials.js';
+import { renderLandedUpstream, renderRebasedOver } from '../lib/conflictText.js';
 import {
-  renderConflictText,
-  renderLandedUpstream,
-  renderRebasedOver,
-  buildConflictFilePayload,
-  capRemoteCommits,
-} from '../lib/conflictText.js';
-import {
-  planConflictPayload,
   CONFLICT_MAX_FILES,
-  CONFLICT_MAX_SPANS,
   CONFLICT_MAX_COMMITS,
   CONFLICT_MAX_COMMIT_FILES,
 } from '../lib/conflictBudget.js';
+import {
+  conflictOutputFields,
+  conflictPayload,
+  diffFileSchema,
+  remoteCommitSchema,
+} from '../lib/conflictPayload.js';
 import { guardPeerWork } from '../lib/peerRefusal.js';
 import {
   planPushReviewDiff,
@@ -28,98 +26,6 @@ import {
   DIFF_CONTENT_BUDGET,
   DIFF_MAX_FILES,
 } from '../lib/diffBudget.js';
-
-const conflictHunkSchema = z.object({
-  startLine: z.number(),
-  endLine: z.number(),
-  local: z.array(z.string()),
-  remote: z.array(z.string()),
-});
-
-const conflictElisionSchema = z.object({
-  chars: z.number().describe('The TRUE (untruncated) character count of the elided part.'),
-  ref: z
-    .string()
-    .optional()
-    .describe(
-      'Sides only. Normally the read_file(path, ref) call that fetches this part in full — but ' +
-        'when the two histories are unrelated there is no merge base to read the `base` side ' +
-        'from, and this instead states that, so check it looks like a call before issuing one.',
-    ),
-  count: z.number().optional().describe('hunks only: how many hunks were elided.'),
-  spans: z
-    .array(z.object({ startLine: z.number(), endLine: z.number() }))
-    .optional()
-    .describe(
-      'hunks only: the line span each elided hunk covered in the conflicted working file — ' +
-        `capped at the first ${CONFLICT_MAX_SPANS}; \`count\` is the true total, so \`count > ` +
-        'spans.length` means the rest were dropped.',
-    ),
-});
-
-/** `null` is ambiguous by itself: "absent" (added/deleted) and "elided for size" both look like
- * `null`. The `elided.<key>` entry is what tells them apart — see `conflictFileSchema.elided`. */
-const nullSideDescribe = (label: string, key: 'base' | 'ours' | 'theirs'): string =>
-  `Full content ${label}, or null. null with no matching \`elided.${key}\` entry means the file ` +
-  `did not exist on this side (added/deleted); null WITH an \`elided.${key}\` entry means the ` +
-  "content was dropped to fit the payload budget — fetch it via that entry's `ref`.";
-
-const conflictFileSchema = z.object({
-  path: z.string(),
-  base: z
-    .string()
-    .nullable()
-    .describe(nullSideDescribe('at the merge-base (common ancestor)', 'base')),
-  ours: z.string().nullable().describe(nullSideDescribe('of our (local) version', 'ours')),
-  theirs: z
-    .string()
-    .nullable()
-    .describe(nullSideDescribe('of the remote version that landed', 'theirs')),
-  hunks: z
-    .array(conflictHunkSchema)
-    .describe(
-      'Marker view of just the overlapping regions. Empty when elided for size — see `elided.hunks`.',
-    ),
-  elided: z
-    .object({
-      base: conflictElisionSchema.optional(),
-      ours: conflictElisionSchema.optional(),
-      theirs: conflictElisionSchema.optional(),
-      hunks: conflictElisionSchema.optional(),
-    })
-    .optional()
-    .describe(
-      'Present iff some part of this file was dropped to fit the payload budget (conflictDetail: ' +
-        '"auto", the default). Absent when everything for this file fit, or when conflictDetail: ' +
-        '"full" was requested.',
-    ),
-});
-
-const diffFileSchema = z.object({
-  path: z.string(),
-  added: z.number(),
-  removed: z.number(),
-});
-
-const remoteCommitSchema = z.object({
-  hash: z.string(),
-  message: z.string(),
-  files: z
-    .array(diffFileSchema)
-    .describe(
-      'Files the commit touched, with added/removed line counts — enough to see what a remote ' +
-        '"Update on Overleaf." commit changed without a shell. For the content, use `diff` with ' +
-        'ref: "<hash>~1..<hash>".',
-    ),
-  filesOmitted: z
-    .number()
-    .optional()
-    .describe(
-      `Files beyond the first ${CONFLICT_MAX_COMMIT_FILES} of this commit, not listed above — ` +
-        'diff with ref: "<hash>~1..<hash>" for the full list. Only present on a conflict result ' +
-        'with conflictDetail: "auto" (the default) when this commit touched more.',
-    ),
-});
 
 const inputSchema = {
   project: z.string().optional().describe('Project id. Defaults to the configured default.'),
@@ -204,39 +110,8 @@ const outputSchema = {
   pushedCommits: z.number().optional(),
   pushedSha: z.string().optional(),
   rebasedOver: z.array(remoteCommitSchema).optional(),
-  // status === 'conflict'
-  conflictFiles: z.array(conflictFileSchema).optional(),
-  conflictPaths: z.array(z.string()).optional(),
-  rebasedOnto: z.string().optional(),
-  remoteHead: z.string().optional(),
-  mergeBase: z.string().nullable().optional(),
-  remoteCommits: z
-    .array(remoteCommitSchema)
-    .optional()
-    .describe(
-      `On a conflict result with conflictDetail: "auto" (the default), capped at ${CONFLICT_MAX_COMMITS} ` +
-        `commits (each with at most ${CONFLICT_MAX_COMMIT_FILES} files, see \`filesOmitted\`) — see ` +
-        '`remoteCommitsOmitted` for how many more landed. Uncapped for conflictDetail: "full", and ' +
-        'uncapped on a successful push (rebasedOver).',
-    ),
-  remoteCommitsOmitted: z
-    .number()
-    .optional()
-    .describe(
-      `Commits beyond the ${CONFLICT_MAX_COMMITS} listed in \`remoteCommits\`, not present there — ` +
-        'status.behindCommits lists them all, since the clone is back at its pre-push state after a ' +
-        'conflict aborts the rebase. Present only on a conflict result with conflictDetail: "auto" ' +
-        'when something was actually omitted.',
-    ),
-  conflictTruncated: z
-    .boolean()
-    .optional()
-    .describe(
-      'True iff conflictDetail: "auto" cut anything to fit the payload budget — a file in ' +
-        `conflictFiles carries an \`elided\` entry, or conflicted files past ${CONFLICT_MAX_FILES} ` +
-        'got no per-file block at all (still listed in conflictPaths). Absent unless status === ' +
-        '"conflict".',
-    ),
+  // status === 'conflict' (shared with project_sync mode "rebase")
+  ...conflictOutputFields,
   // status === 'awaiting-approval'
   base: z.string().optional(),
   diff: z
@@ -320,39 +195,18 @@ function safePushToolResult(
   if (res.pushedSha) structured.pushedSha = res.pushedSha;
   if (res.rebasedOver) structured.rebasedOver = res.rebasedOver;
   if (res.remoteHead && !res.conflict) structured.remoteHead = res.remoteHead;
-  // Planned once here and passed VERBATIM to renderConflictText below (opts.plan) — the file
-  // payload and the commit list are each decided exactly once, so text and structuredContent can
-  // never disagree about what got cut.
-  let plan: ReturnType<typeof planConflictPayload> | undefined;
-  if (res.conflict) {
-    plan = planConflictPayload(res.conflict.files, {
-      detail: conflictDetail,
-      refs: { mergeBase: res.conflict.mergeBase, rebasedOnto: res.conflict.rebasedOnto },
-    });
-    structured.conflictFiles = buildConflictFilePayload(res.conflict, plan);
-    structured.conflictPaths = res.conflict.conflictPaths;
-    structured.rebasedOnto = res.conflict.rebasedOnto;
-    structured.remoteHead = res.conflict.remoteHead;
-    structured.mergeBase = res.conflict.mergeBase;
-    // "full" is the escape hatch for a caller that wants the complete payload and can take the
-    // size — lifting the per-file caps but leaving remoteCommits capped would be inconsistent.
-    if (conflictDetail === 'full') {
-      structured.remoteCommits = res.conflict.remoteCommits;
-    } else {
-      const cappedCommits = capRemoteCommits(res.conflict.remoteCommits);
-      structured.remoteCommits = cappedCommits.commits;
-      if (cappedCommits.omitted > 0) structured.remoteCommitsOmitted = cappedCommits.omitted;
-    }
-    structured.conflictTruncated = plan.truncated;
-  }
+  // Planned once (`conflictPayload`) and that one plan drives both the structured keys and the
+  // text — the file payload and the commit list are each decided exactly once, so text and
+  // structuredContent can never disagree about what got cut.
+  const conflict = res.conflict ? conflictPayload(res.conflict, conflictDetail) : undefined;
+  if (conflict) Object.assign(structured, conflict.fields);
   // Put the full resolution payload in the model-visible text, not only structuredContent (which a
   // client may drop): per-file sides, the remote head to echo back, and what landed upstream.
-  const text =
-    res.conflict && plan
-      ? renderConflictText(res.summary, res.conflict, { plan, detail: conflictDetail })
-      : res.status === 'remote-moved'
-        ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
-        : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
+  const text = conflict
+    ? conflict.text(res.summary)
+    : res.status === 'remote-moved'
+      ? [res.summary, renderLandedUpstream(res.rebasedOver)].filter(Boolean).join('\n')
+      : [res.summary, renderRebasedOver(res.rebasedOver)].filter(Boolean).join('\n');
   return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
@@ -431,7 +285,7 @@ export function registerPush(server: McpServer, ctx: AppContext): void {
         // A peer's persisted re-registration first, so the push (and its credential) goes where
         // a freshly started process would send it, not back to a stale snapshot's remote.
         ctx.projectManager.refreshedGitConfig(project);
-        const cfg = ctx.projectManager.requireGitProject(project, 'push to');
+        const cfg = ctx.projectManager.requireRemoteGitProject(project, 'push to');
         const { id, dir } = await ctx.projectManager.requireProjectDir(cfg.id);
         const auth = await ctx.credentials.resolve(cfg);
         const secrets = ctx.credentials.allSecrets();

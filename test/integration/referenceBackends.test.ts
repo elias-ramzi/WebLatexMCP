@@ -57,6 +57,7 @@ function backends(over: Partial<ReferenceBackends>): ReferenceBackends {
     dblp: { search: nope('dblp'), fetchBibtex: nope('dblp') },
     crossref: { search: nope('crossref'), fetchBibtex: nope('crossref') },
     openalex: { search: nope('openalex'), resolveDoi: nope('openalex') },
+    datacite: { fetchBibtexByDoi: nope('datacite') },
     ...over,
   };
 }

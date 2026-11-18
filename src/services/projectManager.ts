@@ -23,6 +23,12 @@ import {
   stripGitUrlCredentials,
 } from '../lib/gitUrlCredentials.js';
 import { registrationChangeMessage, sameRegistration } from '../lib/registrationChange.js';
+import {
+  isGitCloneLine,
+  parseGitCloneLine,
+  readStoredGitUrl,
+  storedCloneLineRefusal,
+} from '../lib/gitCloneLine.js';
 import type {
   GitProjectConfig,
   ProjectConfig,
@@ -194,7 +200,9 @@ export class ProjectManager {
             this.skippedProjects.push(s),
           ),
         )
-        .map((p) => [p.id, p]),
+        // A stored `git clone` line is read as its URL here too, for a config built without
+        // `loadConfig` (idempotent on one that was).
+        .map((p) => [p.id, isLocalProject(p) ? p : readStoredGitUrl(p)]),
     );
     this.defaultProject = config.defaultProject;
     this.defaultProjectExplicit = config.defaultProjectExplicit === true;
@@ -308,12 +316,26 @@ export class ProjectManager {
     assertValidProjectId(cfg.id);
     let held: ProjectConfig = cfg;
     if (!isLocalProject(cfg)) {
-      const stripped = stripGitUrlCredentials(cfg.gitUrl);
+      // A pasted `git clone <url> [<dir>]` line is read as its URL BEFORE the strip below, so a
+      // token inside such a line is stripped like any other and never held or persisted; a line
+      // with options is refused (`parseGitCloneLine`). The tools parse it first too, for their
+      // notes; on a plain URL this is the identity.
+      const line = parseGitCloneLine(cfg.gitUrl);
+      const url = line.url;
+      // The line's `-b <branch>` is the branch unless the call names one; naming another refuses.
+      if (line.branch !== undefined && cfg.branch !== undefined && cfg.branch !== line.branch) {
+        throw new Error(
+          `The \`git clone\` line names branch ${quoteId(line.branch)} but branch is ` +
+            `${quoteId(cfg.branch)}. Nothing was registered; give one of them.`,
+        );
+      }
+      const branch = cfg.branch ?? line.branch;
+      const stripped = stripGitUrlCredentials(url);
       // A token as a path segment cannot be stripped — removing it would name another
       // repository — so the registration is refused before anything is held or persisted.
       // `register_project` refuses it before the project lock too; this is defence in depth.
-      if (stripped.pathToken) throw new Error(pathTokenRefusal(cfg.gitUrl));
-      held = { ...cfg, gitUrl: stripped.url };
+      if (stripped.pathToken) throw new Error(pathTokenRefusal(url));
+      held = { ...cfg, gitUrl: stripped.url, ...(branch !== undefined ? { branch } : {}) };
     }
     // Decided before the checks below only because it reads the registry in its own way (it
     // must not throw); nothing is held or pinned unless they pass.
@@ -798,6 +820,27 @@ export class ProjectManager {
    */
   requireGitProject(id: string | undefined, action: string): GitProjectConfig {
     return requireGitProject(this.getProjectConfig(id), action);
+  }
+
+  /**
+   * {@link requireGitProject} for a call that reaches the remote (clone, sync, push, reset): also
+   * refuses a held `gitUrl` that is still a whole `git clone` command line. A stored line is
+   * normally read as its URL when loaded (`readStoredGitUrl`); only one that cannot be read — an
+   * option other than `-b`/`--branch`, extra arguments — reaches here. git cannot run it
+   * (`protocol 'git clone https' is not supported`), so it is reported with its re-registration
+   * (`storedCloneLineRefusal`). Local-only git tools (status, diff, commit) keep plain
+   * `requireGitProject`: they never use the URL.
+   */
+  requireRemoteGitProject(id: string | undefined, action: string): GitProjectConfig {
+    const cfg = this.requireGitProject(id, action);
+    if (isGitCloneLine(cfg.gitUrl)) {
+      throw new Error(
+        storedCloneLineRefusal(cfg.id, cfg.gitUrl, {
+          envConfigured: this.envProjectIds.has(cfg.id),
+        }),
+      );
+    }
+    return cfg;
   }
 
   /** All known project ids (configured + runtime-registered), for enumeration. */
