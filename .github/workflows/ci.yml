@@ -154,11 +154,7 @@ jobs:
           git config --global user.name "CI"
       - run: npm ci
       # Unit + integration tests use a local bare repo — no TeX, no secrets.
-      - if: runner.os != 'macOS'
-        run: npm test -- --shard=${{ matrix.shard }}/${{ matrix.shards }}
-      # TEMPORARY (PR #285 macOS hang): stop before the job timeout so the log survives.
-      - if: runner.os == 'macOS'
-        run: perl -e 'alarm shift; exec @ARGV' 660 npx vitest run --shard=${{ matrix.shard }}/${{ matrix.shards }} --reporter=verbose --reporter=hanging-process
+      - run: npm test -- --shard=${{ matrix.shard }}/${{ matrix.shards }}
 
   tex-smoke:
     name: LaTeX compile smoke
