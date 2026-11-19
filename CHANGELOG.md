@@ -119,6 +119,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **An older session no longer asks a newer daemon to step aside.** After an in-place rebuild
+  (`web-latex-mcp-dev-update`) and `daemon restart`, sessions opened before it reconnected with the
+  old build's id, which differed only in the entry's mtime and was read as "newer" whichever way it
+  pointed; `daemon status` then said "to be replaced by a newer build once idle" with no newer build
+  anywhere. Only a later mtime counts as a rebuild now.
+
 - **`add_citation` works for arXiv preprints.** Their DOIs (`10.48550/…`) are registered with
   DataCite, not Crossref, so every one failed with "Crossref returned 404". A DOI's BibTeX now comes
   from the agency that registered it: arXiv DOIs from DataCite, others from Crossref, then DataCite

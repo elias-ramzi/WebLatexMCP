@@ -358,8 +358,8 @@ Milestone 5 (the proxy, `src/proxy/`) follows §9 with these choices:
 
 - **Build rule.** A build id is the version plus the entry file and its mtime (`currentBuildId`).
   Same version → connect, so two installs of one version (Desktop's bundle, `npx`) share a daemon;
-  the exception is the same entry with another mtime (a launcher rebuilding `main` in place), which
-  counts as newer. A newer version replaces an idle daemon now, a busy one once its sessions end
+  the exception is the same entry with a later mtime (a launcher rebuilding `main` in place), which
+  counts as newer — an earlier mtime is a session opened before the rebuild and just connects. A newer version replaces an idle daemon now, a busy one once its sessions end
   (also when an idle one refuses `/shutdown` because a session just opened); `server_info` then
   shows `restartPending`. An older proxy connects. A keep-alive daemon is never replaced.
 - **Ignored env (§7.1)** travels as `X-Web-Latex-Mcp-Client-Env`, each daemon-wide variable the

@@ -75,7 +75,7 @@ export async function findDaemon(
  * - `connect`: the same build; the same version from another install (Claude Desktop's bundle and
  *   an npx install must share one daemon, not evict each other); or a newer daemon, which stays
  *   compatible with older clients;
- * - `replace-now`: a newer version, or this very entry rebuilt in place (same path, other mtime —
+ * - `replace-now`: a newer version, or this very entry rebuilt in place (same path, a LATER mtime —
  *   a launcher building `main` into one directory), and nobody uses the daemon — stop it and start
  *   this build;
  * - `connect-and-replace`: the same, but sessions are open — connect, and ask the daemon to stop
@@ -85,13 +85,31 @@ export async function findDaemon(
  */
 export type BuildDecision = 'connect' | 'replace-now' | 'connect-and-replace';
 
+/**
+ * Whether entry mtime `mine` is a later build than `theirs`. Only later counts: a session opened
+ * before an in-place rebuild still carries the OLD mtime when its proxy reconnects to the daemon
+ * the rebuild started, and must not ask that newer daemon to step aside (it did — `daemon status`
+ * then said "to be replaced by a newer build" with no newer build anywhere). An unreadable stamp
+ * on either side cannot be ordered, so it counts as another build, as before. A rolled-back
+ * (older) build therefore never evicts a running newer daemon: `daemon restart` does that.
+ */
+function rebuiltLater(mine: string, theirs: string): boolean {
+  if (!/^\d+$/.test(mine) || !/^\d+$/.test(theirs)) return true;
+  return Number(mine) > Number(theirs);
+}
+
 export function decideBuild(mine: string, daemon: FoundDaemon): BuildDecision {
   const theirs = daemon.health.buildId || daemon.info.buildId;
   if (theirs === mine || daemon.health.keepAlive) return 'connect';
-  const [myVersion = '', myEntry = ''] = mine.split('|');
-  const [theirVersion = '', theirEntry = ''] = theirs.split('|');
+  const [myVersion = '', myEntry = '', myStamp = ''] = mine.split('|');
+  const [theirVersion = '', theirEntry = '', theirStamp = ''] = theirs.split('|');
   const order = compareVersions(myVersion, theirVersion || daemon.health.version);
-  const newer = order > 0 || (order === 0 && myVersion === theirVersion && myEntry === theirEntry);
+  const newer =
+    order > 0 ||
+    (order === 0 &&
+      myVersion === theirVersion &&
+      myEntry === theirEntry &&
+      rebuiltLater(myStamp, theirStamp));
   if (!newer) return 'connect';
   return daemon.health.sessions === 0 ? 'replace-now' : 'connect-and-replace';
 }

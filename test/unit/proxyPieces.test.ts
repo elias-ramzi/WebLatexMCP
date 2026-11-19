@@ -85,6 +85,12 @@ describe('builds', () => {
     expect(decideBuild('0.9.0|/b|2', daemon())).toBe('replace-now'); // rebuilt in place
     expect(decideBuild('0.10.0|/c|1', daemon())).toBe('replace-now');
     expect(decideBuild('0.10.0|/c|1', daemon({ sessions: 2 }))).toBe('connect-and-replace');
+    // An older proxy of the same entry — a session opened before the rebuild, reconnecting to
+    // the daemon the rebuild started — connects and asks nothing of it.
+    expect(decideBuild('0.9.0|/b|0', daemon())).toBe('connect');
+    expect(decideBuild('0.9.0|/b|0', daemon({ sessions: 2 }))).toBe('connect');
+    // A stamp that cannot be ordered still reads as another build of that entry.
+    expect(decideBuild('0.9.0|/b|unknown', daemon())).toBe('replace-now');
     // A service manager's daemon is left to it.
     expect(decideBuild('0.10.0|/c|1', daemon({ keepAlive: true }))).toBe('connect');
   });
