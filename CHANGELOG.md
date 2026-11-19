@@ -196,6 +196,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **Smaller instructions, and the rules that matter survive a client's cut.** The MCP `instructions`
+  went from about 52,000 characters to about 9,600. Claude Code keeps only about the first 4,000,
+  which used to drop half the bibliography rules, the PDF-comment loop and every convention added
+  with `add_writing_convention`. They now open with a short block of the rules every session needs,
+  then the project-specific conventions, then the writing guide; the 42,000-character concurrency
+  guide is no longer inlined (the tools enforce it) and stays the `guide://latex/concurrency`
+  resource.
+- **`compile`'s `logTail` is shorter.** A run of one repeated line (a font substitution reported a
+  dozen times) is folded into one marked `(×N)`, and a warning removed by `warningsFilter` takes its
+  `l.<n>` context line with it instead of leaving a column of bare `l.55`, `l.92`.
+
 - **One shared server for every session, by default** (milestone 5 of
   `docs/design/shared-server.md`). `web-latex-mcp` is now a small stdio proxy: it finds the
   workspace's shared server (`web-latex-mcp serve`), starts it in the background when none answers,

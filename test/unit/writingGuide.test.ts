@@ -8,6 +8,7 @@ import {
   loadExtraWritingGuide,
   composeWritingGuide,
   EXTRA_GUIDE_HEADING,
+  ESSENTIALS_MAX_CHARS,
 } from '../../src/lib/writingGuide.js';
 
 describe('loadWritingGuide', () => {
@@ -51,7 +52,7 @@ describe('loadWritingGuide', () => {
 describe('buildInstructions', () => {
   it('frames the guide and embeds its content', () => {
     const out = buildInstructions('GUIDE_BODY');
-    expect(out).toContain('LaTeX (.tex) files through this server');
+    expect(out).toContain("project's LaTeX writing guide follows");
     expect(out).toContain('GUIDE_BODY');
   });
 
@@ -59,24 +60,46 @@ describe('buildInstructions', () => {
     const out = buildInstructions(undefined);
     expect(out).toContain('list_comments');
     expect(out).toContain('resolve_comments');
-    expect(out).not.toContain('LaTeX (.tex) files through this server');
+    expect(out).not.toContain('writing guide');
   });
 
-  it('includes the comment workflow alongside a guide', () => {
-    expect(buildInstructions('GUIDE_BODY')).toContain('list_comments');
+  it('puts the essentials before the guide, so a client that cuts instructions keeps them', () => {
+    const out = buildInstructions('GUIDE_BODY', 'CONCURRENCY_BODY');
+    const guideAt = out.indexOf('GUIDE_BODY');
+    for (const rule of ['add_citation', 'confirmBibEdit', 'force-push', 'list_comments']) {
+      expect(out.indexOf(rule)).toBeGreaterThanOrEqual(0);
+      expect(out.indexOf(rule)).toBeLessThan(guideAt);
+    }
+    // Claude Code keeps about the first 4,000 characters; the essentials and the guide's framing
+    // must fit well inside that.
+    expect(guideAt).toBeLessThan(2400);
   });
 
-  it('combines the writing and concurrency guides when both are present', () => {
+  it('keeps the essentials under ESSENTIALS_MAX_CHARS whatever is served', () => {
+    for (const [w, c] of [
+      ['W', 'C'],
+      ['W', undefined],
+      [undefined, 'C'],
+      [undefined, undefined],
+    ] as const) {
+      const essentials = buildInstructions(w, c).split('\n\n---\n\n')[0] ?? '';
+      expect(essentials.length).toBeLessThanOrEqual(ESSENTIALS_MAX_CHARS);
+    }
+  });
+
+  it('never inlines the concurrency guide, only names its resource', () => {
     const out = buildInstructions('WRITING_BODY', 'CONCURRENCY_BODY');
     expect(out).toContain('WRITING_BODY');
-    expect(out).toContain('CONCURRENCY_BODY');
-    expect(out).toContain('committing or pushing changes');
+    expect(out).not.toContain('CONCURRENCY_BODY');
+    expect(out).toContain('guide://latex/concurrency');
+    expect(buildInstructions('WRITING_BODY')).not.toContain('guide://latex/concurrency');
   });
 
-  it('frames the concurrency guide alone when only it is present', () => {
-    const out = buildInstructions(undefined, 'CONCURRENCY_BODY');
-    expect(out).toContain('CONCURRENCY_BODY');
-    expect(out).not.toContain('LaTeX (.tex) files through this server');
+  it('names the writing-guide resource only when a guide is served', () => {
+    expect(buildInstructions('WRITING_BODY')).toContain('guide://latex/writing-guide');
+    expect(buildInstructions(undefined, 'CONCURRENCY_BODY')).not.toContain(
+      'guide://latex/writing-guide',
+    );
   });
 
   it('mentions precedence only when hasExtra is explicitly passed true (base + extra both composed)', () => {
@@ -107,17 +130,17 @@ describe('buildInstructions', () => {
 });
 
 describe('composeWritingGuide', () => {
-  it('puts base first, heading second, extra last, and reports hasExtra true', () => {
+  it("puts the heading first, extra second, base last (a cut keeps the user's rules), and reports hasExtra true", () => {
     const { text: out, hasExtra } = composeWritingGuide('BASE_BODY', 'EXTRA_BODY');
     expect(out).toBeDefined();
     expect(hasExtra).toBe(true);
     const composed = out as string;
-    const baseIdx = composed.indexOf('BASE_BODY');
     const headingIdx = composed.indexOf(EXTRA_GUIDE_HEADING);
     const extraIdx = composed.indexOf('EXTRA_BODY');
-    expect(baseIdx).toBeGreaterThanOrEqual(0);
-    expect(headingIdx).toBeGreaterThan(baseIdx);
+    const baseIdx = composed.indexOf('BASE_BODY');
+    expect(headingIdx).toBe(0);
     expect(extraIdx).toBeGreaterThan(headingIdx);
+    expect(baseIdx).toBeGreaterThan(extraIdx);
   });
 
   it('returns base unchanged when there is no extra, and hasExtra false', () => {

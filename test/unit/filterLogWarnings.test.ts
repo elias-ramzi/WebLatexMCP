@@ -117,6 +117,64 @@ describe('filterLog keepWarning', () => {
   });
 });
 
+describe('filterLog drops the context echo of a warning the filter dropped', () => {
+  const PDFTEX = [
+    '(./main.tex',
+    'pdfTeX warning (ext4): destination with the same identifier (name{page.1}) has been already used, duplicate ignored',
+    'l.55',
+    'pdfTeX warning (ext4): destination with the same identifier (name{page.2}) has been already used, duplicate ignored',
+    'l.92 \\subsection{Architecture}',
+    '! Undefined control sequence.',
+    'l.99 \\badcommand',
+    ')',
+    'Output written on main.pdf (2 pages, 1234 bytes).',
+  ].join('\n');
+
+  it("keeps no bare l.<n> line once its warning is filtered out, but keeps an error's", () => {
+    const out = filterLog(PDFTEX, { keepWarning: () => false });
+    expect(out.split('\n')).toEqual([
+      '! Undefined control sequence.',
+      'l.99 \\badcommand',
+      'Output written on main.pdf (2 pages, 1234 bytes).',
+    ]);
+  });
+
+  it('keeps the echo with its warning when the warning is kept', () => {
+    const out = filterLog(PDFTEX, { keepWarning: () => true });
+    expect(out).toMatch(/^l\.55$/m);
+    expect(out).toMatch(/^l\.92 /m);
+  });
+});
+
+describe('filterLog folds a run of one repeated line', () => {
+  it('marks the run (×N), keeps order, and never merges different lines', () => {
+    const font = "LaTeX Font Warning: Font shape `OT1/ptm/m/scit' undefined";
+    const log = [
+      font,
+      font,
+      font,
+      'Overfull \\hbox (1.0pt too wide) in paragraph at lines 1--2',
+      font,
+    ].join('\n');
+    expect(filterLog(log).split('\n')).toEqual([
+      `${font} (×3)`,
+      'Overfull \\hbox (1.0pt too wide) in paragraph at lines 1--2',
+      font,
+    ]);
+  });
+
+  it('folds before the maxLines cap, so the cap keeps more distinct lines', () => {
+    const log = [
+      'Overfull \\hbox (1.0pt too wide) in paragraph at lines 1--2',
+      ...Array(10).fill('LaTeX Font Warning: x'),
+    ].join('\n');
+    expect(filterLog(log, { maxLines: 2 }).split('\n')).toEqual([
+      'Overfull \\hbox (1.0pt too wide) in paragraph at lines 1--2',
+      'LaTeX Font Warning: x (×10)',
+    ]);
+  });
+});
+
 describe('filterLog when a filter empties the kept set', () => {
   /**
    * The raw-tail fallback exists for a log with nothing diagnostic in it. If a *filter* is what
@@ -419,8 +477,14 @@ describe('filterLog differential: option-insensitivity, plus a golden digest aga
    * those apart — so "I meant to change that list" is not evidence. Diff the old and new output and
    * be able to name every added and removed line; only then update this constant to the digest the
    * failure message prints.
+   *
+   * Last moved by `collapseRepeats` (consecutive identical kept lines fold into one marked
+   * `(×N)`). Proved before updating: over all 3000 logs × every maxLines choice, expanding each
+   * `(×N)` line of the new output gave the old output exactly when uncapped (maxLines 80), and
+   * ended with the old output whenever capped (folding frees room for earlier lines) — no line
+   * added or dropped otherwise.
    */
-  const GOLDEN_DIGEST = '47ff800af27ad36495cf020c4a8e0c16d4149d99ca8004a0dfc8d94a0f4ef65d';
+  const GOLDEN_DIGEST = 'f61b72b2bfa1ec378500647c6f515d83af02f1bb4bc123e05904fbb5a14262c3';
 
   it('pins that the 79-column fragment really is wrap width (else unwrapLines goes untested)', () => {
     expect(WRAPPED_LINE).toHaveLength(WRAP_WIDTH);

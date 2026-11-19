@@ -65,14 +65,17 @@ describe('createServer writing guide', () => {
     await client.close();
   });
 
-  it('advertises the concurrency guide as instructions and a fetchable resource', async () => {
+  it('serves the concurrency guide as a resource and points at it, never inlining it', async () => {
     const writing = '# Writing\n\nUse the present tense.';
     const concurrency = '# Concurrency\n\nAlways pull-rebase before pushing.';
     const client = await connect(writing, concurrency);
 
+    // Tens of thousands of characters paid in every conversation, and past every client's cut:
+    // the instructions name the resource instead.
     const instructions = client.getInstructions();
     expect(instructions).toContain('Use the present tense.');
-    expect(instructions).toContain('Always pull-rebase before pushing.');
+    expect(instructions).not.toContain('Always pull-rebase before pushing.');
+    expect(instructions).toContain(CONCURRENCY_GUIDE_URI);
 
     const { resources } = await client.listResources();
     expect(resources.find((r) => r.uri === WRITING_GUIDE_URI)).toBeDefined();

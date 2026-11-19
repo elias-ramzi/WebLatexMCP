@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { WRITING_GUIDE_URI } from '../resources/writingGuide.js';
+import { CONCURRENCY_GUIDE_URI } from '../resources/concurrencyGuide.js';
 
 /** Path to the bundled guide, relative to this module (works from src/ and dist/). */
 function bundledGuidePath(): string {
@@ -61,9 +63,11 @@ export async function loadExtraWritingGuide(
 }
 
 /**
- * Compose the base guide with the additional, project-specific one — extra always LAST, under
- * `EXTRA_GUIDE_HEADING`, so the base guide's own structure (headings, ordering) is never
- * disturbed by an overlay appended to it.
+ * Compose the base guide with the additional, project-specific one. The extra comes FIRST, under
+ * `EXTRA_GUIDE_HEADING`, then the base guide whole: clients cut `instructions` short (Claude Code
+ * keeps about the first 4,000 characters), and a convention the user added through
+ * `add_writing_convention` is the text a cut must not drop. The base guide's own structure is
+ * left intact as one block after it.
  *
  * `hasExtra` is true only when BOTH a base and an extra guide were actually composed together —
  * it is the one place that fact is decided, so `buildInstructions` never has to re-derive it by
@@ -75,66 +79,67 @@ export function composeWritingGuide(
   extra: string | undefined,
 ): { text: string | undefined; hasExtra: boolean } {
   if (base && extra)
-    return { text: `${base}\n\n${EXTRA_GUIDE_HEADING}\n\n${extra}`, hasExtra: true };
+    return { text: `${EXTRA_GUIDE_HEADING}\n\n${extra}\n\n---\n\n${base}`, hasExtra: true };
   if (base) return { text: base, hasExtra: false };
   if (extra) return { text: `${EXTRA_GUIDE_HEADING}\n\n${extra}`, hasExtra: false };
   return { text: undefined, hasExtra: false };
 }
 
 /**
- * Always-on guidance so a vague request reliably drives the PDF-comment loop. The user places
- * comments by selecting text in the local `viewer` and attaching a note; these instructions tell
- * the client what to do when asked to act on them.
+ * The rules every session needs, in the order a cut must keep them. `instructions` are put in the
+ * model's context for the whole session, so they are paid for in every conversation, and clients
+ * cut them short (Claude Code keeps about the first 4,000 characters). So this block is short and
+ * comes first; the writing guide follows; the concurrency guide (tens of thousands of characters,
+ * mostly the why for humans) is not inlined at all — the tools enforce its rules and their
+ * refusals name the remedy — and is pointed to as a resource instead. Keep this block under
+ * `ESSENTIALS_MAX_CHARS` (test-pinned).
+ *
+ * The PDF-comment loop is always included (the comment tools always exist), so instructions are
+ * present even with no guide: a vague "resolve my comments" must reliably drive it.
  */
-const COMMENT_WORKFLOW =
-  'The user can leave review comments on the compiled PDF in this server’s local `viewer` ' +
-  '(they select text and attach a note). When the user asks you to apply, address, resolve, or ' +
-  'act on their PDF comments / feedback / review notes — e.g. “resolve my comments”, ' +
-  '“apply my PDF feedback”, “address the comments” — run this loop for the ' +
-  'relevant project:\n' +
-  '1. Call `list_comments` to get the open comments (each has the note, the selected `quote`, and ' +
-  'the source `file`/`line` with a snippet).\n' +
-  '2. Make the requested change at each comment’s `file`/`line`, using the `quote` to pin the ' +
-  'exact spot when the line is approximate.\n' +
-  '3. `compile` to confirm it still builds (the viewer hot-reloads).\n' +
-  '4. Call `resolve_comments` (all, or the specific `ids` you handled) so the viewer clears them.\n' +
-  'Make all the edits before resolving, and ask rather than guess when a comment is ambiguous.';
+export const ESSENTIALS_MAX_CHARS = 1800;
+
+function essentials(hasWritingGuide: boolean, hasConcurrencyGuide: boolean): string {
+  const lines = ['web-latex-mcp rules for every session:'];
+  if (hasWritingGuide)
+    lines.push(
+      `- Writing: follow the LaTeX writing guide below when reading, writing, editing, or reviewing .tex files. If it reaches you cut short, read the whole guide (resource \`${WRITING_GUIDE_URI}\`) before drafting or restyling prose.`,
+    );
+  lines.push(
+    '- References: never hand-write or invent BibTeX entries or \\cite keys; add a reference with `add_citation`. Any other `.bib` change needs the user’s explicit approval and `confirmBibEdit: true`.',
+    '- Edits: change only the lines in scope; never reflow, rewrap or re-indent untouched text (git merges line by line).',
+    '- Git: `push` rebases and never force-pushes. On a `conflict` result, show the user the sides and resolve only through `push` with `resolutions` and `expectedRemoteHead` — never auto-merge.' +
+      (hasConcurrencyGuide ? ` Why, in full: resource \`${CONCURRENCY_GUIDE_URI}\`.` : ''),
+    '- PDF comments: when asked to apply, address or resolve the user’s comments / feedback from the `viewer`: `list_comments`, edit at each comment’s `file`/`line` (its `quote` pins the spot), `compile`, then `resolve_comments` with the ids handled. Make every edit before resolving; ask when a comment is ambiguous.',
+  );
+  return lines.join('\n');
+}
 
 /**
- * Wrap each available guide in a short framing sentence so the client knows what it
- * is and when to apply it, then join them into one `instructions` string. The PDF-comment
- * workflow is always included (the comment tools always exist), so instructions are always
- * present even with no writing/concurrency guide.
+ * Build the `instructions` string: `essentials` first, then the (composed) writing guide. The
+ * concurrency guide is never inlined — only whether one is served decides whether the essentials
+ * point at its resource.
  */
 export function buildInstructions(
   writingGuide?: string,
   concurrencyGuide?: string,
   hasExtra = false,
-): string | undefined {
-  const sections: string[] = [];
+): string {
+  const sections = [essentials(writingGuide !== undefined, concurrencyGuide !== undefined)];
   if (writingGuide) {
     // `hasExtra` travels as data from `composeWritingGuide`, not re-derived by sniffing the text
     // for `EXTRA_GUIDE_HEADING` — a base guide could itself contain that literal heading (a false
     // claim of precedence with no extra guide configured), and an extra-only guide (no base)
     // would otherwise vacuously claim precedence over a "rest of the guide" that doesn't exist.
     sections.push(
-      'When reading, writing, editing, or reviewing LaTeX (.tex) files through this ' +
-        "server, follow the project's LaTeX writing guide below." +
+      "The project's LaTeX writing guide follows." +
         (hasExtra
-          ? ' Where the "Project-specific conventions" section contradicts the rest of the ' +
-            'guide, the project-specific conventions take precedence.'
+          ? ' Its "Project-specific conventions" come first and take precedence where they ' +
+            'contradict the rest of the guide.'
           : '') +
         '\n\n' +
         writingGuide,
     );
   }
-  if (concurrencyGuide) {
-    sections.push(
-      'When committing or pushing changes through this server, follow the concurrency ' +
-        'and safe-push rules below.\n\n' +
-        concurrencyGuide,
-    );
-  }
-  sections.push(COMMENT_WORKFLOW);
-  return sections.length > 0 ? sections.join('\n\n---\n\n') : undefined;
+  return sections.join('\n\n---\n\n');
 }

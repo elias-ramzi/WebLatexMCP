@@ -426,7 +426,7 @@ const outputSchema = {
     .string()
     .describe(
       'De-noised log excerpt: only errors, warnings, and the "Output written on" summary (font ' +
-        'and memory noise stripped). Bounded in characters as well as lines: each line is cut at ' +
+        'and memory noise stripped; a run of one repeated line is folded into one marked "(×N)"). Bounded in characters as well as lines: each line is cut at ' +
         `${LOG_TAIL_LINE_CAP} characters with a marker saying how many went, and the whole tail ` +
         `is charged against the ${DIAGNOSTICS_CONTENT_BUDGET}-character result budget — sharing ` +
         'what errors[] leaves with warnings[] — so on a long log its EARLIEST lines are dropped, ' +

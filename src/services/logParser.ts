@@ -936,6 +936,10 @@ export function fitFilteredLog(
   // with no diagnostics in it from one whose diagnostics the *filter* removed. They need opposite
   // answers, and conflating them inverts the feature: see the fallback's own comment.
   let matchedBeforeFilter = 0;
+  // A warning `keepWarning` dropped takes its own `l.<n>` echo with it: TeX prints that context
+  // line right after the warning, and kept alone it says nothing (a filtered build's tail was a
+  // column of bare `l.55`, `l.92`, …). Set when a warning is dropped, cleared by any kept line.
+  let droppedWarningContext = false;
   for (const raw of unwrapLines(log)) {
     const line = raw.replace(/\s+$/, '');
     // Only maintained when needed: a caller with no `keepWarning` must see byte-identical output,
@@ -950,8 +954,13 @@ export function fitFilteredLog(
     if (keepWarning && !ALWAYS_KEEP_PATTERNS.some((re) => re.test(line)) && isWarningLine(line)) {
       const { rule } = warningRuleOf(line);
       const file = openFile ? rebase(openFile, baseDir) : undefined;
-      if (!keepWarning({ file, rule })) continue;
+      if (!keepWarning({ file, rule })) {
+        droppedWarningContext = true;
+        continue;
+      }
     }
+    if (droppedWarningContext && LINE_CONTEXT.test(line)) continue;
+    droppedWarningContext = false;
     // Kept whole and capped only later, by `fitLines`: every pattern above judged the whole line,
     // so a cut can never change which side of the error/warning partition a line lands on — and
     // `fitLines` needs the original to cut the last line further than the cap when it must.
@@ -970,10 +979,32 @@ export function fitFilteredLog(
     const raw = logTail(log, 15).split('\n');
     return fitLines(raw, 0, maxChars, rawLinesHeader);
   }
+  // Before the cap, so a run of one repeated warning frees room rather than crowding out the rest.
+  const lines = collapseRepeats(kept);
   // Written as the legacy `maxLines` branch was, `slice(-maxLines)` quirks included.
-  const overCap = kept.length > maxLines;
-  const shown = overCap ? kept.slice(-maxLines) : kept;
-  return fitLines(shown, overCap ? kept.length - maxLines : 0, maxChars, keptLinesHeader);
+  const overCap = lines.length > maxLines;
+  const shown = overCap ? lines.slice(-maxLines) : lines;
+  return fitLines(shown, overCap ? lines.length - maxLines : 0, maxChars, keptLinesHeader);
+}
+
+/** A TeX error/warning position echo (`l.12 …`): what {@link KEEP_PATTERNS} keeps as context. */
+const LINE_CONTEXT = /^l\.\d+/;
+
+/**
+ * Consecutive identical lines folded into the first, marked `(×N)` — a font substitution or a
+ * missing glyph is often reported a dozen times in a row, each costing the model a full line. Only
+ * exact repeats in a row fold, so no two different lines ever merge and order is kept.
+ */
+export function collapseRepeats(lines: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; ) {
+    const line = lines[i] as string;
+    let j = i + 1;
+    while (j < lines.length && lines[j] === line) j++;
+    out.push(j - i > 1 ? `${line} (×${j - i})` : line);
+    i = j;
+  }
+  return out;
 }
 
 function dedupe(items: ParsedDiagnostic[]): ParsedDiagnostic[] {

@@ -589,10 +589,14 @@ fast instead of hanging.
 
 ## Guides surfaced to the client
 
-At startup the server reads two guides and surfaces each to the client two ways: as the MCP
-`instructions` hint (so a client like Claude keeps it in context for the whole session) and as a
-fetchable **resource** (so you can re-open it on demand and clients that ignore `instructions` can still
-reach it).
+At startup the server reads two guides and serves each as a fetchable **resource**. The MCP
+`instructions` hint, which a client like Claude keeps in context for the whole session, carries a short
+block of the rules every session needs (references only through `add_citation`, surgical edits, never
+force-push and how to resolve a conflict, the PDF-comment loop), then the **writing guide** in full.
+The concurrency guide is not inlined — the tools enforce its rules and their refusals name the remedy —
+and the instructions point at its resource instead. Clients cut `instructions` short (Claude Code keeps
+about the first 4,000 characters), so the essentials come first and the instructions ask the model to
+read the writing-guide resource when the guide reaches it cut.
 
 - **Writing guide** — resource `guide://latex/writing-guide`. The bundled
   [`writing-guide.md`](writing-guide.md) covers tense, style, figures, equations, bibliography, and
@@ -616,8 +620,8 @@ are easy to mix up:
   effect (bundled, or your `WEB_LATEX_MCP_WRITING_GUIDE` replacement) — it never replaces anything. Setting
   both is legal: your replacement base, plus your extra guide layered on top of it.
 
-The extra guide is composed in **last**, under its own `## Project-specific conventions` heading, and
-**takes precedence** where it contradicts the base guide — the instructions say so explicitly, so the
+The extra guide is composed in **first**, under its own `## Project-specific conventions` heading, ahead
+of the base guide (so a client that cuts the instructions short keeps your rules), and **takes precedence** where it contradicts the base guide — the instructions say so explicitly, so the
 model treats a project-specific rule as the tie-breaker rather than picking one at random.
 
 The value accepts either a filesystem path (absolute, `~`-relative, or relative to the launch dir) or a
