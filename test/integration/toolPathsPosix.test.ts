@@ -271,12 +271,15 @@ describe('compile: paths at the response boundary', () => {
         client.callTool({ name: 'compile', arguments: { project: 'doc' } }),
       );
 
-      const out = compileOut(res);
-      expect(out.pdfUrl).toBe(toFileUrl(nativePdfPath));
+      // The URL now ships in the text channel only (structuredContent's pdfUrl only repeated
+      // pdfPath, and is no longer sent).
+      expect(compileOut(res).pdfUrl).toBeUndefined();
+      const url = /^PDF: (\S+)$/m.exec(textOf(res))?.[1];
+      expect(url).toBe(toFileUrl(nativePdfPath));
       // Spelled out so the failure is legible: the separator survives as a percent-encoded
       // backslash in the URL, and must NOT have become a `/` path segment.
-      expect(out.pdfUrl).toContain('%5C');
-      expect(out.pdfUrl).not.toContain(posixOf(nativePdfPath));
+      expect(url).toContain('%5C');
+      expect(url).not.toContain(posixOf(nativePdfPath));
     },
   );
 
@@ -300,7 +303,6 @@ describe('compile: paths at the response boundary', () => {
       client.callTool({ name: 'compile', arguments: { project: 'doc' } }),
     );
 
-    const out = compileOut(res);
     const text = textOf(res);
     // Guard the harness itself: without the overflow line the text carries no absolute path at
     // all and the assertions below would be vacuous for a different reason than the fix.
@@ -308,10 +310,8 @@ describe('compile: paths at the response boundary', () => {
     expect(text).toContain(posixOf(nativeLogPath));
     expect(text).not.toContain(nativeLogPath);
     expect(text).not.toContain(nativePdfPath);
-    // The one path the text is supposed to carry natively is the `file://` URL, and it must be
-    // the very string structuredContent reports.
-    expect(text).toContain(`PDF: ${out.pdfUrl ?? ''}`);
-    expect(out.pdfUrl).toBe(toFileUrl(nativePdfPath));
+    // The one path the text is supposed to carry natively is the `file://` URL.
+    expect(text).toContain(`PDF: ${toFileUrl(nativePdfPath)}`);
   });
 });
 
@@ -391,9 +391,7 @@ describe('render_pages: paths at the response boundary', () => {
 
     const out = renderOut(res);
     expect(out.pdfPath).toBe(posixOf(nativePdfPath));
-    expect(out.outDir).toBe(posixOf(nativeOutDir));
     expect(out.pdfPath).not.toContain('\\');
-    expect(out.outDir).not.toContain('\\');
 
     expect(out.pages).toHaveLength(2);
     for (const p of out.pages) {

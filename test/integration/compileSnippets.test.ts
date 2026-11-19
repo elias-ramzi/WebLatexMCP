@@ -133,7 +133,7 @@ describe('compile: source context', () => {
 
     expect(structured.errors[0]?.snippet).toContain('bad \\nope');
     expect(structured.errors[0]?.snippetStartLine).toBe(1);
-    expect(structured.omittedSnippetLocations).toBe(0);
+    expect(structured.omittedSnippetLocations ?? 0).toBe(0);
     // A client that strips structuredContent still gets it, numbered and marked.
     expect(textOf(res)).toContain('> 3 | bad \\nope');
   });
@@ -212,7 +212,7 @@ describe('compile: source context', () => {
     expect(structured.errors).toHaveLength(12);
     const withSnippet = structured.errors.filter((e) => e.snippet !== undefined);
     expect(withSnippet).toHaveLength(6); // one per location
-    expect(structured.omittedSnippetLocations).toBe(0);
+    expect(structured.omittedSnippetLocations ?? 0).toBe(0);
     // Every one of them reaches the text, marked at its own line.
     for (let i = 1; i <= 6; i++) expect(text).toContain(`> ${i} | line ${i}`);
   });
@@ -237,7 +237,7 @@ describe('compile: source context', () => {
       omittedSnippetLocations: number;
     };
     expect(structured.errors[0]?.snippet).toContain('undefmac');
-    expect(structured.omittedSnippetLocations).toBe(0);
+    expect(structured.omittedSnippetLocations ?? 0).toBe(0);
     expect(textOf(res)).toContain('> 3 |');
   });
 

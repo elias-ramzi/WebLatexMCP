@@ -127,7 +127,7 @@ describe('compile: warningsFilter', () => {
 
     const s = structured(res);
     expect(s.warnings).toHaveLength(2);
-    expect(s.warningsOmitted).toBe(0);
+    expect(s.warningsOmitted ?? 0).toBe(0);
     const logTail = s.logTail as string;
     expect(logTail).toMatch(/Overfull \\hbox \(12\.0pt too wide\)/);
     expect(logTail).toMatch(/Overfull \\hbox \(7\.0pt too wide\)/);
@@ -141,7 +141,7 @@ describe('compile: warningsFilter', () => {
     });
 
     const s = structured(res);
-    expect(s.warnings).toEqual([]);
+    expect(s.warnings ?? []).toEqual([]);
     expect(s.warningsOmitted).toBe(2);
     const logTail = s.logTail as string;
     // This is the assertion that proves the two channels agree: the box lines are gone from the
@@ -180,7 +180,7 @@ describe('compile: warningsFilter', () => {
     });
 
     const s = structured(res);
-    expect(s.warnings).toEqual([]);
+    expect(s.warnings ?? []).toEqual([]);
     expect(s.warningsOmitted).toBe(2);
     const logTail = s.logTail as string;
     // rawLog means raw: both box lines are still there even though warnings[] was filtered.
@@ -199,7 +199,7 @@ describe('compile: warningsFilter', () => {
     const errors = s.errors as Array<{ message: string }>;
     expect(errors).toHaveLength(1);
     expect(errors[0]?.message).toMatch(/Undefined control sequence/);
-    expect(s.warnings).toEqual([]);
+    expect(s.warnings ?? []).toEqual([]);
     expect(s.warningsOmitted).toBe(2);
     const logTail = s.logTail as string;
     expect(logTail).toMatch(/Undefined control sequence/);
@@ -385,7 +385,7 @@ describe('compile: warningsFilter and a withheld path', () => {
         arguments: { project: 'doc', warningsFilter: { file: ['outside.tex'] } },
       }),
     );
-    expect(res.warnings).toHaveLength(0);
+    expect(res.warnings ?? []).toHaveLength(0);
     expect(res.warningsOmitted).toBe(1);
     // The point: logTail agrees. Before the predicate applied the withholding itself, the tail
     // kept this line because the paren stack still called it "outside.tex".

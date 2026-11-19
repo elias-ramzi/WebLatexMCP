@@ -101,7 +101,7 @@ describe('compile: an engine latexmk could not run', () => {
     const sc = res.structuredContent as { success: boolean; errors: unknown[]; hint?: string };
     expect(sc.success).toBe(false);
     // Located nowhere: the message is a hint, never a fabricated error entry.
-    expect(sc.errors).toEqual([]);
+    expect(sc.errors ?? []).toEqual([]);
     expect(sc.hint).toMatch(/^The xelatex engine is not installed \(latexmk could not run it\)/);
     expect(sc.hint).toMatch(/engine: "pdflatex" or "lualatex"/);
 

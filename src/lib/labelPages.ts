@@ -2671,6 +2671,43 @@ export function labelResolutionNote(plan: LabelPagePlan): string {
 }
 
 /**
+ * {@link labelResolutionNote}'s short form, for `render_pages`: the same claims — where the page
+ * numbers came from, which route turned them into PDF pages, that a text-read route is evidence
+ * and not proof, that edits since the last compile are not reflected — without the reasoning
+ * behind each check (the tool description and docs/tools.md hold that). It ships beside the image
+ * of the very page it names, which is the check it asks for.
+ */
+export function labelResolutionBrief(plan: LabelPagePlan): string {
+  const viaDestination = plan.resolved.filter((r) => r.via === 'destination').map((r) => r.label);
+  const verified = plan.destinationVerified ?? [];
+  let route: string;
+  if (plan.labelSource === 'pageLabels') {
+    route = "printed page looked up in the PDF's /PageLabels tree";
+  } else if (viaDestination.length === plan.resolved.length) {
+    route = 'no /PageLabels tree';
+  } else {
+    route =
+      (plan.pageLabelsIgnored === 'beamer'
+        ? 'beamer deck, /PageLabels not used: '
+        : 'no /PageLabels tree: ') +
+      "printed page matched against that page's own folio (read from its text — evidence, not " +
+      'proof)';
+    if (verified.length > 0)
+      route += `; for ${verified.join(', ')} the label's hyperref link target confirmed it`;
+  }
+  const destination =
+    viaDestination.length > 0
+      ? ` ${viaDestination.join(', ')}: the printed page names several PDF pages, so the ` +
+        "label's hyperref link target picked one, corroborated by that page's number — " +
+        'evidence, not proof.'
+      : '';
+  return (
+    `Pages from the LAST COMPILE's .aux (${describeResolvedLabels(plan.resolved)}); ${route}.` +
+    `${destination} Edits since that compile are not reflected: recompile if the page looks wrong.`
+  );
+}
+
+/**
  * Enriches the renderer's own out-of-range error when the page came from a label. The bare
  * message ("Page 9 is out of range: this document has 3 page(s).") is true but blames the caller
  * for a number they never chose — this names where the number came from and what to do.

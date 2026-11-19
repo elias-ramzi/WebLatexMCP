@@ -56,8 +56,8 @@ describe.skipIf(!available)('compiling a local (in-place) project', () => {
     const res = await client.callTool({ name: 'compile', arguments: { project: 'cv' } });
     const structured = res.structuredContent as Record<string, unknown>;
     expect(structured.success, JSON.stringify(res.content)).toBe(true);
-    expect(structured.errors).toEqual([]);
-    expect(structured.missingPackages).toEqual([]);
+    expect(structured.errors ?? []).toEqual([]);
+    expect(structured.missingPackages ?? []).toEqual([]);
 
     // The PDF is surfaced into the workspace, never beside the user's source...
     expect(structured.pdfPath).toBe(path.join(workspace, 'cv.pdf').split(path.sep).join('/'));

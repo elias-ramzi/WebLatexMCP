@@ -162,9 +162,9 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
 
     expect(s.success).toBe(true);
     // The claim of the whole issue. Pre-fix, `warnings` alone rendered to ~140k characters.
-    expect(JSON.stringify(s.errors).length + JSON.stringify(s.warnings).length).toBeLessThanOrEqual(
-      DIAGNOSTICS_CONTENT_BUDGET,
-    );
+    expect(
+      JSON.stringify(s.errors ?? []).length + JSON.stringify(s.warnings ?? []).length,
+    ).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
     // And the whole result, both channels, logTail included: it is charged against the same
     // budget now, so the only excess is the fixed fields. (This used to read `< 40_000`, which
     // held only because logTail's 80 short box lines happened to be small — it was not charged.)
@@ -177,7 +177,7 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     expect(s.warnings.length + s.warningsOmittedByCap).toBe(WARNING_COUNT);
     // The cap is NOT the filter. No warningsFilter was passed, so that counter stays 0 — and a
     // reader who added the two would be double-counting two different claims.
-    expect(s.warningsOmitted).toBe(0);
+    expect(s.warningsOmitted ?? 0).toBe(0);
     expect(s.warningsOmittedByCap).toBeGreaterThan(900);
 
     expect(s.note).toBeDefined();
@@ -204,7 +204,7 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
 
     // ALLOCATION_ORDER, end to end: the warnings pay for the errors, never the other way round.
     expect(s.errors).toHaveLength(ERROR_COUNT);
-    expect(s.errorsOmittedByCap).toBe(0);
+    expect(s.errorsOmittedByCap ?? 0).toBe(0);
     expect(s.warningsOmittedByCap).toBeGreaterThan(0);
 
     // Snippet provenance is untouched: the log named these outright, so they still carry source.
@@ -215,9 +215,9 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     expect(s.omittedSnippetLocations).toBe(ERROR_COUNT - 10);
     expect(textOf(res)).toMatch(/> 3 \| Paragraph 0 of the body text\./);
 
-    expect(JSON.stringify(s.errors).length + JSON.stringify(s.warnings).length).toBeLessThanOrEqual(
-      DIAGNOSTICS_CONTENT_BUDGET,
-    );
+    expect(
+      JSON.stringify(s.errors ?? []).length + JSON.stringify(s.warnings ?? []).length,
+    ).toBeLessThanOrEqual(DIAGNOSTICS_CONTENT_BUDGET);
   });
 
   it('keeps the filter counter and the cap counter apart on one call', async () => {
@@ -229,13 +229,36 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     })) as CallToolResult;
     const s = structured(res);
 
-    expect(s.warnings).toHaveLength(0);
+    expect(s.warnings ?? []).toHaveLength(0);
     // What the caller asked to remove...
     expect(s.warningsOmitted).toBe(WARNING_COUNT);
     // ...and nothing left for the size cap to remove, so it reports nothing. Reusing one counter
     // for both would have made this 2400, or made one of the two claims false.
-    expect(s.warningsOmittedByCap).toBe(0);
+    expect(s.warningsOmittedByCap ?? 0).toBe(0);
     expect(s.errors).toHaveLength(ERROR_COUNT);
+  });
+
+  it('leaves empty lists, zero counters and pdfUrl out of a clean build', async () => {
+    const { client } = await setup('(./main.tex)\nOutput written on main.pdf (1 page, 10 bytes).');
+    const res = (await client.callTool({
+      name: 'compile',
+      arguments: { project: 'doc' },
+    })) as CallToolResult;
+    const s = res.structuredContent as Record<string, unknown>;
+    expect(s.success).toBe(true);
+    for (const key of [
+      'errors',
+      'warnings',
+      'errorsOmittedByCap',
+      'warningsOmittedByCap',
+      'warningsOmitted',
+      'missingPackages',
+      'omittedSnippetLocations',
+      'pdfUrl',
+    ]) {
+      expect(Object.keys(s), key).not.toContain(key);
+    }
+    await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
   });
 
   it('declares every counter in the schema it advertises', async () => {
@@ -250,9 +273,10 @@ describe('compile: errors[] and warnings[] are budgeted', () => {
     // audits the WHOLE payload, which a named-pointer assertion structurally cannot.
     await expectNoUndeclaredKeys(client, 'compile', res.structuredContent);
 
-    await expectDeclaredField(client, 'compile', 'errorsOmittedByCap', { required: true });
+    // Optional since empty/zero fields are left out of the result (absent means 0).
+    await expectDeclaredField(client, 'compile', 'errorsOmittedByCap', { required: false });
     await expectDeclaredField(client, 'compile', 'warningsOmittedByCap', {
-      required: true,
+      required: false,
       description: /NOT warningsOmitted/,
     });
     await expectDeclaredField(client, 'compile', 'note', { required: false });

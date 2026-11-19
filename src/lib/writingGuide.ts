@@ -108,6 +108,7 @@ function essentials(hasWritingGuide: boolean, hasConcurrencyGuide: boolean): str
   lines.push(
     '- References: never hand-write or invent BibTeX entries or \\cite keys; add a reference with `add_citation`. Any other `.bib` change needs the user’s explicit approval and `confirmBibEdit: true`.',
     '- Edits: change only the lines in scope; never reflow, rewrap or re-indent untouched text (git merges line by line).',
+    '- PDF: `render_pages` images are costly — use them only for visual questions (layout, figures, overflow). Read PDF text with `extract_text`; find its source with `locate_text`.',
     '- Git: `push` rebases and never force-pushes. On a `conflict` result, show the user the sides and resolve only through `push` with `resolutions` and `expectedRemoteHead` — never auto-merge.' +
       (hasConcurrencyGuide ? ` Why, in full: resource \`${CONCURRENCY_GUIDE_URI}\`.` : ''),
     '- PDF comments: when asked to apply, address or resolve the user’s comments / feedback from the `viewer`: `list_comments`, edit at each comment’s `file`/`line` (its `quote` pins the spot), `compile`, then `resolve_comments` with the ids handled. Make every edit before resolving; ask when a comment is ambiguous.',

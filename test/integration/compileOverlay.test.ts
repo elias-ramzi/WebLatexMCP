@@ -871,13 +871,11 @@ describe('PDF tools read a variant by its handle', () => {
     const rs = render.structuredContent as {
       variant?: string;
       pdfPath: string;
-      outDir: string;
       pages: Array<{ pngPath: string }>;
     };
     expect(rs.variant).toBe(HANDLE);
     expect(rs.pdfPath).toBe(toPosix(variantPdf));
     const renderDir = toPosix(variantPaths(clone, HANDLE).render);
-    expect(rs.outDir).toBe(renderDir);
     expect(rs.pages[0]?.pngPath.startsWith(`${renderDir}/`)).toBe(true);
     await expect(stat(rs.pages[0]!.pngPath)).resolves.toBeTruthy();
     await expectNoUndeclaredKeys(client, 'render_pages', render.structuredContent);

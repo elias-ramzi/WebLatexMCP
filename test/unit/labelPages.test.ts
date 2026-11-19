@@ -3,6 +3,7 @@ import {
   planLabelPages,
   labelRefusalMessage,
   labelResolutionNote,
+  labelResolutionBrief,
   labelPageRangeMessage,
   describeResolvedLabels,
   buildPageLabelIndex,
@@ -487,5 +488,32 @@ describe('labelResolutionNote states which route resolved the pages', () => {
     );
     expect(note).toContain('no /PageLabels tree');
     expect(note).toMatch(/own folio .* was found to read the same/);
+  });
+});
+
+describe('labelResolutionBrief makes the same claims as the full note, shorter', () => {
+  it('names the /PageLabels route, the last compile and the recompile remedy', () => {
+    const plan = planLabelPages(['sec:preface'], aux([['sec:preface', 'iv']]), [
+      'i',
+      'ii',
+      'iii',
+      'iv',
+    ]);
+    const brief = labelResolutionBrief(plan);
+    expect(brief).toContain('/PageLabels tree');
+    expect(brief).toContain('sec:preface -> page 4');
+    expect(brief).toContain('LAST COMPILE');
+    expect(brief).toMatch(/recompile/i);
+    expect(brief).not.toMatch(/evidence, not proof/);
+    expect(brief.length).toBeLessThan(labelResolutionNote(plan).length);
+  });
+
+  it('calls the folio route evidence, not proof', () => {
+    const plan = planLabelPages(['tab:a'], aux([['tab:a', '5']]), null, shown(5));
+    const brief = labelResolutionBrief(plan);
+    expect(brief).toContain('no /PageLabels tree');
+    expect(brief).toMatch(/own folio/);
+    expect(brief).toMatch(/evidence, not proof/);
+    expect(brief.length).toBeLessThan(labelResolutionNote(plan).length / 2);
   });
 });

@@ -21,7 +21,7 @@ import {
   resolveLabelPages,
   pdfLabelPageReader,
   labelRefusalMessage,
-  labelResolutionNote,
+  labelResolutionBrief,
   labelPageRangeMessage,
   describeResolvedLabels,
   LABEL_LOOKUP_MAX,
@@ -159,8 +159,11 @@ const pageShape = z.object({
   heightPx: z.number().describe('Rendered image height in pixels.'),
   dpi: z.number().describe('Resolution actually rendered at, one decimal place.'),
   clamped: z
-    .boolean()
-    .describe(`True when the request was reduced to fit the ${HARD_MAX_EDGE_PX}px hard cap.`),
+    .literal(true)
+    .optional()
+    .describe(
+      `Present (true) only when the request was reduced to fit the ${HARD_MAX_EDGE_PX}px hard cap.`,
+    ),
   pageWidthPt: z
     .number()
     .describe(
@@ -173,8 +176,13 @@ const pageShape = z.object({
       'The page box height in PostScript points (72pt = 1in) — how a figure clipped by its own ' +
         'too-small box shows up.',
     ),
-  bytes: z.number().describe('Size of the PNG file in bytes.'),
-  inlined: z.boolean().describe('Whether this page was also returned as an image content block.'),
+  inlined: z
+    .literal(false)
+    .optional()
+    .describe(
+      'Present (false) only when this page was NOT returned as an image content block (inline: ' +
+        'false, or the inline budget ran out — see note); absent means it was.',
+    ),
 });
 
 const outputSchema = {
@@ -186,17 +194,13 @@ const outputSchema = {
     .string()
     .describe('The compiled PDF that was rasterized. POSIX (`/`-separated) on every OS.'),
   pageCount: z.number().describe('Pages in the PDF — not the number of pages rendered.'),
-  outDir: z
-    .string()
-    .describe(
-      'Directory the PNGs were written to (a temp build dir, never inside the project). ' +
-        'POSIX (`/`-separated) on every OS.',
-    ),
   pages: z.array(pageShape).describe('One entry per page actually rendered, in page order.'),
   skippedPages: z
     .array(z.number())
+    .optional()
     .describe(
-      `Pages asked for (or implied by the default) that the ${MAX_PAGES_PER_CALL}-per-call cap ` +
+      'Omitted when empty. ' +
+        `Pages asked for (or implied by the default) that the ${MAX_PAGES_PER_CALL}-per-call cap ` +
         'left out.',
     ),
   resolvedLabels: z
@@ -258,6 +262,12 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
     {
       title: 'Rasterize compiled pages to PNG for the model to look at',
       description:
+        'For VISUAL questions only — layout, figures, tables, overflow, what a page looks like. ' +
+        'Each page image costs the model up to ~1,600 tokens (clients downscale past ~1.15 ' +
+        'megapixels, so more pixels buy nothing): to read the text use extract_text, to find ' +
+        'where PDF text lives in the source use locate_text, and to count pages read compile’s ' +
+        'pageCount. For a quick layout glance pass maxEdgePx: 800 (about a third of the cost); ' +
+        'clip to the region in question rather than rendering whole pages. ' +
         'Read-only over the last compiled PDF — it never compiles. Rasterizes the requested pages ' +
         '(default: every page, capped at 8 per call) to PNG so the model can see the actual ' +
         'layout: did a restructured column push a row onto the next page, are columns balanced, ' +
@@ -451,18 +461,17 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // these very paths on the real filesystem), and nothing below touches a disk. Converting
           // here, once, is what keeps the result text and structuredContent rendered from the same
           // value instead of one being native and the other POSIX.
-          const { pdfPath: outPdfPath, outDir: outOutDir } = toPosixOut({ pdfPath, outDir });
+          const { pdfPath: outPdfPath } = toPosixOut({ pdfPath });
           const pagesOut = rendered.map((p) => ({
             page: p.page,
             ...toPosixOut({ pngPath: p.pngPath }),
             widthPx: p.widthPx,
             heightPx: p.heightPx,
             dpi: p.dpi,
-            clamped: p.clamped,
+            ...(p.clamped ? { clamped: true as const } : {}),
             pageWidthPt: p.pageWidthPt,
             pageHeightPt: p.pageHeightPt,
-            bytes: p.bytes,
-            inlined: p.inlined,
+            ...(p.inlined ? {} : { inlined: false as const }),
           }));
 
           // Joined, never overwritten — the two notes answer different questions (what was
@@ -470,7 +479,7 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
           // label-resolved render of several pages can also hit the inline budget. Same shape as
           // pdf_geometry's note joining.
           const note =
-            [labelPlan ? labelResolutionNote(labelPlan) : undefined, inlineNote]
+            [labelPlan ? labelResolutionBrief(labelPlan) : undefined, inlineNote]
               .filter(Boolean)
               .join(' ') || undefined;
 
@@ -480,9 +489,8 @@ export function registerRenderPages(server: McpServer, ctx: AppContext): void {
             ...(variant !== undefined ? { variant } : {}),
             pdfPath: outPdfPath,
             pageCount: result.pageCount,
-            outDir: outOutDir,
             pages: pagesOut,
-            skippedPages: result.skippedPages,
+            ...(result.skippedPages.length > 0 ? { skippedPages: result.skippedPages } : {}),
             resolvedLabels: labelPlan ? labelPlan.resolved : undefined,
             note,
           };

@@ -59,6 +59,7 @@ import {
 import { quoteId } from '../lib/projectId.js';
 import { editItemSchema } from '../lib/editItemSchema.js';
 import type { CompilerKind } from '../types.js';
+import { omitEmpty } from '../lib/omitEmpty.js';
 
 /** Raw-tail size when `rawLog` is set — generous enough to include the full noise tail. */
 const RAW_TAIL_LINES = 400;
@@ -285,6 +286,18 @@ const errorShape = diagnosticShape.extend({
     .describe("1-based source line of `snippet`'s first line, so the caller can number it."),
 });
 
+/** Fields left out of the result when empty or 0 (each says so in its description). */
+const COMPILE_OMITTABLE = [
+  'errors',
+  'warnings',
+  'errorsOmittedByCap',
+  'warningsOmittedByCap',
+  'warningsOmitted',
+  'missingPackages',
+  'omittedSnippetLocations',
+  'lockWaitSec',
+] as const;
+
 const outputSchema = {
   success: z.boolean(),
   rootFile: z.string(),
@@ -309,7 +322,11 @@ const outputSchema = {
   pdfUrl: z
     .string()
     .optional()
-    .describe('Clickable file:// URL of the compiled PDF, when produced.'),
+    .describe(
+      'Clickable file:// URL of the compiled PDF. No longer sent in structuredContent (it ' +
+        'only repeated pdfPath); the result text still carries it. Kept declared for older ' +
+        'clients.',
+    ),
   pageCount: z
     .number()
     .optional()
@@ -342,8 +359,10 @@ const outputSchema = {
     ),
   lockWaitSec: z
     .number()
+    .optional()
     .describe(
-      'Seconds this call waited for the project lock before compiling; 0 when uncontended. Not ' +
+      'Omitted from the result when 0 — absent means 0. ' +
+        'Seconds this call waited for the project lock before compiling; 0 when uncontended. Not ' +
         'included in durationSec.',
     ),
   lockHeldBy: z
@@ -355,8 +374,10 @@ const outputSchema = {
     ),
   errors: z
     .array(errorShape)
+    .optional()
     .describe(
-      "The compile errors, in the order the log reports them — TeX's first error is usually the " +
+      'Omitted from the result when empty — absent means []. ' +
+        "The compile errors, in the order the log reports them — TeX's first error is usually the " +
         'cause and the ones after it the cascade, so this is cut as a TAIL, never reordered. ' +
         `At most ${DIAGNOSTICS_MAX_ERRORS} of them (plus any later one carrying a snippet, so a ` +
         'source excerpt the server already vouched for is never thrown away by the cap), and ' +
@@ -367,8 +388,10 @@ const outputSchema = {
     ),
   warnings: z
     .array(warningShape)
+    .optional()
     .describe(
-      `At most ${DIAGNOSTICS_MAX_WARNINGS} warnings, and fewer when the ` +
+      'Omitted from the result when empty — absent means []. ' +
+        `At most ${DIAGNOSTICS_MAX_WARNINGS} warnings, and fewer when the ` +
         `${DIAGNOSTICS_CONTENT_BUDGET}-character result budget (shared with errors[], which is ` +
         'allocated first) bites — a normal build emits hundreds, and an unbounded list is how a ' +
         'result gets rejected by a client and delivers nothing at all. Cut as a tail, in log ' +
@@ -379,8 +402,10 @@ const outputSchema = {
     ),
   errorsOmittedByCap: z
     .number()
+    .optional()
     .describe(
-      'How many errors this result does not carry because they did not fit — over the ' +
+      'Omitted from the result when 0 — absent means 0. ' +
+        'How many errors this result does not carry because they did not fit — over the ' +
         `${DIAGNOSTICS_MAX_ERRORS}-error cap, or over the ${DIAGNOSTICS_CONTENT_BUDGET}-character ` +
         'budget charged across both channels (the first errors are rendered into the result text ' +
         'with their snippets as well as into structuredContent). 0 means errors[] is the whole ' +
@@ -389,8 +414,10 @@ const outputSchema = {
     ),
   warningsOmittedByCap: z
     .number()
+    .optional()
     .describe(
-      'How many warnings this result does not carry because they did not fit — over the ' +
+      'Omitted from the result when 0 — absent means 0. ' +
+        'How many warnings this result does not carry because they did not fit — over the ' +
         `${DIAGNOSTICS_MAX_WARNINGS}-warning cap, or over the shared ` +
         `${DIAGNOSTICS_CONTENT_BUDGET}-character budget, for which errors[] is allocated first. ` +
         'This is NOT warningsOmitted: that one counts what your own warningsFilter removed at ' +
@@ -401,8 +428,10 @@ const outputSchema = {
     ),
   warningsOmitted: z
     .number()
+    .optional()
     .describe(
-      'How many entries warningsFilter removed from warnings[] — 0 when no filter was given, or ' +
+      'Omitted from the result when 0 — absent means 0. ' +
+        'How many entries warningsFilter removed from warnings[] — 0 when no filter was given, or ' +
         'when it matched everything. Non-zero means the list you are reading is a subset by your ' +
         'own request: re-run without the filter, or read logPath, to see the rest. It counts ' +
         'warnings[] entries ONLY, and is deliberately not a line count for logTail: the same ' +
@@ -416,8 +445,10 @@ const outputSchema = {
     ),
   missingPackages: z
     .array(z.string())
+    .optional()
     .describe(
-      'LaTeX packages/classes the compile could not find, e.g. ["fontawesome"] — pulled out of the ' +
+      'Omitted from the result when empty — absent means []. ' +
+        'LaTeX packages/classes the compile could not find, e.g. ["fontawesome"] — pulled out of the ' +
         'log\'s "File `x.sty\' not found" errors so you do not have to parse them yourself. Only ' +
         '.sty/.cls names appear here: a missing image or .bbl is a problem with the document, not a ' +
         'missing package. Empty when nothing is missing.',
@@ -447,8 +478,10 @@ const outputSchema = {
     .describe('Path to the full compile log. POSIX (`/`-separated) on every OS.'),
   omittedSnippetLocations: z
     .number()
+    .optional()
     .describe(
-      'How many distinct error **locations** carry no `snippet` — over the 10-location cap, or ' +
+      'Omitted from the result when 0 — absent means 0. ' +
+        'How many distinct error **locations** carry no `snippet` — over the 10-location cap, or ' +
         'unreadable, or not named outright by the log, or contradicted by it, or naming a path ' +
         'that leaves the project through a symlink, or naming one past the ' +
         `${MAX_REPORTED_PATH_CHECKS}-file cap on resolving where the log’s paths lead (never ` +
@@ -926,34 +959,39 @@ export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<Ca
             (variant ? 'a variant build does not change the project' : 'the build failed');
         }
       }
-      const structuredContent = {
-        ...(defaultsApplied.length > 0 ? { defaultsApplied } : {}),
-        ...(resolvedComments !== undefined ? { resolvedComments } : {}),
-        success: outcome.success,
-        rootFile: root,
-        compiler: backend.kind,
-        pdfPath: outPdfPath,
-        pdfUrl,
-        pageCount,
-        durationSec: outcome.durationSec,
-        rebuilt: outcome.rebuilt,
-        pdfMtime: outcome.pdfMtime,
-        lockWaitSec,
-        lockHeldBy,
-        errors: diagnostics.errors,
-        warnings: diagnostics.warnings,
-        errorsOmittedByCap: diagnostics.errorsOmittedByCap,
-        warningsOmittedByCap: diagnostics.warningsOmittedByCap,
-        warningsOmitted,
-        missingPackages,
-        // The plan fitted a tail exactly when `rawLog` is off; otherwise this is the raw one.
-        logTail: diagnostics.logTail ?? logTail(outcome.log, RAW_TAIL_LINES),
-        logPath: outLogPath,
-        omittedSnippetLocations,
-        ...(diagnostics.note ? { note: diagnostics.note } : {}),
-        ...(variant ? { variant: variant.handle } : {}),
-        hint,
-      };
+      // What the model reads (Claude Code hands it structuredContent, not the text), so an
+      // empty list or a zero counter is left out rather than spelled — `omitEmpty`, against the
+      // fields the schema marks "absent means [] / 0".
+      const structuredContent = omitEmpty(
+        {
+          ...(defaultsApplied.length > 0 ? { defaultsApplied } : {}),
+          ...(resolvedComments !== undefined ? { resolvedComments } : {}),
+          success: outcome.success,
+          rootFile: root,
+          compiler: backend.kind,
+          pdfPath: outPdfPath,
+          pageCount,
+          durationSec: outcome.durationSec,
+          rebuilt: outcome.rebuilt,
+          pdfMtime: outcome.pdfMtime,
+          lockWaitSec,
+          lockHeldBy,
+          errors: diagnostics.errors,
+          warnings: diagnostics.warnings,
+          errorsOmittedByCap: diagnostics.errorsOmittedByCap,
+          warningsOmittedByCap: diagnostics.warningsOmittedByCap,
+          warningsOmitted,
+          missingPackages,
+          // The plan fitted a tail exactly when `rawLog` is off; otherwise this is the raw one.
+          logTail: diagnostics.logTail ?? logTail(outcome.log, RAW_TAIL_LINES),
+          logPath: outLogPath,
+          omittedSnippetLocations,
+          ...(diagnostics.note ? { note: diagnostics.note } : {}),
+          ...(variant ? { variant: variant.handle } : {}),
+          hint,
+        },
+        COMPILE_OMITTABLE,
+      );
       // Name the backend in the text too, not only structuredContent: which engine spoke
       // decides how to read what follows (tectonic attaches no snippets to anything), and the
       // client this rendering exists for is the one that cannot read structuredContent at all.

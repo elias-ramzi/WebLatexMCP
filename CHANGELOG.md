@@ -203,6 +203,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   then the project-specific conventions, then the writing guide; the 42,000-character concurrency
   guide is no longer inlined (the tools enforce it) and stays the `guide://latex/concurrency`
   resource.
+- **`compile` and `render_pages` results are smaller.** Claude Code hands the model a tool's
+  `structuredContent` as JSON, so every empty field was paid for on every call. `compile` leaves out
+  `errors`, `warnings`, `missingPackages` when empty and `errorsOmittedByCap`,
+  `warningsOmittedByCap`, `warningsOmitted`, `omittedSnippetLocations`, `lockWaitSec` when 0 (each
+  field's schema says absent means `[]`/`0`), and no longer sends `pdfUrl`, which repeated `pdfPath`
+  (the text still carries the link). `render_pages` drops `outDir` and each page's `bytes`, sends
+  `clamped` and `inlined` only when they say something (`true`/`false`), `skippedPages` only when
+  non-empty, and a one-line label provenance note instead of a paragraph.
+- **`render_pages` is for visual questions.** Its description and the instructions now say what an
+  image costs (up to ~1,600 tokens) and send text questions to `extract_text` / `locate_text`;
+  `maxEdgePx: 800` is named as the cheap layout glance.
 - **`compile`'s `logTail` is shorter.** A run of one repeated line (a font substitution reported a
   dozen times) is folded into one marked `(×N)`, and a warning removed by `warningsFilter` takes its
   `l.<n>` context line with it instead of leaving a column of bare `l.55`, `l.92`.
