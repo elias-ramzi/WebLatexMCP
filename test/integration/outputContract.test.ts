@@ -998,6 +998,32 @@ describe('output contract: the bibliography tools', () => {
     expect(swapped.hint).toBeTypeOf('string');
   });
 
+  it('search_references_batch publishes every key it returns, answered and failed', async () => {
+    const { client, ctx } = await localHarness();
+
+    // Unpinned with DBLP unreachable: both queries answered by Crossref, so the per-item
+    // substitution keys (`fallbackFrom`, `hint`) are populated.
+    ctx.references = stubbedReferences({ dblpDown: true });
+    const swapped = await auditCall(client, 'search_references_batch', {
+      queries: ['deep residual learning', 'residual networks he'],
+    });
+    expect(swapped).toMatchObject({ queries: 2, searched: 2, failed: 0, notRun: 0 });
+    const items = swapped.items as Array<Record<string, unknown>>;
+    expect(items[0]).toMatchObject({ status: 'ok', source: 'crossref', fallbackFrom: 'dblp' });
+    expect(items[0]!.hint).toBeTypeOf('string');
+    expect((items[0]!.results as unknown[]).length).toBeGreaterThan(0);
+
+    // Pinned to the unreachable backend: the query fails on its own, reported in `error`.
+    const failed = await auditCall(client, 'search_references_batch', {
+      queries: ['deep residual learning'],
+      source: 'dblp',
+    });
+    expect(failed).toMatchObject({ searched: 0, failed: 1 });
+    const failedItems = failed.items as Array<Record<string, unknown>>;
+    expect(failedItems[0]).toMatchObject({ status: 'error', results: [], resultsOmitted: 0 });
+    expect(failedItems[0]!.error).toBeTypeOf('string');
+  });
+
   /**
    * `add_citation` runs against a git-backed project on purpose: on a local one `changeDiff`
    * returns `''` by design, so the `diff` key would be audited empty — and `diff` is the field

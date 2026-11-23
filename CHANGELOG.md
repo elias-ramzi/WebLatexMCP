@@ -11,6 +11,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`search_references_batch`: many bibliography lookups in one call.** Up to 20 queries, run by
+  the server one at a time — a second apart, backing off 5 s → 10 s → 20 s after a failure, stopping
+  after three failures in a row or at a 45 s start deadline — with each query's outcome reported on
+  its own (`ok`, `error`, `notRun`). Checking a bibliography no longer costs one round trip per entry,
+  and the pacing the `verify-citations` skill asked of the model is now kept by the server. Hits are
+  budgeted across both channels, kept whole and in rank order (every query's top hit first), and
+  the cut is counted in `resultsOmitted`. `verify-citations` now uses it.
 - **A web UI: `web-latex-mcp ui`.** A page in the browser in three parts, built like cc-servers' UI:
   - at the left, your papers, in groups and with labels you set (drag to reorder or to move one
     into a group);

@@ -124,17 +124,26 @@ Run in order. Stop and report if a step fails.
    **Skip** any entry already carrying a `% verified-by-claude:` comment (see below) unless the user
    asks to re-check everything.
 
-5. **Match each entry against a bibliography service — one paper at a time, sequentially.** For each
-   entry, call `search_references` with a query built from the distinctive title words plus the first
-   author's surname (e.g. `deep residual learning he`), and leave `source` unset so the server tries
+5. **Match each entry against a bibliography service, in batches the server paces.** For each
+   entry, build a query from the distinctive title words plus the first author's surname (e.g.
+   `deep residual learning he`), and send up to 20 of them in one `search_references_batch` call
+   (`queries: [...]`, in list order). The server runs them one at a time with the spacing and
+   backoff described under _Pace bibliography-service requests_, and answers per query: `ok` with
+   its hits, `error` with the reason (a "couldn't check" — see below), or `notRun` when the batch
+   stopped early (`stopped`) — send exactly those again in the next batch, after waiting a minute if
+   it stopped on `failures`. If `resultsOmitted` is non-zero for an entry, its lower-ranked hits were
+   cut to keep the result deliverable; re-check that entry alone with `search_references` if the
+   kept hits don't settle it. A single `search_references` call is still right for one entry or a
+   re-check. Either way, leave `source` unset so the server tries
    DBLP, then Crossref, then OpenAlex on its own, substituting one that can't be reached. For a
    `prose` or `bibitem` entry whose `title` came back empty, build the query from `raw` — pick the
-   distinctive noun phrase and a surname yourself. Keep `maxResults` small (5–8). Note which backend
-   answered (`source` in the result — you need it for the report) and, if it substituted for one that
-   was unreachable, `fallbackFrom`/`hint`. Classify the result (see _Classifying a match_ and, for a
-   zero-hit answer or a failed call, _Handling "not found" vs. "couldn't check"_), then move to the
-   next entry. **Do not fan out parallel lookups** (see _Pace bibliography-service requests_ — all
-   three rate-limit hard). Process the whole list one entry at a time.
+   distinctive noun phrase and a surname yourself. Keep `maxResults` small (the batch defaults to 3;
+   5–8 at most). Note which backend answered each query (`source` — you need it for the report) and,
+   if it substituted for one that was unreachable, `fallbackFrom`/`hint`. Classify each result (see
+   _Classifying a match_ and, for a zero-hit answer or a failed query, _Handling "not found" vs.
+   "couldn't check"_). **Never run two batches, or a batch and other lookups, at the same time** (see
+   _Pace bibliography-service requests_ — all three services rate-limit hard): one batch, awaited,
+   then the next.
 
 6. **Triage, don't interrogate.** Entries that match confidently need no questions — just count them.
    Only entries with a discrepancy, no match, or a service that couldn't be reached get escalated to
@@ -231,9 +240,11 @@ waiting out cooldowns. This applies whether a given call lands on DBLP, Crossref
 server may substitute between them per entry, but your calling discipline stays the same. Lessons
 from real runs:
 
-- **Go strictly sequential: one `search_references` per entry, awaited before the next.** Paper-by-
-  paper is _more_ efficient here than asking for a batch all at once, because it never trips a
-  limiter.
+- **Let `search_references_batch` do the pacing.** It sends the lookups strictly one after another,
+  a second apart, backs off 5 s → 10 s → 20 s after a failure, and stops after three failures in a
+  row — the discipline below, kept by the server. Your part is to send batches one at a time,
+  never in parallel. Calling `search_references` by hand, go strictly sequential: one per entry,
+  awaited before the next.
 - **Don't burst.** Never issue lookups in parallel, and don't pre-fetch the whole list up front.
 - **On a `429` or a timeout, back off briefly and retry** — a few seconds, doubling if it repeats
   (e.g. 5s → 10s → 20s). That's enough; **don't sit on multi-minute fixed timers** between every call —

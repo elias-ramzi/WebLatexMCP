@@ -32,6 +32,7 @@ import { registerRevert } from './tools/revert.js';
 import { registerShelve, registerUnshelve, registerListShelves } from './tools/shelve.js';
 import { registerResetToRemote } from './tools/resetToRemote.js';
 import { registerSearchReferences } from './tools/searchReferences.js';
+import { registerSearchReferencesBatch } from './tools/searchReferencesBatch.js';
 import { registerAddCitation } from './tools/addCitation.js';
 import { registerListReferences } from './tools/listReferences.js';
 import { registerCheckCitations } from './tools/checkCitations.js';
@@ -134,6 +135,7 @@ export function createServer(
   registerListShelves(server, ctx);
   registerResetToRemote(server, ctx);
   registerSearchReferences(server, ctx);
+  registerSearchReferencesBatch(server, ctx);
   registerAddCitation(server, ctx);
   registerListReferences(server, ctx);
   registerCheckCitations(server, ctx);

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../context.js';
-import type { ReferenceHit } from '../services/referenceBackend.js';
+import { renderHit } from '../lib/referenceBatchBudget.js';
 import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
 import { errorResult } from '../lib/errors.js';
 
@@ -26,7 +26,7 @@ const SOURCE_OMIT_DEFAULT =
  * — so fixing only the tool description left the lie sitting in the schema, where a model reads
  * it while filling the call in. Both now come from `config`, so they cannot disagree.
  */
-function describeSourceField(config: AppContext['config'] | undefined): string {
+export function describeSourceField(config: AppContext['config'] | undefined): string {
   if (config?.referenceSourceInvalid) {
     return `${SOURCE_FIELD_HEAD} On THIS server you must pass it: WEB_LATEX_MCP_REFERENCE_SOURCE names no backend, so omitting it is REFUSED rather than falling back.`;
   }
@@ -61,7 +61,7 @@ function buildInputSchema(config: AppContext['config'] | undefined) {
   };
 }
 
-const hitSchema = z.object({
+export const hitSchema = z.object({
   key: z.string(),
   source: z.string(),
   title: z.string(),
@@ -100,7 +100,9 @@ const DESCRIPTION_HEAD =
   'add_citation to append the entry, fetched from the source rather than written by hand.';
 
 const DESCRIPTION_TAIL =
-  'These services rate-limit: call this one paper at a time, never in parallel bursts.';
+  'These services rate-limit: call this one paper at a time, never in parallel bursts. To look ' +
+  'up many papers (checking a whole bibliography), use search_references_batch, which paces the ' +
+  'lookups server-side.';
 
 /** What an unconfigured server does: the resolver owns the fallback order across the three. */
 const UNPINNED_CLAUSE =
@@ -125,7 +127,7 @@ const UNPINNED_CLAUSE =
  * which is what a server with nothing configured actually does, so the tolerance costs no
  * accuracy: the two non-default branches are reached only by a config that says so.
  */
-function describeSourceSelection(config: AppContext['config'] | undefined): string {
+export function describeSourceSelection(config: AppContext['config'] | undefined): string {
   if (!config) return UNPINNED_CLAUSE;
   const ids = REFERENCE_SOURCES.map((id) => `"${id}"`).join(', ');
   if (config.referenceSourceInvalid) {
@@ -156,12 +158,6 @@ function describeSourceSelection(config: AppContext['config'] | undefined): stri
   return UNPINNED_CLAUSE;
 }
 
-function formatHit(hit: ReferenceHit): string {
-  const authors = hit.authors.length ? hit.authors.join(', ') : 'unknown authors';
-  const where = [hit.venue, hit.year].filter(Boolean).join(' ');
-  return `• ${hit.title}\n  ${authors}${where ? ` — ${where}` : ''}\n  key: ${hit.key}`;
-}
-
 export function registerSearchReferences(server: McpServer, ctx: AppContext): void {
   server.registerTool(
     'search_references',
@@ -180,7 +176,7 @@ export function registerSearchReferences(server: McpServer, ctx: AppContext): vo
         const header = results.length
           ? `${results.length} result(s) for "${query}" from ${found.source}:`
           : `No results for "${query}" on ${found.source}.`;
-        const body = results.length ? `\n\n${results.map(formatHit).join('\n\n')}` : '';
+        const body = results.length ? `\n\n${results.map(renderHit).join('\n\n')}` : '';
         // The substitution is reported in the text channel too, not only in structuredContent:
         // a caller that reads only the text must still learn which bibliography answered.
         const note = found.note ? `\n\nNote: ${found.note}` : '';
