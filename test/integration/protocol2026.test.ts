@@ -105,6 +105,46 @@ describe('protocol 2026-07-28 through the daemon', () => {
     expect(isScopeOpen(workspace, 'writer')).toBe(false);
   });
 
+  it('answers a probe without opening a session, so a probe that vanishes holds no name', async () => {
+    const { daemon, connect } = await setup();
+    // What the SDK's stdio client does: probe through a sibling proxy (its own connection), then
+    // kill it, which on Windows sends no DELETE; then connect for real, asking for the same name.
+    const res = await fetch(daemon.url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+        'mcp-method': 'server/discover',
+        [HEADER_CONNECTION]: randomUUID(),
+        [HEADER_SESSION]: 'writer',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'server-discover-probe-1',
+        method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientInfo': { name: 'claude-code', version: '0.0.0' },
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        },
+      }),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    expect(text).toContain('supportedVersions');
+    expect(text).toContain('io.modelcontextprotocol/tasks');
+    expect(daemon.sessionIds()).toEqual([]);
+
+    const client = await connect({ [HEADER_CONNECTION]: randomUUID(), [HEADER_SESSION]: 'writer' });
+    const info = await client.callTool({ name: 'server_info', arguments: {} });
+    expect(info.structuredContent).toMatchObject({ sessionId: 'writer' });
+    expect(daemon.sessionIds()).toEqual(['writer']);
+  });
+
   it('keeps two connections apart, each in a session of its own', async () => {
     const { daemon, connect } = await setup();
     const a = await connect({ [HEADER_CONNECTION]: randomUUID() });

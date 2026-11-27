@@ -175,6 +175,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   writes a newline on each hold every 15 s, and the proxy opens a dropped hold again while the same
   server answers (which also keeps a session open on a server of the previous build).
 
+- **A client's protocol check no longer opens a session of its own on the shared server.** A
+  client on protocol 2026-07-28 first asks the server which protocol it speaks (`server/discover`),
+  and the server opened a whole session to answer. The check often comes from a process that is gone
+  a moment later (the MCP SDK's own client checks a stdio server through a second copy it then
+  kills), so that session lingered; with `WEB_LATEX_MCP_SESSION` set it held the name, and the real
+  session got `<name>-2` instead (on Windows, where the killed copy never says goodbye). Claude Code
+  may also make the check beside an old-style `initialize`, which left a second session behind. The
+  check is now answered without opening a session.
+
 - **An older session no longer asks a newer daemon to step aside.** After an in-place rebuild
   (`web-latex-mcp-dev-update`) and `daemon restart`, sessions opened before it reconnected with the
   old build's id, which differed only in the entry's mtime and was read as "newer" whichever way it

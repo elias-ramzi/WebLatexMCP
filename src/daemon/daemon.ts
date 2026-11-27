@@ -187,6 +187,16 @@ export function isModernMessage(body: unknown): boolean {
   return typeof claim === 'string' && claim >= MODERN_ERA_FIRST_REVISION;
 }
 
+/** Whether a parsed POST body is a `server/discover` request (the 2026 era probe). */
+export function isDiscoverRequest(body: unknown): boolean {
+  return (
+    body !== null &&
+    typeof body === 'object' &&
+    !Array.isArray(body) &&
+    (body as { method?: unknown }).method === 'server/discover'
+  );
+}
+
 /** The first protocol revision of the per-request era: revisions are ISO dates, so they sort. */
 const MODERN_ERA_FIRST_REVISION = '2026-07-28';
 
@@ -518,6 +528,64 @@ async function serve(
     if (s) void closeSession(s, 'ended by the client');
   };
 
+  /**
+   * A `server/discover` on a connection with no session yet: answered from a scope opened for it
+   * alone and closed at once, so a probe opens no session; the connection's session opens on its
+   * first other message. A probe often comes from a process that is gone a moment later: the SDK's
+   * client probes a stdio server through a sibling process it then kills (outright on Windows, so
+   * that proxy never sends its `DELETE`), and Claude Code may probe beside a 2025 `initialize` on
+   * one proxy. A session the probe opened outlived it holding the name the client asked for, and
+   * the client's real session got another (`modern-2`). The discover result is the same either
+   * way: instructions and capabilities depend on the daemon's guides, not on the session.
+   */
+  const serveDiscover = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: unknown,
+  ): Promise<void> => {
+    if (stopping) return sendRpcError(res, 503, 'The server is shutting down.');
+    try {
+      // Refused as the session would be, so the client falls back the same way.
+      parseSessionHeaders(req.headersDistinct, env);
+    } catch (err) {
+      if (err instanceof SessionHeaderError) return sendRpcError(res, 400, err.message);
+      throw err;
+    }
+    let done!: () => void;
+    const settled = new Promise<void>((r) => (done = r));
+    opening.add(settled);
+    try {
+      const guides = await loadSessionGuides(env, config.extraWritingGuidePath);
+      const scope = createSessionContext(shared, {
+        sessionId: uniqueSessionId(`probe-${randomBytes(4).toString('hex')}`, idTaken),
+      });
+      const mcp = createMcpHandler(
+        () =>
+          createServer(
+            scope.ctx,
+            guides.writingGuide,
+            guides.concurrencyGuide,
+            guides.skills,
+            guides.writingGuideHasExtra,
+          ),
+        {
+          legacy: 'reject',
+          maxRequestBodySize: maxBodyBytes,
+          onerror: (err) => log(`server/discover: ${err.message}`),
+        },
+      );
+      try {
+        await toNodeHandler(mcp, { maxRequestBodySize: maxBodyBytes })(req, res, body);
+      } finally {
+        await mcp.close().catch(() => {});
+        await scope.close();
+      }
+    } finally {
+      opening.delete(settled);
+      done();
+    }
+  };
+
   /** One 2026-07-28 message: to its connection's session, opened on its first message. */
   const serveModern = async (
     req: http.IncomingMessage,
@@ -544,6 +612,9 @@ async function serve(
       );
     }
     let s = connections.get(connection);
+    if (!s && !connecting.has(connection) && isDiscoverRequest(body)) {
+      return serveDiscover(req, res, body);
+    }
     if (!s) {
       let opened = connecting.get(connection);
       if (!opened) {

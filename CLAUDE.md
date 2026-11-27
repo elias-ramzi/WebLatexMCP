@@ -72,7 +72,11 @@ logic lives in services, unit-testable without an MCP client.
   `serveModern`, keyed by the connection id — `openModern` builds the scope as `openSession` does,
   served by `createMcpHandler` (a server per request, one handler per output shape). Such a session
   never idles while a `/hold` is open, closes on the connection `DELETE`, and reopens under the same
-  id (`connectionSessionIds`). No connection id → a 400 the client falls back from.
+  id (`connectionSessionIds`). No connection id → a 400 the client falls back from. **A probe opens
+  no session**: `server/discover` on a connection without one is answered from a throwaway scope
+  (`serveDiscover`), since the SDK's stdio client probes through a sibling process it kills (no
+  `DELETE` on Windows) and Claude Code may probe beside an `initialize`; a probe's session held the
+  requested name, and the real one became `<name>-2`.
 - `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else the
   proxy, else (daemon unreachable, or `--standalone`) `src/standalone.ts`, the stdio server itself:
   resolves auth (may hit the Keychain), builds the context and serves stdio through `serveStdio`
