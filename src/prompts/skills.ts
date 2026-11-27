@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { Skill, SkillProjectUse } from '../lib/skills.js';
 import { escapeInvisibleChars, quoteId } from '../lib/projectId.js';
 

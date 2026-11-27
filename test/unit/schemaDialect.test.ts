@@ -1,37 +1,43 @@
 /**
- * The advertised tool schemas must be acceptable to a JSON Schema 2020-12 validator AND to the
- * SDK's own draft-07 one, off a real `listTools()` round trip.
+ * The advertised tool schemas must be acceptable to a JSON Schema 2020-12 validator AND to a
+ * draft-07 one (an SDK v1 client's), off a real `listTools()` round trip.
  *
- * The SDK converts zod with no target, so every `inputSchema`/`outputSchema` it advertises carries
- * `"$schema": "http://json-schema.org/draft-07/schema#"`. The Claude desktop app's Code tab
- * validates with a 2020-12-only Ajv and refused every tool call ("unsupported dialect") before any
- * result came back. `stripSchemaDialect` drops the marker, which is only correct while the bodies
- * mean the same thing in both dialects — so this compiles every schema under both, strictly, and a
- * zod feature that emits a draft-specific keyword (`definitions`, array-form `items`) fails here
- * rather than in a client.
+ * SDK v1 converted zod with no target and stamped every schema
+ * `"$schema": "http://json-schema.org/draft-07/schema#"`, which the Claude desktop app's Code tab
+ * (a 2020-12-only Ajv) refused before any call came back; SDK v2 stamps 2020-12 instead, which a
+ * draft-07 Ajv cannot resolve. `dialectFree` drops the stamp at registration, which is only
+ * correct while the bodies mean the same thing in both dialects — so this compiles every schema
+ * under both, strictly, and a zod feature that emits a draft-specific keyword (`definitions`,
+ * array-form `items`, `prefixItems`) fails here rather than in a client.
  */
 import { describe, it, expect } from 'vitest';
 import { Ajv } from 'ajv';
 import { Ajv2020 } from 'ajv/dist/2020.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
-import { installOutputSchemaCompat, stripSchemaDialect } from '../../src/lib/outputSchemaCompat.js';
+import { dialectFree, stripsOutputSchema } from '../../src/lib/outputSchemaCompat.js';
+import type { StandardSchemaWithJSON } from '@modelcontextprotocol/server';
+import { z } from 'zod';
 import type { OutputSchemaMode } from '../../src/lib/outputSchemaCompat.js';
 import type { AppContext } from '../../src/context.js';
 
 const DRAFT_2020_12 = 'https://json-schema.org/draft/2020-12/schema';
 
-/**
- * `listTools()` through the same hook `src/standalone.ts` and the daemon install. The SDK `Client` compiles an Ajv
- * (draft-07) validator for every `outputSchema` inside `listTools()`, so a resolved call is itself
- * proof that an older SDK client still accepts what is advertised.
- */
+/** `listTools()` from a server built the way `src/standalone.ts` and the daemon build one. */
 async function listTools(mode: OutputSchemaMode, clientName = 'claude-code') {
-  const server = createServer({} as unknown as AppContext);
+  const server = createServer(
+    {} as unknown as AppContext,
+    undefined,
+    undefined,
+    [],
+    false,
+    undefined,
+    {
+      stripOutputSchema: stripsOutputSchema(mode, clientName),
+    },
+  );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  installOutputSchemaCompat(server, serverTransport, mode);
   const client = new Client({ name: clientName, version: '0.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   const { tools } = await client.listTools();
@@ -93,54 +99,28 @@ describe('advertised schema dialect', () => {
   });
 });
 
-describe('stripSchemaDialect', () => {
-  it('drops the root $schema of both schemas and nothing else', () => {
-    const msg = {
-      jsonrpc: '2.0',
-      id: 1,
-      result: {
-        tools: [
-          {
-            name: 'a',
-            inputSchema: {
-              $schema: 'x',
-              type: 'object',
-              properties: { $schema: { type: 'string' } },
-            },
-            outputSchema: { $schema: 'x', type: 'object' },
-          },
-          { name: 'b', inputSchema: { type: 'object' } },
-        ],
-      },
-    } as unknown as JSONRPCMessage;
-    stripSchemaDialect(msg);
-    expect(msg).toEqual({
-      jsonrpc: '2.0',
-      id: 1,
-      result: {
-        tools: [
-          {
-            name: 'a',
-            inputSchema: { type: 'object', properties: { $schema: { type: 'string' } } },
-            outputSchema: { type: 'object' },
-          },
-          { name: 'b', inputSchema: { type: 'object' } },
-        ],
-      },
-    });
+describe('dialectFree', () => {
+  const schema = z.object({ $schema: z.string(), n: z.number() });
+  const free = dialectFree(schema as unknown as StandardSchemaWithJSON);
+
+  it('drops only the root $schema of the converted document', () => {
+    const target = { target: 'draft-2020-12' } as const;
+    for (const io of ['input', 'output'] as const) {
+      const original = schema['~standard'].jsonSchema[io](target);
+      const shaped = free['~standard'].jsonSchema[io](target);
+      expect(original.$schema).toBeTypeOf('string');
+      const { $schema: _dropped, ...rest } = original;
+      expect(shaped).toEqual(rest);
+      // A property named `$schema` is the document's own business, kept.
+      expect((shaped.properties as Record<string, unknown>).$schema).toEqual({ type: 'string' });
+    }
   });
 
-  it('leaves messages without a tool list untouched', () => {
-    const msg = {
-      jsonrpc: '2.0',
-      id: 2,
-      result: { content: [], structuredContent: { $schema: 'x' } },
-    } as unknown as JSONRPCMessage;
-    stripSchemaDialect(msg);
-    expect(msg).toEqual({
-      jsonrpc: '2.0',
-      id: 2,
-      result: { content: [], structuredContent: { $schema: 'x' } },
-    });
+  it('validates exactly as the original schema does', async () => {
+    for (const value of [{ $schema: 'a', n: 1 }, { n: 'x' }, null]) {
+      expect(await free['~standard'].validate(value)).toEqual(
+        await schema['~standard'].validate(value),
+      );
+    }
   });
 });

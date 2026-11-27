@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 
 /**
  * The short compile report `edit_file`/`write_file` attach when called with `compile: true`.

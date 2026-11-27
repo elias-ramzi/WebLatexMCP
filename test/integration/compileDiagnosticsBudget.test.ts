@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
@@ -14,7 +14,7 @@ import { expectDeclaredField, expectNoUndeclaredKeys } from '../helpers/outputSc
 import { DIAGNOSTICS_CONTENT_BUDGET } from '../../src/lib/diagnosticsBudget.js';
 import type { CompileOutcome, CompileRequest } from '../../src/services/compiler.js';
 import type { ServerConfig } from '../../src/types.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 
 /**
  * `compile`'s diagnostics budget (issue #162), measured end to end on what a client actually

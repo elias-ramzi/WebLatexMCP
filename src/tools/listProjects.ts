@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, toPosixOut } from '../lib/paths.js';
@@ -167,7 +167,7 @@ export function registerListProjects(server: McpServer, ctx: AppContext): void {
             ? `\n${legacyWorkspaceNote(legacy, legacyCount, ctx.config.workspaceRoot)}`
             : '';
         return {
-          content: [{ type: 'text', text: text + legacyText }],
+          content: [{ type: 'text' as const, text: text + legacyText }],
           structuredContent: {
             projects,
             ...(legacy && legacyCount > 0 ? { legacyWorkspaceRoot: toPosix(legacy) } : {}),

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Readable, Writable } from 'node:stream';
 import { resolveWorkspace } from '../config.js';
 import { currentBuildId } from '../lib/buildId.js';
@@ -11,6 +12,7 @@ import {
   type FoundDaemon,
 } from './discovery.js';
 import { runRelay, type Endpoint } from './relay.js';
+import { HEADER_CONNECTION } from '../daemon/sessionHeaders.js';
 
 /**
  * `web-latex-mcp` with no command: the stdio proxy (docs/design/shared-server.md §9). Finds the
@@ -107,7 +109,12 @@ export async function runProxy(io: ProxyIo): Promise<ProxyOutcome> {
     await runRelay({
       stdin: io.stdin,
       stdout: io.stdout,
-      headers: sessionRequestHeaders(io.env, credentialNames, { replaceWhenIdle }),
+      // One connection id per proxy process: what names this client's session to a daemon that
+      // serves it protocol 2026-07-28, which has no session id of its own (#288).
+      headers: {
+        ...sessionRequestHeaders(io.env, credentialNames, { replaceWhenIdle }),
+        [HEADER_CONNECTION]: randomUUID(),
+      },
       endpoint: endpointOf(found),
       // After a loss: whatever answers now (another proxy may have restarted it), else start one.
       reconnect: async () => {

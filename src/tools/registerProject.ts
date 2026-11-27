@@ -2,7 +2,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { stat } from 'node:fs/promises';
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { toPosix, toPosixOut } from '../lib/paths.js';

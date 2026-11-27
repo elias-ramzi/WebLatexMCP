@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { REFERENCE_SOURCES } from '../lib/referenceKey.js';
 import { errorResult } from '../lib/errors.js';

@@ -1,5 +1,5 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { Client } from '@modelcontextprotocol/client';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { getServerVersion } from '../lib/version.js';
 import { credentialVarNames, daemonSpawnEnv, sessionRequestHeaders } from '../proxy/clientEnv.js';
 import { autostartDaemon, findDaemon, type FoundDaemon } from '../proxy/discovery.js';

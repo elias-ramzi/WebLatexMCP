@@ -51,8 +51,10 @@ logic lives in services, unit-testable without an MCP client.
   (`findDaemon`: pid + `/health` with token and nonce), applies `decideBuild` (build id = version +
   entry + mtime), auto-starts one (`autostartDaemon`, detached, env from `daemonSpawnEnv`: **no
   token or per-connection variable**), and relays stdio ↔ HTTP (`runRelay`, never parses payloads;
-  replays `initialize` once after a loss; watches stdin `end` itself, since the SDK's stdio
-  transport does not). Unreachable daemon → `runStandalone` (`src/standalone.ts`) with
+  replays `initialize` once after a loss; watches stdin `end` itself). Every request carries the
+  proxy's random connection id (`HEADER_CONNECTION`), and the relay holds `GET /hold` open and sends
+  a connection `DELETE` on its way out: that is how a 2026-07-28 client, which has no session id,
+  keeps one session on the daemon. Unreachable daemon → `runStandalone` (`src/standalone.ts`) with
   `daemonUnavailable`. `--standalone` / `WEB_LATEX_MCP_STANDALONE=1` skip the proxy.
 - `src/daemon/*` — `web-latex-mcp serve` (`startDaemon`): Streamable HTTP on `127.0.0.1`, one
   `SessionScope` + `McpServer` + transport per MCP session over one `createSharedServices`.
@@ -63,11 +65,18 @@ logic lives in services, unit-testable without an MCP client.
   `daemon.json` `0600` in a `0700` `.daemon/`, removed only by the daemon that wrote it. A closing
   session leaves the routing map first, drains running calls, then closes its scope. Per-connection
   headers are parsed in `sessionHeaders.ts` and refuse rather than rewrite. Guides load per session
-  (`loadSessionGuides`).
+  (`loadSessionGuides`). **Two eras** (#288): a 2025 session is keyed by `Mcp-Session-Id` and served by
+  one transport; a POST whose `_meta` envelope claims 2026-07-28 (`isModernMessage`) goes to
+  `serveModern`, keyed by the connection id — `openModern` builds the scope as `openSession` does,
+  served by `createMcpHandler` (a server per request, one handler per output shape). Such a session
+  never idles while a `/hold` is open, closes on the connection `DELETE`, and reopens under the same
+  id (`connectionSessionIds`). No connection id → a 400 the client falls back from.
 - `src/index.ts` — bootstrap: runs a CLI command and exits when given one (`src/cli.ts`), else the
   proxy, else (daemon unreachable, or `--standalone`) `src/standalone.ts`, the stdio server itself:
-  resolves auth (may hit the Keychain), builds the context and serves stdio. Both the standalone
-  server and `serve` set `GIT_TERMINAL_PROMPT=0` when unset.
+  resolves auth (may hit the Keychain), builds the context and serves stdio through `serveStdio`
+  (both eras; its factory may run once more than it keeps — the discarded `server/discover` probe —
+  so it builds a server and nothing else). Both the standalone server and `serve` set
+  `GIT_TERMINAL_PROMPT=0` when unset.
 - `src/server.ts` — `createServer(ctx)` registers every tool. **Add a new tool here.**
 - `src/context.ts` — `AppContext` dependency bag (`projectManager`, `git`, `files`, `compiler`,
   `references`, `shadows`, `sessions`, `shelves`, `credentials`, `pdfRenderer`, `viewer`, …), built
@@ -170,10 +179,19 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   `_INSTALL_KIND`, `_CALL_LOG`; the session recorder's stderr paths likewise. Never a bare template literal.
 - **Tool return shape.** `structuredContent` must be a fresh object literal (`{ ...result }`). Every
   catch uses `errorResult(err, ctx.credentials.allSecrets())` (`src/lib/errors.ts`).
+- **MCP SDK v2** (`@modelcontextprotocol/server`, `/client`, `/node`); v1 imports are lint-refused (v1
+  is still installed for the Agent SDK). Tool schemas and output are shaped **at registration**
+  (`installSchemaShaping`, `src/lib/outputSchemaCompat.ts`, first wrapper in `createServer`):
+  `dialectFree` drops the 2020-12 `$schema` stamp for every client, and `stripOutputSchema` (Claude
+  Desktop, `claude-ai`; `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`) builds a server with no `outputSchema` and no
+  `structuredContent`. The client is read where each entry builds its server (`clientNameIn`: stdio's
+  opening message via `watchInbound`, a daemon session's `initialize`, a 2026 request's envelope).
+  Never wrap a transport's `send`: v2's entries own their transports.
 - **Every key in `structuredContent` must be declared in `outputSchema`.** The server strips/ignores
   undeclared keys, but the SDK client validates with `additionalProperties: false` and returns
   `-32602` with **no result** (this broke `list_references` and `shelve`). Tests must assert off a
-  `listTools()` round trip (a client that never lists caches no validator) and audit the whole payload
+  `listTools()` round trip (the v2 client compiles each validator on the first `callTool` against the
+  cached `listTools()` entry, so a client that never lists validates nothing) and audit the whole payload
   with `expectNoUndeclaredKeys` (`test/helpers/outputSchema.ts`, judged on wire form). Adding a budget
   counter is the change most likely to break a tool.
 - **Nothing keyed by a document/user-supplied name is a plain object** (paths, BibTeX types, hosts,

@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
@@ -138,7 +138,6 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
       // Past the client's 60 s default: a cold biber run on a loaded CI machine can take that.
       const res = await client.callTool(
         { name: 'compile', arguments: { project: 'ovl', rootFile: 'paper/main.tex', ...args } },
-        undefined,
         { timeout: 240_000 },
       );
       const s = res.structuredContent as Compiled | undefined;
@@ -320,7 +319,6 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
           ],
         },
       },
-      undefined,
       { timeout: 240_000 },
     );
     expect(res.isError, JSON.stringify(res.content)).toBeFalsy();
@@ -408,7 +406,6 @@ describe.skipIf(!available)('compile with an overlay (real TeX)', () => {
           overlay: overlayFor('drafts/p1'),
         },
       },
-      undefined,
       { timeout: 240_000 },
     );
     const out = res.structuredContent as { success?: boolean; variant?: string } | undefined;
@@ -515,7 +512,6 @@ describe('an overlay build that writes the source anyway (real TeX)', () => {
             ],
           },
         },
-        undefined,
         { timeout: 240_000 },
       );
       const text = JSON.stringify(res.content);
@@ -561,7 +557,6 @@ describe('an overlay build that writes the source anyway (real TeX)', () => {
             ],
           },
         },
-        undefined,
         { timeout: 240_000 },
       );
       const text = JSON.stringify(res.content);

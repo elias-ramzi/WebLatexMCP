@@ -1,13 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { McpServer } from '@modelcontextprotocol/server';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
 import { createSessionProbe, installToolCallProbe } from '../../src/lib/sessionProbe.js';
 import type { SessionProbe } from '../../src/lib/sessionProbe.js';
 import type { AppContext } from '../../src/context.js';
+import { installSchemaShaping } from '../../src/lib/outputSchemaCompat.js';
 
 // Same stand-in as test/unit/server.test.ts: registration reads the bag lazily.
 const fakeCtx = {} as unknown as AppContext;
@@ -114,11 +115,15 @@ describe('installToolCallProbe', () => {
 });
 
 describe('createServer probe wiring', () => {
-  it('installs nothing at all when no probe is passed', () => {
-    // Inertness, stated as strongly as it can be: `registerTool` is still the prototype's own
-    // method, so there is no wrapper in the hot path to measure, fail, or write a line from.
+  it('installs nothing of its own when no probe is passed', () => {
+    // Inertness, stated as strongly as it can be: the only wrapper on `registerTool` is the schema
+    // shaping every server gets (src/lib/outputSchemaCompat.ts) — the same function a bare server
+    // gets from it — so there is no probe in the hot path to measure, fail, or write a line from.
     const server = createServer(fakeCtx);
-    expect(server.registerTool).toBe(McpServer.prototype.registerTool);
+    const shapedOnly = new McpServer({ name: 'bare', version: '0' });
+    installSchemaShaping(shapedOnly);
+    expect(String(server.registerTool)).toBe(String(shapedOnly.registerTool));
+    expect(server.registerTool).not.toBe(McpServer.prototype.registerTool);
   });
 
   it('wraps registerTool once a probe is passed', () => {

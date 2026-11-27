@@ -1449,7 +1449,7 @@ interface PendingGroupBox {
  *    ends up with a non-finite edge (`hasNonFiniteEdge`) — e.g. from a directly non-finite bbox
  *    arg — is dropped rather than emitted, since a zod `z.number()` in the tool schema rejects
  *    both and the MCP SDK's post-handler output validation would otherwise fail the *whole* call
- *    with an unscrubbed, un-caught `McpError`, discarding every other page's geometry with it.
+ *    with an unscrubbed, un-caught `ProtocolError`, discarding every other page's geometry with it.
  *    Keeping the last good CTM leaves every *later* box on the page measured against a transform
  *    the document did not ask for, finite and plausible and, until #80 §2, unflagged — which is
  *    exactly the "a rectangle in the wrong place reads like a measurement" failure this tool

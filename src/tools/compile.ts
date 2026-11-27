@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { applyCompileDefaults, warningsFilterSchema } from '../lib/compileDefaults.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 import { assertRegisteredRootExists, resolveRootFile } from '../lib/rootFile.js';
 import { toFileUrl, toPosix, toPosixOut } from '../lib/paths.js';
 import { surfaceCompiledPdf } from '../lib/pdfSurface.js';

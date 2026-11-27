@@ -16,6 +16,31 @@ export const HEADER_NO_OUTPUT_SCHEMA = 'x-web-latex-mcp-no-output-schema';
 export const HEADER_CLIENT_ENV = 'x-web-latex-mcp-client-env';
 /** `1`: the client runs a newer build; the daemon stops once its last session closes (§9.2). */
 export const HEADER_REPLACE_WHEN_IDLE = 'x-web-latex-mcp-replace-when-idle';
+/**
+ * The proxy's connection id: random, one per proxy process, sent on every request. Protocol
+ * revision 2026-07-28 has no `Mcp-Session-Id` (every request stands alone), so this is what ties
+ * a 2026 client's requests to one session scope on the daemon (#288). A 2025 session is keyed by
+ * its `Mcp-Session-Id` and ignores it.
+ */
+export const HEADER_CONNECTION = 'x-web-latex-mcp-connection';
+
+/** What a connection id must look like: what the proxy sends (a UUID), and nothing it would not. */
+const CONNECTION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+/**
+ * The connection id a request names, `undefined` when it names none, refused when it names one
+ * twice or one the proxy would never send.
+ */
+export function connectionIdOf(
+  headers: Record<string, string | string[] | undefined>,
+): string | undefined {
+  const id = one(headers, HEADER_CONNECTION);
+  if (id === undefined) return undefined;
+  if (!CONNECTION_ID.test(id)) {
+    throw new SessionHeaderError(`${HEADER_CONNECTION} is not a connection id.`);
+  }
+  return id;
+}
 
 /** Bounds on the credential overlay: a handful of variables, each a token. */
 export const MAX_CREDENTIALS = 32;

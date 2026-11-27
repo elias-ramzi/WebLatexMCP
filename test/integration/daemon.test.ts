@@ -3,8 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { access, mkdtemp, rm, writeFile, appendFile } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { Client } from '@modelcontextprotocol/client';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { simpleGit } from 'simple-git';
 import { createFakeRemote } from './helpers/bareRepo.js';
 import {
@@ -280,7 +280,6 @@ describe('the daemon', () => {
           name: 'edit_file',
           arguments: { path: REL, edits: [{ oldString: 'Alpha.', newString: 'A.' }] },
         },
-        undefined,
         { signal: abort.signal },
       )
       .catch(() => undefined);

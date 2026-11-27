@@ -3,8 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { findDaemon, shutdownDaemon, waitGone } from '../../src/proxy/discovery.js';
 
 /**
@@ -43,6 +43,8 @@ describe('the spawned proxy', { timeout: 90_000 }, () => {
   async function client(
     workspace: string,
     env: Record<string, string> = {},
+    /** `'auto'`: negotiate the era as Claude Code does, probing for 2026-07-28 first. */
+    negotiation?: 'auto',
   ): Promise<{ c: Client; transport: StdioClientTransport }> {
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -50,7 +52,10 @@ describe('the spawned proxy', { timeout: 90_000 }, () => {
       env: { ...hermeticEnv(), WEB_LATEX_MCP_WORKSPACE: workspace, ...env },
       stderr: 'pipe',
     });
-    const c = new Client({ name: 'spawned', version: '0.0.0' });
+    const c = new Client(
+      { name: 'spawned', version: '0.0.0' },
+      negotiation ? { versionNegotiation: { mode: negotiation } } : undefined,
+    );
     c.onerror = (err) => strayStdout.push(err);
     await c.connect(transport);
     cleanups.push(() => c.close());
@@ -130,4 +135,37 @@ describe('the spawned proxy', { timeout: 90_000 }, () => {
       expect(await info(again)).toMatchObject({ sessionId: 'alpha' });
     },
   );
+
+  describe('protocol revision 2026-07-28 (#288)', () => {
+    it('is served in-process to a client that negotiates it', async () => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-spawn-'));
+      cleanups.push(() => rm(workspace, { recursive: true, force: true }));
+      const { c } = await client(workspace, { WEB_LATEX_MCP_STANDALONE: '1' }, 'auto');
+      expect(c.getProtocolEra()).toBe('modern');
+      expect(await info(c)).toMatchObject({ mode: 'stdio' });
+    });
+
+    it('still serves a 2025 client in-process', async () => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-spawn-'));
+      cleanups.push(() => rm(workspace, { recursive: true, force: true }));
+      const { c } = await client(workspace, { WEB_LATEX_MCP_STANDALONE: '1' });
+      expect(c.getProtocolEra()).toBe('legacy');
+      expect(await info(c)).toMatchObject({ mode: 'stdio' });
+    });
+
+    it('is relayed to the shared server, and the session ends with the proxy', async () => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), 'wlm-spawn-'));
+      cleanups.push(() => rm(workspace, { recursive: true, force: true }));
+      cleanups.push(() => stopDaemonOf(workspace));
+      const { c } = await client(workspace, { WEB_LATEX_MCP_SESSION: 'modern' }, 'auto');
+      expect(c.getProtocolEra()).toBe('modern');
+      expect(await info(c)).toMatchObject({ mode: 'daemon', sessionId: 'modern' });
+      expect((await findDaemon(workspace))?.health.sessions).toBe(1);
+      await c.close();
+      // The proxy's DELETE ends the 2026 session on its way out.
+      await expect
+        .poll(async () => (await findDaemon(workspace))?.health.sessions, { timeout: 10_000 })
+        .toBe(0);
+    });
+  });
 });

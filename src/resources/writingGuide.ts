@@ -1,4 +1,4 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 
 /** URI under which the LaTeX writing guide is exposed as an MCP resource. */
 export const WRITING_GUIDE_URI = 'guide://latex/writing-guide';

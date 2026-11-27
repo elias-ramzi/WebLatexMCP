@@ -1,4 +1,4 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 
 /** URI under which the concurrency / safe-push guide is exposed as an MCP resource. */
 export const CONCURRENCY_GUIDE_URI = 'guide://latex/concurrency';

@@ -684,9 +684,20 @@ only, leaving structured output fully intact for clients that support it (e.g. C
 ```
 
 Separately, and for every client and every mode, the advertised `inputSchema`/`outputSchema` carry no
-`$schema` key. The MCP SDK stamps a draft-07 marker on them, which a client validating as JSON Schema
-2020-12 (the Claude desktop app's Code tab) refuses as an "unsupported dialect". MCP reads a schema
-without `$schema` as 2020-12. The schema bodies mean the same thing under draft-07 and 2020-12.
+`$schema` key. The MCP SDK stamps a dialect on them (2020-12 today, draft-07 before), and each stamp
+shuts out the other dialect's validators: a client validating as 2020-12 only (the Claude desktop
+app's Code tab) refused the draft-07 one as an "unsupported dialect", and a client built on SDK v1
+validates with draft-07. MCP reads a schema without `$schema` as 2020-12, and the schema bodies mean
+the same thing under draft-07 and 2020-12.
+
+## Protocol revisions
+
+The server speaks both MCP protocol eras, whichever the client asks for: **2026-07-28**, which Claude
+Code negotiates when the server offers it (no `initialize` handshake; each request carries its own
+version and client), and the **2025** revisions (2025-11-25 and earlier) every other client uses.
+Nothing needs configuring: the server answers a client's opening message in the client's era, both
+in-process (`--standalone`) and through the shared server, whose proxy keeps one session per client
+in either era.
 
 ## Session identity probe
 

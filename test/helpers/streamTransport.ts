@@ -1,7 +1,7 @@
 import { PassThrough } from 'node:stream';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import type { Transport } from '@modelcontextprotocol/server';
+import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/server';
+import type { JSONRPCMessage } from '@modelcontextprotocol/server';
 
 /**
  * A client transport speaking newline-delimited JSON-RPC over two streams — what an MCP client

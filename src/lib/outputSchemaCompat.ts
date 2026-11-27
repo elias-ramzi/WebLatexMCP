@@ -1,30 +1,33 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import type { McpServer, StandardSchemaWithJSON } from '@modelcontextprotocol/server';
+import { CLIENT_INFO_META_KEY } from '@modelcontextprotocol/server';
 
 /**
- * Client-compatibility shim for `outputSchema`.
+ * How tool schemas and results are shaped for the client, decided when a server is built.
  *
- * Some MCP clients — observed with **Claude Desktop** (which identifies as `clientInfo.name`
- * `"claude-ai"`) — silently fail to dispatch tool calls to a server whose tools advertise an
- * `outputSchema`: the tool list loads, but every call fails with a generic error and never reaches
- * the server. This module strips `outputSchema` (from `tools/list`) and `structuredContent` (from
- * tool-call results) on the way out for affected clients, so they work — while leaving structured
- * output fully intact for clients that support it (e.g. Claude Code).
+ * **`outputSchema` for clients that choke on it.** Some MCP clients — observed with **Claude
+ * Desktop** (which identifies as `clientInfo.name` `"claude-ai"`) — silently fail to dispatch tool
+ * calls to a server whose tools advertise an `outputSchema`: the tool list loads, but every call
+ * fails with a generic error and never reaches the server. For such a client the server is built
+ * without `outputSchema` and its results without `structuredContent`; every other client (Claude
+ * Code) gets structured output in full.
  *
- * The strip happens at the transport boundary (post-serialization shaping), so the server stays
- * spec-compliant internally and the decision can be made per-connection from the negotiated client.
+ * **No `$schema` dialect, for every client.** SDK v2 converts zod to JSON Schema 2020-12 and stamps
+ * `"$schema": "https://json-schema.org/draft/2020-12/schema"` on every schema (SDK v1 stamped
+ * draft-07). Each stamp shuts out the validators of the other dialect: a 2020-12-only Ajv (the
+ * Claude desktop app's Code tab) refused v1's draft-07, and an SDK v1 client — many third-party
+ * hosts — compiles output validators with a draft-07 Ajv that cannot resolve the 2020-12
+ * meta-schema. MCP reads a schema without `$schema` as 2020-12, and the bodies zod emits here are
+ * dialect-neutral (no `definitions`, no array-form `items`), so dropping the stamp serves both.
+ * `test/unit/schemaDialect.test.ts` compiles every advertised schema under both dialects, which is
+ * what keeps "dialect-neutral" true as the schemas grow.
  *
- * Separately, and for **every** client, the same hook drops the root `$schema` of each advertised
- * `inputSchema`/`outputSchema` (`stripSchemaDialect`). The SDK (1.29 through 1.32.2) converts zod
- * with no target, which falls back to draft-07 and stamps
- * `"$schema": "http://json-schema.org/draft-07/schema#"` on every schema; a client validating with a
- * 2020-12-only Ajv (the Claude desktop app's Code tab) refuses such a schema outright — "unsupported
- * dialect" — and no call reaches the server. MCP reads a schema without `$schema` as 2020-12, and the
- * bodies zod emits here are dialect-neutral (no `definitions`, no array-form `items`), so the SDK's own
- * draft-07 `Client` compiles them unchanged. Stamping 2020-12 instead would trade one client's refusal
- * for another's. `test/unit/schemaDialect.test.ts` compiles every advertised schema under both
- * dialects, which is what keeps "dialect-neutral" true as the schemas grow.
+ * Both are applied at registration ({@link installSchemaShaping}, installed by `createServer`
+ * before any tool), never on the wire: SDK v2's serving entries (`serveStdio`, `createMcpHandler`)
+ * own their transports, and a 2026-07-28 request carries its client's identity in its own `_meta`
+ * envelope rather than in a connection-wide `initialize`. So the client is read where each entry
+ * builds its server — the stdio opening message, a daemon session's `initialize`, a 2026-era
+ * request's envelope ({@link clientNameIn}) — and the server is built for it.
  */
 
 /** `clientInfo.name` values known to choke on `outputSchema`. */
@@ -48,63 +51,144 @@ export function outputSchemaMode(env: NodeJS.ProcessEnv = process.env): OutputSc
   return /^(0|false|no|off)$/i.test(v.trim()) ? 'never' : 'always';
 }
 
+/** Whether a server built for `clientName` under `mode` leaves out `outputSchema`. */
+export function stripsOutputSchema(
+  mode: OutputSchemaMode,
+  clientName: string | undefined,
+): boolean {
+  return mode === 'always' || (mode === 'auto' && isIncompatibleClient(clientName));
+}
+
+const nameOf = (info: unknown): string | undefined => {
+  if (info === null || typeof info !== 'object') return undefined;
+  const name = (info as { name?: unknown }).name;
+  return typeof name === 'string' ? name : undefined;
+};
+
 /**
- * Strip `outputSchema` from an outgoing `tools/list` result and `structuredContent` from a tool-call
- * result, mutating the message in place. Other messages are left untouched.
+ * The client's self-reported name in one inbound JSON-RPC message: `params.clientInfo` of a 2025
+ * `initialize`, or the `io.modelcontextprotocol/clientInfo` key of a 2026-07-28 request's `_meta`
+ * envelope. `undefined` when the message names no client (most 2025 messages; any notification).
+ * Self-reported, so used only to choose a compatible shape, never to grant anything.
  */
-export function stripOutputSchema(message: JSONRPCMessage): void {
-  if (!('result' in message) || typeof message.result !== 'object' || message.result === null)
-    return;
-  const result = message.result as Record<string, unknown>;
-  if (Array.isArray(result.tools)) {
-    for (const tool of result.tools) {
-      if (tool && typeof tool === 'object') {
-        delete (tool as Record<string, unknown>).outputSchema;
-      }
-    }
+export function clientNameIn(message: unknown): string | undefined {
+  if (message === null || typeof message !== 'object') return undefined;
+  const params = (message as { params?: unknown }).params;
+  if (params === null || typeof params !== 'object') return undefined;
+  const { method } = message as { method?: unknown };
+  if (method === 'initialize') {
+    const name = nameOf((params as { clientInfo?: unknown }).clientInfo);
+    if (name !== undefined) return name;
   }
-  if ('structuredContent' in result) {
-    delete result.structuredContent;
-  }
+  const meta = (params as { _meta?: unknown })._meta;
+  if (meta === null || typeof meta !== 'object') return undefined;
+  return nameOf((meta as Record<string, unknown>)[CLIENT_INFO_META_KEY]);
 }
 
 /**
- * Drop the root `$schema` from every tool's `inputSchema` and `outputSchema` in an outgoing
- * `tools/list` result, mutating the message in place (see the module comment for why). Other
- * messages are left untouched.
+ * Call `see` with every message `transport` delivers, before whoever set `transport.onmessage`
+ * gets it — so a serving entry that owns the transport (`serveStdio`) can still be watched for the
+ * client's name ({@link clientNameIn}) ahead of building the server for it. `see` must not throw.
  */
-export function stripSchemaDialect(message: JSONRPCMessage): void {
-  if (!('result' in message) || typeof message.result !== 'object' || message.result === null)
-    return;
-  const tools = (message.result as Record<string, unknown>).tools;
-  if (!Array.isArray(tools)) return;
-  for (const tool of tools) {
-    if (!tool || typeof tool !== 'object') continue;
-    for (const key of ['inputSchema', 'outputSchema']) {
-      const schema = (tool as Record<string, unknown>)[key];
-      if (schema && typeof schema === 'object') delete (schema as Record<string, unknown>).$schema;
-    }
-  }
-}
-
-/**
- * Wrap `transport.send` so outgoing tool schemas/results are shaped for the client. The `$schema`
- * strip applies in every mode, `never` included. Whether `outputSchema`/`structuredContent` are
- * also stripped is decided per message in `auto` mode from the negotiated `clientInfo` (available
- * once the client has initialized, which is always before it requests `tools/list`).
- */
-export function installOutputSchemaCompat(
-  server: McpServer,
-  transport: Transport,
-  mode: OutputSchemaMode = outputSchemaMode(),
+export function watchInbound(
+  transport: { onmessage?: (message: never, extra?: never) => void },
+  see: (message: unknown) => void,
 ): void {
-  const origSend = transport.send.bind(transport);
-  transport.send = (message, options) => {
-    stripSchemaDialect(message);
-    const strip =
-      mode === 'always' ||
-      (mode === 'auto' && isIncompatibleClient(server.server.getClientVersion()?.name));
-    if (strip) stripOutputSchema(message);
-    return origSend(message, options);
+  type Handler = (message: unknown, extra?: unknown) => void;
+  let handler = transport.onmessage as Handler | undefined;
+  Object.defineProperty(transport, 'onmessage', {
+    configurable: true,
+    enumerable: true,
+    get: (): Handler | undefined =>
+      handler === undefined
+        ? undefined
+        : (message, extra) => {
+            try {
+              see(message);
+            } catch {
+              /* watching never drops a message */
+            }
+            handler!(message, extra);
+          },
+    set: (next: Handler | undefined) => {
+      handler = next;
+    },
+  });
+}
+
+/**
+ * The same schema, minus the root `$schema` of the JSON Schema the SDK converts it to: validation
+ * is the original schema's own (`~standard.validate`), only the advertised document changes.
+ */
+export function dialectFree(schema: StandardSchemaWithJSON): StandardSchemaWithJSON {
+  const std = schema['~standard'];
+  const drop = (json: Record<string, unknown>): Record<string, unknown> => {
+    const { $schema: _dialect, ...rest } = json;
+    return rest;
+  };
+  return {
+    '~standard': {
+      ...std,
+      jsonSchema: {
+        input: (options) => drop(std.jsonSchema.input(options)),
+        output: (options) => drop(std.jsonSchema.output(options)),
+      },
+    },
+  } as StandardSchemaWithJSON;
+}
+
+/** A tool's `inputSchema`/`outputSchema` as registered here: a raw zod shape or a schema. */
+function asSchema(value: unknown): StandardSchemaWithJSON {
+  if (value !== null && typeof value === 'object' && '~standard' in value) {
+    return value as StandardSchemaWithJSON;
+  }
+  return z.object(value as z.ZodRawShape) as unknown as StandardSchemaWithJSON;
+}
+
+/** The loose shape of `McpServer.registerTool` the wrapper needs (it is heavily overloaded). */
+type AnyRegisterTool = (
+  name: string,
+  config: unknown,
+  cb: (...cbArgs: unknown[]) => unknown,
+) => unknown;
+
+/** A tool result with `structuredContent` left out; any other value is returned as it is. */
+function withoutStructuredContent(result: unknown): unknown {
+  if (result === null || typeof result !== 'object' || !('structuredContent' in result)) {
+    return result;
+  }
+  const { structuredContent: _omitted, ...rest } = result as Record<string, unknown>;
+  return rest;
+}
+
+/**
+ * Wrap `server.registerTool` so every tool registered afterwards advertises dialect-free schemas
+ * and, with `stripOutputSchema`, no `outputSchema` and no `structuredContent`. Install it before
+ * the registrations (`createServer` does); tools registered earlier are not shaped.
+ */
+export function installSchemaShaping(
+  server: McpServer,
+  opts: { stripOutputSchema?: boolean } = {},
+): void {
+  const target = server as unknown as { registerTool: AnyRegisterTool };
+  const original = target.registerTool.bind(server);
+  const strip = opts.stripOutputSchema === true;
+  target.registerTool = (name, config, cb) => {
+    const shaped = { ...(config as Record<string, unknown>) };
+    if (shaped.inputSchema !== undefined)
+      shaped.inputSchema = dialectFree(asSchema(shaped.inputSchema));
+    if (strip) delete shaped.outputSchema;
+    else if (shaped.outputSchema !== undefined) {
+      shaped.outputSchema = dialectFree(asSchema(shaped.outputSchema));
+    }
+    const callback = strip
+      ? (...cbArgs: unknown[]): unknown => {
+          const result = cb(...cbArgs);
+          return result instanceof Promise
+            ? result.then(withoutStructuredContent)
+            : withoutStructuredContent(result);
+        }
+      : cb;
+    return original(name, shaped, callback);
   };
 }

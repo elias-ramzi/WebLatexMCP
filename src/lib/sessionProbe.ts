@@ -1,4 +1,4 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import { redact } from './redact.js';
 
 /**
@@ -209,15 +209,20 @@ export function createSessionProbe(opts: SessionProbeOptions = {}): SessionProbe
 /**
  * Pull `_meta` off the last argument of an `McpServer` tool callback.
  *
- * The SDK calls a tool callback as `(args, extra)` when the tool declares an `inputSchema` and as
- * `(extra)` when it does not, so the `RequestHandlerExtra` is the LAST argument either way — and
- * `extra._meta` is assigned straight from the request's `params._meta` (`shared/protocol.js`), so
- * this reads exactly what the client sent and exactly what the #18 refactor would later consume.
+ * The SDK calls a tool callback as `(args, ctx)` when the tool declares an `inputSchema` and as
+ * `(ctx)` when it does not, so the handler context is the LAST argument either way. SDK v2 carries
+ * the request's `params._meta` at `ctx.mcpReq._meta` (with the reserved `io.modelcontextprotocol/*`
+ * envelope keys lifted out to `ctx.mcpReq.envelope`); v1's `extra._meta` is still read, so a
+ * hand-built context in a test keeps working.
  */
 export function extraMeta(cbArgs: readonly unknown[]): unknown {
-  const extra = cbArgs.length > 0 ? cbArgs[cbArgs.length - 1] : undefined;
-  if (extra === null || typeof extra !== 'object') return undefined;
-  return (extra as { _meta?: unknown })._meta;
+  const ctx = cbArgs.length > 0 ? cbArgs[cbArgs.length - 1] : undefined;
+  if (ctx === null || typeof ctx !== 'object') return undefined;
+  const mcpReq = (ctx as { mcpReq?: unknown }).mcpReq;
+  if (mcpReq !== null && typeof mcpReq === 'object' && '_meta' in mcpReq) {
+    return (mcpReq as { _meta?: unknown })._meta;
+  }
+  return (ctx as { _meta?: unknown })._meta;
 }
 
 /**

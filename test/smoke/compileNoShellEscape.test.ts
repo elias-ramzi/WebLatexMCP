@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
@@ -63,9 +63,12 @@ describe.skipIf(!available)('a plain compile runs no shell command (#213)', () =
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     cleanups.push(() => client.close());
 
-    const res = await client.callTool({ name: 'compile', arguments: {} }, undefined, {
-      timeout: 240_000,
-    });
+    const res = await client.callTool(
+      { name: 'compile', arguments: {} },
+      {
+        timeout: 240_000,
+      },
+    );
     expect(res.isError, JSON.stringify(res.content)).toBeFalsy();
     const out = res.structuredContent as { success: boolean; hint?: string; logPath?: string };
     // The source first: it is the promise.

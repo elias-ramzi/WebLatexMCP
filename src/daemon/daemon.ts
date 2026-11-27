@@ -1,8 +1,15 @@
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  NodeStreamableHTTPServerTransport as StreamableHTTPServerTransport,
+  toNodeHandler,
+} from '@modelcontextprotocol/node';
+import type { McpServer } from '@modelcontextprotocol/server';
+import {
+  PROTOCOL_VERSION_META_KEY,
+  createMcpHandler,
+  isInitializeRequest,
+} from '@modelcontextprotocol/server';
 import { createServer } from '../server.js';
 import {
   createSessionContext,
@@ -12,7 +19,11 @@ import {
 } from '../context.js';
 import { processNonce, withFileLock, LockTimeoutError } from '../lib/fileLock.js';
 import { isScopeOpen } from '../lib/openScopes.js';
-import { installOutputSchemaCompat } from '../lib/outputSchemaCompat.js';
+import {
+  clientNameIn,
+  stripsOutputSchema,
+  type OutputSchemaMode,
+} from '../lib/outputSchemaCompat.js';
 import { loadSessionGuides } from '../lib/sessionGuides.js';
 import { quoteId } from '../lib/projectId.js';
 import { getServerVersion } from '../lib/version.js';
@@ -29,7 +40,13 @@ import {
   writeDaemonInfo,
   type DaemonInfo,
 } from './daemonFiles.js';
-import { SessionHeaderError, parseSessionHeaders, uniqueSessionId } from './sessionHeaders.js';
+import {
+  HEADER_CONNECTION,
+  SessionHeaderError,
+  connectionIdOf,
+  parseSessionHeaders,
+  uniqueSessionId,
+} from './sessionHeaders.js';
 
 /**
  * `web-latex-mcp serve`: one MCP server over Streamable HTTP for every session on a workspace
@@ -106,18 +123,63 @@ export interface RunningDaemon {
   stopped: Promise<void>;
 }
 
+/**
+ * One MCP session: one `SessionScope`, served either in the 2025 era (one `McpServer` over one
+ * sessionful transport, keyed by `Mcp-Session-Id`) or in the 2026-07-28 era (`modern`: a handler
+ * that builds a server per request, keyed by the proxy's connection id, since that revision has no
+ * protocol session at all).
+ */
 interface Session {
   sessionId: string;
   scope: SessionScope;
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  /** Open GET (SSE) streams; a session with one is never idle. */
+  /** 2025 era: the session's server and its transport. */
+  server?: McpServer;
+  transport?: StreamableHTTPServerTransport;
+  /** 2026-07-28: what serves the connection's requests (`openModern`). */
+  modern?: ModernServing;
+  /**
+   * Open streams: a 2025 session's GET (SSE) streams, or a 2026 connection's holds (`GET /hold`,
+   * the proxy's stand-in for that GET stream). A session with one is never idle.
+   */
   openStreams: number;
   /** Whether the client ever held a stream open: one that drops all of them has likely gone. */
   hadStream: boolean;
+  /** 2026-07-28 requests still being answered (a 2025 session's are its transport's business). */
+  inflight: number;
   idleTimer?: NodeJS.Timeout;
   closing?: Promise<void>;
 }
+
+/** How a 2026-07-28 connection is served: one handler per output shape, built on first use. */
+interface ModernServing {
+  connection: string;
+  outputSchema: OutputSchemaMode;
+  serve: (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: unknown,
+    stripOutputSchema: boolean,
+  ) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+/**
+ * Whether a parsed POST body is a 2026-07-28 message: its `_meta` envelope claims a protocol
+ * revision of that era. A 2025 client never sends the claim (the `io.modelcontextprotocol/` prefix
+ * is reserved in 2025-11-25 too), so everything else is 2025 traffic, as `isLegacyRequest` decides.
+ */
+export function isModernMessage(body: unknown): boolean {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return false;
+  const params = (body as { params?: unknown }).params;
+  if (params === null || typeof params !== 'object') return false;
+  const meta = (params as { _meta?: unknown })._meta;
+  if (meta === null || typeof meta !== 'object') return false;
+  const claim = (meta as Record<string, unknown>)[PROTOCOL_VERSION_META_KEY];
+  return typeof claim === 'string' && claim >= MODERN_ERA_FIRST_REVISION;
+}
+
+/** The first protocol revision of the per-request era: revisions are ISO dates, so they sort. */
+const MODERN_ERA_FIRST_REVISION = '2026-07-28';
 
 export class DaemonAlreadyRunningError extends Error {
   constructor(workspaceRoot: string, holder: string) {
@@ -195,8 +257,23 @@ async function serve(
     opts.registry,
   );
 
-  /** By transport session id (the `Mcp-Session-Id` header). */
+  /** 2025-era sessions, by transport session id (the `Mcp-Session-Id` header). */
   const sessions = new Map<string, Session>();
+  /** 2026-07-28 sessions, by the proxy's connection id (`HEADER_CONNECTION`). */
+  const connections = new Map<string, Session>();
+  /** 2026 sessions being opened, so two first requests of one connection open one session. */
+  const connecting = new Map<string, Promise<Session | undefined>>();
+  /** Holds (`GET /hold`) open per connection, counted before its session exists too. */
+  const holds = new Map<string, number>();
+  /**
+   * The session id each 2026 connection was given, kept until the proxy ends it (`DELETE`): a
+   * session closed for idleness reopens under the same id, so its shadow and the ownership of its
+   * edits survive, as a 2025 session's do across a daemon restart.
+   */
+  const connectionSessionIds = new Map<string, string>();
+  const openSessions = (): Session[] => [
+    ...new Set([...sessions.values(), ...connections.values()]),
+  ];
   /** Session ids (case-folded) handed out to an `initialize` still being set up. */
   const reserved = new Set<string>();
   /** Initializes still being set up, which `stop` waits for before closing every session. */
@@ -219,13 +296,13 @@ async function serve(
   const fold = (id: string): string => id.toLowerCase();
   const idTaken = (id: string): boolean =>
     reserved.has(fold(id)) ||
-    [...sessions.values()].some((s) => fold(s.sessionId) === fold(id)) ||
+    openSessions().some((s) => fold(s.sessionId) === fold(id)) ||
     isScopeOpen(config.workspaceRoot, id);
 
   const scheduleIdleExit = (): void => {
     clearTimeout(idleExitTimer);
     idleExitTimer = undefined;
-    if (stopping || sessions.size > 0 || reserved.size > 0) return;
+    if (stopping || openSessions().length > 0 || reserved.size > 0) return;
     if (replaceRequested && !opts.keepAlive) {
       void stop('a newer build asked to replace this one');
       return;
@@ -243,7 +320,7 @@ async function serve(
     const wait =
       s.hadStream && s.openStreams === 0 ? Math.min(streamLossMs, sessionIdleMs) : sessionIdleMs;
     s.idleTimer = setTimeout(() => {
-      if (s.openStreams > 0 || s.scope.ctx.projectManager.isBusy()) armIdle(s);
+      if (s.openStreams > 0 || s.inflight > 0 || s.scope.ctx.projectManager.isBusy()) armIdle(s);
       else void closeSession(s, 'idle');
     }, wait);
     s.idleTimer.unref?.();
@@ -257,6 +334,7 @@ async function serve(
       // so their writes land while the scope is still open — a write after close would re-create
       // a record peers in this process read dead (§5.3).
       for (const [key, value] of sessions) if (value === s) sessions.delete(key);
+      for (const [key, value] of connections) if (value === s) connections.delete(key);
       // Every write runs inside `runExclusive`, which keeps running when the client cancels or
       // the transport aborts the call; so wait for those, not for responses.
       let capTimer: NodeJS.Timeout | undefined;
@@ -267,7 +345,8 @@ async function serve(
       ]);
       clearTimeout(capTimer);
       await s.scope.close();
-      await s.server.close().catch(() => {});
+      await s.server?.close().catch(() => {});
+      await s.modern?.close().catch(() => {});
       log(`session ${quoteId(s.sessionId)} closed (${reason})`);
       scheduleIdleExit();
     })();
@@ -304,20 +383,21 @@ async function serve(
         processNonce,
         pid: process.pid,
         buildId,
-        sessions: sessions.size,
+        sessions: openSessions().length,
         keepAlive: opts.keepAlive === true,
         replaceRequested,
       });
     }
     if (url.pathname === '/shutdown' && req.method === 'POST') {
       // A proxy stops an older daemon only when nobody uses it (§9.2); `?force=1` is the shell's.
-      if (sessions.size + reserved.size > 0 && url.searchParams.get('force') !== '1') {
-        return sendJson(res, 409, { error: 'Sessions are open', sessions: sessions.size });
+      if (openSessions().length + reserved.size > 0 && url.searchParams.get('force') !== '1') {
+        return sendJson(res, 409, { error: 'Sessions are open', sessions: openSessions().length });
       }
       sendJson(res, 200, { stopping: true });
       void stop('shutdown requested');
       return;
     }
+    if (url.pathname === '/hold' && req.method === 'GET') return holdConnection(req, res);
     if (url.pathname !== '/mcp') return sendJson(res, 404, { error: 'Not found' });
     if (stopping) return sendRpcError(res, 503, 'The server is shutting down.');
 
@@ -347,12 +427,246 @@ async function serve(
           armIdle(s);
         });
       }
-      return s.transport.handleRequest(req, res, body);
+      return s.transport!.handleRequest(req, res, body);
     }
+    // Protocol revision 2026-07-28: no session id at all, the era claimed in each message's own
+    // `_meta` envelope, the session named by the proxy's connection id (#288).
+    if (req.method === 'POST' && isModernMessage(body)) return serveModern(req, res, body);
+    if (req.method === 'DELETE') return endConnection(req, res);
     if (req.method !== 'POST' || !isInitializeRequest(body)) {
       return sendRpcError(res, 400, 'Bad request: no valid session id, and not an initialize.');
     }
     await openSession(req, res, body);
+  };
+
+  /** The connection id a request names; answers the request itself (and is `null`) when bad. */
+  const connectionOf = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): string | undefined | null => {
+    try {
+      return connectionIdOf(req.headersDistinct);
+    } catch (err) {
+      if (!(err instanceof SessionHeaderError)) throw err;
+      sendRpcError(res, 400, err.message);
+      return null;
+    }
+  };
+
+  /**
+   * `GET /hold`: the proxy holds this open for as long as it runs, naming its connection — the
+   * 2026 stand-in for the 2025 GET stream, which that revision dropped. A connection's 2026
+   * session is never idle while a hold is open, and closes `streamLossMs` after its last one goes
+   * (a proxy killed without a `DELETE`). Nothing is ever written to it.
+   */
+  const holdConnection = (req: http.IncomingMessage, res: http.ServerResponse): void => {
+    const connection = connectionOf(req, res);
+    if (connection === null) return;
+    if (connection === undefined) {
+      return sendRpcError(res, 400, `A hold names its connection (${HEADER_CONNECTION}).`);
+    }
+    if (stopping) return sendRpcError(res, 503, 'The server is shutting down.');
+    holds.set(connection, (holds.get(connection) ?? 0) + 1);
+    const s = connections.get(connection);
+    if (s) {
+      s.openStreams++;
+      s.hadStream = true;
+      armIdle(s);
+    }
+    res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
+    res.flushHeaders();
+    res.on('close', () => {
+      const left = (holds.get(connection) ?? 1) - 1;
+      if (left > 0) holds.set(connection, left);
+      else holds.delete(connection);
+      const open = connections.get(connection);
+      if (open) {
+        open.openStreams = Math.max(0, open.openStreams - 1);
+        armIdle(open);
+      }
+    });
+  };
+
+  /** `DELETE /mcp` with no session id: the proxy ending its 2026 connection. */
+  const endConnection = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> => {
+    const connection = connectionOf(req, res);
+    if (connection === null) return;
+    if (connection === undefined) {
+      return sendRpcError(res, 400, 'Bad request: no valid session id, and not an initialize.');
+    }
+    connectionSessionIds.delete(connection);
+    const s = connections.get(connection) ?? (await connecting.get(connection));
+    res.writeHead(200).end();
+    // Not awaited: the answer must not wait for a compile to drain.
+    if (s) void closeSession(s, 'ended by the client');
+  };
+
+  /** One 2026-07-28 message: to its connection's session, opened on its first message. */
+  const serveModern = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: unknown,
+  ): Promise<void> => {
+    const connection = connectionOf(req, res);
+    if (connection === null) return;
+    if (connection === undefined) {
+      // A proxy of a build before #288, relaying a 2026 client's probe: any error makes that
+      // client fall back to the 2025 handshake, which this daemon serves.
+      return sendRpcError(
+        res,
+        400,
+        `Protocol 2026-07-28 needs the proxy's connection id (${HEADER_CONNECTION}); use the ` +
+          '2025 initialize handshake.',
+      );
+    }
+    let s = connections.get(connection);
+    if (!s) {
+      let opened = connecting.get(connection);
+      if (!opened) {
+        opened = openModern(req, res, connection).finally(() => connecting.delete(connection));
+        connecting.set(connection, opened);
+      }
+      s = await opened;
+      if (!s) return; // refused, and answered
+    }
+    s.inflight++;
+    clearTimeout(s.idleTimer);
+    try {
+      const strip = stripsOutputSchema(s.modern!.outputSchema, clientNameIn(body));
+      await s.modern!.serve(req, res, body, strip);
+    } finally {
+      s.inflight--;
+      if (!s.closing) armIdle(s);
+    }
+  };
+
+  /**
+   * Open the 2026 session of `connection`, as `openSession` does a 2025 one: the same headers,
+   * the same scope, the same guides. It is served by `createMcpHandler`, which builds a server per
+   * request from one factory — one handler per output shape, since the client (and with it whether
+   * `outputSchema` is left out) is named in each request's envelope. `undefined` when refused (and
+   * answered).
+   */
+  const openModern = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    connection: string,
+  ): Promise<Session | undefined> => {
+    if (openSessions().length + reserved.size >= maxSessions) {
+      sendRpcError(res, 503, `Too many open sessions (at most ${maxSessions}).`);
+      return undefined;
+    }
+    let settings: ReturnType<typeof parseSessionHeaders>;
+    try {
+      settings = parseSessionHeaders(req.headersDistinct, env);
+    } catch (err) {
+      if (err instanceof SessionHeaderError) {
+        sendRpcError(res, 400, err.message);
+        return undefined;
+      }
+      throw err;
+    }
+    const requested = settings.requestedSessionId;
+    if (settings.replaceWhenIdle && !replaceRequested) {
+      replaceRequested = true;
+      log('a newer build asked to replace this daemon; it stops once its last session closes');
+      for (const open of openSessions()) open.scope.ctx.config.restartPending = true;
+    }
+    const previous = connectionSessionIds.get(connection);
+    const sessionId =
+      previous !== undefined && !idTaken(previous)
+        ? previous
+        : uniqueSessionId(requested ?? `session-${randomBytes(4).toString('hex')}`, idTaken);
+    reserved.add(fold(sessionId));
+    clearTimeout(idleExitTimer);
+    let done!: () => void;
+    const settled = new Promise<void>((r) => (done = r));
+    opening.add(settled);
+    try {
+      const guides = await loadSessionGuides(env, config.extraWritingGuidePath);
+      const scope = createSessionContext(shared, {
+        sessionId,
+        ...(settings.defaultProject !== undefined
+          ? { defaultProject: settings.defaultProject, defaultProjectExplicit: true }
+          : {}),
+        ...(settings.credentialOverlay ? { credentialOverlay: settings.credentialOverlay } : {}),
+      });
+      Object.assign(scope.ctx.config, {
+        extraWritingGuideLoaded: guides.extraWritingGuideLoaded,
+        ...(requested !== undefined && requested !== sessionId
+          ? { sessionIdRequested: requested }
+          : {}),
+        ...(settings.ignoredEnv.length > 0 ? { ignoredClientEnv: settings.ignoredEnv } : {}),
+        ...(replaceRequested ? { restartPending: true } : {}),
+      });
+      const handlers = new Map<boolean, ReturnType<typeof toNodeHandler>>();
+      const mcpHandlers: Array<ReturnType<typeof createMcpHandler>> = [];
+      const handlerFor = (strip: boolean): ReturnType<typeof toNodeHandler> => {
+        let node = handlers.get(strip);
+        if (!node) {
+          const mcp = createMcpHandler(
+            () =>
+              createServer(
+                scope.ctx,
+                guides.writingGuide,
+                guides.concurrencyGuide,
+                guides.skills,
+                guides.writingGuideHasExtra,
+                undefined,
+                { stripOutputSchema: strip },
+              ),
+            {
+              legacy: 'reject',
+              maxRequestBodySize: maxBodyBytes,
+              onerror: (err) => log(`session ${quoteId(sessionId)}: ${err.message}`),
+            },
+          );
+          mcpHandlers.push(mcp);
+          node = toNodeHandler(mcp, { maxRequestBodySize: maxBodyBytes });
+          handlers.set(strip, node);
+        }
+        return node;
+      };
+      const held = holds.get(connection) ?? 0;
+      const s: Session = {
+        sessionId,
+        scope,
+        modern: {
+          connection,
+          outputSchema: settings.outputSchema,
+          serve: (rq, rs, body, strip) => handlerFor(strip)(rq, rs, body),
+          close: async () => {
+            await Promise.all(mcpHandlers.map((h) => h.close().catch(() => {})));
+          },
+        },
+        openStreams: held,
+        hadStream: held > 0,
+        inflight: 0,
+      };
+      if (stopping) {
+        await scope.close();
+        sendRpcError(res, 503, 'The server is shutting down.');
+        return undefined;
+      }
+      connections.set(connection, s);
+      connectionSessionIds.set(connection, sessionId);
+      armIdle(s);
+      log(
+        `session ${quoteId(sessionId)} opened (protocol 2026-07-28)` +
+          (requested !== undefined && requested !== sessionId
+            ? ` (asked for ${quoteId(requested)}, already open)`
+            : ''),
+      );
+      return s;
+    } finally {
+      reserved.delete(fold(sessionId));
+      opening.delete(settled);
+      done();
+      scheduleIdleExit();
+    }
   };
 
   const openSession = async (
@@ -360,7 +674,7 @@ async function serve(
     res: http.ServerResponse,
     body: unknown,
   ): Promise<void> => {
-    if (sessions.size + reserved.size >= maxSessions) {
+    if (openSessions().length + reserved.size >= maxSessions) {
       return sendRpcError(res, 503, `Too many open sessions (at most ${maxSessions}).`);
     }
     let settings: ReturnType<typeof parseSessionHeaders>;
@@ -375,7 +689,7 @@ async function serve(
     if (settings.replaceWhenIdle && !replaceRequested) {
       replaceRequested = true;
       log('a newer build asked to replace this daemon; it stops once its last session closes');
-      for (const open of sessions.values()) open.scope.ctx.config.restartPending = true;
+      for (const open of openSessions()) open.scope.ctx.config.restartPending = true;
     }
     const sessionId = uniqueSessionId(
       requested ?? `session-${randomBytes(4).toString('hex')}`,
@@ -404,23 +718,18 @@ async function serve(
         ...(settings.ignoredEnv.length > 0 ? { ignoredClientEnv: settings.ignoredEnv } : {}),
         ...(replaceRequested ? { restartPending: true } : {}),
       });
+      // Built for the client the `initialize` names: no `outputSchema` for one that chokes on it
+      // (src/lib/outputSchemaCompat.ts).
       const server = createServer(
         scope.ctx,
         guides.writingGuide,
         guides.concurrencyGuide,
         guides.skills,
         guides.writingGuideHasExtra,
+        undefined,
+        { stripOutputSchema: stripsOutputSchema(settings.outputSchema, clientNameIn(body)) },
       );
-      const s: Session = {
-        sessionId,
-        scope,
-        server,
-        // Assigned below; the transport's callbacks need `s`.
-        transport: undefined as unknown as StreamableHTTPServerTransport,
-        openStreams: 0,
-        hadStream: false,
-      };
-      s.transport = new StreamableHTTPServerTransport({
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
           sessions.set(id, s);
@@ -435,12 +744,20 @@ async function serve(
         // Not awaited: the DELETE's answer must not wait for a compile to drain.
         onsessionclosed: () => void closeSession(s, 'ended by the client'),
       });
+      const s: Session = {
+        sessionId,
+        scope,
+        server,
+        transport,
+        openStreams: 0,
+        hadStream: false,
+        inflight: 0,
+      };
       // Set before `connect`, which chains its own handler after this one.
-      s.transport.onclose = () => void closeSession(s, 'transport closed');
-      installOutputSchemaCompat(server, s.transport, settings.outputSchema);
-      await server.connect(s.transport);
-      await s.transport.handleRequest(req, res, body);
-      if (s.transport.sessionId === undefined || !sessions.has(s.transport.sessionId)) {
+      transport.onclose = () => void closeSession(s, 'transport closed');
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+      if (transport.sessionId === undefined || !sessions.has(transport.sessionId)) {
         // The initialize failed (the transport answered with the error): nothing to keep open.
         await closeSession(s, 'initialize failed');
       } else if (stopping) {
@@ -462,9 +779,7 @@ async function serve(
       setTimeout(passStopDeadline, STOP_DRAIN_MS).unref?.();
       // An initialize under way finishes (and, seeing `stopping`, closes itself) before the rest.
       await Promise.all([...opening]);
-      await Promise.all(
-        [...new Set(sessions.values())].map((s) => closeSession(s, 'server stopping')),
-      );
+      await Promise.all(openSessions().map((s) => closeSession(s, 'server stopping')));
       await new Promise<void>((r) => {
         httpServer.close(() => r());
         httpServer.closeAllConnections();
@@ -516,7 +831,7 @@ async function serve(
     token,
     url: `http://127.0.0.1:${port}/mcp`,
     info,
-    sessionIds: () => [...new Set([...sessions.values()].map((s) => s.sessionId))],
+    sessionIds: () => openSessions().map((s) => s.sessionId),
     stop,
     stopped: Promise.resolve(),
   };

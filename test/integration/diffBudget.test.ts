@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '../../src/server.js';
 import { createContext } from '../../src/context.js';
 import { CredentialResolver } from '../../src/services/auth.js';
@@ -12,7 +12,7 @@ import { createFakeRemote } from './helpers/bareRepo.js';
 import { expectNoUndeclaredKeys } from '../helpers/outputSchema.js';
 import { CHANGE_DIFF_BUDGET, DIFF_CONTENT_BUDGET } from '../../src/lib/diffBudget.js';
 import type { ServerConfig } from '../../src/types.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 
 /**
  * The `diff` budget (issue #153), measured end to end on what a client actually receives.

@@ -220,15 +220,27 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
-- **MCP SDK 1.32.2** (from 1.29.0), which adds stdio and HTTP hardening from upstream. One
-  behaviour is new: the stdio transport now refuses a single message from the client over 10 MiB
-  and closes the connection. A `--standalone` server now says so on stderr
-  (`stdio: ReadBuffer exceeded maximum size …`) instead of exiting silently; the proxy already
-  logged it. Through the shared daemon, any request over 4 MB was already refused with an error
-  and the session kept going; that is unchanged up to 10 MiB, and a larger one now ends the
-  session. No `write_file` or `push` resolution comes near either cap. The server still speaks
-  protocol 2025-11-25: Claude Code's probe for revision 2026-07-28 gets a prompt error, and Claude
-  Code falls back to the older handshake.
+- **MCP protocol revision 2026-07-28, on MCP TypeScript SDK v2 (#288).** The server moves from
+  `@modelcontextprotocol/sdk` 1.x (whose support ends in 2027 and which will never speak the new
+  revision) to the v2 packages (`@modelcontextprotocol/server`, `/client`, `/node` 2.4), and serves
+  both protocol eras from one set of tools: Claude Code now negotiates 2026-07-28 with it instead
+  of falling back, and every 2025-era client is served as before.
+  - **In-process** (`--standalone`), stdio is served by the SDK's `serveStdio`, which answers each
+    client in the era it opens with.
+  - **Through the shared server**, a 2026 client has no session id, so the proxy now names its
+    connection on every request (`X-Web-Latex-Mcp-Connection`, a random id per proxy), holds
+    `GET /hold` open while it runs, and ends the session with a `DELETE` when the client goes. The
+    daemon serves those requests one by one in that connection's session, which keeps its id (and
+    with it the ownership of its edits) even if it idles out and reopens. A proxy of an older build
+    gets an error its client falls back from.
+  - Claude Desktop compatibility (no `outputSchema` for `claude-ai`) and the dialect-free schemas
+    are now decided when the server is built for its client, in both eras. The SDK now stamps JSON
+    Schema 2020-12 rather than draft-07; the stamp is still removed, so validators of either
+    dialect accept every schema.
+  - The stdio transport refuses a single message from the client over 10 MiB and closes the
+    connection (new since SDK 1.30). A `--standalone` server says so on stderr instead of exiting
+    silently. Through the shared daemon, a request over 4 MB is refused with an error, as before.
+    No `write_file` or `push` resolution comes near either cap.
 - **Smaller instructions, and the rules that matter survive a client's cut.** The MCP `instructions`
   went from about 52,000 characters to about 9,600. Claude Code keeps only about the first 4,000,
   which used to drop half the bibliography rules, the PDF-comment loop and every convention added

@@ -3,11 +3,11 @@
  *
  * Why this exists (issue #130). `McpServer` validates a tool result against the tool's output
  * schema and then throws the parse result away
- * (`node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js`: only `parseResult.success` is
+ * (`McpServer.validateToolOutput` in `@modelcontextprotocol/server`, v1 and v2 alike: only `parseResult.success` is
  * consulted, `parseResult.data` is never used). So:
  *
  * - a **required field missing** from `structuredContent` fails the parse and surfaces as an
- *   `McpError` — that direction is caught, and a test asserting on `structuredContent` sees it;
+ *   `ProtocolError` — that direction is caught, and a test asserting on `structuredContent` sees it;
  * - a field **present in `structuredContent` but absent from the `outputSchema`** passes the
  *   parse (a zod object strips by default, it does not reject), is **not** stripped from what the
  *   client receives (the handler's own object is forwarded), and reaches the caller undeclared.
@@ -23,7 +23,7 @@
  * computes should keep asserting on `structuredContent` and nothing else.
  */
 import { expect } from 'vitest';
-import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import type { Client } from '@modelcontextprotocol/client';
 
 /** The slice of JSON Schema these helpers walk. Deliberately structural: what `tools/list` ships. */
 export interface JsonSchemaNode {

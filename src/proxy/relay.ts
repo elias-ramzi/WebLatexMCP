@@ -1,12 +1,12 @@
 import type { Readable, Writable } from 'node:stream';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import {
   isInitializeRequest,
   isJSONRPCRequest,
   type JSONRPCMessage,
   type RequestId,
-} from '@modelcontextprotocol/sdk/types.js';
+} from '@modelcontextprotocol/server';
 
 /**
  * The stdio proxy's relay (docs/design/shared-server.md §9.1): JSON-RPC from the client's stdin to
@@ -54,9 +54,43 @@ export class RelayEndedError extends Error {
   }
 }
 
+/**
+ * Hold a connection open on the daemon (`GET /hold`) until `signal` aborts or the daemon drops it:
+ * the 2026-07-28 stand-in for the 2025 GET stream, which keeps this connection's session from
+ * going idle while the proxy runs (`HEADER_CONNECTION`, src/daemon/sessionHeaders.ts). A daemon
+ * of a build before #288 answers 404; that, and any failure, is only ever logged — a 2025 session
+ * keeps itself alive through the SDK's own GET stream.
+ */
+async function holdConnection(
+  endpoint: Endpoint,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+  log: (line: string) => void,
+): Promise<void> {
+  try {
+    const res = await fetch(new URL('/hold', endpoint.url), {
+      headers: { ...headers, authorization: `Bearer ${endpoint.token}` },
+      signal,
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return;
+    }
+    // Nothing is ever sent on it: read until the daemon (or `signal`) ends it.
+    for await (const _chunk of res.body ?? []) {
+      /* drained */
+    }
+  } catch (err) {
+    if (!signal.aborted) log(`relay: hold: ${(err as Error).message}`);
+  }
+}
+
 /** Relay until the client closes stdin (resolves) or the daemon is lost twice (rejects). */
 export async function runRelay(opts: RelayOptions): Promise<void> {
   const stdio = new StdioServerTransport(opts.stdin, opts.stdout);
+  let endpoint = opts.endpoint;
+  let hold = new AbortController();
+  void holdConnection(endpoint, opts.headers, hold.signal, opts.log);
   let initRequest: JSONRPCMessage | undefined;
   /** Whether the daemon answered the client's own `initialize`. */
   let initAnswered = false;
@@ -130,10 +164,13 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
       const old = http;
       const initId = initRequest && 'id' in initRequest ? initRequest.id : undefined;
       try {
-        const endpoint = await opts.reconnect();
+        endpoint = await opts.reconnect();
         http = makeHttp(endpoint);
         await old.close().catch(() => {});
         await http.start();
+        hold.abort();
+        hold = new AbortController();
+        void holdConnection(endpoint, opts.headers, hold.signal, opts.log);
         if (initRequest && !initAnswered) {
           // The client's own initialize was lost: send it again, as itself, so its answer reaches
           // the client — a client does not retry an initialize.
@@ -177,8 +214,17 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
     ended = true;
     if (err) opts.log(`relay: ${err.message}`);
     void (async () => {
-      // Always end the session on the daemon, so its scope closes now rather than when idle.
+      // Always end the session on the daemon, so its scope closes now rather than when idle: a
+      // 2025 session by its id, a 2026 one by this proxy's connection (a no-op for the other).
       await http.terminateSession().catch(() => {});
+      await fetch(endpoint.url, {
+        method: 'DELETE',
+        headers: { ...opts.headers, authorization: `Bearer ${endpoint.token}` },
+        signal: AbortSignal.timeout(5_000),
+      })
+        .then((res) => res.body?.cancel())
+        .catch(() => {});
+      hold.abort();
       await http.close().catch(() => {});
       await stdio.close().catch(() => {});
       if (err) fail(err);

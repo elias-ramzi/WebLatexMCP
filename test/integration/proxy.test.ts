@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { Client } from '@modelcontextprotocol/client';
 import { createFakeRemote } from './helpers/bareRepo.js';
 import { streamPair } from '../helpers/streamTransport.js';
 import { startDaemon, type RunningDaemon } from '../../src/daemon/daemon.js';

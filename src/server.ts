@@ -1,4 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from './context.js';
 import { registerListProjects } from './tools/listProjects.js';
 import { registerProjectSync } from './tools/projectSync.js';
@@ -52,6 +52,7 @@ import { installToolCallProbe } from './lib/sessionProbe.js';
 import { callLogSink, installCallLog } from './lib/callLog.js';
 import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
+import { installSchemaShaping } from './lib/outputSchemaCompat.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -70,6 +71,11 @@ import type { Skill } from './lib/skills.js';
  * registered, so every tool below reports its call's `_meta` to stderr. Omitted — which is the
  * default and every existing call site — nothing at all is installed: `registerTool` is still the
  * prototype's own method and the server behaves exactly as it did before the probe existed.
+ *
+ * `shape` is how the tools are advertised to the client this server is built for
+ * (`src/lib/outputSchemaCompat.ts`): every schema loses its `$schema` dialect stamp, and with
+ * `stripOutputSchema` (Claude Desktop, or `WEB_LATEX_MCP_NO_OUTPUT_SCHEMA`) no tool advertises an
+ * `outputSchema` or returns `structuredContent`.
  */
 export function createServer(
   ctx: AppContext,
@@ -78,6 +84,7 @@ export function createServer(
   skills: Skill[] = [],
   writingGuideHasExtra = false,
   probe?: SessionProbe,
+  shape: { stripOutputSchema?: boolean } = {},
 ): McpServer {
   const instructions = buildInstructions(writingGuide, concurrencyGuide, writingGuideHasExtra);
   const server = new McpServer(
@@ -88,7 +95,9 @@ export function createServer(
     instructions ? { instructions } : undefined,
   );
 
-  // Before the registrations below: the wrapper only covers tools registered after it.
+  // Before the registrations below: each wrapper only covers tools registered after it. Shaping
+  // goes first, so it sits innermost, next to the SDK's own `registerTool`.
+  installSchemaShaping(server, shape);
   if (probe) installToolCallProbe(server, probe);
   // Likewise before the registrations: one line per tool call (src/lib/callLog.ts).
   if (ctx.config?.callLog === true) {

@@ -105,10 +105,22 @@ with a leading `.`, so no project can collide with `.daemon`.
 
 ### 4.2 Transport
 
-`StreamableHTTPServerTransport` from `@modelcontextprotocol/sdk` (1.29), stateful mode
-(`sessionIdGenerator: randomUUID`), over `node:http`. Don't add express. One transport and one
-`McpServer` per MCP session. `onsessioninitialized` creates the session's `SessionScope` (§5);
-`onsessionclosed` and transport `onclose` release it.
+`NodeStreamableHTTPServerTransport` from `@modelcontextprotocol/node` (MCP SDK v2; v1's
+`StreamableHTTPServerTransport` until #288), stateful mode (`sessionIdGenerator: randomUUID`), over
+`node:http`. Don't add express. One transport and one `McpServer` per MCP session.
+`onsessioninitialized` creates the session's `SessionScope` (§5); `onsessionclosed` and transport
+`onclose` release it.
+
+That is the 2025 era. Protocol revision 2026-07-28 drops `Mcp-Session-Id`, the GET stream and the
+`initialize` handshake: every request stands alone, its era and client named in its own `_meta`
+envelope. Its requests (`isModernMessage`) go to `createMcpHandler`, which builds a server per
+request from the session's scope; the session is the one the proxy's connection id
+(`X-Web-Latex-Mcp-Connection`, a random UUID per proxy process) names. The proxy holds `GET /hold`
+open in place of the GET stream (the session never idles while one is open, and closes a minute
+after the last one goes), and ends the session with a `DELETE` naming the connection. A session
+closed for idleness reopens under the same id, so its shadow and the ownership of its edits survive.
+A request naming no connection (a proxy of an older build) gets a 400, from which a 2026 client falls
+back to the 2025 handshake.
 
 ## 5. The session model (the core change)
 

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { getServerVersion } from '../lib/version.js';
 import { quoteId } from '../lib/projectId.js';
@@ -304,7 +304,7 @@ export function registerServerInfo(server: McpServer, ctx: AppContext): void {
           `rewrite mode (default): ${info.rewriteMode}` +
           (info.envConfigured ? ' (WEB_LATEX_MCP_REWRITE_MODE)' : ' (built-in)');
         return {
-          content: [{ type: 'text', text }],
+          content: [{ type: 'text' as const, text }],
           structuredContent: { ...info },
         };
       } catch (err) {

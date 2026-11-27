@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { readFile } from 'node:fs/promises';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { foldCase } from '../lib/caseFold.js';

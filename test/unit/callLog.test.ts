@@ -2,9 +2,9 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { McpServer } from '@modelcontextprotocol/server';
+import { Client } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import {
   CallLogSink,
@@ -129,7 +129,7 @@ describe('installCallLog', () => {
           noteLockWait(30);
           await compiler.compile({} as never);
           await timedPhase('git-remote', async () => {});
-          return { content: [{ type: 'text', text: 'done!!!!' }] };
+          return { content: [{ type: 'text' as const, text: 'done!!!!' }] };
         },
       );
     });

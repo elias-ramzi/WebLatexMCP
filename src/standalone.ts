@@ -1,4 +1,5 @@
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { McpServer } from '@modelcontextprotocol/server';
+import { StdioServerTransport, serveStdio } from '@modelcontextprotocol/server/stdio';
 import { loadConfig } from './config.js';
 import { CredentialResolver, loadIdentity } from './services/auth.js';
 import { createSessionContext, createSharedServices } from './context.js';
@@ -7,9 +8,10 @@ import { ProjectRegistry, countRegisteredProjects } from './services/projectRegi
 import { legacyWorkspaceNote } from './lib/workspaceNote.js';
 import { loadSessionGuides } from './lib/sessionGuides.js';
 import {
-  installOutputSchemaCompat,
-  isIncompatibleClient,
+  clientNameIn,
   outputSchemaMode,
+  stripsOutputSchema,
+  watchInbound,
 } from './lib/outputSchemaCompat.js';
 import { escapeInvisibleChars } from './lib/projectId.js';
 import {
@@ -59,42 +61,46 @@ export async function runStandalone(opts: { daemonUnavailable?: string } = {}): 
       createSessionProbe({ secrets: () => credentials.allSecrets() })
     : undefined;
   probe?.startup(config.sessionId);
-  const server = createServer(
-    ctx,
-    writingGuide,
-    concurrencyGuide,
-    skills,
-    writingGuideHasExtra,
-    probe,
-  );
 
-  // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr.
+  // stdio transport: stdout carries the JSON-RPC stream, so all logging goes to stderr. Ours, not
+  // the entry's default, so the client's name is read off the opening message (a 2025
+  // `initialize`, or a 2026-07-28 request's `_meta` envelope) before the server is built for it.
   const transport = new StdioServerTransport();
-  // Shape outgoing tool schemas: always drop the SDK's draft-07 `$schema` marker (a 2020-12-only
-  // client refuses it), and omit `outputSchema` for clients that can't handle it (e.g. Claude
-  // Desktop); see src/lib/outputSchemaCompat.ts. The default `auto` mode omits it only for
-  // known-incompatible clients. Every mode installs the hook.
+  let clientName: string | undefined;
+  watchInbound(transport, (message) => {
+    clientName ??= clientNameIn(message);
+  });
+  // Shape the tool schemas for the client: no `$schema` dialect stamp for anyone, and no
+  // `outputSchema` for clients that can't handle it (Claude Desktop) or when the env asks for
+  // none; see src/lib/outputSchemaCompat.ts.
   const schemaMode = outputSchemaMode();
-  installOutputSchemaCompat(server, transport, schemaMode);
-  const prevOnInitialized = server.server.oninitialized;
-  server.server.oninitialized = () => {
-    prevOnInitialized?.();
-    const client = server.server.getClientVersion();
-    const stripping = schemaMode === 'always' || isIncompatibleClient(client?.name);
-    console.error(
-      `[web-latex-mcp] client ${client?.name ?? 'unknown'} v${client?.version ?? '?'}` +
-        `${stripping ? ' — omitting outputSchema for compatibility' : ''}`,
+  let announced = false;
+  // `serveStdio` serves both eras from this factory (#288): a 2025 client opens with `initialize`
+  // and keeps that era; a 2026-07-28 client opens with `server/discover`. It may build one more
+  // instance than it keeps (the discarded probe), so the factory builds only — the session scope
+  // is this process's, made once above.
+  const build = (opening: { era: 'legacy' | 'modern' }): McpServer => {
+    const strip = stripsOutputSchema(schemaMode, clientName);
+    const server = createServer(
+      ctx,
+      writingGuide,
+      concurrencyGuide,
+      skills,
+      writingGuideHasExtra,
+      probe,
+      { stripOutputSchema: strip },
     );
-  };
-  // Chained after the handler above, and deliberately so: the probe runs first inside that chain
-  // (see installConnectionProbe), so a firing is counted even if the compatibility logger throws.
-  if (probe) installConnectionProbe(server.server, probe);
-  // The SDK (1.30 on) closes the stdio transport when one inbound message passes its 10 MiB read
-  // cap, which ends this server: say why on stderr rather than exit without a word (the proxy's
-  // relay logs its own, `relay: stdin: …`). A JSON parse error quotes what the client sent, so the
-  // text is escaped and cut like any client-supplied string.
-  server.server.onerror = (err) => {
-    console.error(`[web-latex-mcp] stdio: ${escapeInvisibleChars(err.message).slice(0, 300)}`);
+    if (!announced) {
+      announced = true;
+      console.error(
+        `[web-latex-mcp] client ${clientName ?? 'unknown'} (` +
+          `${opening.era === 'modern' ? 'protocol 2026-07-28' : '2025-era protocol'})` +
+          `${strip ? ' — omitting outputSchema for compatibility' : ''}`,
+      );
+    }
+    // Only a 2025 connection initializes; the probe counts those, as before.
+    if (probe) installConnectionProbe(server.server, probe);
+    return server;
   };
   // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
   // session that dies without this is detected as gone by pid instead.
@@ -105,7 +111,16 @@ export async function runStandalone(opts: { daemonUnavailable?: string } = {}): 
   process.once('SIGTERM', release);
   process.once('beforeExit', release);
 
-  await server.connect(transport);
+  serveStdio(build, {
+    transport,
+    // The stdio transport closes when one inbound message passes its 10 MiB read cap, which ends
+    // this server: say why on stderr rather than exit without a word (the proxy's relay logs its
+    // own, `relay: stdin: …`). A JSON parse error quotes what the client sent, so the text is
+    // escaped and cut like any client-supplied string.
+    onerror: (err) => {
+      console.error(`[web-latex-mcp] stdio: ${escapeInvisibleChars(err.message).slice(0, 300)}`);
+    },
+  });
   console.error(
     `[web-latex-mcp] server ready on stdio as session "${config.sessionId}"` +
       `${writingGuide ? ' (writing guide loaded)' : ''}` +

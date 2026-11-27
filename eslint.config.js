@@ -21,6 +21,22 @@ export default tseslint.config(
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
       ],
+      // The server is on MCP SDK v2 (`@modelcontextprotocol/server`, `/client`, `/node`, #288).
+      // v1 (`@modelcontextprotocol/sdk`) is still installed — the optional Agent SDK depends on it
+      // — so a stale v1 import would compile and quietly run a second, older protocol stack.
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/*'],
+              message:
+                'Use the MCP SDK v2 packages (@modelcontextprotocol/server, /client, /node); ' +
+                'v1 is only here as a dependency of the Agent SDK.',
+            },
+          ],
+        },
+      ],
     },
   },
   {
