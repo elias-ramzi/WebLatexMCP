@@ -687,6 +687,7 @@ const RESERVED_SESSION_IDS: readonly string[] = [
   'project.lock',
   'rewrite-mode.json',
   'compile-defaults.json',
+  'citation-profile.json',
 ];
 
 /** Parse the default viewer target from env; undefined (the default) means the OS browser. */

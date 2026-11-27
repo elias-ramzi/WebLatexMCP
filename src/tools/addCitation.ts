@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { errorResult } from '../lib/errors.js';
 import { changeDiff, changedPath } from '../lib/changeDiff.js';
 import { isBibFile, mergeBibEntry } from '../lib/bib.js';
+import { applyProfile } from '../lib/citationProfile.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -45,7 +46,19 @@ const outputSchema = {
         '"datacite" for an openalex: key (fetched by its DOI), "datacite" for a crossref: key ' +
         'whose DOI DataCite registered (arXiv preprints, 10.48550/...).',
     ),
-  bibtex: z.string(),
+  bibtex: z
+    .string()
+    .describe(
+      "The entry as written (or, when alreadyPresent, as it would have been): the service's own " +
+        "bytes, minus any field the project's citation profile removes (profileRemoved).",
+    ),
+  profileRemoved: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Fields the project's citation profile (set_citation_profile) removed from the fetched " +
+        'entry, lower-cased, in the order the entry had them. Absent when it removed none.',
+    ),
   diff: z
     .string()
     .describe(
@@ -76,7 +89,7 @@ function entryLine(content: string, key: string): number {
  * through it would land in main.tex. A link whose far end is a .bib (a shared bibliography
  * linked in) is fine — that is where the entry belongs.
  */
-async function resolveBibFile(
+export async function resolveBibFile(
   ctx: AppContext,
   dir: string,
   bibFile: string | undefined,
@@ -128,7 +141,10 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
         "DataCite's cite keys are URLs (e.g. https://doi.org/10.48550/arxiv.1706.03762); the " +
         'entry is written verbatim, so the returned key is that URL — the format-bibliography ' +
         'skill rekeys entries later. Find the key with ' +
-        'search_references first. No-op (alreadyPresent) if the cite key is already in the file.',
+        'search_references first. No-op (alreadyPresent) if the cite key is already in the file. ' +
+        'When the project has a citation profile (set_citation_profile), the fields it leaves out ' +
+        'are removed from the fetched entry before it is appended (profileRemoved); nothing is ' +
+        'ever added or rewritten.',
       inputSchema,
       outputSchema,
     },
@@ -148,8 +164,18 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
         // or DataCite), and refused outright when it has none — we never assemble an entry
         // ourselves.
         const fetched = await ctx.references.fetchBibtex(key);
-        const bibtex = fetched.bibtex;
         return await ctx.projectManager.runExclusive(id, async () => {
+          // The project's citation profile (#255), read under the lock set_citation_profile writes
+          // under. It only ever removes whole fields from the fetched bytes — never writes a value
+          // — so what lands is still the service's own text (src/lib/citationProfile.ts).
+          const profile = await ctx.citationProfiles.get(id);
+          const profiled =
+            profile === null
+              ? { text: fetched.bibtex, changed: [] }
+              : applyProfile(fetched.bibtex, profile);
+          const bibtex = profiled.text;
+          const profileRemoved = profiled.changed.flatMap((c) => c.removed);
+          const removedField = profileRemoved.length > 0 ? { profileRemoved } : {};
           // Authoritative resolution, under the lock: a peer cannot add a second .bib or plant a
           // link between this check and the write. The link target is resolved here too, BEFORE
           // the write, as write_file/edit_file do.
@@ -193,6 +219,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
                 source: fetched.source,
                 ...(fetched.via ? { via: fetched.via } : {}),
                 bibtex,
+                ...removedField,
                 diff: '',
                 diffTruncated: false,
               },
@@ -222,7 +249,11 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
           const from = fetched.via
             ? `${fetched.source} via ${fetched.via}`
             : String(fetched.source);
-          const summary = `added ${merged.key} to ${bibPath}:${at} (from ${from})\n\n${bibtex}`;
+          const trimmed =
+            profileRemoved.length > 0
+              ? `; the citation profile removed ${profileRemoved.join(', ')}`
+              : '';
+          const summary = `added ${merged.key} to ${bibPath}:${at} (from ${from}${trimmed})\n\n${bibtex}`;
           // Both channels render from the same budgeted plan, never from the full patch.
           return {
             content: [{ type: 'text', text: diff.diff ? `${summary}\n\n${diff.diff}` : summary }],
@@ -235,6 +266,7 @@ export function registerAddCitation(server: McpServer, ctx: AppContext): void {
               source: fetched.source,
               ...(fetched.via ? { via: fetched.via } : {}),
               bibtex,
+              ...removedField,
               diff: diff.diff,
               diffTruncated: diff.truncated,
             },

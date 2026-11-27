@@ -20,6 +20,8 @@ import { REFERENCE_SOURCES } from '../../src/lib/referenceKey.js';
 import {
   projectLockPath,
   rewriteModePath,
+  compileDefaultsPath,
+  citationProfilePath,
   sessionDir,
   sessionStateDir,
 } from '../../src/lib/sessionPaths.js';
@@ -944,12 +946,20 @@ describe('WEB_LATEX_MCP_SESSION never names a directory the project state dir al
     new ShelfStore(ws, 'any').shelvesDir('p'),
     projectLockPath(ws, 'p'),
     rewriteModePath(ws, 'p'),
+    compileDefaultsPath(ws, 'p'),
+    citationProfilePath(ws, 'p'),
   ];
   const reserved = projectLevel.map((entry) => path.basename(entry));
 
   it('reads every reserved name off an entry directly under the project state dir', () => {
     expect(projectLevel.every((entry) => path.dirname(entry) === stateDir)).toBe(true);
-    expect(reserved).toEqual(['shelves', 'project.lock', 'rewrite-mode.json']);
+    expect(reserved).toEqual([
+      'shelves',
+      'project.lock',
+      'rewrite-mode.json',
+      'compile-defaults.json',
+      'citation-profile.json',
+    ]);
   });
 
   it.each(reserved)('refuses a session id of %j, which would collide', (name) => {

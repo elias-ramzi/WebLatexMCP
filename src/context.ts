@@ -23,6 +23,7 @@ import { ShadowStore } from './services/shadowStore.js';
 import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CompileDefaultsStore } from './services/compileDefaultsStore.js';
+import { CitationProfileStore } from './services/citationProfileStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
@@ -102,6 +103,8 @@ export interface AppContext {
   rewriteModes: RewriteModeStore;
   /** Per-project compile defaults — see `src/services/compileDefaultsStore.ts`. */
   compileDefaults: CompileDefaultsStore;
+  /** Per-project citation field profile — see `src/services/citationProfileStore.ts`. */
+  citationProfiles: CitationProfileStore;
   /** Loopback page for entering a git token off the chat — see `src/services/credentialPortal.ts`. */
   credentialPortal: CredentialPortal;
   /** Checks GitHub for a newer release and fetches the Desktop bundle — see `src/services/updater.ts`. */
@@ -138,6 +141,7 @@ export interface SharedServices {
   doctor: DoctorService;
   rewriteModes: RewriteModeStore;
   compileDefaults: CompileDefaultsStore;
+  citationProfiles: CitationProfileStore;
   credentialPortal: CredentialPortal;
   updater: UpdateService;
 }
@@ -353,6 +357,7 @@ export function createSharedServices(
     doctor: new DoctorService(),
     rewriteModes: new RewriteModeStore(config.workspaceRoot),
     compileDefaults: new CompileDefaultsStore(config.workspaceRoot),
+    citationProfiles: new CitationProfileStore(config.workspaceRoot),
     // The keychain is the machine's, so a token entered on the portal goes through the process's
     // own resolver, whichever session opened the page.
     credentialPortal: new CredentialPortal((host, username, token) =>
@@ -460,6 +465,7 @@ export function createSessionContext(
     shelves,
     rewriteModes: shared.rewriteModes,
     compileDefaults: shared.compileDefaults,
+    citationProfiles: shared.citationProfiles,
     credentialPortal: shared.credentialPortal,
     updater: shared.updater,
   };

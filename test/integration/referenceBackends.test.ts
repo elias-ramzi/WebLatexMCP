@@ -32,6 +32,7 @@ import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CompileDefaultsStore } from '../../src/services/compileDefaultsStore.js';
+import { CitationProfileStore } from '../../src/services/citationProfileStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import { UpdateService } from '../../src/services/updater.js';
 import { ReferenceResolver, type ReferenceBackends } from '../../src/services/referenceResolver.js';
@@ -153,6 +154,7 @@ describe('multi-backend reference lookup through a real MCP client', () => {
       ),
       rewriteModes: new RewriteModeStore(workspace),
       compileDefaults: new CompileDefaultsStore(workspace),
+      citationProfiles: new CitationProfileStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
       // Never called here; constructing it reaches nothing.
       updater: new UpdateService(),

@@ -60,6 +60,11 @@ export function compileDefaultsPath(workspaceRoot: string, projectId: string): s
   return path.join(sessionStateDir(workspaceRoot, projectId), 'compile-defaults.json');
 }
 
+/** Where `set_citation_profile` keeps a project's citation field profile. */
+export function citationProfilePath(workspaceRoot: string, projectId: string): string {
+  return path.join(sessionStateDir(workspaceRoot, projectId), 'citation-profile.json');
+}
+
 export function rewriteModePath(workspaceRoot: string, projectId: string): string {
   return path.join(sessionStateDir(workspaceRoot, projectId), 'rewrite-mode.json');
 }

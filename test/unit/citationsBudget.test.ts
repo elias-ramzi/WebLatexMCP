@@ -208,6 +208,7 @@ describe('planCitationsPayload', () => {
       'undefinedCitations',
       'duplicateKeys',
       'incompleteEntries',
+      'profileViolations',
       'uncitedEntries',
     ]);
     expect(plan.duplicateKeys.length).toBeGreaterThan(0);

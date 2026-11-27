@@ -15,6 +15,8 @@ import { registerAddAsset } from './tools/addAsset.js';
 import { registerEditFile } from './tools/editFile.js';
 import { registerSetRewriteMode } from './tools/setRewriteMode.js';
 import { registerSetCompileDefaults } from './tools/setCompileDefaults.js';
+import { registerSetCitationProfile } from './tools/setCitationProfile.js';
+import { registerApplyCitationProfile } from './tools/applyCitationProfile.js';
 import { registerCompile } from './tools/compile.js';
 import { registerRenderPages } from './tools/renderPages.js';
 import { registerPdfGeometry } from './tools/pdfGeometry.js';
@@ -113,6 +115,8 @@ export function createServer(
   registerEditFile(server, ctx);
   registerSetRewriteMode(server, ctx);
   registerSetCompileDefaults(server, ctx);
+  registerSetCitationProfile(server, ctx);
+  registerApplyCitationProfile(server, ctx);
   registerDeleteFile(server, ctx);
   registerCompile(server, ctx);
   registerRenderPages(server, ctx);

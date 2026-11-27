@@ -138,6 +138,13 @@ Apply one rule per field across the whole bibliography, per the user's choice in
 Keep this surgical: change only the fields the policy covers, plus the cite key. Don't rewrite an entry
 wholesale unless the user asked you to re-fetch it from a bibliography service.
 
+**Make a strip policy stick.** Store the fields the user chose to strip as the project's citation
+profile (`set_citation_profile { profile: { drop: [...] } }`, or `keep` per entry type). Every later
+`add_citation` then removes them from the entry it fetches, and `check_citations` reports any entry
+that carries one again. For the strip itself, `apply_citation_profile` (with `dryRun: true` to preview,
+then `confirmBibEdit: true` once the user approves) removes those whole fields from the existing entries
+without touching anything else, so you don't have to edit each entry by hand.
+
 ## Renaming keys without breaking `\cite`
 
 This is the dangerous part: a renamed key that isn't updated everywhere becomes an undefined citation.

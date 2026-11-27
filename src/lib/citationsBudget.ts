@@ -52,7 +52,7 @@
 import { SEARCH_SKIPPED_BUDGET } from './searchBudget.js';
 
 /**
- * Hard ceiling on entries in each of the four finding lists, before the character budget is even
+ * Hard ceiling on entries in each of the five finding lists, before the character budget is even
  * consulted. 20 is this codebase's house figure for a capped list (`capList` in
  * `src/services/gitService.ts`, `CONFLICT_MAX_FILES` in `src/lib/conflictBudget.ts`,
  * `SEARCH_MAX_SKIPPED`), and nothing about a citation finding argues for a different one.
@@ -77,7 +77,7 @@ export const CITATIONS_MAX_FINDINGS = 20;
 export const CITATIONS_MAX_PLACES = 20;
 
 /**
- * Total character budget for the four finding lists together, as they will be JSON-encoded into
+ * Total character budget for the five finding lists together, as they will be JSON-encoded into
  * `structuredContent`.
  *
  * 20000 is this codebase's house figure for "one document-controlled field's share of a tool
@@ -93,7 +93,7 @@ export const CITATIONS_CONTENT_BUDGET = 20000;
  * Hard ceiling on the paths listed in EACH of `documents` and `bibliographySources` — the house
  * figure for a capped list, reused from {@link CITATIONS_MAX_FINDINGS} rather than restated.
  *
- * Deliberately NOT raised by `maxResults`: that input is documented as the cap on the four
+ * Deliberately NOT raised by `maxResults`: that input is documented as the cap on the five
  * finding lists, and these two are provenance, not findings — which files were read, not what is
  * wrong with them. The report's header still counts every file (shown + omitted); a caller who
  * needs the names narrows `documents` or `bibliography`, which it already knows how to do.
@@ -132,6 +132,10 @@ const ELEMENT_SEPARATOR_OVERHEAD = 1;
  *  1. `uncitedEntries` is cut first. It is advisory — "dead weight, not an error", in the output
  *     schema's own words — and it is also the longest and the most expensive per entry, since it
  *     is the only one carrying a document-controlled `title`.
+ *  1b. `profileViolations` next (#255): an entry carrying a field the project's citation profile
+ *     leaves out is a matter of shape, not of content — the reference renders and points at the
+ *     right work — so it ranks below every finding about what a reference says, and above only
+ *     the dead weight. `apply_citation_profile` lists every one of them itself, uncut by this.
  *  2. `incompleteEntries` next. A missing required field degrades how a reference renders; the
  *     document still builds and still cites the right work.
  *  3. `duplicateKeys` next. A key defined twice means the later definition is silently ignored, so
@@ -149,6 +153,7 @@ export const ALLOCATION_ORDER = [
   'undefinedCitations',
   'duplicateKeys',
   'incompleteEntries',
+  'profileViolations',
   'uncitedEntries',
 ] as const;
 
@@ -188,6 +193,22 @@ export interface IncompleteEntryLike {
   missing: string[];
 }
 
+/** A BibTeX entry carrying fields the project's citation profile leaves out (#255). */
+export interface ProfileViolationLike {
+  key: string;
+  path: string;
+  line: number;
+  type?: string;
+  /** The fields the profile would remove, lower-cased. */
+  fields: string[];
+}
+
+/** {@link ProfileViolationLike} once its `fields` have been cut. */
+export interface ProfileViolation extends ProfileViolationLike {
+  /** Fields dropped by {@link CITATIONS_MAX_PLACES}. Absent when nothing was dropped. */
+  fieldsOmitted?: number;
+}
+
 /** {@link UndefinedCitationLike} once its `uses` have been cut. */
 export interface UndefinedCitation extends UndefinedCitationLike {
   /** Uses dropped by {@link CITATIONS_MAX_PLACES}. Absent when nothing was dropped. */
@@ -206,12 +227,14 @@ export interface IncompleteEntry extends IncompleteEntryLike {
   missingOmitted?: number;
 }
 
-/** The four uncut lists, exactly as the tool derives them, plus the two uncut file lists. */
+/** The five uncut lists, exactly as the tool derives them, plus the two uncut file lists. */
 export interface CitationsFindings {
   undefinedCitations: UndefinedCitationLike[];
   uncitedEntries: UncitedEntryLike[];
   duplicateKeys: DuplicateKeyLike[];
   incompleteEntries: IncompleteEntryLike[];
+  /** Entries the citation profile would trim. Absent means none (or no profile). */
+  profileViolations?: ProfileViolationLike[];
   /** Every document whose citations were collected. Absent means none. */
   documents?: string[];
   /** Every file the reference entries came from. Absent means none. */
@@ -233,11 +256,13 @@ export interface CitationsPlan {
   uncitedEntries: UncitedEntryLike[];
   duplicateKeys: DuplicateKey[];
   incompleteEntries: IncompleteEntry[];
+  profileViolations: ProfileViolation[];
   /** Findings not shown, by list. Never a silent cut: `total = shown + omitted`, always. */
   undefinedCitationsOmitted: number;
   uncitedEntriesOmitted: number;
   duplicateKeysOmitted: number;
   incompleteEntriesOmitted: number;
+  profileViolationsOmitted: number;
   /** At most {@link CITATIONS_MAX_FILES} paths, and within {@link CITATIONS_FILES_BUDGET}. */
   documents: string[];
   bibliographySources: string[];
@@ -333,12 +358,17 @@ export function planCitationsPayload(
     const { kept, omitted } = cutInner(e.missing, CITATIONS_MAX_PLACES);
     return { ...e, missing: kept, ...(omitted > 0 ? { missingOmitted: omitted } : {}) };
   });
+  const profileAll: ProfileViolation[] = (findings.profileViolations ?? []).map((v) => {
+    const { kept, omitted } = cutInner(v.fields, CITATIONS_MAX_PLACES);
+    return { ...v, fields: kept, ...(omitted > 0 ? { fieldsOmitted: omitted } : {}) };
+  });
   const uncitedAll = findings.uncitedEntries;
 
   // Pass 2 — the per-list count cap.
   const undefinedCapped = cutInner(undefinedAll, maxFindings);
   const duplicateCapped = cutInner(duplicateAll, maxFindings);
   const incompleteCapped = cutInner(incompleteAll, maxFindings);
+  const profileCapped = cutInner(profileAll, maxFindings);
   const uncitedCapped = cutInner(uncitedAll, maxFindings);
 
   // Pass 3 — the character budget, in ALLOCATION_ORDER. Once a list has been cut by size the
@@ -350,7 +380,8 @@ export function planCitationsPayload(
   const fitted = fitList(undefinedCapped.kept, budget, true);
   const fittedDuplicates = fitList(duplicateCapped.kept, spent(fitted), false);
   const fittedIncomplete = fitList(incompleteCapped.kept, spent(fittedDuplicates), false);
-  const fittedUncited = fitList(uncitedCapped.kept, spent(fittedIncomplete), false);
+  const fittedProfile = fitList(profileCapped.kept, spent(fittedIncomplete), false);
+  const fittedUncited = fitList(uncitedCapped.kept, spent(fittedProfile), false);
 
   const lanes: Lane[] = [
     {
@@ -372,6 +403,12 @@ export function planCitationsPayload(
       cutBySize: fittedIncomplete.cutBySize,
     },
     {
+      field: 'profileViolations',
+      shown: fittedProfile.kept.length,
+      cutByCap: profileCapped.omitted,
+      cutBySize: fittedProfile.cutBySize,
+    },
+    {
       field: 'uncitedEntries',
       shown: fittedUncited.kept.length,
       cutByCap: uncitedCapped.omitted,
@@ -382,7 +419,8 @@ export function planCitationsPayload(
   const innerOmitted =
     undefinedAll.reduce((n, u) => n + (u.usesOmitted ?? 0), 0) +
     duplicateAll.reduce((n, d) => n + (d.occurrencesOmitted ?? 0), 0) +
-    incompleteAll.reduce((n, e) => n + (e.missingOmitted ?? 0), 0);
+    incompleteAll.reduce((n, e) => n + (e.missingOmitted ?? 0), 0) +
+    profileAll.reduce((n, v) => n + (v.fieldsOmitted ?? 0), 0);
 
   const parts = lanes.map((l) => laneNote(l, budget)).filter((p): p is string => p !== undefined);
   if (innerOmitted > 0) {
@@ -395,7 +433,8 @@ export function planCitationsPayload(
     parts.length === 0
       ? undefined
       : `${parts.join('; ')}. Lists are cut in this order: uncitedEntries (advisory) first, then ` +
-        'incompleteEntries, duplicateKeys, and undefinedCitations last — those break the build. ' +
+        'profileViolations, incompleteEntries, duplicateKeys, and undefinedCitations last — ' +
+        'those break the build. ' +
         '`maxResults` raises the per-list cap; the character budget is fixed, so narrow ' +
         '`documents` or `bibliography` when it is the budget that fired.';
 
@@ -439,10 +478,12 @@ export function planCitationsPayload(
     uncitedEntries: fittedUncited.kept,
     duplicateKeys: fittedDuplicates.kept,
     incompleteEntries: fittedIncomplete.kept,
+    profileViolations: fittedProfile.kept,
     undefinedCitationsOmitted: undefinedCapped.omitted + fitted.cutBySize,
     uncitedEntriesOmitted: uncitedCapped.omitted + fittedUncited.cutBySize,
     duplicateKeysOmitted: duplicateCapped.omitted + fittedDuplicates.cutBySize,
     incompleteEntriesOmitted: incompleteCapped.omitted + fittedIncomplete.cutBySize,
+    profileViolationsOmitted: profileCapped.omitted + fittedProfile.cutBySize,
     documents: documents.kept,
     bibliographySources: sources.kept,
     documentsOmitted: documents.omitted,

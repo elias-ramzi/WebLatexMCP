@@ -19,6 +19,7 @@ import {
   planCitationsPayload,
   type CitationsPlan,
 } from '../lib/citationsBudget.js';
+import { fieldsRemovedBy } from '../lib/citationProfile.js';
 
 const inputSchema = {
   project: z.string().optional(),
@@ -54,7 +55,7 @@ const inputSchema = {
     .max(CITATIONS_MAX_RESULTS)
     .optional()
     .describe(
-      `Cap on findings returned in EACH of the four lists (default ${CITATIONS_MAX_FINDINGS}). ` +
+      `Cap on findings returned in EACH of the five finding lists (default ${CITATIONS_MAX_FINDINGS}). ` +
         'A character budget applies on top and can cut further — advisory findings first, ' +
         'undefinedCitations last — so raising this does not guarantee a longer report; narrow ' +
         '`documents` or `bibliography` instead. Nothing is ever cut silently: every list has an ' +
@@ -162,6 +163,28 @@ const outputSchema = {
       'BibTeX entries missing a field their type requires ("a|b" means either will do). Limited ' +
         'to cited entries when `bibliographyProject` is set.',
     ),
+  profileViolations: z
+    .array(
+      z.object({
+        key: z.string(),
+        path: z.string(),
+        line: z.number(),
+        type: z.string().optional(),
+        fields: z
+          .array(z.string())
+          .describe('Fields the citation profile leaves out that this entry carries, lower-cased.'),
+        fieldsOmitted: z
+          .number()
+          .optional()
+          .describe(`Further such fields, not listed (max ${CITATIONS_MAX_PLACES} shown).`),
+      }),
+    )
+    .describe(
+      "BibTeX entries carrying a field the project's citation profile (set_citation_profile) " +
+        'leaves out — a matter of shape, not of content. apply_citation_profile removes them, ' +
+        "with the user's approval. Always empty when no profile is set (for a " +
+        '`bibliographyProject`, its own profile applies, and only cited entries are listed).',
+    ),
   undefinedCitationsOmitted: z
     .number()
     .describe('Undefined citations found but not listed. Cut LAST — these break the build.'),
@@ -170,6 +193,9 @@ const outputSchema = {
     .describe('Uncited entries found but not listed. Cut FIRST — advisory, and the longest list.'),
   duplicateKeysOmitted: z.number().describe('Duplicate keys found but not listed.'),
   incompleteEntriesOmitted: z.number().describe('Incomplete entries found but not listed.'),
+  profileViolationsOmitted: z
+    .number()
+    .describe('Profile violations found but not listed. Cut right after uncitedEntries.'),
   note: z
     .string()
     .optional()
@@ -351,7 +377,25 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
           .filter((e) => e.missing.length > 0)
           .sort((a, b) => a.key.localeCompare(b.key));
 
-        // Every byte of all four lists is document-controlled, and a group .bib carried in the
+        // The bibliography's own project's profile: the entries belong to it, and so does the
+        // remedy (apply_citation_profile runs there).
+        const profile = await ctx.citationProfiles.get(bib.id);
+        const profileViolations =
+          profile === null
+            ? []
+            : entries
+                .filter((e) => e.format === 'bibtex' && e.type && relevant(e.key!))
+                .map((e) => ({
+                  key: e.key!,
+                  path: e.path,
+                  line: e.line,
+                  type: e.type,
+                  fields: fieldsRemovedBy(profile, e.type!, Object.keys(e.fields ?? {})),
+                }))
+                .filter((e) => e.fields.length > 0)
+                .sort((a, b) => a.key.localeCompare(b.key));
+
+        // Every byte of all five lists is document-controlled, and a group .bib carried in the
         // project routinely makes `uncitedEntries` hundreds of rows long on a perfectly ordinary
         // paper. The planner cuts before anything is sent, counts what it cut, and decides the
         // ORDER — advisory findings first, build-breaking ones last (issue #154). The two file
@@ -363,6 +407,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
             uncitedEntries,
             duplicateKeys,
             incompleteEntries,
+            profileViolations,
             documents: scanned,
             bibliographySources: sources,
           },
@@ -390,7 +435,7 @@ export function registerCheckCitations(server: McpServer, ctx: AppContext): void
 /**
  * What `render` reads: the header fields plus the planner's own output shape.
  *
- * The four lists are NOT restated here. They used to be, and had already drifted: the handler
+ * The finding lists are NOT restated here. They used to be, and had already drifted: the handler
  * emits `incompleteEntries[].type` and `outputSchema` declares it, but the hand-written interface
  * omitted it — harmless (an interface a non-literal argument is checked against permits extra
  * properties, so nothing failed) but exactly the kind of divergence that becomes a real one the
@@ -467,6 +512,16 @@ function render(r: Report): string {
         (e.missingOmitted ? `, +${e.missingOmitted} more` : ''),
     ),
     r.incompleteEntriesOmitted,
+  );
+  section(
+    'Fields the citation profile leaves out (apply_citation_profile removes them)',
+    r.profileViolations.map(
+      (v) =>
+        `${v.key} (${v.path}:${v.line}) — ` +
+        v.fields.join(', ') +
+        (v.fieldsOmitted ? `, +${v.fieldsOmitted} more` : ''),
+    ),
+    r.profileViolationsOmitted,
   );
   if (lines.length === headerLines) lines.push('', 'No problems found.');
   if (r.note) lines.push('', r.note);

@@ -1096,6 +1096,51 @@ describe('output contract: the bibliography tools', () => {
       key: 'https://doi.org/10.48550/arxiv.1706.03762',
     });
   });
+
+  it('the citation profile tools publish every key they return (#255)', async () => {
+    const { client } = await citationHarness();
+
+    const set = await auditCall(client, 'set_citation_profile', {
+      project: 'demo',
+      profile: { drop: ['doi'], keep: [{ type: 'misc', fields: ['author'] }] },
+    });
+    expect(set).toMatchObject({ changed: true, previous: null });
+    expect((await auditCall(client, 'set_citation_profile', { project: 'demo' })).changed).toBe(
+      false,
+    );
+
+    // add_citation's profileRemoved is emitted only when the profile removed something.
+    const added = await auditCall(client, 'add_citation', {
+      project: 'demo',
+      key: 'dblp:conf/cvpr/HeZRS16',
+    });
+    expect(added.profileRemoved).toEqual(['doi']);
+    expect(String(added.bibtex)).not.toContain('doi');
+
+    // The seed @misc entry keeps only `author`, so its `title` is a violation.
+    const checked = await auditCall(client, 'check_citations', { project: 'demo' });
+    expect(checked.profileViolations).toEqual([
+      { key: 'seed2000', path: 'refs.bib', line: 1, type: 'misc', fields: ['title'] },
+    ]);
+
+    const dry = await auditCall(client, 'apply_citation_profile', {
+      project: 'demo',
+      dryRun: true,
+    });
+    expect(dry).toMatchObject({ dryRun: true, written: false, entriesChanged: 1, diff: '' });
+    const applied = await auditCall(client, 'apply_citation_profile', {
+      project: 'demo',
+      confirmBibEdit: true,
+    });
+    expect(applied).toMatchObject({ written: true, entriesChanged: 1, fieldsRemoved: 1 });
+    expect(String(applied.diff)).toContain('-  title = {A seed entry so the file is tracked}');
+
+    const cleared = await auditCall(client, 'set_citation_profile', {
+      project: 'demo',
+      clear: true,
+    });
+    expect(cleared.profile).toBeNull();
+  });
 });
 
 describe('output contract: update_server', () => {

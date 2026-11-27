@@ -233,7 +233,7 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 - **Sessions share a clone; commits don't.** A session is an MCP connection — one scope in the shared server, or one `--standalone` process; `WEB_LATEX_MCP_SESSION` (the proxy's `X-Web-Latex-Mcp-Session`) names it (`parseSessionId`;
   `RESERVED_SESSION_IDS` refuses `shelves`, `project.lock`, `rewrite-mode.json`,
-  `compile-defaults.json` — add any new
+  `compile-defaults.json`, `citation-profile.json` — add any new
   project-level entry under `.sessions/<id>/` there by hand). State lives in
   `<workspace>/.sessions/<projectId>/` (`src/lib/sessionPaths.ts`). **Guarantee: a commit contains one
   session's lines and nobody else's.**
@@ -598,6 +598,14 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
   inserting, reordering, reformatting or completing is not. Closer believed at depth 0 alone on its
   line, or ending the header's own line with no unmatched closer after; otherwise **fail open** (run to
   end).
+- **The citation profile only ever deletes whole fields** (`applyProfile`,
+  `src/lib/citationProfile.ts`; `set_citation_profile`, stored per project like compile defaults).
+  `add_citation` applies it to the fetched entry under the lock (`profileRemoved`); `check_citations`
+  reports `profileViolations` (the bibliography project's profile); `apply_citation_profile` trims
+  existing entries and needs `confirmBibEdit` (it is a `.bib` change). Each removal is one contiguous
+  run of bytes — a field with the comma after it, or a final run with the comma before it — found by
+  `scanBibtexBlocks`/`splitTopLevelSpans`/`fieldNameOf` (`references.ts`, the parser's own scan);
+  never write a value, and never key `keep` by type (`zod.record` mishandles `__proto__`).
 - Keys are namespaced (`dblp:…`, `crossref:…`, `openalex:W…`) and parsed in `src/lib/referenceKey.ts` — a
   **security boundary** (ids go into URL paths; never partially validated; emitted keys must re-parse,
   `keyRoundTrips`). `normalizeDblpKey` is idempotent: strips once, refuses leftover `rec/` or

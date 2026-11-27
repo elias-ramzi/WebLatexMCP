@@ -23,6 +23,7 @@ import { ShelfStore } from '../../src/services/shelfStore.js';
 import { ShadowStore } from '../../src/services/shadowStore.js';
 import { RewriteModeStore } from '../../src/services/rewriteModeStore.js';
 import { CompileDefaultsStore } from '../../src/services/compileDefaultsStore.js';
+import { CitationProfileStore } from '../../src/services/citationProfileStore.js';
 import { CredentialPortal } from '../../src/services/credentialPortal.js';
 import { UpdateService } from '../../src/services/updater.js';
 import type { AppContext } from '../../src/context.js';
@@ -123,6 +124,7 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
       ),
       rewriteModes: new RewriteModeStore(workspace),
       compileDefaults: new CompileDefaultsStore(workspace),
+      citationProfiles: new CitationProfileStore(workspace),
       credentialPortal: new CredentialPortal(async () => ({ persisted: false })),
       // Never called here; constructing it reaches nothing.
       updater: new UpdateService(),
@@ -314,5 +316,53 @@ describe('citation tools + .bib guard against a bare-repo stand-in', () => {
     });
     expect(res.isError).toBe(true);
     expect(JSON.stringify(res.content)).toContain('Multiple .bib files');
+  });
+
+  it('applies the citation profile to new entries, and to old ones only with approval (#255)', async () => {
+    const seed = '@misc{seed,\n  title = {Seed},\n  url = {https://example.com}\n}\n';
+    const { client, dir } = await setup({ 'main.tex': 'x\n', 'refs.bib': seed });
+
+    // No profile yet: nothing to apply.
+    const none = await client.callTool({
+      name: 'apply_citation_profile',
+      arguments: { confirmBibEdit: true },
+    });
+    expect(none.isError).toBe(true);
+    expect(JSON.stringify(none.content)).toContain('set_citation_profile');
+
+    const set = await client.callTool({
+      name: 'set_citation_profile',
+      arguments: { profile: { drop: ['URL', 'year'] } },
+    });
+    expect(set.isError).toBeFalsy();
+
+    // A new entry arrives without the dropped field; the old one is left as it was.
+    const added = await client.callTool({
+      name: 'add_citation',
+      arguments: { key: 'conf/cvpr/HeZRS16' },
+    });
+    expect(added.isError).toBeFalsy();
+    expect((added.structuredContent as { profileRemoved?: string[] }).profileRemoved).toEqual([
+      'year',
+    ]);
+    const afterAdd = await readFile(path.join(dir, 'refs.bib'), 'utf8');
+    expect(afterAdd).toContain('url = {https://example.com}');
+    expect(afterAdd).toContain('Deep Residual Learning');
+    expect(afterAdd).not.toContain('year');
+
+    // Trimming the old entry is a .bib change: refused without approval, file untouched.
+    const refused = await client.callTool({ name: 'apply_citation_profile', arguments: {} });
+    expect(refused.isError).toBe(true);
+    expect(JSON.stringify(refused.content)).toContain('confirmBibEdit: true');
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(afterAdd);
+
+    const applied = await client.callTool({
+      name: 'apply_citation_profile',
+      arguments: { confirmBibEdit: true },
+    });
+    expect(applied.isError).toBeFalsy();
+    expect(await readFile(path.join(dir, 'refs.bib'), 'utf8')).toBe(
+      afterAdd.replace(',\n  url = {https://example.com}', ''),
+    );
   });
 });

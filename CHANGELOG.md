@@ -11,6 +11,17 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **A citation field profile per project (#255).** `set_citation_profile` stores which BibTeX fields
+  a project's bibliography carries: fields to `drop` from every entry (`publisher`, `month`, `issn`,
+  `bibsource`, `timestamp`, …), and per entry type the only fields to `keep`. `add_citation` then
+  removes those fields from each fetched entry before appending it (`profileRemoved`), so entries
+  from DBLP and Crossref stop arriving in different shapes. `check_citations` lists existing entries
+  that carry such a field (`profileViolations`), and the new `apply_citation_profile` removes them,
+  with `confirmBibEdit: true` like any other `.bib` change (`dryRun: true` previews it). A profile
+  only ever deletes whole `name = value` fields from the service's bytes, never writes a value, so a
+  trimmed entry stays as verifiable as before. See
+  [Citation field profile](docs/tools.md#citation-field-profile).
+
 - **`search_references_batch`: many bibliography lookups in one call.** Up to 20 queries, run by
   the server one at a time — a second apart, backing off 5 s → 10 s → 20 s after a failure, stopping
   after three failures in a row or at a 45 s start deadline — with each query's outcome reported on

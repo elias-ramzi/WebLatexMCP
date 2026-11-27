@@ -116,9 +116,19 @@ function matchDelimiter(text: string, open: number): number {
   return -1;
 }
 
-/** Split on a separator that only counts at brace depth 0 and outside quotes. */
-function splitTopLevel(text: string, separator: string): string[] {
-  const parts: string[] = [];
+/** One part of {@link splitTopLevelSpans}: `text.slice(start, end)`, separator excluded. */
+export interface TextSpan {
+  start: number;
+  end: number;
+}
+
+/**
+ * Where a separator that only counts at brace depth 0 and outside quotes splits `text`: one span
+ * per part, in order, so a caller can cut a part out of the original bytes (the citation profile,
+ * `src/lib/citationProfile.ts`) and read exactly the parts {@link splitTopLevel} reads.
+ */
+export function splitTopLevelSpans(text: string, separator: string): TextSpan[] {
+  const spans: TextSpan[] = [];
   let depth = 0;
   let inQuote = false;
   let start = 0;
@@ -132,12 +142,17 @@ function splitTopLevel(text: string, separator: string): string[] {
     else if (ch === '}') depth--;
     else if (ch === '"' && depth === 0) inQuote = !inQuote;
     else if (ch === separator && depth === 0 && !inQuote) {
-      parts.push(text.slice(start, i));
+      spans.push({ start, end: i });
       start = i + 1;
     }
   }
-  parts.push(text.slice(start));
-  return parts;
+  spans.push({ start, end: text.length });
+  return spans;
+}
+
+/** Split on a separator that only counts at brace depth 0 and outside quotes. */
+function splitTopLevel(text: string, separator: string): string[] {
+  return splitTopLevelSpans(text, separator).map(({ start, end }) => text.slice(start, end));
 }
 
 /**
@@ -220,17 +235,27 @@ function emptyFieldMap(): Record<string, string> {
   return Object.create(null) as Record<string, string>;
 }
 
+/**
+ * The field name a `name = value` part of an entry body declares (lower-cased), or `undefined`
+ * when the part is not a field (no `=`, or a name BibTeX would not read as one). The one reading
+ * of a field's name, shared by {@link parseFields} and the citation profile.
+ */
+export function fieldNameOf(chunk: string): string | undefined {
+  const eq = chunk.indexOf('=');
+  if (eq === -1) return undefined;
+  const name = chunk.slice(0, eq).trim().toLowerCase();
+  return /^[a-z][\w-]*$/.test(name) ? name : undefined;
+}
+
 /** Parse `name = value` pairs from an entry body (everything after the cite key). */
 function parseFields(body: string, macros: Map<string, string>): Record<string, string> {
   // Null-prototype: the keys are field names the document chose, so the map must answer only for
   // the fields the entry declares — never for `constructor`/`toString` inherited from a `{}`.
   const fields = emptyFieldMap();
   for (const chunk of splitTopLevel(body, ',')) {
-    const eq = chunk.indexOf('=');
-    if (eq === -1) continue;
-    const name = chunk.slice(0, eq).trim().toLowerCase();
-    if (!/^[a-z][\w-]*$/.test(name)) continue;
-    fields[name] = evaluateValue(chunk.slice(eq + 1), macros);
+    const name = fieldNameOf(chunk);
+    if (name === undefined) continue;
+    fields[name] = evaluateValue(chunk.slice(chunk.indexOf('=') + 1), macros);
   }
   return fields;
 }
@@ -251,12 +276,24 @@ function startsControlSequence(text: string, at: number): boolean {
 }
 
 /**
- * Parse a BibTeX database. Tolerant by design: a malformed entry is skipped rather than aborting the
- * file, because the point is to report on a bibliography, not to validate its syntax.
+ * One `@type{…}` (or `@type(…)`) block of a BibTeX database: `at` is its `@`, `open` and `close`
+ * its delimiters, `type` lower-cased. `@string`, `@comment` and `@preamble` are blocks too.
  */
-export function parseBibtex(text: string): ReferenceEntry[] {
-  const entries: ReferenceEntry[] = [];
-  const macros = new Map<string, string>();
+export interface BibtexBlock {
+  type: string;
+  at: number;
+  open: number;
+  close: number;
+}
+
+/**
+ * Every block of a BibTeX database, in order: the one scan {@link parseBibtex} reads entries
+ * from, exported so a caller that cuts bytes out of an entry (the citation profile) finds the
+ * very entries the parser reports. An `@` inside a control sequence starts nothing, and an
+ * unbalanced block ends the scan.
+ */
+export function scanBibtexBlocks(text: string): BibtexBlock[] {
+  const blocks: BibtexBlock[] = [];
   let i = 0;
   while (i < text.length) {
     const at = text.indexOf('@', i);
@@ -271,7 +308,25 @@ export function parseBibtex(text: string): ReferenceEntry[] {
     const open = at + header[0].length - 1;
     const close = matchDelimiter(text, open);
     if (close === -1) break;
-    const type = header[1]!.toLowerCase();
+    blocks.push({ type: header[1]!.toLowerCase(), at, open, close });
+    i = close + 1;
+  }
+  return blocks;
+}
+
+/** Whether a block's type is a real entry, rather than `@string`, `@comment` or `@preamble`. */
+export function isEntryType(type: string): boolean {
+  return !NON_ENTRY_TYPES.has(type);
+}
+
+/**
+ * Parse a BibTeX database. Tolerant by design: a malformed entry is skipped rather than aborting the
+ * file, because the point is to report on a bibliography, not to validate its syntax.
+ */
+export function parseBibtex(text: string): ReferenceEntry[] {
+  const entries: ReferenceEntry[] = [];
+  const macros = new Map<string, string>();
+  for (const { type, at, open, close } of scanBibtexBlocks(text)) {
     const body = text.slice(open + 1, close);
 
     if (type === 'string') {
@@ -305,7 +360,6 @@ export function parseBibtex(text: string): ReferenceEntry[] {
         });
       }
     }
-    i = close + 1;
   }
   return entries;
 }
