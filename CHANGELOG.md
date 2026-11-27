@@ -184,6 +184,13 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   may also make the check beside an old-style `initialize`, which left a second session behind. The
   check is now answered without opening a session.
 
+- **A session survives more than one restart of the shared server.** When the shared server went
+  away, a session's proxy restarted it and carried on, but only once in its whole life: the second
+  time, hours later or not, the proxy gave up and the client lost every web-latex-mcp tool until
+  `/mcp` reconnected it. A second `daemon restart --force` (to pick up a new build, say) cut off
+  every session that had lived through the first. The proxy now gives up only on a server lost again
+  within a minute of a restart, which is a crash loop; any later loss is restarted like the first.
+
 - **An older session no longer asks a newer daemon to step aside.** After an in-place rebuild
   (`web-latex-mcp-dev-update`) and `daemon restart`, sessions opened before it reconnected with the
   old build's id, which differed only in the entry's mtime and was read as "newer" whichever way it

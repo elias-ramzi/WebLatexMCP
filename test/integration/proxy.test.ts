@@ -91,6 +91,7 @@ describe('the stdio proxy', () => {
     env: NodeJS.ProcessEnv,
     autostart: (ws: string, env: NodeJS.ProcessEnv) => Promise<FoundDaemon>,
     buildId?: string,
+    restartAgainMs?: number,
   ): Promise<Proxied> {
     const { toServer, fromServer, transport } = streamPair();
     const outcome = runProxy({
@@ -101,6 +102,7 @@ describe('the stdio proxy', () => {
       log: () => {},
       autostart,
       ...(buildId !== undefined ? { buildId } : {}),
+      ...(restartAgainMs !== undefined ? { restartAgainMs } : {}),
     });
     const client = new Client({ name: 'proxied', version: '0.0.0' });
     await client.connect(transport);
@@ -180,6 +182,63 @@ describe('the stdio proxy', () => {
     await expect.poll(() => daemons.length, { timeout: 10_000 }).toBe(2);
     expect(await info(a.client)).toMatchObject({ mode: 'daemon', sessionId: 'alpha' });
     expect(daemons[1]?.sessionIds()).toEqual(['alpha']);
+  });
+
+  /** A proxy whose daemons the test can kill, each restart starting the next in-process. */
+  async function restartable(restartAgainMs?: number): Promise<{
+    a: Proxied;
+    daemons: RunningDaemon[];
+    callInfo: () => Promise<string>;
+  }> {
+    const { workspace, config } = await workspaceWithClone();
+    const daemons: RunningDaemon[] = [];
+    const autostart = async (ws: string): Promise<FoundDaemon> => {
+      daemons.push(await daemonOn(config));
+      return (await findDaemon(ws)) as FoundDaemon;
+    };
+    const a = await proxied(
+      workspace,
+      { WEB_LATEX_MCP_SESSION: 'alpha' },
+      autostart,
+      undefined,
+      restartAgainMs,
+    );
+    const callInfo = (): Promise<string> =>
+      a.client.callTool({ name: 'server_info', arguments: {} }).then(
+        () => 'ok',
+        (err: Error) => err.message,
+      );
+    return { a, daemons, callInfo };
+  }
+
+  it('restarts a daemon lost again a while after a restart, as it did the first', async () => {
+    // Two forced restarts hours apart, in use; 50 ms apart here. The relay used to give up on
+    // the second, cutting off every session that had lived through the first.
+    const { a, daemons, callInfo } = await restartable(50);
+    for (const lost of [0, 1]) {
+      await daemons[lost]?.stop('restarted by the test');
+      const next = await callInfo();
+      expect(next === 'ok' || next.includes(RESTARTED_MESSAGE)).toBe(true);
+      await expect.poll(() => daemons.length, { timeout: 10_000 }).toBe(lost + 2);
+      expect(await info(a.client)).toMatchObject({ mode: 'daemon', sessionId: 'alpha' });
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(daemons[2]?.sessionIds()).toEqual(['alpha']);
+  });
+
+  it('gives up on a daemon lost again right after a restart: a crash loop', async () => {
+    const { a, daemons, callInfo } = await restartable();
+    await daemons[0]?.stop('restarted by the test');
+    await callInfo();
+    await expect.poll(() => daemons.length, { timeout: 10_000 }).toBe(2);
+    await daemons[1]?.stop('crashing again');
+    // Its answer never comes: the relay ends, and with it the proxy process the client waits on.
+    void callInfo();
+    await expect(a.outcome).resolves.toMatchObject({
+      kind: 'failed',
+      reason: expect.stringMatching(/lost again within 60 s of a restart/),
+    });
+    expect(daemons).toHaveLength(2);
   });
 
   it('reports the daemon unavailable before reading anything, so the caller serves in-process', async () => {

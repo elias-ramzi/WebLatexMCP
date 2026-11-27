@@ -51,7 +51,8 @@ logic lives in services, unit-testable without an MCP client.
   (`findDaemon`: pid + `/health` with token and nonce), applies `decideBuild` (build id = version +
   entry + mtime), auto-starts one (`autostartDaemon`, detached, env from `daemonSpawnEnv`: **no
   token or per-connection variable**), and relays stdio ↔ HTTP (`runRelay`, never parses payloads;
-  replays `initialize` once after a loss; watches stdin `end` itself). Every request carries the
+  replays `initialize` after a loss, giving up only on a loss within `RESTART_AGAIN_MS` of the last
+  restart; watches stdin `end` itself). Every request carries the
   proxy's random connection id (`HEADER_CONNECTION`), and the relay holds `GET /hold` open and sends
   a connection `DELETE` on its way out: that is how a 2026-07-28 client, which has no session id,
   keeps one session on the daemon. **A hold is never silent**: `fetch` drops a body silent for 5

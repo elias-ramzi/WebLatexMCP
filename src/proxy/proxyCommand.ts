@@ -36,6 +36,7 @@ export interface ProxyIo {
   /** Test seams. */
   buildId?: string;
   autostart?: (workspaceRoot: string, env: NodeJS.ProcessEnv) => Promise<FoundDaemon>;
+  restartAgainMs?: number;
 }
 
 export type ProxyOutcome =
@@ -128,6 +129,7 @@ export async function runProxy(io: ProxyIo): Promise<ProxyOutcome> {
       },
       log: io.log,
       ...(io.onStop ? { onStop: io.onStop } : {}),
+      ...(io.restartAgainMs !== undefined ? { restartAgainMs: io.restartAgainMs } : {}),
     });
     return { kind: 'relayed' };
   } catch (err) {

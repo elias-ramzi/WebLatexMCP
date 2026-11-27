@@ -18,7 +18,8 @@ import {
  * relay asks for a daemon once more (`reconnect`, which restarts it), replays the cached
  * `initialize` under the same session headers — so the session id, and with it the session's
  * shadow and the ownership of its edits, survives — and answers every request still waiting with
- * an error saying the server restarted. A second failure ends the relay.
+ * an error saying the server restarted. A daemon lost again within `RESTART_AGAIN_MS` of a
+ * restart ends the relay; a later loss is restarted like the first.
  */
 
 export interface Endpoint {
@@ -42,7 +43,18 @@ export interface RelayOptions {
   onStop?: (stop: () => void) => void;
   /** First wait before holding again after a hold drops (`HOLD_RETRY_MS`; a test seam). */
   holdRetryMs?: number;
+  /** `RESTART_AGAIN_MS` (a test seam). */
+  restartAgainMs?: number;
 }
+
+/**
+ * A daemon lost again within this long of the relay's last restart is taken to be crashing on
+ * something this session sends (the replayed `initialize`, a request it retries), and the relay
+ * gives up rather than restart it in a loop. A loss after that is a new one and gets its own
+ * restart: the relay used to give up on any second loss, so a `daemon restart --force` hours after
+ * an earlier one cut off every session that had lived through both.
+ */
+export const RESTART_AGAIN_MS = 60_000;
 
 /**
  * The first wait before a dropped hold is opened again, doubled after each hold that dropped
@@ -143,7 +155,8 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
    * sent to the new one instead — telling the client to retry it would run it twice.
    */
   const inflight = new Map<RequestId, StreamableHTTPClientTransport>();
-  let restarts = 0;
+  /** When the last restart reconnected (`RESTART_AGAIN_MS`). */
+  let restartedAt: number | undefined;
   let restarting: Promise<void> | undefined;
   let ended = false;
   let finish!: () => void;
@@ -196,11 +209,16 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
   const restart = (): Promise<void> => {
     restarting ??= (async () => {
       if (ended) return;
-      if (restarts >= 1) {
-        end(new RelayEndedError('the shared server was lost again after a restart; giving up'));
+      const window = opts.restartAgainMs ?? RESTART_AGAIN_MS;
+      if (restartedAt !== undefined && Date.now() - restartedAt < window) {
+        end(
+          new RelayEndedError(
+            `the shared server was lost again within ${Math.round(window / 1000)} s of a ` +
+              'restart; giving up',
+          ),
+        );
         return;
       }
-      restarts++;
       opts.log('relay: the shared server went away; restarting it');
       const old = http;
       const initId = initRequest && 'id' in initRequest ? initRequest.id : undefined;
@@ -232,6 +250,7 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
           if (protocolVersion) http.setProtocolVersion(protocolVersion);
           if (initializedNote) await http.send(initializedNote);
         }
+        restartedAt = Date.now();
       } catch (err) {
         end(new RelayEndedError(`could not restart the shared server: ${(err as Error).message}`));
         return;

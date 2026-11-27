@@ -393,7 +393,9 @@ Milestone 5 (the proxy, `src/proxy/`) follows §9 with these choices:
 - **Relay.** Only a request actually handed to a daemon that is then lost is answered "restarted,
   retry"; one queued behind the restart goes to the new daemon. A send the live daemon refuses (a 413) is passed back as an error and never triggers a restart. A client `initialize` still
   unanswered at a restart is re-sent as itself. `/health` answers 503 while a daemon stops.
-  Reconnect restarts at most once per proxy; a second loss ends it.
+  A daemon lost again within a minute of a restart ends the proxy (a crash loop, likely on
+  something this session sends); a later loss is restarted like the first, so a session lives
+  through any number of `daemon restart --force` runs.
 - **Ending a session.** The proxy sends `DELETE` on stdin end and on SIGINT, SIGTERM and SIGHUP.
   For a kill it cannot see (SIGKILL, Windows `TerminateProcess`), the daemon closes a session that
   held an event stream and lost every one after `DEFAULT_STREAM_LOSS_MS` (60 s) instead of the

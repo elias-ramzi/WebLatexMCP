@@ -214,9 +214,10 @@ and file baselines, exactly as separate processes did. Client configs do not cha
   one shared server; an older client uses a newer one as it is.
 - **If it cannot run** (the workspace is not writable, the port is refused), the proxy says why on
   stderr and serves the session in-process, as before; `server_info` shows `daemonUnavailable`. If
-  the shared server dies mid-session, the proxy restarts it once and keeps the session id, so the
+  the shared server dies mid-session, the proxy restarts it and keeps the session id, so the
   session's uncommitted changes stay its own; a request that was running gets an error asking to
-  retry.
+  retry. A server that dies again within a minute of that restart ends the session's connection
+  instead of being restarted in a loop.
 - **Opting out.** `npx web-latex-mcp --standalone`, or `WEB_LATEX_MCP_STANDALONE=1`, serves the session
   in-process, one server per session as before.
 
