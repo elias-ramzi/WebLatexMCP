@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { projectIdProblem, quoteId } from '../../src/lib/projectId.js';
 import { judgeProject } from '../../src/prompts/skills.js';
-import { loadConfig } from '../../src/config.js';
+import { loadConfig } from '../helpers/hermeticConfig.js';
 
 const U = (...cps: number[]): string => String.fromCodePoint(...cps);
 

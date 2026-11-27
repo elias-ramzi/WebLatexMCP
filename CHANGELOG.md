@@ -285,6 +285,11 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 - **`npm run format:check` skips the workspace-local `.web_latex_mcp` folder.** Files the server
   writes there (clones, paper-review reports) are git-excluded but made the local check fail.
 
+- **The test suite no longer reads your own `~/.web-latex-mcp` registry (#292).** Two config tests
+  failed on any machine with registered projects, and passed only on CI, whose runners have none.
+  Tests now load the config through `test/helpers/hermeticConfig.ts`, which answers the home
+  workspace as an empty registry and still reads any workspace a test names.
+
 - **`CLAUDE.md` is about a third of its former size.** The contributor guide keeps every rule and
   the function, constant or file that enforces it, grouped under topic headings; the history and
   rationale it repeated now live only in the named files' JSDoc and tests.

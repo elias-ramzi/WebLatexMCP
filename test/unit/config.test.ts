@@ -5,13 +5,14 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gitUrlOf } from '../../src/lib/projectMode.js';
 import {
-  loadConfig,
   parseRewriteMode,
   parseInstallKind,
   parseExtraWritingGuide,
   parseReferenceSource,
   parseContactEmail,
 } from '../../src/config.js';
+// Every call stays off the developer's real ~/.web-latex-mcp registry (#292).
+import { loadConfig } from '../helpers/hermeticConfig.js';
 import { COMPILER_KINDS } from '../../src/services/compilerResolver.js';
 import { registryPath } from '../../src/services/projectRegistry.js';
 import { REWRITE_MODES, DEFAULT_REWRITE_MODE } from '../../src/lib/rewriteMode.js';
@@ -970,5 +971,42 @@ describe('WEB_LATEX_MCP_SESSION never names a directory the project state dir al
     // CONTROL: passes before and after — the refusal is by whole name, never by substring.
     expect(loadConfig({ WEB_LATEX_MCP_SESSION: 'shelves-2' }).sessionId).toBe('shelves-2');
     expect(loadConfig({ WEB_LATEX_MCP_SESSION: 'writer' }).sessionId).toBe('writer');
+  });
+});
+
+describe('the suite never reads the real home registry (#292)', () => {
+  let fakeHome: string;
+  beforeEach(async () => {
+    fakeHome = await mkdtemp(path.join(os.tmpdir(), 'wlm-fake-home-'));
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(fakeHome, { recursive: true, force: true });
+  });
+
+  it('answers the home workspace as an empty registry, and still reads a named one', async () => {
+    // A home registry with a project and a default: exactly what made two tests here fail on
+    // every machine that uses the server, and pass on CI.
+    const homeWorkspace = path.join(os.homedir(), '.web-latex-mcp', 'projects');
+    expect(homeWorkspace.startsWith(fakeHome)).toBe(true);
+    const entries = JSON.stringify({
+      mine: { gitUrl: 'https://example.com/mine.git', default: true },
+    });
+    await mkdir(homeWorkspace, { recursive: true });
+    await writeFile(registryPath(homeWorkspace), entries);
+    const named = path.join(fakeHome, 'named');
+    await mkdir(named);
+    await writeFile(registryPath(named), entries);
+
+    const home = loadConfig({}, '/some/dir');
+    expect(home.workspaceRoot).toBe(homeWorkspace);
+    expect(home.projects).toEqual([]);
+    expect(home.defaultProject).toBeUndefined();
+
+    const other = loadConfig({ WEB_LATEX_MCP_WORKSPACE: named }, '/some/dir');
+    expect(other.projects.map((p) => p.id)).toEqual(['mine']);
+    expect(other.defaultProject).toBe('mine');
   });
 });

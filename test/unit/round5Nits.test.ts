@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { loadConfig, parseExtraWritingGuide } from '../../src/config.js';
+import { parseExtraWritingGuide } from '../../src/config.js';
+import { loadConfig } from '../helpers/hermeticConfig.js';
 import { createSessionRecorder } from '../../src/lib/mutationRecorder.js';
 import { stripGitUrlCredentials } from '../../src/lib/gitUrlCredentials.js';
 

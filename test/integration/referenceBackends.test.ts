@@ -16,7 +16,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createFakeRemote } from './helpers/bareRepo.js';
 import { createServer } from '../../src/server.js';
-import { loadConfig } from '../../src/config.js';
+import { loadConfig } from '../helpers/hermeticConfig.js';
 import { GitService } from '../../src/services/gitService.js';
 import { FileService } from '../../src/services/fileService.js';
 import { CompilerResolver } from '../../src/services/compilerResolver.js';
