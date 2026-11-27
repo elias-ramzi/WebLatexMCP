@@ -165,6 +165,16 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Fixed
 
+- **A session on protocol 2026-07-28 no longer loses its state about six minutes in.** The proxy
+  keeps its session open on the shared server by holding a request open (`GET /hold`), on which
+  the server sent nothing; Node's `fetch` drops a response that stays silent for 5 minutes, so the
+  hold ended there. From then on, any pause of a minute between tool calls closed the session, and
+  the next call reopened it under the same id with nothing in memory: the out-of-band-edit guard
+  forgot which files the session had read, so an edit made in your editor meanwhile could be
+  overwritten without a refusal, and a finished compile task's result was gone. The server now
+  writes a newline on each hold every 15 s, and the proxy opens a dropped hold again while the same
+  server answers (which also keeps a session open on a server of the previous build).
+
 - **An older session no longer asks a newer daemon to step aside.** After an in-place rebuild
   (`web-latex-mcp-dev-update`) and `daemon restart`, sessions opened before it reconnected with the
   old build's id, which differed only in the entry's mtime and was read as "newer" whichever way it
@@ -247,6 +257,12 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
   rebinding, and refuses a POST from another site, so a page cannot submit a token.
 
 ### Changed
+
+- **The shared server's log stamps each line with its time.** Every line of
+  `<workspace>/.daemon/daemon.log` now starts with its UTC time, as in
+  `2026-11-27T16:00:12.552Z [web-latex-mcp] session "session-1a2b3c4d" closed (idle)`, so it lines
+  up with Claude Code's own MCP logs; before, when a session opened or closed could only be
+  guessed.
 
 - **MCP protocol revision 2026-07-28, on MCP TypeScript SDK v2 (#288).** The server moves from
   `@modelcontextprotocol/sdk` 1.x (whose support ends in 2027 and which will never speak the new

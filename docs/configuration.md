@@ -194,7 +194,7 @@ one process, one project list and one viewer, and each still keeps its own id, u
 and file baselines, exactly as separate processes did. Client configs do not change.
 
 - **Starting and stopping.** The shared server logs to `<workspace>/.daemon/daemon.log` (rotated at
-  10 MB) and exits after 30 minutes with no open session. `npx web-latex-mcp daemon status`,
+  10 MB, each line stamped with its UTC time) and exits after 30 minutes with no open session. `npx web-latex-mcp daemon status`,
   `daemon stop` and `daemon restart` manage it from a shell; `--force` stops it even with sessions
   open.
 - **Settings.** Your session's `WEB_LATEX_MCP_SESSION`, `WEB_LATEX_MCP_DEFAULT_PROJECT`,

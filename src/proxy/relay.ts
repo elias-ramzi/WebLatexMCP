@@ -1,4 +1,5 @@
 import type { Readable, Writable } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import {
@@ -34,12 +35,23 @@ export interface RelayOptions {
   endpoint: Endpoint;
   /** Find or start a daemon after the first one went away. */
   reconnect: () => Promise<Endpoint>;
-  /** Whether the current daemon still answers (after an event-stream error). */
+  /** Whether the current daemon still answers (after an event-stream error, or a dropped hold). */
   isAlive: () => Promise<boolean>;
   log: (line: string) => void;
   /** Called once with the function that ends the relay (DELETE, then close): wire signals to it. */
   onStop?: (stop: () => void) => void;
+  /** First wait before holding again after a hold drops (`HOLD_RETRY_MS`; a test seam). */
+  holdRetryMs?: number;
 }
+
+/**
+ * The first wait before a dropped hold is opened again, doubled after each hold that dropped
+ * within a minute, up to `HOLD_RETRY_MAX_MS`.
+ */
+export const HOLD_RETRY_MS = 1_000;
+const HOLD_RETRY_MAX_MS = 30_000;
+/** A hold that lasted this long dropped for a reason of its own: start the backoff again. */
+const HOLD_SETTLED_MS = 60_000;
 
 /** The id the relay's own replayed `initialize` carries; never one a client would pick. */
 const REPLAY_ID = 'web-latex-mcp-proxy-replay';
@@ -55,33 +67,50 @@ export class RelayEndedError extends Error {
 }
 
 /**
- * Hold a connection open on the daemon (`GET /hold`) until `signal` aborts or the daemon drops it:
- * the 2026-07-28 stand-in for the 2025 GET stream, which keeps this connection's session from
- * going idle while the proxy runs (`HEADER_CONNECTION`, src/daemon/sessionHeaders.ts). A daemon
- * of a build before #288 answers 404; that, and any failure, is only ever logged — a 2025 session
- * keeps itself alive through the SDK's own GET stream.
+ * Hold a connection open on the daemon (`GET /hold`) until `signal` aborts: the 2026-07-28
+ * stand-in for the 2025 GET stream, which keeps this connection's session from going idle while
+ * the proxy runs (`HEADER_CONNECTION`, src/daemon/sessionHeaders.ts).
+ *
+ * A hold that drops while the same daemon still answers (`stillServed`) is opened again, after
+ * `retryMs`, doubling per quick drop: without it the session closed a minute after the drop and
+ * reopened with nothing in memory (the out-of-band-edit baselines, finished tasks). A daemon of a
+ * build before this fix sends nothing on a hold, and `fetch` drops a body silent for 5 minutes,
+ * so this is what keeps such a daemon's session open. A daemon that is gone is left to the relay's
+ * restart, which holds again itself. A refusal (a build before #288 answers 404) ends it: a 2025
+ * session keeps itself alive through the SDK's own GET stream. Failures are only ever logged.
  */
 async function holdConnection(
   endpoint: Endpoint,
   headers: Record<string, string>,
   signal: AbortSignal,
   log: (line: string) => void,
+  stillServed: () => Promise<boolean>,
+  retryMs: number,
 ): Promise<void> {
-  try {
-    const res = await fetch(new URL('/hold', endpoint.url), {
-      headers: { ...headers, authorization: `Bearer ${endpoint.token}` },
-      signal,
-    });
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
-      return;
+  let wait = retryMs;
+  while (!signal.aborted) {
+    const heldFrom = Date.now();
+    try {
+      const res = await fetch(new URL('/hold', endpoint.url), {
+        headers: { ...headers, authorization: `Bearer ${endpoint.token}` },
+        signal,
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return;
+      }
+      // Only keep-alive newlines come on it: read until the daemon (or `signal`) ends it.
+      for await (const _chunk of res.body ?? []) {
+        /* drained */
+      }
+    } catch (err) {
+      if (signal.aborted) return;
+      log(`relay: hold: ${(err as Error).message}`);
     }
-    // Nothing is ever sent on it: read until the daemon (or `signal`) ends it.
-    for await (const _chunk of res.body ?? []) {
-      /* drained */
-    }
-  } catch (err) {
-    if (!signal.aborted) log(`relay: hold: ${(err as Error).message}`);
+    if (signal.aborted || !(await stillServed().catch(() => false))) return;
+    if (Date.now() - heldFrom >= HOLD_SETTLED_MS) wait = retryMs;
+    await delay(wait, undefined, { signal }).catch(() => {});
+    wait = Math.min(wait * 2, HOLD_RETRY_MAX_MS);
   }
 }
 
@@ -89,8 +118,20 @@ async function holdConnection(
 export async function runRelay(opts: RelayOptions): Promise<void> {
   const stdio = new StdioServerTransport(opts.stdin, opts.stdout);
   let endpoint = opts.endpoint;
-  let hold = new AbortController();
-  void holdConnection(endpoint, opts.headers, hold.signal, opts.log);
+  /** Hold this connection on the current daemon until the returned controller aborts. */
+  const startHold = (): AbortController => {
+    const controller = new AbortController();
+    void holdConnection(
+      endpoint,
+      opts.headers,
+      controller.signal,
+      opts.log,
+      opts.isAlive,
+      opts.holdRetryMs ?? HOLD_RETRY_MS,
+    );
+    return controller;
+  };
+  let hold = startHold();
   let initRequest: JSONRPCMessage | undefined;
   /** Whether the daemon answered the client's own `initialize`. */
   let initAnswered = false;
@@ -169,8 +210,7 @@ export async function runRelay(opts: RelayOptions): Promise<void> {
         await old.close().catch(() => {});
         await http.start();
         hold.abort();
-        hold = new AbortController();
-        void holdConnection(endpoint, opts.headers, hold.signal, opts.log);
+        hold = startHold();
         if (initRequest && !initAnswered) {
           // The client's own initialize was lost: send it again, as itself, so its answer reaches
           // the client — a client does not retry an initialize.

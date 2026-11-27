@@ -1,12 +1,13 @@
 import { loadConfig, quoteEnvValue } from '../config.js';
 import { CredentialResolver, loadIdentity } from '../services/auth.js';
 import { ProjectRegistry } from '../services/projectRegistry.js';
+import { stampLines } from '../lib/stampedLines.js';
 import { startDaemon, type RunningDaemon } from './daemon.js';
 
 /**
  * `web-latex-mcp serve [--keep-alive] [--port <n>]`: run the daemon in the foreground until it is
- * stopped (`/shutdown`, SIGINT/SIGTERM, or idleness unless `--keep-alive`). Logs go to stderr;
- * stdout stays empty. Returns the exit status.
+ * stopped (`/shutdown`, SIGINT/SIGTERM, or idleness unless `--keep-alive`). Logs go to stderr,
+ * each line time-stamped (`stampLines`); stdout stays empty. Returns the exit status.
  */
 
 export const SERVE_USAGE =
@@ -54,6 +55,8 @@ export async function runServe(
   }
   process.env.GIT_TERMINAL_PROMPT ??= '0';
   process.env.GCM_INTERACTIVE ??= 'never';
+  // Every line this process writes from here on, the daemon's log, carries its time.
+  stampLines(process.stderr);
 
   let daemon: RunningDaemon;
   try {

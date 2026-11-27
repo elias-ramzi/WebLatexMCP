@@ -117,7 +117,10 @@ envelope. Its requests (`isModernMessage`) go to `createMcpHandler`, which build
 request from the session's scope; the session is the one the proxy's connection id
 (`X-Web-Latex-Mcp-Connection`, a random UUID per proxy process) names. The proxy holds `GET /hold`
 open in place of the GET stream (the session never idles while one is open, and closes a minute
-after the last one goes), and ends the session with a `DELETE` naming the connection. A session
+after the last one goes), and ends the session with a `DELETE` naming the connection. The daemon
+writes a newline on each hold every 15 s, as the SDK sends a comment on its own event streams:
+Node's `fetch` drops a response body silent for 5 minutes. The proxy opens a dropped hold again
+while the same daemon answers. A session
 closed for idleness reopens under the same id, so its shadow and the ownership of its edits survive.
 A request naming no connection (a proxy of an older build) gets a 400, from which a 2026 client falls
 back to the 2025 handshake.

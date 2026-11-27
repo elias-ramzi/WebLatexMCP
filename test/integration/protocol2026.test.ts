@@ -150,6 +150,21 @@ describe('protocol 2026-07-28 through the daemon', () => {
     hold.abort();
   });
 
+  it('sends a keep-alive on a hold, which fetch would otherwise drop after 5 silent minutes', async () => {
+    const { daemon } = await setup({ holdKeepAliveMs: 50 });
+    const hold = new AbortController();
+    cleanups.push(async () => hold.abort());
+    const held = await fetch(new URL('/hold', daemon.url), {
+      headers: { authorization: `Bearer ${daemon.token}`, [HEADER_CONNECTION]: randomUUID() },
+      signal: hold.signal,
+    });
+    expect(held.status).toBe(200);
+    const reader = held.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toMatch(/^\n+$/);
+    hold.abort();
+  });
+
   it('asks the user before a guarded change, the client retrying with the answer (#289)', async () => {
     const { daemon, workspace } = await setup();
     const transport = new StreamableHTTPClientTransport(new URL(daemon.url), {

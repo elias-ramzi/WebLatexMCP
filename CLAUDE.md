@@ -54,7 +54,9 @@ logic lives in services, unit-testable without an MCP client.
   replays `initialize` once after a loss; watches stdin `end` itself). Every request carries the
   proxy's random connection id (`HEADER_CONNECTION`), and the relay holds `GET /hold` open and sends
   a connection `DELETE` on its way out: that is how a 2026-07-28 client, which has no session id,
-  keeps one session on the daemon. Unreachable daemon → `runStandalone` (`src/standalone.ts`) with
+  keeps one session on the daemon. **A hold is never silent**: `fetch` drops a body silent for 5
+  minutes, so the daemon writes a newline every `DEFAULT_HOLD_KEEP_ALIVE_MS` (15 s), and the relay
+  re-opens a dropped hold while the same daemon answers (backoff from `HOLD_RETRY_MS`). Unreachable daemon → `runStandalone` (`src/standalone.ts`) with
   `daemonUnavailable`. `--standalone` / `WEB_LATEX_MCP_STANDALONE=1` skip the proxy.
 - `src/daemon/*` — `web-latex-mcp serve` (`startDaemon`): Streamable HTTP on `127.0.0.1`, one
   `SessionScope` + `McpServer` + transport per MCP session over one `createSharedServices`.

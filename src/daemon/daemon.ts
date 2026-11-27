@@ -72,6 +72,13 @@ export const DEFAULT_MAX_SESSIONS = 64;
  * without one means the client is gone.
  */
 export const DEFAULT_STREAM_LOSS_MS = 60 * 1000;
+/**
+ * How often a hold (`GET /hold`) gets a keep-alive byte. Node's `fetch` (undici) drops a response
+ * body that stays silent for 5 minutes (`bodyTimeout`): a silent hold ended there, and the
+ * connection's 2026 session closed a minute later. The SDK's own event streams send a comment
+ * every 15 s for the same reason.
+ */
+export const DEFAULT_HOLD_KEEP_ALIVE_MS = 15_000;
 export const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 /** How long a closing session waits for its running calls (a compile) before closing anyway. */
 export const DEFAULT_DRAIN_MS = 10 * 60 * 1000;
@@ -97,6 +104,7 @@ export interface DaemonOptions {
   keepAlive?: boolean;
   sessionIdleMs?: number;
   streamLossMs?: number;
+  holdKeepAliveMs?: number;
   idleExitMs?: number;
   drainMs?: number;
   maxSessions?: number;
@@ -246,6 +254,7 @@ async function serve(
   const { config, env } = opts;
   const sessionIdleMs = opts.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS;
   const streamLossMs = opts.streamLossMs ?? DEFAULT_STREAM_LOSS_MS;
+  const holdKeepAliveMs = opts.holdKeepAliveMs ?? DEFAULT_HOLD_KEEP_ALIVE_MS;
   const idleExitMs = opts.idleExitMs ?? DEFAULT_IDLE_EXIT_MS;
   const drainMs = opts.drainMs ?? DEFAULT_DRAIN_MS;
   const maxSessions = opts.maxSessions ?? DEFAULT_MAX_SESSIONS;
@@ -458,7 +467,8 @@ async function serve(
    * `GET /hold`: the proxy holds this open for as long as it runs, naming its connection — the
    * 2026 stand-in for the 2025 GET stream, which that revision dropped. A connection's 2026
    * session is never idle while a hold is open, and closes `streamLossMs` after its last one goes
-   * (a proxy killed without a `DELETE`). Nothing is ever written to it.
+   * (a proxy killed without a `DELETE`). Only a newline is ever written to it, every
+   * `holdKeepAliveMs` (`DEFAULT_HOLD_KEEP_ALIVE_MS`: `fetch` drops a body silent for 5 minutes).
    */
   const holdConnection = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     const connection = connectionOf(req, res);
@@ -476,7 +486,10 @@ async function serve(
     }
     res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
     res.flushHeaders();
+    const keepAlive = setInterval(() => res.write('\n'), holdKeepAliveMs);
+    keepAlive.unref?.();
     res.on('close', () => {
+      clearInterval(keepAlive);
       const left = (holds.get(connection) ?? 1) - 1;
       if (left > 0) holds.set(connection, left);
       else holds.delete(connection);
