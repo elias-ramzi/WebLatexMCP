@@ -11,6 +11,7 @@ import {
   isIncompatibleClient,
   outputSchemaMode,
 } from './lib/outputSchemaCompat.js';
+import { escapeInvisibleChars } from './lib/projectId.js';
 import {
   createSessionProbe,
   installConnectionProbe,
@@ -88,6 +89,13 @@ export async function runStandalone(opts: { daemonUnavailable?: string } = {}): 
   // Chained after the handler above, and deliberately so: the probe runs first inside that chain
   // (see installConnectionProbe), so a firing is counted even if the compatibility logger throws.
   if (probe) installConnectionProbe(server.server, probe);
+  // The SDK (1.30 on) closes the stdio transport when one inbound message passes its 10 MiB read
+  // cap, which ends this server: say why on stderr rather than exit without a word (the proxy's
+  // relay logs its own, `relay: stdin: …`). A JSON parse error quotes what the client sent, so the
+  // text is escaped and cut like any client-supplied string.
+  server.server.onerror = (err) => {
+    console.error(`[web-latex-mcp] stdio: ${escapeInvisibleChars(err.message).slice(0, 300)}`);
+  };
   // Retract this session's advertisement so peers stop seeing it as active. Best-effort: a
   // session that dies without this is detected as gone by pid instead.
   const release = (): void => {

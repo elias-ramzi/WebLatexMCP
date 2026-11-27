@@ -16,7 +16,7 @@ import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
  * spec-compliant internally and the decision can be made per-connection from the negotiated client.
  *
  * Separately, and for **every** client, the same hook drops the root `$schema` of each advertised
- * `inputSchema`/`outputSchema` (`stripSchemaDialect`). The SDK (1.29, and 1.30 still) converts zod
+ * `inputSchema`/`outputSchema` (`stripSchemaDialect`). The SDK (1.29 through 1.32.2) converts zod
  * with no target, which falls back to draft-07 and stamps
  * `"$schema": "http://json-schema.org/draft-07/schema#"` on every schema; a client validating with a
  * 2020-12-only Ajv (the Claude desktop app's Code tab) refuses such a schema outright — "unsupported

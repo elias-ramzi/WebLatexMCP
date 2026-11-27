@@ -209,6 +209,15 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Changed
 
+- **MCP SDK 1.32.2** (from 1.29.0), which adds stdio and HTTP hardening from upstream. One
+  behaviour is new: the stdio transport now refuses a single message from the client over 10 MiB
+  and closes the connection. A `--standalone` server now says so on stderr
+  (`stdio: ReadBuffer exceeded maximum size …`) instead of exiting silently; the proxy already
+  logged it. Through the shared daemon, any request over 4 MB was already refused with an error
+  and the session kept going; that is unchanged up to 10 MiB, and a larger one now ends the
+  session. No `write_file` or `push` resolution comes near either cap. The server still speaks
+  protocol 2025-11-25: Claude Code's probe for revision 2026-07-28 gets a prompt error, and Claude
+  Code falls back to the older handshake.
 - **Smaller instructions, and the rules that matter survive a client's cut.** The MCP `instructions`
   went from about 52,000 characters to about 9,600. Claude Code keeps only about the first 4,000,
   which used to drop half the bibliography rules, the PDF-comment loop and every convention added
