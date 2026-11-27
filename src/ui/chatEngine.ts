@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { getServerVersion } from '../lib/version.js';
 import {
+  HEADER_APPROVALS,
   HEADER_DEFAULT_PROJECT,
   HEADER_SESSION,
 } from '../daemon/sessionHeaders.js';
@@ -392,6 +393,10 @@ class PaperChat {
             authorization: `Bearer \${${TOKEN_VAR}}`,
             [HEADER_SESSION]: uiSessionId(this.paper),
             ...(dev ? {} : { [HEADER_DEFAULT_PROJECT]: this.paper }),
+            // A Claude run through the Agent SDK answers no elicitation form (it declines them
+            // unseen), so a guarded change relies on the confirmation flag here, which the page's
+            // own permission cards already put in front of the user (src/lib/approvals.ts).
+            [HEADER_APPROVALS]: 'flag',
           },
           alwaysLoad: true,
         },

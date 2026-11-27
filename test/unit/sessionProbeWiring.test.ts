@@ -9,6 +9,7 @@ import { createSessionProbe, installToolCallProbe } from '../../src/lib/sessionP
 import type { SessionProbe } from '../../src/lib/sessionProbe.js';
 import type { AppContext } from '../../src/context.js';
 import { installSchemaShaping } from '../../src/lib/outputSchemaCompat.js';
+import { installApprovalGates } from '../../src/lib/approvals.js';
 
 // Same stand-in as test/unit/server.test.ts: registration reads the bag lazily.
 const fakeCtx = {} as unknown as AppContext;
@@ -116,12 +117,14 @@ describe('installToolCallProbe', () => {
 
 describe('createServer probe wiring', () => {
   it('installs nothing of its own when no probe is passed', () => {
-    // Inertness, stated as strongly as it can be: the only wrapper on `registerTool` is the schema
-    // shaping every server gets (src/lib/outputSchemaCompat.ts) — the same function a bare server
-    // gets from it — so there is no probe in the hot path to measure, fail, or write a line from.
+    // Inertness, stated as strongly as it can be: the only wrappers on `registerTool` are the ones
+    // every server gets — schema shaping (src/lib/outputSchemaCompat.ts) and approval gates
+    // (src/lib/approvals.ts), the outermost being the same function a bare server gets — so there
+    // is no probe in the hot path to measure, fail, or write a line from.
     const server = createServer(fakeCtx);
     const shapedOnly = new McpServer({ name: 'bare', version: '0' });
     installSchemaShaping(shapedOnly);
+    installApprovalGates(shapedOnly, () => 'ask');
     expect(String(server.registerTool)).toBe(String(shapedOnly.registerTool));
     expect(server.registerTool).not.toBe(McpServer.prototype.registerTool);
   });

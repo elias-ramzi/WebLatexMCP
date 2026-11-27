@@ -150,7 +150,49 @@ describe('protocol 2026-07-28 through the daemon', () => {
     hold.abort();
   });
 
-  it('falls back to the 2025 handshake for a proxy that names no connection', async () => {
+  it('asks the user before a guarded change, the client retrying with the answer (#289)', async () => {
+    const { daemon, workspace } = await setup();
+    const transport = new StreamableHTTPClientTransport(new URL(daemon.url), {
+      requestInit: {
+        headers: { authorization: `Bearer ${daemon.token}`, [HEADER_CONNECTION]: randomUUID() },
+      },
+    });
+    const client = new Client(
+      { name: 'claude-code', version: '0.0.0' },
+      { versionNegotiation: { mode: 'auto' }, capabilities: { elicitation: { form: {} } } },
+    );
+    const asked: string[] = [];
+    client.setRequestHandler('elicitation/create', async (request) => {
+      asked.push(String((request.params as { message?: unknown }).message));
+      return { action: 'accept', content: { approve: true } };
+    });
+    await client.connect(transport);
+    cleanups.push(() => client.close());
+    expect(client.getProtocolEra()).toBe('modern');
+
+    const res = await client.callTool({
+      name: 'write_file',
+      arguments: { path: 'refs.bib', content: '@misc{a, title = {A}}\n', confirmBibEdit: true },
+    });
+    expect(res.isError, JSON.stringify(res.content)).toBeFalsy();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('"refs.bib"');
+    const { readFile } = await import('node:fs/promises');
+    expect(await readFile(path.join(workspace, 'demo', 'refs.bib'), 'utf8')).toContain('{A}');
+  });
+
+  it('serves a client that names only its session (the web UI) in that one session, run after run', async () => {
+    const { daemon, connect } = await setup();
+    const first = await connect({ [HEADER_SESSION]: 'ui-paper' });
+    expect(first.getProtocolEra()).toBe('modern');
+    await first.callTool({ name: 'status', arguments: {} });
+    await first.close();
+    const second = await connect({ [HEADER_SESSION]: 'ui-paper' });
+    await second.callTool({ name: 'status', arguments: {} });
+    expect(daemon.sessionIds()).toEqual(['ui-paper']);
+  });
+
+  it('falls back to the 2025 handshake for a client that names no connection or session', async () => {
     const { daemon, connect } = await setup();
     const client = await connect();
     expect(client.getProtocolEra()).toBe('legacy');

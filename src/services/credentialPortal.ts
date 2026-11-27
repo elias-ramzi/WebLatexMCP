@@ -116,6 +116,45 @@ export class CredentialPortal {
     return undefined;
   }
 
+  /** Callers of {@link waitOutcome} still waiting, each settled once. */
+  private waiters = new Set<(outcome: PortalOutcome | undefined) => void>();
+
+  /**
+   * Wait for the submission for `host` (#291: the URL-elicitation flow answers in the same call),
+   * taking it as {@link takeOutcome} does. `undefined` when the page closes (one-shot, or timed
+   * out), `timeoutMs` passes, or `signal` aborts first — the caller then reports that the user
+   * has not submitted yet, and a later call can still take the outcome.
+   */
+  waitOutcome(
+    host: string,
+    opts: { timeoutMs: number; signal?: AbortSignal },
+  ): Promise<PortalOutcome | undefined> {
+    const ready = this.takeOutcome(host);
+    if (ready) return Promise.resolve(ready);
+    if (!this.isRunning() || opts.signal?.aborted) return Promise.resolve(undefined);
+    return new Promise((resolve) => {
+      const settle = (outcome: PortalOutcome | undefined): void => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        this.waiters.delete(waiter);
+        resolve(outcome === undefined ? undefined : this.takeOutcome(host));
+      };
+      const waiter = (outcome: PortalOutcome | undefined): void =>
+        settle(outcome?.host === host ? outcome : undefined);
+      const onAbort = (): void => settle(undefined);
+      this.waiters.add(waiter);
+      // Declared after `settle`, which only ever runs once it is set (the timer, the abort
+      // listener below, or a submission — all after this line).
+      const timer = setTimeout(() => settle(undefined), opts.timeoutMs);
+      timer.unref?.();
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  private settleWaiters(outcome: PortalOutcome | undefined): void {
+    for (const waiter of [...this.waiters]) waiter(outcome);
+  }
+
   /**
    * Open (or re-point) the portal for a target and return the form URL, or undefined if no loopback
    * port could be bound. Idempotent: a second call reuses the listener and just updates the target.
@@ -169,6 +208,8 @@ export class CredentialPortal {
     this.baseUrl = undefined;
     this.nonce = undefined;
     this.target = undefined;
+    // A submission closes the page too: its waiters were settled with the outcome just before.
+    this.settleWaiters(undefined);
   }
 
   private armTimeout(ms: number): void {
@@ -245,6 +286,7 @@ export class CredentialPortal {
       persisted,
       ...(target.storage !== undefined ? { storage: target.storage } : {}),
     };
+    this.settleWaiters(this.lastOutcome);
     const msg = persisted
       ? `Stored the credential for ${target.username}@${target.host} in ${target.storage ?? 'your git credential helper'}. You can close this tab.`
       : `Sent the credential to git, but no credential helper kept it. Configure one (e.g. libsecret on Linux) or use an env var. You can close this tab.`;

@@ -42,6 +42,7 @@ import {
 } from './daemonFiles.js';
 import {
   HEADER_CONNECTION,
+  HEADER_SESSION,
   SessionHeaderError,
   connectionIdOf,
   parseSessionHeaders,
@@ -510,16 +511,23 @@ async function serve(
     res: http.ServerResponse,
     body: unknown,
   ): Promise<void> => {
-    const connection = connectionOf(req, res);
-    if (connection === null) return;
+    const named = connectionOf(req, res);
+    if (named === null) return;
+    // A client that reaches the daemon without a proxy (the web UI's Claude) names no connection
+    // but always names its session: its requests share that session, run after run. The prefix
+    // keeps such a key apart from every connection id (a UUID).
+    const sessionHeader = req.headersDistinct[HEADER_SESSION];
+    const connection =
+      named ??
+      (sessionHeader?.length === 1 && sessionHeader[0] ? `session:${sessionHeader[0]}` : undefined);
     if (connection === undefined) {
       // A proxy of a build before #288, relaying a 2026 client's probe: any error makes that
       // client fall back to the 2025 handshake, which this daemon serves.
       return sendRpcError(
         res,
         400,
-        `Protocol 2026-07-28 needs the proxy's connection id (${HEADER_CONNECTION}); use the ` +
-          '2025 initialize handshake.',
+        `Protocol 2026-07-28 needs the proxy's connection id (${HEADER_CONNECTION}) or a ` +
+          `session id (${HEADER_SESSION}); use the 2025 initialize handshake.`,
       );
     }
     let s = connections.get(connection);
@@ -601,6 +609,7 @@ async function serve(
           : {}),
         ...(settings.ignoredEnv.length > 0 ? { ignoredClientEnv: settings.ignoredEnv } : {}),
         ...(replaceRequested ? { restartPending: true } : {}),
+        ...(settings.approvals !== undefined ? { approvals: settings.approvals } : {}),
       });
       const handlers = new Map<boolean, ReturnType<typeof toNodeHandler>>();
       const mcpHandlers: Array<ReturnType<typeof createMcpHandler>> = [];
@@ -717,6 +726,7 @@ async function serve(
           : {}),
         ...(settings.ignoredEnv.length > 0 ? { ignoredClientEnv: settings.ignoredEnv } : {}),
         ...(replaceRequested ? { restartPending: true } : {}),
+        ...(settings.approvals !== undefined ? { approvals: settings.approvals } : {}),
       });
       // Built for the client the `initialize` names: no `outputSchema` for one that chokes on it
       // (src/lib/outputSchemaCompat.ts).

@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { parseCallLog } from './lib/callLog.js';
+import { parseApprovalsMode } from './lib/approvals.js';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -591,6 +592,13 @@ export function loadConfig(
         'keeping the tool-call log on.',
     );
   }
+  const approvals = parseApprovalsMode(env.WEB_LATEX_MCP_APPROVALS);
+  if (approvals.invalid !== undefined) {
+    console.error(
+      `[web-latex-mcp] WEB_LATEX_MCP_APPROVALS ${quoteEnvValue(approvals.invalid)} is not ask or ` +
+        'flag; asking the user when the client can.',
+    );
+  }
   const viewerTarget = parseViewerTarget(env.WEB_LATEX_MCP_VIEWER_TARGET);
   const { mode: rewriteMode, explicit: rewriteModeExplicit } = parseRewriteMode(
     env.WEB_LATEX_MCP_REWRITE_MODE,
@@ -629,6 +637,7 @@ export function loadConfig(
     viewerPort,
     maxParallelBuilds,
     callLog: callLog.enabled,
+    approvals: approvals.mode,
     viewerTarget,
     rewriteMode,
     rewriteModeExplicit,

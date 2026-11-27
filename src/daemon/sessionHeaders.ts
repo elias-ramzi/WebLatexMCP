@@ -2,6 +2,7 @@ import { parseSessionId } from '../config.js';
 import { projectIdProblem, quoteId } from '../lib/projectId.js';
 import { outputSchemaMode, type OutputSchemaMode } from '../lib/outputSchemaCompat.js';
 import { DAEMON_WIDE_ENV, differingEnv } from '../lib/daemonWideEnv.js';
+import { parseApprovalsMode, type ApprovalsMode } from '../lib/approvals.js';
 
 /**
  * The per-connection settings a client (in practice the stdio proxy, milestone 5) sends on
@@ -16,6 +17,8 @@ export const HEADER_NO_OUTPUT_SCHEMA = 'x-web-latex-mcp-no-output-schema';
 export const HEADER_CLIENT_ENV = 'x-web-latex-mcp-client-env';
 /** `1`: the client runs a newer build; the daemon stops once its last session closes (§9.2). */
 export const HEADER_REPLACE_WHEN_IDLE = 'x-web-latex-mcp-replace-when-idle';
+/** The client's `WEB_LATEX_MCP_APPROVALS` (`src/lib/approvals.ts`): per session, like the next. */
+export const HEADER_APPROVALS = 'x-web-latex-mcp-approvals';
 /**
  * The proxy's connection id: random, one per proxy process, sent on every request. Protocol
  * revision 2026-07-28 has no `Mcp-Session-Id` (every request stands alone), so this is what ties
@@ -58,6 +61,8 @@ export interface SessionSettings {
   ignoredEnv: string[];
   /** The client runs a newer build and asks the daemon to stop once nobody uses it. */
   replaceWhenIdle?: boolean;
+  /** How this session approves a guarded change; absent → the daemon's own setting. */
+  approvals?: ApprovalsMode;
 }
 
 export class SessionHeaderError extends Error {
@@ -134,6 +139,12 @@ export function parseSessionHeaders(
   }
 
   settings.replaceWhenIdle = one(headers, HEADER_REPLACE_WHEN_IDLE) === '1';
+
+  const approvals = one(headers, HEADER_APPROVALS);
+  if (approvals !== undefined && approvals.trim() !== '') {
+    // An unknown value reads as `ask`, as the variable does in-process: the safe direction.
+    settings.approvals = parseApprovalsMode(approvals).mode;
+  }
   return settings;
 }
 

@@ -10,6 +10,7 @@ import {
   HEADER_DEFAULT_PROJECT,
   HEADER_NO_OUTPUT_SCHEMA,
   HEADER_REPLACE_WHEN_IDLE,
+  HEADER_APPROVALS,
   HEADER_SESSION,
   MAX_CREDENTIALS,
   MAX_CREDENTIAL_CHARS,
@@ -26,6 +27,7 @@ const PER_CONNECTION = [
   'WEB_LATEX_MCP_SESSION',
   'WEB_LATEX_MCP_DEFAULT_PROJECT',
   'WEB_LATEX_MCP_NO_OUTPUT_SCHEMA',
+  'WEB_LATEX_MCP_APPROVALS',
   // Q2: the daemon serves the central registry; one client's env list would apply to everyone.
   'WEB_LATEX_MCP_PROJECTS',
 ];
@@ -88,6 +90,8 @@ export function sessionRequestHeaders(
   const hashes = clientEnvHashes(env);
   if (Object.keys(hashes).length > 0) headers[HEADER_CLIENT_ENV] = JSON.stringify(hashes);
   if (opts.replaceWhenIdle) headers[HEADER_REPLACE_WHEN_IDLE] = '1';
+  const approvals = env.WEB_LATEX_MCP_APPROVALS?.trim();
+  if (approvals) headers[HEADER_APPROVALS] = approvals;
   return headers;
 }
 

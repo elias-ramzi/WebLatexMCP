@@ -11,6 +11,26 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **`credential_portal` answers in one call when your client can open the page for you (#291).**
+  A client with URL-mode elicitation (Claude Code) is handed the portal's `127.0.0.1` address and
+  shows it with its own consent step; the same call then waits for the token to be entered and
+  returns `stored` or `not-persisted`, or `declined` if you decline to open the page. Before, the
+  model had to call the tool again once you were done, which was easy to forget or to do too
+  early. The token still goes only from your browser to the local page, never through the chat or
+  the client. Other clients keep the open-then-call-again flow, and so does a session with
+  `WEB_LATEX_MCP_APPROVALS=flag`.
+
+- **The server asks you before a guarded change (#289).** A hand edit to a `.bib`
+  (`confirmBibEdit`), a new writing-guide rule (`confirmGuideEdit`), overwriting changes made outside
+  the session (`overrideExternalChanges`), and `discard` or `reset_to_remote` (`confirm: true`) were
+  allowed as soon as the model set the flag, which it could do on its own. When your client can
+  show a form (MCP elicitation, which Claude Code supports), the server now asks you directly,
+  naming what will change, and goes ahead only if you allow it. The flag is still required. A
+  client without forms keeps the flag alone, and `WEB_LATEX_MCP_APPROVALS=flag` restores that for
+  a client that declines questions without showing them (Claude Code's `-p` and Agent SDK runs).
+  The web UI's chat sets it itself. Works in both protocol eras. See
+  [Approvals](docs/tools.md#approvals).
+
 - **A citation field profile per project (#255).** `set_citation_profile` stores which BibTeX fields
   a project's bibliography carries: fields to `drop` from every entry (`publisher`, `month`, `issn`,
   `bibsource`, `timestamp`, …), and per entry type the only fields to `keep`. `add_citation` then

@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
  * `server_info`'s `ignoredClientEnv`.
  *
  * Not listed, because they are per connection and forwarded as headers: `WEB_LATEX_MCP_SESSION`,
- * `_DEFAULT_PROJECT`, `_NO_OUTPUT_SCHEMA` and the token variables. `WEB_LATEX_MCP_WORKSPACE`
+ * `_DEFAULT_PROJECT`, `_NO_OUTPUT_SCHEMA`, `_APPROVALS` and the token variables. `WEB_LATEX_MCP_WORKSPACE`
  * chooses which daemon a proxy uses, so it can never differ. `WEB_LATEX_MCP_PORT` is the
  * daemon's alone.
  */

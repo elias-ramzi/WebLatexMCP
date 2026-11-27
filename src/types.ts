@@ -1,6 +1,7 @@
 import type { RewriteMode } from './lib/rewriteMode.js';
 import type { ReferenceSourceId } from './lib/referenceKey.js';
 import type { InstallKind } from './lib/installKind.js';
+import type { ApprovalsMode } from './lib/approvals.js';
 
 /**
  * A project the server can operate on. Two kinds, because syncing with a remote and compiling a
@@ -203,6 +204,12 @@ export interface ServerConfig {
    * variable says off; a config built by hand (tests) leaves it unset, which is off.
    */
   callLog?: boolean;
+  /**
+   * How a guarded change is approved (`WEB_LATEX_MCP_APPROVALS`, `src/lib/approvals.ts`): `ask`
+   * (the default; unset reads as it) asks the user through MCP elicitation when the client can show
+   * a form, `flag` trusts the confirmation flag alone. Per session through the shared server.
+   */
+  approvals?: ApprovalsMode;
   /** Default place to open the viewer: OS browser, or as a VSCode Simple Browser tab. */
   viewerTarget?: ViewerTarget;
   /**

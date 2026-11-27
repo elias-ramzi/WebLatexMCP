@@ -484,6 +484,19 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### File writes and guards
 
+- **A guarded flag asks the user when the client can show a form** (#289, `src/lib/approvals.ts`,
+  `installApprovalGates` in `createServer`, after shaping). `GATES` maps each tool to the question
+  its guarded flags raise (`confirmBibEdit`, `confirmGuideEdit`, `overrideExternalChanges`,
+  `confirm` on `discard`/`reset_to_remote`); a call setting one returns `inputRequired(elicit…)`
+  (2026: the client retries; 2025: the SDK's legacy shim sends `elicitation/create` and re-enters),
+  and runs only on `approve: true`. The flag stays required (no flag → the tool's own refusal, no
+  question). No form capability (`clientCanElicitForm`: envelope first, else `initialize`) or
+  `approvals: 'flag'` (`WEB_LATEX_MCP_APPROVALS`, per session via `HEADER_APPROVALS`; the web UI
+  sends `flag`) → the flag alone, as before. Every name in a question goes through `quoteId`. A new
+  guarded flag gets a `GATES` entry. `credential_portal` (#291) does the same in URL mode
+  (`clientCanElicitUrl`): it returns `inputRequired(elicitUrl(<loopback url>))`, and the retry
+  waits for the submission (`CredentialPortal.waitOutcome`, `PORTAL_WAIT_MS`, progress on the
+  call's token) so the outcome comes back in that call; a decline closes the page.
 - **`.bib` is guarded.** `write_file`/`edit_file`/`delete_file` refuse a `.bib` unless
   `confirmBibEdit: true`. `isBibFile` (`src/lib/bib.ts`) also judges the Windows-opened name (cut at
   first `:`, trailing `.`/spaces stripped) on every platform. The sanctioned path is `add_citation`,

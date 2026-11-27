@@ -53,6 +53,7 @@ import { callLogSink, installCallLog } from './lib/callLog.js';
 import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
 import { installSchemaShaping } from './lib/outputSchemaCompat.js';
+import { installApprovalGates } from './lib/approvals.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -98,6 +99,9 @@ export function createServer(
   // Before the registrations below: each wrapper only covers tools registered after it. Shaping
   // goes first, so it sits innermost, next to the SDK's own `registerTool`.
   installSchemaShaping(server, shape);
+  // Guarded changes ask the user first, when the client can show a form (src/lib/approvals.ts).
+  // Read per call: a scope's config is its own, set when the session opened.
+  installApprovalGates(server, () => ctx.config?.approvals ?? 'ask');
   if (probe) installToolCallProbe(server, probe);
   // Likewise before the registrations: one line per tool call (src/lib/callLog.ts).
   if (ctx.config?.callLog === true) {
