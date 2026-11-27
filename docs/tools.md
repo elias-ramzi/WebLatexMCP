@@ -508,6 +508,22 @@ Some clients declare forms and still decline every question without showing it (
 `WEB_LATEX_MCP_APPROVALS=flag` in that client's server config to make the flag enough again. The
 web UI's chat does this itself: its own permission cards are where you approve.
 
+## Long compiles as background tasks
+
+A client that speaks protocol revision 2026-07-28 and supports MCP **tasks** (Claude Code does)
+gets `compile` as a task: the call returns at once with a task id, the build runs in the background,
+and the client polls it and can cancel it. Meanwhile the conversation goes on, and the task's status
+says which pass the build is on (`latexmk: run 2 of pdflatex`). The finished task carries exactly the
+result a blocking `compile` would have returned.
+
+- The project lock is held from the start of the build to its end, so a peer's write waits, as it
+  does for any compile.
+- Cancelling stops the build: latexmk (or tectonic) and every process it started are killed, and the
+  task ends as cancelled. A cancelled build's partial output is never reported as a result.
+- Finished tasks are kept for an hour; a task does not survive a server restart.
+
+Every other client gets the blocking call, unchanged.
+
 ## Compile defaults
 
 A project that always compiles the same way — `tectonic`, a 600 s timeout, a `warningsFilter` that

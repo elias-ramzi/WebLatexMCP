@@ -657,6 +657,15 @@ surfaced copy even for a registered root with no build (`compile`'s hint says `s
 
 ### Compile
 
+- **`compile` is an MCP task for a 2026 client declaring `io.modelcontextprotocol/tasks`** (#290,
+  `src/lib/tasks.ts`; SEP-2663 forbids one to anyone else). SDK 2.4 has no task support and
+  validates output before any callback wrapper sees it, so `installTasks` (last in `createServer`)
+  wraps the protocol's private `_requestHandlers` `tools/call` entry — pinned by
+  `test/integration/compileTask.test.ts`; without the field, tasks are off. The task runs
+  `runCompile` (lock held throughout) from the session's `TaskStore` (`src/services/taskStore.ts`,
+  per scope, closed with it); `tasks/cancel` aborts `CompileRun.signal`, which `execCapture` turns into
+  a process-tree kill (POSIX: `detached` + group kill; Windows: `taskkill /T`). Status messages come
+  only from `progressReader`'s fixed pass lines, never from document output.
 - **Compiles and PDF loads share one process-wide `WorkGate`** (`src/lib/workGate.ts`,
   `WEB_LATEX_MCP_MAX_PARALLEL_BUILDS`, default 2, FIFO), applied by wrapping the compiler and the
   renderer in `createSharedServices` (`src/services/gatedWork.ts`); tools never take it. A slot is

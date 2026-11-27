@@ -117,7 +117,7 @@ export function overlayNeverReadHint(paths: string[], success: boolean): string 
         `${one ? 'it' : 'them'} is not known yet — fix the errors and compile again.`;
 }
 
-const inputSchema = {
+export const inputSchema = {
   project: z.string().optional(),
   rootFile: z
     .string()
@@ -644,7 +644,21 @@ export type CompileArgs = z.infer<z.ZodObject<typeof inputSchema>>;
  * `compile: true` run it after their own lock is released (the project lock is not re-entrant), so
  * the build is the same one a separate `compile` call would have made, defaults and all.
  */
-export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<CallToolResult> {
+/**
+ * How a compile runs when it is not an ordinary call: as an MCP task (#290), whose `tasks/cancel`
+ * aborts it (`signal`, killing the backend and everything it started) and whose status follows
+ * its passes (`onProgress`).
+ */
+export interface CompileRun {
+  signal?: AbortSignal;
+  onProgress?: (message: string) => void;
+}
+
+export async function runCompile(
+  ctx: AppContext,
+  args: CompileArgs,
+  run: CompileRun = {},
+): Promise<CallToolResult> {
   try {
     const { id, dir } = await ctx.projectManager.requireProjectDir(args.project);
     // The project's stored defaults fill what the call left out, field by field; an argument
@@ -670,7 +684,9 @@ export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<Ca
     // project file, and throwing here costs nothing. Without it a missing backend surfaced as a
     // raw `spawn latexmk ENOENT`, naming neither the env var nor the backend that would work.
     const backend = await ctx.compiler.select(compiler);
+    run.onProgress?.(`waiting for the project lock on ${quoteId(id)}`);
     return await ctx.projectManager.runExclusive(id, async (lock) => {
+      run.onProgress?.(`compiling with ${backend.kind}`);
       // The caller's root, else the project's registered one, else auto-detection — the one
       // order every tool and the viewer use (resolveRootFile). The registered root is read
       // once (from the registry's current entry, so a peer's re-registration counts) and the
@@ -760,6 +776,8 @@ export async function runCompile(ctx: AppContext, args: CompileArgs): Promise<Ca
         shellEscape,
         restrictedShellEscape,
         ...(variant ? { workDir: variant.workDir, outDir: variant.outDir } : {}),
+        ...(run.signal ? { signal: run.signal } : {}),
+        ...(run.onProgress ? { onProgress: run.onProgress } : {}),
       });
       const sourceCheck = variant ? await variant.sourceChanges() : undefined;
       const changedSource = sourceCheck?.changed;

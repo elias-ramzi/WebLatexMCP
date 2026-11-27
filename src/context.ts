@@ -24,6 +24,7 @@ import { ShelfStore } from './services/shelfStore.js';
 import { RewriteModeStore } from './services/rewriteModeStore.js';
 import { CompileDefaultsStore } from './services/compileDefaultsStore.js';
 import { CitationProfileStore } from './services/citationProfileStore.js';
+import { TaskStore } from './services/taskStore.js';
 import { CredentialPortal } from './services/credentialPortal.js';
 import { UpdateService } from './services/updater.js';
 import { createSessionRecorder } from './lib/mutationRecorder.js';
@@ -109,6 +110,11 @@ export interface AppContext {
   credentialPortal: CredentialPortal;
   /** Checks GitHub for a newer release and fetches the Desktop bundle — see `src/services/updater.ts`. */
   updater: UpdateService;
+  /**
+   * The session's MCP tasks (#290, `src/services/taskStore.ts`). Absent in a context built by
+   * hand (tests), where `compile` then never answers with a task.
+   */
+  tasks?: TaskStore;
 }
 
 /**
@@ -447,6 +453,8 @@ export function createSessionContext(
     }),
   );
 
+  // Background work this session started as MCP tasks (#290); aborted when the session closes.
+  const tasks = new TaskStore();
   const ctx: AppContext = {
     config,
     projectManager,
@@ -468,6 +476,7 @@ export function createSessionContext(
     citationProfiles: shared.citationProfiles,
     credentialPortal: shared.credentialPortal,
     updater: shared.updater,
+    tasks,
   };
 
   const scopes = viewerScopes.get(shared);
@@ -479,6 +488,7 @@ export function createSessionContext(
   // second close must retract that one too.
   const close = async (): Promise<void> => {
     scopes?.delete(projectManager);
+    tasks.close();
     markClosed();
     await Promise.all(sessions.trackedProjects().map((id) => sessions.release(id).catch(() => {})));
   };

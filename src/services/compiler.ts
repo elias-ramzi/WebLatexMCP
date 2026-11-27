@@ -18,6 +18,13 @@ import type { LogSource } from './logParser.js';
 export type Engine = 'pdflatex' | 'xelatex' | 'lualatex';
 
 export interface CompileRequest {
+  /**
+   * Aborting stops the build: the backend and every process it started are killed (`execCapture`'s
+   * `signal`). Set by a compile run as an MCP task (#290), whose `tasks/cancel` aborts it.
+   */
+  signal?: AbortSignal;
+  /** Called with a short line each time the backend starts a pass (`latexmk: run 2 of pdflatex`). */
+  onProgress?: (message: string) => void;
   /** Absolute path to the project clone. */
   projectDir: string;
   /** Root .tex file, relative to projectDir. */
@@ -104,6 +111,38 @@ export interface CompileOutcome {
    * why this is only ever a name from the fixed engine allowlist and never a captured line.
    */
   missingEngine?: Engine;
+}
+
+/**
+ * Turn a backend's live output into `onProgress` lines, one per pass it announces: latexmk's
+ * `Run number N of rule 'pdflatex'` and tectonic's `note: Running TeX …` / `Rerunning TeX …`.
+ * Lines are reassembled across chunks; only the announcement is passed on, never the document's
+ * own output (which a compile also prints), so nothing document-controlled reaches a status.
+ */
+export function progressReader(
+  backend: 'latexmk' | 'tectonic',
+  onProgress: ((message: string) => void) | undefined,
+): ((text: string) => void) | undefined {
+  if (onProgress === undefined) return undefined;
+  let pending = '';
+  return (text) => {
+    pending += text;
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? '';
+    for (const line of lines) {
+      if (backend === 'latexmk') {
+        const m =
+          /^Run number (\d+) of rule '(pdflatex|xelatex|lualatex|latex|biber|bibtex|makeindex|makeglossaries|dvipdf|xdvipdfmx)/.exec(
+            line.trim(),
+          );
+        if (m) onProgress(`latexmk: run ${m[1]} of ${m[2]}`);
+      } else if (/^note: (Running|Rerunning) TeX/.test(line.trim())) {
+        onProgress(
+          `tectonic: ${line.trim().startsWith('note: Rerunning') ? 'rerunning' : 'running'} TeX`,
+        );
+      }
+    }
+  };
 }
 
 export interface LatexCompiler {
@@ -1240,6 +1279,8 @@ export class LatexmkCompiler implements LatexCompiler {
     const res = await this.run('latexmk', args, {
       cwd: workDirFor(req),
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
+      ...(req.signal ? { signal: req.signal } : {}),
+      ...(req.onProgress ? { onOutput: progressReader('latexmk', req.onProgress) } : {}),
     });
     // `-cd` chdirs into the root file's directory: that is what the log's paths are relative to.
     // latexmk shells out to the engine, so a missing one shows up as the shell's not-found line.
@@ -1352,6 +1393,8 @@ export class TectonicCompiler implements LatexCompiler {
     const res = await this.run('tectonic', args, {
       cwd: workDirFor(req),
       timeoutMs: (req.timeoutSec ?? 120) * 1000,
+      ...(req.signal ? { signal: req.signal } : {}),
+      ...(req.onProgress ? { onOutput: progressReader('tectonic', req.onProgress) } : {}),
     });
     // Tectonic takes no `-cd`: it runs in the project root, so its log paths already are. No
     // `detectMissingEngine`: it drives its bundled engine and never runs an engine binary, so a

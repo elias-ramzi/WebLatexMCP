@@ -5,6 +5,8 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Set when `signal` aborted the run (and killed its process tree). */
+  aborted?: boolean;
 }
 
 export interface ExecOptions {
@@ -17,6 +19,33 @@ export interface ExecOptions {
    * A `Buffer` is written verbatim — used to pipe binary blob content into `git hash-object`.
    */
   input?: string | Buffer;
+  /**
+   * Aborting kills the child **and every process it started** (a compile task cancelled, #290):
+   * latexmk runs the engine, biber, makeindex as children of its own, and killing latexmk alone
+   * leaves them writing into the build directory after the lock is released. On POSIX the child
+   * leads its own process group (spawned `detached`), which is killed whole; on Windows
+   * `taskkill /T` kills the tree. The result then has `aborted: true`.
+   */
+  signal?: AbortSignal;
+  /** Called with each piece of stdout and stderr as it arrives (decoded as UTF-8, best-effort). */
+  onOutput?: (text: string) => void;
+}
+
+/** Kill a child and, when it leads a process group (POSIX) or has children (Windows), them too. */
+function killTree(pid: number | undefined, group: boolean): void {
+  if (pid === undefined) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }).on(
+        'error',
+        () => {},
+      );
+    } else {
+      process.kill(group ? -pid : pid, 'SIGKILL');
+    }
+  } catch {
+    /* already gone */
+  }
 }
 
 export interface ExecBytesResult {
@@ -24,6 +53,8 @@ export interface ExecBytesResult {
   stdout: Buffer;
   stderr: string;
   timedOut: boolean;
+  /** Set when `signal` aborted the run (and killed its process tree). */
+  aborted?: boolean;
 }
 
 /**
@@ -61,37 +92,59 @@ export function execCaptureBytes(
   opts: ExecOptions = {},
 ): Promise<ExecBytesResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, windowsHide: true });
+    // Its own process group only when it may have to be killed whole: everything else keeps the
+    // spawn it always had.
+    const group = opts.signal !== undefined && process.platform !== 'win32';
+    const child = spawn(cmd, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      windowsHide: true,
+      ...(group ? { detached: true } : {}),
+    });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let timedOut = false;
+    let aborted = false;
     const timer = opts.timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          child.kill('SIGKILL');
+          if (group) killTree(child.pid, true);
+          else child.kill('SIGKILL');
         }, opts.timeoutMs)
       : undefined;
+    const onAbort = (): void => {
+      aborted = true;
+      killTree(child.pid, group);
+    };
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener('abort', onAbort, { once: true });
 
     child.stdout.on('data', (d: Buffer) => {
       stdoutChunks.push(d);
+      opts.onOutput?.(d.toString('utf8'));
     });
     // Accumulated as bytes and decoded once at the end, like stdout: decoding each chunk on its
     // own turns a multi-byte character split across two `data` events into two U+FFFD — and
-    // `PathBeyondSymlinkError` rebuilds a path out of git's stderr.
+    // `PathBeyondSymlinkError` rebuilds a path out of git's stderr. (`onOutput` gets a per-chunk
+    // decode, good enough for progress lines.)
     child.stderr.on('data', (d: Buffer) => {
       stderrChunks.push(d);
+      opts.onOutput?.(d.toString('utf8'));
     });
     child.on('error', (err) => {
       if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
       reject(err);
     });
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
       resolve({
         code,
         stdout: Buffer.concat(stdoutChunks),
         stderr: Buffer.concat(stderrChunks).toString('utf8'),
         timedOut,
+        ...(aborted ? { aborted } : {}),
       });
     });
 

@@ -11,6 +11,14 @@ This log starts with the changes made after 0.2.0; for anything earlier, see the
 
 ### Added
 
+- **Long compiles run as background tasks (#290).** A client on protocol 2026-07-28 that supports
+  MCP tasks (Claude Code) gets `compile` back at once as a task, which it polls and can cancel,
+  instead of a call that holds the conversation for the whole build. The task's status names the
+  pass the build is on; its result is exactly the blocking call's. The project lock is held for the
+  whole build, and cancelling kills latexmk (or tectonic) and everything it started. Other clients
+  get the blocking call, unchanged. See
+  [Long compiles as background tasks](docs/tools.md#long-compiles-as-background-tasks).
+
 - **`credential_portal` answers in one call when your client can open the page for you (#291).**
   A client with URL-mode elicitation (Claude Code) is handed the portal's `127.0.0.1` address and
   shows it with its own consent step; the same call then waits for the token to be entered and

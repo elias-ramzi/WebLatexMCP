@@ -54,6 +54,7 @@ import type { SessionProbe } from './lib/sessionProbe.js';
 import type { Skill } from './lib/skills.js';
 import { installSchemaShaping } from './lib/outputSchemaCompat.js';
 import { installApprovalGates } from './lib/approvals.js';
+import { installTasks } from './lib/tasks.js';
 
 /**
  * Create the MCP server and register all tools against the given context.
@@ -173,5 +174,7 @@ export function createServer(
     isRegisteredProject: (id) => ctx.projectManager.knownIds().includes(id),
   });
 
+  // Last: it wraps the `tools/call` handler the registrations above installed (src/lib/tasks.ts).
+  installTasks(server, ctx, shape);
   return server;
 }
